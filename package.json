@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-agent-swarm",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Durable workstreams, peer collaboration and evidence-based delivery for DeepSeek Harness",
   "type": "module",
   "main": "lib/index.js",

@@ -10,6 +10,7 @@ import { useCopy } from './locale.tsx'
 import { selectedOperation } from './selection.ts'
 import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
+import { BaselineNotice, DeliveryPanel } from './DeliveryPanel.tsx'
 
 export const OPEN_MONITOR = 'agent-swarm:open-monitor'
 export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
@@ -86,6 +87,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
       {latestStart && <section className="sw-auto-start" data-swarm-start={latestStart.status} role="status">
         <strong>{t(latestStart.status === 'planning' ? 'Planning collaboration…' : latestStart.status === 'launching' ? 'Starting workers…' : latestStart.status === 'failed' ? 'Collaboration could not start' : 'Agent Swarm request')}</strong>
         <p>{latestStart.goal}</p>
+        {latestStart.baseline && !snapshot && <BaselineNotice baseline={latestStart.baseline} />}
         {['planning', 'launching'].includes(latestStart.status) && <small>{t('Choosing roles, tasks and checks automatically using this conversation’s model.')}</small>}
         {latestStart.error && <p className="sw-error" role="alert">{latestStart.error}</p>}
       </section>}
@@ -101,7 +103,11 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
           <button data-action="stop" disabled={Boolean(busy)} onClick={() => stopArmed ? void control('stop') : setStopArmed(true)}>{t(stopArmed ? 'Confirm stop' : 'Stop')}</button></>}
         {stopArmed && <span className="sw-small">{t('Stop ends this mission and its workers.')} <button onClick={() => setStopArmed(false)}>{t('Cancel')}</button></span>}
         {busy && <span role="status">{t('Working')}…</span>}
-      </div><SwarmBoard key={snapshot.mission.id} snapshot={snapshot} live onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} /></>}
+      </div>
+        {snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}
+        {owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && snapshot.tasks.some(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact) &&
+          <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} />}
+        <SwarmBoard key={snapshot.mission.id} snapshot={snapshot} live onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} /></>}
       {owner && data && !snapshot && !draft && !latestStart && selected !== 'new' && <div className="sw-empty"><p>{t('Start from the conversation input:')}</p><code>/agent-swarm {t('Describe what you want to accomplish')}</code><p>{t('Roles, tasks and verification are set up automatically.')}</p></div>}
       </>}
     </div>

@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { withinScope } from './scope.js'
-import type { Artifact, Member, Mission, Task } from './types.js'
+import { captureGitSnapshot } from './git-snapshot.js'
+import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 
 export interface CheckResult { command: string; exitCode: number; output: string }
 export interface WorkspaceOptions {
@@ -15,7 +16,7 @@ export interface WorkspaceOptions {
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
 }
-interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string }
+interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
@@ -103,6 +104,7 @@ export class Workspaces {
   readonly root: string
   private readonly controllers = new Map<string, Set<AbortController>>()
   private readonly inFlight = new Set<Promise<unknown>>()
+  private readonly baselines = new Map<string, Promise<WorkspaceBaseline>>()
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
@@ -115,8 +117,9 @@ export class Workspaces {
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
   private memberPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.workspace.json`) }
   private taskPath(missionId: string, taskId: string): string { return path.join(this.missionDir(missionId), 'tasks', `${segment(taskId)}.json`) }
-  private async git(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
-    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, ...(signal === undefined ? {} : { signal }) })
+  private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes): Promise<string> {
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
+    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.options.checkTimeoutMs, maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed (${result.exitCode}): ${result.output.trim()}`)
     if (result.truncated) throw new Error(`git ${args[0]} output exceeded the configured limit; refusing incomplete artifact inspection`)
     return args.includes('-z') ? result.output : result.output.trim()
@@ -140,7 +143,64 @@ export class Workspaces {
   private async missionRecord(missionId: string): Promise<MissionWorkspace> {
     const value = await readJson(path.join(this.missionDir(missionId), 'mission.json'))
     if (!isRecord(value) || value.version !== 1 || value.missionId !== missionId || typeof value.source !== 'string' || !commitId(value.baseCommit)) throw new Error('Invalid or missing mission workspace metadata')
-    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit }
+    let baseline: WorkspaceBaseline | undefined
+    if (value.baseline !== undefined) {
+      const saved = value.baseline
+      if (!isRecord(saved) || !commitId(saved.sourceHead) || saved.snapshotCommit !== value.baseCommit || typeof saved.planningWorkspace !== 'string' || !Array.isArray(saved.changedPaths) || saved.changedPaths.some(item => typeof item !== 'string') || !Number.isSafeInteger(saved.createdAt)) throw new Error('Invalid mission snapshot metadata')
+      baseline = { sourceHead: saved.sourceHead, snapshotCommit: value.baseCommit, planningWorkspace: saved.planningWorkspace, changedPaths: saved.changedPaths as string[], createdAt: saved.createdAt as number }
+    }
+    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }) }
+  }
+
+  /** Freeze one source baseline before planning; all members and restarts reuse it. */
+  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
+    signal?.throwIfAborted()
+    const existing = this.baselines.get(mission.id)
+    if (existing !== undefined) {
+      const baseline = await existing
+      signal?.throwIfAborted()
+      if ((await this.missionRecord(mission.id)).source !== await realpath(mission.workspace)) throw new Error('Mission source workspace changed')
+      return baseline
+    }
+    const pending = this.operation(`baseline-${mission.id}`, async ownedSignal => {
+      const source = await realpath(mission.workspace)
+      const relativeRoot = path.relative(source, this.root)
+      if (relativeRoot === '' || (!relativeRoot.startsWith(`..${path.sep}`) && relativeRoot !== '..' && !path.isAbsolute(relativeRoot))) throw new Error('Swarm snapshot storage must be outside the source repository')
+      await mkdir(this.root, { recursive: true, mode: 0o700 })
+      if (await realpath(this.root) !== this.root) throw new Error('workspacesRoot must be canonical, without symlinks')
+      if (await this.git(source, ['rev-parse', '--show-toplevel'], ownedSignal) !== source) throw new Error('Mission workspace must be the Git repository root')
+      const manifest = path.join(this.missionDir(mission.id), 'mission.json')
+      const planningWorkspace = path.join(this.missionDir(mission.id), 'planning')
+      let record: MissionWorkspace
+      if (await readJson(manifest) === undefined) {
+        // Full repository path inventories need a metadata bound independent
+        // of the much smaller user-visible check-output retention limit.
+        const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, 16 * 1024 * 1024), ownedSignal)
+        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace } }
+        await writePrivateJson(manifest, record)
+      } else record = await this.missionRecord(mission.id)
+      if (record.source !== source) throw new Error('Mission source workspace changed')
+      // Older manifests must retain their original baseline even if the source
+      // now has unrelated edits. Add only the planning-view metadata.
+      const baseline = record.baseline ?? { sourceHead: record.baseCommit, snapshotCommit: record.baseCommit, planningWorkspace, changedPaths: [], createdAt: Date.now() }
+      if (baseline.planningWorkspace !== planningWorkspace) throw new Error('Planning workspace is outside its owned mission directory')
+      // Persist the baseline identity before its ref/checkout. Interrupted
+      // publication resumes that exact commit, never another source snapshot.
+      await this.git(source, ['update-ref', `refs/swarm/${segment(mission.id)}/baseline`, baseline.snapshotCommit], ownedSignal)
+      const exists = await realpath(planningWorkspace).then(value => value, error => {
+        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined
+        throw error
+      })
+      if (exists === undefined) {
+        await mkdir(path.dirname(planningWorkspace), { recursive: true, mode: 0o700 })
+        await this.git(source, ['worktree', 'add', '--detach', planningWorkspace, baseline.snapshotCommit], ownedSignal)
+      } else if (exists !== planningWorkspace || await this.git(planningWorkspace, ['rev-parse', 'HEAD^{commit}'], ownedSignal) !== baseline.snapshotCommit || await this.git(planningWorkspace, ['status', '--porcelain=v1', '--untracked-files=all'], ownedSignal)) throw new Error('Planning snapshot checkout was changed; restore the saved snapshot before continuing')
+      if (record.baseline === undefined) await writePrivateJson(manifest, { ...record, baseline })
+      return baseline
+    }, signal)
+    this.baselines.set(mission.id, pending)
+    try { return await pending }
+    finally { if (this.baselines.get(mission.id) === pending) this.baselines.delete(mission.id) }
   }
 
   private async memberRecord(member: Pick<Member, 'missionId' | 'id' | 'workspace'>): Promise<MemberWorkspace> {
@@ -164,17 +224,12 @@ export class Workspaces {
   }
 
   async prepareWorkspace(mission: Mission, memberId: string): Promise<string> {
+    await this.prepareBaseline(mission)
     return await this.operation(memberId, async signal => {
       await mkdir(this.root, { recursive: true, mode: 0o700 })
       if (await realpath(this.root) !== this.root) throw new Error('workspacesRoot must be canonical, without symlinks')
       const source = await realpath(mission.workspace)
       if (await this.git(source, ['rev-parse', '--show-toplevel'], signal) !== source) throw new Error('Mission workspace must be the Git repository root')
-      const manifest = path.join(this.missionDir(mission.id), 'mission.json')
-      if (await readJson(manifest) === undefined) {
-        if ((await this.git(source, ['status', '--porcelain=v1', '--untracked-files=all'], signal)).length > 0) throw new Error('Mission source checkout has uncommitted or untracked changes; commit or isolate them before starting a swarm')
-        const baseCommit = await this.git(source, ['rev-parse', 'HEAD^{commit}'], signal)
-        await writePrivateJson(manifest, { version: 1, missionId: mission.id, source, baseCommit } satisfies MissionWorkspace)
-      }
       const saved = await this.missionRecord(mission.id)
       if (saved.source !== source) throw new Error('Mission source workspace changed')
       const workspace = path.join(this.missionDir(mission.id), 'members', segment(memberId))

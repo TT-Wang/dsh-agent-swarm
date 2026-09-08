@@ -13,6 +13,7 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { readFile } from 'node:fs/promises'
 import { Workspaces, writePrivateJson } from './workspaces.js'
+import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import type { Artifact, Delivery, Member, Mission, Task, WorkerAdapter, WorkerCallbacks, WorkerSpec } from './types.js'
@@ -164,6 +165,15 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   prepareWorkspace(mission: Mission, memberId: string): Promise<string> { return this.workspaces.prepareWorkspace(mission, memberId) }
+  prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
+  inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal) {
+    if (!mission.baseline) throw new Error('This mission has no saved delivery baseline')
+    return inspectDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)
+  }
+  applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal) {
+    if (!mission.baseline) throw new Error('This mission has no saved delivery baseline')
+    return applyDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)
+  }
 
   async start(spec: WorkerSpec): Promise<void> {
     if (this.closing) throw new Error('Worker adapter is disposed')

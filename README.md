@@ -8,7 +8,7 @@ Turn a natural-language task into a team of collaborating agents inside [DeepSee
 
 The primary agent inspects the project, chooses the team and resource budgets, and launches the work. Workers can propose tasks, ask peers, share evidence, challenge results and hand off partial implementations. A durable runtime coordinates their work and requires independent review before accepting a deliverable.
 
-**Version 0.4.0 · MIT · Local Git workspaces · Native DSH Web sidebar**
+**Version 0.5.0 · MIT · Local Git workspaces · Native DSH Web sidebar**
 
 ## What you get
 
@@ -94,9 +94,9 @@ The primary agent chooses the plan and budgets from the task. The sidebar shows 
 
 Use **Pause**, **Resume** and **Stop** in the owner conversation's panel. Hiding the sidebar pauses its display updates, not the workers. If more resources are needed, ask the primary agent to reassess the budget and resume; increasing a budget alone does not resume a paused mission, and it does not reset consumption. The duration limit is measured from mission creation, including time spent paused.
 
-The first worker rejects a dirty Git workspace. Commit or otherwise preserve your changes before starting. Workers operate in plugin-owned worktrees; source working files and the checked-out branch remain unchanged. Git objects, worktree metadata and plugin refs are written to the repository's shared `.git` directory and retained for recovery.
+Before planning, the plugin freezes the project's saved files into a private Git snapshot. Tracked changes and non-ignored new files are included; your branch, real index and working files stay as they are. No manual commit is needed. The primary is directed to inspect a frozen planning checkout and every worker starts from the same snapshot, including after restart. Later source edits do not change that baseline. Unresolved merge conflicts, dirty submodules and unsupported repository layouts produce a specific error instead of silently omitting work. Git objects, worktree metadata and plugin refs are retained for recovery.
 
-For code work, the deliverable is an independently accepted **integration commit and its worktree**. Review that result and merge it into your source branch explicitly. The plugin does not automatically merge, publish or delete retained artifacts.
+For code work, the deliverable is an independently accepted **integration commit and its worktree**. The completed mission's sidebar offers **View changes** and **Apply result**. Both use the project snapshot as their baseline, so your pre-existing changes are not counted as swarm output. Applying merges the result with current working files while preserving your branch and index. Conflicts are reported before any source file is changed. It does not stage, commit or push the result; retained artifacts remain available for inspection.
 
 ## Sidebar
 

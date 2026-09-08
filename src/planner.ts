@@ -22,6 +22,7 @@ export function planningMessage(request: AutoStart) {
     content: [{ type: 'text', text: `The user invoked /agent-swarm to execute this goal. Automatically plan and launch its collaboration now; do not ask them to configure agents or press Launch.
 Request id: ${request.id}
 Workspace: ${request.workspace}
+${request.baseline ? `Frozen planning workspace: ${request.baseline.planningWorkspace}\nSnapshot commit: ${request.baseline.snapshotCommit}\nInspect files and run read-only planning commands in this frozen workspace. The original source may keep changing; all workers will use this exact snapshot. Existing user changes are baseline context, not new swarm deliverables.` : ''}
 Resource budgets: choose these yourself from the actual task; no preset token or step allowance has been selected.
 User goal (JSON string): ${JSON.stringify(request.goal)}
 
@@ -59,14 +60,16 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     }
     if (await realpath(await git(['rev-parse', '--show-toplevel'])) !== workspace) throw new Error('请在 Git 项目根目录的对话中开启 Agent Swarm。')
     await git(['rev-parse', 'HEAD^{commit}'])
-    if (await git(['status', '--porcelain=v1', '--untracked-files=all'])) throw new Error('项目有未提交的改动。请先保存为 Git 提交，再开启协作；现有改动会保留。')
     const model = await ownerModelSelection(ctx, agent, signal)
     if (!model) throw new Error('当前对话没有可用模型，请先选择模型。')
     await ctx.llm.resolveCallConfig(model, signal)
     signal.throwIfAborted()
     if (disposed) throw new Error('Agent Swarm is unloading')
-    const request = runtime.requestStart({ sessionId, signal }, { commandId, goal, workspace })
+    let request = runtime.requestStart({ sessionId, signal }, { commandId, goal, workspace })
     try {
+      request = await runtime.prepareStart({ sessionId, signal }, request.id)
+      signal.throwIfAborted()
+      if (disposed || ctx.agents.get(agent.id) !== agent) throw new Error('当前对话已关闭，请重新打开后重试。')
       agent.followup(planningMessage(request))
       // Native whenIdle includes any queued follow-up: it cannot race ahead of planning.
       void agent.whenIdle().then(() => {
@@ -78,6 +81,6 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
       runtime.failStart({ sessionId }, request.id, error instanceof Error ? error.message : String(error))
       throw error
     }
-    return { kind: 'success', text: '已接收任务，正在自动规划分工。成员和进度会显示在协作侧边栏。' }
+    return { kind: 'success', text: '已保存当前项目快照，正在自动规划协作。你可以继续编辑项目，成员和进度会显示在侧边栏。' }
   } })
 }

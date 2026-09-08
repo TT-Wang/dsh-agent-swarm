@@ -205,6 +205,12 @@ export class SwarmRuntime {
       if (members.filter(m => m.status !== 'stopped').length >= mission.budget.maxWorkers) throw new Error('Mission worker budget exhausted')
       if (members.some(m => m.name === input.name)) throw new Error('Worker name already exists')
       const memberId = admittedId ?? id('member')
+      if (!mission.baseline && this.workers.prepareBaseline) {
+        const baseline = await this.workers.prepareBaseline(mission, actor.signal)
+        const current = this.active(actor, missionId, admittedId !== undefined).mission
+        current.baseline = baseline; mission.baseline = baseline
+        this.commit(missionId, () => { this.store.put('missions', current); this.store.event(missionId, 'workspace/snapshot', 'runtime', baseline) })
+      }
       const workspace = await this.workers.prepareWorkspace(mission, memberId)
       this.active(actor, missionId, admittedId !== undefined)
       const member: Member = { id: memberId, missionId, name: input.name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, status: 'idle', subscriptions: input.subscriptions ?? [] }
@@ -569,6 +575,22 @@ export class SwarmRuntime {
     })
     return request
   }
+  /** Capture before the owner's planning turn; retries retain the same immutable files. */
+  async prepareStart(actor: Actor, requestId: string): Promise<AutoStart> {
+    return this.exclusive(requestId, async () => {
+      const request = this.ownedStart(actor, requestId)
+      if (!['planning', 'failed'].includes(request.status)) throw new Error('Request is no longer awaiting planning')
+      if (request.baseline) return request
+      if (!this.workers.prepareBaseline) throw new Error('This worker adapter cannot snapshot a project for automatic planning')
+      const baseline = await this.workers.prepareBaseline({ id: `mission_draft_${request.id}`, workspace: request.workspace }, actor.signal)
+      actor.signal?.throwIfAborted()
+      const current = this.ownedStart(actor, requestId)
+      if (!['planning', 'failed'].includes(current.status)) throw new Error('Snapshot preparation was interrupted')
+      current.baseline = baseline; current.updatedAt = Date.now()
+      this.commit(request.id, () => { this.store.put('starts', current); this.store.event(request.id, 'workspace/snapshot', 'runtime', baseline) })
+      return current
+    })
+  }
   /** Keep the journal synchronized inside the same transaction as mission control. */
   private syncStarts(mission: Mission): void {
     for (const request of this.store.list('starts', mission.id)) {
@@ -790,6 +812,42 @@ export class SwarmRuntime {
     return { events: this.store.events(missionId, this.config.maxEvents, after), toolRuns: this.store.list('tool_runs', missionId).filter(run => !member || run.memberId === member.id).slice(-this.config.maxEvents) }
   }
   /** One completion policy is shared by manual controls and automatic requests. */
+  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
+    actor.signal?.throwIfAborted()
+    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    const mission = this.mission(missionId)
+    if (mission.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
+    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
+    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
+    const tasks = this.store.list('tasks', missionId)
+    const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
+    const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
+      if (seen.has(task.id)) return false
+      seen.add(task.id)
+      return task.dependencies.some(id => id === sourceId || tasks.some(parent => parent.id === id && covers(parent, sourceId, seen)))
+    }
+    const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
+    // A later integration may subsume an earlier one; never guess among independent final artifacts.
+    const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && covers(other, candidate.id)))
+    if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required')
+    return { mission, task: finals[0]! }
+  }
+  async inspectDelivery(actor: Actor, missionId: string) {
+    const { mission, task } = this.deliveryTarget(actor, missionId)
+    if (!this.workers.inspectDelivery) throw new Error('This worker adapter does not support delivery inspection')
+    return this.workers.inspectDelivery(mission, task.artifact!.commit, actor.signal)
+  }
+  async applyDelivery(actor: Actor, missionId: string) {
+    const target = this.deliveryTarget(actor, missionId)
+    // Different completed missions for one source must not apply concurrently.
+    return this.exclusive(`delivery:${target.mission.workspace}`, async () => {
+      const { mission, task } = this.deliveryTarget(actor, missionId)
+      if (!this.workers.applyDelivery) throw new Error('This worker adapter does not support applying results')
+      const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
+      this.commit(missionId, () => this.store.event(missionId, `delivery/${result.status}`, 'owner', { resultCommit: task.artifact!.commit, ...result }))
+      return result
+    })
+  }
   private completionError(mission: Mission): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     if (!tasks.length || tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))) return 'Mission still has unfinished or blocked required work'

@@ -2,6 +2,14 @@ import { createContext, useContext } from 'react'
 
 /** English strings are stable keys; only plugin-owned copy is translated. */
 export const zh: Record<string, string> = {
+  'Project snapshot': '项目快照', 'existing changed files included': '个已有改动文件已纳入',
+  'Your branch, staged changes and source files were preserved.': '创建快照时保留了你的分支、暂存状态和源文件。',
+  'Collaboration result': '协作成果', 'View changes': '查看修改', 'Apply result': '应用结果',
+  'Only changes made after the project snapshot are applied. Your staged changes stay as they are.': '只应用项目快照之后的协作改动，保留你现有的暂存状态。',
+  'Result applied to working files. Nothing was staged, committed or pushed.': '结果已应用到工作文件，未进行暂存、提交或推送。',
+  'Some files conflict with your current edits. No source files were changed. Resolve these paths against the retained result, then retry.': '部分文件与你当前的修改冲突，源文件未被改动。请对照保留的协作结果处理这些路径后重试。',
+  'changed files': '个改动文件', 'No changes': '没有改动',
+  'Diff display is truncated. The retained result contains the complete changes.': '差异显示已截断，保留的协作成果中包含完整修改。',
   'Agent Swarm request': '协作任务请求', 'Starting collaboration…': '正在启动协作…', 'Collaboration requested': '已请求协作',
   'Planning collaboration…': '正在规划协作…', 'Starting workers…': '正在启动成员…', 'Collaboration could not start': '协作未能启动',
   'Choosing roles, tasks and checks automatically using this conversation’s model.': '正在沿用当前对话模型，自动安排成员、子任务和验证。',

@@ -1,6 +1,6 @@
 # Design traceability
 
-Version 0.4.0 includes native one-command planning and execution, with primary-agent-selected budgets and task policies, to the docked sidebar and durable collaboration runtime. Plan editing and mission controls call the same runtime that authenticates model tools by session identity; the browser transport uses modern Harness native browser credentials, cookies and trusted-host checks.
+Version 0.5.0 adds automatic project snapshots and explicit result application to native one-command planning, primary-agent-selected budgets, the docked sidebar and durable collaboration runtime. Plan editing and mission controls call the same runtime that authenticates model tools by session identity; the browser transport uses modern Harness native browser credentials, cookies and trusted-host checks.
 
 | Agreed design property | Implementation | Evidence |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ Without Better Sidebar, the additive shell contribution renders a right-edge doc
 
 The command descriptor is registered in native `commands`; native `ui-commands` supplies autocomplete and arbitrary text input. A client commandview renders the original goal and acknowledgment, and a successful native command event opens the sidebar. No duplicate client-only command or custom composer parser is used.
 
-`planner.ts` checks the live owner, canonical Git workspace and current model before creating a durable automatic request. It delivers a typed `swarm-start` follow-up through the same owner's native inbox. That turn inspects the repository and invokes `swarm_launch`; no secondary provider loop or hardcoded task decomposition is used. The runtime checks the generated topology, assembles it with dispatch fenced, and activates it atomically. Completion is driven by accepted artifacts, independent review and coverage, not a model's claimed success.
+`planner.ts` checks the live owner, canonical Git workspace and current model before creating a durable automatic request. Before delivering the typed `swarm-start` follow-up through that owner's native inbox, it freezes one project baseline and supplies a detached planning checkout. That turn inspects the frozen repository and invokes `swarm_launch`; no secondary provider loop or hardcoded task decomposition is used. All members use the same durable baseline, including retries and restarts. The runtime checks the generated topology, assembles it with dispatch fenced, and activates it atomically. Completion is driven by accepted artifacts, independent review and coverage, not a model's claimed success.
 
 The primary agent decides token/step budgets, team capacity and membership, task/experiment limits, mission duration, task graph, scope, acceptance, check commands, priorities, optional model routes, per-member output-token allowances, per-task recovery attempts and verification timeouts. `swarm_budget` permits owner-only revisions based on progress, with a durable reason; it never resets usage. Paused/blocked missions remain under explicit owner control. Database/worktree locations, heartbeat/tick intervals, output/payload bounds, identity, artifact checks and review requirements remain runtime policy.
 

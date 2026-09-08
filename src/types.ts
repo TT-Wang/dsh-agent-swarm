@@ -12,6 +12,26 @@ export interface Budget {
   maxTasks: number
   maxExperiments: number
 }
+/** Host-created immutable starting point; never supplied by a model plan. */
+export interface WorkspaceBaseline {
+  sourceHead: string
+  snapshotCommit: string
+  planningWorkspace: string
+  changedPaths: string[]
+  createdAt: number
+}
+export interface DeliveryInspection {
+  baselineCommit: string
+  resultCommit: string
+  changedPaths: string[]
+  diff: string
+  truncated: boolean
+}
+export interface DeliveryApplication {
+  status: 'applied' | 'conflicts'
+  changedPaths: string[]
+  conflicts: string[]
+}
 export interface Mission {
   id: string
   ownerSessionId: string
@@ -29,6 +49,7 @@ export interface Mission {
   deadline: number
   coordinatorId?: string
   reason?: string
+  baseline?: WorkspaceBaseline
   /** Durable gate while budget exhaustion stops the previous worker activity. */
   budgetPause?: { id: string; quiesced: boolean }
 }
@@ -228,6 +249,7 @@ export interface AutoStart extends RequestStartInput {
   draftId?: string
   missionId?: string
   error?: string
+  baseline?: WorkspaceBaseline
   createdAt: number
   updatedAt: number
 }
@@ -281,6 +303,10 @@ export interface WorkerCallbacks {
 /** Worker handles and all effectful execution remain owned by the adapter. */
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
+  /** Freeze once before planning; optional only for adapters without Git execution. */
+  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
+  inspectDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
+  applyDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
   start(spec: WorkerSpec): Promise<void>
   deliver(member: Member, delivery: Delivery): Promise<void>

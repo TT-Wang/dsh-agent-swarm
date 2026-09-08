@@ -47,6 +47,10 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     : record(value) && 'snapshot' in value ? value.snapshot : value
   if (!record(candidate) || !record(candidate.mission)) return undefined
   const mission = candidate.mission
+  if (mission.baseline !== undefined && (!record(mission.baseline)
+    || typeof mission.baseline.snapshotCommit !== 'string' || typeof mission.baseline.sourceHead !== 'string'
+    || typeof mission.baseline.planningWorkspace !== 'string' || !strings(mission.baseline.changedPaths)
+    || !finite(mission.baseline.createdAt))) return undefined
   if (typeof mission.id !== 'string' || typeof mission.title !== 'string'
     || typeof mission.objective !== 'string' || typeof mission.status !== 'string'
     || !finite(mission.updatedAt) || !finite(mission.createdAt) || !finite(mission.deadline)

@@ -103,6 +103,15 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       const actor: Actor = { sessionId, signal }
       signal.throwIfAborted()
       switch (endpoint) {
+        case 'delivery':
+        case 'apply-delivery': {
+          const missionId = text(body, 'missionId')
+          const mission = runtime.store.get('missions', missionId)
+          if (!mission || mission.ownerSessionId !== sessionId) throw new Error('Only the mission owner can access deliverables')
+          await canonicalWorkspace(mission.workspace, header)
+          if (endpoint === 'delivery') return { ok: true, value: { delivery: await runtime.inspectDelivery(actor, missionId) } }
+          return { ok: true, value: { result: await runtime.applyDelivery(actor, missionId), snapshot: runtime.snapshot(actor, missionId) } }
+        }
         case 'worker-history': {
           const workerSessionId = SessionId(text(body, 'workerSessionId'))
           const member = runtime.store.list('members').find(candidate => candidate.sessionId === workerSessionId)

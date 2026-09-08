@@ -223,6 +223,39 @@ test('member state is visible without granting owner controls, and unrelated ses
   assert.equal(paused.result.value.snapshot.mission.status, 'paused')
 })
 
+test('delivery routes require owner, completed acceptance and the exact session workspace', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const member = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
+  let writes = 0
+  f.workers.inspectDelivery = async (value, commit) => ({ baselineCommit: value.baseline.snapshotCommit, resultCommit: commit, changedPaths: ['src/fix.js'], diff: 'verified delta', truncated: false })
+  f.workers.applyDelivery = async () => { writes++; return { status: 'applied', changedPaths: ['src/fix.js'], conflicts: [] } }
+  for (const endpoint of ['delivery', 'apply-delivery']) {
+    const before = await f.rpc(endpoint, { sessionId: f.ownerId, missionId: mission.id })
+    assert.equal(before.result.ok, false, 'active work cannot be delivered')
+    for (const sessionId of ['other-owner', member.sessionId]) {
+      const denied = await f.rpc(endpoint, { sessionId, missionId: mission.id })
+      assert.equal(denied.result.ok, false)
+    }
+  }
+  assert.equal(writes, 0)
+  mission.status = 'completed'
+  mission.baseline = { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/private/planning', changedPaths: ['user.txt'], createdAt: 1 }
+  f.runtime.store.put('missions', mission)
+  const source = { id: 'delivery-source', missionId: mission.id, kind: 'implementation', status: 'accepted', dependencies: [], artifact: { commit: 'c'.repeat(40) } }
+  const final = { id: 'delivery-final', missionId: mission.id, kind: 'integration', status: 'accepted', dependencies: [source.id], artifact: { commit: 'd'.repeat(40) } }
+  f.runtime.store.put('tasks', source); f.runtime.store.put('tasks', final)
+  const inspected = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id, resultCommit: 'forged' })
+  assert.equal(inspected.result.value.delivery.resultCommit, final.artifact.commit, 'caller cannot choose an unaccepted commit')
+  const applied = await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(applied.result.value.result.status, 'applied'); assert.equal(writes, 1)
+  mission.workspace = f.directory; f.runtime.store.put('missions', mission)
+  assert.equal((await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })).result.ok, false)
+  assert.equal(writes, 1, 'a changed native workspace cannot redirect delivery')
+})
+
 test('a stopped historical member session stays readonly even when active mission views are absent', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
