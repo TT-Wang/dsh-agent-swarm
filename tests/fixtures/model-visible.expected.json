@@ -1,18 +1,35 @@
 {
   "visibleSwarmTools": [
     "swarm_add_member",
+    "swarm_challenge",
+    "swarm_create",
+    "swarm_message",
+    "swarm_observe",
+    "swarm_propose",
+    "swarm_stage",
+    "swarm_workstream"
+  ],
+  "ownerSwarmTools": [
+    "swarm_add_member",
     "swarm_budget",
     "swarm_challenge",
-    "swarm_claim",
     "swarm_control",
     "swarm_create",
-    "swarm_handoff",
     "swarm_launch",
     "swarm_message",
     "swarm_observe",
     "swarm_propose",
-    "swarm_publish",
     "swarm_stage",
+    "swarm_workstream"
+  ],
+  "workerSwarmTools": [
+    "swarm_challenge",
+    "swarm_claim",
+    "swarm_handoff",
+    "swarm_message",
+    "swarm_observe",
+    "swarm_propose",
+    "swarm_publish",
     "swarm_submit",
     "swarm_subscribe",
     "swarm_verify",
@@ -42,7 +59,7 @@
         "dependencyCount": 0,
         "independentReview": false
       },
-      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
     },
     {
       "source": {
@@ -64,7 +81,7 @@
         "dependencyCount": 0,
         "independentReview": true
       },
-      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
     },
     {
       "source": {
@@ -88,7 +105,7 @@
         "dependencyCount": 1,
         "independentReview": false
       },
-      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
     },
     {
       "source": {
@@ -110,7 +127,7 @@
         "dependencyCount": 0,
         "independentReview": true
       },
-      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
     }
   ],
   "peerMessages": [

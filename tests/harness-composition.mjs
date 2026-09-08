@@ -42,12 +42,12 @@ function jsonResult(block) {
   assert(!block.isError, `Harness tool failed: ${rendered}`)
   return JSON.parse(rendered)
 }
-function latestSnapshot(messages) {
+function latestObservation(messages) {
   for (const block of toolBlocks(messages).toReversed()) {
     if (block.isError) continue
     let body
     try { body = JSON.parse(texts(block).join('\n')) } catch { continue }
-    if (body.snapshot) return body
+    if (body.result?.member !== undefined) return body
   }
   return undefined
 }
@@ -76,13 +76,14 @@ setResponder(options => {
     }
     if (workerMode === 'wait') { waitingSessions.add(options.sessionId); return { kind: 'wait' } }
     if (script.stage === 'done') return answer('Assignment finished; waiting for new work.')
-    const observed = latestSnapshot(options.messages)
-    assert(observed, 'assignment must lead to a model-visible board snapshot')
-    const snapshot = observed.snapshot
-    const member = snapshot.members.find(member => member.sessionId === options.sessionId)
-    assert(member, 'model-visible board must identify the authenticated worker')
-    const task = snapshot.tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    assert(task, 'model-visible board must contain the current owned attempt')
+    const observed = latestObservation(options.messages)
+    assert(observed, 'assignment must lead to a model-visible focused observation')
+    const view = observed.result
+    const member = view.member
+    assert(member?.id, 'model-visible observation must identify the authenticated worker')
+    assert(view.current?.task?.status === 'running' && view.current.task.attempt?.ownerId === member.id, 'model-visible observation must contain the current owned attempt')
+    const task = view.current.task
+    assert(!('snapshot' in observed), 'the complete board must not be repeated in the model-visible text')
     const current = { missionId: source.missionId, taskId: task.id, attemptId: task.attempt.id }
     if (task.kind === 'verification') {
       script.stage = 'done'
@@ -102,17 +103,22 @@ setResponder(options => {
       return tool('swarm_observe', { missionId: source.missionId })
     }
     if (script.stage === 'publish') {
-      const runs = observed.result.toolRuns
+      const runs = view.toolRuns
       assert(Array.isArray(runs), 'observe must expose the worker’s host-recorded tool runs')
       const supporting = runs.filter(run => run.taskId === task.id && run.tool === 'bash' && !run.isError)
       assert(supporting.length > 0, 'real bash result must be available as evidence')
+      // The bash result itself already carried the citable run id; observation must agree with it.
+      const bashResult = toolBlocks(options.messages).toReversed().find(block => texts(block).join('\n').includes('[swarm toolRunId: '))
+      assert(bashResult, 'each recorded tool result must end with its host run id')
+      const citedInResult = texts(bashResult).join('\n').match(/\[swarm toolRunId: (run_[^\]]+)\]/)[1]
+      assert(supporting.some(run => run.id === citedInResult), 'the run id appended to the tool result must be the recorded run')
       script.stage = 'request-review'
       return tool('swarm_publish', {
         ...current, claim: 'The committed fixture produces the required value of two.', outcome: 'supported', toolRunIds: supporting.map(run => run.id),
       })
     }
     if (script.stage === 'request-review') {
-      const reviewer = snapshot.members.find(candidate => candidate.id !== member.id && candidate.role === 'independent verifier')
+      const reviewer = view.members.find(candidate => candidate.id !== member.id && candidate.role === 'independent verifier')
       assert(reviewer, 'the worker must discover its peer from the board')
       script.stage = 'review'
       return tool('swarm_message', {
@@ -121,7 +127,7 @@ setResponder(options => {
       })
     }
     if (script.stage === 'review') {
-      const reviewer = snapshot.members.find(candidate => candidate.id !== member.id && candidate.role === 'independent verifier')
+      const reviewer = view.members.find(candidate => candidate.id !== member.id && candidate.role === 'independent verifier')
       assert(reviewer, 'the worker must discover its peer from the board')
       script.stage = 'submit'
       return tool('swarm_propose', {
@@ -301,8 +307,14 @@ try {
       })
     }
   }
+  const swarmToolNames = request => request.tools.filter(tool => tool.name.startsWith('swarm_')).map(tool => tool.name).sort()
+  const ownerRequests = requests.filter(request => request.sessionId === ownerId)
+  const workerRequest = requests.find(request => request.sessionId === builder.sessionId)
   const boundarySnapshot = {
-    visibleSwarmTools: requests.find(request => request.sessionId === ownerId).tools.filter(tool => tool.name.startsWith('swarm_')).map(tool => tool.name).sort(),
+    // Before owning a mission the owner sees the entry set; after swarm_create it sees the owner set; workers see only member tools.
+    visibleSwarmTools: swarmToolNames(ownerRequests[0]),
+    ownerSwarmTools: swarmToolNames(ownerRequests.at(-1)),
+    workerSwarmTools: swarmToolNames(workerRequest),
     assignments: [...assignments.values()],
     peerMessages: [...peerMessages.values()],
     completion: completion.result.status,

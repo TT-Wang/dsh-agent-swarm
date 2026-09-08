@@ -12,6 +12,19 @@ export interface Budget {
   maxTasks: number
   maxExperiments: number
 }
+/**
+ * Provider-reported usage split into billing buckets. `outputTokens` already
+ * includes `reasoningTokens`; cache buckets are disjoint from uncached input.
+ * `requests` counts physical model requests carrying usage, not logical steps.
+ */
+export interface UsageBuckets {
+  uncachedInputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  requests: number
+}
 /** Host-created immutable starting point; never supplied by a model plan. */
 export interface WorkspaceBaseline {
   sourceHead: string
@@ -52,6 +65,12 @@ export interface Mission {
   baseline?: WorkspaceBaseline
   /** Durable gate while budget exhaustion stops the previous worker activity. */
   budgetPause?: { id: string; quiesced: boolean }
+  /** Bucketed worker usage behind `usedTokens`; absent on missions recorded before bucket accounting. */
+  workerUsage?: UsageBuckets
+  /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
+  ownerUsage?: UsageBuckets
+  /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
+  stallNotice?: string
 }
 /** Host-observed operation; lifecycle timestamps are not a completion estimate. */
 export interface WorkerActivity {
@@ -81,6 +100,8 @@ export interface Member {
   maxOutputTokens?: number
   /** Last authoritative cumulative token total applied to the mission budget. */
   accountedTokens?: number
+  /** Cumulative bucketed usage from this worker's persisted session log. */
+  usage?: UsageBuckets
 }
 export interface Workstream {
   id: string
@@ -154,6 +175,8 @@ export interface Evidence {
 }
 export interface ToolRun {
   id: string
+  /** Per-mission monotonic position; absent on runs recorded before cursors existed. */
+  seq?: number
   missionId: string
   memberId: string
   taskId: string
@@ -262,8 +285,26 @@ export interface AutoStart extends RequestStartInput {
   missionId?: string
   error?: string
   baseline?: WorkspaceBaseline
+  /** Owner usage during planning, folded into the launched mission's ownerUsage. */
+  ownerUsage?: UsageBuckets
   createdAt: number
   updatedAt: number
+}
+/** Bounded, focused reads for the model; the complete board stays in the UI projection. */
+export interface ObserveQuery {
+  /** Return only events after this sequence number. */
+  after?: number
+  /** Return only this participant's visible tool runs after this per-mission position. */
+  afterRun?: number
+  /** Focus one task: its full record, evidence and tool-run references. */
+  taskId?: string
+  /** Read one stored tool run in full, paged by `offset` characters. */
+  runId?: string
+  offset?: number
+  /** Read one evidence record including challenges. */
+  evidenceId?: string
+  /** `full` includes complete task records and evidence claims for the whole board. */
+  detail?: 'summary' | 'full'
 }
 export interface ProposeTaskInput {
   workstreamId: string
@@ -306,10 +347,13 @@ export interface WorkerCallbacks {
   beforeStep(memberId: string, hasFreshInput?: boolean): Promise<void | false>
   usage(memberId: string, tokens: number): Promise<void>
   /** Optional idempotent accounting path; cumulative persisted session total, never a delta. */
-  usageSnapshot?(memberId: string, totalTokens: number): Promise<void>
+  usageSnapshot?(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void>
+  /** Optional owner-session usage report, attributed by the runtime to that owner's live missions or planning requests. */
+  ownerUsage?(sessionId: string, usage: UsageBuckets): void
   /** Reject a revoked assignment by its durable delivery id; other peer messages retain their context. */
   admitDelivery?(memberId: string, deliveryId: string): boolean
-  toolRun(memberId: string, run: Omit<ToolRun, 'id' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<void>
+  /** Record a host-observed execution; resolves to the durable run id, or undefined when no owned attempt exists. */
+  toolRun(memberId: string, run: Omit<ToolRun, 'id' | 'seq' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<string | undefined>
   /** Synchronous final guard on all tools, including alternate dispatch surfaces. */
   guard(memberId: string, toolName: string): string | undefined
   failure(memberId: string, error: string): void
@@ -327,6 +371,8 @@ export interface WorkerAdapter {
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */
   currentActivity?(memberId: string): WorkerActivity | undefined
+  /** A unit of work closed for this member; the adapter may compact its history when idle and over its pressure threshold. */
+  compactAtBoundary?(memberId: string): void
   isIdle(memberId: string): boolean
   captureArtifact(member: Member, task: Task): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */

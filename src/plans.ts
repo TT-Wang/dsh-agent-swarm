@@ -55,42 +55,52 @@ export function validatePlan(value: unknown): PlanInput {
   if (members.size > Number(value.budget.maxWorkers)) throw new Error('Roster exceeds worker budget')
   if (tasks.size > Number(value.budget.maxTasks) || streams.size > Number(value.budget.maxTasks)) throw new Error('Plan exceeds task/workstream budget')
   const names = new Set<string>()
-  for (const member of members.values()) {
-    text(member.name, 'Member name'); text(member.role, 'Member role')
-    if (names.has(member.name)) throw new Error('Member names must be unique')
+  // Field diagnostics are collected per record so the primary repairs one complete plan per round.
+  for (const member of members.values()) inspectAdmission(() => {
+    text(member.name, `members[${member.key}].name`); text(member.role, `members[${member.key}].role`)
+    if (names.has(member.name)) throw new Error(`members[${member.key}].name duplicates another member; member names must be unique`)
     names.add(member.name)
-    for (const field of ['provider', 'model', 'reasoningEffort']) if (member[field] !== undefined) text(member[field], field)
-    if (member.maxOutputTokens !== undefined && (!Number.isSafeInteger(member.maxOutputTokens) || Number(member.maxOutputTokens) < 1)) throw new Error('maxOutputTokens must be a positive safe integer')
-    if (member.provider !== undefined && member.model === undefined) throw new Error('A selected provider requires a selected model')
-  }
-  for (const stream of streams.values()) { text(stream.title, 'Workstream title'); text(stream.objective, 'Workstream objective') }
+    for (const field of ['provider', 'model', 'reasoningEffort']) if (member[field] !== undefined) text(member[field], `members[${member.key}].${field}`)
+    if (member.maxOutputTokens !== undefined && (!Number.isSafeInteger(member.maxOutputTokens) || Number(member.maxOutputTokens) < 1)) throw new Error(`members[${member.key}].maxOutputTokens must be a positive safe integer`)
+    if (member.provider !== undefined && member.model === undefined) throw new Error(`members[${member.key}].provider requires a selected model`)
+  })
+  for (const stream of streams.values()) inspectAdmission(() => { text(stream.title, `workstreams[${stream.key}].title`); text(stream.objective, `workstreams[${stream.key}].objective`) })
   let experiments = 0
   for (const [index, task] of [...tasks.values()].entries()) {
-    text(task.title, 'Task title'); text(task.objective, 'Task objective')
-    if (typeof task.workstreamKey !== 'string' || !streams.has(task.workstreamKey)) throw new Error('Unknown task workstream')
-    if (!['research', 'implementation', 'integration', 'verification'].includes(String(task.kind))) throw new Error('Invalid task kind')
-    strings(task.scope, 'Task scope'); strings(task.acceptance, 'Task acceptance')
-    task.scope = normalizeScopeSelectors(task.scope)
-    inspectAdmission(() => assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[]))
-    if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new Error('maxRecoveryAttempts must be a positive safe integer')
-    if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new Error('checkTimeoutMs must be a positive integer within the platform timer range')
-    inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key)))
-    if (task.assigneeKey !== undefined && (typeof task.assigneeKey !== 'string' || !members.has(task.assigneeKey))) throw new Error('Unknown task assignee')
-    if (task.priority !== undefined && (!Number.isInteger(task.priority) || Number(task.priority) < 0 || Number(task.priority) > 100)) throw new Error('Priority must be 0–100')
-    if (task.experiment !== undefined && typeof task.experiment !== 'boolean') throw new Error('experiment must be boolean')
-    if (task.experiment) experiments++
-    if (task.dependencies !== undefined) strings(task.dependencies, 'Dependencies', true)
-    if (task.dependencies !== undefined) task.dependencies = normalizeReviewDependencies(String(task.kind), task.reviewOf as string | undefined, task.dependencies as string[])
-    for (const dependency of (task.dependencies ?? []) as string[]) if (!tasks.has(dependency)) throw new Error('Unknown dependency')
-    if (task.kind === 'verification') {
-      if (typeof task.reviewOf !== 'string' || !tasks.has(task.reviewOf)) throw new Error('Verification requires an existing reviewOf key')
-      const source = tasks.get(task.reviewOf)!
-      if (source.kind === 'verification') throw new Error('Verification cannot review another verification')
-      if (task.assigneeKey && task.assigneeKey === source.assigneeKey) throw new Error('Review must be assigned to a different member')
-    } else if (task.reviewOf !== undefined) throw new Error('Only verification tasks can set reviewOf')
+    const at = `tasks[${index}] (${String(task.key)})`
+    inspectAdmission(() => { text(task.title, `${at}.title`); text(task.objective, `${at}.objective`) })
+    inspectAdmission(() => { if (typeof task.workstreamKey !== 'string' || !streams.has(task.workstreamKey)) throw new Error(`${at}.workstreamKey must name an existing workstream key`) })
+    const validKind = ['research', 'implementation', 'integration', 'verification'].includes(String(task.kind))
+    if (!validKind) admissionIssues.push(`${at}.kind must be research, implementation, integration or verification`)
+    inspectAdmission(() => {
+      strings(task.scope, `${at}.scope`)
+      task.scope = normalizeScopeSelectors(task.scope as string[])
+      assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[])
+    })
+    inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
+    inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new Error(`${at}.maxRecoveryAttempts must be a positive safe integer`) })
+    inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new Error(`${at}.checkTimeoutMs must be a positive integer within the platform timer range`) })
+    if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key)))
+    inspectAdmission(() => { if (task.assigneeKey !== undefined && (typeof task.assigneeKey !== 'string' || !members.has(task.assigneeKey))) throw new Error(`${at}.assigneeKey must name an existing member key`) })
+    inspectAdmission(() => { if (task.priority !== undefined && (!Number.isInteger(task.priority) || Number(task.priority) < 0 || Number(task.priority) > 100)) throw new Error(`${at}.priority must be 0–100`) })
+    inspectAdmission(() => { if (task.experiment !== undefined && typeof task.experiment !== 'boolean') throw new Error(`${at}.experiment must be boolean`) })
+    if (task.experiment === true) experiments++
+    inspectAdmission(() => {
+      if (task.dependencies !== undefined) strings(task.dependencies, `${at}.dependencies`, true)
+      if (task.dependencies !== undefined) task.dependencies = normalizeReviewDependencies(String(task.kind), task.reviewOf as string | undefined, task.dependencies as string[])
+      for (const dependency of (task.dependencies ?? []) as string[]) if (!tasks.has(dependency)) throw new Error(`${at}.dependencies names unknown task key ${JSON.stringify(dependency)}`)
+    })
+    inspectAdmission(() => {
+      if (task.kind === 'verification') {
+        if (typeof task.reviewOf !== 'string' || !tasks.has(task.reviewOf)) throw new Error(`${at}.reviewOf must name the existing source task key this verification reviews`)
+        const source = tasks.get(task.reviewOf)!
+        if (source.kind === 'verification') throw new Error(`${at}.reviewOf cannot name another verification task`)
+        if (task.assigneeKey && task.assigneeKey === source.assigneeKey) throw new Error(`${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`)
+      } else if (task.reviewOf !== undefined) throw new Error(`${at}.reviewOf is only valid on verification tasks`)
+    })
   }
+  if (experiments > Number(value.budget.maxExperiments)) admissionIssues.push('Plan exceeds experiment budget')
   if (admissionIssues.length) throw new Error(admissionIssues.join('\n'))
-  if (experiments > Number(value.budget.maxExperiments)) throw new Error('Plan exceeds experiment budget')
   const raw = JSON.parse(JSON.stringify(value)) as PlanInput
   const plan: PlanInput = {
     title: raw.title, objective: raw.objective, workspace: raw.workspace, scope: raw.scope, acceptance: raw.acceptance,

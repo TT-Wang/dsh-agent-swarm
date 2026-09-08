@@ -150,6 +150,24 @@ export class SwarmStore {
     this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)').run(missionId, type, actor, JSON.stringify(data), Date.now())
     this.transactionScopes?.add(missionId)
   }
+  /** Number of runs recorded for a mission; the next run's per-mission position is count + 1. */
+  countToolRuns(missionId: string): number {
+    return Number(this.db.prepare('SELECT COUNT(*) AS count FROM tool_runs WHERE mission_id=?').get(missionId)!.count)
+  }
+  /**
+   * Read tool runs in recorded order with optional identity filters and a
+   * position cursor. Runs recorded before positions existed sort as position 0.
+   */
+  toolRuns(missionId: string, filter: { memberId?: string; taskId?: string; attemptId?: string; afterSeq?: number; limit?: number } = {}): ToolRun[] {
+    const clauses = ['mission_id=?'], params: Array<string | number> = [missionId]
+    for (const key of ['memberId', 'taskId', 'attemptId'] as const) {
+      if (filter[key] !== undefined) { clauses.push(`json_extract(value,'$.${key}')=?`); params.push(filter[key]!) }
+    }
+    if (filter.afterSeq !== undefined) { clauses.push("COALESCE(json_extract(value,'$.seq'),0)>?"); params.push(filter.afterSeq) }
+    let sql = `SELECT value FROM tool_runs WHERE ${clauses.join(' AND ')} ORDER BY rowid`
+    if (filter.limit !== undefined) { sql += ' LIMIT ?'; params.push(filter.limit) }
+    return this.db.prepare(sql).all(...params).map(row => this.parse<'tool_runs'>(String(row.value)))
+  }
   /** Read chronological deltas, bounded for display and agent context. */
   events(missionId: string, limit: number, after = 0): SwarmEvent[] {
     const rows = after > 0

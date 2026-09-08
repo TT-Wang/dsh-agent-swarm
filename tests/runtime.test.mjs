@@ -74,7 +74,7 @@ test('a claimed pass cannot override failing host verification',async t=>{
   await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:claimed.attempt.id,verdict:'accept',reason:'I think it passes'})
   const snapshot=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(snapshot.tasks.find(t=>t.id===task.id).status,'blocked')
-  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/blocked required work/)
+  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/cover every mission acceptance criterion.*Blocked work still needs repair/)
 })
 test('handoff fences immediately but replacement waits for quiescence',async t=>{
   const f=await setup(t); const task=await f.runtime.claim(f.actorA,f.mission.id,f.propose().id)

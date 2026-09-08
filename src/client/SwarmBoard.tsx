@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
-import type { Snapshot, Task, Evidence, Member } from '../types.ts'
-import { LANES, compactNumber, evidenceCounts, eventSummary, remainingPercent, shortId, taskLane } from './projection.ts'
+import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
+import { LANES, compactNumber, dependencyMet, evidenceCounts, eventSummary, remainingPercent, shortId, taskLane } from './projection.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
 import { MissionProgress, RecentProgress, ResultSummary } from './MissionProgress.tsx'
@@ -23,11 +23,24 @@ function Metric({ label, value, detail, remaining }: { label: string; value: str
       aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(remaining)}>
       <span style={{ width: `${remaining}%` }} /></div>}</div>
 }
+/** Usage buckets are disjoint billing units; reasoning is a subset of output and is shown as such. */
+function UsageBreakdown({ worker, owner, steps }: { worker?: UsageBuckets; owner?: UsageBuckets; steps: number }) {
+  const t = useCopy()
+  if (!worker && !owner) return null
+  const row = (label: string, usage: UsageBuckets) => <tr><th scope="row">{label}</th>
+    <td>{compactNumber(usage.uncachedInputTokens)}</td><td>{compactNumber(usage.cacheReadTokens)}</td><td>{compactNumber(usage.cacheWriteTokens)}</td>
+    <td>{compactNumber(usage.outputTokens)}<small> ({compactNumber(usage.reasoningTokens)} {t('reasoning')})</small></td><td>{usage.requests}</td></tr>
+  return <details className="sw-section" data-swarm-usage=""><summary>{t('Usage breakdown')}</summary>
+    <div className="sw-table-wrap"><table className="sw-usage"><thead><tr><th></th><th>{t('Uncached input')}</th><th>{t('Cache read')}</th><th>{t('Cache write')}</th><th>{t('Output')}</th><th>{t('Requests')}</th></tr></thead>
+      <tbody>{worker && row(t('Workers'), worker)}{owner && row(t('Owner conversation'), owner)}</tbody></table></div>
+    <p className="sw-small">{t('Worker requests are physical model calls; steps count logical worker turns')} · {steps} {t('steps')}. {t('Owner usage is attributed by time window and is not charged to the worker budget.')}</p>
+  </details>
+}
 function TaskCard({ task, snapshot }: { task: Task; snapshot: Snapshot }) {
   const t = useCopy()
   const member = snapshot.members.find(item => item.id === (task.attempt?.ownerId ?? task.assigneeId))
   const dependencies = task.dependencies.map(id => snapshot.tasks.find(item => item.id === id))
-  const blocked = dependencies.filter(item => item?.status !== 'accepted')
+  const blocked = task.dependencies.filter(id => !dependencyMet(id, snapshot.tasks))
   const reviewSource = task.reviewOf ? snapshot.tasks.find(item => item.id === task.reviewOf) : undefined
   return <article className="sw-task" data-lane={taskLane(task, snapshot.tasks)}>
     <div className="sw-row"><span className="sw-eyebrow">{task.kind}</span><span className="sw-code sw-muted">{shortId(task.id)}</span></div>
@@ -130,6 +143,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
         remaining={remainingPercent(mission.usedSteps, mission.budget.maxSteps)} />
       <Metric label={t('WORKERS')} value={`${activeWorkers} active`} detail={`${snapshot.members.length} workers · cap ${mission.budget.maxWorkers}`} />
     </div>
+    <UsageBreakdown worker={mission.workerUsage} owner={mission.ownerUsage} steps={mission.usedSteps} />
     <div className="sw-tabs" role="tablist" aria-label="Mission views">
       <button className="sw-tab" role="tab" aria-selected={view === 'board'} onClick={() => setView('board')}>{t('Work board')}</button>
       <button className="sw-tab" role="tab" aria-selected={view === 'graph'} onClick={() => setView('graph')}>{t('Dependency graph')}</button>

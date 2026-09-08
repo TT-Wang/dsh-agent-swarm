@@ -17,7 +17,8 @@ import { Workspaces, writePrivateJson } from './workspaces.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
-import type { Artifact, Delivery, Member, Mission, Task, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
+import type { Artifact, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -29,6 +30,10 @@ export interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
+  /** Ignored dependency directories linked from the source into verification checkouts. */
+  verificationDependencyDirs?: string[]
+  /** Prompt-token pressure (uncached + cached input of the last request) above which an idle worker compacts at a task boundary; 0 disables. */
+  boundaryCompactionTokens?: number
 }
 interface Composition {
   version: 1
@@ -52,6 +57,12 @@ interface Resident {
   recoveryInbox: Map<string, { target: 'next-step' | 'next-turn'; message: UserMessage }>
   journalWrites: Promise<void>
   totalTokens: number
+  usage: UsageBuckets
+  /** Prompt pressure of the most recent request; the boundary compaction trigger. */
+  lastPromptTokens: number
+  compactionRequested: boolean
+  /** Executions already recorded through the post-execute waterfall; the result emit must not record them twice. */
+  recordedExecutions: WeakSet<object>
   rejectedPendingStep: boolean
   activities: Map<string, { value: WorkerActivity; signal?: AbortSignal; release: () => void }>
   requestSignal?: AbortSignal
@@ -59,6 +70,21 @@ interface Resident {
 }
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error) }
+/** Aggregate one provider usage report into disjoint billing buckets; reasoning is already inside output. */
+function accumulateUsage(target: UsageBuckets, usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }): number {
+  target.uncachedInputTokens += usage.inputTokens
+  target.outputTokens += usage.outputTokens
+  target.cacheReadTokens += usage.cacheReadTokens ?? 0
+  target.cacheWriteTokens += usage.cacheWriteTokens ?? 0
+  target.reasoningTokens += usage.reasoningTokens ?? 0
+  target.requests += 1
+  return usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+}
+const emptyBuckets = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
+/** The durable run keeps the model-visible content; the execution-local canonical value is deliberately not persisted. */
+function durableResult(result: { isError: boolean; content: unknown; error?: unknown; meta?: unknown }): Record<string, unknown> {
+  return { isError: result.isError, content: result.content, ...(result.error === undefined ? {} : { error: result.error }), ...(result.meta === undefined ? {} : { meta: result.meta }) }
+}
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
 function parseComposition(value: unknown, spec: WorkerSpec): Composition {
   if (!isRecord(value) || value.version !== 1 || value.sessionId !== spec.member.sessionId || value.missionId !== spec.mission.id || value.memberId !== spec.member.id || value.workspace !== spec.member.workspace || typeof value.persona !== 'string' || (value.preset !== undefined && typeof value.preset !== 'string') || !isRecord(value.options)) throw new Error('Worker composition metadata is invalid or belongs to a different worker')
@@ -92,7 +118,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private disposal: Promise<void> | undefined
   private readonly removeStreamObserver: () => void
 
-  constructor(private readonly ctx: Context, options: HarnessWorkerOptions) {
+  constructor(private readonly ctx: Context, private readonly options: HarnessWorkerOptions) {
     this.workspaces = new Workspaces({
       ...options,
       checkEnv: scrubbedParentEnv(),
@@ -103,7 +129,7 @@ export class HarnessWorkers implements WorkerAdapter {
       },
     })
     const owner = this
-    this.removeStreamObserver = ctx.on('llm/stream', async function* (options, next) {
+    const removeStream = ctx.on('llm/stream', async function* (options, next) {
       const resident = [...owner.residents.values()].find(item => item.spec.member.sessionId === options.sessionId)
       if (resident === undefined || owner.closing || resident.abort.signal.aborted) { yield* next(); return }
       resident.requestSignal = options.signal
@@ -112,6 +138,17 @@ export class HarnessWorkers implements WorkerAdapter {
         for await (const chunk of next()) { activity.touch(); yield chunk }
       } finally { activity.end() }
     })
+    // Owner sessions are ordinary Harness agents: attribute their usage to their swarm without charging the worker pool.
+    const removeOwnerUsage = ctx.on('session/event', (session, event) => {
+      if (this.closing || event.type !== 'assistant/message' || event.data.usage === undefined || this.callbacks?.ownerUsage === undefined) return
+      const sessionId = String(session.header.id)
+      if ([...this.residents.values()].some(item => item.spec.member.sessionId === sessionId)) return
+      const buckets = emptyBuckets()
+      accumulateUsage(buckets, event.data.usage)
+      try { this.callbacks.ownerUsage(sessionId, buckets) }
+      catch (error) { this.ctx.logger.error(`Swarm owner usage observer failed: ${errorText(error)}`) }
+    })
+    this.removeStreamObserver = () => { removeStream(); removeOwnerUsage() }
   }
 
   /** Read liveness from owned native operations, never from a persisted UI record. */
@@ -232,7 +269,7 @@ export class HarnessWorkers implements WorkerAdapter {
       if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec) }
       return await existing.opening
     }
-    const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, rejectedPendingStep: false, activities: new Map() }
+    const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
     try { await resident.opening }
@@ -289,14 +326,14 @@ export class HarnessWorkers implements WorkerAdapter {
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
       this.removeRevokedPending(resident, agent)
+      resident.usage = emptyBuckets()
       resident.totalTokens = agent.session.snapshotEvents().reduce((total, event) => {
         if (event.type !== 'assistant/message' || event.data.usage === undefined) return total
-        const usage = event.data.usage
-        return total + usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+        return total + accumulateUsage(resident.usage, event.data.usage)
       }, 0)
       // Reconcile a session-log commit whose runtime budget transaction was
       // interrupted, before publication can release pending model requests.
-      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens)
+      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage })
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
@@ -314,6 +351,12 @@ export class HarnessWorkers implements WorkerAdapter {
         `Your memberId: ${spec.member.id}`,
         'Use these exact IDs in swarm tool arguments, even before your first task assignment.',
       ].join('\n') })
+      // Members carry only the collaboration rules and tools they can use; the
+      // runtime guard below remains the authority boundary for hidden names.
+      agentCtx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: WORKER_PROMPT })
+      const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))
+      const hidden = hiddenToolsFor('worker').filter(name => visible.has(name))
+      if (hidden.length) agentCtx.tools.restrict({ deny: hidden })
       agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
       agentCtx.on('agent/pre-step', async ({ signal, messages }, next) => {
         await this.drainObservations(resident)
@@ -342,10 +385,27 @@ export class HarnessWorkers implements WorkerAdapter {
         const activity = this.beginActivity(resident, { kind: 'tool', tool: exec.name }, exec.signal)
         try { return await next() } finally { activity.end() }
       })
+      // Record the execution before the model sees its result and append the
+      // durable run id, so evidence can be cited without an observe round trip.
+      agentCtx.on('tools/post-execute', async (exec, result, next) => {
+        const decision = await next()
+        if (exec.name.startsWith('swarm_') || resident.recordedExecutions.has(exec)) return decision
+        resident.recordedExecutions.add(exec)
+        const content = decision.kind === 'accept' && decision.content !== undefined ? decision.content : result.content
+        const runId = await this.observer().toolRun(spec.member.id, {
+          tool: exec.name, arguments: exec.arguments, isError: result.isError,
+          result: { callId: exec.callId, rootCallId: exec.rootCallId, ...durableResult({ ...result, content }) },
+        })
+        if (runId === undefined || decision.kind !== 'accept' || decision.value !== undefined) return decision
+        return { ...decision, content: [...content, { type: 'text', text: `[swarm toolRunId: ${runId}]` }] }
+      })
       agentCtx.on('tools/result', (exec, result) => {
+        // Only paths that bypass post-execute (materialization failures, pipeline throws) reach here unrecorded.
+        if (resident.recordedExecutions.has(exec)) return undefined
+        resident.recordedExecutions.add(exec)
         this.observe(resident, async () => { await this.observer().toolRun(spec.member.id, {
           tool: exec.name, arguments: exec.arguments, isError: result.isError,
-          result: { callId: exec.callId, rootCallId: exec.rootCallId, ...result },
+          result: { callId: exec.callId, rootCallId: exec.rootCallId, ...durableResult(result) },
         }) })
         return undefined
       })
@@ -361,16 +421,16 @@ export class HarnessWorkers implements WorkerAdapter {
         }
         if (event.type === 'user/message') resident.recoveryInbox.delete(event.data.id)
         if (event.type === 'assistant/message' && event.data.usage !== undefined) {
-          const usage = event.data.usage
-          const tokens = usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+          resident.lastPromptTokens = event.data.usage.inputTokens + (event.data.usage.cacheReadTokens ?? 0) + (event.data.usage.cacheWriteTokens ?? 0)
+          const tokens = accumulateUsage(resident.usage, event.data.usage)
           resident.totalTokens += tokens
-          const total = resident.totalTokens
+          const total = resident.totalTokens, buckets = { ...resident.usage }
           this.observe(resident, async () => {
             const observer = this.observer()
             if (observer.usageSnapshot !== undefined) {
               // The source total must survive a crash before SQLite accounts it.
               await this.ctx.sessions.flush(session)
-              await observer.usageSnapshot(spec.member.id, total)
+              await observer.usageSnapshot(spec.member.id, total, buckets)
             } else await observer.usage(spec.member.id, tokens)
           })
         }
@@ -380,6 +440,7 @@ export class HarnessWorkers implements WorkerAdapter {
         if (status !== 'idle') return
         this.clearActivities(resident)
         if (this.continueAfterRejectedStep(resident, agent)) return
+        this.compactIfRequested(resident)
         void this.drainObservations(resident).then(() => {
           if (resident.stopping === undefined && !this.closing && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
@@ -399,6 +460,34 @@ export class HarnessWorkers implements WorkerAdapter {
       await this.ctx.sessions.flush(handle.agent.session)
       await this.preserveInbox(resident, handle.agent)
     } catch (error) { await handle.dispose(); resident.handle = undefined; throw error }
+  }
+
+  /**
+   * A closed unit of work is the safe moment to summarize history the worker
+   * no longer needs. Only the native compaction engine is used, only while the
+   * worker is idle, and only when its last request's prompt pressure exceeds
+   * the configured threshold; the summary request is accounted like any other.
+   */
+  compactAtBoundary(memberId: string): void {
+    const resident = this.residents.get(memberId)
+    if (resident === undefined || this.closing || resident.stopping !== undefined) return
+    resident.compactionRequested = true
+    this.compactIfRequested(resident)
+  }
+  private compactIfRequested(resident: Resident): void {
+    const threshold = this.options.boundaryCompactionTokens ?? 250000
+    const agent = resident.handle?.agent
+    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined) return
+    if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
+    // The compaction engine is an optional host service; structural access avoids a hard package dependency.
+    const compaction = (this.ctx.get as (name: string) => unknown)('compaction') as { compactNow(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
+    if (compaction === undefined || typeof compaction.compactNow !== 'function') { resident.compactionRequested = false; return }
+    resident.compactionRequested = false
+    resident.lastPromptTokens = 0
+    this.observe(resident, async () => {
+      try { await compaction.compactNow(agent, resident.abort.signal) }
+      catch (error) { if (!resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${errorText(error)}`) }
+    })
   }
 
   async deliver(member: Member, delivery: Delivery): Promise<void> {

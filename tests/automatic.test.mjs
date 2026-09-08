@@ -116,7 +116,8 @@ test('automatic admission rejects incomplete topology before creating workers or
     input => { input.tasks.pop() },
     input => { input.tasks[0].assigneeKey = undefined },
     input => { input.tasks[1].assigneeKey = undefined },
-    input => { input.tasks[0].kind = 'implementation' },
+    // One reviewed implementation is deliverable alone; several implementation branches still need a final integration.
+    input => { input.tasks[0].kind = 'implementation'; input.tasks.push({ ...input.tasks[0], key: 'second', title: 'Second' }, { ...input.tasks[1], key: 'second-review', title: 'Second review', reviewOf: 'second' }) },
     input => { input.acceptance = ['uncovered obligation'] },
     input => { delete input.tasks[0].maxRecoveryAttempts },
     input => { delete input.tasks[0].checkTimeoutMs },
@@ -138,7 +139,7 @@ test('automatic implementation plans require a final integration dependency and 
   const implementationReview = { ...f.input.tasks[1], key: 'implementation-review', reviewOf: 'implement' }
   f.input.tasks.unshift(implementation, implementationReview)
   const request = f.runtime.requestStart(f.owner, f.requestInput)
-  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /integration task depending/)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /integration task must depend on implementation implement/)
   f.input.tasks.find(task => task.key === 'deliver').dependencies = ['implement']
   const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
   assert.equal(snapshot.tasks.length, 4)

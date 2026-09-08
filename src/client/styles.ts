@@ -2,6 +2,10 @@
 export const SWARM_CSS = `
 [data-swarm] .sw-auto-start { margin:12px 0; padding:12px; border:1px solid var(--sw-line); border-radius:10px; }
 [data-swarm] .sw-auto-start p { margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+[data-swarm] .sw-table-wrap { overflow-x:auto; }
+[data-swarm] table.sw-usage { border-collapse:collapse; font-size:12px; width:100%; }
+[data-swarm] table.sw-usage th, [data-swarm] table.sw-usage td { padding:4px 8px; text-align:right; border-bottom:1px solid var(--sw-border); white-space:nowrap; }
+[data-swarm] table.sw-usage th[scope=row] { text-align:left; font-weight:600; }
 
 [data-swarm]{--sw-bg:#101b22;--sw-card:#162630;--sw-border:#2b414b;--sw-text:#e9f1f3;--sw-muted:#a0b7bf;--sw-accent:#76dcc8;color:var(--sw-text);background:var(--sw-bg);border:1px solid var(--sw-border);border-radius:16px;font:13px/1.5 ui-sans-serif,system-ui,sans-serif;overflow:hidden;margin:12px 0;max-width:100%;color-scheme:dark}
 [data-swarm] *{box-sizing:border-box}[data-swarm] button{font:inherit;color:inherit;cursor:pointer}[data-swarm] button:focus-visible,[data-swarm] summary:focus-visible{outline:2px solid var(--sw-accent);outline-offset:3px}[data-swarm] .sw-head{padding:22px 24px 16px;background:linear-gradient(135deg,#173630 0%,#13232c 75%)}

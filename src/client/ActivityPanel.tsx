@@ -7,6 +7,7 @@ import { SwarmMonitor } from './monitor.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { DraftEditor } from './DraftEditor.tsx'
 import { useCopy } from './locale.tsx'
+import { deliverableTask } from './projection.ts'
 import { selectedOperation } from './selection.ts'
 import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
@@ -130,7 +131,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
       </details>}
       {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={controls}
         technicalDetails={<>{snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}{advancedControls}</>}
-        delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && snapshot.tasks.some(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact) ?
+        delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && deliverableTask(snapshot) ?
           <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} disabled={connection !== 'connected'} /> : undefined}
         onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} />}
       </>}

@@ -7,6 +7,18 @@ export const LANES: readonly { id: BoardLane; label: string }[] = [
   { id: 'blocked', label: 'Blocked / cancelled' },
 ]
 
+/** A dependency on a replaced task is met by its accepted repair, mirroring the runtime's lineage rule. */
+export function dependencyMet(id: string, tasks: readonly Task[]): boolean {
+  let current = tasks.find(item => item.id === id)
+  const seen = new Set<string>()
+  while (current && (current.status === 'cancelled' || current.status === 'blocked') && !seen.has(current.id)) {
+    seen.add(current.id)
+    const replacements = tasks.filter(item => item.replaces?.includes(current!.id) && item.kind === current!.kind && !seen.has(item.id))
+    current = replacements.find(item => item.status === 'accepted') ?? replacements.find(item => item.status !== 'cancelled') ?? undefined
+  }
+  return current?.status === 'accepted'
+}
+
 /** Dependent pending work is visibly blocked instead of advertised as dispatchable. */
 export function taskLane(task: Task, tasks: readonly Task[]): BoardLane {
   if (task.status === 'accepted') return 'done'
@@ -14,7 +26,7 @@ export function taskLane(task: Task, tasks: readonly Task[]): BoardLane {
   if (task.status === 'submitted') return 'review'
   if (task.status === 'blocked' || task.status === 'cancelled') return 'blocked'
   if (task.reviewOf && tasks.find(item => item.id === task.reviewOf)?.status !== 'submitted') return 'blocked'
-  return task.dependencies.some(id => tasks.find(item => item.id === id)?.status !== 'accepted') ? 'blocked' : 'ready'
+  return task.dependencies.some(id => !dependencyMet(id, tasks)) ? 'blocked' : 'ready'
 }
 
 export function remainingPercent(used: number, limit: number): number {
@@ -93,6 +105,16 @@ export function snapshotFromResult(meta: unknown, content: unknown): Snapshot | 
     }
   }
   return undefined
+}
+
+/** The deliverable: the accepted integration, or the single accepted implementation when the plan needed no assembly step. */
+export function deliverableTask(snapshot: Snapshot): Task | undefined {
+  const accepted = snapshot.tasks.filter(task => task.status === 'accepted' && task.artifact)
+  const integration = accepted.find(task => task.kind === 'integration')
+  if (integration) return integration
+  if (snapshot.tasks.some(task => task.kind === 'integration')) return undefined
+  const implementations = accepted.filter(task => task.kind === 'implementation')
+  return implementations.length === 1 ? implementations[0] : undefined
 }
 
 export function evidenceCounts(evidence: readonly Evidence[]): { verified: number; challenged: number; total: number } {

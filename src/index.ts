@@ -6,6 +6,7 @@ import { join, isAbsolute } from 'node:path'
 import { SwarmRuntime } from './runtime.ts'
 import { HarnessWorkers } from './harness-workers.ts'
 import { registerTools, SWARM_PROMPT } from './tools.ts'
+import { RoleScoper } from './roles.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import type { Budget } from './types.ts'
@@ -24,6 +25,8 @@ export interface Config {
   maxAttempts: number
   checkTimeoutMs: number
   maxCheckOutputBytes: number
+  verificationDependencyDirs: string[]
+  boundaryCompactionTokens: number
   defaultBudget: Budget
 }
 export const Config: z<Config> = z.object({
@@ -36,6 +39,8 @@ export const Config: z<Config> = z.object({
   maxAttempts: z.natural().min(1).default(3),
   checkTimeoutMs: z.natural().min(100).default(60000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
+  verificationDependencyDirs: z.array(z.string()).default(['node_modules']),
+  boundaryCompactionTokens: z.natural().default(250000),
   defaultBudget: z.object({
     maxTokens: z.natural().min(1).default(500000),
     maxSteps: z.natural().min(1).default(200),
@@ -54,7 +59,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
   ctx.provide('swarm', runtime)
   registerTools(ctx, runtime, config.defaultBudget)
+  // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
+  new RoleScoper(ctx, runtime)
   await runtime.start()
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
   ctx.inject(['connection'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))

@@ -119,9 +119,9 @@ export async function apply(ctx, config) {
     if (script.stage === 'done') return answer('Assignment finished; awaiting further work.')
     const observation = blocks(options.messages).toReversed().map(block => {
       try { return resultBody(block) } catch { return undefined }
-    }).find(body => body?.snapshot)
-    assert(observation, 'worker must see the real board through swarm_observe')
-    const task = observation.snapshot.tasks.find(task => task.id === assignment.task.id)
+    }).find(body => body?.result?.member !== undefined && body.result.current?.task?.id === assignment.task.id)
+    assert(observation, 'worker must see its focused task view through swarm_observe')
+    const task = observation.result.current.task
     const current = { missionId: assignment.missionId, taskId: task.id, attemptId: task.attempt.id }
     if (task.kind === 'verification') { script.stage = 'done'; return tool('swarm_verify', { ...current, verdict: 'accept', reason: 'The host independently executes the declared check against the submitted commit.' }) }
     if (script.stage === 'work') { script.stage = 'record'; return tool('bash', { command: "printf 'module.exports = 2\\n' > value.cjs && node check.cjs", description: 'Implement and check the scoped fixture change.' }) }

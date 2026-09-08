@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { DeliveryApplication, DeliveryInspection, Snapshot, WorkspaceBaseline } from '../types.ts'
 import type { Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
+import { deliverableTask } from './projection.ts'
 
 export function BaselineNotice({ baseline }: { baseline: WorkspaceBaseline }) {
   const t = useCopy()
@@ -21,7 +22,7 @@ export function DeliveryPanel({ snapshot, sessionId, request, onApplied, disable
   const [result, setResult] = useState<DeliveryApplication>()
   const [busy, setBusy] = useState(false), [error, setError] = useState('')
   const mounted = useRef(true), pending = useRef(false)
-  const resultCommit = snapshot.tasks.find(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact)?.artifact?.commit
+  const resultCommit = deliverableTask(snapshot)?.artifact?.commit
   const applied = result?.status === 'applied' || Boolean(resultCommit && snapshot.events.some(event => event.type === 'delivery/applied'
     && event.data && typeof event.data === 'object' && 'resultCommit' in event.data && event.data.resultCommit === resultCommit))
   useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])

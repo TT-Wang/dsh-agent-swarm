@@ -122,8 +122,8 @@ try {
     scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], checks: ['node check.cjs'],
     objective: [
       'Change value.cjs to export 2, preserving check.cjs. Work only in your assigned directory. Be concise.',
-      'First call swarm_observe to obtain your owned running task and attempt IDs. Use bash to inspect/change value.cjs and run node check.cjs.',
-      'Call swarm_observe again to obtain host toolRunIds; publish supported evidence with swarm_publish citing the successful bash run.',
+      'Your assignment message carries your task and attempt IDs; swarm_observe returns the same focused view. Use bash to inspect/change value.cjs and run node check.cjs.',
+      'Each bash result ends with its host toolRunId; publish supported evidence with swarm_publish citing the successful bash run.',
       ...(messageEarly ? [`Before proposing review, send reviewer ${reviewer.id} one short swarm_message question requesting independent review; tell them to swarm_wait if their assigned verification task has not arrived yet.`] : []),
       `Propose one verification task in this same workstream, reviewOf your current task ID, assigneeId ${reviewer.id}, same scope/acceptance, and no dependencies. Its objective is: observe current assigned review attempt then call swarm_verify; do not swarm_submit a verification task.`,
       `Then swarm_submit your own current task and attempt with a short output.${messageEarly ? ' End your turn.' : ` After submitting, send reviewer ${reviewer.id} one short swarm_message question requesting independent review, then end your turn.`}`,

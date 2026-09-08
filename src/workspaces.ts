@@ -1,18 +1,24 @@
 /** Owned Git worktrees and immutable artifacts. The source checkout is read-only. */
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { withinScope } from './scope.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 
-export interface CheckResult { command: string; exitCode: number; output: string }
+export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean }
 export interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
   checkEnv?: Record<string, string>
+  /**
+   * Ignored dependency directory names (such as `node_modules`) linked from the
+   * source checkout into each clean verification checkout, so declared checks
+   * find installed toolchains. Default: `['node_modules']`. Empty disables.
+   */
+  verificationDependencyDirs?: string[]
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
 }
@@ -356,12 +362,17 @@ export class Workspaces {
       await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
       await this.git(mission.source, ['worktree', 'add', '--detach', checkout, artifact.commit], signal)
       try {
+        const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
         const results: CheckResult[] = []
         for (const command of task.checks) {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
           const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env: this.options.checkEnv })
-          results.push({ command, ...result })
+          // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
+          const output = result.exitCode === 127
+            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. Linked dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
+            : result.output
+          results.push({ command, exitCode: result.exitCode, output, truncated: result.truncated })
           if (result.exitCode !== 0) break
         }
         return results
@@ -373,6 +384,33 @@ export class Workspaces {
   cancel(memberId: string): void { for (const controller of this.controllers.get(memberId) ?? []) controller.abort('member stopped') }
 
   /** Preserve mission worktrees as deliverables, while draining all owned execution. */
+  /**
+   * Clean checkouts contain only committed files, so toolchains installed in the
+   * source (ignored `node_modules` and similar) are absent. Link those ignored
+   * directories read-through from the source at the same relative paths; the
+   * artifact commit is unchanged and the sandbox still confines writes to the
+   * checkout. Build outputs and other ignored paths are never linked.
+   * @returns the relative directories that were linked.
+   */
+  private async linkDependencyDirs(source: string, checkout: string, signal: AbortSignal): Promise<string[]> {
+    const names = new Set(this.options.verificationDependencyDirs ?? ['node_modules'])
+    if (names.size === 0) return []
+    const ignored = await this.git(source, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], signal, undefined, 16 * 1024 * 1024)
+    const linked: string[] = []
+    for (const entry of ignored.split('\0')) {
+      if (!entry.endsWith('/')) continue
+      const relative = entry.slice(0, -1)
+      if (!names.has(path.basename(relative)) || relative.split('/').some(part => part === '..' || part === '')) continue
+      const target = path.join(source, relative), link = path.join(checkout, relative)
+      const targetStat = await lstat(target).catch(() => undefined)
+      if (targetStat === undefined || !targetStat.isDirectory()) continue
+      if (await lstat(link).then(() => true, () => false)) continue
+      await mkdir(path.dirname(link), { recursive: true })
+      await symlink(target, link, 'dir')
+      linked.push(relative)
+    }
+    return linked
+  }
   async dispose(): Promise<void> {
     this.closing = true
     for (const active of this.controllers.values()) for (const controller of active) controller.abort('adapter disposed')

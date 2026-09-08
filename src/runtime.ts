@@ -4,10 +4,31 @@ import { isAbsolute } from 'node:path'
 import { SwarmStore } from './store.ts'
 import { assertScopeSelectors, normalizeReviewDependencies, normalizeScopeSelectors, requireHostChecks } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, Member, Mission, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, Member, Mission, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
+const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
+export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
+export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): UsageBuckets {
+  const result = { ...(base ?? emptyUsage()) }
+  for (const key of USAGE_KEYS) result[key] += Math.max(0, delta[key])
+  return result
+}
+/** Cumulative logs never shrink; a smaller bucket means a replayed snapshot and contributes nothing. */
+function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
+  const result = emptyUsage()
+  for (const key of USAGE_KEYS) result[key] = Math.max(0, next[key] - (previous?.[key] ?? 0))
+  return result
+}
+function validUsage(value: unknown): value is UsageBuckets {
+  return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
+}
+/** Bounded text for model-visible views; the stored record remains complete. */
+function excerpt(value: unknown, limit: number): string {
+  const raw = typeof value === 'string' ? value : JSON.stringify(value) ?? ''
+  return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
+}
 function requireText(value: string, name: string): void { if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`) }
 function requireStrings(value: string[], name: string): void {
   if (!Array.isArray(value) || value.length === 0 || !value.every(x => typeof x === 'string' && x.trim())) throw new Error(`${name} must contain nonempty strings`)
@@ -42,7 +63,8 @@ export class SwarmRuntime {
       idle: memberId => this.onIdle(memberId),
       beforeStep: (memberId, hasFreshInput) => this.beforeStep(memberId, hasFreshInput),
       usage: (memberId, tokens) => this.usage(memberId, tokens),
-      usageSnapshot: (memberId, totalTokens) => this.usageSnapshot(memberId, totalTokens),
+      usageSnapshot: (memberId, totalTokens, usage) => this.usageSnapshot(memberId, totalTokens, usage),
+      ownerUsage: (sessionId, usage) => this.recordOwnerUsage(sessionId, usage),
       admitDelivery: (memberId, deliveryId) => {
         const delivery = this.store.get('deliveries', deliveryId)
         if (!delivery || delivery.to !== memberId) return false
@@ -165,11 +187,45 @@ export class SwarmRuntime {
     if (!task || task.missionId !== missionId) throw new Error('Task is not in this mission')
     return task
   }
+  /**
+   * Follow repair lineage from a referenced dependency to the task that now
+   * carries its obligations. A blocked or cancelled task replaced by a live
+   * repair resolves to that repair, recursively; the original identity in a
+   * dependent's `dependencies` therefore keeps working after replacement.
+   */
+  private lineage(missionId: string, dependencyId: string, tasks = this.store.list('tasks', missionId)): Task[] {
+    const chain = [this.task(missionId, dependencyId)]
+    const seen = new Set<string>()
+    while ((chain.at(-1)!.status === 'cancelled' || chain.at(-1)!.status === 'blocked') && !seen.has(chain.at(-1)!.id)) {
+      const current = chain.at(-1)!
+      seen.add(current.id)
+      const replacements = tasks.filter(task => task.replaces?.includes(current.id) && task.kind === current.kind && !seen.has(task.id))
+      const accepted = replacements.filter(task => task.status === 'accepted')
+      // Two accepted artifacts for one obligation is ambiguous history: fail closed so no arbitrary artifact is trusted.
+      if (accepted.length > 1) return [...chain, { ...current, status: 'blocked', output: `Ambiguous accepted replacements ${accepted.map(task => task.id).join(', ')} for ${current.id}` }]
+      const latest = (candidates: Task[]) => candidates.sort((a, b) => b.createdAt - a.createdAt)[0]
+      const next = accepted[0]
+        ?? latest(replacements.filter(task => ['pending', 'running', 'submitted'].includes(task.status)))
+        ?? latest(replacements.filter(task => task.status === 'blocked' || task.status === 'cancelled'))
+      if (!next) break
+      chain.push(next)
+    }
+    return chain
+  }
+  /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
+  private effectiveDependencies(missionId: string, task: Task): Task[] {
+    const seen = new Set<string>()
+    return task.dependencies.map(dep => this.effectiveDependency(missionId, dep)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+  }
+  private effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
+  private dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
+  /** Every identity a dependency reference stands for, including the current effective repair. */
+  private dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
     const { member } = this.active(actor, missionId)
     const task = this.task(missionId, taskId)
     if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < Date.now()) throw new Error('Stale or unauthorized task attempt; stop work and observe the current assignment')
-    if (!task.dependencies.every(dep => this.task(missionId, dep).status === 'accepted')) throw new Error('A task prerequisite is no longer accepted; stop work')
+    if (!task.dependencies.every(dep => this.dependencySatisfied(missionId, dep))) throw new Error('A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   private bounded(text: string): string {
@@ -177,6 +233,11 @@ export class SwarmRuntime {
     if (text.length > this.config.maxMessageChars) throw new Error(`Content exceeds ${this.config.maxMessageChars} characters`)
     return text
   }
+  /**
+   * Owner notices wake the primary agent and replay its whole context, so only
+   * decisions, blockers, failures, budget exhaustion and final delivery use
+   * them. Routine progress is already a durable event shown by the UI.
+   */
   private notify(missionId: string, content: string, from = 'runtime'): void {
     this.store.put('deliveries', { id: id('msg'), missionId, from, to: 'owner', kind: 'control', content, createdAt: Date.now() })
   }
@@ -281,20 +342,30 @@ export class SwarmRuntime {
     if (input.priority !== undefined && (!Number.isInteger(input.priority) || input.priority < 0 || input.priority > 100)) throw new Error('priority must be an integer from 0 to 100')
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
     for (const dependency of dependencies) {
-      const task = this.task(missionId, dependency)
-      if (task.status === 'cancelled' || task.status === 'blocked') throw new Error('Dependencies cannot refer to blocked or cancelled tasks; use a repair with evidence references')
+      const effective = this.effectiveDependency(missionId, dependency, tasks)
+      if (effective.status === 'cancelled' || effective.status === 'blocked') throw new Error(`Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
     if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && m.status !== 'stopped')) throw new Error('Unknown assignee')
     if (input.kind === 'verification') {
       if (!input.reviewOf) throw new Error('Verification requires reviewOf')
       const source = this.task(missionId, input.reviewOf)
       if (source.kind === 'verification') throw new Error('Verification cannot review another verification task')
+      if (source.status === 'cancelled' || source.status === 'accepted') throw new Error(`reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
+      const author = source.attempt?.ownerId ?? source.assigneeId
+      if (input.assigneeId !== undefined && author !== undefined && input.assigneeId === author) throw new Error(`assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a different member or left unassigned`)
     } else if (input.reviewOf) throw new Error('Only verification tasks may set reviewOf')
     for (const previousId of input.replaces ?? []) {
       const previous = this.task(missionId, previousId)
-      if (previous.status !== 'blocked' || previous.kind === 'verification' || previous.kind !== input.kind) throw new Error('A replacement must replace blocked work of the same kind')
-      if (!previous.acceptance.every(item => input.acceptance.includes(item))) throw new Error('Replacement acceptance must cover the original obligations')
-      if (dependencies.includes(previousId)) throw new Error('A repair cannot depend on the blocked task it replaces')
+      if (previous.kind === 'verification') throw new Error(`replaces ${previousId}: that is a verification task. Repair its reviewed source ${previous.reviewOf ?? ''} instead; a new review starts automatically when the repair is submitted`)
+      if (previous.status !== 'blocked') {
+        const replacement = tasks.find(task => task.replaces?.includes(previousId) && task.status !== 'cancelled')
+        throw new Error(`replaces ${previousId}: that task is ${previous.status}, and only blocked work can be replaced${replacement ? `; it is already replaced by ${replacement.id} (${replacement.status})` : previous.status === 'pending' || previous.status === 'running' || previous.status === 'submitted' ? '; wait for its verdict or use swarm_handoff/challenge' : ''}`)
+      }
+      if (previous.resumeAfterStop?.epoch === previous.epoch) throw new Error(`replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
+      if (previous.kind !== input.kind) throw new Error(`replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
+      const missing = previous.acceptance.filter(item => !input.acceptance.includes(item))
+      if (missing.length) throw new Error(`replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
+      if (dependencies.includes(previousId)) throw new Error(`replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
     }
     requireHostChecks(input.kind, input.checks, 'task', input.title)
     if (input.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(input.maxRecoveryAttempts) || input.maxRecoveryAttempts < 1)) throw new Error('maxRecoveryAttempts must be a positive safe integer')
@@ -307,9 +378,9 @@ export class SwarmRuntime {
     this.kick(missionId)
     return task
   }
-  private ready(task: Task, member: Member): boolean {
+  private ready(task: Task, member: Member, tasks?: Task[]): boolean {
     if (task.status !== 'pending' || (task.assigneeId && task.assigneeId !== member.id)) return false
-    if (!task.dependencies.every(dep => this.task(task.missionId, dep).status === 'accepted')) return false
+    if (!task.dependencies.every(dep => this.dependencySatisfied(task.missionId, dep, tasks))) return false
     if (task.reviewOf) {
       const source = this.task(task.missionId, task.reviewOf)
       if (source.status !== 'submitted' || source.attempt?.ownerId === member.id) return false
@@ -325,7 +396,7 @@ export class SwarmRuntime {
     this.commit(task.missionId, () => {
       this.store.put('tasks', task); this.store.put('members', member)
       this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-        content: JSON.stringify({ missionId: task.missionId, task, instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
+        content: JSON.stringify({ missionId: task.missionId, task, instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
       this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
     })
     return task
@@ -337,7 +408,7 @@ export class SwarmRuntime {
       if (!member) throw new Error('Only a member can claim work')
       const task = this.task(missionId, taskId)
       if (!this.ready(task, member)) throw new Error('Task is not ready for this member')
-      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, task.dependencies.map(dep => this.task(missionId, dep)), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
+      await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
       this.active(actor, missionId)
       const fresh = this.task(missionId, taskId)
       if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) throw new Error('Task changed while preparing its workspace')
@@ -386,8 +457,8 @@ export class SwarmRuntime {
       this.commit(missionId, () => {
         this.store.put('tasks', task)
         for (const evidenceId of task.evidenceIds) { const e = this.store.get('evidence', evidenceId)!; e.artifact = artifact; this.store.put('evidence', e) }
+        // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
         this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact })
-        this.notify(missionId, `Task ${task.id} submitted for independent verification. Use swarm_observe to inspect the board.`, member.id)
       })
       this.kick(missionId)
       return task
@@ -420,20 +491,28 @@ export class SwarmRuntime {
       const passed = input.verdict === 'accept' && checks.every(c => c.exitCode === 0)
       const runIds: string[] = []
       this.commit(missionId, () => {
+        let seq = this.store.countToolRuns(missionId)
         for (const check of checks) {
-          const run: ToolRun = { id: id('run'), missionId, memberId: member.id, taskId: task.id, attemptId: input.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
+          const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: member.id, taskId: task.id, attemptId: input.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
           this.store.put('tool_runs', run); runIds.push(run.id)
         }
         source.status = passed ? 'accepted' : 'blocked'
         task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(input.reason); task.reviewedCommit = artifact.commit
         this.store.put('tasks', source); this.store.put('tasks', task)
+        // Other pending reviews of this source can never start: the source is no longer submitted.
+        for (const sibling of this.store.list('tasks', missionId)) {
+          if (sibling.id !== task.id && sibling.reviewOf === source.id && sibling.status === 'pending') {
+            sibling.status = 'cancelled'; sibling.output = `Superseded: ${source.id} was ${passed ? 'accepted' : 'rejected'} by review ${task.id}`
+            this.store.put('tasks', sibling)
+          }
+        }
         if (passed) for (const previousId of source.replaces ?? []) {
           const previous = this.task(missionId, previousId)
           if (previous.status !== 'blocked') throw new Error('Replacement target changed during verification')
           previous.status = 'cancelled'; previous.output = `${previous.output ?? ''}\nSuperseded by independently accepted task ${source.id}`
           this.store.put('tasks', previous)
           for (const oldReview of this.store.list('tasks', missionId)) {
-            if (oldReview.reviewOf === previousId && oldReview.status === 'blocked') { oldReview.status = 'cancelled'; this.store.put('tasks', oldReview) }
+            if (oldReview.reviewOf === previousId && (oldReview.status === 'blocked' || oldReview.status === 'pending')) { oldReview.status = 'cancelled'; oldReview.output = `Superseded by review of replacement ${source.id}`; this.store.put('tasks', oldReview) }
           }
         }
         for (const evidenceId of source.evidenceIds) {
@@ -446,8 +525,11 @@ export class SwarmRuntime {
           }
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: input.reason, checks: runIds })
-        this.notify(missionId, `${source.title}: ${passed ? 'independently accepted' : 'blocked by verification'}. ${input.reason}`, member.id)
+        // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
+        if (!passed) this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${input.reason}. Repair it with a replacement task or adjust the plan.`, member.id)
       })
+      // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
+      if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
       return task
     })
@@ -488,11 +570,13 @@ export class SwarmRuntime {
       if (source.status === 'accepted') { source.status = 'submitted'; this.store.put('tasks', source) }
       const invalidated = new Set([source.id])
       const tasks = this.store.list('tasks', missionId)
+      // A dependent naming a replaced original effectively depends on its accepted repair.
+      const dependsOnInvalidated = (dependent: Task) => dependent.dependencies.some(dep => [...this.dependencyIdentities(missionId, dep, tasks)].some(identity => invalidated.has(identity)))
       let changed = true
       while (changed) {
         changed = false
         for (const dependent of tasks) {
-          if (invalidated.has(dependent.id) || (!dependent.dependencies.some(dep => invalidated.has(dep)) && !(dependent.reviewOf && invalidated.has(dependent.reviewOf)))) continue
+          if (invalidated.has(dependent.id) || (!dependsOnInvalidated(dependent) && !(dependent.reviewOf && invalidated.has(dependent.reviewOf)))) continue
           invalidated.add(dependent.id); changed = true
           if (dependent.status === 'cancelled' || dependent.status === 'pending') continue
           if (dependent.attempt && dependent.status === 'running') interrupted.add(dependent.attempt.ownerId)
@@ -634,21 +718,23 @@ export class SwarmRuntime {
   /** Automatic requests must contain a complete independently verifiable topology. */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
     const plan = validatePlan({ ...input, workspace: request.workspace })
-    if (plan.members.length < 2) throw new Error('Automatic plans require at least two independent workers')
-    for (const member of plan.members) if (member.maxOutputTokens === undefined) throw new Error(`Automatic worker ${member.key} requires maxOutputTokens chosen by the primary agent`)
+    // Collect every automatic-policy issue so one repair round fixes the whole plan.
+    const issues: string[] = []
+    if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
+    for (const member of plan.members) if (member.maxOutputTokens === undefined) issues.push(`members[${member.key}].maxOutputTokens is required: choose this worker's per-request output allowance`)
     const sources = plan.tasks.filter(task => task.kind !== 'verification')
-    if (!sources.length) throw new Error('Automatic plans require deliverable work')
+    if (!sources.length) issues.push('Automatic plans require deliverable work')
     for (const task of plan.tasks) {
-      if (task.maxRecoveryAttempts === undefined) throw new Error(`Automatic task ${task.key} requires maxRecoveryAttempts chosen by the primary agent`)
-      if (task.kind !== 'verification' && task.checks?.length && task.checkTimeoutMs === undefined) throw new Error(`Automatic task ${task.key} requires checkTimeoutMs chosen by the primary agent`)
+      if (task.maxRecoveryAttempts === undefined) issues.push(`tasks[${task.key}].maxRecoveryAttempts is required: choose the allowed automatic recovery attempts`)
+      if (task.kind !== 'verification' && task.checks?.length && task.checkTimeoutMs === undefined) issues.push(`tasks[${task.key}].checkTimeoutMs is required because it has checks`)
     }
     for (const source of sources) {
       if (!source.assigneeKey || !plan.tasks.some(review => review.kind === 'verification' && review.reviewOf === source.key && review.assigneeKey && review.assigneeKey !== source.assigneeKey)) {
-        throw new Error(`Automatic task ${source.key} requires an assigned independent verification task`)
+        issues.push(`tasks[${source.key}] requires an assigned independent verification task (kind verification, reviewOf ${source.key}, assigneeKey different from ${source.assigneeKey ?? 'its assignee'})`)
       }
     }
     const missingCriteria = plan.acceptance.filter(criterion => !sources.some(task => task.acceptance.includes(criterion)))
-    if (missingCriteria.length) throw new Error(`Automatic plan deliverables must cover every mission acceptance criterion. Missing exact acceptance strings: ${JSON.stringify(missingCriteria)}. Copy each missing string into the acceptance array of the deliverable task that satisfies it; a paraphrase does not match.`)
+    if (missingCriteria.length) issues.push(`Deliverables must cover every mission acceptance criterion. Missing exact acceptance strings: ${JSON.stringify(missingCriteria)}. Copy each missing string into the acceptance array of the deliverable task that satisfies it; a paraphrase does not match.`)
     const implementations = sources.filter(task => task.kind === 'implementation')
     const byKey = new Map(plan.tasks.map(task => [task.key, task]))
     const dependsOn = (key: string, dependency: string): boolean => {
@@ -661,9 +747,14 @@ export class SwarmRuntime {
       }
       return false
     }
-    if (implementations.length && !sources.some(task => task.kind === 'integration' && implementations.every(implementation => dependsOn(task.key, implementation.key)))) {
-      throw new Error('Automatic code plans require a final integration task depending on every implementation deliverable')
+    const integrations = sources.filter(task => task.kind === 'integration')
+    // One reviewed implementation is deliverable on its own; assembling several branches needs a final integration.
+    if (implementations.length > 1 && !integrations.some(task => implementations.every(implementation => dependsOn(task.key, implementation.key)))) {
+      issues.push('Plans with several implementation tasks require a final integration task depending on every implementation deliverable')
+    } else if (implementations.length === 1 && integrations.length && !integrations.some(task => dependsOn(task.key, implementations[0]!.key))) {
+      issues.push(`The integration task must depend on implementation ${implementations[0]!.key}, or be omitted so the reviewed implementation is delivered directly`)
     }
+    if (issues.length) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
     return plan
   }
   /**
@@ -700,7 +791,15 @@ export class SwarmRuntime {
         const snapshot = await this.launchDraft(launchActor, draft.id, draft.revision)
         // The activation commit is authoritative even if cancellation raced its
         // acknowledgment; never report an active mission as an unlaunched retry.
-        this.commit(snapshot.mission.id, () => this.syncStarts(this.mission(snapshot.mission.id)))
+        this.commit(snapshot.mission.id, () => {
+          const launched = this.mission(snapshot.mission.id)
+          const planning = this.store.get('starts', requestId)
+          if (planning?.ownerUsage) {
+            launched.ownerUsage = addUsage(launched.ownerUsage, planning.ownerUsage); delete planning.ownerUsage
+            this.store.put('missions', launched); this.store.put('starts', planning)
+          }
+          this.syncStarts(launched)
+        })
         this.kick(snapshot.mission.id)
         return this.snapshot({ sessionId: actor.sessionId }, snapshot.mission.id)
       } catch (error) {
@@ -803,7 +902,6 @@ export class SwarmRuntime {
           this.store.put('missions', mission!); this.store.put('drafts', draft)
           this.syncStarts(mission!)
           this.store.event(missionId, 'plan/launched', 'owner', { draftId, revision: draft.revision })
-          this.notify(missionId, `Launched plan: ${mission!.title}`)
         })
         this.kick(missionId)
         return this.snapshot(actor, missionId)
@@ -819,10 +917,99 @@ export class SwarmRuntime {
     const { mission } = this.participant(actor, missionId)
     return { mission, members: this.store.list('members', missionId), workstreams: this.store.list('workstreams', missionId), tasks: this.store.list('tasks', missionId), evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length }
   }
-  /** Return provenance references and event deltas with explicit bounds. */
-  observe(actor: Actor, missionId: string, after?: number): unknown {
-    const { member } = this.participant(actor, missionId)
-    return { events: this.store.events(missionId, this.config.maxEvents, after), toolRuns: this.store.list('tool_runs', missionId).filter(run => !member || run.memberId === member.id).slice(-this.config.maxEvents) }
+  /**
+   * Bounded, focused model views. A member sees its current task, the
+   * prerequisites and review source it needs, its own run references and new
+   * events; the owner sees a compact board and usage. Full records are read by
+   * id (`taskId`, `runId` paged by `offset`, `evidenceId`). The complete board
+   * stays in the UI projection instead of every model request.
+   */
+  observe(actor: Actor, missionId: string, query: ObserveQuery = {}): unknown {
+    actor.signal?.throwIfAborted()
+    const { mission, member, owner } = this.participant(actor, missionId)
+    for (const key of ['after', 'afterRun', 'offset'] as const) {
+      if (query[key] !== undefined && (!Number.isSafeInteger(query[key]) || Number(query[key]) < 0)) throw new Error(`${key} must be a nonnegative integer`)
+    }
+    const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
+    const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
+    const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
+      ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
+    const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
+      ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}) })
+    const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
+    const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
+    const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number) => {
+      const all = this.store.toolRuns(missionId, { ...filter, afterSeq: query.afterRun })
+      const shown = query.afterRun === undefined ? all.slice(-limit) : all.slice(0, limit)
+      return { toolRuns: shown.map(runRef), totalToolRuns: all.length, ...(shown.length ? { nextAfterRun: shown.at(-1)!.seq ?? 0 } : {}), ...(all.length > shown.length ? { omittedToolRuns: all.length - shown.length } : {}) }
+    }
+    if (query.runId !== undefined) {
+      const run = this.store.get('tool_runs', query.runId)
+      if (!run || run.missionId !== missionId) throw new Error('Unknown tool run in this mission')
+      const body = JSON.stringify({ arguments: run.arguments, result: run.result })
+      const offset = query.offset ?? 0, page = Math.min(12000, this.config.maxMessageChars)
+      return { run: { id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, createdAt: run.createdAt },
+        totalChars: body.length, offset, content: body.slice(offset, offset + page), ...(offset + page < body.length ? { nextOffset: offset + page } : {}) }
+    }
+    if (query.evidenceId !== undefined) {
+      const evidence = this.store.get('evidence', query.evidenceId)
+      if (!evidence || evidence.missionId !== missionId) throw new Error('Unknown evidence in this mission')
+      return { evidence: { ...evidenceRef(evidence, true), workstreamId: evidence.workstreamId, artifact: evidence.artifact, createdAt: evidence.createdAt } }
+    }
+    if (query.taskId !== undefined) {
+      const task = this.task(missionId, query.taskId)
+      return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
+        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+        ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40) }
+    }
+    const eventLimit = 12
+    const fetched = this.store.events(missionId, query.after ? eventLimit + 1 : eventLimit, query.after)
+    const events = fetched.slice(0, eventLimit).map(event => ({ seq: event.seq, type: event.type, actor: event.actor, summary: excerpt(event.data, 240) }))
+    const eventCursor = { ...(events.length ? { nextAfter: events.at(-1)!.seq } : {}), ...(fetched.length > eventLimit ? { moreEvents: true } : {}) }
+    const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: this.inFlightEstimate(members) }
+    if (member) {
+      const current = tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+      const source = current?.reviewOf ? this.task(missionId, current.reviewOf) : undefined
+      return {
+        mission: { id: mission.id, title: mission.title, status: mission.status, ...budget },
+        member: { id: member.id, name: member.name, role: member.role, status: member.status },
+        current: current ? {
+          task: taskRecord(current, 2400), attemptId: current.attempt!.id,
+          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
+        } : null,
+        evidence: current ? evidenceOf(current) : [],
+        ...runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20),
+        events, ...eventCursor,
+        board: tasks.map(taskRef), members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status })),
+        detail: 'Focused view. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
+      }
+    }
+    const full = query.detail === 'full'
+    const evidence = this.store.list('evidence', missionId)
+    return {
+      mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
+      members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status, ...(item.activity ? { activity: item.activity.kind } : {}), accountedTokens: item.accountedTokens ?? 0, requests: item.usage?.requests ?? 0 })),
+      board: full ? tasks.map(task => taskRecord(task, 6000)) : tasks.map(taskRef),
+      evidence: (full ? evidence : evidence.filter(item => item.status === 'challenged')).map(item => evidenceRef(item, full)),
+      unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
+      pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => !delivery.deliveredAt).length,
+      events, ...eventCursor,
+      detail: full ? 'Complete task records and evidence claims; tool payloads are read by runId.' : 'Compact board. taskId reads one task with evidence and runs; detail=full expands every task record; after returns only newer events.',
+      ...(owner ? {} : { note: 'Non-member observer' }),
+    }
+  }
+  /** Requests already streaming have no reported usage yet; estimate each at its worker's average. */
+  private inFlightEstimate(members: Member[]): number {
+    let total = 0
+    for (const member of members) {
+      if (member.status === 'stopped') continue
+      const activity = this.workers.currentActivity ? this.workers.currentActivity(member.id) : member.activity
+      if (activity?.kind !== 'model') continue
+      const requests = member.usage?.requests ?? 0
+      if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
+    }
+    return total
   }
   /** One completion policy is shared by manual controls and automatic requests. */
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
@@ -834,10 +1021,19 @@ export class SwarmRuntime {
     if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
     const tasks = this.store.list('tasks', missionId)
     const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
+    // A dependency reference to a replaced original also covers its accepted repair.
     const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
       if (seen.has(task.id)) return false
       seen.add(task.id)
-      return task.dependencies.some(id => id === sourceId || tasks.some(parent => parent.id === id && covers(parent, sourceId, seen)))
+      return task.dependencies.some(id => {
+        const identities = this.dependencyIdentities(missionId, id, tasks)
+        return identities.has(sourceId) || tasks.some(parent => identities.has(parent.id) && covers(parent, sourceId, seen))
+      })
+    }
+    if (!tasks.some(task => task.kind === 'integration')) {
+      // A single reviewed implementation is the deliverable when the plan needed no assembly step.
+      if (implementations.length === 1 && implementations[0]!.artifact) return { mission, task: implementations[0]! }
+      throw new Error('A unique independently accepted implementation artifact is required when the plan has no integration task')
     }
     const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
     // A later integration may subsume an earlier one; never guess among independent final artifacts.
@@ -861,24 +1057,93 @@ export class SwarmRuntime {
       return result
     })
   }
-  private completionError(mission: Mission): string | undefined {
+  /**
+   * Tasks that can never be dispatched again: pending work whose dependency
+   * lineage or review source is dead, reviews assigned to their own author, and
+   * blocked work. They contribute nothing further; completion may cancel them
+   * once every acceptance criterion is independently covered.
+   */
+  private unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
+    const live = members.filter(member => member.status !== 'stopped')
+    const dead = new Set(tasks.filter(task => task.status === 'blocked').map(task => task.id))
+    // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
+    for (let changed = true; changed;) {
+      changed = false
+      for (const task of tasks) {
+        if (dead.has(task.id) || task.status !== 'pending') continue
+        const stuck = task.dependencies.some(dep => { const effective = this.effectiveDependency(mission.id, dep, tasks); return effective.status === 'cancelled' || dead.has(effective.id) })
+          || (task.reviewOf !== undefined && (() => {
+            const source = this.task(mission.id, task.reviewOf)
+            return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
+              || (task.assigneeId !== undefined && (source.attempt?.ownerId ?? source.assigneeId) === task.assigneeId)
+          })())
+          || (task.assigneeId !== undefined && !live.some(member => member.id === task.assigneeId))
+        if (stuck) { dead.add(task.id); changed = true }
+      }
+    }
+    return tasks.filter(task => dead.has(task.id))
+  }
+  /** Nothing is running, submitted or dispatchable: workers would stay idle forever. */
+  private stalled(mission: Mission, tasks: Task[], members: Member[]): boolean {
+    if (tasks.some(task => task.status === 'running' || task.status === 'submitted')) return false
+    const live = members.filter(member => member.status !== 'stopped')
+    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
+  }
+  private completionError(mission: Mission, options: { cancelUnschedulable?: boolean } = {}): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
-    if (!tasks.length || tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))) return 'Mission still has unfinished or blocked required work'
+    if (!tasks.length) return 'Mission still has unfinished or blocked required work'
+    const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()
+    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked') && !leftover.has(task.id))
+    if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
     const accepted = tasks.filter(task => task.status === 'accepted')
-    if (!mission.acceptance.every(criterion => accepted.some(task => task.acceptance.includes(criterion)))) return 'Accepted tasks do not cover every mission acceptance criterion'
-    if (tasks.some(task => task.kind === 'implementation') && !accepted.some(task => task.kind === 'integration' && task.artifact)) return 'Coding missions require an independently accepted integration artifact'
-    if (this.store.list('evidence', mission.id).some(evidence => evidence.status === 'challenged')) return 'Unresolved evidence challenges prevent completion'
+    const uncovered = mission.acceptance.filter(criterion => !accepted.some(task => task.acceptance.includes(criterion)))
+    if (uncovered.length) {
+      const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
+      return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
+    }
+    if (tasks.some(task => task.kind === 'implementation') && !accepted.some(task => task.kind === 'integration' && task.artifact)) {
+      const implementations = accepted.filter(task => task.kind === 'implementation' && task.artifact)
+      if (tasks.some(task => task.kind === 'integration') || implementations.length !== 1) return 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
+    }
+    // Evidence of cancelled or dead work no longer supports any accepted result; live disputes still block.
+    const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))
+    const disputed = this.store.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId))
+    if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
     return undefined
   }
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
-    if (mission.status !== 'active' || !this.store.list('starts', missionId).length || this.completionError(mission)) return false
-    this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', 'Automatically completed after independent verification satisfied all mission acceptance criteria')
+    if (mission.status !== 'active' || !this.store.list('starts', missionId).length) return false
+    const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
+    const strict = this.completionError(mission)
+    const isStalled = strict !== undefined && this.stalled(mission, tasks, members)
+    const relaxed = isStalled ? this.completionError(mission, { cancelUnschedulable: true }) : strict
+    if (strict !== undefined && !(isStalled && relaxed === undefined)) {
+      // The owner needs the gap that would remain after cancelling dead leftovers, not the leftovers themselves.
+      if (isStalled) this.notifyStall(mission, tasks, members, relaxed ?? strict)
+      return false
+    }
+    this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', isStalled
+      ? 'Automatically completed: every acceptance criterion was independently covered and the remaining tasks could no longer be scheduled'
+      : 'Automatically completed after independent verification satisfied all mission acceptance criteria')
     this.commit(missionId, () => {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})
       this.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`)
     })
     return true
+  }
+  /** Wake the owner once per distinct stalled state; idle workers cannot resolve it themselves. */
+  private notifyStall(mission: Mission, tasks: Task[], members: Member[], reason: string): void {
+    const leftover = this.unschedulable(mission, tasks, members)
+    const fingerprint = JSON.stringify(tasks.filter(task => !['accepted', 'cancelled'].includes(task.status)).map(task => [task.id, task.status, task.epoch]))
+    if (mission.stallNotice === fingerprint) return
+    mission.stallNotice = fingerprint; mission.updatedAt = Date.now()
+    const detail = leftover.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
+    this.commit(mission.id, () => {
+      this.store.put('missions', mission)
+      this.store.event(mission.id, 'mission/stalled', 'runtime', { reason, unschedulable: leftover.map(task => task.id) })
+      this.notify(mission.id, `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`)
+    })
   }
   /** Primary-agent resource decisions change ceilings without resetting consumed work. */
   updateBudget(actor: Actor, missionId: string, input: Budget, reason?: string): Budget {
@@ -921,7 +1186,8 @@ export class SwarmRuntime {
       if (!coordinatorId || !this.store.list('members', missionId).some(m => m.id === coordinatorId && m.status !== 'stopped')) throw new Error('Unknown coordinator')
       mission.coordinatorId = coordinatorId
     } else if (action === 'complete') {
-      const error = this.completionError(mission)
+      // The owner decides; verified coverage and the deliverable are still required.
+      const error = this.completionError(mission, { cancelUnschedulable: true })
       if (error) throw new Error(error)
       mission.status = 'completed'
     } else if (action === 'resume') {
@@ -932,6 +1198,12 @@ export class SwarmRuntime {
     this.commit(missionId, () => {
       this.store.put('missions', mission)
       this.syncStarts(mission)
+      if (action === 'complete') for (const task of this.unschedulable(mission, this.store.list('tasks', missionId), this.store.list('members', missionId))) {
+        task.status = 'cancelled'; task.epoch++; delete task.attempt; delete task.resumeAfterStop; delete task.budgetResume
+        task.output = `${task.output ?? ''}\nCancelled at completion: this task could no longer be scheduled and every acceptance criterion was independently covered.`.trim()
+        this.store.put('tasks', task)
+        this.store.event(missionId, 'task/cancelled-at-completion', 'owner', { taskId: task.id, reason })
+      }
       if (action === 'pause' || action === 'stop') for (const task of this.store.list('tasks', missionId)) {
         if (task.status !== 'running' && !(task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch)) continue
         task.status = action === 'pause' ? 'pending' : 'cancelled'; task.epoch++; delete task.attempt
@@ -969,7 +1241,7 @@ export class SwarmRuntime {
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
     if (/subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph/.test(tool) || ['send_message', 'interrupt_agent', 'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control'].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
     const active = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
-    if (active && !active.dependencies.every(dep => this.task(member.missionId, dep).status === 'accepted')) return 'A prerequisite was invalidated; stop work and inspect the challenge'
+    if (active && !active.dependencies.every(dep => this.dependencySatisfied(member.missionId, dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
     if (active?.reviewOf && this.task(member.missionId, active.reviewOf).status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
     if (active?.attempt && active.attempt.leaseUntil < Date.now()) return 'Task lease expired; await reassignment'
     if (!active && !tool.startsWith('swarm_')) return 'Claim an assigned task before executing workspace tools'
@@ -983,7 +1255,8 @@ export class SwarmRuntime {
     if (mission.status !== 'active') throw new Error(`Mission is ${mission.status}`)
     if (mission.budgetPause) return false
     if (member.status === 'waiting' && !hasFreshInput) return false
-    if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens || Date.now() >= mission.deadline) {
+    // Requests still streaming for other workers will settle against the same pool.
+    if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens + this.inFlightEstimate(this.store.list('members', mission.id).filter(item => item.id !== memberId)) >= mission.budget.maxTokens || Date.now() >= mission.deadline) {
       this.blockBudget(mission); throw new Error('Mission aggregate budget exhausted')
     }
     mission.usedSteps++; mission.updatedAt = Date.now()
@@ -1005,18 +1278,40 @@ export class SwarmRuntime {
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
   }
   /** Reconcile durable Harness usage cumulatively, including after a crash before SQLite accounting. */
-  private async usageSnapshot(memberId: string, totalTokens: number): Promise<void> {
+  private async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> {
     if (this.closed) return
     if (!Number.isSafeInteger(totalTokens) || totalTokens < 0) throw new Error('Invalid authoritative usage snapshot')
+    if (usage !== undefined && !validUsage(usage)) throw new Error('Invalid usage buckets')
     const member = this.store.get('members', memberId)
     if (!member) throw new Error('Unknown worker in usage accounting')
     const mission = this.mission(member.missionId)
     const previouslyAccounted = member.accountedTokens ?? 0
-    if (totalTokens <= previouslyAccounted) return
-    member.accountedTokens = totalTokens
-    mission.usedTokens += totalTokens - previouslyAccounted
+    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, member.usage)
+    if (totalTokens <= previouslyAccounted && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0))) return
+    member.accountedTokens = Math.max(previouslyAccounted, totalTokens)
+    mission.usedTokens += Math.max(0, totalTokens - previouslyAccounted)
+    if (bucketDelta !== undefined) { member.usage = usage; mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
     this.commit(mission.id, () => { this.store.put('members', member); this.store.put('missions', mission) })
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
+  }
+  /**
+   * Owner-session usage (planning, coordination, replies to notices) is not
+   * charged to the worker pool but is attributed to that owner's newest live
+   * mission, or to its planning request before launch, so the total cost of a
+   * collaboration stays visible.
+   */
+  private recordOwnerUsage(sessionId: string, usage: UsageBuckets): void {
+    if (this.closed || this.shuttingDown || !validUsage(usage) || this.isWorkerSession(sessionId)) return
+    const mission = this.store.list('missions').filter(item => item.ownerSessionId === sessionId && !terminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
+    if (mission) {
+      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = Date.now()
+      this.commit(mission.id, () => this.store.put('missions', mission))
+      return
+    }
+    const request = this.store.list('starts').filter(item => item.ownerSessionId === sessionId && (item.status === 'planning' || item.status === 'launching')).sort((a, b) => b.createdAt - a.createdAt)[0]
+    if (!request) return
+    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = Date.now()
+    this.commit(request.id, () => this.store.put('starts', request))
   }
   private blockBudget(mission: Mission): void {
     if (terminal(mission) || mission.status === 'blocked') return
@@ -1118,15 +1413,20 @@ export class SwarmRuntime {
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
     this.commit(mission.id, () => this.store.put('tasks', task))
   }
-  private async recordToolRun(memberId: string, input: Omit<ToolRun, 'id' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<void> {
-    if (this.closed || input.tool.startsWith('swarm_')) return
+  private async recordToolRun(memberId: string, input: Omit<ToolRun, 'id' | 'seq' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<string | undefined> {
+    if (this.closed || input.tool.startsWith('swarm_')) return undefined
     const member = this.store.get('members', memberId)
-    if (!member) return
+    if (!member) return undefined
     const task = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
-    if (!task?.attempt) return
+    if (!task?.attempt) return undefined
     const run: ToolRun = { ...input, id: id('run'), missionId: member.missionId, memberId, taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now() }
     task.attempt.leaseUntil = Date.now() + this.config.leaseMs
-    this.commit(member.missionId, () => { this.store.put('tool_runs', run); this.store.put('tasks', task); this.store.event(member.missionId, 'tool/recorded', memberId, { runId: run.id, taskId: task.id, tool: run.tool, isError: run.isError }) })
+    this.commit(member.missionId, () => {
+      run.seq = this.store.countToolRuns(member.missionId) + 1
+      this.store.put('tool_runs', run); this.store.put('tasks', task)
+      this.store.event(member.missionId, 'tool/recorded', memberId, { runId: run.id, seq: run.seq, taskId: task.id, tool: run.tool, isError: run.isError })
+    })
+    return run.id
   }
   private onIdle(memberId: string): void {
     if (this.closed || this.shuttingDown) return
@@ -1223,11 +1523,12 @@ export class SwarmRuntime {
       if (this.shuttingDown || this.mission(missionId).status !== 'active') return
       if (!this.workers.isIdle(member.id)) continue
       if (this.store.list('tasks', missionId).some(t => t.status === 'running' && t.attempt?.ownerId === member.id)) continue
-      const tasks = this.store.list('tasks', missionId).filter(t => this.ready(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+      const all = this.store.list('tasks', missionId)
+      const tasks = all.filter(t => this.ready(t, member, all)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
       const task = tasks[0]
       if (!task) continue
       try {
-        await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, task.dependencies.map(dep => this.task(missionId, dep)), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
+        await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
         if (this.shuttingDown || this.mission(missionId).status !== 'active') return
         const fresh = this.task(missionId, task.id)
         if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue

@@ -3,7 +3,6 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { realpath } from 'node:fs/promises'
 import { registerSwarmCommand } from './command.ts'
-import { TASK_PLANNING_RULES } from './tools.ts'
 import { ownerModelSelection } from './model-selection.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -15,26 +14,21 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-/** Host-produced instructions retain the exact user goal as separately identified data. */
+/**
+ * Host-produced instructions retain the exact user goal as separately identified
+ * data. Planning rules live once in the owner system prompt; this message carries
+ * only the dynamic request facts and the turn contract.
+ */
 export function planningMessage(request: AutoStart) {
   return createUserMessage({
     source: { kind: 'swarm-start', form: 'notice', summary: 'Agent Swarm: plan and start collaboration', requestId: request.id, commandId: request.commandId },
-    content: [{ type: 'text', text: `The user invoked /agent-swarm to execute this goal. Automatically plan and launch its collaboration now; do not ask them to configure agents or press Launch.
+    content: [{ type: 'text', text: `The user invoked /agent-swarm to execute this goal. Plan and launch its collaboration now with swarm_launch and this request id; do not ask them to configure agents or press Launch.
 Request id: ${request.id}
 Workspace: ${request.workspace}
-${request.baseline ? `Frozen planning workspace: ${request.baseline.planningWorkspace}\nSnapshot commit: ${request.baseline.snapshotCommit}\nInspect files and run read-only planning commands in this frozen workspace. The original source may keep changing; all workers will use this exact snapshot. Existing user changes are baseline context, not new swarm deliverables.` : ''}
-Resource budgets: choose these yourself from the actual task; no preset token or step allowance has been selected.
+${request.baseline ? `Frozen planning workspace: ${request.baseline.planningWorkspace}\nSnapshot commit: ${request.baseline.snapshotCommit}\nInspect files and run read-only planning commands in this frozen workspace. The original source may keep changing; all workers use this exact snapshot. Existing user changes are baseline context, not new swarm deliverables.` : ''}
 User goal (JSON string): ${JSON.stringify(request.goal)}
 
-Inspect the repository and relevant existing checks using a few read-only tool calls. Do not edit source files during planning. Choose the smallest useful team of persistent members suited to this goal, with at least two members for independent review. Workers inherit the current conversation model unless you explicitly select another available route for a concrete task reason. Decompose only useful work into a complete, bounded plan. Use narrow relative paths for scope, existing repository test commands that actually prove the goal; prefer the verified project scripts to inventing complex shell pipelines, and exact matching acceptance strings between mission and delivery tasks. Host acceptance commands run in a clean checkout of the committed immutable artifact. Never rely on uncommitted git diff output in those commands; the host separately validates changed paths against task scope.
-${TASK_PLANNING_RULES}
-Decide all six budget fields yourself: maxTokens (estimated total worker input/output tokens, including repeated context), maxSteps (total worker model calls), maxWorkers (team capacity), maxDurationMs (whole-mission elapsed time), maxTasks (room for the planned graph and likely repairs), maxExperiments (useful alternative hypotheses). Estimate from repository size, complexity, testing cost and uncertainty; avoid blindly copying a fixed allowance. Choose each member's maxOutputTokens (per-request output allowance) for its role within the selected model's capabilities. Select each task's maxRecoveryAttempts for lease/restart recovery and checkTimeoutMs for its check commands. Choose scopes, acceptance, check commands, dependencies, priorities and experimental work yourself. During execution, inspect real progress and use swarm_budget with a reason to adjust resource ceilings when warranted. Existing consumed tokens and steps are never reset; after a budget block, adjust it and use swarm_control resume if continuing is justified.
-Call swarm_launch with requestId ${request.id} and your complete plan. Required record fields (do not drop fields when retrying):
-- members[]: key, name, role, maxOutputTokens.
-- workstreams[]: key, title, objective.
-- tasks[]: key, workstreamKey, title, objective, kind, scope, acceptance, assigneeKey, maxRecoveryAttempts, checkTimeoutMs. Code sources also need checks; verification also needs reviewOf; integration needs dependencies.
-Every single tasks[] entry MUST contain its own explicit key, including verification entries. title is not key. For example a source key task_1 is referenced by reviewOf: task_1; choose your own stable identifiers for the actual task. scopes contain only literal relative paths (such as src/ or a filename discovered in this repository); put explanations in objective, not scope. Copy mission acceptance strings verbatim into relevant task acceptance arrays; for code, the final integration task should copy the entire mission acceptance array exactly. Never weaken or delete a user requirement just to pass schema validation. If a tool returns a validation error, repair that specific field while preserving all other required fields and the user's complete goal. Assign each task to a member. Every research, implementation and integration task needs a verification task assigned to a different member, with reviewOf pointing at its source key. Do not also put that source in the verification task's dependencies: the reviewer starts on the submitted artifact. For code, include an integration task depending on the implementation tasks so their accepted artifacts are assembled; include a separate independent reviewOf that integration. Integration needs the real verification commands too. For a small code change, two members and four tasks (implement, review implementation, integrate, review integration) suffice. Avoid redundant research or busywork. Do not hard-code a sample goal or tests from these instructions.
-swarm_launch validates and launches the entire plan automatically. If validation reports a correctable error, fix the plan and retry the same requestId. Never use swarm_stage, manual UI setup, swarm_create, or other delegation tools for this request. After successful launch or resume, give a brief text response and end this native conversation turn. Explain the division of work and budget rationale after launch. The runtime sends notices when your attention is needed and when the mission completes; wait for those notices rather than polling. swarm_wait is for member workers only, not the primary agent. The runtime automatically completes only after independently accepted results meet all criteria. Report final accepted artifact locations; do not claim the source checkout was changed or merged. If the goal is not actionable, explain the concrete blocker instead of inventing work.` }],
+Inspect the repository and its existing check commands with a few read-only tool calls; do not edit source files. Follow the Agent Swarm owner protocol in your system prompt: choose the team, task graph, scopes, verbatim acceptance copies, real check commands, all six budget fields, each member's maxOutputTokens and reasoning effort, and each task's maxRecoveryAttempts and checkTimeoutMs from this repository and goal. Workers inherit this conversation's model unless a member sets another route for a concrete reason. If swarm_launch returns validation errors, repair every listed field in one retry with the same request id and complete plan; never use swarm_stage, swarm_create or other delegation tools for this request. After a successful launch, reply briefly with the division of work and budget rationale, end this turn, and wait for runtime notices instead of polling. Report final accepted artifact locations when notified; do not claim the source checkout was changed or merged. If the goal is not actionable, explain the concrete blocker instead of inventing work.` }],
   })
 }
 
