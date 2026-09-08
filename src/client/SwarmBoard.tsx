@@ -1,8 +1,10 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member } from '../types.ts'
 import { LANES, compactNumber, evidenceCounts, eventSummary, remainingPercent, shortId, taskLane } from './projection.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
+import { MissionProgress, RecentProgress, ResultSummary } from './MissionProgress.tsx'
+import { activityLabels, memberActivity, type ConnectionState } from './progress.ts'
 
 type View = 'board' | 'evidence' | 'activity' | 'graph'
 function time(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
@@ -12,7 +14,8 @@ function tone(status: string): string {
     : ['active', 'working', 'running'].includes(status) ? 'live' : 'warn'
 }
 function Badge({ value }: { value: string }) {
-  return <span className="sw-chip" data-tone={tone(value)}>{value.replaceAll('_', ' ')}</span>
+  const t = useCopy()
+  return <span className="sw-chip" data-tone={tone(value)}>{t(value.replaceAll('_', ' '))}</span>
 }
 function Metric({ label, value, detail, remaining }: { label: string; value: string; detail: string; remaining?: number }) {
   return <div className="sw-metric"><label>{label}</label><strong>{value}</strong><small>{detail}</small>
@@ -49,12 +52,14 @@ function TaskCard({ task, snapshot }: { task: Task; snapshot: Snapshot }) {
 function Worker({ member, tasks, onOpen }: { member: Member; tasks: Task[]; onOpen?: (member: Member) => void }) {
   const t = useCopy()
   const current = tasks.find(task => task.status === 'running' && (task.attempt?.ownerId ?? task.assigneeId) === member.id)
+  const activity = memberActivity(member, tasks)
   return <article className="sw-worker"><div className="sw-row"><div className="sw-person">
     <span className="sw-avatar" aria-hidden="true">{member.name.slice(0, 2).toUpperCase()}</span>
     <div><div className="sw-worker-name">{member.name}</div><div className="sw-small">{member.role}</div></div>
   </div><Badge value={member.status} /></div>
     {member.model && <div className="sw-small" style={{ marginTop: 8 }}>{member.provider ? `${member.provider} / ` : ''}{member.model}{member.reasoningEffort ? ` · ${member.reasoningEffort}` : ''}</div>}
     <p className="sw-small" style={{ marginTop: 7 }}>{current?.title ?? t(member.status === 'waiting' ? 'Waiting for input or dependencies' : 'No active task')}</p>
+    {activity && <p className="sw-small" data-swarm-worker-activity={activity.kind}>{t(activityLabels[activity.kind])}{activity.tool ? ` · ${activity.tool}` : ''}</p>}
     {onOpen && <button className="sw-link" data-worker-session={member.sessionId} onClick={() => onOpen(member)}>{t('Open conversation')} ↗</button>}
   </article>
 }
@@ -83,9 +88,13 @@ function EvidenceCard({ evidence, snapshot }: { evidence: Evidence; snapshot: Sn
 }
 
 /** Read-only projection. Rendering never performs a request or interprets peer text as code. */
-export function SwarmBoard({ snapshot, initialView = 'board', onOpenWorker, live = false }: { snapshot: Snapshot; initialView?: View; onOpenWorker?: (member: Member) => void; live?: boolean }) {
+export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, connection = 'connected', actions, delivery, technicalDetails }: {
+  snapshot: Snapshot; initialView?: View; onOpenWorker?: (member: Member) => void; live?: boolean;
+  connection?: ConnectionState; actions?: ReactNode; delivery?: ReactNode; technicalDetails?: ReactNode;
+}) {
   const t = useCopy()
-  const [view, setView] = useState<View>(initialView)
+  const [view, setView] = useState<View>(initialView ?? 'board')
+  const [detailsOpen, setDetailsOpen] = useState(initialView !== undefined)
   const [stream, setStream] = useState('all')
   const { mission } = snapshot
   const tasks = snapshot.tasks.filter(task => stream === 'all' || task.workstreamId === stream)
@@ -95,9 +104,25 @@ export function SwarmBoard({ snapshot, initialView = 'board', onOpenWorker, live
   const activeWorkers = snapshot.members.filter(member => member.status === 'working').length
   const blocked = snapshot.tasks.filter(task => taskLane(task, snapshot.tasks) === 'blocked').length
   return <section data-swarm="" aria-label={`Agent Swarm mission: ${mission.title}`}>
-    <header className="sw-head"><div className="sw-row"><span className="sw-eyebrow">{t('Agent Swarm')} / {t('Mission control')}</span><Badge value={mission.status} /></div>
-      <h2>{mission.title}</h2><p className="sw-objective">{mission.objective}</p>
+    <header className="sw-head"><div className="sw-row"><span className="sw-eyebrow">{t(live ? 'Current mission' : 'Mission snapshot')}</span><Badge value={mission.status} /></div>
+      <h2>{mission.title}</h2>
     </header>
+    <div className="sw-overview">
+      <MissionProgress snapshot={snapshot} live={live} connection={connection} />
+      {mission.status === 'completed' && <ResultSummary snapshot={snapshot} />}
+      {delivery}
+      {actions}
+      <RecentProgress snapshot={snapshot} />
+      <details className="sw-disclosure" data-swarm-details="team"><summary>{t('Team')} <span className="sw-detail-count">{snapshot.members.length}</span></summary>
+        <div className="sw-workers">{snapshot.members.length === 0 ? <p className="sw-muted">{t('Workers appear when the mission delegates work.')}</p>
+          : snapshot.members.map(member => <Worker key={member.id} member={member} tasks={snapshot.tasks} onOpen={onOpenWorker} />)}</div>
+      </details>
+    </div>
+    <details className="sw-disclosure sw-technical" data-swarm-details="technical" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
+      <summary>{t('Task details and resources')}</summary>
+      {detailsOpen && <>
+    <p className="sw-objective sw-detail-objective">{mission.objective}</p>
+    {technicalDetails}
     <div className="sw-metrics"><Metric label={t('ACCEPTED WORK')} value={`${accepted} / ${snapshot.tasks.length}`} detail={`${blocked} blocked · ${snapshot.workstreams.length} workstreams`} />
       <Metric label={t('TOKENS USED')} value={compactNumber(mission.usedTokens)} detail={`of ${compactNumber(mission.budget.maxTokens)} budget`}
         remaining={remainingPercent(mission.usedTokens, mission.budget.maxTokens)} />
@@ -124,10 +149,6 @@ export function SwarmBoard({ snapshot, initialView = 'board', onOpenWorker, live
           {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} />)}
         </section>
       })}</div>
-        <section className="sw-section"><h3>{t('Workers')}</h3><div className="sw-workers">
-          {snapshot.members.length === 0 ? <div className="sw-empty">{t('Workers appear when the mission delegates work.')}</div>
-            : snapshot.members.map(member => <Worker key={member.id} member={member} tasks={snapshot.tasks} onOpen={onOpenWorker} />)}
-        </div></section>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">
           <div><h3>{t('Acceptance')}</h3><ul>{mission.acceptance.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>
           <div><h3>{t('Scope')}</h3><ul>{mission.scope.map((path, index) => <li key={index}>{path}</li>)}</ul>
@@ -148,6 +169,8 @@ export function SwarmBoard({ snapshot, initialView = 'board', onOpenWorker, live
         {snapshot.events.length > 40 && <p className="sw-small" style={{ marginTop: 12 }}>Showing the latest 40 events from this snapshot.</p>}
       </>}
     </div>
+    </>}
+    </details>
     <footer className="sw-foot"><span>Snapshot {new Date(mission.updatedAt).toLocaleString()} · {shortId(mission.id)}</span>
       <span>{t(live ? 'Updates automatically while this conversation is selected.' : 'Snapshot. Open the sidebar for live progress.')}</span></footer>
   </section>

@@ -12,6 +12,8 @@ import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import type { Actor, Budget, PlanInput, PlanMember } from './types.ts'
+import type { LiveState, LiveUpdate } from './live-types.ts'
+import { waitForStateChange } from './watch.ts'
 
 /** Payload bound is additional to the native Connection carrier's HTTP limit. */
 export interface WebApiOptions {
@@ -86,6 +88,18 @@ async function validateModels(ctx: Context, ownerId: SessionId, members: Pick<Pl
  */
 export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: WebApiOptions): void {
   if (!Number.isSafeInteger(options.maxPayloadBytes) || options.maxPayloadBytes < 1) throw new Error('maxPayloadBytes must be a positive integer')
+  const lifetime = new AbortController()
+  ctx.effect(() => () => lifetime.abort(new Error('Swarm web API was unloaded')), 'agent-swarm: watches')
+  const stateFor = (actor: Actor, header: SessionHeader, changed?: ReadonlySet<string>): { state: LiveState; missionIds: string[] } => {
+    const visible = runtime.visibleMissions(actor)
+    const writable = !runtime.isWorkerSession(actor.sessionId)
+    return { missionIds: visible.map(mission => mission.id), state: {
+      ownerSessionId: actor.sessionId, workspace: header.cwd!,
+      snapshots: visible.filter(mission => changed === undefined || changed.has(mission.id)).map(mission => runtime.snapshot(actor, mission.id)),
+      drafts: runtime.drafts(actor), starts: writable ? runtime.starts(actor) : [], defaultBudget: options.defaultBudget,
+      writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
+    } }
+  }
   const handler: ConnectionRpcHandler = async (endpoint, payload, signal) => {
     try {
       signal.throwIfAborted()
@@ -142,11 +156,37 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: { events: events.slice(cut, end).map(event => ({ event })), hasMore: cut > 0 } }
         }
         case 'state': {
-          const snapshots = runtime.visibleSnapshots(actor)
-          const writable = !runtime.isWorkerSession(sessionId)
-          return { ok: true, value: { ownerSessionId: sessionId, workspace: header.cwd,
-            snapshots, drafts: runtime.drafts(actor), starts: writable ? runtime.starts(actor) : [], defaultBudget: options.defaultBudget,
-            writable, ownerLive: writable && ctx.agents.get(sessionId) !== undefined } }
+          return { ok: true, value: stateFor(actor, header).state }
+        }
+        case 'watch': {
+          const after = body.afterRevision
+          if (after !== undefined && (!Number.isSafeInteger(after) || Number(after) < 0)) throw new Error('afterRevision must be a nonnegative safe integer')
+          const waitMs = body.waitMs ?? 20_000
+          if (!Number.isSafeInteger(waitMs) || Number(waitMs) < 0 || Number(waitMs) > 20_000) throw new Error('waitMs must be an integer from 0 through 20000')
+          const visibleScopes = () => new Set([sessionId, ...runtime.visibleMissions(actor).map(mission => mission.id)])
+          if (after !== undefined) await waitForStateChange(runtime.store, Number(after), visibleScopes, AbortSignal.any([signal, lifetime.signal]), Number(waitMs), wake => {
+            const observe = ({ agent }: { agent: { id: string } }) => { if (agent.id === sessionId) wake() }
+            const created = ctx.on('agent/created', observe, { global: true })
+            const disposed = ctx.on('agent/disposed', observe, { global: true })
+            return () => { created(); disposed() }
+          })
+          signal.throwIfAborted()
+          lifetime.signal.throwIfAborted()
+          const changes = after === undefined ? undefined : runtime.store.changesSince(Number(after))
+          const current = runtime.store.revision()
+          let update: LiveUpdate
+          if (changes === undefined) {
+            update = { kind: 'snapshot', ownerSessionId: sessionId, revision: current, ...stateFor(actor, header) }
+          } else {
+            const allowed = visibleScopes()
+            const changed = new Set(changes.flatMap(change => change.scopes).filter(scope => allowed.has(scope)))
+            update = changed.size === 0
+              ? { kind: 'heartbeat', ownerSessionId: sessionId, revision: current,
+                writable: !runtime.isWorkerSession(sessionId), ownerLive: !runtime.isWorkerSession(sessionId) && ctx.agents.get(sessionId) !== undefined,
+                workspace: header.cwd!, defaultBudget: options.defaultBudget }
+              : { kind: 'delta', ownerSessionId: sessionId, revision: current, ...stateFor(actor, header, changed) }
+          }
+          return { ok: true, value: update }
         }
         case 'create-draft':
           return { ok: true, value: { draft: runtime.createDraft(actor, await planInput(ctx, body, header, signal)) } }

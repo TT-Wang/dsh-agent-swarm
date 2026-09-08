@@ -96,7 +96,7 @@ test('current native Conversation assembler rebuilds swarm cards from durable to
 test('render includes evidence provenance, challenges, attempts, blockers and inert peer text', () => {
   const snapshot = uiSnapshot()
   snapshot.mission.title = '<script>steal()</script>'
-  const board = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot }))
+  const board = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, initialView: 'board' }))
   assert.match(board, /Attempt 2/)
   assert.match(board, /Waiting for source submission/)
   assert.match(board, /Snapshot\. Open the sidebar for live progress\./)
@@ -231,7 +231,7 @@ test('graph and Chinese card render real task/evidence projections and worker li
   assert.match(graph, /sw-graph-node/)
   assert.match(graph, /role="tabpanel" aria-label="Dependency graph"/)
   assert.match(graph, /stroke-dasharray="4 4"/)
-  const chinese = renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, React.createElement(SwarmBoard, { snapshot, onOpenWorker() {} })))
+  const chinese = renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, React.createElement(SwarmBoard, { snapshot, initialView: 'board', onOpenWorker() {} })))
   assert.match(chinese, /任务看板/)
   assert.match(chinese, /data-worker-session=/)
   assert.match(chinese, /打开对话/)

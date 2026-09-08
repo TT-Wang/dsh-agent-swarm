@@ -1,5 +1,6 @@
 import { authenticatedLaunchUrl, publicBaseUrl, publicFailure, redactWebSecrets, openAuthenticatedWeb, selectWebWorkspace, composerFor, isolateWebModelFixture, writeComposerDraft } from './web-smoke-browser.mjs'
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
+import { assertSimplifiedSwarm, observedSwarmState, openSwarmDetails } from './swarm-smoke-checks.mjs'
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -127,7 +128,7 @@ try {
       try {
         const body = await response.json()
         rpcResults.push({ endpoint, ...body.result })
-        if (endpoint === '/agent-swarm/state' && body.result?.ok) latestState = body.result.value
+        if (body.result?.ok) latestState = observedSwarmState(latestState, endpoint, body.result.value) ?? latestState
       } catch { /* A cancelled navigation response does not overwrite the last observed state. */ }
     })
     async function clickRpc(locator, endpoint) {
@@ -184,6 +185,9 @@ try {
       const stagedOwner = stagedTrace.find(event => event.type === 'owner/session').sessionId
       assert(stagedTrace.filter(event => event.type === 'model/request').every(event => event.sessionId === stagedOwner), 'workers must not execute before browser launch')
       checks.push('model-staged topology is visible before launch with no worker execution')
+      await assertSimplifiedSwarm(panel)
+      await openSwarmDetails(panel, 'editor')
+      checks.push('default staged view hides technical tabs, budgets and manual plan fields until its advanced disclosure is opened')
       await page.getByTestId('draft-title').fill('Unsaved sidebar draft')
       await until(async () => {
         const box = await dock.boundingBox()
@@ -245,6 +249,7 @@ try {
       checks.push('live mission Pause/Resume controls, cancellation and reassignment')
       await until(() => latestState?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.tasks.every(task => task.status === 'accepted'), 'live accepted task state without owner swarm_observe', 45_000)
       // Live sessions can use the native conversation selector before mission disposal.
+      await openSwarmDetails(panel, 'team')
       await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
       await until(() => latestState?.ownerSessionId === builder.sessionId && latestState.writable === false, 'native active worker conversation navigation and read-only swarm view')
       await panel.getByText('Mission controls are read-only in worker conversations. Open the owner conversation to manage this mission.', { exact: true }).waitFor()
@@ -256,6 +261,7 @@ try {
       if (!await sessions.isVisible()) await page.getByRole('button', { name: 'Open sidebar', exact: true }).click()
       await sessions.getByRole('treeitem', { name: /^Prepare a staged swarm for / }).click()
       await until(() => latestState?.ownerSessionId === ownerSessionId && latestState.writable === true, 'native sidebar returns to the owner conversation')
+      await openSwarmDetails(panel, 'technical')
       const completed = await clickRpc(page.locator('[data-action="complete"]'), 'control')
       assert.equal(completed.snapshot.mission.status, 'completed')
       await panel.locator('[data-swarm-status="completed"]').waitFor()
@@ -266,6 +272,7 @@ try {
       checks.push('actual sandboxed worker tools, host evidence, independent verification and immutable artifact')
       await page.screenshot({ path: join(artifacts, 'completed.png'), fullPage: true })
       await writeFile(join(artifacts, 'completed.aria.txt'), await page.locator('body').ariaSnapshot())
+      await openSwarmDetails(panel, 'technical')
       await panel.getByRole('tab', { name: 'Dependency graph', exact: true }).click()
       await panel.getByRole('tabpanel', { name: 'Dependency graph', exact: true }).waitFor()
       await page.screenshot({ path: join(artifacts, 'dependency-graph.png'), fullPage: true })
@@ -307,8 +314,10 @@ try {
       await until(() => latestState?.drafts.find(draft => draft.status === 'draft' && draft.id !== saved.draft.id), 'second model-staged draft')
       const secondDraft = latestState.drafts.find(draft => draft.status === 'draft' && draft.id !== saved.draft.id)
       await panel.getByRole('combobox', { name: 'Missions', exact: true }).selectOption(`draft:${secondDraft.id}`)
+      await openSwarmDetails(panel, 'editor')
       const secondLaunch = await clickRpc(page.locator('[data-action="launch-draft"]'), 'launch-draft')
       assert.notEqual(secondLaunch.snapshot.mission.id, missionId)
+      await openSwarmDetails(panel, 'technical')
       await page.locator('[data-action="stop"]').click()
       const stopped = await clickRpc(page.locator('[data-action="stop"]'), 'control')
       assert.equal(stopped.snapshot.mission.status, 'stopped')
@@ -318,6 +327,7 @@ try {
       await panel.getByRole('combobox', { name: 'Missions', exact: true }).selectOption(`mission:${missionId}`)
       const beforeHistory = (await readFile(tracePath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
       const workerRequests = events => events.filter(event => event.type === 'model/request' && [builder.sessionId, reviewer.sessionId].includes(event.sessionId)).length
+      await openSwarmDetails(panel, 'team')
       await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
       const transcript = panel.locator(`[data-swarm-transcript="${builder.sessionId}"]`)
       await transcript.waitFor()

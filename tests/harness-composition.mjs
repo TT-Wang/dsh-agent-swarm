@@ -215,7 +215,8 @@ function attachTranscript(context) {
 const budget = { maxTokens: 50_000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 90_000, maxTasks: 20, maxExperiments: 3 }
 const config = {
   statePath: join(runRoot, 'swarm.sqlite'), workspacesRoot: join(runRoot, 'worktrees'),
-  tickMs: 20, leaseMs: 30_000, checkTimeoutMs: 5000, maxCheckOutputBytes: 16_000,
+  // Real Git and child-process checks share the host with integration suites.
+  tickMs: 20, leaseMs: 30_000, checkTimeoutMs: 30_000, maxCheckOutputBytes: 16_000,
 }
 
 try {

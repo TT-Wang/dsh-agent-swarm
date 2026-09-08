@@ -18,13 +18,17 @@ interface Tables {
 }
 export type Table = keyof Tables
 const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts']
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
+const CHANGE_HISTORY = 1024
+export interface StoreChange { revision: number; scopes: string[] }
 /** SQLite-backed source of truth. Only one live runtime may own a state file. */
 export class SwarmStore {
   private readonly db: DatabaseSync
   private readonly lockPath: string
   private readonly nonce = randomUUID()
   private closed = false
+  private transactionScopes?: Set<string>
+  private readonly listeners = new Set<() => void>()
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.lockPath = `${path}.lock`
@@ -34,7 +38,7 @@ export class SwarmStore {
       chmodSync(path, 0o600)
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;')
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
-      if (version !== 0 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
+      if (version !== 0 && version !== 1 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
       this.db.exec('BEGIN IMMEDIATE')
       try {
         for (const table of TABLES) {
@@ -42,6 +46,7 @@ export class SwarmStore {
         }
         this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS starts_command ON starts(json_extract(value, '$.ownerSessionId'), json_extract(value, '$.commandId'))")
         this.db.exec('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS events_mission ON events(mission_id, seq);')
+        this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
       } catch (error) { this.db.exec('ROLLBACK'); throw error }
     } catch (error) { this.releaseLock(); throw error }
@@ -74,10 +79,48 @@ export class SwarmStore {
   }
   /** Commit a synchronous group of state changes and outbox events atomically. */
   transaction<T>(operation: () => T): T {
+    if (this.closed) throw new Error('Swarm store is closed')
+    if (this.transactionScopes) throw new Error('Nested swarm transactions are not supported')
     this.db.exec('BEGIN IMMEDIATE')
-    try { const result = operation(); this.db.exec('COMMIT'); return result }
-    catch (error) { this.db.exec('ROLLBACK'); throw error }
+    this.transactionScopes = new Set()
+    let result: T, changed = false
+    try {
+      result = operation()
+      changed = this.transactionScopes.size > 0
+      if (changed) {
+        this.db.exec('UPDATE state_revision SET revision=revision+1 WHERE id=1')
+        const revision = this.revision()
+        this.db.prepare('INSERT INTO state_changes(revision,scopes) VALUES(?,?)').run(revision, JSON.stringify([...this.transactionScopes]))
+        this.db.prepare('DELETE FROM state_changes WHERE revision<=?').run(revision - CHANGE_HISTORY)
+      }
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+    finally { this.transactionScopes = undefined }
+    // Observers see only committed data, and cannot roll back another observer's work.
+    if (changed) this.publish()
+    return result
   }
+  /** Cursor for every committed mutation, including those without coordination events. */
+  revision(): number {
+    if (this.closed) throw new Error('Swarm store is closed')
+    return Number(this.db.prepare('SELECT revision FROM state_revision WHERE id=1').get()!.revision)
+  }
+  /** Undefined means the cursor cannot be replayed and the reader needs a fresh snapshot. */
+  changesSince(after: number): StoreChange[] | undefined {
+    const current = this.revision()
+    if (!Number.isSafeInteger(after) || after < 0 || after > current) return undefined
+    if (after === current) return []
+    const first = Number(this.db.prepare('SELECT MIN(revision) AS first FROM state_changes').get()?.first ?? current + 1)
+    if (after < first - 1) return undefined
+    return this.db.prepare('SELECT revision,scopes FROM state_changes WHERE revision>? ORDER BY revision').all(after)
+      .map(row => ({ revision: Number(row.revision), scopes: JSON.parse(String(row.scopes)) as string[] }))
+  }
+  subscribe(listener: () => void): () => void {
+    if (this.closed) throw new Error('Swarm store is closed')
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+  private publish(): void { for (const listener of this.listeners) { try { listener() } catch { /* Observers own failure handling. */ } } }
   /** Read a detached record. Durable parsers reject malformed identity fields. */
   get<T extends Table>(table: T, id: string): Tables[T] | undefined {
     const row = this.db.prepare(`SELECT value FROM ${table} WHERE id=?`).get(id)
@@ -98,10 +141,14 @@ export class SwarmStore {
   put<T extends Table>(table: T, value: Tables[T]): void {
     const missionId = 'missionId' in value && value.missionId !== undefined ? value.missionId : value.id
     this.db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET mission_id=excluded.mission_id,value=excluded.value`).run(value.id, missionId, JSON.stringify(value))
+    this.transactionScopes?.add(missionId)
+    if ('ownerSessionId' in value) this.transactionScopes?.add(value.ownerSessionId)
+    if ('sessionId' in value) this.transactionScopes?.add(value.sessionId)
   }
   /** Append an immutable coordination event inside the same state transaction. */
   event(missionId: string, type: string, actor: string, data: unknown): void {
     this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)').run(missionId, type, actor, JSON.stringify(data), Date.now())
+    this.transactionScopes?.add(missionId)
   }
   /** Read chronological deltas, bounded for display and agent context. */
   events(missionId: string, limit: number, after = 0): SwarmEvent[] {
@@ -114,6 +161,8 @@ export class SwarmStore {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.publish()
+    this.listeners.clear()
     this.db.close()
     this.releaseLock()
   }

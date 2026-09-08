@@ -11,8 +11,10 @@ import { selectedOperation } from './selection.ts'
 import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
 import { BaselineNotice, DeliveryPanel } from './DeliveryPanel.tsx'
+import type { ConnectionState } from './progress.ts'
 
 export const OPEN_MONITOR = 'agent-swarm:open-monitor'
+const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting', paused: 'Updates paused' }
 export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
   sessions: Context['sessions']; modelDirectories: Context['modelDirectories']; monitor: SwarmMonitor;
   history: WorkerHistory; onOpenWorker: (member: Member) => void;
@@ -23,13 +25,13 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const state = useSyncExternalStore(monitor.subscribe, monitor.getSnapshot, monitor.getSnapshot)
   const transcript = useSyncExternalStore(history.subscribe, history.getSnapshot, history.getSnapshot)
   const owner = sessionId === undefined ? sessionState.current : sessionId as SessionId
-  const selectedOwner = useRef(owner)
-  selectedOwner.current = owner
   const [selection, setSelection] = useState(''), [localDraft, setLocalDraft] = useState<DraftPlan>(), [localMission, setLocalMission] = useState<Snapshot>()
-  const [error, setError] = useState(''), [busy, setBusy] = useState(''), [stopArmed, setStopArmed] = useState(false)
-  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setError(''); setBusy(''); setStopArmed(false) }, [owner, monitor, history])
+  const [error, setError] = useState(''), [busy, setBusy] = useState(''), [stopArmed, setStopArmed] = useState(false), [editorOpen, setEditorOpen] = useState(false)
+  const [editorMounted, setEditorMounted] = useState(false)
+  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }, [owner, monitor, history])
   useEffect(() => { monitor.select(owner, active) }, [active, owner, monitor])
   const data = state.ownerSessionId === owner ? state.data : undefined
+  const connection: ConnectionState = state.ownerSessionId === owner ? (state.connection ?? (state.loading ? 'connecting' : state.error ? 'reconnecting' : state.data ? 'connected' : 'connecting')) : 'connecting'
   const starts = data?.starts ?? []
   const latestStart = [...starts].sort((a, b) => b.createdAt - a.createdAt)[0]
   const autoDraftIds = new Set(starts.map(item => item.draftId))
@@ -51,15 +53,23 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const knownSelection = selection === 'new' || drafts.some(item => `draft:${item.id}` === selection) || snapshots.some(item => `mission:${item.mission.id}` === selection)
   const launchedSelection = data?.drafts.find(item => `draft:${item.id}` === selection && item.status === 'launched')?.missionId
   const selected = knownSelection ? selection : launchedSelection ? `mission:${launchedSelection}` : drafts[0] ? `draft:${drafts[0].id}` : snapshots[0] ? `mission:${snapshots[0].mission.id}` : ''
+  const showMissionPicker = drafts.length + snapshots.length > 1 || (selected === 'new' && drafts.length + snapshots.length > 0)
   const draft = drafts.find(item => `draft:${item.id}` === selected)
   const snapshot = snapshots.find(item => `mission:${item.mission.id}` === selected)
+  const selectedContext = useRef({ key: '', generation: 0 })
+  const context = `${owner ?? ''}:${selected}`
+  if (selectedContext.current.key !== context) selectedContext.current = { key: context, generation: selectedContext.current.generation + 1 }
+  const generation = selectedContext.current.generation
+  const stillSelected = () => selectedContext.current.key === context && selectedContext.current.generation === generation
+  const selectedStart = snapshot ? starts.find(item => item.missionId === snapshot.mission.id) : selected === 'new' || draft ? undefined : latestStart
+  const start = selectedStart && ['planning', 'launching', 'failed'].includes(selectedStart.status) ? selectedStart : undefined
   const directory = useMemo(() => {
     if (!owner || (!sessionId && sessionState.currentAddress)) return undefined
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
   }, [owner, sessionId, modelDirectories, sessionState.currentAddress])
-  const stillSelected = () => selectedOwner.current === owner
+  const choose = (value: string) => { history.close(); setSelection(value); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }
   const control = async (action: 'pause' | 'resume' | 'stop' | 'complete') => {
-    if (!owner || !snapshot || !data?.writable) return
+    if (!owner || !snapshot || !data?.writable || connection !== 'connected') return
     setBusy(action); setError('')
     await selectedOperation(stillSelected,
       () => monitor.request<{ snapshot: Snapshot }>('control', { sessionId: owner, missionId: snapshot.mission.id, action, reason: `User selected ${action} in the Agent Swarm monitor.` }), {
@@ -68,49 +78,62 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
         settled: () => setBusy(''),
       })
   }
+  const disabled = Boolean(busy) || connection !== 'connected'
+  const status = snapshot?.mission.status
+  const controls = snapshot && <div className="sw-mission-controls" data-swarm-mission={snapshot.mission.id}>
+    <span data-swarm-status={status} className="sw-sr-only">{t(status!)}</span>
+    {data?.writable && status === 'active' && <button data-action="pause" disabled={disabled} onClick={() => { void control('pause') }}>{t('Pause')}</button>}
+    {data?.writable && ['paused', 'blocked'].includes(status!) && <button data-action="resume" disabled={disabled} onClick={() => { void control('resume') }}>{t('Resume')}</button>}
+    {busy && <span role="status">{t('Working')}…</span>}
+  </div>
+  const advancedControls = snapshot && data?.writable && !['completed', 'stopped', 'staged'].includes(status!) && <div className="sw-mission-controls">
+    {!starts.some(item => item.missionId === snapshot.mission.id) && <button data-action="complete" disabled={disabled || !snapshot.tasks.length || snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))} onClick={() => { void control('complete') }}>{t('Complete')}</button>}
+    <button data-action="stop" disabled={disabled} onClick={() => stopArmed ? void control('stop') : setStopArmed(true)}>{t(stopArmed ? 'Confirm stop' : 'Stop')}</button>
+    {stopArmed && <span className="sw-small">{t('Stop ends this mission and its workers.')} <button onClick={() => setStopArmed(false)}>{t('Cancel')}</button></span>}
+  </div>
   return <aside data-swarm="" data-swarm-panel="" data-swarm-session={owner} aria-label={t('Mission control')}>
     <header className="sw-panel-title">
-      <div><strong>{t('Agent Swarm')}</strong><small><span className="sw-live-dot" data-error={Boolean(state.error)} />{t(state.error ? 'Reconnecting' : 'Live')} · {sessionState.byId[owner!]?.displayTitle ?? t('Mission control')}</small></div>
+      <div><strong>{t('Agent Swarm')}</strong><small data-swarm-connection={connection}><span className="sw-live-dot" data-connection={connection} />{t(connectionLabels[connection])}</small></div>
       {onClose && <div className="sw-panel-buttons"><button title={t('Collapse sidebar')} aria-label={t('Collapse sidebar')} onClick={onClose}>›</button></div>}
     </header>
-    <div className="sw-panel-toolbar"><select aria-label={t('Missions')} value={selected} onChange={event => { history.close(); setSelection(event.currentTarget.value); setError(''); setStopArmed(false) }}>
+    <div className="sw-panel-toolbar">{showMissionPicker && <select aria-label={t('Missions')} value={selected} onChange={event => choose(event.currentTarget.value)}>
       {!drafts.length && !snapshots.length && <option value="">{t('No missions yet')}</option>}
-      {drafts.length > 0 && <optgroup label={t('Drafts')}>{drafts.map(item => <option key={item.id} value={`draft:${item.id}`}>{item.input.title || t('New mission')} · {item.status}</option>)}</optgroup>}
-      {snapshots.length > 0 && <optgroup label={t('Missions')}>{snapshots.map(item => <option key={item.mission.id} value={`mission:${item.mission.id}`}>{item.mission.title} · {item.mission.status}</option>)}</optgroup>}
+      {drafts.length > 0 && <optgroup label={t('Drafts')}>{drafts.map(item => <option key={item.id} value={`draft:${item.id}`}>{item.input.title || t('New mission')} · {t(item.status)}</option>)}</optgroup>}
+      {snapshots.length > 0 && <optgroup label={t('Missions')}>{snapshots.map(item => <option key={item.mission.id} value={`mission:${item.mission.id}`}>{item.mission.title} · {t(item.mission.status)}</option>)}</optgroup>}
       {selected === 'new' && <option value="new">{t('New mission')}</option>}
-    </select><button disabled={!owner || !data?.writable} onClick={() => { history.close(); setSelection('new'); setError('') }}>{t('New mission')}</button><button aria-label={t('Refresh')} onClick={() => { void monitor.refresh() }}>↻</button></div>
+    </select>}<button disabled={!owner || !data?.writable} onClick={() => choose('new')}>{t('New mission')}</button><button aria-label={t('Refresh')} onClick={() => { void monitor.refresh() }}>↻</button></div>
     <div className="sw-panel-content">
       {transcript.sessionId ? <WorkerTranscript history={history} /> : <>
-      {(state.error || error) && <div className="sw-error" role="alert">{error || state.error}</div>}
+      {((state.ownerSessionId === owner && state.error) || error) && <div className="sw-error" role="alert">{error || state.error}</div>}
+      {connection === 'reconnecting' && state.updatedAt && <p className="sw-connection-note">{t('Last synchronized')} {new Date(state.updatedAt).toLocaleTimeString()} · {t('Task execution status is unconfirmed.')}</p>}
       {!owner ? <div className="sw-empty">{t('Select a conversation to manage its missions.')}</div> : !data ? <div className="sw-empty">{t(state.loading ? 'Loading mission state…' : 'Swarm bridge is unavailable. Refresh to retry.')}</div> : null}
       {data && !data.writable && <p className="sw-notice">{t('Mission controls are read-only in worker conversations. Open the owner conversation to manage this mission.')}</p>}
-      {latestStart && <section className="sw-auto-start" data-swarm-start={latestStart.status} role="status">
-        <strong>{t(latestStart.status === 'planning' ? 'Planning collaboration…' : latestStart.status === 'launching' ? 'Starting workers…' : latestStart.status === 'failed' ? 'Collaboration could not start' : 'Agent Swarm request')}</strong>
-        <p>{latestStart.goal}</p>
-        {latestStart.baseline && !snapshot && <BaselineNotice baseline={latestStart.baseline} />}
-        {['planning', 'launching'].includes(latestStart.status) && <small>{t('Choosing roles, tasks and checks automatically using this conversation’s model.')}</small>}
-        {latestStart.error && <p className="sw-error" role="alert">{latestStart.error}</p>}
+      {start && <section className="sw-auto-start" data-swarm-start={start.status} role="status">
+        <strong>{t(start.status === 'planning' ? 'Planning collaboration…' : start.status === 'launching' ? 'Starting workers…' : 'Collaboration could not start')}</strong>
+        <p>{start.goal}</p>
+        {['planning', 'launching'].includes(start.status) && <small>{t('Choosing roles, tasks and checks automatically using this conversation’s model.')}</small>}
+        {start.error && <p className="sw-error" role="alert">{start.error}</p>}
+        {start.baseline && !snapshot && <details><summary>{t('Project snapshot')}</summary><BaselineNotice baseline={start.baseline} /></details>}
       </section>}
-      {owner && data?.writable && (draft || selected === 'new') && <DraftEditor key={`${owner}:${draft?.id ?? 'new'}`} sessionId={owner} workspace={data.workspace} budget={data.defaultBudget} draft={draft} directory={directory} request={monitor.request} ownerLive={data.ownerLive} isSelected={stillSelected}
-        onSaved={value => { if (!stillSelected()) return; setLocalDraft(value); setSelection(`draft:${value.id}`); void monitor.refresh() }}
-        onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
-        onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
-      {snapshot && <><div className="sw-mission-controls" data-swarm-mission={snapshot.mission.id}>
-        <span data-swarm-status={snapshot.mission.status} className="sw-chip">{snapshot.mission.status}</span>
-        {data?.writable && snapshot.mission.status === 'active' && <button data-action="pause" disabled={Boolean(busy)} onClick={() => { void control('pause') }}>{t('Pause')}</button>}
-        {data?.writable && ['paused', 'blocked'].includes(snapshot.mission.status) && <button data-action="resume" disabled={Boolean(busy)} onClick={() => { void control('resume') }}>{t('Resume')}</button>}
-        {data?.writable && !['completed', 'stopped', 'staged'].includes(snapshot.mission.status) && <>{!starts.some(item => item.missionId === snapshot.mission.id) && <button data-action="complete" disabled={Boolean(busy) || !snapshot.tasks.length || snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))} onClick={() => { void control('complete') }}>{t('Complete')}</button>}
-          <button data-action="stop" disabled={Boolean(busy)} onClick={() => stopArmed ? void control('stop') : setStopArmed(true)}>{t(stopArmed ? 'Confirm stop' : 'Stop')}</button></>}
-        {stopArmed && <span className="sw-small">{t('Stop ends this mission and its workers.')} <button onClick={() => setStopArmed(false)}>{t('Cancel')}</button></span>}
-        {busy && <span role="status">{t('Working')}…</span>}
-      </div>
-        {snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}
-        {owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && snapshot.tasks.some(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact) &&
-          <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} />}
-        <SwarmBoard key={snapshot.mission.id} snapshot={snapshot} live onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} /></>}
-      {owner && data && !snapshot && !draft && !latestStart && selected !== 'new' && <div className="sw-empty"><p>{t('Start from the conversation input:')}</p><code>/agent-swarm {t('Describe what you want to accomplish')}</code><p>{t('Roles, tasks and verification are set up automatically.')}</p></div>}
+      {owner && data && !snapshot && !start && <div className="sw-start-guide" data-swarm-natural-start="">
+        <h2>{draft?.input.title || t('Start a collaboration')}</h2>
+        <p>{t('Start from the conversation input:')}</p><code>/agent-swarm {t('Describe what you want to accomplish')}</code>
+        <p>{t('Roles, tasks and verification are set up automatically.')}</p>
+        {draft && <p className="sw-muted">{t('A saved draft is available in advanced settings.')}</p>}
+      </div>}
+      {owner && data?.writable && !snapshot && !start && <details className="sw-disclosure" data-swarm-details="editor" open={editorOpen} onToggle={event => { setEditorOpen(event.currentTarget.open); if (event.currentTarget.open) setEditorMounted(true) }}>
+        <summary>{t('Advanced: configure a mission')}</summary>
+        {editorMounted && <DraftEditor key={`${owner}:${draft?.id ?? 'new'}`} sessionId={owner} workspace={data.workspace} budget={data.defaultBudget} draft={draft} directory={directory} request={monitor.request} ownerLive={data.ownerLive} isSelected={stillSelected}
+          onSaved={value => { if (!stillSelected()) return; setLocalDraft(value); setSelection(`draft:${value.id}`); void monitor.refresh() }}
+          onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
+          onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
+      </details>}
+      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={controls}
+        technicalDetails={<>{snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}{advancedControls}</>}
+        delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && snapshot.tasks.some(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact) ?
+          <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} disabled={connection !== 'connected'} /> : undefined}
+        onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} />}
       </>}
     </div>
-
   </aside>
 }

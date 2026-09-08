@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
-import { linkHarnessPeers } from '../tests/fixtures/built-harness.mjs'
+import { importHarness, linkHarnessPeers } from '../tests/fixtures/built-harness.mjs'
 import { authenticatedLaunchUrl } from './web-smoke-browser.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -26,6 +26,19 @@ const env = { ...process.env, DSH_HOME: join(preview, 'home'), DSH_AGENTS_HOME: 
 for (const key of ['DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL']) if (config[key]) env[key] = config[key]
 if (!env.DEEPSEEK_API_KEY) throw new Error('DeepSeek credential is unavailable')
 for (const path of [env.DSH_HOME, env.DSH_AGENTS_HOME, env.DSH_BUNDLED_SKILL_DIR]) mkdirSync(path, { recursive: true, mode: 0o700 })
+// Seed this new preview through the native provider, so later restarts do not depend on
+// inheriting a transient shell variable. The caller's home and credentials are untouched.
+const { Context } = await importHarness(harnessRoot, '@deepseek-ai/cordis')
+const { LocalCredentialProvider } = await importHarness(harnessRoot, '@deepseek-ai/dsh-credentials-local')
+const { credentialRef } = await importHarness(harnessRoot, '@deepseek-ai/dsh-credentials')
+const { createLaunchEnvironmentSnapshot, DSH_LAUNCH_ENVIRONMENT_KEY } = await importHarness(harnessRoot, '@deepseek-ai/dsh-launch-environment')
+const credentialHost = new Context()
+credentialHost.provide(DSH_LAUNCH_ENVIRONMENT_KEY, createLaunchEnvironmentSnapshot([]))
+try {
+  await credentialHost.plugin(LocalCredentialProvider, { path: join(env.DSH_HOME, '.credentials.yaml'), watch: false })
+  await credentialHost.credentials.set(credentialRef('DEEPSEEK_API_KEY'), env.DEEPSEEK_API_KEY)
+} finally { await credentialHost.fiber.dispose() }
+delete env.DEEPSEEK_API_KEY
 const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', preview], { cwd: project, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))[0]
 const plugin = join(preview, 'plugin')
 mkdirSync(plugin)

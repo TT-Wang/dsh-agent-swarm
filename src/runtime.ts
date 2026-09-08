@@ -4,7 +4,7 @@ import { isAbsolute } from 'node:path'
 import { SwarmStore } from './store.ts'
 import { assertScopeSelectors, normalizeReviewDependencies, normalizeScopeSelectors, requireHostChecks } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, Member, Mission, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, WorkerAdapter, Workstream } from './types.ts'
+import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, Member, Mission, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
@@ -38,6 +38,7 @@ export class SwarmRuntime {
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter) {
     this.store = new SwarmStore(config.statePath)
     workers.bind({
+      activity: (memberId, activity) => this.onActivity(memberId, activity),
       idle: memberId => this.onIdle(memberId),
       beforeStep: (memberId, hasFreshInput) => this.beforeStep(memberId, hasFreshInput),
       usage: (memberId, tokens) => this.usage(memberId, tokens),
@@ -57,6 +58,11 @@ export class SwarmRuntime {
   }
   /** Recover active missions without requiring a live coordinator or user session. */
   async start(): Promise<void> {
+    // Persisted activity is presentation history, never proof that an execution survived a restart.
+    for (const member of this.store.list('members')) if (member.activity !== undefined) {
+      delete member.activity
+      this.commit(member.missionId, () => this.store.put('members', member))
+    }
     for (const draft of this.store.list('drafts')) if (draft.status === 'launching') {
       draft.status = 'failed'; draft.error = 'Host restarted during plan assembly. Retry launch to continue the saved plan.'; draft.updatedAt = Date.now()
       this.store.transaction(() => this.store.put('drafts', draft))
@@ -110,7 +116,13 @@ export class SwarmRuntime {
       if (mission.status === 'active') await this.ensureWorkers(mission)
       this.kick(mission.id)
     }
-    this.timer = setInterval(() => { for (const m of this.store.list('missions')) if (!terminal(m)) this.kick(m.id) }, this.config.tickMs)
+    this.timer = setInterval(() => {
+      for (const mission of this.store.list('missions')) {
+        // Deadline cancellation cannot queue behind a long verification holding the mission queue.
+        if (mission.status === 'active' && Date.now() >= mission.deadline) this.blockBudget(mission)
+        if (!terminal(mission)) this.kick(mission.id)
+      }
+    }, this.config.tickMs)
     this.timer.unref()
   }
   private async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
@@ -709,10 +721,11 @@ export class SwarmRuntime {
     })
   }
   /** Native browser callers select an existing Harness session; membership still bounds reads. */
-  visibleSnapshots(actor: Actor): Snapshot[] {
+  visibleMissions(actor: Actor): Mission[] {
     const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))
-    return this.store.list('missions').filter(m => m.ownerSessionId === actor.sessionId || memberMissions.has(m.id)).map(m => this.snapshot(actor, m.id))
+    return this.store.list('missions').filter(m => m.ownerSessionId === actor.sessionId || memberMissions.has(m.id))
   }
+  visibleSnapshots(actor: Actor): Snapshot[] { return this.visibleMissions(actor).map(m => this.snapshot(actor, m.id)) }
   drafts(actor: Actor): DraftPlan[] { return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded') }
   private ownedDraft(actor: Actor, draftId: string): DraftPlan {
     actor.signal?.throwIfAborted()
@@ -928,6 +941,7 @@ export class SwarmRuntime {
         this.store.put('tasks', task)
       }
       if (terminal(mission) && mission.budgetPause) { delete mission.budgetPause; this.store.put('missions', mission) }
+      if (mission.status !== 'active') for (const member of this.store.list('members', missionId)) { delete member.activity; this.store.put('members', member) }
       this.store.event(missionId, `mission/${action}`, 'owner', { reason, coordinatorId: coordinatorId ?? null })
     })
     if (mission.status !== 'active') this.defer(async () => {
@@ -977,7 +991,7 @@ export class SwarmRuntime {
       if (member.status === 'waiting') { member.status = 'working'; this.store.put('members', member) }
       this.store.put('missions', mission)
       for (const task of this.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt?.ownerId === memberId) {
-        task.attempt.leaseUntil = Date.now() + this.config.leaseMs; this.store.put('tasks', task)
+        task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs); this.store.put('tasks', task)
       }
     })
   }
@@ -1014,6 +1028,7 @@ export class SwarmRuntime {
         task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id, epoch: task.epoch }
         this.store.put('tasks', task)
       }
+      for (const member of this.store.list('members', mission.id)) { delete member.activity; this.store.put('members', member) }
       this.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps })
       this.notify(mission.id, mission.reason!)
     })
@@ -1069,6 +1084,40 @@ export class SwarmRuntime {
       this.store.put('missions', mission)
     })
   }
+  private onActivity(memberId: string, activity?: WorkerActivity): void {
+    if (this.closed || this.shuttingDown) return
+    const member = this.store.get('members', memberId)
+    if (!member) return
+    const mission = this.mission(member.missionId)
+    if (mission.status !== 'active' || member.status === 'stopped' || mission.budgetPause || Date.now() >= mission.deadline) activity = undefined
+    const previous = member.activity
+    if (activity !== undefined) {
+      const task = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
+      // One operation keeps the attempt it started under even if a later assignment races its end.
+      const attemptId = member.activity?.id === activity.id ? member.activity.attemptId : task?.attempt?.id
+      member.activity = { ...activity, attemptId }
+    } else {
+      if (member.activity === undefined) return
+      delete member.activity
+    }
+    this.commit(mission.id, () => {
+      this.store.put('members', member)
+      // Native stream touches advance the state revision without displacing coordination milestones.
+      if (previous?.id !== member.activity?.id || previous?.kind !== member.activity?.kind || previous?.attemptId !== member.activity?.attemptId) {
+        this.store.event(mission.id, 'member/activity', 'runtime', { memberId, activity: member.activity ?? null })
+      }
+    })
+  }
+  /** Renew only a still-owned native operation, bounded by the owner's actual mission deadline. */
+  private renewActiveOperation(task: Task, mission: Mission): void {
+    if (!task.attempt || task.attempt.leaseUntil >= Date.now() + this.config.leaseMs / 2) return
+    const member = this.store.get('members', task.attempt.ownerId)
+    const observed = this.workers.currentActivity?.(task.attempt.ownerId)
+    if (!member?.activity || member.activity.attemptId !== task.attempt.id || observed?.id !== member.activity.id) return
+    task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs)
+    // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
+    this.commit(mission.id, () => this.store.put('tasks', task))
+  }
   private async recordToolRun(memberId: string, input: Omit<ToolRun, 'id' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<void> {
     if (this.closed || input.tool.startsWith('swarm_')) return
     const member = this.store.get('members', memberId)
@@ -1084,6 +1133,7 @@ export class SwarmRuntime {
     const member = this.store.get('members', memberId)
     if (!member || member.status === 'stopped') return
     member.status = 'idle'
+    delete member.activity
     this.commit(member.missionId, () => { this.store.put('members', member) })
     this.kick(member.missionId)
   }
@@ -1134,7 +1184,9 @@ export class SwarmRuntime {
     if (Date.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.blockBudget(mission); return }
     for (const task of this.store.list('tasks', missionId)) {
       if (this.shuttingDown) return
-      if (task.status !== 'running' || !task.attempt || task.attempt.leaseUntil >= Date.now()) continue
+      if (task.status !== 'running' || !task.attempt) continue
+      this.renewActiveOperation(task, mission)
+      if (task.attempt.leaseUntil >= Date.now()) continue
       const oldOwner = task.attempt.ownerId
       task.status = 'blocked'; task.epoch++; task.recoveryCount = (task.recoveryCount ?? 0) + 1; delete task.attempt
       delete task.assigneeId

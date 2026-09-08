@@ -392,3 +392,113 @@ test('worker history pages retain message source groups and cold sessions withou
   const historical = await f.rpc('worker-history', { sessionId: f.ownerId, workerSessionId: member.sessionId })
   assert.equal(historical.result.ok, true, historical.text)
 })
+
+test('watch returns only authorized changed missions and includes eventless state updates', async t => {
+  const f = await fixture(t)
+  const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  assert.equal(typeof initial.revision, 'number')
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const first = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 0 })).result.value
+  assert.equal(first.kind, 'delta')
+  assert.deepEqual(first.missionIds, [mission.id])
+  assert.equal(first.state.snapshots[0].mission.id, mission.id)
+  const previous = first.revision
+  f.runtime.store.transaction(() => {
+    const current = f.runtime.store.get('missions', mission.id)
+    current.usedTokens = 42
+    f.runtime.store.put('missions', current)
+  })
+  const updated = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: previous, waitMs: 0 })).result.value
+  assert.equal(updated.kind, 'delta')
+  assert.equal(updated.state.snapshots[0].mission.usedTokens, 42)
+  const other = (await f.rpc('watch', { sessionId: 'other-owner', afterRevision: initial.revision, waitMs: 0 })).result.value
+  assert.equal(other.kind, 'heartbeat')
+  assert.equal(other.state, undefined)
+  const reset = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: updated.revision + 100, waitMs: 0 })).result.value
+  assert.equal(reset.kind, 'snapshot')
+  assert.deepEqual(reset.missionIds, [mission.id])
+  const unauthenticated = await f.rpc('watch', { sessionId: f.ownerId, waitMs: 0 }, { headers: { cookie: '' } })
+  assert.equal(unauthenticated.status, 401)
+})
+
+test('watch observes draft-only planning changes and validates its bounded wait/cursor', async t => {
+  const f = await fixture(t)
+  const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  const created = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  const draftUpdate = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 0 })).result.value
+  assert.equal(draftUpdate.kind, 'delta')
+  assert.deepEqual(draftUpdate.state.snapshots, [])
+  assert.equal(draftUpdate.state.drafts[0].id, created.id)
+  for (const payload of [{ afterRevision: -1 }, { afterRevision: 0.5 }, { waitMs: 20001 }]) {
+    assert.equal((await f.rpc('watch', { sessionId: f.ownerId, ...payload })).result.ok, false)
+  }
+  const idle = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: draftUpdate.revision, waitMs: 5 })).result.value
+  assert.equal(idle.kind, 'heartbeat')
+})
+
+test('native watch wakes on commit and releases observers when its plugin unloads', async t => {
+  const f = await fixture(t)
+  const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  const pending = f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 1000 })
+  await new Promise(resolve => setTimeout(resolve, 25))
+  f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const response = await pending
+  assert.equal(response.result.value.kind, 'delta')
+  const unloading = f.rpc('watch', { sessionId: f.ownerId, afterRevision: response.result.value.revision, waitMs: 1000 })
+  await new Promise(resolve => setTimeout(resolve, 25))
+  await f.bridge.dispose()
+  const cancelled = await unloading
+  assert.equal(cancelled.result.ok, false)
+  assert.match(cancelled.result.error.message, /unloaded|cancelled/)
+})
+
+test('watch removes mission data when a worker loses read membership', async t => {
+  const f = await fixture(t)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const member = await f.runtime.addMember({ sessionId: f.ownerId }, mission.id, { name: 'Worker', role: 'Builder' })
+  f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
+  const initial = (await f.rpc('state', { sessionId: member.sessionId })).result.value
+  assert.equal(initial.snapshots.length, 1)
+  f.runtime.store.transaction(() => f.runtime.store.put('members', { ...member, status: 'stopped' }))
+  const removed = (await f.rpc('watch', { sessionId: member.sessionId, afterRevision: initial.revision, waitMs: 0 })).result.value
+  assert.equal(removed.kind, 'delta')
+  assert.deepEqual(removed.missionIds, [])
+  assert.deepEqual(removed.state.snapshots, [])
+  assert.equal(removed.state.writable, false)
+})
+
+test('watch wakes for native owner lifecycle without inventing a swarm revision', async t => {
+  const f = await fixture(t)
+  const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
+  assert.equal(initial.ownerLive, true)
+  // Explicit durability and subscription admission avoid racing persistence/HTTP setup with resume.
+  await f.ctx.sessions.flush(f.ctx.agents.get(SessionId(f.ownerId)).session)
+  const subscribe = f.runtime.store.subscribe.bind(f.runtime.store)
+  let admitted
+  f.runtime.store.subscribe = listener => { const remove = subscribe(listener); admitted?.(); return remove }
+  const watch = () => {
+    const ready = new Promise(resolve => { admitted = resolve })
+    const response = f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 1000 })
+    return { response, ready: Promise.race([ready, response.then(reply => { throw new Error(`Watch ended before lifecycle action: ${JSON.stringify(reply.result)}`) })]) }
+  }
+  const watching = watch()
+  await watching.ready
+  await f.ownerFiber.dispose()
+  const dormantReply = await watching.response
+  assert.equal(dormantReply.result.ok, true, JSON.stringify(dormantReply.result))
+  const dormant = dormantReply.result.value
+  assert.equal(dormant.kind, 'heartbeat')
+  assert.equal(dormant.ownerLive, false)
+  assert.equal(dormant.revision, initial.revision)
+  assert.deepEqual(dormant.defaultBudget, initial.defaultBudget)
+  const resumedWatch = watch()
+  await resumedWatch.ready
+  const resumed = await f.ctx.agents.resume({ resumeSessionId: SessionId(f.ownerId), agentOptions: { provider: 'public-provider', model: 'model-one' } })
+  t.after(() => resumed.dispose())
+  const resumedReply = await resumedWatch.response
+  assert.equal(resumedReply.result.ok, true, JSON.stringify(resumedReply.result))
+  const live = resumedReply.result.value
+  assert.equal(live.kind, 'heartbeat')
+  assert.equal(live.ownerLive, true)
+  assert.equal(live.revision, initial.revision)
+})

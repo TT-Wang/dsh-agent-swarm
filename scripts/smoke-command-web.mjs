@@ -1,5 +1,6 @@
 import { authenticatedLaunchUrl, publicBaseUrl, publicFailure, redactWebSecrets, openAuthenticatedWeb, selectWebWorkspace, composerFor, isolateWebModelFixture, writeComposerDraft } from './web-smoke-browser.mjs'
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
+import { assertSimplifiedSwarm, observedSwarmState, openSwarmDetails } from './swarm-smoke-checks.mjs'
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -40,6 +41,7 @@ const started = Date.now()
 let validatedAt
 const checks = []
 const rpcResults = []
+const watchTimings = []
 
 async function writeReport() {
   const modelTrace = await readFile(tracePath, 'utf8')
@@ -49,7 +51,9 @@ async function writeReport() {
     modelRequests: events.filter(event => event.type === 'model/request').length,
     toolCalls: events.filter(event => event.type === 'tool/call').length,
     passed: !failure, scenario: validationRepair ? 'native-slash-command-validation-repair' : 'native-slash-command-auto-start',
-    ...(failure ? { failure: String(failure) } : {}), build, elapsedMs: (validatedAt ?? Date.now()) - started, checks, rpcResults,
+    ...(failure ? { failure: String(failure) } : {}), build, elapsedMs: (validatedAt ?? Date.now()) - started, checks,
+    watchTimingMethod: 'Each previously unseen mission/event sequence delivered in a delta on an uninterrupted observer is sampled once. Full snapshots, eventless deltas and the first response after interruption are excluded.',
+    watchTimings, rpcResults,
   }, null, 2) + '\n')
   await writeFile(join(artifacts, 'model-trace.jsonl'), modelTrace)
   await writeFile(join(artifacts, 'server.log'), redactWebSecrets(output))
@@ -128,16 +132,51 @@ try {
     browser = await chromium.launch({ headless: true, ...(browserChannel === 'chromium' ? {} : { channel: browserChannel }) })
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: 'en-US' })
     const pageErrors = []
+    const stateRequests = []
+    const seenEvents = new Set()
+    const sampleEligible = new WeakMap()
+    let continuousObserver = false
+    let latestObserverRequest
+    let watchResponses = 0
     let latestState
     let stateRevision = 0
     page.on('pageerror', error => pageErrors.push(error.message))
+    page.on('request', request => {
+      const endpoint = new URL(request.url()).pathname
+      if (['/agent-swarm/state', '/agent-swarm/watch'].includes(endpoint)) {
+        latestObserverRequest = request
+        stateRequests.push({ endpoint, at: Date.now() })
+        sampleEligible.set(request, endpoint === '/agent-swarm/watch' && continuousObserver)
+      }
+    })
+    page.on('requestfailed', request => { if (request === latestObserverRequest) continuousObserver = false })
     page.on('response', async response => {
       const endpoint = new URL(response.url()).pathname
       if (!endpoint.startsWith('/agent-swarm/')) return
       try {
         const body = await response.json()
         rpcResults.push({ endpoint, ...body.result })
-        if (endpoint === '/agent-swarm/state' && body.result?.ok) { latestState = body.result.value; stateRevision++ }
+        if (body.result?.ok) {
+          if (endpoint === '/agent-swarm/watch') {
+            watchResponses++
+          }
+          const state = observedSwarmState(latestState, endpoint, body.result.value)
+          if (state) {
+            const receivedAt = Date.now()
+            // State reopens/reconnects and eventless lease updates are not
+            // real-time latency samples. Each committed event is measured once.
+            for (const snapshot of state.snapshots) for (const event of snapshot.events) {
+              const key = `${snapshot.mission.id}:${event.seq}`
+              if (!seenEvents.has(key) && sampleEligible.get(response.request()) && body.result.value.kind === 'delta') {
+                watchTimings.push({ revision: body.result.value.revision, receivedAt, eventCreatedAt: event.createdAt,
+                  kind: 'delta', missionId: snapshot.mission.id, eventSeq: event.seq })
+              }
+              seenEvents.add(key)
+            }
+            latestState = state; stateRevision++
+            if (response.request() === latestObserverRequest) continuousObserver = true
+          }
+        }
       } catch { /* A cancelled navigation response does not overwrite the last observed state. */ }
     })
     await openAuthenticatedWeb(page, launchUrl, checks)
@@ -167,6 +206,7 @@ try {
     await page.locator('[data-swarm-command]').filter({ hasText: goal }).waitFor()
     const planningText = await panel.innerText()
     assert.match(planningText, /planning|Planning|规划/)
+    await assertSimplifiedSwarm(panel)
     await page.screenshot({ path: join(artifacts, 'planning.png'), fullPage: true })
     await writeFile(join(artifacts, 'planning.aria.txt'), await page.locator('body').ariaSnapshot())
     checks.push('one natural-language send opens the sidebar automatically and exposes durable planning before workers exist')
@@ -177,6 +217,9 @@ try {
       assert.match(rejected.message, /scope\[0\]/)
       assert.match(rejected.message, /tasks\[0\]\.checks/)
       const before = stateRevision
+      // A rejected plan has no committed mutation to wake an event watch.
+      // Request an explicit read to verify that its durable state stayed empty.
+      await panel.getByRole('button', { name: 'Refresh', exact: true }).click()
       await until(() => stateRevision > before, 'fresh native sidebar state after rejected launch')
       assert.equal(latestState.snapshots.length, 0, 'invalid plan must create no mission or workers')
       assert.equal(latestState.drafts.length, 0, 'invalid plan must create no partial draft')
@@ -215,9 +258,34 @@ try {
     const dockBox = await dock.boundingBox()
     const shellBox = await page.locator('#root').boundingBox()
     assert(dockBox && shellBox && shellBox.x + shellBox.width <= dockBox.x + 1, 'automatic opening reserves native conversation space')
+    await assertSimplifiedSwarm(panel)
     await page.screenshot({ path: join(artifacts, 'running.png'), fullPage: true })
     checks.push('swarm_launch admits the complete topology and primary-agent-selected budget; no configuration, Save or Launch gesture')
+    await until(() => latestState?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.members.some(member => member.activity?.kind === 'model'), 'native worker stream exposes its actual pending model activity')
+    await panel.locator('[data-swarm-current="model"]').waitFor()
+    assert.match(await panel.locator('[data-swarm-current="model"]').innerText(), /Agent is thinking/)
+    const currentActivity = latestState.snapshots.find(snapshot => snapshot.mission.id === missionId).members.find(member => member.activity?.kind === 'model').activity
+    assert.equal(typeof currentActivity.id, 'string')
+    assert(currentActivity.startedAt <= currentActivity.updatedAt)
+    const elapsed = panel.locator('[data-swarm-elapsed]')
+    const firstElapsed = await elapsed.innerText()
+    await until(async () => (await elapsed.innerText()) !== firstElapsed, 'connected activity elapsed time advances from the real operation start', 3000)
+    assert.equal(Number(await elapsed.getAttribute('data-swarm-elapsed')), currentActivity.startedAt)
+    assert(watchTimings.some(item => item.receivedAt - item.eventCreatedAt < 1500), 'a new committed event must reach the browser through watch before the former two-second polling interval')
+    await page.screenshot({ path: join(artifacts, 'thinking.png'), fullPage: true })
+    checks.push('actual pending Harness model activity is visible with a real elapsed clock; watch includes a committed update below 1.5 seconds, with all timing samples retained and no latency guarantee')
+    await panel.getByRole('button', { name: 'Collapse sidebar', exact: true }).click()
+    await until(async () => !await panel.isVisible(), 'collapsed sidebar is hidden')
+    // Let a cancelled request settle, then complete actual worker activity while
+    // no user-visible panel is subscribed. Native model execution keeps running.
+    await new Promise(resolve => setTimeout(resolve, 250))
+    const hiddenRequestCount = stateRequests.length
     await writeFile(releasePath, 'release scripted worker model only')
+    await until(async () => (await readFile(tracePath, 'utf8')).includes('"name":"swarm_verify"'), 'workers continue to independent verification while the sidebar is hidden', 120_000)
+    await new Promise(resolve => setTimeout(resolve, 2300))
+    assert.equal(stateRequests.length, hiddenRequestCount, 'hidden sidebar must not maintain a polling or watch request loop')
+    await page.locator('[data-swarm-launcher]').click()
+    await panel.waitFor()
     await until(() => latestState?.snapshots.some(snapshot => snapshot.mission.id === missionId && snapshot.mission.status === 'completed'), 'worker acceptance automatically completes the mission', 120_000)
     await until(() => latestState?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.members.every(member => member.status !== 'working'), 'completed workers settle to non-working durable status', 30_000)
     const completed = latestState.snapshots.find(snapshot => snapshot.mission.id === missionId)
@@ -225,6 +293,10 @@ try {
     assert(completed.evidence.length > 0 && completed.evidence.every(evidence => evidence.status === 'verified'))
     assert.equal(latestState.starts.find(request => request.missionId === missionId)?.status, 'completed')
     assert.equal(completed.members.length, 2)
+    assert(completed.members.every(member => !member.activity), 'completed workers do not retain a fabricated active operation')
+    assert.equal(await panel.getAttribute('data-swarm-session'), completed.mission.ownerSessionId, 'reopening retains the selected owner')
+    await assertSimplifiedSwarm(panel)
+    checks.push('hidden sidebar suspends state requests while workers finish; reopening catches up with the same owner and clears finished activity')
     assert.equal(completed.mission.baseline.sourceHead, sourceHead)
     assert.notEqual(completed.mission.baseline.snapshotCommit, sourceHead)
     assert.deepEqual(completed.mission.baseline.changedPaths.sort(), ['check.cjs', 'user-notes.txt'])
@@ -235,6 +307,25 @@ try {
     await panel.locator('[data-swarm-status="completed"]').waitFor()
     await page.locator('[data-swarm-command]').scrollIntoViewIfNeeded()
     await page.screenshot({ path: join(artifacts, 'completed.png'), fullPage: true })
+    let failedWatch = false
+    const transientFailure = async route => {
+      if (!failedWatch) { failedWatch = true; await route.abort('failed') }
+      else await route.continue()
+    }
+    await page.route('**/agent-swarm/watch', transientFailure)
+    await panel.getByRole('button', { name: 'Refresh', exact: true }).click()
+    await until(() => failedWatch, 'a single native watch request is interrupted')
+    await panel.locator('[data-swarm-connection="reconnecting"]').waitFor()
+    await page.screenshot({ path: join(artifacts, 'reconnecting.png'), fullPage: true })
+    const successfulBefore = watchResponses
+    await until(() => watchResponses > successfulBefore, 'native watch recovers after transient network failure', 45_000)
+    await panel.locator('[data-swarm-connection="connected"]').waitFor()
+    await page.unroute('**/agent-swarm/watch', transientFailure)
+    assert.equal(latestState.ownerSessionId, completed.mission.ownerSessionId)
+    assert.equal(latestState.snapshots.find(snapshot => snapshot.mission.id === missionId)?.mission.status, 'completed')
+    assert.equal(await panel.getAttribute('data-swarm-session'), completed.mission.ownerSessionId)
+    checks.push('one failed native watch exposes reconnecting, then resumes without losing the completed mission or changing owner')
+    await openSwarmDetails(panel, 'technical')
     await panel.getByRole('tab', { name: 'Dependency graph', exact: true }).click()
     await panel.getByRole('tabpanel', { name: 'Dependency graph', exact: true }).waitFor()
     await page.screenshot({ path: join(artifacts, 'dependency-graph.png'), fullPage: true })

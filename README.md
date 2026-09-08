@@ -8,12 +8,12 @@ Turn a natural-language task into a team of collaborating agents inside [DeepSee
 
 The primary agent inspects the project, chooses the team and resource budgets, and launches the work. Workers can propose tasks, ask peers, share evidence, challenge results and hand off partial implementations. A durable runtime coordinates their work and requires independent review before accepting a deliverable.
 
-**Version 0.5.0 · MIT · Local Git workspaces · Native DSH Web sidebar**
+**Version 0.6.0 · MIT · Local Git workspaces · Native DSH Web sidebar**
 
 ## What you get
 
 - **One command to start.** `/agent-swarm` appears in native command autocomplete. Describe the outcome; the primary agent plans and launches without a configuration form.
-- **A sidebar beside your conversation.** Follow tasks, dependencies, workers, budgets, evidence and activity. Use a Better Sidebar tab when available, or the built-in dock.
+- **A sidebar beside your conversation.** See the goal, current activity, accepted work and recent progress first. Expand team and technical details when needed. Use a Better Sidebar tab when available, or the built-in dock.
 - **Real Harness workers.** Each worker has its own native agent, session, inbox, tools and sandbox. Open live conversations or read persisted worker transcripts.
 - **Agent-selected resource limits.** The primary chooses token and step budgets, team capacity, task and experiment limits, mission duration, model routes, output-token allowances, recovery attempts and verification timeouts. It can revise budgets with a recorded reason while preserving usage.
 - **Durable collaboration.** SQLite coordination state, attempt fencing, retained worktrees and recoverable peer messages support restart and handoff.
@@ -30,9 +30,9 @@ The following exact Harness releases were validated on **2026-09-08**:
 | [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` | npm `latest` / `next` |
 | [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` | npm `alpha`; newest GitHub release |
 
-Both are prereleases. Version 0.4.0 does not claim compatibility with the old `0.1.0-rc.5` SDK or with newer unreleased Harness commits. The development linker checks the release revision in [compatibility.json](compatibility.json), not just its version string.
+Both are prereleases. This plugin does not claim compatibility with the old `0.1.0-rc.5` SDK or with newer unreleased Harness commits. The development linker checks the release revision in [compatibility.json](compatibility.json), not just its version string.
 
-Both targets passed **145 behavioral tests**, packaged-artifact loading, native CLI profile installation and the native `/agent-swarm` browser workflow. Provider responses were scripted while Harness, tools, persistence, Git effects, authentication and browser interactions were real. These checks establish integration behavior, not model planning success rates. See [validation](docs/validation.md) for the exact matrix and its limits.
+The supported releases have passed packaged-artifact loading, native CLI profile installation and the native `/agent-swarm` browser workflow; the exact tested builds and behavioral totals are recorded in the validation document. Provider responses were scripted while Harness, tools, persistence, Git effects, authentication and browser interactions were real. These checks establish integration behavior, not model planning success rates. See [validation](docs/validation.md) for the exact matrix and its limits.
 
 ## Install from source
 
@@ -76,7 +76,7 @@ These instructions install a local source build. They do not require or imply a 
 
 ## Use it
 
-Open a conversation in a **clean Git workspace**, choose your model in Harness, then send a task:
+Open a conversation in a **Git workspace**, choose your model in Harness, then send a task:
 
 ```text
 /agent-swarm Add search to this project, preserve the existing API, and verify the relevant tests pass.
@@ -92,7 +92,7 @@ Open a conversation in a **clean Git workspace**, choose your model in Harness, 
 
 The primary agent chooses the plan and budgets from the task. The sidebar shows planning, launch and progress; automatic missions complete after their required independent acceptance. You do not need to enter worker counts, token limits or step counts, or manually press Launch and Complete.
 
-Use **Pause**, **Resume** and **Stop** in the owner conversation's panel. Hiding the sidebar pauses its display updates, not the workers. If more resources are needed, ask the primary agent to reassess the budget and resume; increasing a budget alone does not resume a paused mission, and it does not reset consumption. The duration limit is measured from mission creation, including time spent paused.
+Use **Pause** and **Resume** beside the progress summary in the owner conversation. **Stop** is inside **Task details and resources** and asks for a second click. Hiding the sidebar pauses its display updates, not the workers. If more resources are needed, ask the primary agent to reassess the budget and resume; increasing a budget alone does not resume a paused mission, and it does not reset consumption. The duration limit is measured from mission creation, including time spent paused.
 
 Before planning, the plugin freezes the project's saved files into a private Git snapshot. Tracked changes and non-ignored new files are included; your branch, real index and working files stay as they are. No manual commit is needed. The primary is directed to inspect a frozen planning checkout and every worker starts from the same snapshot, including after restart. Later source edits do not change that baseline. Unresolved merge conflicts, dirty submodules and unsupported repository layouts produce a specific error instead of silently omitting work. Git objects, worktree metadata and plugin refs are retained for recovery.
 
@@ -104,9 +104,13 @@ With **Better Sidebar** installed, choose **Agent Swarm** from its **+** tab men
 
 Without Better Sidebar, a resizable dock sits beside the conversation. Collapse and reopen it from the Agent Swarm rail; its width is remembered. Narrow screens place the panel below the conversation. Principal labels follow Harness's English/Chinese setting and light/dark theme.
 
-The board includes task status, a dependency graph, evidence and activity views. **Open conversation** navigates to a listed worker's native chat. After that worker is disposed, it opens a read-only, paginated transcript in the sidebar without activating an agent or making a model request. Conversation cards are historical snapshots; the sidebar reads current durable state.
+The default view shows the mission goal, current work, accepted-task count and recent progress. **Team** reveals worker conversations. **Task details and resources** reveals budgets, the work board, dependency graph, evidence and event history. The four technical tabs and resource metrics are collapsed initially.
 
-An advanced **New mission** editor remains available for explicit manual planning. It supports saved drafts, model choices and task graphs. Saving a draft does not start workers. The natural-language command is the normal entry point.
+Activity labels come from native model requests, tools, verification and provider retry events. Elapsed time counts from the observed operation's actual start while the panel is connected. These labels describe what the host has observed; an active request is not a promise that the model is making useful progress. On a connection failure the panel shows **Reconnecting** and marks retained activity as the last observed state.
+
+The panel receives committed changes through a cancellable native RPC watch, with periodic connection keepalives. Hiding a pane stops its requests; reopening fetches current state. Reconnection uses a durable cursor and requests a full snapshot when the retained change history cannot fill a gap. **Open conversation** navigates to a listed worker's native chat; after disposal it opens a read-only, paginated transcript without activating an agent or making a model request. Conversation cards remain historical snapshots.
+
+An **Advanced: configure a mission** disclosure remains available for explicit manual planning. It supports saved drafts, model choices and task graphs. Saving a draft does not start workers. The natural-language command is the normal entry point.
 
 ## How collaboration works
 
@@ -130,6 +134,8 @@ The plugin's Loader row is `dsh-external-agent-swarm`. Infrastructure settings a
 | `tickMs` | `1000` |
 
 Only one live runtime may own a database. For independent Harness processes, configure distinct absolute `statePath` and `workspacesRoot` values through each profile's configuration overlay. **Changing `DSH_HOME` alone does not isolate this plugin's default storage.**
+
+The live-update implementation upgrades the SQLite schema from version 1 to version 2 and retains existing missions. Save a consistent database backup before upgrading an existing installation if you need to return to an older plugin build: older builds reject the upgraded schema. Restore the pre-upgrade database or use a separate state path when downgrading; retain the corresponding workspaces and refs.
 
 The infrastructure settings and manual editor defaults do not replace the primary agent's decisions. Automatic plans must supply their complete resource budgets and task policies.
 
@@ -157,8 +163,8 @@ Optional checks include `npm run test:sidebar-service` against an installed Bett
 - **Budget accounting has boundaries.** Worker tokens use reported provider usage, so in-flight requests can cross a threshold before usage arrives. Usage that was never durably reported cannot be reconstructed. The primary conversation's own model usage is outside the worker pool.
 - **Task specifications determine verification quality.** The host proves that declared commands ran against the submitted artifact. It cannot infer a complete test oracle from natural-language requirements; mission-level acceptance checks remain an area for improvement.
 - **Confinement follows the configured Harness sandbox.** Artifact capture checks changed paths against declared scopes. The plugin does not add independent network/credential isolation or adversarial multi-user isolation. Its tool restriction list is not a complete boundary for scheduling tools or other external side effects. Pre-launch read-only planning is a prompt instruction, not an OS write barrier.
-- **Recovery still has open work.** Long-running tools may outlast their attempt lease; lease renewal and outbox failure visibility need further work. Delivery recovery does not guarantee exactly-once external side effects. Retained worktrees and refs require explicit cleanup.
-- **Some views are intentionally limited.** The sidebar polls local RPC state. Cold worker history displays text and tool records rather than the complete native chat interface; media appears by type and individual entries are capped with a truncation notice. Listed native worker chats may retain a writable composer, while mission controls remain owner-only.
+- **Recovery still has open work.** Attempt leases renew only while the adapter can identify a live, uncancelled native operation, within the mission deadline. This does not detect every unproductive or stuck request; provider/tool timeouts and resource limits still matter. Outbox failure visibility needs further work, and delivery recovery does not guarantee exactly-once external side effects. Retained worktrees and refs require explicit cleanup.
+- **Some views are intentionally limited.** Live updates reconcile committed mission snapshots; they are not token-by-token model streaming or distributed synchronization. Cold worker history displays text and tool records rather than the complete native chat interface; media appears by type and individual entries are capped with a truncation notice. Listed native worker chats may retain a writable composer, while mission controls remain owner-only.
 - **Compatibility is bounded by the tested compositions.** Better Sidebar's public service integration was exercised against installed version 0.18.0. That does not establish compatibility with every other plugin or arbitrary custom Harness profile.
 
 See [known limitations](docs/known-limitations.md) for the remaining review findings and their practical impact.

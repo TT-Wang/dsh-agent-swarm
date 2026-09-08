@@ -12,11 +12,12 @@ import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { readFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { Workspaces, writePrivateJson } from './workspaces.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
-import type { Artifact, Delivery, Member, Mission, Task, WorkerAdapter, WorkerCallbacks, WorkerSpec } from './types.js'
+import type { Artifact, Delivery, Member, Mission, Task, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -52,6 +53,9 @@ interface Resident {
   journalWrites: Promise<void>
   totalTokens: number
   rejectedPendingStep: boolean
+  activities: Map<string, { value: WorkerActivity; signal?: AbortSignal; release: () => void }>
+  requestSignal?: AbortSignal
+  retryActivity?: () => void
 }
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error) }
@@ -86,6 +90,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private readonly workspaces: Workspaces
   private closing = false
   private disposal: Promise<void> | undefined
+  private readonly removeStreamObserver: () => void
 
   constructor(private readonly ctx: Context, options: HarnessWorkerOptions) {
     this.workspaces = new Workspaces({
@@ -97,6 +102,49 @@ export class HarnessWorkers implements WorkerAdapter {
         return sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd }).argv
       },
     })
+    const owner = this
+    this.removeStreamObserver = ctx.on('llm/stream', async function* (options, next) {
+      const resident = [...owner.residents.values()].find(item => item.spec.member.sessionId === options.sessionId)
+      if (resident === undefined || owner.closing || resident.abort.signal.aborted) { yield* next(); return }
+      resident.requestSignal = options.signal
+      const activity = owner.beginActivity(resident, { kind: 'model' }, options.signal)
+      try {
+        for await (const chunk of next()) { activity.touch(); yield chunk }
+      } finally { activity.end() }
+    })
+  }
+
+  /** Read liveness from owned native operations, never from a persisted UI record. */
+  currentActivity(memberId: string): WorkerActivity | undefined {
+    const resident = this.residents.get(memberId)
+    if (!resident || this.closing || resident.stopping || resident.abort.signal.aborted) return undefined
+    const active = [...resident.activities.values()].filter(item => !item.signal?.aborted && (item.value.retryAt === undefined || Date.now() <= item.value.retryAt))
+    const value = active.at(-1)?.value
+    return value === undefined ? undefined : { ...value }
+  }
+  private publishActivity(resident: Resident): void {
+    try { this.callbacks?.activity?.(resident.spec.member.id, this.currentActivity(resident.spec.member.id)) }
+    catch (error) { this.ctx.logger.error(`Swarm activity observer failed: ${errorText(error)}`) }
+  }
+  private beginActivity(resident: Resident, fields: Pick<WorkerActivity, 'kind'> & Partial<Pick<WorkerActivity, 'tool' | 'retryAt' | 'retryAttempt'>>, signal?: AbortSignal) {
+    const now = Date.now(), key = randomUUID()
+    const value: WorkerActivity = { ...fields, id: key, startedAt: now, updatedAt: now }
+    const end = () => {
+      signal?.removeEventListener('abort', end)
+      if (resident.activities.delete(key)) this.publishActivity(resident)
+    }
+    resident.activities.set(key, { value, signal, release: end })
+    signal?.addEventListener('abort', end, { once: true })
+    if (signal?.aborted) end()
+    else this.publishActivity(resident)
+    return { end, touch: () => {
+      // Stream chunks prove new activity; coalesce writes without inventing progress heartbeats.
+      if (resident.activities.has(key) && Date.now() - value.updatedAt >= 1000) { value.updatedAt = Date.now(); this.publishActivity(resident) }
+    } }
+  }
+  private clearActivities(resident: Resident): void {
+    for (const item of [...resident.activities.values()]) item.release()
+    resident.retryActivity = undefined
   }
 
   bind(callbacks: WorkerCallbacks): void {
@@ -184,7 +232,7 @@ export class HarnessWorkers implements WorkerAdapter {
       if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec) }
       return await existing.opening
     }
-    const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, rejectedPendingStep: false }
+    const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
     try { await resident.opening }
@@ -290,6 +338,10 @@ export class HarnessWorkers implements WorkerAdapter {
         signal.throwIfAborted()
         return { kind: 'enter', messages: admitted.filter(message => !this.revokedAssignment(resident, message)) }
       })
+      agentCtx.on('tools/execute', async (exec, next) => {
+        const activity = this.beginActivity(resident, { kind: 'tool', tool: exec.name }, exec.signal)
+        try { return await next() } finally { activity.end() }
+      })
       agentCtx.on('tools/result', (exec, result) => {
         this.observe(resident, async () => { await this.observer().toolRun(spec.member.id, {
           tool: exec.name, arguments: exec.arguments, isError: result.isError,
@@ -298,6 +350,15 @@ export class HarnessWorkers implements WorkerAdapter {
         return undefined
       })
       agentCtx.on('session/event', (session, event) => {
+        // Retry events are an optional public session extension in both supported versions.
+        const type: string = event.type
+        const retryData: unknown = event.data
+        if (type === 'llm/retry' && isRecord(retryData) && typeof retryData.delayMs === 'number' && Number.isSafeInteger(retryData.delayMs) && retryData.delayMs >= 0 && typeof retryData.retry === 'number') {
+          resident.retryActivity?.()
+          resident.retryActivity = this.beginActivity(resident, { kind: 'retry', retryAt: Date.now() + retryData.delayMs, retryAttempt: retryData.retry }, resident.requestSignal).end
+        } else if (type === 'llm/retry-started' || type === 'turn/end') {
+          resident.retryActivity?.(); resident.retryActivity = undefined
+        }
         if (event.type === 'user/message') resident.recoveryInbox.delete(event.data.id)
         if (event.type === 'assistant/message' && event.data.usage !== undefined) {
           const usage = event.data.usage
@@ -317,6 +378,7 @@ export class HarnessWorkers implements WorkerAdapter {
       agentCtx.on('agent/error', ({ error }) => { this.failure(spec.member.id, error) })
       agentCtx.on('agent/status', ({ status }) => {
         if (status !== 'idle') return
+        this.clearActivities(resident)
         if (this.continueAfterRejectedStep(resident, agent)) return
         void this.drainObservations(resident).then(() => {
           if (resident.stopping === undefined && !this.closing && agent.status === 'idle') this.observer().idle(spec.member.id)
@@ -416,6 +478,7 @@ export class HarnessWorkers implements WorkerAdapter {
     if (resident === undefined) return
     if (resident.stopping !== undefined) return await resident.stopping
     resident.abort.abort('worker stopped')
+    this.clearActivities(resident)
     // Node fetch may annotate an object abort reason with a non-JSON stack.
     // Keep the native typed cancellation cause immutable for durable turn/end.
     // Accepted peer context is durable even when its model step has not begun.
@@ -448,11 +511,17 @@ export class HarnessWorkers implements WorkerAdapter {
     return resident?.handle !== undefined && resident.stopping === undefined && resident.observations.size === 0 && resident.handle.agent.status === 'idle' && !resident.handle.agent.inbox.hasPending
   }
   captureArtifact(member: Member, task: Task): Promise<Artifact> { return this.workspaces.captureArtifact(member, task) }
-  verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> { return this.workspaces.verifyArtifact(member, task, artifact, signal) }
+  async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {
+    const resident = this.residents.get(member.id)
+    const activity = resident === undefined ? undefined : this.beginActivity(resident, { kind: 'verification' }, signal)
+    try { return await this.workspaces.verifyArtifact(member, task, artifact, signal) }
+    finally { activity?.end() }
+  }
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> { return this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
   dispose(): Promise<void> {
     return this.disposal ??= (async () => {
       this.closing = true
+      this.removeStreamObserver()
       const results = await Promise.allSettled([...this.residents.keys()].map(async id => { await this.stop(id) }))
       await this.workspaces.dispose()
       const errors = results.filter((item): item is PromiseRejectedResult => item.status === 'rejected').map(item => item.reason as unknown)

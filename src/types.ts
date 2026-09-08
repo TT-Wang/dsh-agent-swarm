@@ -53,6 +53,17 @@ export interface Mission {
   /** Durable gate while budget exhaustion stops the previous worker activity. */
   budgetPause?: { id: string; quiesced: boolean }
 }
+/** Host-observed operation; lifecycle timestamps are not a completion estimate. */
+export interface WorkerActivity {
+  id: string
+  kind: 'model' | 'tool' | 'verification' | 'retry'
+  startedAt: number
+  updatedAt: number
+  tool?: string
+  retryAt?: number
+  retryAttempt?: number
+  attemptId?: string
+}
 export interface Member {
   id: string
   missionId: string
@@ -61,6 +72,7 @@ export interface Member {
   sessionId: string
   workspace: string
   status: MemberStatus
+  activity?: WorkerActivity
   subscriptions: string[]
   model?: string
   provider?: string
@@ -287,6 +299,8 @@ export interface WorkerSpec {
   ownerSessionId: string
 }
 export interface WorkerCallbacks {
+  /** Optional for adapters without live execution observation. */
+  activity?(memberId: string, activity?: WorkerActivity): void
   idle(memberId: string): void
   /** Called before each model step. False parks gracefully; errors deny execution. Fresh input excludes generated runtime context. */
   beforeStep(memberId: string, hasFreshInput?: boolean): Promise<void | false>
@@ -311,6 +325,8 @@ export interface WorkerAdapter {
   start(spec: WorkerSpec): Promise<void>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
+  /** Only returns operations still owned by a live, uncancelled adapter execution. */
+  currentActivity?(memberId: string): WorkerActivity | undefined
   isIdle(memberId: string): boolean
   captureArtifact(member: Member, task: Task): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
