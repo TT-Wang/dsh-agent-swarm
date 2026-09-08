@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "policy": "dsh-plugin-naming/v1",
+  "plugin": {
+    "namespace": "dsh-external",
+    "name": "agent-swarm",
+    "coordinate": "dsh-external/agent-swarm",
+    "packageName": "@dsh-external/dsh-agent-swarm"
+  },
+  "names": {
+    "pluginNames": [
+      "agent-swarm"
+    ],
+    "loaderIds": [
+      "dsh-external-agent-swarm"
+    ],
+    "services": [
+      "swarm"
+    ],
+    "tools": [
+      "swarm_add_member",
+      "swarm_budget",
+      "swarm_challenge",
+      "swarm_claim",
+      "swarm_control",
+      "swarm_create",
+      "swarm_handoff",
+      "swarm_launch",
+      "swarm_message",
+      "swarm_observe",
+      "swarm_propose",
+      "swarm_publish",
+      "swarm_stage",
+      "swarm_submit",
+      "swarm_subscribe",
+      "swarm_verify",
+      "swarm_wait",
+      "swarm_workstream"
+    ],
+    "commands": [
+      "agent-swarm"
+    ],
+    "skills": [],
+    "skillProviders": [],
+    "events": [],
+    "settingsNamespaces": [],
+    "routes": [
+      {
+        "kind": "prefix",
+        "path": "/agent-swarm"
+      }
+    ]
+  }
+}

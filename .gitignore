@@ -1,0 +1,25 @@
+node_modules/
+lib/
+*.tgz
+.swarm/
+coverage/
+test-results/
+.DS_Store
+.env
+.env.local
+
+# Local runs and historical investigation records (retain on disk).
+artifacts/
+docs/local/
+docs/validation-v*.md
+docs/live-smoke.md
+docs/review-*.md
+
+# Credentials, local runtime state and generated packages.
+.env*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.tsbuildinfo

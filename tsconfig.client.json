@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noUncheckedIndexedAccess": true, "skipLibCheck": true,
+    "declaration": true, "sourceMap": true, "jsx": "react-jsx",
+    "rootDir": "src", "outDir": "lib/types", "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "rewriteRelativeImportExtensions": true, "types": ["react"]
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/types.ts"]
+}

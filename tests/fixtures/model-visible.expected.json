@@ -1,0 +1,157 @@
+{
+  "visibleSwarmTools": [
+    "swarm_add_member",
+    "swarm_budget",
+    "swarm_challenge",
+    "swarm_claim",
+    "swarm_control",
+    "swarm_create",
+    "swarm_handoff",
+    "swarm_launch",
+    "swarm_message",
+    "swarm_observe",
+    "swarm_propose",
+    "swarm_publish",
+    "swarm_stage",
+    "swarm_submit",
+    "swarm_subscribe",
+    "swarm_verify",
+    "swarm_wait",
+    "swarm_workstream"
+  ],
+  "assignments": [
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "assignment"
+      },
+      "task": {
+        "title": "Implement value two",
+        "objective": "Change value.cjs to export two.",
+        "kind": "implementation",
+        "scope": [
+          "value.cjs"
+        ],
+        "acceptance": [
+          "value is two"
+        ],
+        "checks": [
+          "node check.cjs"
+        ],
+        "dependencyCount": 0,
+        "independentReview": false
+      },
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+    },
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "assignment"
+      },
+      "task": {
+        "title": "Independent review: Implement value two",
+        "objective": "Review the submitted artifact and run its required checks.",
+        "kind": "verification",
+        "scope": [
+          "value.cjs"
+        ],
+        "acceptance": [
+          "value is two"
+        ],
+        "checks": [],
+        "dependencyCount": 0,
+        "independentReview": true
+      },
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+    },
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "assignment"
+      },
+      "task": {
+        "title": "Integrate value two",
+        "objective": "Integrate the accepted implementation and validate the deliverable.",
+        "kind": "integration",
+        "scope": [
+          "value.cjs"
+        ],
+        "acceptance": [
+          "value is two"
+        ],
+        "checks": [
+          "node check.cjs"
+        ],
+        "dependencyCount": 1,
+        "independentReview": false
+      },
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+    },
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "assignment"
+      },
+      "task": {
+        "title": "Independent review: Integrate value two",
+        "objective": "Review the submitted artifact and run its required checks.",
+        "kind": "verification",
+        "scope": [
+          "value.cjs"
+        ],
+        "acceptance": [
+          "value is two"
+        ],
+        "checks": [],
+        "dependencyCount": 0,
+        "independentReview": true
+      },
+      "instructions": "Use this attempt id. Inspect prior evidence and workspace before work. Publish findings with host tool-run ids from swarm_observe; submit your artifact when ready. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority."
+    }
+  ],
+  "peerMessages": [
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "question"
+      },
+      "content": "Independent review requested; use the board and review only the current submitted artifact."
+    },
+    {
+      "source": {
+        "kind": "swarm",
+        "form": "relay",
+        "deliveryKind": "question"
+      },
+      "content": "Independent review requested; use the board and review only the current submitted artifact."
+    }
+  ],
+  "completion": "completed",
+  "acceptedTasks": [
+    {
+      "title": "Implement value two",
+      "kind": "implementation",
+      "status": "accepted"
+    },
+    {
+      "title": "Independent review: Implement value two",
+      "kind": "verification",
+      "status": "accepted"
+    },
+    {
+      "title": "Independent review: Integrate value two",
+      "kind": "verification",
+      "status": "accepted"
+    },
+    {
+      "title": "Integrate value two",
+      "kind": "integration",
+      "status": "accepted"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-external-agent-swarm
+      name: '@dsh-external/dsh-agent-swarm'
+      config: {}

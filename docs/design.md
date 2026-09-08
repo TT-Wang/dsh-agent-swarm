@@ -1,0 +1,69 @@
+# Design traceability
+
+Version 0.4.0 includes native one-command planning and execution, with primary-agent-selected budgets and task policies, to the docked sidebar and durable collaboration runtime. Plan editing and mission controls call the same runtime that authenticates model tools by session identity; the browser transport uses modern Harness native browser credentials, cookies and trusted-host checks.
+
+| Agreed design property | Implementation | Evidence |
+| --- | --- | --- |
+| Workstreams outlive agent turns | `types.ts`, `store.ts`, `runtime.ts` | Full host restart without live owner in `harness-composition.mjs` |
+| Peer initiative within one mission | `propose`, `workstream`, `message`, `subscribeTopics` | Worker proposes review and contacts its peer through real model-visible tools |
+| Conversation differs from verified knowledge | Typed `Delivery` and `Evidence` records | Unverified findings, negative outcomes, challenges and host tool-run references |
+| Runtime owns coordination authority and capacity | Actor resolution, scoped tool guards, shared budget; Harness sandbox owns workspace confinement | Cross-session rejection, alternate delegation denial, shared-step tests |
+| Enforced exclusive work ownership | Atomic attempts, epochs, leases, quiescent handoff | Concurrent claims, stale result rejection, transfer and cancellation tests |
+| Durable partial work | Per-task workspace checkpoint metadata, retained Git refs and durable stop-transition markers | Dirty restart, interrupted handoff, cross-owner and round-trip handoff tests |
+| Immutable artifacts and independent verification | `captureArtifact`, exact candidate reviewer checkout, fresh host check checkout; evidence status changes remain recorded | Source branch preservation, scope and failed-check tests |
+| Challenges affect dependent decisions | Transitive dependency and `reviewOf` invalidation | Delayed preparation/verification race regressions |
+| Repair can converge | `replaces`, acceptance obligation preservation, verified evidence supersession | Runtime repair/acceptance tests |
+| Controlled coding integration | Accepted dependency artifacts merged only in owned integration worktree | Real Loader composition and merge conflict tests |
+| Durable coordination and selective wakeups | SQLite transactional state/event/outbox, stable inbox IDs and enforced parking at pre-step | Restart, duplicate delivery, offline owner and concurrent parking/wake tests |
+| Peer context is visible to the actual model | Host-derived identity prompt and mission IDs in rendered delivery text | First-peer-before-assignment regression through native model input |
+| Resumable bounded workers | Harness factory handles, saved composition, cumulative usage reconciliation | Adapter cold resume and usage replay tests |
+| Editable planning before execution | `swarm_stage`, `PlanInput`, revisioned `DraftPlan`, `plans.ts`, `DraftEditor.tsx` | Plan validation, ownership, revision-conflict and draft HTTP tests; CLI Web/browser workflow in `test:web` |
+| Complete topology before dispatch | Staged mission assembly, stable topology IDs, `launchDraft`; saved-plan workspace and exact-model admission | Launch retry, interrupted assembly recovery and model-validation-before-effects tests |
+| Live inspectable mission state | `ActivityPanel.tsx`, selected-session `SwarmMonitor`, native `/agent-swarm` RPC, work board/graph/evidence/activity views | Poll cancellation and stale-response tests, HTTP tests, actual Web-profile browser smoke |
+| Sidebar remains usable beside chat | Optional Better Sidebar tab, independent dock fallback, retained draft state on collapse | Real service contract tests and browser geometry/draft interactions |
+| Owner-only mission management | Verified native session IDs, `visibleSnapshots`, durable worker identity checks and runtime control methods | Owner/member isolation, historical-worker readonly, pause/stop and cold-owner HTTP cases |
+| Independent worker conversations and persisted transcripts | Listed workers use `sessions.open(workerSessionId)`; missing/disposed workers use owner-authorized `worker-history` RPC backed by native `sessionController.inspect`, through `WorkerHistory` and `WorkerTranscript` | Native navigation and history pagination/projection tests; browser workflow checks live navigation and cold history without model activation |
+| Conversation history stays reconstructable | Durable `tool/result.meta.swarmSnapshot` conversation projections, separate from live polling | Real client registry mount/dispose and conversation render tests |
+| No agent-loop fork | `ctx.agents`, `agent.send`, scoped guards and lifecycle events | Packaged artifact loaded with unmodified target Harness |
+
+The runtime uses one SQLite owner and a local worker adapter. Task selection is deterministic priority/readiness scheduling; temporary coordinators advise through the same tools as other members. The primary chooses the initial team and task graph. Runtime scheduling does not perform separate model-based task valuation or distributed consensus.
+
+An owner can stage a plan through the model tool or create one manually in **New mission**. The plan records the mission's scope, budget and acceptance criteria, worker provider/model/reasoning choices, workstreams, and tasks with dependencies and independent review targets. Saving performs no worker or worktree creation. Browser saves and launch validate the canonical workspace against the selected native session. Provider catalogs are advisory; the exact route and requested reasoning effort are validated through the public Harness LLM service before launch effects.
+
+Launch requires a saved revision and a live owner composition. All workers and task references are materialized while the mission remains staged; only the final activation permits dispatch. A failed launch retains its draft and partially prepared mission for retry using stable IDs. The same completed launch returns the same mission on retry. To change a failed plan, discard it and stage a new one; retained artifacts are not silently deleted.
+
+The browser bridge is optional and registered through native Connection under `/agent-swarm`, with native browser authentication and Host/Origin/Fetch-Metadata checks, native RPC envelopes and an additional decoded-payload bound. Headless use does not depend on a web server. The sidebar reads only its viewed session's authorized drafts and missions, polls without model requests, cancels obsolete session reads, and fences late plan/control responses after selection changes. Draft editing and owner controls are disabled for worker sessions, including stopped historical workers.
+
+Worker links use ordinary `sessions.open` while the independent worker session is listed. The native composer may remain writable; mission management authority is enforced separately. When a disposed worker is absent from that list, a read-only transcript opens inside the sidebar using the plugin’s `worker-history` RPC. The host checks mission/member ownership, then reads attached or persisted events through native `sessionController.inspect` without resuming or publishing an agent. `WorkerHistory` fetches pages of 30 append-origin messages, merges by event sequence, and ignores responses after a view closes or changes. The viewer displays input, assistant messages, tool calls/results and an event index, with earlier-page loading. It is a text-oriented history view, not a recreated native chat session; media is represented by type and individual entry display is explicitly capped at 40,000 characters. Both live sidebar cards and historical conversation cards share this navigation path.
+
+Conversation snapshot cards preserve the state recorded by explicit observations. The sidebar's work board, selectable dependency graph, evidence and activity views reflect later durable state through polling. The draft editor includes native model/reasoning selectors, priorities, experiment flags, scope, budgets and independent review targets; verification rows display their source task's actual check commands. Principal labels use the native English/Chinese locale setting, and CSS follows Harness's light/dark theme marker. Hiding a tab or collapsing the dock pauses monitor requests while retaining editor state; workers continue within runtime budgets. Polling is not a continuous event stream or a distributed synchronization protocol.
+
+Deterministic composition tests script provider responses while Harness loading, tools, sessions, worktrees, sandboxes and filesystem outcomes are real. `npm run test:web` additionally exercises the actual CLI Web composition and browser controls; its artifacts and current outcome are reported separately from synthetic UI previews. Current tested versions, the scripted-provider boundary and frontend evidence are summarized in [validation.md](validation.md). These tests do not establish comparative swarm performance. Remaining authority, lease and storage limits are documented in [known-limitations.md](known-limitations.md).
+
+## v0.2.1 sidebar presentation
+
+The client registers one `agent-swarm` tab through the optional public Better Sidebar service. Each tab receives its supplied session scope and visibility, owns a separate state monitor and history viewer, and never substitutes the globally selected session for a pinned tab. Hidden tabs suspend polling. Registration and service replacement follow Cordis disposal.
+
+Without Better Sidebar, the additive shell contribution renders a right-edge dock and explicitly reserves its width from the DSH root. A narrow viewport uses a bottom row. Width changes, collapse and reopen affect layout, not runtime authority. The floating rectangle, title-bar dragging, corner resize and free-position preferences were removed. The native conversation and tool-details slot owners remain installed.
+
+
+## Native command and primary-agent decisions (v0.3.0)
+
+The command descriptor is registered in native `commands`; native `ui-commands` supplies autocomplete and arbitrary text input. A client commandview renders the original goal and acknowledgment, and a successful native command event opens the sidebar. No duplicate client-only command or custom composer parser is used.
+
+`planner.ts` checks the live owner, canonical Git workspace and current model before creating a durable automatic request. It delivers a typed `swarm-start` follow-up through the same owner's native inbox. That turn inspects the repository and invokes `swarm_launch`; no secondary provider loop or hardcoded task decomposition is used. The runtime checks the generated topology, assembles it with dispatch fenced, and activates it atomically. Completion is driven by accepted artifacts, independent review and coverage, not a model's claimed success.
+
+The primary agent decides token/step budgets, team capacity and membership, task/experiment limits, mission duration, task graph, scope, acceptance, check commands, priorities, optional model routes, per-member output-token allowances, per-task recovery attempts and verification timeouts. `swarm_budget` permits owner-only revisions based on progress, with a durable reason; it never resets usage. Paused/blocked missions remain under explicit owner control. Database/worktree locations, heartbeat/tick intervals, output/payload bounds, identity, artifact checks and review requirements remain runtime policy.
+
+The journal is separate from manual drafts. The frontend displays planning/errors directly and hides the internal auto-generated draft editor. Manual advanced staging remains available when explicitly requested. Host restarts and retries preserve request/draft/mission identities. Peer messages cannot launch another swarm, expand budgets, change owner authority or waive verification.
+
+Automatic topology size is constrained by the primary-selected worker/task budgets and the transport payload bound; no separate 200-entry team/task ceiling remains. Acceptance commands run in clean committed artifact checkouts, with changed paths checked separately by the host. Budget resume waits for actual worker quiescence and wakes the same attempt immediately, preserving evidence.
+
+
+## Admission repair (v0.3.1)
+
+Both complete plans and incremental create/propose calls share admission normalization and diagnostics. Only equivalent path aliases (`./src/`, `src/**`) become canonical relative scopes; arbitrary globs, root guesses, traversal and descriptive prose are never expanded to broader permissions. Legal filenames may contain spaces, so admission cannot reliably detect every prose sentence; the model contract explicitly separates path scope from objective and acceptance.
+
+For verification, `reviewOf` already gates the source's submitted artifact. A duplicate ordinary dependency is removed on a detached input copy to avoid waiting for acceptance of the source being reviewed. Other dependencies remain mandatory, and the source author still cannot accept their own work. Canonical fields are retained in the durable plan/task; caller inputs are unchanged.
+
+Field diagnostics for paths and code checks are returned together before complete-plan admission. Missing, empty and whitespace-only shell checks remain rejected. The primary uses ordinary tools to inspect the repository and corrects the same request, preserving identity, acceptance and its selected budget. Read-only analysis and report consolidation use research tasks and may depend on accepted research; code integration continues to require immutable artifacts and host commands. The runtime never silently changes a task kind or supplies an always-passing command.

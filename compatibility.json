@@ -1,0 +1,22 @@
+{
+  "defaultHost": "0.1.2-rc.1",
+  "supportedHosts": [
+    {
+      "version": "0.1.2-rc.1",
+      "commit": "a66e4702047846cdaa10c66c9d3df3951f5ea70d",
+      "channel": "latest",
+      "source": "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1"
+    },
+    {
+      "version": "0.1.3-alpha.2",
+      "commit": "82a5fd61a7cf5c293cec4bdff68f455398d685e9",
+      "channel": "alpha",
+      "source": "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2"
+    }
+  ],
+  "reference": {
+    "commit": "1caff61f4c0909711b515ebc56187055556186cd",
+    "source": "https://github.com/NanmiCoder/dsh-agent-teams"
+  },
+  "note": "Targets the npm latest release and newest alpha release separately. See docs/validation.md for completed checks; historical rc.5 evidence does not establish compatibility with these targets."
+}
