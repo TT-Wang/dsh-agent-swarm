@@ -336,7 +336,14 @@ test('launch revalidates current model routing before side effects and activates
 
 test('public model response and native route registration contain no configuration and dispose cleanly', async t => {
   const f = await fixture(t)
-  const models = await f.rpc('models', {})
+  // L2: the catalog is no longer the one RPC that skips session resolution.
+  const unbound = await f.rpc('models', {})
+  assert.equal(unbound.result.ok, false, 'models must bind to an authenticated session')
+  assert.match(unbound.result.error.message, /sessionId/)
+  const unknown = await f.rpc('models', { sessionId: 'invented-owner' })
+  assert.equal(unknown.result.ok, false)
+  assert.equal(unknown.result.error.code, 'session-not-found')
+  const models = await f.rpc('models', { sessionId: f.ownerId })
   assert.equal(models.result.ok, true, models.text)
   assert.deepEqual(models.result.value, { providers: [{ id: 'public-provider', name: 'Public provider' }],
     models: [{ provider: 'public-provider', id: 'model-one', name: 'Model One', description: 'Public description' }] })
@@ -344,6 +351,41 @@ test('public model response and native route registration contain no configurati
   assert.equal((await f.rpc('state', { sessionId: f.ownerId })).status, 404)
 })
 
+
+test('unexpected web API failures are sanitized while validation messages stay actionable', async t => {
+  const f = await fixture(t)
+  // A known validation failure keeps its actionable message.
+  const validation = await f.rpc('watch', { sessionId: f.ownerId, afterRevision: -1 })
+  assert.equal(validation.result.ok, false)
+  assert.match(validation.result.error.message, /afterRevision must be a nonnegative safe integer/)
+  // L3: an unexpected internal failure must not leak paths or store schema text.
+  f.runtime.visibleMissions = () => [{ id: 'internal-mission' }]
+  f.runtime.snapshot = () => { throw new TypeError('SQLITE_ERROR: no such table tasks at /private/var/secret/swarm.sqlite') }
+  const internal = await f.rpc('state', { sessionId: f.ownerId })
+  assert.equal(internal.result.ok, false)
+  assert.equal(internal.result.error.code, 'internal-error')
+  assert.doesNotMatch(internal.result.error.message, /secret|SQLITE|private|sqlite/)
+  assert.match(internal.result.error.message, /logged/)
+})
+
+test('add-member validates subscriptions as a string array before admitting a worker', async t => {
+  const f = await fixture(t)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  // M9(c): a bare string would be stored and make topic matching substring-based.
+  const rejected = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
+    input: { name: 'Worker', role: 'implementation', subscriptions: 'topic-a' } })
+  assert.equal(rejected.result.ok, false, 'a non-array subscriptions value must be rejected')
+  assert.match(rejected.result.error.message, /subscriptions must be a string array/)
+  assert.deepEqual(f.runtime.snapshot({ sessionId: f.ownerId }, mission.id).members, [], 'no worker is admitted on a rejected request')
+  const invalidItem = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
+    input: { name: 'Worker', role: 'implementation', subscriptions: ['topic-a', 7] } })
+  assert.equal(invalidItem.result.ok, false)
+  assert.match(invalidItem.result.error.message, /subscriptions must be a string array/)
+  const accepted = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
+    input: { name: 'Worker', role: 'implementation', subscriptions: ['topic-a', 'topic-b'] } })
+  assert.equal(accepted.result.ok, true, accepted.text)
+  assert.deepEqual(accepted.result.value.member.subscriptions, ['topic-a', 'topic-b'])
+})
 
 test('worker history pages retain message source groups and cold sessions without activating workers', async t => {
   const f = await fixture(t)

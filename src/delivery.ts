@@ -23,6 +23,14 @@ function same(a?: Entry, b?: Entry): boolean { return a === undefined || b === u
 function validPath(value: string): void {
   if (!value || value.includes('\0') || value.includes('\\') || path.posix.isAbsolute(value) || value.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git' || part.includes(':'))) throw new Error(`Unsafe delivery path: ${JSON.stringify(value)}`)
 }
+/** A delivery never materializes a link whose target leaves the repository. */
+function assertContainedSymlink(relative: string, target: Buffer): void {
+  let value: string
+  try { value = new TextDecoder('utf-8', { fatal: true }).decode(target) } catch { throw new Error(`Delivery symlink target is not valid UTF-8: ${relative}`) }
+  if (!value || value.includes('\0') || path.posix.isAbsolute(value)) throw new Error(`Delivery symlink escapes the repository: ${relative} -> ${JSON.stringify(value)}`)
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(relative), value))
+  if (resolved === '..' || resolved.startsWith('../')) throw new Error(`Delivery symlink escapes the repository: ${relative} -> ${JSON.stringify(value)}`)
+}
 function environment(): NodeJS.ProcessEnv {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')))
   return { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' }
@@ -135,22 +143,52 @@ async function privateDirectory(gitDir: string): Promise<string> {
   if (await realpath(directory) !== directory || !(await lstat(directory)).isDirectory()) throw new Error('Unsafe delivery metadata directory')
   return directory
 }
+/**
+ * A lock without a readable owner is the crash window between `mkdir` and the
+ * atomic owner rename, so it is reclaimable after this grace period. A readable
+ * owner is reclaimable only when its pid is gone.
+ */
+const LOCK_GRACE_MS = 30_000
+const LOCK_RETRIES = 5
+async function lockOwner(lock: string): Promise<{ pid: number; createdAt?: number } | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path.join(lock, 'owner.json'), 'utf8')) as unknown
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+    const owner = value as { pid?: unknown; createdAt?: unknown }
+    if (!Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 0) return undefined
+    return { pid: owner.pid as number, ...(Number.isSafeInteger(owner.createdAt) ? { createdAt: owner.createdAt as number } : {}) }
+  } catch { return undefined }
+}
+function ownerAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true }
+  catch (failure) { return !(failure instanceof Error && 'code' in failure && failure.code === 'ESRCH') }
+}
+async function lockStale(lock: string): Promise<boolean> {
+  const owner = await lockOwner(lock)
+  if (owner !== undefined) return !ownerAlive(owner.pid)
+  const info = await lstat(lock).catch(() => undefined)
+  return info === undefined || Date.now() - info.mtimeMs >= LOCK_GRACE_MS
+}
 async function acquire(directory: string): Promise<() => Promise<void>> {
   const lock = path.join(directory, 'apply.lock')
-  try { await mkdir(lock, { mode: 0o700 }) } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-    let stale = false
-    try {
-      const owner = JSON.parse(await readFile(path.join(lock, 'owner.json'), 'utf8')) as { pid?: number }
-      if (Number.isSafeInteger(owner.pid) && owner.pid! > 0) {
-        try { process.kill(owner.pid!, 0) } catch (failure) { stale = failure instanceof Error && 'code' in failure && failure.code === 'ESRCH' }
-      }
-    } catch { /* An incomplete lock is left intact rather than stealing a live operation. */ }
-    if (!stale) throw new Error('Another delivery is being applied to this project')
-    await rm(lock, { recursive: true })
-    await mkdir(lock, { mode: 0o700 })
+  for (let attempt = 0; ; attempt++) {
+    try { await mkdir(lock, { mode: 0o700 }); break } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
+      if (attempt >= LOCK_RETRIES - 1 || !(await lockStale(lock))) throw new Error('Another delivery is being applied to this project')
+      // Reclaim atomically: the winner of the rename owns the removal, so two
+      // contenders cannot both delete a lock the other just created.
+      const discarded = `${lock}.stale-${randomUUID()}`
+      try { await rename(lock, discarded); await rm(discarded, { recursive: true, force: true }) } catch { /* another contender reclaimed it first */ }
+    }
   }
-  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' })
+  const temporary = path.join(directory, `owner-${randomUUID()}.tmp`)
+  try {
+    await writeFile(temporary, JSON.stringify({ pid: process.pid, createdAt: Date.now() }), { mode: 0o600, flag: 'wx' })
+    await rename(temporary, path.join(lock, 'owner.json'))
+  } catch (error) {
+    await rm(lock, { recursive: true, force: true }).catch(() => undefined)
+    throw error
+  } finally { await rm(temporary, { force: true }).catch(() => undefined) }
   return async () => { await rm(lock, { recursive: true, force: true }) }
 }
 
@@ -207,9 +245,29 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
     const metadata = await privateDirectory(gitDir)
     release = await acquire(metadata)
     const receipt = path.join(metadata, `${sha(`${source}\0${input.baselineCommit}\0${input.resultCommit}`)}.json`)
+    let receiptHit = false
     try {
       const saved = JSON.parse(await readFile(receipt, 'utf8')) as Record<string, unknown>
-      if (saved.source === source && saved.baselineCommit === input.baselineCommit && saved.resultCommit === input.resultCommit && saved.applied === true) return { status: 'applied', changedPaths, conflicts: [] }
+      if (saved.source === source && saved.baselineCommit === input.baselineCommit && saved.resultCommit === input.resultCommit && saved.applied === true) {
+        receiptHit = true
+        // A receipt is a hint, not proof: the working tree may have been
+        // reverted or edited after the recorded apply. Re-check every changed
+        // path against the recorded fingerprints and fall through to the
+        // idempotent three-way merge on any mismatch. Legacy receipts without
+        // fingerprints always fall through.
+        const savedFingerprints = saved.fingerprints
+        let unchanged = typeof savedFingerprints === 'object' && savedFingerprints !== null && !Array.isArray(savedFingerprints)
+        if (unchanged) {
+          const recorded = savedFingerprints as Record<string, unknown>
+          for (const relative of changedPaths) {
+            const expected = recorded[relative]
+            if (typeof expected !== 'string') { unchanged = false; break }
+            try { if ((await local(source, relative)).fingerprint !== expected) { unchanged = false; break } }
+            catch { unchanged = false; break }
+          }
+        }
+        if (unchanged) return { status: 'applied', changedPaths, conflicts: [] }
+      }
     } catch (error) { if (!missing(error)) throw error }
     temporary = await mkdtemp(path.join(tmpdir(), 'dsh-swarm-delivery-'))
     const changes: Change[] = []
@@ -220,9 +278,18 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
       if (original.directory) { conflicts.push(relative); continue }
       const base = await treeEntry(source, input.baselineCommit, relative, signal)
       const result = await treeEntry(source, input.resultCommit, relative, signal)
+      // The result tree is what this call can materialize; a link that escapes
+      // the repository is refused before any source write.
+      if (result?.kind === 'symlink') assertContainedSymlink(relative, result.bytes)
       const merged = await mergeEntry(base, original.entry, result, temporary, signal)
-      if (merged.conflict) conflicts.push(relative)
-      else if (!same(original.entry, merged.output)) changes.push({ relative, original, output: merged.output })
+      if (merged.conflict) {
+        // A recorded apply already wrote this result. If the user has since
+        // edited the path in a way that cannot merge cleanly, keep their work
+        // instead of reporting a spurious conflict. The result is only
+        // rewritten when it is definitively absent (the path was deleted).
+        if (receiptHit && original.entry === undefined && result !== undefined) changes.push({ relative, original, output: result })
+        else if (!receiptHit) conflicts.push(relative)
+      } else if (!same(original.entry, merged.output)) changes.push({ relative, original, output: merged.output })
     }
     if (conflicts.length) return { status: 'conflicts', changedPaths, conflicts }
     // Check the whole write set before making the first modification.
@@ -270,9 +337,13 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
       // An editor may still hold an open descriptor to the original, renamed file.
       if (item.backup && !same((await local(source, path.relative(source, item.backup))).entry, item.change.original.entry)) throw new Error(`Original file changed while applying delivery: ${item.change.relative}`)
     }
+    // Record the exact applied state per changed path so a later call can tell
+    // a genuinely applied tree from a stale receipt.
+    const fingerprints: Record<string, string> = {}
+    for (const relative of changedPaths) fingerprints[relative] = (await local(source, relative)).fingerprint
     const pendingReceipt = `${receipt}.${randomUUID()}.tmp`
     temporaryFiles.push(pendingReceipt)
-    await writeFile(pendingReceipt, JSON.stringify({ ...input, source, applied: true, changedPaths }), { mode: 0o600, flag: 'wx' })
+    await writeFile(pendingReceipt, JSON.stringify({ ...input, source, applied: true, changedPaths, fingerprints }), { mode: 0o600, flag: 'wx' })
     await rename(pendingReceipt, receipt)
     completed = true
     for (const item of written) if (item.backup) await unlink(item.backup).catch(() => undefined)

@@ -181,3 +181,67 @@ test('pausing an in-flight worker start preserves membership for resume', async 
   runtime.control(owner, mission.id, 'resume', 'Continue the same mission')
   await eventually(() => runtime.store.get('tasks', task.id).status === 'running', 'worker did not resume after pause')
 })
+
+/** A committed budget pause with a preserved running attempt, ready to resume or restart. */
+async function budgetFixture(t) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-budget-'))
+  const config = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
+  const runtime = new SwarmRuntime(config, new ShutdownWorkers())
+  const owner = { sessionId: 'budget-owner' }
+  const mission = runtime.create(owner, { title: 'Pause', objective: 'Resume the same attempt', workspace: directory, scope: ['src/'], acceptance: ['done'],
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 10, maxExperiments: 1 } })
+  const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Resume' })
+  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Paused task', objective: 'Resume', kind: 'implementation',
+    assigneeId: member.id, scope: ['src/'], acceptance: ['done'], checks: ['test'] })
+  const claimed = await runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
+  const pause = () => {
+    const missionRecord = runtime.store.get('missions', mission.id)
+    missionRecord.status = 'blocked'; missionRecord.reason = 'Aggregate mission budget exhausted: maxTokens'; missionRecord.budgetPause = { id: 'pause-1', quiesced: true }
+    runtime.store.put('missions', missionRecord)
+  }
+  const preserve = attemptId => {
+    const taskRecord = runtime.store.get('tasks', task.id)
+    taskRecord.budgetResume = { pauseId: 'pause-1', attemptId, epoch: taskRecord.epoch }
+    runtime.store.put('tasks', taskRecord)
+  }
+  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  return { directory, config, runtime, owner, mission, member, task, claimed, pause, preserve }
+}
+
+test('budget resume keeps the preserved attempt and spends no recovery credit', { timeout: 10000 }, async t => {
+  const f = await budgetFixture(t)
+  f.pause(); f.preserve(f.claimed.attempt.id)
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+  await eventually(() => f.runtime.store.get('missions', f.mission.id).budgetPause === undefined, 'the pause must clear on resume')
+  const resumed = f.runtime.store.get('tasks', f.task.id)
+  assert.equal(resumed.status, 'running')
+  assert.equal(resumed.attempt.id, f.claimed.attempt.id, 'the preserved attempt survives the pause')
+  assert.equal(resumed.recoveryCount, undefined, 'a budget pause spends no recovery credit')
+  assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active')
+})
+
+test('a stale budget resume marker re-pends without charging a recovery attempt', { timeout: 10000 }, async t => {
+  const f = await budgetFixture(t)
+  f.pause(); f.preserve('stale-attempt')
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
+  await eventually(() => f.runtime.store.events(f.mission.id, 100).some(event => event.type === 'task/budget-resume-skipped'), 'the stale marker must be reported')
+  const current = f.runtime.store.get('tasks', f.task.id)
+  assert.equal(current.recoveryCount, undefined, 'a stale marker is not a recovery failure')
+  assert.notEqual(current.attempt?.id, 'stale-attempt')
+  assert.notEqual(current.status, 'blocked')
+})
+
+test('a host restart during a budget pause spends no recovery credit', { timeout: 10000 }, async t => {
+  const f = await budgetFixture(t)
+  f.pause(); f.preserve(f.claimed.attempt.id)
+  await f.runtime.dispose()
+  const recovered = new SwarmRuntime(f.config, new ShutdownWorkers())
+  try {
+    await recovered.start()
+    const restored = recovered.store.get('tasks', f.task.id)
+    assert.equal(restored.recoveryCount, undefined, 'a pause-induced stop spends no recovery credit')
+    assert.equal(restored.status, 'pending')
+    assert.equal(restored.attempt, undefined)
+  } finally { await recovered.dispose() }
+})

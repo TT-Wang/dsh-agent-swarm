@@ -1,6 +1,7 @@
 /** Model tools are thin, authenticated consumers of the swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { JsonSchemaNode, ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
+import { realpath } from 'node:fs/promises'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -9,6 +10,8 @@ import type { Actor, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanIn
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
 const integer = { type: 'integer' } as const
+/** Cursors and paging offsets are nonnegative at runtime (`optionalInteger`), so the schema says so. */
+const nonnegativeInteger = { type: 'integer', minimum: 0 } as const
 
 /** Every registered swarm tool, in registration order (stable schema prefix for prompt caching). */
 export const SWARM_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control'] as const
@@ -18,6 +21,8 @@ export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'sw
 export const MANAGEMENT_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control'] as const
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control'] as const
+/** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */
+export const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
 export type SwarmRole = 'entry' | 'owner' | 'worker' | 'none'
 /** Global tool names hidden from a session in the given role. */
 export function hiddenToolsFor(role: SwarmRole): string[] {
@@ -73,6 +78,23 @@ function optionalInteger(args: Args, key: string): number | undefined {
 }
 function optionalText(args: Args, key: string): string | undefined { return args[key] === undefined ? undefined : text(args, key) }
 
+/**
+ * Bind a model-supplied plan workspace to the calling agent session.
+ * The browser path already canonicalizes against `header.cwd`; model tools must
+ * enforce the same boundary so a misled or injected model cannot direct a swarm
+ * outside the user-authorized workspace. Fail closed when the session has no cwd,
+ * and return the realpath so the mission records a canonical source that
+ * delivery can apply.
+ */
+async function boundPlanWorkspace(exec: ToolExecution, requested: string): Promise<string> {
+  const cwd = exec.agent?.session?.header?.cwd
+  if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('Swarm planning tools require an agent session workspace')
+  const session = await realpath(cwd).catch(() => undefined)
+  const workspace = await realpath(requested).catch(() => undefined)
+  if (session === undefined || workspace === undefined || workspace !== session) throw new Error('Plan workspace must match the selected session workspace')
+  return workspace
+}
+
 /** Launch confirmation the model needs: identities and the graph, not every record. */
 function launchSummary(snapshot: Snapshot): unknown {
   return {
@@ -113,7 +135,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       async execute(value, exec) {
         exec.signal.throwIfAborted()
         if (!exec.agent) throw new Error('Swarm tools require an authenticated Harness agent session')
-        const args = object(value)
+        let args = object(value)
+        // H4: planning workspaces are bound to the calling session, never the model's word.
+        if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) args = { ...args, workspace: await boundPlanWorkspace(exec, text(args, 'workspace')) }
         const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
         const result = await run(args, actor)
         const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
@@ -147,10 +171,10 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   launchProperties.requestId = { type: 'string', description: 'Exact requestId from the swarm-start context.' }
   launchProperties.members!.items!.required = ['key', 'name', 'role', 'maxOutputTokens']
   launchProperties.members!.items!.properties!.maxOutputTokens = { type: 'integer', description: 'Per-request output-token allowance for this worker’s role and model.' }
-  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance', 'assigneeKey', 'maxRecoveryAttempts', 'checkTimeoutMs']
+  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance', 'assigneeKey', 'maxRecoveryAttempts']
   launchProperties.tasks!.items!.properties!.key = { type: 'string', description: 'Unique stable identifier such as task_1, required on every task including reviews; dependencies and reviewOf reference it.' }
   launchProperties.tasks!.items!.properties!.acceptance = { type: 'array', items: { type: 'string' }, description: 'Mission acceptance strings copied exactly into the deliverable task that satisfies them; a paraphrase does not match.' }
-  launchProperties.tasks!.items!.properties!.checkTimeoutMs = { type: 'integer', description: 'Per-check timeout in milliseconds; reviews inherit their source’s checks and timeout.' }
+  launchProperties.tasks!.items!.properties!.checkTimeoutMs = { type: 'integer', description: 'Per-check timeout in milliseconds; required for non-verification tasks that declare checks, because the runtime extends the verifier lease by it. Reviews inherit their source’s checks and timeout.' }
   launchProperties.tasks!.items!.properties!.maxRecoveryAttempts = { type: 'integer', description: 'Allowed automatic recovery attempts for this task.' }
   register('swarm_launch', 'Launch the complete plan for a native /agent-swarm request identified by requestId; no user confirmation is needed and the workspace is the frozen request snapshot. Validation errors list every field to repair: fix them all and retry the same requestId. Completion is automatic after verified acceptance; end your turn after a successful launch.', launchProperties, ['requestId', 'title', 'objective', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], async (a, actor) => {
     const requestId = text(a, 'requestId')
@@ -186,8 +210,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     } satisfies CreateMissionInput))
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree.',
     { ...mission, name: string, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'name', 'role'],
-    (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: text(a, 'name'), role: text(a, 'role'), model: a.model as string | undefined,
-      provider: a.provider as string | undefined, reasoningEffort: a.reasoningEffort as string | undefined, maxOutputTokens: a.maxOutputTokens as number | undefined, subscriptions: a.subscriptions as string[] | undefined }))
+    (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: text(a, 'name'), role: text(a, 'role'), model: optionalText(a, 'model'),
+      provider: optionalText(a, 'provider'), reasoningEffort: optionalText(a, 'reasoningEffort'), maxOutputTokens: optionalInteger(a, 'maxOutputTokens'),
+      subscriptions: a.subscriptions === undefined ? undefined : array(a, 'subscriptions') }))
   register('swarm_workstream', 'Create a durable workstream in this mission; any member can propose work under it.',
     { ...mission, title: string, objective: string, coordinatorId: string }, ['missionId', 'title', 'objective'],
     (a, actor) => runtime.workstream(actor, text(a, 'missionId'), { title: text(a, 'title'), objective: text(a, 'objective'), coordinatorId: a.coordinatorId as string | undefined }))
@@ -220,7 +245,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_wait', 'Members only: park until relevant work or a direct message arrives, then end the turn. The owner ends its native turn instead and waits for runtime notices.',
     mission, ['missionId'], (a, actor) => runtime.wait(actor, text(a, 'missionId')))
   register('swarm_observe', 'Bounded mission reads. Default: your current task, prerequisites, review source, your run references and recent events (owner: compact board and usage). after/afterRun return only newer events/runs; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record. Omit missionId to list your missions.',
-    { ...mission, after: integer, afterRun: integer, taskId: string, runId: string, offset: integer, evidenceId: string, detail: { type: 'string', enum: ['summary', 'full'] } }, [],
+    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, detail: { type: 'string', enum: ['summary', 'full'] } }, [],
     (a, actor) => a.missionId === undefined ? runtime.list(actor.sessionId) : runtime.observe(actor, text(a, 'missionId'), {
       after: optionalInteger(a, 'after'), afterRun: optionalInteger(a, 'afterRun'), offset: optionalInteger(a, 'offset'),
       taskId: optionalText(a, 'taskId'), runId: optionalText(a, 'runId'), evidenceId: optionalText(a, 'evidenceId'),

@@ -7,9 +7,11 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { taskLane, remainingPercent, snapshotFromResult } from '../lib/types/client/projection.js'
+import { taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
+import { leaseExpired } from '../lib/types/client/clock.js'
 import { swarmCardDefinition } from '../lib/types/client/card-definition.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
+import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityPanel.js'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
 import { fitSidebar } from '../lib/types/client/SidebarDock.js'
@@ -322,4 +324,94 @@ test('hidden sidebar monitor retains editor input data while stopping requests a
     calls[2].resolve(response('pinned-owner'))
     await new Promise(resolve => setImmediate(resolve))
   } finally { monitor.dispose() }
+})
+
+test('default plan ships a real artifact-exercising host check instead of a whitespace diff', () => {
+  const input = newPlan('/repo', uiSnapshot().mission.budget)
+  assert.deepEqual(input.tasks[0].checks, ['npm test'])
+  assert.equal(input.tasks[0].checks.some(check => /git diff --check/.test(check)), false, 'a whitespace diff cannot prove the acceptance criteria')
+  assert.match(input.tasks[0].checks[0], /^(?:npm|pnpm|yarn|node|npx)\s/, 'the default check must exercise the artifact')
+  input.title = 'Default check'; input.objective = 'Prove the default check exercises the artifact'
+  assert.doesNotThrow(() => validatePlan(input))
+  const html = renderToStaticMarkup(React.createElement(DraftEditor, { sessionId: 'owner', workspace: '/repo', budget: input.budget, request: async () => ({}), onSaved() {}, onLaunched() {}, onDiscarded() {} }))
+  assert.match(html, /readonly=""[^>]*>npm test/, 'the verification task inherits the real source check')
+  assert.doesNotMatch(html, /git diff --check/)
+})
+
+test('Complete is gated by the runtime completion projection and shows its blocking reason', async () => {
+  const snapshot = uiSnapshot()
+  snapshot.mission.status = 'active'
+  snapshot.tasks = snapshot.tasks.map(task => ({ ...task, status: 'accepted', dependencies: [], reviewOf: undefined, attempt: undefined }))
+  const render = value => renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot: value, initialView: 'board',
+    technicalDetails: React.createElement(CompletionControls, { snapshot: value, disabled: false, onComplete() {} }) }))
+  assert.match(render(snapshot), /data-action="complete">/, 'a snapshot without the projection keeps the historical terminal-work gate')
+  const blocked = { ...snapshot, completion: { eligible: false, reason: 'Unresolved evidence challenges prevent completion: ev-2' } }
+  assert.match(render(blocked), /data-action="complete" disabled=""/)
+  assert.match(render(blocked), /data-swarm-completion="blocked"/)
+  assert.match(render(blocked), /Unresolved evidence challenges prevent completion: ev-2/)
+  assert.match(render({ ...snapshot, completion: { eligible: true } }), /data-action="complete">/)
+  const source = await readFile(new URL('../src/client/ActivityPanel.tsx', import.meta.url), 'utf8')
+  assert.match(source, /<CompletionControls snapshot=\{snapshot\} disabled=\{disabled\}/, 'ActivityPanel renders the gated Complete control')
+})
+
+test('live lease marker uses the wall clock instead of the last recorded event time', () => {
+  const snapshot = uiSnapshot()
+  const leaseUntil = Date.now() - 300_000
+  snapshot.tasks[1].attempt = { ...snapshot.tasks[1].attempt, leaseUntil }
+  snapshot.mission.updatedAt = leaseUntil - 60_000
+  assert.equal(leaseExpired(leaseUntil, snapshot.mission.updatedAt), false, 'the recorded reference predates the expiry')
+  assert.equal(leaseExpired(leaseUntil, Date.now()), true, 'the runtime compares the lease with the wall clock')
+  const live = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, live: true, initialView: 'board' }))
+  assert.match(live, /\(expired\)/)
+  snapshot.tasks[1].attempt = { ...snapshot.tasks[1].attempt, leaseUntil: Date.now() + 3_600_000 }
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, live: true, initialView: 'board' })), /\(expired\)/)
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, initialView: 'board' })), /\(expired\)/, 'a historical card keeps its recorded reference')
+})
+
+test('SwarmBoard card labels render through the locale instead of raw English literals', () => {
+  const snapshot = uiSnapshot()
+  snapshot.tasks[4].dependencies = ['t3']
+  snapshot.tasks[3].experiment = true
+  const english = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, initialView: 'board' }))
+    + renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, initialView: 'evidence' }))
+  assert.match(english, /Attempt 2/)
+  assert.match(english, /· lease /)
+  assert.match(english, /Waiting on 1 prerequisite/)
+  assert.match(english, /1 evidence record/)
+  assert.match(english, /Artifact [0-9a-f]{8}/)
+  assert.match(english, /Prerequisites: /)
+  assert.match(english, /Reviews t2/)
+  assert.match(english, /Artifact commit: /)
+  const chinese = renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text },
+    React.createElement(SwarmBoard, { snapshot, initialView: 'board' })))
+    + renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text },
+      React.createElement(SwarmBoard, { snapshot, initialView: 'evidence' })))
+  for (const untranslated of [/Attempt \d/, /· lease /, /Waiting on \d/, /\d evidence record/, /Artifact [0-9a-f]{8}/,
+    /Prerequisites: /, /Reviews /, /Artifact commit: /, /Host tool run IDs: /, /Tool records: /, /Challenge ·/]) {
+    assert.doesNotMatch(chinese, untranslated, `untranslated SwarmBoard label ${untranslated}`)
+  }
+  assert.match(chinese, /尝试次数 2/)
+  assert.match(chinese, /租约/)
+  assert.match(chinese, /等待 1 个前置任务/)
+  assert.match(chinese, /1 条证据记录/)
+  assert.match(chinese, /产物 [0-9a-f]{8}/)
+  assert.match(chinese, /前置任务: /)
+  assert.match(chinese, /审查 t2/)
+  assert.match(chinese, /产物提交: /)
+})
+
+test('snapshot reader validates every budget key and the runtime-projected delivery fields', () => {
+  const snapshot = uiSnapshot()
+  const missingDuration = JSON.parse(JSON.stringify(snapshot))
+  delete missingDuration.mission.budget.maxDurationMs
+  assert.equal(readSnapshot(missingDuration), undefined, 'a budget without maxDurationMs is not a valid snapshot')
+  assert.deepEqual(readSnapshot(snapshot), snapshot)
+  assert.equal(readSnapshot({ ...snapshot, deliveryTarget: { taskId: 't1' } }), undefined)
+  assert.equal(readSnapshot({ ...snapshot, completion: { eligible: 'yes' } }), undefined)
+  assert.equal(readSnapshot({ ...snapshot, appliedDelivery: { resultCommit: 5 } }), undefined)
+  const projected = { ...snapshot, deliveryTarget: { taskId: 't1', commit: 'a'.repeat(40) },
+    completion: { eligible: false, reason: 'still blocked' }, appliedDelivery: { resultCommit: 'a'.repeat(40), appliedAt: 1 } }
+  assert.deepEqual(readSnapshot(projected), projected)
+  assert.equal(deliverableCommit(projected), 'a'.repeat(40))
+  assert.equal(completionBlocker(projected), 'still blocked')
 })

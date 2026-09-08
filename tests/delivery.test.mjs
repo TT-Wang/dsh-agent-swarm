@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import filesystem from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { applyDelivery, inspectDelivery } from '../lib/delivery.js'
@@ -194,4 +194,68 @@ test('cancellation during publication rolls back source files and leaf symlinks'
   assert.equal(await readlink(path.join(source, 'a-link')), 'original-target')
   assert.equal(await readFile(path.join(source, 'b.txt'), 'utf8'), 'original B\n')
   assert.deepEqual(await headAndIndex(source), before)
+})
+
+test('a receipt hit re-checks the working tree and re-applies a discarded result', async t => {
+  const { source, worker, head } = await fixture(t)
+  await writeFile(path.join(worker, 'answer.txt'), 'swarm answer\n')
+  const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
+  assert.equal((await applyDelivery(input)).status, 'applied')
+  assert.equal(await readFile(path.join(source, 'answer.txt'), 'utf8'), 'swarm answer\n')
+  // H3: the user discards the delivered result; a receipt alone must not report success.
+  await git(source, 'checkout', head, '--', 'answer.txt')
+  assert.equal(await readFile(path.join(source, 'answer.txt'), 'utf8'), 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n')
+  assert.deepEqual(await applyDelivery(input), { status: 'applied', changedPaths: ['answer.txt'], conflicts: [] })
+  assert.equal(await readFile(path.join(source, 'answer.txt'), 'utf8'), 'swarm answer\n')
+  // A legacy receipt without fingerprints is re-verified instead of trusted.
+  const metadata = path.join(source, '.git', 'dsh-agent-swarm-delivery')
+  const receipt = (await readdir(metadata)).find(name => name.endsWith('.json'))
+  assert.ok(receipt, 'the applied receipt exists')
+  const saved = JSON.parse(await readFile(path.join(metadata, receipt), 'utf8'))
+  delete saved.fingerprints
+  await writeFile(path.join(metadata, receipt), JSON.stringify(saved))
+  await git(source, 'checkout', head, '--', 'answer.txt')
+  assert.equal((await applyDelivery(input)).status, 'applied')
+  assert.equal(await readFile(path.join(source, 'answer.txt'), 'utf8'), 'swarm answer\n')
+})
+
+test('delivery refuses a result symlink that escapes the repository', async t => {
+  const { source, worker, head } = await fixture(t)
+  await symlink('/etc/hosts', path.join(worker, 'escape'))
+  await symlink('../../../outside.txt', path.join(worker, 'relative-escape'))
+  const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
+  const before = await headAndIndex(source)
+  await assert.rejects(applyDelivery(input), /symlink escapes the repository: escape/)
+  assert.deepEqual(await headAndIndex(source), before)
+  await assert.rejects(readFile(path.join(source, 'escape')), { code: 'ENOENT' })
+  await assert.rejects(readFile(path.join(source, 'relative-escape')), { code: 'ENOENT' })
+})
+
+test('an incomplete or corrupt apply lock is recoverable without stealing a live one', async t => {
+  const { source, worker, head } = await fixture(t)
+  await writeFile(path.join(worker, 'answer.txt'), 'swarm answer\n')
+  const input = { source, baselineCommit: head, resultCommit: await commit(worker) }
+  const lock = path.join(source, '.git', 'dsh-agent-swarm-delivery', 'apply.lock')
+  const past = new Date(Date.now() - 5 * 60_000)
+  await mkdir(lock, { recursive: true })
+  // M7: a fresh lock without an owner is the crash window and still blocks.
+  await assert.rejects(applyDelivery(input), /Another delivery is being applied/)
+  // After the grace period the crashed lock is reclaimed and the delivery runs.
+  await utimes(lock, past, past)
+  assert.equal((await applyDelivery(input)).status, 'applied')
+  // A corrupt owner is treated like a missing one.
+  await mkdir(lock, { recursive: true })
+  await writeFile(path.join(lock, 'owner.json'), '{ truncated')
+  await utimes(lock, past, past)
+  assert.equal((await applyDelivery(input)).status, 'applied')
+  // A live owner is never stolen, however old the lock looks.
+  await mkdir(lock, { recursive: true })
+  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid, createdAt: Date.now() - 3_600_000 }))
+  await utimes(lock, past, past)
+  await assert.rejects(applyDelivery(input), /Another delivery is being applied/)
+  await rm(lock, { recursive: true, force: true })
+  // A dead pid is stale immediately, as before.
+  await mkdir(lock, { recursive: true })
+  await writeFile(path.join(lock, 'owner.json'), JSON.stringify({ pid: 999999 }))
+  assert.equal((await applyDelivery(input)).status, 'applied')
 })

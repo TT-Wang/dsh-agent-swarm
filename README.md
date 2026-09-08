@@ -55,6 +55,8 @@ npm run build
 
 `link:dsh` links dependencies from that Harness checkout, including its shared runtime packages and build tools. This source workflow does not require a separate `npm install` in the plugin directory.
 
+`npm pack` and `npm publish` rebuild `lib/` through the `prepack` hook, so packing a clean checkout ships the declared entry points instead of an empty `lib/` directory. The hook writes build progress to stderr, so `npm pack --json` output stays machine-readable.
+
 Install the built directory into the Web profile using the **matching Harness CLI**:
 
 ```sh
@@ -153,6 +155,12 @@ npm run test:web
 npm run test:command-web
 ```
 
+The test files import the built `lib/` output. `npm test` builds it first; a bare `node --test tests/*.test.mjs` needs `npm run link:dsh` and `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout without linked dependencies stops earlier at `tsc: command not found`.
+
+`test:harness`, `test:pack` and `test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they need a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt it anyway. `test:harness` reports the same error directly.
+
+`test:web` and `test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host and re-run a timeout before treating it as a product defect.
+
 `npm run verify` runs those checks together. Browser checks require the built Harness Web app, its installed Playwright package and Google Chrome by default. To use an installed Playwright Chromium browser instead, set `DSH_SMOKE_BROWSER=chromium`. The suites use temporary profiles and Git workspaces; the model boundary is scripted. Test output and local browser evidence are written under the ignored `artifacts/` directory.
 
 Optional checks include `npm run test:sidebar-service` against an installed Better Sidebar service (`DSH_BETTER_SIDEBAR_ROOT` can select its directory), and `npm run test:validation-repair-web` for same-request repair of an invalid plan. The `test:deepseek` and `test:command-deepseek` scripts make real provider requests and can incur API charges; they are excluded from `verify`.
@@ -161,7 +169,7 @@ Optional checks include `npm run test:sidebar-service` against an installed Bett
 
 - **Local, single-host operation.** Git workspaces and POSIX process groups are required. Distributed workers and non-Git workspaces are not implemented.
 - **Budget accounting has boundaries.** Worker tokens use reported provider usage. Requests still streaming are estimated at their worker's average per-request usage before a new step is admitted, which reduces but does not eliminate overruns. Usage that was never durably reported cannot be reconstructed. The primary conversation's own usage is attributed to its newest live mission by time window and shown separately; it is not charged to the worker pool, and it cannot be split across several concurrent missions of one owner.
-- **Context efficiency depends on host services.** Sessions see only the swarm tools and prompt for their role, workers receive focused observations and their run ids inline, and routine progress no longer wakes the primary agent. History compaction at task boundaries uses the host compaction engine when one is loaded; without it, a worker's context keeps growing until the host's own pressure threshold. Verification checkouts link the source project's ignored dependency directories (`node_modules` by default) so declared checks find their toolchain; a check that writes through such a link is confined by the sandbox and fails rather than modifying the source.
+- **Context efficiency depends on host services.** Sessions see only the swarm tools and prompt for their role, workers receive focused observations and their run ids inline, and routine progress no longer wakes the primary agent. History compaction at task boundaries uses the host compaction engine when one is loaded; without it, a worker's context keeps growing until the host's own pressure threshold. Verification checkouts make the source project's ignored dependency directories (`node_modules` by default) available to declared checks so they find their toolchain. Those directories are not part of the artifact and a check must treat them as read-only: a write through them may fail rather than modify the source, and results can depend on the installed toolchain state.
 - **Task specifications determine verification quality.** The host proves that declared commands ran against the submitted artifact. It cannot infer a complete test oracle from natural-language requirements; mission-level acceptance checks remain an area for improvement.
 - **Confinement follows the configured Harness sandbox.** Artifact capture checks changed paths against declared scopes. The plugin does not add independent network/credential isolation or adversarial multi-user isolation. Its tool restriction list is not a complete boundary for scheduling tools or other external side effects. Pre-launch read-only planning is a prompt instruction, not an OS write barrier.
 - **Recovery still has open work.** Attempt leases renew only while the adapter can identify a live, uncancelled native operation, within the mission deadline. This does not detect every unproductive or stuck request; provider/tool timeouts and resource limits still matter. Outbox failure visibility needs further work, and delivery recovery does not guarantee exactly-once external side effects. Retained worktrees and refs require explicit cleanup.

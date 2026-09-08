@@ -401,6 +401,9 @@ test('primary-agent recovery limits replace the legacy host retry cap on restart
 
 test('verification lease covers every primary-agent-declared long-running check', async t => {
   const f = await fixture(t)
+  // The mission must be long enough to contain the declared check window; the
+  // lease itself is still bounded by the mission deadline (see runtime.test.mjs).
+  f.input.budget = { ...f.input.budget, maxDurationMs: 3600000 }
   f.input.tasks[0].checkTimeoutMs = 400000
   f.input.tasks[0].checks = ['first-check', 'second-check']
   const { snapshot } = await launch(f)

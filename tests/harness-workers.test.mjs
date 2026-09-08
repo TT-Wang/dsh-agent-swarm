@@ -76,6 +76,8 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     async *stream(options) {
       requests.push(options)
       const action = await responder(options, requests.length)
+      // Test hook: hold the provider silent after the request started and before any chunk.
+      if (config.beforeChunks !== undefined) await config.beforeChunks(action, options, requests.length)
       if (action.kind === 'tool') {
         const id = ToolCallId(`tool-${requests.length}`)
         const args = JSON.stringify(action.arguments ?? {})
@@ -108,7 +110,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   ctx.llm.registerAdapter(['swarm-test', 'other-provider'], new Scripted())
   const owner = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: config.ownerOptions ?? { provider: 'swarm-test', model: 'scripted' } })
   await config.configureOwner?.({ ctx, owner })
-  const options = { workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000 }
+  const options = { workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, ...config.workerOptions }
   let adapterContext = ctx
   let workerOwnerScope
   if (config.scopedOwner) {
@@ -116,9 +118,10 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
     await workerOwnerScope
   }
   adapter = new HarnessWorkers(adapterContext, options)
-  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [] }
+  const observations = { idle: [], steps: [], usage: [], tools: [], failures: [], activities: [] }
   const callbacks = {
     idle: id => { observations.idle.push(id) },
+    activity: (id, activity) => { observations.activities.push({ id, activity }) },
     beforeStep: async id => { observations.steps.push(id) },
     usage: async (id, tokens) => { observations.usage.push({ id, tokens }) },
     toolRun: async (id, run) => { observations.tools.push({ id, run }) },
@@ -134,6 +137,14 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
 }
 
 const message = (member, id = 'delivery-one') => ({ id, missionId: member.missionId, from: 'coordinator-test', to: member.id, kind: 'assignment', content: 'Complete the assigned task.', createdAt: 1 })
+
+async function eventually(read, what) {
+  const deadline = Date.now() + 10000
+  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
+  assert.fail(`Timed out waiting for ${what}`)
+}
+/** The scripted provider reports this per request; cache reads are charged at the adapter weight, buckets stay raw. */
+const rawScriptedBuckets = { uncachedInputTokens: 10, cacheReadTokens: 3, cacheWriteTokens: 4, outputTokens: 2, reasoningTokens: 1, requests: 1 }
 
 const reasoningModel = model => model === 'plain-model' ? {} : {
   reasoning: { efforts: [{ id: ReasoningEffortId('off'), name: 'Off' }, { id: ReasoningEffortId('high'), name: 'High' }], defaultEffort: ReasoningEffortId('off') },
@@ -264,7 +275,7 @@ test('real Agent delivery keeps sender identity, deduplicates across resume, and
   assert.equal(input.data.source.kind, 'swarm')
   assert.equal(input.data.source.senderMemberId, 'coordinator-test')
   assert.equal(input.data.source.deliveryId, 'delivery-one')
-  assert.deepEqual(f.observations.usage.map(item => item.tokens), [19], 'cache counts are disjoint; reasoning is already part of output')
+  assert.deepEqual(f.observations.usage.map(item => item.tokens), [17], 'cache counts are disjoint; reasoning is already part of output; cache reads are charged at the 0.1 default weight')
   assert.equal(f.observations.steps.length, 1)
   await f.adapter.deliver(f.member, message(f.member))
   assert.equal(f.requests.length, 1)
@@ -405,14 +416,15 @@ test('cumulative usage snapshots reconcile persisted work before a resumed worke
   f.callbacks.usageSnapshot = async (_memberId, total) => {
     snapshots.push(total)
     const stored = await readStoredSession(f.ctx.sessionPersistence, SessionId(f.member.sessionId))
-    const persistedTotal = stored.events.reduce((sum, event) => event.type === 'assistant/message' && event.data.usage ? sum + 19 : sum, 0)
+    // Each persisted request is charged 10 + 2 + 4 + 3 × 0.1 = 16.3 → 17 under the default weight.
+    const persistedTotal = stored.events.reduce((sum, event) => event.type === 'assistant/message' && event.data.usage ? sum + 17 : sum, 0)
     assert.equal(persistedTotal, total, 'session events are persisted before accounting')
     accounted = Math.max(accounted, total)
   }
   const firstIdle = waitForAccounting()
   await f.adapter.deliver(f.member, message(f.member))
   await firstIdle
-  assert.equal(accounted, 19)
+  assert.equal(accounted, 17)
   assert.deepEqual(f.observations.usage, [], 'snapshot capability replaces delta accounting')
   await f.adapter.dispose()
   accounted = 0 // Simulate loss of the runtime transaction after the source log committed.
@@ -420,15 +432,121 @@ test('cumulative usage snapshots reconcile persisted work before a resumed worke
   resumed.bind(f.callbacks)
   try {
     await resumed.start(f.spec)
-    assert.equal(accounted, 19)
-    assert.deepEqual(snapshots, [19, 19])
+    assert.equal(accounted, 17)
+    assert.deepEqual(snapshots, [17, 17])
     assert.equal(f.requests.length, 1, 'reconciliation completes before another request')
     const nextIdle = waitForAccounting()
     await resumed.deliver(f.member, message(f.member, 'second-usage-message'))
     await nextIdle
-    assert.equal(accounted, 38)
+    assert.equal(accounted, 34)
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
+})
+
+test('cache reads are charged at the configured weight while raw buckets stay exact for the UI', async t => {
+  const charged = []
+  const f = await fixture(t, undefined, { workerOptions: { cacheReadWeight: 0.5 } })
+  f.callbacks.usageSnapshot = async (_memberId, total, usage) => { charged.push({ total, usage }) }
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => charged.length >= 1, 'the first weighted usage snapshot')
+  assert.deepEqual(charged, [{ total: 18, usage: rawScriptedBuckets }],
+    '10 uncached + 2 output + 4 cache-write + 3 cache-read × 0.5 = 17.5, charged as 18, while every raw bucket stays exact')
+  await f.adapter.deliver(f.member, message(f.member, 'weighted-usage-second'))
+  await eventually(() => charged.length >= 2, 'the cumulative weighted usage snapshot')
+  assert.equal(charged[1].total, 36, 'the cumulative charge is the sum of per-request charges, not a re-weighted total')
+  assert.deepEqual(charged[1].usage, { uncachedInputTokens: 20, cacheReadTokens: 6, cacheWriteTokens: 8, outputTokens: 4, reasoningTokens: 2, requests: 2 },
+    'the UI contract stays raw and cumulative')
+  assert.deepEqual(f.observations.usage, [], 'the weighted charge replaces delta accounting instead of adding to it')
+})
+
+test('a single long model generation republishes liveness without inventing progress', async t => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, undefined, {
+    workerOptions: { activityHeartbeatMs: 20 },
+    beforeChunks: (_action, _options, count) => count === 1 ? gate : undefined,
+  })
+  try {
+    await f.adapter.deliver(f.member, message(f.member))
+    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'model'), 'the model activity')
+    // The gate holds the provider silent: no chunk arrives, so only the liveness
+    // heartbeat can republish the still-running operation.
+    await new Promise(resolve => setTimeout(resolve, 140))
+    const sameOperation = f.observations.activities.filter(item => item.activity?.id === first.activity.id)
+    assert.ok(sameOperation.length >= 3, `a silent generation republishes at least every 20 ms: ${sameOperation.length} publishes`)
+    for (let index = 1; index < sameOperation.length; index++) {
+      assert.ok(sameOperation[index].activity.updatedAt >= sameOperation[index - 1].activity.updatedAt, 'republished liveness is monotonic')
+    }
+    const live = f.adapter.currentActivity(f.member.id)
+    assert.equal(live.id, first.activity.id); assert.equal(live.kind, 'model')
+    assert.equal(sameOperation.every(item => item.activity.attemptId === undefined), true, 'the adapter reports liveness only; the runtime owns the attempt binding')
+  } finally { release() }
+  await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
+  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the model activity to end')
+  assert.equal(f.adapter.currentActivity(f.member.id), undefined)
+  const settled = f.observations.activities.length
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(f.observations.activities.length, settled, 'an ended operation leaves no heartbeat publishing')
+})
+
+test('an active tool execution republishes liveness while its body is blocked', async t => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, (_options, count) => count === 1 ? { kind: 'tool', name: 'slow_probe', arguments: {} } : { kind: 'text', text: 'done' },
+    { workerOptions: { activityHeartbeatMs: 20 } })
+  f.ctx.tools.register(defineContentToolFixture({ name: 'slow_probe', description: 'Slow probe', parameters: {}, execute: async () => { await gate; return [{ type: 'text', text: 'probe done' }] } }))
+  try {
+    await f.adapter.deliver(f.member, message(f.member))
+    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'tool'), 'the tool activity')
+    assert.equal(first.activity.tool, 'slow_probe')
+    await new Promise(resolve => setTimeout(resolve, 140))
+    const sameOperation = f.observations.activities.filter(item => item.activity?.id === first.activity.id)
+    assert.ok(sameOperation.length >= 3, `a blocked tool body republishes at least every 20 ms: ${sameOperation.length} publishes`)
+    assert.equal(f.adapter.currentActivity(f.member.id).tool, 'slow_probe')
+  } finally { release() }
+  await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
+  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the tool activity to end')
+})
+
+test('a silent generation keeps its attempt lease renewed through the runtime with no tool call', async t => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const f = await fixture(t, undefined, {
+    workerOptions: { activityHeartbeatMs: 20 },
+    // Hold the provider silent on its first request; abort must still release the gate.
+    beforeChunks: (_action, options, count) => count !== 1 ? undefined : Promise.race([gate, new Promise(resolve => {
+      if (options.signal.aborted) resolve()
+      else options.signal.addEventListener('abort', resolve, { once: true })
+    })]),
+  })
+  const adapter = new HarnessWorkers(f.ctx, { ...f.options, workspacesRoot: path.join(f.options.workspacesRoot, 'lease-runtime') })
+  const runtime = new SwarmRuntime({ statePath: path.join(f.options.workspacesRoot, 'lease.sqlite'), leaseMs: 150, tickMs: 10,
+    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, adapter)
+  try {
+    const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 }
+    const owner = { sessionId: String(f.owner.agent.id) }
+    const mission = runtime.create(owner, { title: 'Lease liveness', objective: 'Survive one silent generation', workspace: f.mission.workspace, scope: ['**'], acceptance: ['survives'], budget })
+    const member = await runtime.addMember(owner, mission.id, { name: 'silent-worker', role: 'implementation' })
+    const actor = { sessionId: member.sessionId }
+    const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep the attempt alive' })
+    const task = runtime.propose(actor, mission.id, { workstreamId: stream.id, title: 'Long generation', objective: 'Generate without tools', kind: 'implementation', scope: ['**'], acceptance: ['survives'], checks: ['check'] })
+    // start() must precede the claim: it treats an already-running task as host-restart recovery.
+    await runtime.start()
+    await runtime.claim(actor, mission.id, task.id)
+    const running = await eventually(() => { const current = runtime.store.get('tasks', task.id); return current?.status === 'running' ? current : undefined }, 'the task to be running')
+    const published = await eventually(() => runtime.store.get('members', member.id)?.activity, 'the published activity')
+    assert.equal(published.attemptId, running.attempt.id, 'the runtime binds the live operation to its attempt')
+    // Simulate the runtime dropping the persisted activity (the budget-pause clear in
+    // blockBudget): only the adapter's ongoing liveness can restore it before expiry.
+    runtime.store.transaction(() => { const stored = runtime.store.get('members', member.id); delete stored.activity; runtime.store.put('members', stored) })
+    await new Promise(resolve => setTimeout(resolve, 600))
+    const after = runtime.store.get('tasks', task.id)
+    assert.equal(after.status, 'running', 'a silent generation is lease liveness for its full duration')
+    assert.equal(after.attempt.id, running.attempt.id, 'the original attempt keeps ownership')
+    assert.equal(after.recoveryCount ?? 0, 0, 'no recovery is spent while the operation is live')
+    assert.equal(runtime.store.events(mission.id, 500).some(event => event.type === 'task/lease-expired'), false, 'no lease expiry while the operation is live')
+    assert.equal(runtime.store.get('members', member.id).activity.attemptId, running.attempt.id, 'the adapter restored the persisted activity')
+  } finally { release(); await runtime.dispose() }
 })
 
 test('revoked assignments never cause a model step while peer findings remain admissible', async t => {

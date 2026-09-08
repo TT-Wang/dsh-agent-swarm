@@ -8,6 +8,11 @@ import { SwarmStore } from '../lib/store.js'
 import { withinScope, scopeSubset } from '../lib/scope.js'
 
 const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+async function eventually(read, message) {
+  const until = Date.now() + 2500
+  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
+  assert.fail(message)
+}
 /** Only the external execution adapter is replaced; store/admission/state/outbox are real. */
 class ControlledWorkers {
   callbacks; deliveries = []; stopped = []; checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }; stopGate; prepared = []
@@ -22,14 +27,14 @@ class ControlledWorkers {
   async prepareTask(member,task) { this.prepared.push(task.epoch) }
   async dispose() {}
 }
-async function setup(t, overrides = {}) {
+async function setup(t, overrides = {}, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'swarm-runtime-'))
   const workers = new ControlledWorkers()
-  const config = { statePath: join(dir,'db.sqlite'), leaseMs:60000, tickMs:1000, maxMessageChars:16000, maxEvents:100, maxTasksPerMember:3 }
+  const config = { statePath: join(dir,'db.sqlite'), leaseMs:60000, tickMs:1000, maxMessageChars:16000, maxEvents:100, maxTasksPerMember:3, ...options.config }
   const runtime = new SwarmRuntime(config, workers)
   t.after(async () => { await runtime.dispose(); await rm(dir,{recursive:true,force:true}) })
   const owner = { sessionId:'owner-session' }
-  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:['works'],budget:{...budget,...overrides}})
+  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}})
   const stream = runtime.workstream(owner,mission.id,{title:'Core',objective:'Fix module'})
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
@@ -257,4 +262,160 @@ test('a disproved research hypothesis remains an accepted useful result after in
   const accepted=f.runtime.snapshot(f.owner,f.mission.id).evidence.find(e=>e.id===evidence.id)
   assert.equal(accepted.status,'verified'); assert.equal(accepted.outcome,'disproved')
   assert.equal(f.runtime.control(f.owner,f.mission.id,'complete','Research complete').status,'completed')
+})
+
+test('verify() fences the attempt lease for every task with checks, even without checkTimeoutMs', async t => {
+  const f = await setup(t, {}, { config: { leaseMs: 150, tickMs: 10 } })
+  const source = await f.runtime.claim(f.actorA, f.mission.id, f.propose().id)
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: source.id, attemptId: source.attempt.id, output: 'done' })
+  const review = f.propose(f.actorB, { kind: 'verification', reviewOf: source.id, checks: [] })
+  const claimed = await f.runtime.claim(f.actorB, f.mission.id, review.id)
+  f.workers.verifyArtifact = async () => { await new Promise(resolve => setTimeout(resolve, 400)); return [{ command: 'test', exitCode: 0, output: 'ok' }] }
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Checks outlived the initial lease' })
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.find(task => task.id === source.id).status, 'accepted')
+})
+
+test('verify() never stores a lease beyond the mission deadline', async t => {
+  const f = await setup(t, {}, { config: { leaseMs: 1000, tickMs: 10 } })
+  const source = await f.runtime.claim(f.actorA, f.mission.id, f.propose(f.actorA, { checkTimeoutMs: 10_000_000 }).id)
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: source.id, attemptId: source.attempt.id, output: 'done' })
+  const review = f.propose(f.actorB, { kind: 'verification', reviewOf: source.id, checks: [] })
+  const claimed = await f.runtime.claim(f.actorB, f.mission.id, review.id)
+  const deadline = f.runtime.snapshot(f.owner, f.mission.id).mission.deadline
+  let observed
+  f.workers.verifyArtifact = async () => {
+    observed = f.runtime.snapshot(f.owner, f.mission.id).tasks.find(task => task.id === review.id).attempt.leaseUntil
+    return [{ command: 'test', exitCode: 0, output: 'ok' }]
+  }
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Clamped to the deadline' })
+  assert.ok(observed <= deadline, `lease ${observed} must not outlive mission deadline ${deadline}`)
+  assert.ok(observed > Date.now(), 'the lease must still cover the verification window')
+})
+
+test('submit() refreshes the attempt lease before artifact capture', async t => {
+  const f = await setup(t, {}, { config: { leaseMs: 600, tickMs: 10 } })
+  const task = await f.runtime.claim(f.actorA, f.mission.id, f.propose().id)
+  await new Promise(resolve => setTimeout(resolve, 400))
+  f.workers.captureArtifact = async () => { await new Promise(resolve => setTimeout(resolve, 300)); return f.workers.artifact }
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'done' })
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks[0].status, 'submitted')
+})
+
+test('submit() names the captured artifact when the attempt expires during capture', async t => {
+  const f = await setup(t, {}, { config: { leaseMs: 120, tickMs: 10 } })
+  const task = await f.runtime.claim(f.actorA, f.mission.id, f.propose().id)
+  f.workers.captureArtifact = async () => { await new Promise(resolve => setTimeout(resolve, 400)); return { ...f.workers.artifact, commit: 'deadbeef' } }
+  await assert.rejects(f.runtime.submit(f.actorA, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'done' }),
+    /Artifact deadbeef was captured but the attempt is no longer current/)
+})
+
+test('completion coverage ignores verification acceptance text', async t => {
+  const f = await setup(t, {}, { acceptance: ['works', 'extra'] })
+  const deliverable = await f.runtime.claim(f.actorA, f.mission.id, f.propose().id)
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: deliverable.id, attemptId: deliverable.attempt.id, output: 'done' })
+  const review = f.propose(f.actorB, { kind: 'verification', reviewOf: deliverable.id, checks: [], acceptance: ['works', 'extra'] })
+  const claimed = await f.runtime.claim(f.actorB, f.mission.id, review.id)
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Review restates both criteria' })
+  const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
+  assert.equal(snapshot.completion.eligible, false)
+  assert.match(snapshot.completion.reason, /"extra"/)
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'verification covered extra'), /"extra"/)
+})
+
+test('create() requires every budget field through validatedBudget', async t => {
+  const f = await setup(t)
+  assert.throws(() => f.runtime.create(f.owner, { title: 'Partial', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { maxDurationMs: 60000 } }), /Invalid budget maxTokens/)
+  const complete = f.runtime.create(f.owner, { title: 'Complete', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  assert.deepEqual(complete.budget, budget)
+})
+
+test('evidence supersedes is scoped to the publishing task or its replacement lineage', async t => {
+  const f = await setup(t)
+  const first = await f.runtime.claim(f.actorA, f.mission.id, f.propose(f.actorA, { title: 'First' }).id)
+  await f.workers.callbacks.toolRun(f.a.id, { tool: 'bash', arguments: {}, result: {}, isError: false })
+  const firstRun = f.runtime.observe(f.actorA, f.mission.id).toolRuns.at(-1)
+  const original = f.runtime.publish(f.actorA, f.mission.id, { taskId: first.id, attemptId: first.attempt.id, claim: 'Original claim', outcome: 'supported', toolRunIds: [firstRun.id] })
+  const other = await f.runtime.claim(f.actorB, f.mission.id, f.propose(f.actorB, { title: 'Other' }).id)
+  await f.workers.callbacks.toolRun(f.b.id, { tool: 'bash', arguments: {}, result: {}, isError: false })
+  const otherRun = f.runtime.observe(f.actorB, f.mission.id).toolRuns.at(-1)
+  assert.throws(() => f.runtime.publish(f.actorB, f.mission.id, { taskId: other.id, attemptId: other.attempt.id, claim: 'Unrelated', outcome: 'supported', toolRunIds: [otherRun.id], supersedes: [original.id] }),
+    /replacement lineage/)
+})
+
+test('accepted replacement evidence refutes its lineage predecessor with an explicit link', async t => {
+  const f = await setup(t)
+  const original = await f.runtime.claim(f.actorA, f.mission.id, f.propose(f.actorA, { title: 'Original' }).id)
+  await f.workers.callbacks.toolRun(f.a.id, { tool: 'bash', arguments: {}, result: {}, isError: false })
+  const originalRun = f.runtime.observe(f.actorA, f.mission.id).toolRuns.at(-1)
+  const originalEvidence = f.runtime.publish(f.actorA, f.mission.id, { taskId: original.id, attemptId: original.attempt.id, claim: 'Original', outcome: 'supported', toolRunIds: [originalRun.id] })
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: original.id, attemptId: original.attempt.id, output: 'v1' })
+  const firstReview = f.propose(f.actorB, { kind: 'verification', reviewOf: original.id, checks: [] })
+  const firstClaim = await f.runtime.claim(f.actorB, f.mission.id, firstReview.id)
+  f.workers.checks = [{ command: 'test', exitCode: 1, output: 'fail' }]
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: firstReview.id, attemptId: firstClaim.attempt.id, verdict: 'accept', reason: 'Rejected by host checks' })
+  assert.equal(f.runtime.store.get('tasks', original.id).status, 'blocked')
+  const replacement = f.propose(f.actorA, { title: 'Repair', replaces: [original.id] })
+  const claimed = await f.runtime.claim(f.actorA, f.mission.id, replacement.id)
+  await f.workers.callbacks.toolRun(f.a.id, { tool: 'bash', arguments: {}, result: {}, isError: false })
+  const replacementRun = f.runtime.observe(f.actorA, f.mission.id).toolRuns.at(-1)
+  const replacementEvidence = f.runtime.publish(f.actorA, f.mission.id, { taskId: replacement.id, attemptId: claimed.attempt.id, claim: 'Repair', outcome: 'supported', toolRunIds: [replacementRun.id], supersedes: [originalEvidence.id] })
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: replacement.id, attemptId: claimed.attempt.id, output: 'v2' })
+  const secondReview = f.propose(f.actorB, { kind: 'verification', reviewOf: replacement.id, checks: [] })
+  const secondClaim = await f.runtime.claim(f.actorB, f.mission.id, secondReview.id)
+  f.workers.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: secondReview.id, attemptId: secondClaim.attempt.id, verdict: 'accept', reason: 'Repair accepted' })
+  const refuted = f.runtime.store.get('evidence', originalEvidence.id)
+  assert.equal(refuted.status, 'refuted')
+  assert.equal(refuted.refutedBy, replacementEvidence.id)
+})
+
+test('an inconclusive claim is never promoted to verified knowledge', async t => {
+  const f = await setup(t)
+  const task = await f.runtime.claim(f.actorA, f.mission.id, f.propose(f.actorA, { kind: 'research', checks: undefined }).id)
+  await f.workers.callbacks.toolRun(f.a.id, { tool: 'bash', arguments: {}, result: {}, isError: false })
+  const run = f.runtime.observe(f.actorA, f.mission.id).toolRuns.at(-1)
+  const evidence = f.runtime.publish(f.actorA, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, claim: 'Undecided', outcome: 'inconclusive', toolRunIds: [run.id] })
+  await f.runtime.submit(f.actorA, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'inconclusive result' })
+  const review = f.propose(f.actorB, { kind: 'verification', reviewOf: task.id, checks: [] })
+  const claimed = await f.runtime.claim(f.actorB, f.mission.id, review.id)
+  await f.runtime.verify(f.actorB, f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Independent reproduction is inconclusive' })
+  assert.equal(f.runtime.store.get('evidence', evidence.id).status, 'unverified')
+})
+
+test('lease expiry restores the plan-intended assignee without losing recovery accounting', async t => {
+  const f = await setup(t, {}, { config: { tickMs: 10 } })
+  await f.runtime.start()
+  const task = await f.runtime.claim(f.actorA, f.mission.id, f.propose(f.actorA, { assigneeId: f.a.id }).id)
+  assert.equal(task.plannedAssigneeId, f.a.id)
+  const stored = f.runtime.store.get('tasks', task.id)
+  stored.attempt.leaseUntil = Date.now() - 1
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
+  const pending = await eventually(() => { const current = f.runtime.store.get('tasks', task.id); return current.status === 'pending' ? current : undefined }, 'the expired attempt must be re-pended')
+  assert.equal(pending.assigneeId, f.a.id, 'the planned assignee survives the expiry')
+  assert.equal(pending.plannedAssigneeId, f.a.id)
+  assert.equal(pending.recoveryCount, 1)
+  assert.equal(pending.attempt, undefined)
+})
+
+test('approaching-limit warnings fire once per dimension and threshold', async t => {
+  const f = await setup(t, { maxTokens: 1000 })
+  const warnings = () => f.runtime.snapshot(f.owner, f.mission.id).events.filter(event => event.type === 'mission/budget-warning')
+  await f.workers.callbacks.usageSnapshot(f.a.id, 700)
+  assert.deepEqual(warnings().map(event => [event.data.dimension, event.data.threshold]), [['maxTokens', 0.7]])
+  await f.workers.callbacks.usageSnapshot(f.a.id, 700)
+  assert.equal(warnings().length, 1, 'a threshold is warned once')
+  await f.workers.callbacks.usageSnapshot(f.a.id, 950)
+  assert.deepEqual(warnings().map(event => [event.data.dimension, event.data.threshold]), [['maxTokens', 0.7], ['maxTokens', 0.9]])
+  assert.equal(warnings().at(-1).data.remaining, 50)
+  assert.equal(warnings().at(-1).data.suggestedLimit, Math.ceil(950 / 0.9))
+})
+
+test('budget exhaustion names the exhausted dimension in the reason and event', async t => {
+  const f = await setup(t, { maxTokens: 100 })
+  await f.workers.callbacks.usageSnapshot(f.a.id, 100)
+  const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
+  assert.equal(snapshot.mission.status, 'blocked')
+  assert.match(snapshot.mission.reason, /maxTokens/)
+  const exhausted = snapshot.events.find(event => event.type === 'mission/budget-exhausted')
+  assert.deepEqual(exhausted.data.dimensions, ['maxTokens'])
 })

@@ -71,6 +71,10 @@ export interface Mission {
   ownerUsage?: UsageBuckets
   /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
   stallNotice?: string
+  /** Highest approaching-limit threshold already warned per budget dimension. */
+  budgetWarned?: Record<string, number>
+  /** Last successful delivery application; projected for the client after the event window scrolls. */
+  appliedDelivery?: { resultCommit: string; appliedAt: number }
 }
 /** Host-observed operation; lifecycle timestamps are not a completion estimate. */
 export interface WorkerActivity {
@@ -137,7 +141,11 @@ export interface Task {
   priority: number
   experiment: boolean
   assigneeId?: string
+  /** Plan-intended owner; restored when a lease expiry re-pends the task and the member is still live. */
+  plannedAssigneeId?: string
   attempt?: Attempt
+  /** Lease value already warned about, so a lease-expiring event is emitted once per lease. */
+  leaseWarned?: number
   epoch: number
   output?: string
   recoveryCount?: number
@@ -171,6 +179,8 @@ export interface Evidence {
   artifact?: Artifact
   challenges: Array<{ authorId: string; reason: string; toolRunIds: string[] }>
   supersedes: string[]
+  /** Evidence that independently refuted this claim; explicit durable lineage for supersession. */
+  refutedBy?: string
   createdAt: number
 }
 export interface ToolRun {
@@ -216,6 +226,12 @@ export interface Snapshot {
   evidence: Evidence[]
   events: SwarmEvent[]
   pendingDeliveries: number
+  /** Runtime-selected deliverable; identical rule to applyDelivery, so the client never re-derives it. */
+  deliveryTarget?: { taskId: string; commit: string }
+  /** Whether control('complete') would be accepted now, with the exact rejection reason. */
+  completion?: { eligible: boolean; reason?: string }
+  /** Last successful apply, projected past the bounded event window. */
+  appliedDelivery?: { resultCommit: string; appliedAt?: number }
 }
 export interface CreateMissionInput {
   title: string
@@ -388,4 +404,8 @@ export interface RuntimeConfig {
   maxMessageChars: number
   maxEvents: number
   maxTasksPerMember: number
+  /** Host verification timeout applied when a task does not choose one; index.ts Config supplies it. */
+  checkTimeoutMs?: number
+  /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
+  budgetWarnAt?: number[]
 }

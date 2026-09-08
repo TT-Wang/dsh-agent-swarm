@@ -63,11 +63,32 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
     if (stat === undefined) continue
     if (submodules.has(filename)) {
       // A clean gitlink is preserved; dirty or moved submodule state has no
-      // faithful single-repository snapshot representation.
-      const nestedHead = await git(['-C', absolute, 'rev-parse', 'HEAD^{commit}'])
-      const nestedStatus = await git(['-C', absolute, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none'])
-      if (nestedHead !== submodules.get(filename) || nestedStatus) throw new Error(`Dirty submodule cannot be captured in a swarm snapshot: ${filename}`)
-      digest.update(nestedHead)
+      // faithful single-repository snapshot representation. An uninitialized
+      // submodule has no `<sub>/.git`, and `git -C <sub>` then resolves the
+      // PARENT repository instead of failing, so detect that state explicitly
+      // and compare the recorded gitlink rather than the resolved HEAD.
+      const gitlink = submodules.get(filename)!
+      let nestedHead: string | undefined
+      let nestedStatus = ''
+      if (await lstat(path.join(absolute, '.git')).then(() => true, () => false)) {
+        try {
+          if (path.resolve(await git(['-C', absolute, 'rev-parse', '--show-toplevel'])) === path.resolve(absolute)) {
+            nestedHead = await git(['-C', absolute, 'rev-parse', 'HEAD^{commit}'])
+            nestedStatus = await git(['-C', absolute, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none'])
+          }
+        } catch { nestedHead = undefined }
+      }
+      if (nestedHead !== undefined) {
+        if (nestedHead !== gitlink || nestedStatus) throw new Error(`Dirty submodule cannot be captured in a swarm snapshot: ${filename}`)
+        digest.update(nestedHead)
+      } else {
+        // Uninitialized: the snapshot records only the gitlink, so accept it
+        // when the index still points at the same commit. A staged gitlink
+        // move or removal is genuine dirty state and stays rejected.
+        const indexed = /^160000 ([a-f0-9]{40,64}) 0\t/.exec(await git(['ls-files', '--stage', '-z', '--', filename]))
+        if (indexed === null || indexed[1] !== gitlink) throw new Error(`Dirty submodule cannot be captured in a swarm snapshot: ${filename}`)
+        digest.update(gitlink)
+      }
     } else if (stat.isSymbolicLink()) digest.update(await readlink(absolute))
     else if (stat.isFile()) {
       try { digest.update(await digestFile(absolute, signal)) }
@@ -108,7 +129,7 @@ export async function captureGitSnapshot(source: string, directory: string, git:
       if (before.fingerprint !== after.fingerprint) continue
       const originalTree = await git(['rev-parse', `${before.head}^{tree}`])
       const snapshotCommit = tree === originalTree ? before.head : await git(['commit-tree', tree, '-p', before.head, '-m', 'Agent Swarm private workspace baseline'])
-      const changedPaths = paths(await git(['diff', '--name-only', '-z', before.head, snapshotCommit, '--']))
+      const changedPaths = paths(await git(['diff', '--name-only', '--no-renames', '-z', before.head, snapshotCommit, '--']))
       return { sourceHead: before.head, snapshotCommit, changedPaths, createdAt: Date.now() }
     } catch (error) {
       signal?.throwIfAborted()

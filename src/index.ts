@@ -26,7 +26,15 @@ export interface Config {
   checkTimeoutMs: number
   maxCheckOutputBytes: number
   verificationDependencyDirs: string[]
+  /** M6: `link` (default) symlinks source dependency directories read-through; `copy` clones them into each checkout. */
+  verificationDependencyMode: 'link' | 'copy'
   boundaryCompactionTokens: number
+  /** O3: cost weight charged for cache-read input tokens (raw buckets stay visible to the UI). */
+  cacheReadWeight: number
+  /** O5: interval at which a live native operation republishes activity as lease liveness; 0 disables it. */
+  activityHeartbeatMs: number
+  /** O4: budget fractions at which the runtime emits an approaching-limit warning. */
+  budgetWarnAt: number[]
   defaultBudget: Budget
 }
 export const Config: z<Config> = z.object({
@@ -40,7 +48,11 @@ export const Config: z<Config> = z.object({
   checkTimeoutMs: z.natural().min(100).default(60000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
   verificationDependencyDirs: z.array(z.string()).default(['node_modules']),
+  verificationDependencyMode: z.union(['link', 'copy']).default('link'),
   boundaryCompactionTokens: z.natural().default(250000),
+  cacheReadWeight: z.number().min(0).max(1).default(0.1),
+  activityHeartbeatMs: z.natural().min(0).default(1000),
+  budgetWarnAt: z.array(z.number().min(0).max(1)).default([0.7, 0.9]),
   defaultBudget: z.object({
     maxTokens: z.natural().min(1).default(500000),
     maxSteps: z.natural().min(1).default(200),

@@ -4,10 +4,15 @@ import { isAbsolute } from 'node:path'
 import { SwarmStore } from './store.ts'
 import { assertScopeSelectors, normalizeReviewDependencies, normalizeScopeSelectors, requireHostChecks } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, Member, Mission, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, EvidenceStatus, Member, Mission, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
+/** Host verification timeout when a task chose none; matches the plugin config default. */
+const DEFAULT_CHECK_TIMEOUT_MS = 60000
+/** Extra lease headroom per allowed output token while a model stream is observably live. */
+const LEASE_MS_PER_OUTPUT_TOKEN = 20
+const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
 export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): UsageBuckets {
@@ -123,8 +128,12 @@ export class SwarmRuntime {
             this.store.event(mission.id, 'task/quiescence-recovered', 'runtime', { taskId: task.id, reason })
           }
           if (task.status === 'running') {
-            task.recoveryCount = (task.recoveryCount ?? 0) + 1
-            task.status = task.recoveryCount >= (task.maxRecoveryAttempts ?? this.config.maxTasksPerMember) ? 'blocked' : 'pending'; task.epoch++; task.handoff = `${task.handoff ?? ''}\nRecovered after host restart; inspect prior tool runs and workspace before repeating effects.`
+            // A budget-pause stop is host policy, not a recovery failure: re-pend
+            // without spending recovery credit so a long pause cannot kill the task.
+            const pauseInduced = mission.budgetPause !== undefined || task.budgetResume !== undefined
+            if (!pauseInduced) task.recoveryCount = (task.recoveryCount ?? 0) + 1
+            task.status = !pauseInduced && (task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? this.config.maxTasksPerMember) ? 'blocked' : 'pending'
+            task.epoch++; task.handoff = `${task.handoff ?? ''}\nRecovered after host restart; inspect prior tool runs and workspace before repeating effects.`
             delete task.attempt
             delete task.budgetResume
             this.store.put('tasks', task)
@@ -142,6 +151,7 @@ export class SwarmRuntime {
       for (const mission of this.store.list('missions')) {
         // Deadline cancellation cannot queue behind a long verification holding the mission queue.
         if (mission.status === 'active' && Date.now() >= mission.deadline) this.blockBudget(mission)
+        else if (mission.status === 'active') this.warnBudget(mission)
         if (!terminal(mission)) this.kick(mission.id)
       }
     }, this.config.tickMs)
@@ -228,6 +238,33 @@ export class SwarmRuntime {
     if (!task.dependencies.every(dep => this.dependencySatisfied(missionId, dep))) throw new Error('A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
+  /**
+   * Extend the current attempt's lease before a long host operation. Bounded by
+   * the mission deadline so a stored lease can never outlive the mission.
+   */
+  private fenceAttempt(mission: Mission, task: Task, windowMs: number): void {
+    if (!task.attempt) throw new Error('Task has no active attempt')
+    const leaseUntil = Math.min(mission.deadline, Date.now() + Math.max(this.config.leaseMs, windowMs))
+    if (!Number.isSafeInteger(leaseUntil)) throw new Error('Attempt lease exceeds the supported clock range')
+    task.attempt.leaseUntil = leaseUntil
+    this.commit(mission.id, () => this.store.put('tasks', task))
+  }
+  /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
+  private replacementLineage(missionId: string, task: Task): Set<string> {
+    const tasks = this.store.list('tasks', missionId)
+    const seen = new Set<string>([task.id])
+    for (let frontier = [task]; frontier.length;) {
+      const next: Task[] = []
+      for (const item of frontier) for (const replacedId of item.replaces ?? []) {
+        if (seen.has(replacedId)) continue
+        seen.add(replacedId)
+        const replaced = tasks.find(candidate => candidate.id === replacedId)
+        if (replaced) next.push(replaced)
+      }
+      frontier = next
+    }
+    return seen
+  }
   private bounded(text: string): string {
     requireText(text, 'content')
     if (text.length > this.config.maxMessageChars) throw new Error(`Content exceeds ${this.config.maxMessageChars} characters`)
@@ -250,10 +287,10 @@ export class SwarmRuntime {
     requireStrings(input.scope, 'scope'); requireStrings(input.acceptance, 'acceptance')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'scope')
-    for (const [name, value] of Object.entries(input.budget)) if (!Number.isSafeInteger(value) || value < (name === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${name}`)
+    const budget = validatedBudget(input.budget)
     const now = Date.now()
-    if (!Number.isSafeInteger(now + input.budget.maxDurationMs)) throw new Error('Mission duration exceeds the supported clock range')
-    const mission: Mission = { ...input, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, deadline: now + input.budget.maxDurationMs }
+    if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new Error('Mission duration exceeds the supported clock range')
+    const mission: Mission = { ...input, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, deadline: now + budget.maxDurationMs }
     if (this.store.get('missions', mission.id)) throw new Error('Mission already exists')
     this.commit(mission.id, () => { this.store.put('missions', mission); this.store.event(mission.id, 'mission/created', 'owner', mission) })
     return mission
@@ -372,6 +409,7 @@ export class SwarmRuntime {
     if (input.checkTimeoutMs !== undefined && (!Number.isSafeInteger(input.checkTimeoutMs) || input.checkTimeoutMs < 1 || input.checkTimeoutMs > 2147483647)) throw new Error('checkTimeoutMs must be a positive integer within the platform timer range')
     const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, evidenceIds: [], createdAt: Date.now() }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
+    if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
     if (input.checkTimeoutMs !== undefined) task.checkTimeoutMs = input.checkTimeoutMs
     this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/proposed', key, task) })
@@ -431,9 +469,11 @@ export class SwarmRuntime {
     this.bounded(input.claim)
     if (!['supported', 'disproved', 'inconclusive'].includes(input.outcome)) throw new Error('Invalid evidence outcome')
     this.validateRuns(missionId, member.id, task, input.toolRunIds)
+    const lineage = this.replacementLineage(missionId, task)
     for (const previous of input.supersedes ?? []) {
       const evidence = this.store.get('evidence', previous)
       if (!evidence || evidence.missionId !== missionId) throw new Error('Superseded evidence must belong to this mission')
+      if (!lineage.has(evidence.taskId)) throw new Error('Superseded evidence must belong to this task or its replacement lineage')
     }
     const evidence: Evidence = { id: id('evidence'), missionId, workstreamId: task.workstreamId, taskId: task.id, authorId: member.id, claim: input.claim, outcome: input.outcome, status: 'unverified', toolRunIds: input.toolRunIds, challenges: [], supersedes: input.supersedes ?? [], createdAt: Date.now() }
     task.evidenceIds.push(evidence.id)
@@ -451,8 +491,13 @@ export class SwarmRuntime {
       if (task.kind === 'verification') throw new Error('Verification tasks must use swarm_verify')
       this.bounded(input.output)
       if (task.kind === 'research' && task.evidenceIds.length === 0) throw new Error('Research submission requires host-backed evidence')
+      this.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       const artifact = await this.workers.captureArtifact(member, task)
-      this.ownAttempt(actor, missionId, task.id, input.attemptId)
+      try { this.ownAttempt(actor, missionId, task.id, input.attemptId) }
+      catch (error) {
+        // The commit is durable even when the attempt lost its lease during capture.
+        throw new Error(`Artifact ${artifact.commit} was captured but the attempt is no longer current; observe the task and submit again after reassignment (${error instanceof Error ? error.message : String(error)})`)
+      }
       task.artifact = artifact; task.output = input.output; task.status = 'submitted'
       this.commit(missionId, () => {
         this.store.put('tasks', task)
@@ -472,12 +517,11 @@ export class SwarmRuntime {
       const source = this.task(missionId, task.reviewOf)
       if (source.status !== 'submitted' || !source.artifact || source.attempt?.ownerId === member.id) throw new Error('Only independent verification of a submitted artifact is allowed')
       const artifact = source.artifact
-      if (source.checkTimeoutMs !== undefined && source.checks.length) {
-        const verificationWindow = source.checkTimeoutMs * source.checks.length + this.config.leaseMs
-        const leaseUntil = Date.now() + Math.max(this.config.leaseMs, verificationWindow)
-        if (!Number.isSafeInteger(verificationWindow) || !Number.isSafeInteger(leaseUntil)) throw new Error('Verification check duration exceeds the supported clock range')
-        task.attempt!.leaseUntil = leaseUntil
-        this.commit(missionId, () => this.store.put('tasks', task))
+      if (source.checks.length) {
+        const checkTimeoutMs = source.checkTimeoutMs ?? this.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
+        const verificationWindow = checkTimeoutMs * Math.max(1, source.checks.length) + this.config.leaseMs
+        if (!Number.isSafeInteger(verificationWindow)) throw new Error('Verification check duration exceeds the supported clock range')
+        this.fenceAttempt(this.mission(missionId), task, verificationWindow)
         this.ownAttempt(actor, missionId, task.id, input.attemptId)
       }
       const evidenceRevision = JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))
@@ -517,11 +561,14 @@ export class SwarmRuntime {
         }
         for (const evidenceId of source.evidenceIds) {
           const evidence = this.store.get('evidence', evidenceId)!
-          evidence.status = passed ? 'verified' : 'challenged'
+          // Status follows the verdict and the claim's own outcome: an inconclusive
+          // claim is never promoted to verified knowledge.
+          const status: EvidenceStatus = !passed ? 'challenged' : evidence.outcome === 'inconclusive' ? 'unverified' : 'verified'
+          evidence.status = status
           this.store.put('evidence', evidence)
-          if (passed) for (const previous of evidence.supersedes) {
+          if (status === 'verified') for (const previous of evidence.supersedes) {
             const old = this.store.get('evidence', previous)!
-            old.status = 'refuted'; this.store.put('evidence', old)
+            old.status = 'refuted'; old.refutedBy = evidence.id; this.store.put('evidence', old)
           }
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: input.reason, checks: runIds })
@@ -599,6 +646,7 @@ export class SwarmRuntime {
     this.bounded(input.summary)
     if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && m.status !== 'stopped')) throw new Error('Unknown new owner')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; delete task.attempt
+    if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff' }
     this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary }) })
     this.defer(async () => {
@@ -915,7 +963,17 @@ export class SwarmRuntime {
   /** Snapshot access is checked against durable membership. */
   snapshot(actor: Actor, missionId: string): Snapshot {
     const { mission } = this.participant(actor, missionId)
-    return { mission, members: this.store.list('members', missionId), workstreams: this.store.list('workstreams', missionId), tasks: this.store.list('tasks', missionId), evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length }
+    const tasks = this.store.list('tasks', missionId)
+    let deliveryTarget: { taskId: string; commit: string } | undefined
+    try {
+      const target = this.selectDeliveryTarget(missionId, tasks)
+      if (target.artifact) deliveryTarget = { taskId: target.id, commit: target.artifact.commit }
+    } catch { deliveryTarget = undefined }
+    const completionReason = this.completionError(mission, { cancelUnschedulable: true })
+    return { mission, members: this.store.list('members', missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length,
+      ...(deliveryTarget === undefined ? {} : { deliveryTarget }),
+      completion: { eligible: completionReason === undefined, ...(completionReason === undefined ? {} : { reason: completionReason }) },
+      ...(mission.appliedDelivery === undefined ? {} : { appliedDelivery: { resultCommit: mission.appliedDelivery.resultCommit, appliedAt: mission.appliedDelivery.appliedAt } }) }
   }
   /**
    * Bounded, focused model views. A member sees its current task, the
@@ -967,6 +1025,7 @@ export class SwarmRuntime {
     const events = fetched.slice(0, eventLimit).map(event => ({ seq: event.seq, type: event.type, actor: event.actor, summary: excerpt(event.data, 240) }))
     const eventCursor = { ...(events.length ? { nextAfter: events.at(-1)!.seq } : {}), ...(fetched.length > eventLimit ? { moreEvents: true } : {}) }
     const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: this.inFlightEstimate(members) }
+    const full = query.detail === 'full'
     if (member) {
       const current = tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
       const source = current?.reviewOf ? this.task(missionId, current.reviewOf) : undefined
@@ -981,11 +1040,10 @@ export class SwarmRuntime {
         evidence: current ? evidenceOf(current) : [],
         ...runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20),
         events, ...eventCursor,
-        board: tasks.map(taskRef), members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status })),
-        detail: 'Focused view. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
+        board: full ? tasks.map(task => taskRecord(task, 2400)) : tasks.map(taskRef), members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status })),
+        detail: full ? 'Focused view with complete task records. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.' : 'Focused view. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
       }
     }
-    const full = query.detail === 'full'
     const evidence = this.store.list('evidence', missionId)
     return {
       mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
@@ -1011,15 +1069,8 @@ export class SwarmRuntime {
     }
     return total
   }
-  /** One completion policy is shared by manual controls and automatic requests. */
-  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
-    actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
-    const mission = this.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
-    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
-    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
-    const tasks = this.store.list('tasks', missionId)
+  /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
+  private selectDeliveryTarget(missionId: string, tasks: Task[]): Task {
     const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
     // A dependency reference to a replaced original also covers its accepted repair.
     const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
@@ -1032,14 +1083,24 @@ export class SwarmRuntime {
     }
     if (!tasks.some(task => task.kind === 'integration')) {
       // A single reviewed implementation is the deliverable when the plan needed no assembly step.
-      if (implementations.length === 1 && implementations[0]!.artifact) return { mission, task: implementations[0]! }
+      if (implementations.length === 1 && implementations[0]!.artifact) return implementations[0]!
       throw new Error('A unique independently accepted implementation artifact is required when the plan has no integration task')
     }
     const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
     // A later integration may subsume an earlier one; never guess among independent final artifacts.
     const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && covers(other, candidate.id)))
     if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required')
-    return { mission, task: finals[0]! }
+    return finals[0]!
+  }
+  /** One completion policy is shared by manual controls and automatic requests. */
+  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
+    actor.signal?.throwIfAborted()
+    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    const mission = this.mission(missionId)
+    if (mission.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
+    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
+    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
+    return { mission, task: this.selectDeliveryTarget(missionId, this.store.list('tasks', missionId)) }
   }
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
@@ -1053,7 +1114,15 @@ export class SwarmRuntime {
       const { mission, task } = this.deliveryTarget(actor, missionId)
       if (!this.workers.applyDelivery) throw new Error('This worker adapter does not support applying results')
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
-      this.commit(missionId, () => this.store.event(missionId, `delivery/${result.status}`, 'owner', { resultCommit: task.artifact!.commit, ...result }))
+      this.commit(missionId, () => {
+        // The projection states what is currently in effect, so a conflicts result
+        // clears any earlier marker instead of leaving a stale "applied" claim for
+        // the same target (I2 hand-off 4, reconciled at integration).
+        if (result.status === 'applied') mission.appliedDelivery = { resultCommit: task.artifact!.commit, appliedAt: Date.now() }
+        else delete mission.appliedDelivery
+        this.store.put('missions', mission)
+        this.store.event(missionId, `delivery/${result.status}`, 'owner', { resultCommit: task.artifact!.commit, ...result })
+      })
       return result
     })
   }
@@ -1096,7 +1165,10 @@ export class SwarmRuntime {
     const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked') && !leftover.has(task.id))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
     const accepted = tasks.filter(task => task.status === 'accepted')
-    const uncovered = mission.acceptance.filter(criterion => !accepted.some(task => task.acceptance.includes(criterion)))
+    // Verification acceptance text is free-form review criteria; only deliverable
+    // work can cover a mission criterion, and code deliverables need an artifact.
+    const deliverables = accepted.filter(task => task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
+    const uncovered = mission.acceptance.filter(criterion => !deliverables.some(task => Array.isArray(task.acceptance) && task.acceptance.includes(criterion)))
     if (uncovered.length) {
       const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
       return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
@@ -1166,7 +1238,7 @@ export class SwarmRuntime {
     if (!Number.isSafeInteger(deadline)) throw new Error('Mission duration exceeds the supported clock range')
     if (mission.status === 'active' && deadline <= Date.now()) throw new Error('An active mission needs a duration deadline in the future')
     const previous = mission.budget
-    mission.budget = budget; mission.deadline = deadline; mission.updatedAt = Date.now()
+    mission.budget = budget; mission.deadline = deadline; mission.updatedAt = Date.now(); delete mission.budgetWarned
     this.commit(missionId, () => {
       this.store.put('missions', mission)
       this.syncStarts(mission)
@@ -1267,6 +1339,7 @@ export class SwarmRuntime {
         task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs); this.store.put('tasks', task)
       }
     })
+    this.warnBudget(mission)
   }
   private async usage(memberId: string, tokens: number): Promise<void> {
     if (!Number.isFinite(tokens) || tokens < 0 || this.closed) return
@@ -1275,6 +1348,7 @@ export class SwarmRuntime {
     const mission = this.mission(member.missionId)
     mission.usedTokens += Math.ceil(tokens)
     this.commit(mission.id, () => { this.store.put('missions', mission) })
+    this.warnBudget(mission)
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
   }
   /** Reconcile durable Harness usage cumulatively, including after a crash before SQLite accounting. */
@@ -1292,6 +1366,7 @@ export class SwarmRuntime {
     mission.usedTokens += Math.max(0, totalTokens - previouslyAccounted)
     if (bucketDelta !== undefined) { member.usage = usage; mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
     this.commit(mission.id, () => { this.store.put('members', member); this.store.put('missions', mission) })
+    this.warnBudget(mission)
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
   }
   /**
@@ -1313,9 +1388,45 @@ export class SwarmRuntime {
     request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = Date.now()
     this.commit(request.id, () => this.store.put('starts', request))
   }
+  /** Budget dimensions that are currently exhausted; used by the pause reason and event. */
+  private exhaustedDimensions(mission: Mission): string[] {
+    const dimensions: string[] = []
+    if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
+    if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
+    if (Date.now() >= mission.deadline) dimensions.push('maxDurationMs')
+    return dimensions
+  }
+  /**
+   * Emit at most one approaching-limit warning per dimension per threshold. The
+   * first signal is an event, not a fatal pause; thresholds default to 0.7/0.9.
+   */
+  private warnBudget(mission: Mission): void {
+    if (mission.status !== 'active' || mission.budgetPause) return
+    const thresholds = [...(this.config.budgetWarnAt ?? DEFAULT_BUDGET_WARN_AT)]
+      .filter(value => Number.isFinite(value) && value > 0 && value < 1).sort((a, b) => a - b)
+    if (!thresholds.length) return
+    const dimensions: Array<{ dimension: string; used: number; limit: number }> = [
+      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens },
+      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps },
+      { dimension: 'maxDurationMs', used: Math.max(0, Date.now() - mission.createdAt), limit: mission.budget.maxDurationMs },
+    ]
+    let changed = false
+    for (const item of dimensions) {
+      if (!(item.limit > 0)) continue
+      const crossed = thresholds.filter(threshold => item.used / item.limit >= threshold).at(-1)
+      if (crossed === undefined || crossed <= (mission.budgetWarned?.[item.dimension] ?? 0)) continue
+      mission.budgetWarned = { ...(mission.budgetWarned ?? {}), [item.dimension]: crossed }
+      changed = true
+      this.store.event(mission.id, 'mission/budget-warning', 'runtime', { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
+        remaining: Math.max(0, item.limit - item.used), suggestedLimit: Math.ceil(item.used / crossed) })
+    }
+    if (changed) this.commit(mission.id, () => this.store.put('missions', mission))
+  }
   private blockBudget(mission: Mission): void {
     if (terminal(mission) || mission.status === 'blocked') return
-    mission.status = 'blocked'; mission.reason = 'Aggregate mission budget exhausted'
+    const dimensions = this.exhaustedDimensions(mission)
+    mission.status = 'blocked'
+    mission.reason = dimensions.length ? `Aggregate mission budget exhausted: ${dimensions.join(', ')}` : 'Aggregate mission budget exhausted'
     mission.budgetPause = { id: id('budget-pause'), quiesced: false }
     this.commit(mission.id, () => {
       this.store.put('missions', mission)
@@ -1324,7 +1435,7 @@ export class SwarmRuntime {
         this.store.put('tasks', task)
       }
       for (const member of this.store.list('members', mission.id)) { delete member.activity; this.store.put('members', member) }
-      this.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps })
+      this.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps, dimensions })
       this.notify(mission.id, mission.reason!)
     })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
@@ -1359,9 +1470,14 @@ export class SwarmRuntime {
         if (!resume || resume.pauseId !== pause.id) continue
         delete task.budgetResume
         if (task.status !== 'running' || !task.attempt || task.attempt.id !== resume.attemptId || task.epoch !== resume.epoch) {
-          this.store.put('tasks', task); continue
+          // The pause marker outlived its attempt (challenge, handoff or restart):
+          // re-pend the work without charging a recovery attempt.
+          if (task.status === 'running') { task.status = 'pending'; delete task.attempt }
+          this.store.put('tasks', task)
+          this.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
+          continue
         }
-        task.attempt.leaseUntil = Date.now() + this.config.leaseMs
+        task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs)
         this.store.put('tasks', task)
         const member = this.store.get('members', task.attempt.ownerId)
         if (member && member.status !== 'stopped') { member.status = 'working'; this.store.put('members', member) }
@@ -1407,9 +1523,25 @@ export class SwarmRuntime {
   private renewActiveOperation(task: Task, mission: Mission): void {
     if (!task.attempt || task.attempt.leaseUntil >= Date.now() + this.config.leaseMs / 2) return
     const member = this.store.get('members', task.attempt.ownerId)
+    const activity = member?.activity
     const observed = this.workers.currentActivity?.(task.attempt.ownerId)
-    if (!member?.activity || member.activity.attemptId !== task.attempt.id || observed?.id !== member.activity.id) return
-    task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs)
+    // A live operation is liveness for its full duration: match by member and
+    // activity id, never by the attempt the operation happens to be stored under.
+    // Adapters that report current activity must confirm the operation is live.
+    const live = activity !== undefined && (this.workers.currentActivity === undefined || (observed !== undefined && observed.id === activity.id))
+    if (!live) {
+      if (task.leaseWarned !== task.attempt.leaseUntil) {
+        task.leaseWarned = task.attempt.leaseUntil
+        this.commit(mission.id, () => {
+          this.store.put('tasks', task)
+          this.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt!.ownerId, leaseUntil: task.attempt!.leaseUntil })
+        })
+      }
+      return
+    }
+    const modelAllowance = activity.kind === 'model' ? (member?.maxOutputTokens ?? 0) : 0
+    task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs + Math.ceil(modelAllowance * LEASE_MS_PER_OUTPUT_TOKEN))
+    delete task.leaseWarned
     // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
     this.commit(mission.id, () => this.store.put('tasks', task))
   }
@@ -1488,8 +1620,15 @@ export class SwarmRuntime {
       this.renewActiveOperation(task, mission)
       if (task.attempt.leaseUntil >= Date.now()) continue
       const oldOwner = task.attempt.ownerId
-      task.status = 'blocked'; task.epoch++; task.recoveryCount = (task.recoveryCount ?? 0) + 1; delete task.attempt
-      delete task.assigneeId
+      // A lease that expired while the task was budget-paused is host policy, not
+      // a recovery failure, and the plan's intended owner must survive it.
+      const pauseInduced = task.budgetResume !== undefined
+      task.status = 'blocked'; task.epoch++
+      if (!pauseInduced) task.recoveryCount = (task.recoveryCount ?? 0) + 1
+      delete task.attempt
+      const planned = task.plannedAssigneeId === undefined ? undefined : this.store.get('members', task.plannedAssigneeId)
+      if (planned !== undefined && planned.status !== 'stopped') task.assigneeId = planned.id
+      else delete task.assigneeId
       task.resumeAfterStop = { epoch: task.epoch, reason: 'lease-expired' }
       this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: task.id, oldOwner }) })
       await this.workers.stop(oldOwner)

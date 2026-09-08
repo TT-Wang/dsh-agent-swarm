@@ -1,4 +1,5 @@
 import { resolveHarnessRoot, assertSupportedHarness } from './harness-target.mjs'
+import { assertSandboxPrerequisite } from './sandbox-prerequisite.mjs'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { access, mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
@@ -44,6 +45,7 @@ try {
   assert(dump.stdout.includes(`name: '${manifest.name}'`), 'dump-config must compose the installed swarm row')
   assert(dump.stdout.includes('dsh-external-agent-swarm'), 'dump-config must preserve the shipped bundle entry identity')
   assert(dump.stdout.includes('@deepseek-ai/dsh-agent-loop'), 'profile must retain its real Harness base composition')
+  await assertSandboxPrerequisite('npm run test:profile')
   const run = await execute(process.execPath, [
     '--expose-internals', join(project, 'tests/harness-composition.mjs'),
     '--artifact', project, '--harness', harnessRoot, '--bundle-profile', profileDir,

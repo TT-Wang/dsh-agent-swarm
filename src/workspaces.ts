@@ -1,13 +1,15 @@
 /** Owned Git worktrees and immutable artifacts. The source checkout is read-only. */
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { withinScope } from './scope.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean }
+/** Full-repository path inventories are metadata, not user-visible check output. */
+const INVENTORY_BYTES = 16 * 1024 * 1024
 export interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
@@ -19,8 +21,29 @@ export interface WorkspaceOptions {
    * find installed toolchains. Default: `['node_modules']`. Empty disables.
    */
   verificationDependencyDirs?: string[]
+  /**
+   * How ignored dependency directories reach a verification checkout.
+   * `link` (default) symlinks the source directory: checks read the real
+   * toolchain, and writes through the link reach the source checkout because
+   * the link target is not redirected by the sandbox. `copy` clones the
+   * directory into the checkout so checks can write without touching the
+   * source, at the cost of copying the tree for every verification.
+   */
+  verificationDependencyMode?: 'link' | 'copy'
+  /**
+   * Called when a disposable verification checkout cannot be removed. Cleanup
+   * failure is recorded here and never masks the check results.
+   */
+  onCleanupFailure?(info: { checkout: string; error: string }): void
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
+}
+/** Reject a symlink whose target leaves its owning workspace. */
+function assertContainedSymlink(workspace: string, relative: string, target: string): void {
+  if (!target || target.includes('\0') || path.isAbsolute(target)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
+  const root = path.resolve(workspace)
+  const resolved = path.resolve(path.dirname(path.join(root, relative)), target)
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
 }
 interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string }
@@ -46,7 +69,12 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
     const killGroup = (signal: NodeJS.Signals): void => {
       if (child.pid === undefined) return
       try { process.kill(-child.pid, signal) } catch (error) {
-        if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH')) failure ??= error instanceof Error ? error : new Error(String(error))
+        // ESRCH and EPERM both mean the group is no longer ours to signal: the
+        // close-path reap must not replace the child's real exit code and
+        // output with a cleanup error. A timeout or abort already recorded its
+        // own failure in cancel() before any kill.
+        const code = error instanceof Error && 'code' in error ? error.code : undefined
+        if (code !== 'ESRCH' && code !== 'EPERM') failure ??= error instanceof Error ? error : new Error(String(error))
       }
     }
     const cancel = (error: Error): void => {
@@ -111,6 +139,7 @@ export class Workspaces {
   private readonly controllers = new Map<string, Set<AbortController>>()
   private readonly inFlight = new Set<Promise<unknown>>()
   private readonly baselines = new Map<string, Promise<WorkspaceBaseline>>()
+  private readonly cleanupIssues: string[] = []
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
@@ -119,16 +148,19 @@ export class Workspaces {
     if (!Number.isSafeInteger(options.maxCheckOutputBytes) || options.maxCheckOutputBytes < 64) throw new Error('maxCheckOutputBytes must be at least 64')
   }
 
+  /** Non-fatal verification-checkout cleanup failures, oldest first (bounded). */
+  cleanupFailures(): readonly string[] { return [...this.cleanupIssues] }
+
   private missionDir(missionId: string): string { return path.join(this.root, segment(missionId)) }
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
   private memberPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.workspace.json`) }
   private taskPath(missionId: string, taskId: string): string { return path.join(this.missionDir(missionId), 'tasks', `${segment(taskId)}.json`) }
-  private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes): Promise<string> {
+  private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
     const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.options.checkTimeoutMs, maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed (${result.exitCode}): ${result.output.trim()}`)
     if (result.truncated) throw new Error(`git ${args[0]} output exceeded the configured limit; refusing incomplete artifact inspection`)
-    return args.includes('-z') ? result.output : result.output.trim()
+    return raw || args.includes('-z') ? result.output : result.output.trim()
   }
 
   private operation<T>(memberId: string, callback: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -181,7 +213,7 @@ export class Workspaces {
       if (await readJson(manifest) === undefined) {
         // Full repository path inventories need a metadata bound independent
         // of the much smaller user-visible check-output retention limit.
-        const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, 16 * 1024 * 1024), ownedSignal)
+        const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, INVENTORY_BYTES), ownedSignal)
         record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace } }
         await writePrivateJson(manifest, record)
       } else record = await this.missionRecord(mission.id)
@@ -330,22 +362,53 @@ export class Workspaces {
     await this.git(mission.source, ['merge-base', '--is-ancestor', mission.baseCommit, artifact.commit])
   }
 
+  /**
+   * Reject artifact symlinks whose target is absolute or leaves the member
+   * workspace. Applied artifacts materialize these links in the source
+   * checkout, so a read-through link to `/etc/hosts` or `../../..` would let a
+   * worker plant a link that later tooling follows outside the repository.
+   * Relative in-repository links stay allowed.
+   */
+  private async assertCommittedSymlinks(workspace: string, baseCommit: string, commit: string, signal: AbortSignal): Promise<void> {
+    const raw = await this.git(workspace, ['diff', '--raw', '--no-abbrev', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)
+    const fields = raw.split('\0')
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      const meta = fields[index]!.split(' ')
+      const relative = fields[index + 1]!
+      if (!relative || meta[1] !== '120000' || meta[3] === undefined) continue
+      const target = await this.git(workspace, ['cat-file', 'blob', meta[3]!], signal, undefined, INVENTORY_BYTES, true)
+      assertContainedSymlink(workspace, relative, target)
+    }
+  }
+
   async captureArtifact(member: Member, task: Task): Promise<Artifact> {
     return await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
       if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('Task has no matching prepared workspace baseline')
       const baseCommit = record.task.baseCommit
       // Include tracked changes, staged changes, and new files before any commit.
-      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '-z', baseCommit, '--'], signal)).split('\0').filter(Boolean))
-      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal)).split('\0').filter(Boolean)) changed.add(name)
+      // Rename detection is disabled so a `git mv` out of scope reports the
+      // deleted source path too, instead of only the in-scope destination.
+      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
+      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) changed.add(name)
       for (const name of changed) if (!withinScope(name, task.scope)) throw new Error(`Artifact changes path outside task scope: ${name}`)
+      // Untracked symlinks are invisible to `git diff`; inspect every changed
+      // working-tree path before committing so an escaping link is never
+      // recorded in a swarm ref.
+      for (const name of changed) {
+        const info = await lstat(path.join(member.workspace, name)).catch(() => undefined)
+        if (info?.isSymbolicLink()) assertContainedSymlink(member.workspace, name, await readlink(path.join(member.workspace, name)))
+      }
       await this.git(member.workspace, ['add', '--all', '--', '.'], signal)
-      const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '-z'], signal)
-      if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal)
+      const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
+      if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
       const commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
       await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
-      const changedPaths = (await this.git(member.workspace, ['diff', '--name-only', '-z', baseCommit, commit, '--'], signal)).split('\0').filter(Boolean)
+      const changedPaths = (await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
       for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new Error(`Committed artifact changes path outside task scope: ${name}`)
+      // The commit is authoritative: re-check the recorded blobs so a working
+      // tree edited after staging cannot smuggle a symlink into the artifact.
+      await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
       await this.git(member.workspace, ['update-ref', `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, commit], signal)
       record.task.capturedCommit = commit
       await this.saveTaskWorkspace(record)
@@ -363,21 +426,87 @@ export class Workspaces {
       await this.git(mission.source, ['worktree', 'add', '--detach', checkout, artifact.commit], signal)
       try {
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
+        const cache = this.checkCacheEnvironment(checkout)
+        await mkdir(path.join(checkout, '.swarm-check-cache'), { recursive: true, mode: 0o700 }).catch(() => undefined)
+        const parentEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+        const env = this.options.checkEnv === undefined ? { ...parentEnv, ...cache } : { ...cache, ...this.options.checkEnv }
         const results: CheckResult[] = []
         for (const command of task.checks) {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
-          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env: this.options.checkEnv })
+          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env })
           // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
           const output = result.exitCode === 127
-            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. Linked dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
+            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${(this.options.verificationDependencyMode ?? 'link') === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
             : result.output
           results.push({ command, exitCode: result.exitCode, output, truncated: result.truncated })
           if (result.exitCode !== 0) break
         }
         return results
-      } finally { await this.git(mission.source, ['worktree', 'remove', '--force', checkout]) }
+      } finally { await this.cleanupVerification(mission.source, checkout) }
     }, signal)
+  }
+
+  /** Keep package-manager caches inside the disposable checkout, never the source. */
+  private checkCacheEnvironment(checkout: string): Record<string, string> {
+    const cache = path.join(checkout, '.swarm-check-cache')
+    return {
+      npm_config_cache: path.join(cache, 'npm'),
+      YARN_CACHE_FOLDER: path.join(cache, 'yarn'),
+      XDG_CACHE_HOME: path.join(cache, 'xdg'),
+      PIP_CACHE_DIR: path.join(cache, 'pip'),
+      GOCACHE: path.join(cache, 'go'),
+    }
+  }
+
+  /**
+   * Remove a disposable verification checkout without ever masking the check
+   * results. `git worktree remove` fails when a check left an unreadable
+   * directory; fall back to `fs.rm`, then to an owner-permission repair before
+   * `git worktree prune` drops a stale registration. Failures are recorded for
+   * the host and are never thrown.
+   */
+  private async cleanupVerification(source: string, checkout: string): Promise<void> {
+    let failure: unknown
+    try {
+      await this.git(source, ['worktree', 'remove', '--force', checkout])
+      return
+    } catch (error) { failure = error }
+    if (!(await lstat(checkout).then(() => true, () => false))) {
+      try { await this.git(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
+      return
+    }
+    try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
+    catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
+    try { await this.git(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
+    this.recordCleanupIssue(checkout, failure)
+  }
+
+  /** Restore owner permissions on an unreadable tree so removal can finish. */
+  private async forceRemove(directory: string): Promise<void> {
+    const gone = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT'
+    // A failed recursive removal can still be deleting entries, so every step
+    // tolerates a path that disappeared underneath it.
+    const ignoringMissing = async <T>(operation: Promise<T>): Promise<T | undefined> => await operation.catch(error => { if (gone(error)) return undefined; throw error })
+    const repair = async (current: string): Promise<void> => {
+      for (const entry of await ignoringMissing(readdir(current, { withFileTypes: true })) ?? []) {
+        const child = path.join(current, entry.name)
+        const info = await ignoringMissing(lstat(child))
+        if (info === undefined || info.isSymbolicLink()) continue
+        if (info.isDirectory()) { await ignoringMissing(chmod(child, 0o700)); await repair(child) }
+        else await ignoringMissing(chmod(child, 0o600))
+      }
+    }
+    await repair(directory)
+    await ignoringMissing(chmod(directory, 0o700))
+    await rm(directory, { recursive: true, force: true })
+  }
+
+  private recordCleanupIssue(checkout: string, failure: unknown): void {
+    const message = `Verification checkout cleanup failed for ${checkout}: ${failure instanceof Error ? failure.message : String(failure)}`
+    this.cleanupIssues.push(message)
+    if (this.cleanupIssues.length > 50) this.cleanupIssues.splice(0, this.cleanupIssues.length - 50)
+    try { this.options.onCleanupFailure?.({ checkout, error: message }) } catch { /* reporting must not mask results */ }
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */
@@ -386,17 +515,23 @@ export class Workspaces {
   /** Preserve mission worktrees as deliverables, while draining all owned execution. */
   /**
    * Clean checkouts contain only committed files, so toolchains installed in the
-   * source (ignored `node_modules` and similar) are absent. Link those ignored
-   * directories read-through from the source at the same relative paths; the
-   * artifact commit is unchanged and the sandbox still confines writes to the
-   * checkout. Build outputs and other ignored paths are never linked.
-   * @returns the relative directories that were linked.
+   * source (ignored `node_modules` and similar) are absent. By default those
+   * ignored directories are symlinked read-through from the source at the same
+   * relative paths: the artifact commit is unchanged, but the link target is
+   * NOT redirected by the sandbox, so a check that writes through it modifies
+   * the source checkout (and caches can leak source state into the result).
+   * `verificationDependencyMode: 'copy'` clones the directory into the checkout
+   * instead, isolating writes at the cost of copying the tree. Package-manager
+   * caches are always pointed inside the checkout. Build outputs and other
+   * ignored paths are never linked or copied.
+   * @returns the relative directories that were linked or copied.
    */
   private async linkDependencyDirs(source: string, checkout: string, signal: AbortSignal): Promise<string[]> {
     const names = new Set(this.options.verificationDependencyDirs ?? ['node_modules'])
     if (names.size === 0) return []
-    const ignored = await this.git(source, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], signal, undefined, 16 * 1024 * 1024)
+    const ignored = await this.git(source, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], signal, undefined, INVENTORY_BYTES)
     const linked: string[] = []
+    const copy = (this.options.verificationDependencyMode ?? 'link') === 'copy'
     for (const entry of ignored.split('\0')) {
       if (!entry.endsWith('/')) continue
       const relative = entry.slice(0, -1)
@@ -406,7 +541,8 @@ export class Workspaces {
       if (targetStat === undefined || !targetStat.isDirectory()) continue
       if (await lstat(link).then(() => true, () => false)) continue
       await mkdir(path.dirname(link), { recursive: true })
-      await symlink(target, link, 'dir')
+      if (copy) await cp(target, link, { recursive: true, dereference: false, verbatimSymlinks: true })
+      else await symlink(target, link, 'dir')
       linked.push(relative)
     }
     return linked

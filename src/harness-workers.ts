@@ -32,8 +32,24 @@ export interface HarnessWorkerOptions {
   maxCheckOutputBytes: number
   /** Ignored dependency directories linked from the source into verification checkouts. */
   verificationDependencyDirs?: string[]
+  /** M6: `link` (default) symlinks those directories read-through; `copy` clones them into each checkout. */
+  verificationDependencyMode?: 'link' | 'copy'
   /** Prompt-token pressure (uncached + cached input of the last request) above which an idle worker compacts at a task boundary; 0 disables. */
   boundaryCompactionTokens?: number
+  /**
+   * Cost weight applied to cache-read input when charging the mission token
+   * ceiling. Raw buckets are never rescaled; only the charged total the runtime
+   * accounts (and can warn from) uses this weight. Defaults to 0.1; invalid
+   * values fall back to the default.
+   */
+  cacheReadWeight?: number
+  /**
+   * Interval at which a live native operation (model stream, tool execution,
+   * verification, retry backoff) republishes its activity as lease liveness for
+   * its full duration, including one long generation that emits no chunk. 0
+   * disables the timer. Defaults to 1000 ms.
+   */
+  activityHeartbeatMs?: number
 }
 interface Composition {
   version: 1
@@ -64,21 +80,35 @@ interface Resident {
   /** Executions already recorded through the post-execute waterfall; the result emit must not record them twice. */
   recordedExecutions: WeakSet<object>
   rejectedPendingStep: boolean
-  activities: Map<string, { value: WorkerActivity; signal?: AbortSignal; release: () => void }>
+  activities: Map<string, { value: WorkerActivity; signal?: AbortSignal; release: () => void; heartbeat?: ReturnType<typeof setInterval> }>
   requestSignal?: AbortSignal
   retryActivity?: () => void
 }
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error) }
-/** Aggregate one provider usage report into disjoint billing buckets; reasoning is already inside output. */
-function accumulateUsage(target: UsageBuckets, usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }): number {
+const DEFAULT_CACHE_READ_WEIGHT = 0.1
+const DEFAULT_ACTIVITY_HEARTBEAT_MS = 1000
+/** Invalid configuration never silently reverts to 1:1 cache charging. */
+function cacheReadWeight(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : DEFAULT_CACHE_READ_WEIGHT
+}
+function activityHeartbeatMs(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : DEFAULT_ACTIVITY_HEARTBEAT_MS
+}
+/**
+ * Aggregate one provider usage report into disjoint billing buckets; reasoning
+ * is already inside output. Returns the charge this request adds to the mission
+ * token ceiling: cache reads cost a fraction of uncached input, while every raw
+ * bucket stays exact for the UI and for cost attribution.
+ */
+function accumulateUsage(target: UsageBuckets, usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number }, cacheRead: number): number {
   target.uncachedInputTokens += usage.inputTokens
   target.outputTokens += usage.outputTokens
   target.cacheReadTokens += usage.cacheReadTokens ?? 0
   target.cacheWriteTokens += usage.cacheWriteTokens ?? 0
   target.reasoningTokens += usage.reasoningTokens ?? 0
   target.requests += 1
-  return usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+  return Math.ceil(usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) * cacheRead + (usage.cacheWriteTokens ?? 0))
 }
 const emptyBuckets = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
 /** The durable run keeps the model-visible content; the execution-local canonical value is deliberately not persisted. */
@@ -114,11 +144,18 @@ export class HarnessWorkers implements WorkerAdapter {
   private callbacks: WorkerCallbacks | undefined
   private readonly residents = new Map<string, Resident>()
   private readonly workspaces: Workspaces
+  private readonly cacheReadWeight: number
+  private readonly activityHeartbeatMs: number
+  private readonly activityPublishIntervalMs: number
   private closing = false
   private disposal: Promise<void> | undefined
   private readonly removeStreamObserver: () => void
 
   constructor(private readonly ctx: Context, private readonly options: HarnessWorkerOptions) {
+    this.cacheReadWeight = cacheReadWeight(options.cacheReadWeight)
+    this.activityHeartbeatMs = activityHeartbeatMs(options.activityHeartbeatMs)
+    // Touches coalesce on the same interval so a chunking stream never publishes faster than the heartbeat.
+    this.activityPublishIntervalMs = this.activityHeartbeatMs > 0 ? this.activityHeartbeatMs : DEFAULT_ACTIVITY_HEARTBEAT_MS
     this.workspaces = new Workspaces({
       ...options,
       checkEnv: scrubbedParentEnv(),
@@ -144,7 +181,7 @@ export class HarnessWorkers implements WorkerAdapter {
       const sessionId = String(session.header.id)
       if ([...this.residents.values()].some(item => item.spec.member.sessionId === sessionId)) return
       const buckets = emptyBuckets()
-      accumulateUsage(buckets, event.data.usage)
+      accumulateUsage(buckets, event.data.usage, this.cacheReadWeight)
       try { this.callbacks.ownerUsage(sessionId, buckets) }
       catch (error) { this.ctx.logger.error(`Swarm owner usage observer failed: ${errorText(error)}`) }
     })
@@ -168,16 +205,34 @@ export class HarnessWorkers implements WorkerAdapter {
     const value: WorkerActivity = { ...fields, id: key, startedAt: now, updatedAt: now }
     const end = () => {
       signal?.removeEventListener('abort', end)
+      const heartbeat = resident.activities.get(key)?.heartbeat
+      if (heartbeat !== undefined) clearInterval(heartbeat)
       if (resident.activities.delete(key)) this.publishActivity(resident)
+    }
+    const publish = (coalesce: boolean) => {
+      if (!resident.activities.has(key)) return
+      if (coalesce && Date.now() - value.updatedAt < this.activityPublishIntervalMs) return
+      value.updatedAt = Date.now()
+      this.publishActivity(resident)
     }
     resident.activities.set(key, { value, signal, release: end })
     signal?.addEventListener('abort', end, { once: true })
     if (signal?.aborted) end()
-    else this.publishActivity(resident)
-    return { end, touch: () => {
-      // Stream chunks prove new activity; coalesce writes without inventing progress heartbeats.
-      if (resident.activities.has(key) && Date.now() - value.updatedAt >= 1000) { value.updatedAt = Date.now(); this.publishActivity(resident) }
-    } }
+    else {
+      this.publishActivity(resident)
+      // A model stream or tool body can stay silent for longer than the attempt
+      // lease while it is demonstrably still running. Republish this same
+      // operation for its full duration so the runtime can renew the owning
+      // attempt: this asserts the operation is live, never that it progressed.
+      if (this.activityHeartbeatMs > 0) {
+        const heartbeat = setInterval(() => publish(false), this.activityHeartbeatMs)
+        heartbeat.unref()
+        const entry = resident.activities.get(key)
+        if (entry === undefined) clearInterval(heartbeat)
+        else entry.heartbeat = heartbeat
+      }
+    }
+    return { end, touch: () => publish(true) }
   }
   private clearActivities(resident: Resident): void {
     for (const item of [...resident.activities.values()]) item.release()
@@ -329,10 +384,11 @@ export class HarnessWorkers implements WorkerAdapter {
       resident.usage = emptyBuckets()
       resident.totalTokens = agent.session.snapshotEvents().reduce((total, event) => {
         if (event.type !== 'assistant/message' || event.data.usage === undefined) return total
-        return total + accumulateUsage(resident.usage, event.data.usage)
+        return total + accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
       }, 0)
       // Reconcile a session-log commit whose runtime budget transaction was
       // interrupted, before publication can release pending model requests.
+      // `totalTokens` is the weighted charge; `usage` keeps the raw buckets.
       await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage })
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
@@ -422,13 +478,14 @@ export class HarnessWorkers implements WorkerAdapter {
         if (event.type === 'user/message') resident.recoveryInbox.delete(event.data.id)
         if (event.type === 'assistant/message' && event.data.usage !== undefined) {
           resident.lastPromptTokens = event.data.usage.inputTokens + (event.data.usage.cacheReadTokens ?? 0) + (event.data.usage.cacheWriteTokens ?? 0)
-          const tokens = accumulateUsage(resident.usage, event.data.usage)
+          const tokens = accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
           resident.totalTokens += tokens
           const total = resident.totalTokens, buckets = { ...resident.usage }
           this.observe(resident, async () => {
             const observer = this.observer()
             if (observer.usageSnapshot !== undefined) {
               // The source total must survive a crash before SQLite accounts it.
+              // The weighted charge is the accounted total; buckets stay raw.
               await this.ctx.sessions.flush(session)
               await observer.usageSnapshot(spec.member.id, total, buckets)
             } else await observer.usage(spec.member.id, tokens)

@@ -52,6 +52,35 @@ function attempt(value: unknown): boolean {
   return value === undefined || (record(value) && typeof value.id === 'string'
     && typeof value.ownerId === 'string' && finite(value.epoch) && finite(value.leaseUntil))
 }
+/**
+ * Runtime-projected fields this client consumes. The runtime task lands the
+ * declarations in `types.ts`; reading them through a validating accessor keeps
+ * this projection honest about untrusted payloads and independent of that landing.
+ */
+export interface DeliveryTargetProjection { taskId: string; commit: string }
+export interface CompletionProjection { eligible: boolean; reason?: string }
+export interface AppliedDeliveryProjection { resultCommit: string; appliedAt?: number }
+function projected(snapshot: Snapshot, key: string): unknown {
+  return (snapshot as unknown as Record<string, unknown>)[key]
+}
+/** The unique maximal accepted integration the runtime will deliver; undefined on legacy snapshots. */
+export function readDeliveryTarget(snapshot: Snapshot): DeliveryTargetProjection | undefined {
+  const value = projected(snapshot, 'deliveryTarget')
+  return record(value) && typeof value.taskId === 'string' && typeof value.commit === 'string'
+    ? { taskId: value.taskId, commit: value.commit } : undefined
+}
+/** Runtime completion eligibility and its blocking reason; undefined on legacy snapshots. */
+export function readCompletion(snapshot: Snapshot): CompletionProjection | undefined {
+  const value = projected(snapshot, 'completion')
+  return record(value) && typeof value.eligible === 'boolean' && (value.reason === undefined || typeof value.reason === 'string')
+    ? { eligible: value.eligible, ...(value.reason === undefined ? {} : { reason: value.reason }) } : undefined
+}
+/** Durable applied-delivery receipt recorded by the runtime; undefined until a result was applied. */
+export function readAppliedDelivery(snapshot: Snapshot): AppliedDeliveryProjection | undefined {
+  const value = projected(snapshot, 'appliedDelivery')
+  return record(value) && typeof value.resultCommit === 'string' && (value.appliedAt === undefined || finite(value.appliedAt))
+    ? { resultCommit: value.resultCommit, ...(value.appliedAt === undefined ? {} : { appliedAt: value.appliedAt as number }) } : undefined
+}
 
 /** Treat historical payloads as untrusted, including malformed or incompatible versions. */
 export function readSnapshot(value: unknown): Snapshot | undefined {
@@ -68,7 +97,15 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     || !finite(mission.updatedAt) || !finite(mission.createdAt) || !finite(mission.deadline)
     || !finite(mission.usedSteps) || !finite(mission.usedTokens)
     || !record(mission.budget) || !strings(mission.scope) || !strings(mission.acceptance)) return undefined
-  if (!['maxTokens', 'maxSteps', 'maxWorkers', 'maxTasks', 'maxExperiments'].every(key => finite((mission.budget as Record<string, unknown>)[key]))) return undefined
+  if (!['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].every(key => finite((mission.budget as Record<string, unknown>)[key]))) return undefined
+  if (candidate.deliveryTarget !== undefined && !(record(candidate.deliveryTarget)
+    && typeof candidate.deliveryTarget.taskId === 'string' && typeof candidate.deliveryTarget.commit === 'string')) return undefined
+  if (candidate.completion !== undefined && !(record(candidate.completion)
+    && typeof candidate.completion.eligible === 'boolean'
+    && (candidate.completion.reason === undefined || typeof candidate.completion.reason === 'string'))) return undefined
+  if (candidate.appliedDelivery !== undefined && !(record(candidate.appliedDelivery)
+    && typeof candidate.appliedDelivery.resultCommit === 'string'
+    && (candidate.appliedDelivery.appliedAt === undefined || finite(candidate.appliedDelivery.appliedAt)))) return undefined
   if (!['members', 'tasks', 'workstreams', 'evidence', 'events'].every(key => Array.isArray(candidate[key]))) return undefined
   if (!(candidate.tasks as unknown[]).every(task => record(task) && typeof task.id === 'string'
     && typeof task.title === 'string' && typeof task.status === 'string' && typeof task.kind === 'string'
@@ -107,14 +144,53 @@ export function snapshotFromResult(meta: unknown, content: unknown): Snapshot | 
   return undefined
 }
 
-/** The deliverable: the accepted integration, or the single accepted implementation when the plan needed no assembly step. */
+/**
+ * The deliverable the runtime will apply. The runtime projects its unique maximal
+ * accepted integration as `deliveryTarget`; only a legacy snapshot without that
+ * projection falls back to the historical local rule (first accepted integration,
+ * or the single accepted implementation when the plan needed no assembly step).
+ */
 export function deliverableTask(snapshot: Snapshot): Task | undefined {
+  const target = readDeliveryTarget(snapshot)
+  if (target) return snapshot.tasks.find(task => task.id === target.taskId)
   const accepted = snapshot.tasks.filter(task => task.status === 'accepted' && task.artifact)
   const integration = accepted.find(task => task.kind === 'integration')
   if (integration) return integration
   if (snapshot.tasks.some(task => task.kind === 'integration')) return undefined
   const implementations = accepted.filter(task => task.kind === 'implementation')
   return implementations.length === 1 ? implementations[0] : undefined
+}
+
+/** The projected runtime target commit is authoritative; the local rule is a legacy fallback only. */
+export function deliverableCommit(snapshot: Snapshot): string | undefined {
+  return readDeliveryTarget(snapshot)?.commit ?? deliverableTask(snapshot)?.artifact?.commit
+}
+
+/**
+ * A result is applied when the durable receipt projected by the runtime matches the
+ * delivered commit. A projected receipt is authoritative. A runtime snapshot always
+ * projects `completion`, so once that field is present an absent `appliedDelivery`
+ * means "not currently applied" (the runtime clears it on a conflicts result) and the
+ * bounded event window must not override it. The event window is only a fallback for
+ * legacy snapshots that predate both projections.
+ */
+export function deliveryApplied(snapshot: Snapshot, resultCommit: string | undefined): boolean {
+  if (!resultCommit) return false
+  if (projected(snapshot, 'appliedDelivery') !== undefined) return readAppliedDelivery(snapshot)?.resultCommit === resultCommit
+  if (projected(snapshot, 'completion') !== undefined) return false
+  return snapshot.events.some(event => event.type === 'delivery/applied' && record(event.data) && event.data.resultCommit === resultCommit)
+}
+
+/**
+ * Why the runtime would refuse `complete`. The runtime's projected eligibility is
+ * authoritative; a legacy snapshot without it keeps the historical terminal-work rule.
+ */
+export function completionBlocker(snapshot: Snapshot): string | undefined {
+  const completion = readCompletion(snapshot)
+  if (completion) return completion.eligible ? undefined : completion.reason || 'Mission is not eligible to complete'
+  if (!snapshot.tasks.length) return 'Mission still has unfinished or blocked required work'
+  const unfinished = snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))
+  return unfinished ? 'Mission still has unfinished or blocked required work' : undefined
 }
 
 export function evidenceCounts(evidence: readonly Evidence[]): { verified: number; challenged: number; total: number } {

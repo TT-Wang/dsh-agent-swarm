@@ -373,3 +373,101 @@ test('reviewer reads the submitted exact commit while its edits cannot change th
   assert.equal(await readFile(path.join(member.workspace, 'src', 'answer.txt'), 'utf8'), 'proposed change\n')
   assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer.txt`), 'proposed change')
 })
+
+test('scope enforcement rejects a rename that moves a path out of scope and keeps in-scope renames', async t => {
+  const { workspaces, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  // H1: `git mv outside.txt src/moved.txt` reports only the destination under
+  // rename detection, hiding the out-of-scope deletion.
+  await git(member.workspace, 'mv', 'outside.txt', 'src/moved.txt')
+  await assert.rejects(workspaces.captureArtifact(member, task), /outside task scope: outside.txt/)
+  await git(member.workspace, 'reset', '--hard')
+  await git(member.workspace, 'mv', 'src/answer.txt', 'src/renamed.txt')
+  const artifact = await workspaces.captureArtifact(member, task)
+  assert.deepEqual([...artifact.changedPaths].sort(), ['src/answer.txt', 'src/renamed.txt'])
+  assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/renamed.txt`), 'base')
+  assert.equal(await git(member.workspace, 'show', `${artifact.commit}:outside.txt`), 'original')
+})
+
+test('a clean uninitialized submodule snapshots while a staged gitlink move stays dirty', async t => {
+  const { source, workspaces, temp } = await fixture(t)
+  const nested = path.join(temp, 'nested-source')
+  await mkdir(nested)
+  await git(nested, 'init', '-b', 'main')
+  await writeFile(path.join(nested, 'nested.txt'), 'nested base\n')
+  await git(nested, 'add', '.')
+  await git(nested, 'commit', '-m', 'nested')
+  await git(source, '-c', 'protocol.file.allow=always', 'submodule', 'add', nested, 'nested')
+  await git(source, 'commit', '-am', 'add submodule')
+  const gitlink = await git(source, 'rev-parse', 'HEAD:nested')
+  await git(source, 'submodule', 'deinit', '-f', 'nested')
+  // H2: the deinitialized submodule has no `nested/.git`, and `git -C nested`
+  // then resolves the parent HEAD, so the gitlink must be compared instead.
+  const baseline = await workspaces.prepareBaseline({ id: 'mission-clean-submodule', workspace: source })
+  assert.equal(await git(source, 'ls-tree', baseline.snapshotCommit, 'nested'), `160000 commit ${gitlink}\tnested`)
+  assert.equal(await readFile(path.join(baseline.planningWorkspace, 'nested', 'nested.txt'), 'utf8').catch(() => 'absent'), 'absent')
+  // A staged gitlink move is genuine dirty state and must stay rejected.
+  await git(source, 'update-index', '--cacheinfo', `160000,${await git(source, 'rev-parse', 'HEAD')},nested`)
+  await assert.rejects(workspaces.prepareBaseline({ id: 'mission-moved-submodule', workspace: source }), /Dirty submodule/)
+})
+
+test('capture refuses symlinks that escape the member workspace and keeps contained links', async t => {
+  const { workspaces, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  await symlink('/etc/hosts', path.join(member.workspace, 'src', 'absolute-escape'))
+  await assert.rejects(workspaces.captureArtifact(member, task), /symlink escapes the mission workspace: src\/absolute-escape/)
+  await rm(path.join(member.workspace, 'src', 'absolute-escape'))
+  await symlink('../../outside-link', path.join(member.workspace, 'src', 'relative-escape'))
+  await assert.rejects(workspaces.captureArtifact(member, task), /symlink escapes the mission workspace: src\/relative-escape/)
+  await rm(path.join(member.workspace, 'src', 'relative-escape'))
+  await symlink('answer.txt', path.join(member.workspace, 'src', 'answer-link'))
+  const artifact = await workspaces.captureArtifact(member, task)
+  assert.ok(artifact.changedPaths.includes('src/answer-link'), JSON.stringify(artifact.changedPaths))
+  assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer-link`), 'answer.txt')
+})
+
+test('verification cleanup failure never masks the check result and is recorded', async t => {
+  const { workspaces, member, task, temp } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
+  const artifact = await workspaces.captureArtifact(member, task)
+  // M4: an unreadable directory makes `git worktree remove --force` fail.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['mkdir locked && touch locked/keep && chmod 500 locked && echo checked'] }, artifact)
+  assert.equal(results.length, 1)
+  assert.equal(results[0].exitCode, 0, JSON.stringify(results))
+  assert.match(results[0].output, /checked/)
+  assert.ok(workspaces.cleanupFailures().some(issue => /cleanup failed/.test(issue)), 'the cleanup failure is recorded separately')
+  assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
+})
+
+test('copied dependency directories isolate check writes from the source toolchain', async t => {
+  const { source, workspaces, member, task } = await fixture(t, { verificationDependencyMode: 'copy' })
+  await writeFile(path.join(source, '.gitignore'), 'node_modules/\n')
+  await git(source, 'add', '.gitignore')
+  await git(source, 'commit', '-m', 'ignore installed dependencies')
+  await mkdir(path.join(source, 'node_modules', 'dep'), { recursive: true })
+  await writeFile(path.join(source, 'node_modules', 'dep', 'value.txt'), 'from source\n')
+  await workspaces.prepareTask(member, task, [])
+  await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
+  const artifact = await workspaces.captureArtifact(member, task)
+  // M6: `copy` gives the check a private tree, so writes never reach the source.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['cat node_modules/dep/value.txt && echo changed > node_modules/dep/value.txt && (test -L node_modules && echo linked || echo private)'] }, artifact)
+  assert.equal(results[0].exitCode, 0, JSON.stringify(results))
+  assert.match(results[0].output, /from source/)
+  assert.match(results[0].output, /private/)
+  assert.equal(await readFile(path.join(source, 'node_modules', 'dep', 'value.txt'), 'utf8'), 'from source\n', 'the source toolchain is untouched')
+})
+
+test('capture path inventory tolerates far more than the small check-output limit', async t => {
+  const { workspaces, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  // V1: the default check-output cap is 32 KiB; this inventory is larger.
+  const names = Array.from({ length: 1500 }, (_, index) => `src/bulk-${String(index).padStart(4, '0')}-${'x'.repeat(24)}.txt`)
+  for (let index = 0; index < names.length; index += 200) {
+    await Promise.all(names.slice(index, index + 200).map(name => writeFile(path.join(member.workspace, name), 'bulk\n')))
+  }
+  assert.ok(Buffer.byteLength(names.join('\0')) > 32000)
+  const artifact = await workspaces.captureArtifact(member, task)
+  assert.equal(artifact.changedPaths.length, names.length)
+  assert.equal(await readFile(path.join(member.workspace, names[0]), 'utf8'), 'bulk\n')
+})

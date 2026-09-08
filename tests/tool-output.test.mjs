@@ -35,8 +35,25 @@ test('all model plan entry points require their chosen budget; automatic schema 
   for (const name of ['swarm_launch', 'swarm_create', 'swarm_stage']) assert(definitions.get(name).parameters.required.includes('budget'))
   const properties = definitions.get('swarm_launch').parameters.properties
   assert(properties.members.items.required.includes('maxOutputTokens'))
-  for (const key of ['key', 'assigneeKey', 'maxRecoveryAttempts', 'checkTimeoutMs']) assert(properties.tasks.items.required.includes(key))
+  for (const key of ['key', 'assigneeKey', 'maxRecoveryAttempts']) assert(properties.tasks.items.required.includes(key))
+  // M9(a): runtime admission requires checkTimeoutMs only for non-verification
+  // tasks that declare checks, so the schema must not demand it on every task.
+  assert(!properties.tasks.items.required.includes('checkTimeoutMs'), 'checkTimeoutMs is conditional, never universally required')
+  assert.equal(properties.tasks.items.properties.checkTimeoutMs.type, 'integer', 'the conditional property stays declared')
+  assert.match(properties.tasks.items.properties.checkTimeoutMs.description, /checks/)
   assert.equal(properties.budget.properties.maxTokens.default, undefined)
+})
+
+test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {
+  const definitions = tools()
+  // M9(b): optionalInteger rejects negatives, so every cursor declares minimum 0.
+  const observe = definitions.get('swarm_observe').parameters.properties
+  for (const key of ['after', 'afterRun', 'offset']) assert.equal(observe[key].minimum, 0, `${key} must declare the nonnegative runtime contract`)
+  // M9(c): the runtime stores subscriptions verbatim; a bare string would turn
+  // topic matching into substring semantics, so the schema is a string array.
+  const member = definitions.get('swarm_add_member').parameters.properties
+  assert.equal(member.subscriptions.type, 'array')
+  assert.equal(member.subscriptions.items.type, 'string')
 })
 
 test('launch rejects indexed shell syntax errors before admission and syntax checks never execute commands', async t => {

@@ -7,7 +7,7 @@ import { SwarmMonitor } from './monitor.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { DraftEditor } from './DraftEditor.tsx'
 import { useCopy } from './locale.tsx'
-import { deliverableTask } from './projection.ts'
+import { completionBlocker, deliverableCommit } from './projection.ts'
 import { selectedOperation } from './selection.ts'
 import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
@@ -16,6 +16,19 @@ import type { ConnectionState } from './progress.ts'
 
 export const OPEN_MONITOR = 'agent-swarm:open-monitor'
 const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting', paused: 'Updates paused' }
+/**
+ * Completion is offered only when the runtime would accept it. The runtime
+ * projects `completion {eligible, reason}`; a legacy snapshot without it keeps
+ * the historical terminal-work gate.
+ */
+export function CompletionControls({ snapshot, disabled, onComplete }: { snapshot: Snapshot; disabled: boolean; onComplete: () => void }) {
+  const t = useCopy()
+  const reason = completionBlocker(snapshot)
+  return <>
+    <button data-action="complete" disabled={disabled || reason !== undefined} onClick={onComplete}>{t('Complete')}</button>
+    {reason !== undefined && <span className="sw-small" data-swarm-completion="blocked">{t('Cannot complete')}: {reason}</span>}
+  </>
+}
 export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
   sessions: Context['sessions']; modelDirectories: Context['modelDirectories']; monitor: SwarmMonitor;
   history: WorkerHistory; onOpenWorker: (member: Member) => void;
@@ -88,7 +101,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     {busy && <span role="status">{t('Working')}…</span>}
   </div>
   const advancedControls = snapshot && data?.writable && !['completed', 'stopped', 'staged'].includes(status!) && <div className="sw-mission-controls">
-    {!starts.some(item => item.missionId === snapshot.mission.id) && <button data-action="complete" disabled={disabled || !snapshot.tasks.length || snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))} onClick={() => { void control('complete') }}>{t('Complete')}</button>}
+    {!starts.some(item => item.missionId === snapshot.mission.id) && <CompletionControls snapshot={snapshot} disabled={disabled} onComplete={() => { void control('complete') }} />}
     <button data-action="stop" disabled={disabled} onClick={() => stopArmed ? void control('stop') : setStopArmed(true)}>{t(stopArmed ? 'Confirm stop' : 'Stop')}</button>
     {stopArmed && <span className="sw-small">{t('Stop ends this mission and its workers.')} <button onClick={() => setStopArmed(false)}>{t('Cancel')}</button></span>}
   </div>
@@ -131,7 +144,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
       </details>}
       {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={controls}
         technicalDetails={<>{snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}{advancedControls}</>}
-        delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && deliverableTask(snapshot) ?
+        delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && deliverableCommit(snapshot) !== undefined ?
           <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} disabled={connection !== 'connected'} /> : undefined}
         onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} />}
       </>}

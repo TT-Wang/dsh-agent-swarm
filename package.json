@@ -63,6 +63,7 @@
   "scripts": {
     "link:dsh": "node scripts/link-dsh.mjs",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
+    "prepack": "npm run build >&2",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run test:harness && npm run test:pack && npm run test:profile && npm run test:web && npm run test:command-web",

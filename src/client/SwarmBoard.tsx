@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
 import { LANES, compactNumber, dependencyMet, evidenceCounts, eventSummary, remainingPercent, shortId, taskLane } from './projection.ts'
+import { leaseExpired, useNow } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
 import { MissionProgress, RecentProgress, ResultSummary } from './MissionProgress.tsx'
@@ -36,28 +37,28 @@ function UsageBreakdown({ worker, owner, steps }: { worker?: UsageBuckets; owner
     <p className="sw-small">{t('Worker requests are physical model calls; steps count logical worker turns')} · {steps} {t('steps')}. {t('Owner usage is attributed by time window and is not charged to the worker budget.')}</p>
   </details>
 }
-function TaskCard({ task, snapshot }: { task: Task; snapshot: Snapshot }) {
+function TaskCard({ task, snapshot, live, now }: { task: Task; snapshot: Snapshot; live: boolean; now: number }) {
   const t = useCopy()
   const member = snapshot.members.find(item => item.id === (task.attempt?.ownerId ?? task.assigneeId))
   const dependencies = task.dependencies.map(id => snapshot.tasks.find(item => item.id === id))
   const blocked = task.dependencies.filter(id => !dependencyMet(id, snapshot.tasks))
   const reviewSource = task.reviewOf ? snapshot.tasks.find(item => item.id === task.reviewOf) : undefined
+  const expired = task.attempt !== undefined && leaseExpired(task.attempt.leaseUntil, live ? now : snapshot.mission.updatedAt)
   return <article className="sw-task" data-lane={taskLane(task, snapshot.tasks)}>
     <div className="sw-row"><span className="sw-eyebrow">{task.kind}</span><span className="sw-code sw-muted">{shortId(task.id)}</span></div>
     <div className="sw-task-title">{task.title}</div>
-    <div className="sw-task-meta"><span>{member?.name ?? 'Unassigned'}{task.experiment ? ' · experiment' : ''}</span>
-      {task.attempt && <span title={`Attempt ${task.attempt.id}`}>Attempt {task.attempt.epoch} · lease {time(task.attempt.leaseUntil)}
-        {task.attempt.leaseUntil < snapshot.mission.updatedAt ? ' (expired)' : ''}</span>}
-      {blocked.length > 0 && <span>Waiting on {blocked.length} prerequisite{blocked.length === 1 ? '' : 's'}</span>}
+    <div className="sw-task-meta"><span>{member?.name ?? t('Unassigned')}{task.experiment ? ` · ${t('experiment')}` : ''}</span>
+      {task.attempt && <span title={`${t('Attempt')} ${task.attempt.id}`}>{t('Attempt')} {task.attempt.epoch} · {t('lease')} {time(task.attempt.leaseUntil)}{expired ? ` ${t('(expired)')}` : ''}</span>}
+      {blocked.length > 0 && <span>{t('Waiting on')} {blocked.length} {t(blocked.length === 1 ? 'prerequisite' : 'prerequisites')}</span>}
       {task.status === 'pending' && task.reviewOf && reviewSource?.status !== 'submitted' && <span>{t(reviewSource ? 'Waiting for source submission' : 'Review source is missing')}</span>}
-      {task.evidenceIds.length > 0 && <span>{task.evidenceIds.length} evidence record{task.evidenceIds.length === 1 ? '' : 's'}</span>}
-      {task.artifact && <span className="sw-code" title={task.artifact.commit}>Artifact {shortId(task.artifact.commit)}</span>}
+      {task.evidenceIds.length > 0 && <span>{task.evidenceIds.length} {t(task.evidenceIds.length === 1 ? 'evidence record' : 'evidence records')}</span>}
+      {task.artifact && <span className="sw-code" title={task.artifact.commit}>{t('Artifact')} {shortId(task.artifact.commit)}</span>}
     </div>
     {(task.dependencies.length > 0 || task.output || task.scope?.length > 0) && <details><summary>{t('Task details')}</summary>
       {task.objective && <p className="sw-small">{task.objective}</p>}
-      {task.dependencies.length > 0 && <p className="sw-refs">Prerequisites: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}
-      {task.scope?.length > 0 && <p className="sw-refs">Scope: {task.scope.join(', ')}</p>}
-      {task.reviewOf && <p className="sw-refs">Reviews {shortId(task.reviewOf)}{task.reviewedCommit ? ` at ${shortId(task.reviewedCommit)}` : ''}</p>}
+      {task.dependencies.length > 0 && <p className="sw-refs">{t('Prerequisites')}: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}
+      {task.scope?.length > 0 && <p className="sw-refs">{t('Scope')}: {task.scope.join(', ')}</p>}
+      {task.reviewOf && <p className="sw-refs">{t('Reviews')} {shortId(task.reviewOf)}{task.reviewedCommit ? ` ${t('at')} ${shortId(task.reviewedCommit)}` : ''}</p>}
       {task.output && <p className="sw-small" style={{ marginTop: 8 }}>{task.output}</p>}
     </details>}
   </article>
@@ -82,20 +83,20 @@ function EvidenceCard({ evidence, snapshot }: { evidence: Evidence; snapshot: Sn
   const task = snapshot.tasks.find(item => item.id === evidence.taskId)
   return <article className="sw-evidence"><div className="sw-row"><span className="sw-code sw-muted">{shortId(evidence.id)} · {evidence.outcome}</span>
     <Badge value={evidence.status} /></div><p className="sw-claim">{evidence.claim}</p>
-    <div className="sw-provenance"><span>By {author}</span><span>·</span><span>{task?.title ?? shortId(evidence.taskId)}</span>
-      <span>·</span><span>{evidence.toolRunIds.length} host tool record{evidence.toolRunIds.length === 1 ? '' : 's'}</span>
-      {evidence.artifact && <><span>·</span><span className="sw-code" title={evidence.artifact.commit}>commit {shortId(evidence.artifact.commit)}</span></>}
+    <div className="sw-provenance"><span>{t('By')} {author}</span><span>·</span><span>{task?.title ?? shortId(evidence.taskId)}</span>
+      <span>·</span><span>{evidence.toolRunIds.length} {t(evidence.toolRunIds.length === 1 ? 'host tool record' : 'host tool records')}</span>
+      {evidence.artifact && <><span>·</span><span className="sw-code" title={evidence.artifact.commit}>{t('commit')} {shortId(evidence.artifact.commit)}</span></>}
     </div>
     <details><summary>{t('Evidence provenance')}</summary>
-      <p className="sw-refs">Host tool run IDs: {evidence.toolRunIds.length > 0 ? evidence.toolRunIds.join(', ') : 'None recorded'}</p>
-      {evidence.artifact && <><p className="sw-refs">Artifact commit: {evidence.artifact.commit}</p>
-        <p className="sw-refs">Base: {evidence.artifact.baseCommit}</p>
-        <p className="sw-refs">Changed paths: {evidence.artifact.changedPaths.join(', ') || 'No changes'}</p></>}
-      {evidence.supersedes?.length > 0 && <p className="sw-refs">Supersedes: {evidence.supersedes.join(', ')}</p>}
+      <p className="sw-refs">{t('Host tool run IDs')}: {evidence.toolRunIds.length > 0 ? evidence.toolRunIds.join(', ') : t('None recorded')}</p>
+      {evidence.artifact && <><p className="sw-refs">{t('Artifact commit')}: {evidence.artifact.commit}</p>
+        <p className="sw-refs">{t('Base')}: {evidence.artifact.baseCommit}</p>
+        <p className="sw-refs">{t('Changed paths')}: {evidence.artifact.changedPaths.join(', ') || t('No changes')}</p></>}
+      {evidence.supersedes?.length > 0 && <p className="sw-refs">{t('Supersedes')}: {evidence.supersedes.join(', ')}</p>}
     </details>
     {evidence.challenges.map((challenge, index) => <div className="sw-challenge" key={index}>
-      <strong>Challenge · {snapshot.members.find(item => item.id === challenge.authorId)?.name ?? shortId(challenge.authorId)}</strong>
-      <p>{challenge.reason}</p><p className="sw-refs">Tool records: {challenge.toolRunIds.join(', ') || 'None'}</p>
+      <strong>{t('Challenge')} · {snapshot.members.find(item => item.id === challenge.authorId)?.name ?? shortId(challenge.authorId)}</strong>
+      <p>{challenge.reason}</p><p className="sw-refs">{t('Tool records')}: {challenge.toolRunIds.join(', ') || t('None')}</p>
     </div>)}
   </article>
 }
@@ -109,6 +110,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
   const [view, setView] = useState<View>(initialView ?? 'board')
   const [detailsOpen, setDetailsOpen] = useState(initialView !== undefined)
   const [stream, setStream] = useState('all')
+  const now = useNow(live)
   const { mission } = snapshot
   const tasks = snapshot.tasks.filter(task => stream === 'all' || task.workstreamId === stream)
   const evidence = snapshot.evidence.filter(item => stream === 'all' || item.workstreamId === stream)
@@ -160,7 +162,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
       {view === 'board' && <><div className="sw-board">{LANES.map(lane => {
         const items = tasks.filter(task => taskLane(task, snapshot.tasks) === lane.id)
         return <section className="sw-lane" key={lane.id} aria-label={t(lane.label)}><div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
-          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} />)}
+          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live} now={now} />)}
         </section>
       })}</div>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">

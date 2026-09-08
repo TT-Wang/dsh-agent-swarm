@@ -4,9 +4,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { SwarmStore } from '../lib/store.js'
 import { waitForStateChange } from '../lib/watch.js'
 import { SwarmMonitor, mergeUpdate } from '../lib/types/client/monitor.js'
+import { deliverableTask, deliverableCommit, deliveryApplied } from '../lib/types/client/projection.js'
+import { DeliveryPanel } from '../lib/types/client/DeliveryPanel.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 
 async function fixture(t) {
@@ -145,4 +149,30 @@ test('heartbeat refreshes native lifecycle and configuration metadata without al
   assert.equal(updated.defaultBudget, nextBudget)
   assert.equal(updated.snapshots, initial.snapshots)
   assert.equal(updated.revision, initial.revision)
+})
+
+test('delivery consumes the runtime target instead of the first accepted integration', () => {
+  const base = uiSnapshot()
+  const artifact = commit => ({ commit, baseCommit: 'f'.repeat(40), workspace: '/workspace/demo', changedPaths: ['src/change.ts'] })
+  const tasks = [
+    { ...base.tasks[0], id: 'impl-1', kind: 'implementation', status: 'accepted', artifact: artifact('1'.repeat(40)), dependencies: [] },
+    { ...base.tasks[0], id: 'integ-1', kind: 'integration', status: 'accepted', artifact: artifact('2'.repeat(40)), dependencies: ['impl-1'] },
+    { ...base.tasks[0], id: 'integ-2', kind: 'integration', status: 'accepted', artifact: artifact('3'.repeat(40)), dependencies: ['integ-1'] },
+  ]
+  const snapshot = { ...base, tasks, deliveryTarget: { taskId: 'integ-2', commit: '3'.repeat(40) } }
+  assert.equal(deliverableTask(snapshot).id, 'integ-2', 'the runtime maximal integration is the deliverable')
+  assert.equal(deliverableCommit(snapshot), '3'.repeat(40))
+  const legacy = { ...snapshot }
+  delete legacy.deliveryTarget
+  assert.equal(deliverableTask(legacy).id, 'integ-1', 'a legacy snapshot keeps the historical local rule')
+  assert.equal(deliverableCommit(legacy), '2'.repeat(40))
+  assert.equal(deliveryApplied(snapshot, deliverableCommit(snapshot)), false, 'no receipt means the result is not applied')
+  const applied = { ...snapshot, appliedDelivery: { resultCommit: '3'.repeat(40), appliedAt: base.mission.updatedAt } }
+  assert.equal(deliveryApplied(applied, deliverableCommit(applied)), true)
+  assert.equal(deliveryApplied(applied, '2'.repeat(40)), false, 'a receipt only marks its own result commit applied')
+  const panel = props => renderToStaticMarkup(React.createElement(DeliveryPanel, { snapshot: props, sessionId: 'owner', request: async () => ({}), onApplied() {} }))
+  assert.match(panel(applied), /data-action="apply-delivery"[^>]*disabled=""/)
+  assert.match(panel(applied), />Applied</)
+  assert.match(panel(applied), /Result applied to working files/)
+  assert.match(panel(snapshot), /data-action="apply-delivery"[^>]*>Apply result</, 'the button is offered while no applied receipt exists')
 })
