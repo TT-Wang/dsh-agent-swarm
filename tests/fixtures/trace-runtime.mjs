@@ -27,11 +27,18 @@ export class TraceWorkers {
   async dispose() {}
 }
 
-export async function traceFixture(t) {
+/**
+ * `options.checks` overrides the declared-check results the host verification
+ * returns (default: one passing `test`), and `options.verdict`/`options.reason`
+ * override the requested tool verdict (default: accept). Callers that pass no
+ * options get the original passing-accept flow unchanged.
+ */
+export async function traceFixture(t, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'swarm-trace-'))
   const workspace = await realpath(await mkdtemp(join(root, 'ws-')))
   const statePath = join(root, 'db.sqlite')
   const workers = new TraceWorkers()
+  if (options.checks !== undefined) workers.checks = options.checks
   const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
   t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const definitions = new Map()
@@ -57,7 +64,7 @@ export async function traceFixture(t) {
   const reviewClaim = await call('swarm_claim', { missionId, taskId: review.id }, reviewer.sessionId)
   const review2 = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Second review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, assigneeId: reviewer2.id }, owner)
   const review2Claim = await call('swarm_claim', { missionId, taskId: review2.id }, reviewer2.sessionId)
-  const verdict = await call('swarm_verify', { missionId, taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: 'accept', reason: 'Independent accept' }, reviewer.sessionId)
+  const verdict = await call('swarm_verify', { missionId, taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: options.verdict ?? 'accept', reason: options.reason ?? 'Independent accept' }, reviewer.sessionId)
   const events = () => runtime.store.events(missionId, 1000, 0)
   return {
     root, workspace, statePath, runtime, workers, definitions, raw, call, exec, owner, missionId, stream, builder, reviewer, reviewer2,

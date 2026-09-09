@@ -1,28 +1,61 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
 import { randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
-import { SwarmStore, WriterBusyError, type StoreOptions } from './store.ts'
+import { SwarmStore, WriterBusyError, type PostFilter, type StoreOptions } from './store.ts'
 import { AdmissionRefusedError, admissionRowId, decideAdmission, defaultLimitRules, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type AdmissionUsage, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope } from './scope.ts'
-import { assertScopeSelectors, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
+import { assertScopeSelectors, formatDiagnostic, liveReviewFor, missingReviewDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, Artifact, AutoStart, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, EvidenceStatus, Member, Mission, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CreateMissionInput, Delivery, DraftPlan, Evidence, EvidenceStatus, Member, Mission, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, PublishInput, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
+/** Closed board kind vocabulary; a free-form kind is a validation error. */
+const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
+/** A board page shows a bounded body excerpt; the full body is read by postId. */
+const BOARD_BODY_EXCERPT = 600
+/** Board delta reads are bounded to this page size unless the caller asks for less. */
+const BOARD_PAGE_MAX = 100
+const BOARD_PAGE_DEFAULT = 20
+/** Observe shows only the newest few new posts; the board tool pages the rest. */
+const BOARD_DELTA_POSTS = 3
 /** Host verification timeout when a task chose none; matches the plugin config default. */
 const DEFAULT_CHECK_TIMEOUT_MS = 60000
+/** A rejection names at most this many failing checks; the rest are counted. */
+const MAX_REPORTED_CHECK_FAILURES = 4
 /** Extra lease headroom per allowed output token while a model stream is observably live. */
 const LEASE_MS_PER_OUTPUT_TOKEN = 20
 const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
 /** Idle close-out nudges before an open attempt is checkpointed and re-pended. */
 const DEFAULT_IDLE_CLOSEOUTS = 2
 /**
+ * Round-8 F1: scheduling passes an unreviewed submission must persist before
+ * the board is reported stalled. The owner may be admitting the review it just
+ * planned; a submission that stays unreviewable past this bounded grace is a
+ * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
+ */
+const STALL_GRACE_PASSES = 30
+const STALL_GRACE_MAX_MS = 1000
+/**
  * R5-02: consecutive `workers.start` failures for one member before its work is
  * re-routed to another capable live member. A transient start failure self-heals
  * on the next tick; only a route that keeps failing is retired.
  */
 const START_FAILURE_REROUTE_LIMIT = 3
+/**
+ * F2: recovery budget for a verification task the runtime admits automatically
+ * when a submitted code deliverable has no live review path. Two attempts cover
+ * a transient workspace/preparation failure without letting the automatic review
+ * consume an unbounded share of the mission budget.
+ */
+const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
+/**
+ * F2: how long a submitted code deliverable may stay without a live review
+ * before the runtime concludes none is coming. One scheduler period gives the
+ * author the turn in which it submitted to propose its own review; the floor
+ * keeps a fast tick from turning a same-turn proposal into a race.
+ */
+const AUTO_REVIEW_GRACE_MS = 1000
 /** A worker-side git write that the sandbox refused; the action names the supported exit. */
 const gitWriteDeniedMessage = (command: string): string => `Worker git writes are denied by the workspace sandbox: ${command} could not write git metadata (index.lock EPERM). Workers cannot commit; do not retry git add/commit. Publish the workspace with swarm_submit, which captures it host-side, or release the attempt with swarm_handoff/swarm_wait.`
 /**
@@ -320,9 +353,35 @@ function excerpt(value: unknown, limit: number): string {
   const raw = typeof value === 'string' ? value : JSON.stringify(value) ?? ''
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
+/**
+ * Bounded board projection. `full` is used only by the single-post read; every
+ * page carries an excerpt and says how many characters were withheld, so a
+ * board page can never flood a model context. TTL expiry is reported, never
+ * enforced by mutating the post.
+ */
+function postView(post: Post, full = false): Record<string, unknown> {
+  return {
+    id: post.id, seq: post.seq, kind: post.kind, fromMemberId: post.fromMemberId,
+    ...(post.toMemberId === undefined ? {} : { toMemberId: post.toMemberId }),
+    ...(post.taskId === undefined ? {} : { taskId: post.taskId }),
+    ...(post.attemptId === undefined ? {} : { attemptId: post.attemptId }),
+    body: full ? post.body : excerpt(post.body, BOARD_BODY_EXCERPT),
+    ...(full || post.body.length <= BOARD_BODY_EXCERPT ? {} : { bodyChars: post.body.length, bodyTruncated: true }),
+    ...(post.evidenceIds.length ? { evidenceIds: post.evidenceIds } : {}),
+    ...(post.toolRunIds.length ? { toolRunIds: post.toolRunIds } : {}),
+    ...(post.replyTo === undefined ? {} : { replyTo: post.replyTo }),
+    createdAt: post.createdAt,
+    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: Date.now() >= post.createdAt + post.ttlMs }),
+  }
+}
 function requireText(value: string, name: string): void { if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`) }
 function requireStrings(value: string[], name: string): void {
   if (!Array.isArray(value) || value.length === 0 || !value.every(x => typeof x === 'string' && x.trim())) throw new Error(`${name} must contain nonempty strings`)
+}
+/** Exact ordered comparison of declared check lists (Round 9-C check integrity). */
+function sameChecks(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
+  const a = left ?? [], b = right ?? []
+  return a.length === b.length && a.every((value, index) => value === b[index])
 }
 function validatedBudget(input: Budget): Budget {
   const budget = {} as Budget
@@ -361,7 +420,7 @@ export class ObserveDetailRefusedError extends Error {
   }
 }
 /** The model-visible position already delivered to one member; the next default read starts after it. */
-interface DeliveredCursor { eventSeq: number; runSeq: number; current?: string }
+interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 export class SwarmRuntime {
   readonly store: SwarmStore
@@ -371,6 +430,12 @@ export class SwarmRuntime {
   private readonly operations = new Set<Promise<unknown>>()
   private readonly startControllers = new Map<string, AbortController>()
   private readonly budgetStops = new Set<string>()
+  /**
+   * Unreviewed submissions observed per mission, with the scheduling pass they
+   * were first seen. In-memory only: every tick recomputes the durable board,
+   * so a restart restarts the grace instead of trusting a stale timer.
+   */
+  private readonly unreviewedSince = new Map<string, { fingerprint: string; since: number; passes: number }>()
   /** Members that ended a turn while still owning an attempt; drives the bounded close-out. */
   private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
   /** Consecutive `workers.start` failures per member; a successful start clears the count (R5-02). */
@@ -386,6 +451,17 @@ export class SwarmRuntime {
   private shuttingDown = false
   /** A classified SQLITE_BUSY that must become a durable `writer_busy` admission row. */
   private writerBusy?: { at: number; attempts: number; candidate: AdmissionCandidate; detail: string }
+  /**
+   * F2: automatic review admissions per submitted source, and the exact
+   * owner-notice already sent for an unreviewable one. The map keeps the
+   * runtime from admitting a second automatic review after the owner withdrew
+   * the first; the set keeps a persistent blocker from waking the owner on
+   * every tick.
+   */
+  private readonly autoReviewAdmissions = new Map<string, string>()
+  private readonly reviewPathNotices = new Set<string>()
+  /** Missing-review records already written, keyed by mission:source:submission seq. */
+  private readonly reviewPathReported = new Set<string>()
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.store = new SwarmStore(config.statePath, storeOptions)
@@ -604,6 +680,45 @@ export class SwarmRuntime {
     return text
   }
   /**
+   * The durable rejection reason: the reviewer's own prose plus, per failing
+   * declared check, the command, the exit code and a bounded output excerpt.
+   * The Round-8 benchmark lost the real failure here — the reviewer wrote that
+   * every criterion passed while the host check had exited 127, and the only
+   * copy lived in a tool run. A rejection on judgement (no failing check) keeps
+   * the prose untouched. The combined text never exceeds `maxMessageChars`, and
+   * every reported command and exit code survives truncation because only
+   * output excerpts are cut.
+   */
+  private rejectionReason(reason: string, checks: ReadonlyArray<{ command: string; exitCode: number; output: string; truncated?: boolean }>): string {
+    const failures = checks.filter(check => check.exitCode !== 0)
+    if (failures.length === 0) return reason
+    const shown = failures.slice(0, MAX_REPORTED_CHECK_FAILURES)
+    const omitted = failures.length - shown.length
+    const heading = failures.length === 1 ? 'Host check failed' : `Host checks failed (${failures.length})`
+    const heads = shown.map((check, index) => `check ${index + 1} \`${check.command}\` exited ${check.exitCode}${check.truncated === true ? ' (host output truncated at the check-output bound)' : ''}: `)
+    const omission = omitted === 0 ? '' : `\n… ${omitted} more failing check(s) not shown`
+    const marker = ' …[output excerpt truncated]'
+    const fixed = 1 + heading.length + 2 + heads.reduce((total, head) => total + head.length + 1, 0) + marker.length + omission.length
+    let prose = reason
+    if (prose.length + fixed > this.config.maxMessageChars) {
+      // The check evidence is the part that must never be lost: excerpt the prose to fit.
+      const proseBudget = Math.max(0, this.config.maxMessageChars - fixed - 48)
+      prose = `${prose.slice(0, proseBudget)} …[reviewer reason truncated]`
+    }
+    let remaining = Math.max(0, this.config.maxMessageChars - prose.length - fixed)
+    const parts: string[] = []
+    for (const [index, check] of shown.entries()) {
+      const output = check.output.trimEnd()
+      const share = index === shown.length - 1 ? remaining : Math.max(0, Math.floor(remaining / (shown.length - index)))
+      const excerpt = output.length === 0 ? '(no output captured)'
+        : output.length <= share ? output : `${output.slice(0, Math.max(0, share - marker.length))}${marker}`
+      remaining = Math.max(0, remaining - excerpt.length)
+      parts.push(`${heads[index]}${excerpt}`)
+    }
+    const report = `${prose}\n${heading}:\n${parts.join('\n')}${omission}`
+    return report.length <= this.config.maxMessageChars ? report : `${report.slice(0, Math.max(0, this.config.maxMessageChars - marker.length))}${marker}`
+  }
+  /**
    * Owner notices wake the primary agent and replay its whole context, so only
    * decisions, blockers, failures, budget exhaustion and final delivery use
    * them. Routine progress is already a durable event shown by the UI.
@@ -724,6 +839,16 @@ export class SwarmRuntime {
       // F7: launchDraft retries with deterministic ids. A withdrawn record must
       // never be silently re-admitted, or a mission can activate with dead work.
       if (prior.status === 'cancelled') throw new Error(`Task ${prior.id} was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.`)
+      // Round 9-C: a re-submission that changes a check the task already
+      // declared is recorded durably. The stored record keeps its original
+      // check, so a retry can never silently swap it for a weaker or
+      // host-specific one. Filling in a check the task never declared is not a
+      // change and emits nothing.
+      if (Array.isArray(input.checks) && prior.checks.length > 0 && !sameChecks(input.checks, prior.checks)) {
+        this.commit(missionId, () => this.store.event(missionId, 'task/check-changed', key, {
+          taskId: prior.id, sourceTaskId: prior.id, reason: 'resubmission', previousChecks: [...prior.checks], checks: [...input.checks as string[]],
+        }))
+      }
       return prior
     }
     if (this.store.list('starts', missionId).length) {
@@ -770,9 +895,15 @@ export class SwarmRuntime {
       const author = source.attempt?.ownerId ?? source.assigneeId
       if (input.assigneeId !== undefined && author !== undefined && input.assigneeId === author) throw new Error(`assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a different member or left unassigned`)
     } else if (input.reviewOf) throw new Error('Only verification tasks may set reviewOf')
+    // Round 9-C: a repair may keep the original acceptance while changing the
+    // declared check. Acceptance is already required verbatim above; a check
+    // change is recorded durably so an owner can see that the new check no
+    // longer matches the original obligation. A repair that merely supplies
+    // checks the replaced task never declared is not a change.
+    const checkChanges: Array<{ replaces: string[]; sourceTaskId: string; previousChecks: string[]; checks: string[] }> = []
     for (const previousId of input.replaces ?? []) {
       const previous = this.task(missionId, previousId)
-      if (previous.kind === 'verification') throw new Error(`replaces ${previousId}: that is a verification task. Repair its reviewed source ${previous.reviewOf ?? ''} instead; a new review starts automatically when the repair is submitted`)
+      if (previous.kind === 'verification') throw new Error(`replaces ${previousId}: that is a verification task. Repair its reviewed source ${previous.reviewOf ?? ''} instead; when that repair is submitted the runtime detects the missing review and admits an independent verification task automatically once the mission has task budget and a live member who did not author the repair`)
       // Resolve existing live replacements before the status check. The guard
       // must be reachable for exactly the blocked case it was written for: two
       // admitted replacements would make lineage ambiguous and stall every
@@ -792,6 +923,10 @@ export class SwarmRuntime {
       const missing = previous.acceptance.filter(item => !input.acceptance.includes(item))
       if (missing.length) throw new Error(`replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
       if (dependencies.includes(previousId)) throw new Error(`replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
+      const nextChecks = Array.isArray(input.checks) ? input.checks as string[] : []
+      if (previous.checks.length > 0 && !sameChecks(nextChecks, previous.checks)) {
+        checkChanges.push({ replaces: [previousId], sourceTaskId: previousId, previousChecks: [...previous.checks], checks: [...nextChecks] })
+      }
     }
     requireHostChecks(input.kind, input.checks, 'task', input.title)
     if (input.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(input.maxRecoveryAttempts) || input.maxRecoveryAttempts < 1)) throw new Error('maxRecoveryAttempts must be a positive safe integer')
@@ -804,7 +939,11 @@ export class SwarmRuntime {
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
     if (input.checkTimeoutMs !== undefined) task.checkTimeoutMs = input.checkTimeoutMs
-    this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/proposed', key, task) })
+    this.commit(missionId, () => {
+      this.store.put('tasks', task)
+      this.store.event(missionId, 'task/proposed', key, task)
+      for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
+    })
     this.kick(missionId)
     return task
   }
@@ -1045,11 +1184,17 @@ export class SwarmRuntime {
         throw new Error(`${stale}; observe the task and submit again after reassignment (${detail})`)
       }
       task.artifact = artifact; task.output = input.output; task.status = 'submitted'
+      // F2: decide the review path before committing, so the missing-review
+      // record lands atomically with the submission and can never be lost. The
+      // dedicated task/review-missing event follows on the scheduler tick once
+      // the grace period proves no review is being proposed for this artifact.
+      const missingReview = this.missingReviewPath(task)
       this.commit(missionId, () => {
         this.store.put('tasks', task)
         for (const evidenceId of task.evidenceIds) { const e = this.store.get('evidence', evidenceId)!; e.artifact = artifact; this.store.put('evidence', e) }
         // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
-        this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact })
+        this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact,
+          ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
       })
       this.kick(missionId)
       return task
@@ -1062,6 +1207,9 @@ export class SwarmRuntime {
       if (task.kind !== 'verification' || !task.reviewOf) throw new Error('This is not a verification task')
       const source = this.task(missionId, task.reviewOf)
       if (source.status !== 'submitted' || !source.artifact || source.attempt?.ownerId === member.id) throw new Error('Only independent verification of a submitted artifact is allowed')
+      // The reviewer's own reason is required and bounded; the check-failure
+      // report is appended to it, never substituted for it.
+      this.bounded(input.reason)
       const artifact = source.artifact
       if (source.checks.length) {
         const checkTimeoutMs = source.checkTimeoutMs ?? this.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
@@ -1079,6 +1227,10 @@ export class SwarmRuntime {
       const independentRuns = this.store.list('tool_runs', missionId).filter(run => run.memberId === member.id && run.taskId === task.id && run.attemptId === input.attemptId && !run.isError)
       if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
       const passed = input.verdict === 'accept' && checks.every(c => c.exitCode === 0)
+      const failingChecks = checks.filter(check => check.exitCode !== 0)
+      // F3-A: a rejection must carry the real failure, not only the reviewer's
+      // prose. A judgement rejection with no failing check keeps the prose.
+      const rejection = passed ? input.reason : this.rejectionReason(input.reason, checks)
       const runIds: string[] = []
       const released = new Set<string>()
       this.commit(missionId, () => {
@@ -1088,7 +1240,7 @@ export class SwarmRuntime {
           this.store.put('tool_runs', run); runIds.push(run.id)
         }
         source.status = passed ? 'accepted' : 'blocked'
-        task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(input.reason); task.reviewedCommit = artifact.commit
+        task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(rejection); task.reviewedCommit = artifact.commit
         this.store.put('tasks', source); this.store.put('tasks', task)
         // Every other review of this source is moot: pending ones can never
         // start, running ones would burn tokens until lease expiry, and parked
@@ -1110,26 +1262,43 @@ export class SwarmRuntime {
         }
         for (const evidenceId of source.evidenceIds) {
           const evidence = this.store.get('evidence', evidenceId)!
-          // Status follows the verdict and the claim's own outcome: an inconclusive
-          // claim is never promoted to verified knowledge.
-          const status: EvidenceStatus = !passed ? 'challenged' : evidence.outcome === 'inconclusive' ? 'unverified' : 'verified'
-          evidence.status = status
-          this.store.put('evidence', evidence)
           // F-12: the durable log must reconstruct which claim became verified or
           // refuted and which reviews the verdict retired; `task/accepted` alone
           // names neither the evidence nor the retired tasks.
           const retired = siblings.retired.map(retiredReview => retiredReview.id)
-          if (status === 'verified') this.store.event(missionId, 'evidence/verified', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, commit: artifact.commit, retired })
-          else if (!passed) this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: input.reason, retired })
-          if (status === 'verified') for (const previous of evidence.supersedes) {
+          if (!passed) {
+            // F3-B: a rejected verification refutes the claim exactly once and
+            // the stored status matches the `evidence/refuted` event. Leaving
+            // the record `challenged` made the board show an unresolved dispute
+            // while the durable log already said the claim was refuted.
+            if (evidence.status !== 'refuted') {
+              evidence.status = 'refuted'
+              this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
+            }
+            this.store.put('evidence', evidence)
+            continue
+          }
+          // Status follows the verdict and the claim's own outcome: an inconclusive
+          // claim is never promoted to verified knowledge.
+          const status: EvidenceStatus = evidence.outcome === 'inconclusive' ? 'unverified' : 'verified'
+          evidence.status = status
+          this.store.put('evidence', evidence)
+          if (status !== 'verified') continue
+          this.store.event(missionId, 'evidence/verified', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, commit: artifact.commit, retired })
+          for (const previous of evidence.supersedes) {
             const old = this.store.get('evidence', previous)!
+            const alreadyRefuted = old.status === 'refuted'
             old.status = 'refuted'; old.refutedBy = evidence.id; this.store.put('evidence', old)
-            this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId: old.id, refutedBy: evidence.id, taskId: old.taskId, verificationTaskId: task.id, reason: `Superseded by verified evidence ${evidence.id}`, retired })
+            // A predecessor already refuted by its own rejected verification
+            // keeps its single refutation; supersession only adds the lineage
+            // link. A claim is never refuted twice or both refuted and verified.
+            if (!alreadyRefuted) this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId: old.id, refutedBy: evidence.id, taskId: old.taskId, verificationTaskId: task.id, reason: `Superseded by verified evidence ${evidence.id}`, retired })
           }
         }
-        this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: input.reason, checks: runIds })
+        this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: rejection, checks: runIds,
+          ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, output: excerpt(check.output, 400) })) }) })
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
-        if (!passed) this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${input.reason}. Repair it with a replacement task or adjust the plan.`, member.id)
+        if (!passed) this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, member.id)
       })
       // Retired reviewers are released inside the verdict transaction; their
       // handles stop outside it so a slow adapter never holds mission state.
@@ -1160,6 +1329,109 @@ export class SwarmRuntime {
     })
     this.kick(missionId)
     return { queued: true }
+  }
+  /**
+   * Create one durable, typed board post. The sender key and the monotonic
+   * sequence come from the host, never from the model. Cited evidence and tool
+   * runs must already exist in this mission, a named recipient must be a member
+   * of this mission (or the owner), and a reply must name a post in this mission.
+   *
+   * Authority invariant: this method writes exactly one immutable record. It
+   * never accepts, blocks, claims, re-routes or budgets anything, and no runtime
+   * path reads a post body as an instruction. Posting therefore cannot change
+   * task state; the board is visibility, not control.
+   */
+  post(actor: Actor, missionId: string, input: PostInput): Post {
+    const { key } = this.active(actor, missionId)
+    if (!POST_KINDS.includes(input.kind)) throw new Error(`Post kind must be one of ${POST_KINDS.join(', ')}`)
+    const body = this.bounded(input.body)
+    if (input.to !== undefined) {
+      if (input.to === 'me') throw new Error('Recipient "me" is a board read filter, not a post target')
+      if (input.to !== 'owner') {
+        const target = this.store.get('members', input.to)
+        if (target !== undefined && target.missionId !== missionId) throw new Error('Recipient belongs to another mission')
+        if (target === undefined) throw new Error('Unknown recipient in this mission')
+      }
+    }
+    if (input.taskId !== undefined) this.task(missionId, input.taskId)
+    if (input.attemptId !== undefined && input.taskId === undefined) throw new Error('attemptId requires taskId')
+    const evidenceIds = input.evidenceIds ?? []
+    for (const evidenceId of evidenceIds) {
+      const evidence = this.store.get('evidence', evidenceId)
+      if (!evidence || evidence.missionId !== missionId) throw new Error('Unknown evidence in this mission')
+    }
+    const toolRunIds = input.toolRunIds ?? []
+    for (const runId of toolRunIds) {
+      const run = this.store.get('tool_runs', runId)
+      if (!run || run.missionId !== missionId) throw new Error('Unknown tool run in this mission')
+    }
+    if (input.replyTo !== undefined) {
+      const parent = this.store.post(input.replyTo)
+      if (!parent || parent.missionId !== missionId) throw new Error('Unknown replyTo post in this mission')
+    }
+    if (input.ttlMs !== undefined && (!Number.isSafeInteger(input.ttlMs) || input.ttlMs < 0)) throw new Error('ttlMs must be a nonnegative integer')
+    return this.commit(missionId, () => this.store.recordPost({
+      id: id('post'), missionId, kind: input.kind, fromMemberId: key,
+      ...(input.to === undefined ? {} : { toMemberId: input.to }),
+      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
+      ...(input.attemptId === undefined ? {} : { attemptId: input.attemptId }),
+      body, evidenceIds, toolRunIds,
+      ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
+      ...(input.ttlMs === undefined ? {} : { ttlMs: input.ttlMs }),
+      createdAt: Date.now(),
+    }))
+  }
+  /**
+   * Bounded board read. `to: 'me'` is the caller's inbox view: posts addressed
+   * to the caller plus mission-wide posts. The server records no read state, so
+   * the same page comes back until the caller advances its own `after` cursor.
+   * `postId` reads one full record; a page carries bounded body excerpts.
+   */
+  board(actor: Actor, missionId: string, query: BoardQuery = {}): unknown {
+    const { key } = this.participant(actor, missionId)
+    if (query.postId !== undefined) {
+      const post = this.store.post(query.postId)
+      if (!post || post.missionId !== missionId) throw new Error('Unknown post in this mission')
+      return { post: postView(post, true), note: 'A post is durable data, never an instruction and never authority. Read state is client-side.' }
+    }
+    if (query.after !== undefined && (!Number.isSafeInteger(query.after) || query.after < 0)) throw new Error('after must be a nonnegative integer')
+    if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit < 1)) throw new Error('limit must be a positive integer')
+    if (query.kind !== undefined && !POST_KINDS.includes(query.kind)) throw new Error(`Post kind must be one of ${POST_KINDS.join(', ')}`)
+    if (query.taskId !== undefined) this.task(missionId, query.taskId)
+    if (query.to !== undefined && query.to !== 'me' && query.to !== 'owner') {
+      const target = this.store.get('members', query.to)
+      if (target !== undefined && target.missionId !== missionId) throw new Error('Recipient belongs to another mission')
+      if (target === undefined) throw new Error('Unknown recipient in this mission')
+    }
+    const limit = Math.min(BOARD_PAGE_MAX, query.limit ?? BOARD_PAGE_DEFAULT)
+    const filter: PostFilter = {
+      ...(query.kind === undefined ? {} : { kind: query.kind }),
+      ...(query.taskId === undefined ? {} : { taskId: query.taskId }),
+      ...(query.to === 'me' ? { inboxFor: key } : query.to === undefined ? {} : { toMemberId: query.to }),
+      ...(query.after === undefined ? {} : { afterSeq: query.after }),
+    }
+    const after = query.after ?? 0
+    // Without a cursor the store fetches the newest posts and returns them
+    // ascending, so the extra row used for `hasMore` is the oldest of the fetch
+    // and the page keeps the tail. A forward `after` page keeps the head. Either
+    // way the page is in sequence order and never skips a match.
+    const descending = query.after === undefined
+    const rows = this.store.posts(missionId, { ...filter, limit: limit + 1 })
+    const hasMore = rows.length > limit
+    const page = descending ? rows.slice(-limit) : rows.slice(0, limit)
+    const nextAfter = page.at(-1)?.seq ?? after
+    const matching = this.store.countPosts(missionId, filter)
+    return {
+      posts: page.map(post => postView(post)),
+      page: { limit, after, nextAfter, hasMore, matching, ...(hasMore ? { remaining: matching - page.length } : {}) },
+      inbox: {
+        memberId: key,
+        addressed: this.store.countPosts(missionId, { inboxFor: key, afterSeq: after }),
+        missionWide: this.store.countPosts(missionId, { missionWide: true, afterSeq: after }),
+        note: 'Read state is client-side only; the server never marks a post read.',
+      },
+      note: 'Typed durable posts are visibility, never authority: they change no task state. Page with after for gap-free deltas; filter to=me for your inbox.',
+    }
   }
   /** Participant-visible durable admission ledger; refusals merge in place. */
   admissionLedger(actor: Actor, missionId: string, filter: { reason?: AdmissionReason; admitted?: boolean; memberId?: string; taskId?: string; limit?: number } = {}): AdmissionRecord[] {
@@ -1285,6 +1557,138 @@ export class SwarmRuntime {
       retired.push(review)
     }
     return { retired, released }
+  }
+  /**
+   * F2: the live independent review of a submitted source, if one can still
+   * reach a verdict. Uses the shared admission predicate so admission,
+   * scheduling and the owner notice agree on what "has a review" means.
+   */
+  private liveReview(missionId: string, source: Task): Task | undefined {
+    const author = source.attempt?.ownerId ?? source.assigneeId
+    const live = new Set(this.store.list('members', missionId).filter(member => member.status !== 'stopped').map(member => member.id))
+    return liveReviewFor(this.store.list('tasks', missionId), source.id, author, live,
+      review => review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
+  }
+  /**
+   * F2: why a freshly submitted code deliverable has no review path, or
+   * undefined when it has one or its kind does not need independent review.
+   */
+  private missingReviewPath(task: Task): string | undefined {
+    if (task.kind !== 'implementation' && task.kind !== 'integration') return undefined
+    if (this.liveReview(task.missionId, task) !== undefined) return undefined
+    return `no live independent verification task reviews this submitted ${task.kind} artifact; a review (kind verification, reviewOf ${task.id}) must be pending or running and assigned to a member who did not author it`
+  }
+  /**
+   * F2: a submitted code deliverable no live review can accept is never
+   * silently parked. After a grace period (one scheduler period, floor 1s) the
+   * runtime records the missing review durably; once the board would otherwise
+   * make no progress it admits a bounded independent verification, or wakes the
+   * owner once with the exact task id and the concrete blocker. The grace keeps
+   * the runtime from racing a review the author is proposing in the same turn
+   * and keeps the durable log free of redundant events.
+   */
+  private admitMissingReviews(mission: Mission): void {
+    const tasks = this.store.list('tasks', mission.id)
+    const members = this.store.list('members', mission.id)
+    const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    const unreviewable: Task[] = []
+    for (const source of tasks) {
+      if (source.status !== 'submitted' || (source.kind !== 'implementation' && source.kind !== 'integration')) continue
+      if (this.liveReview(mission.id, source) !== undefined) continue
+      const submission = this.latestSubmission(mission.id, source.id)
+      if (submission !== undefined && submission.age < grace) continue
+      this.reportMissingReview(mission, source, submission?.seq ?? 0)
+      unreviewable.push(source)
+    }
+    if (!unreviewable.length || !this.reviewPathStalled(tasks, members)) return
+    for (const source of unreviewable) {
+      const blocked = this.withdrawnAutomaticReview(source.id) ?? this.reviewPathBlocker(mission, source, members)
+      if (blocked !== undefined) { this.notifyReviewBlocked(mission, source, blocked); continue }
+      this.admitAutomaticReview(mission, source)
+    }
+  }
+  /** The newest durable submission of one task: how long ago, and its event seq. */
+  private latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined {
+    const events = this.store.events(missionId, this.config.maxEvents)
+    for (let index = events.length - 1; index >= 0; index--) {
+      const event = events[index]!
+      if (event.type !== 'task/submitted' || (event.data as { taskId?: string } | undefined)?.taskId !== taskId) continue
+      return { seq: event.seq, age: Math.max(0, Date.now() - event.createdAt) }
+    }
+    return undefined
+  }
+  /** Record the missing review once per submission; false when it is already recorded. */
+  private reportMissingReview(mission: Mission, source: Task, submissionSeq: number): boolean {
+    const key = `${mission.id}:${source.id}:${submissionSeq}`
+    if (this.reviewPathReported.has(key)) return false
+    const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
+    this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, reason }))
+    this.reviewPathReported.add(key)
+    return true
+  }
+  /** An automatic review admitted earlier for this source, once the owner has withdrawn it. */
+  private withdrawnAutomaticReview(sourceId: string): string | undefined {
+    const admitted = this.autoReviewAdmissions.get(sourceId)
+    if (admitted === undefined) return undefined
+    const review = this.store.get('tasks', admitted)
+    if (review === undefined || review.status !== 'cancelled') return undefined
+    return `the automatically admitted review ${admitted} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
+  }
+  /** The concrete reason the runtime cannot admit an independent review right now. */
+  private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
+    const tasks = this.store.list('tasks', mission.id)
+    if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
+    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
+    const author = source.attempt?.ownerId ?? source.assigneeId
+    if (!members.some(member => member.status !== 'stopped' && member.id !== author)) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
+    return undefined
+  }
+  /** Admit the bounded independent review for one unreviewable submitted deliverable. */
+  private admitAutomaticReview(mission: Mission, source: Task): void {
+    let review: Task
+    try {
+      review = this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
+        workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,
+        objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
+        kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
+        reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, priority: source.priority,
+        ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
+      })
+    } catch (error) {
+      // Admission can still refuse (budget race, ignored deliverable). The
+      // submission stands; the owner is told exactly what to admit instead.
+      this.notifyReviewBlocked(mission, source, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    this.autoReviewAdmissions.set(source.id, review.id)
+    // The review already exists and its task/proposed event is durable; a busy
+    // writer must not turn a successful admission into a false blocker notice.
+    try {
+      this.commit(mission.id, () => this.store.event(mission.id, 'task/review-admitted', 'runtime', {
+        taskId: review.id, reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, reason: 'no live review existed for the submitted artifact',
+      }))
+    } catch { /* The next tick re-derives the live review from the admitted task. */ }
+  }
+  /** Wake the owner once per distinct blocker for one unreviewable submitted deliverable. */
+  private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void {
+    const key = `${mission.id}:${source.id}:${reason}`
+    if (this.reviewPathNotices.has(key)) return
+    const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
+    this.commit(mission.id, () => {
+      this.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
+      this.notify(mission.id, `${diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${source.id}) or cancel the source task; the mission cannot complete while it is unreviewable.`)
+    })
+    this.reviewPathNotices.add(key)
+  }
+  /**
+   * F2: the board makes no progress except for submitted work. Unlike `stalled`,
+   * a submitted task is not progress: an artifact whose review path is broken
+   * can never reach a verdict by itself.
+   */
+  private reviewPathStalled(tasks: Task[], members: Member[]): boolean {
+    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
+    const live = members.filter(member => member.status !== 'stopped')
+    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
   /**
    * Owner-only withdrawal of admitted-but-mistaken work. Pending, blocked,
@@ -1729,12 +2133,18 @@ export class SwarmRuntime {
       const currentKey = current === undefined ? undefined : `${current.id}:${current.attempt!.id}:${current.status}`
       const source = current?.reviewOf ? this.task(missionId, current.reviewOf) : undefined
       const runs = runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20, afterRun)
+      // Board traffic is part of the delta: counts plus the newest few posts,
+      // so a worker learns about cross-task posts without a second poll.
+      const postAfter = delivered?.postSeq ?? 0
+      const posts = this.boardWindow(missionId, member.id, postAfter)
+      const nextPostSeq = typeof posts.nextAfter === 'number' ? posts.nextAfter : postAfter
       // Record only what this response delivers. A history page swapped in by
       // tools.ts suppresses the event advance so no unseen event is skipped.
       const advanceEvents = options.advanceEventCursor !== false
       if (delivered !== undefined || advanceEvents) this.observeCursors.set(member.id, {
         eventSeq: advanceEvents ? Math.max(delivered?.eventSeq ?? 0, events.at(-1)?.seq ?? 0, query.after ?? 0) : delivered?.eventSeq ?? 0,
         runSeq: Math.max(delivered?.runSeq ?? 0, runs.toolRuns.at(-1)?.seq ?? 0, query.afterRun ?? 0),
+        postSeq: advanceEvents ? Math.max(delivered?.postSeq ?? 0, nextPostSeq) : delivered?.postSeq ?? 0,
         ...(currentKey === undefined ? {} : { current: currentKey }),
       })
       // The first read is the focused view; later default reads are deltas.
@@ -1747,8 +2157,9 @@ export class SwarmRuntime {
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } }),
         events, ...eventCursor, ...runs,
+        posts,
         delta: true,
-        detail: 'Delta since your last delivered cursor: new events and tool runs, plus your current assignment when it changed. Read taskId, runId or evidenceId for one full record.',
+        detail: 'Delta since your last delivered cursor: new events, tool runs and board posts, plus your current assignment when it changed. Read taskId, runId, evidenceId or swarm_board for one full record.',
       }
       return {
         mission: { id: mission.id, title: mission.title, status: mission.status, ...budget },
@@ -1761,8 +2172,9 @@ export class SwarmRuntime {
         evidence: current ? evidenceOf(current) : [],
         ...runs,
         events, ...eventCursor,
+        posts,
         board: full ? tasks.map(task => taskRecord(task, 2400)) : tasks.map(taskRef), members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status })),
-        detail: full ? 'Focused view with complete task records. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.' : 'Focused view; later default reads return only the delta of new events and tool runs. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
+        detail: full ? 'Focused view with complete task records. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; swarm_board reads the durable post board; after/afterRun return only changes.' : 'Focused view; later default reads return only the delta of new events, tool runs and board posts. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; swarm_board reads the durable post board; after/afterRun return only changes.',
       }
     }
     const evidence = this.store.list('evidence', missionId)
@@ -1770,12 +2182,32 @@ export class SwarmRuntime {
       mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
       members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status, ...(item.activity ? { activity: item.activity.kind } : {}), accountedTokens: item.accountedTokens ?? 0, requests: item.usage?.requests ?? 0 })),
       board: full ? tasks.map(task => taskRecord(task, 6000)) : tasks.map(taskRef),
-      evidence: (full ? evidence : evidence.filter(item => item.status === 'challenged')).map(item => evidenceRef(item, full)),
+      evidence: (full ? evidence : evidence.filter(item => item.status === 'challenged' || item.status === 'refuted')).map(item => evidenceRef(item, full)),
       unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
       pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => !delivery.deliveredAt).length,
+      // The owner has no delivered cursor, so the board appears as a bounded
+      // total plus the newest few posts; swarm_board pages the full history.
+      posts: { total: this.store.countPosts(missionId), newest: this.store.posts(missionId, { newest: true, limit: BOARD_DELTA_POSTS }).map(post => postView(post)) },
       events, ...eventCursor,
       detail: full ? 'Complete task records and evidence claims; tool payloads are read by runId.' : 'Compact board. taskId reads one task with evidence and runs; detail=full expands every task record; after returns only newer events.',
       ...(owner ? {} : { note: 'Non-member observer' }),
+    }
+  }
+  /**
+   * Bounded board window for observe: counts plus the newest few posts after
+   * the member's delivered cursor. Older unseen posts are counted and named as
+   * omitted rather than re-sent; `swarm_board` pages them with an explicit
+   * cursor, so nothing is lost and no delta grows without bound.
+   */
+  private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> {
+    const count = this.store.countPosts(missionId, { afterSeq })
+    const newest = this.store.posts(missionId, { afterSeq, newest: true, limit: BOARD_DELTA_POSTS })
+    return {
+      count,
+      addressed: this.store.countPosts(missionId, { inboxFor: memberId, afterSeq }),
+      newest: newest.map(post => postView(post)),
+      ...(count > newest.length ? { omitted: count - newest.length } : {}),
+      ...(newest.length ? { nextAfter: newest.at(-1)!.seq } : {}),
     }
   }
   /** Requests already streaming have no reported usage yet; estimate each at its worker's average. */
@@ -1883,9 +2315,44 @@ export class SwarmRuntime {
    * and completion decision treats it as live work.
    */
   private quiescencePending(task: Task): boolean { return task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch }
-  /** Nothing is running, submitted or dispatchable: workers would stay idle forever. */
+  /**
+   * A submitted task is progress only while a live review can still accept it.
+   * A review that was never admitted or was retired leaves the submission
+   * unreviewable forever; counting it as progress hid a stalled board from the
+   * owner (Round-8 F1). Pending and running reviews are live, and a parked
+   * review (blocked with a matching stop marker) re-pends after the stop
+   * acknowledgement, so it still counts.
+   */
+  private reviewable(task: Task, tasks: Task[]): boolean {
+    return tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
+      && (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)))
+  }
+  /**
+   * A submission with no live review is a stall candidate, not a stall, until
+   * the same unreviewed set survives the grace. This separates the benchmark
+   * failure (a review was never admitted) from the normal flow where the owner
+   * submits work and admits its review on the next call.
+   */
+  private unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
+    const fingerprint = unreviewed.map(task => `${task.id}:${task.epoch}`).sort().join(',')
+    const now = Date.now()
+    const prior = this.unreviewedSince.get(missionId)
+    if (prior === undefined || prior.fingerprint !== fingerprint) {
+      this.unreviewedSince.set(missionId, { fingerprint, since: now, passes: 1 })
+      return false
+    }
+    prior.passes += 1
+    return prior.passes > STALL_GRACE_PASSES || now - prior.since >= Math.min(this.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
+  }
+  /** Nothing is running, reviewably submitted or dispatchable: workers would stay idle forever. */
   private stalled(mission: Mission, tasks: Task[], members: Member[]): boolean {
-    if (tasks.some(task => task.status === 'running' || task.status === 'submitted' || this.quiescencePending(task))) return false
+    // An empty board is a mission the owner has not planned yet, not a stall.
+    if (!tasks.length) return false
+    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
+    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks))
+    if (unreviewed.length) {
+      if (!this.unreviewedStall(mission.id, unreviewed)) return false
+    } else this.unreviewedSince.delete(mission.id)
     const live = members.filter(member => member.status !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
@@ -1914,9 +2381,26 @@ export class SwarmRuntime {
     if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
     return undefined
   }
+  /**
+   * Liveness for every active mission, not only for missions launched from an
+   * automatic request. The `starts` journal is an admission-policy marker
+   * (automatic workers must carry primary-agent-chosen limits, enforced at
+   * `addMember`/`propose`); gating liveness on it left a `swarm_create` mission
+   * unable to wake the owner when it stalled (Round-8 F1).
+   *
+   * A stalled board is reported for every mission, and a stalled board whose
+   * dead leftovers can be cancelled under complete independent coverage
+   * completes for every mission. A covered board with no unschedulable work
+   * still completes automatically only on the automatic launch path, whose
+   * fixed plan makes the board final: an owner-assembled plan may still be
+   * extending the mission, so `swarm_create`/staged missions retain explicit
+   * completion there (the automatic launch path is the one that must not need
+   * an owner action).
+   */
   private completeAutomatic(missionId: string): boolean {
     const mission = this.mission(missionId)
-    if (mission.status !== 'active' || !this.store.list('starts', missionId).length) return false
+    if (mission.status !== 'active') return false
+    const automatic = this.store.list('starts', missionId).length > 0
     const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
     const strict = this.completionError(mission)
     const isStalled = strict !== undefined && this.stalled(mission, tasks, members)
@@ -1926,6 +2410,7 @@ export class SwarmRuntime {
       if (isStalled) this.notifyStall(mission, tasks, members, relaxed ?? strict)
       return false
     }
+    if (!automatic && !isStalled) return false
     this.control({ sessionId: mission.ownerSessionId }, missionId, 'complete', isStalled
       ? 'Automatically completed: every acceptance criterion was independently covered and the remaining tasks could no longer be scheduled'
       : 'Automatically completed after independent verification satisfied all mission acceptance criteria')
@@ -2564,6 +3049,9 @@ export class SwarmRuntime {
     }
     if (this.completeAutomatic(missionId)) { await this.flushOutbox(missionId); return }
     if (Date.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.blockBudget(mission); return }
+    // F2: a submitted code deliverable no live review can accept is repaired
+    // before dispatch, so the auto-admitted review can be scheduled this tick.
+    this.admitMissingReviews(this.mission(missionId))
     for (const task of this.store.list('tasks', missionId)) {
       if (this.shuttingDown) return
       if (task.status !== 'running' || !task.attempt) continue

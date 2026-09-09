@@ -1,16 +1,19 @@
 {
   "visibleSwarmTools": [
     "swarm_add_member",
+    "swarm_board",
     "swarm_challenge",
     "swarm_create",
     "swarm_message",
     "swarm_observe",
+    "swarm_post",
     "swarm_propose",
     "swarm_stage",
     "swarm_workstream"
   ],
   "ownerSwarmTools": [
     "swarm_add_member",
+    "swarm_board",
     "swarm_budget",
     "swarm_cancel",
     "swarm_challenge",
@@ -19,16 +22,19 @@
     "swarm_launch",
     "swarm_message",
     "swarm_observe",
+    "swarm_post",
     "swarm_propose",
     "swarm_stage",
     "swarm_workstream"
   ],
   "workerSwarmTools": [
+    "swarm_board",
     "swarm_challenge",
     "swarm_claim",
     "swarm_handoff",
     "swarm_message",
     "swarm_observe",
+    "swarm_post",
     "swarm_propose",
     "swarm_publish",
     "swarm_submit",

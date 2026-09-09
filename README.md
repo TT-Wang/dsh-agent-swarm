@@ -105,13 +105,13 @@ You do not enter worker counts, token limits or step counts, and you do not pres
 A submitted artifact is a real Git commit. To accept it, the host:
 
 1. creates a fresh worktree at exactly that commit — not the worker's directory, and not your source checkout;
-2. links your project's installed dependency directories (by default `node_modules`, at any depth) into that checkout, so declared checks find their toolchain;
+2. links your project's installed dependency directories (by default `node_modules`, `.venv`, `venv`, `vendor` and `.tox`, at any depth) into that checkout, so declared checks find their toolchain;
 3. runs each declared command with the task's timeout, inside the Harness sandbox;
 4. validates the artifact's changed paths against the task's declared scope, separately from the commands.
 
 Any non-zero exit rejects the artifact. A command that is not found reports that it was an environment failure rather than a defect in the work, so a reviewer does not retry the same artifact blindly.
 
-If your project keeps its toolchain somewhere other than `node_modules` — a Python `.venv`, a Go `vendor/` — name those directories in `verificationDependencyDirs`. Use `verificationDependencyMode: "copy"` when a read-through symlink is not acceptable; `link` is the default and is cheaper.
+If your project keeps its toolchain in other directories, name them in `verificationDependencyDirs`; the configured list replaces the default set, and `[]` disables materialisation. Use `verificationDependencyMode: "copy"` when a read-through symlink is not acceptable; `link` is the default and is cheaper.
 
 ## Resource limits and cost
 
@@ -140,7 +140,7 @@ An **Advanced: configure a mission** disclosure remains available for explicit m
 ## How collaboration works
 
 1. The primary agent supplies a complete plan: objective, scope, acceptance criteria, budgets, members, workstreams and a task graph. The runtime validates it before any worker starts and returns every field problem at once so one repair fixes the whole plan.
-2. Workers propose further work inside the mission, exchange attributed peer messages, and publish evidence tied to host-recorded tool executions. Every tool result a worker receives carries the host's own run id, so a claim can cite it.
+2. Workers propose further work inside the mission, exchange attributed peer messages, publish evidence tied to host-recorded tool executions, and post typed notes to the sanctioned mission board (`swarm_post`, read back with `swarm_board`). Every tool result a worker receives carries the host's own run id, so a claim can cite it.
 3. Work is submitted as an immutable artifact. Independent review starts as soon as the source is submitted; ordinary dependencies unlock only after acceptance. A review is never assigned to the author of the work it reviews.
 4. A challenge reopens the affected result and invalidates whatever depended on it. A handoff checkpoints partial work and stops the previous attempt before a replacement can begin.
 5. Blocked work is repaired by a replacement task that carries the original acceptance criteria. **Dependents follow the repair automatically** — a task that depended on the rejected original becomes ready when the accepted replacement lands, and is built against the replacement's artifact.
@@ -156,7 +156,7 @@ The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [
 | --- | --- | --- |
 | `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | Coordination state. One live runtime per file. |
 | `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | Snapshots, worker worktrees, verification checkouts. Must be outside your source repository. |
-| `verificationDependencyDirs` | `["node_modules"]` | Installed dependency directories made available to verification checkouts. |
+| `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | Installed dependency directories made available to verification checkouts. |
 | `verificationDependencyMode` | `"link"` | `link` symlinks them read-through; `copy` clones them per checkout. |
 | `cacheReadWeight` | `0.1` | Budget weight for cached input. Raw buckets are unaffected. |
 | `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned per dimension. |

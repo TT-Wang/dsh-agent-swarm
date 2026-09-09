@@ -5,6 +5,7 @@ import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import { SwarmRuntime } from './runtime.ts'
 import { HarnessWorkers } from './harness-workers.ts'
+import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS } from './workspaces.ts'
 import { registerTools, SWARM_PROMPT } from './tools.ts'
 import { RoleScoper } from './roles.ts'
 import { registerAutomaticStart } from './planner.ts'
@@ -25,6 +26,7 @@ export interface Config {
   maxAttempts: number
   checkTimeoutMs: number
   maxCheckOutputBytes: number
+  /** Ignored dependency directories materialised into verification checkouts; see DEFAULT_VERIFICATION_DEPENDENCY_DIRS. */
   verificationDependencyDirs: string[]
   /** M6: `link` (default) symlinks source dependency directories read-through; `copy` clones them into each checkout. */
   verificationDependencyMode: 'link' | 'copy'
@@ -47,7 +49,7 @@ export const Config: z<Config> = z.object({
   maxAttempts: z.natural().min(1).default(3),
   checkTimeoutMs: z.natural().min(100).default(60000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
-  verificationDependencyDirs: z.array(z.string()).default(['node_modules']),
+  verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),
   boundaryCompactionTokens: z.natural().default(250000),
   cacheReadWeight: z.number().min(0).max(1).default(0.1),

@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 
 interface Tables {
@@ -30,7 +30,20 @@ interface Tables {
 }
 export type Table = keyof Tables
 const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits']
-const SCHEMA_VERSION = 2
+/** Bounded board filters. `inboxFor` means "addressed to this key or mission-wide". */
+export interface PostFilter {
+  kind?: PostKind
+  toMemberId?: string
+  inboxFor?: string
+  missionWide?: boolean
+  taskId?: string
+  afterSeq?: number
+  /** With `afterSeq`, return the newest matches instead of the oldest. */
+  newest?: boolean
+  limit?: number
+}
+/** v3 adds the append-only `posts` board table; older versions are read-compatible. */
+const SCHEMA_VERSION = 3
 const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
@@ -110,13 +123,17 @@ export class SwarmStore {
       chmodSync(path, 0o600)
       this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${this.busyTimeoutMs}; PRAGMA wal_autocheckpoint=${WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit=${WAL_JOURNAL_SIZE_LIMIT};`)
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
-      if (version !== 0 && version !== 1 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
+      if (version !== 0 && version !== 1 && version !== 2 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
       this.db.exec('BEGIN IMMEDIATE')
       try {
         for (const table of TABLES) {
           this.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS ${table}_mission ON ${table}(mission_id);`)
         }
         this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS starts_command ON starts(json_extract(value, '$.ownerSessionId'), json_extract(value, '$.commandId'))")
+        // Board posts are append-only and carry a host-assigned sequence as the
+        // primary key, so delta reads page on a monotonic cursor. They are never
+        // updated in place: a post is immutable once recorded.
+        this.db.exec('CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, mission_id TEXT NOT NULL, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS posts_mission ON posts(mission_id, seq);')
         this.db.exec('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS events_mission ON events(mission_id, seq);')
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
@@ -270,6 +287,68 @@ export class SwarmStore {
     let sql = `SELECT value FROM tool_runs WHERE ${clauses.join(' AND ')} ORDER BY rowid`
     if (filter.limit !== undefined) { sql += ' LIMIT ?'; params.push(filter.limit) }
     return this.db.prepare(sql).all(...params).map(row => this.parse<'tool_runs'>(String(row.value)))
+  }
+  /** One durable board post by id, or undefined when it does not exist. */
+  post(id: string): Post | undefined {
+    if (this.closed) throw new Error('Swarm store is closed')
+    const row = this.db.prepare('SELECT value FROM posts WHERE id=?').get(id)
+    return row === undefined ? undefined : this.parsePost(String(row.value), id)
+  }
+  /**
+   * Append one immutable board post. The sequence is host-assigned inside the
+   * caller's transaction; the runtime is the single writer, so `MAX(seq)+1`
+   * cannot race. Posts are never updated or deleted, which is what makes the
+   * cursor a gap-free delta position.
+   */
+  recordPost(post: Omit<Post, 'seq'>): Post {
+    if (this.closed) throw new Error('Swarm store is closed')
+    const seq = Number(this.db.prepare('SELECT COALESCE(MAX(seq),0)+1 AS next FROM posts').get()!.next)
+    const stored: Post = { ...post, seq }
+    const statement = this.db.prepare('INSERT INTO posts(seq,id,mission_id,value) VALUES(?,?,?,?)')
+    withWriterRetry(() => statement.run(stored.seq, stored.id, stored.missionId, JSON.stringify(stored)), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    this.transactionScopes?.add(stored.missionId)
+    return stored
+  }
+  /**
+   * Bounded board page in sequence order. Without a cursor the newest `limit`
+   * posts are returned; with `afterSeq` the next page is returned oldest-first
+   * (or newest-first when `newest` is set), so a reader can page without gaps
+   * or repeats. Filters are applied in SQL so a page never hides matching posts.
+   */
+  posts(missionId: string, filter: PostFilter = {}): Post[] {
+    if (this.closed) throw new Error('Swarm store is closed')
+    const limit = filter.limit === undefined ? undefined : Math.max(0, Math.trunc(filter.limit))
+    if (limit === 0) return []
+    const { where, params } = this.postWhere(missionId, filter)
+    const ascending = filter.afterSeq !== undefined && filter.newest !== true
+    const rows = this.db.prepare(`SELECT value FROM posts WHERE ${where} ORDER BY seq ${ascending ? 'ASC' : 'DESC'}${limit === undefined ? '' : ' LIMIT ?'}`)
+      .all(...(limit === undefined ? params : [...params, limit]))
+    const posts = rows.map(row => this.parsePost(String(row.value)))
+    return ascending ? posts : posts.reverse()
+  }
+  /** Count matching posts without materializing them; used for bounded delta counts. */
+  countPosts(missionId: string, filter: PostFilter = {}): number {
+    if (this.closed) throw new Error('Swarm store is closed')
+    const { where, params } = this.postWhere(missionId, filter)
+    return Number(this.db.prepare(`SELECT COUNT(*) AS count FROM posts WHERE ${where}`).get(...params)!.count)
+  }
+  private postWhere(missionId: string, filter: PostFilter): { where: string; params: Array<string | number> } {
+    const clauses = ['mission_id=?']
+    const params: Array<string | number> = [missionId]
+    if (filter.kind !== undefined) { clauses.push("json_extract(value,'$.kind')=?"); params.push(filter.kind) }
+    if (filter.toMemberId !== undefined) { clauses.push("json_extract(value,'$.toMemberId')=?"); params.push(filter.toMemberId) }
+    // Mission-wide posts omit `toMemberId` entirely, so JSON extraction yields NULL.
+    if (filter.inboxFor !== undefined) { clauses.push("(json_extract(value,'$.toMemberId') IS NULL OR json_extract(value,'$.toMemberId')=?)"); params.push(filter.inboxFor) }
+    if (filter.missionWide === true) clauses.push("json_extract(value,'$.toMemberId') IS NULL")
+    if (filter.taskId !== undefined) { clauses.push("json_extract(value,'$.taskId')=?"); params.push(filter.taskId) }
+    if (filter.afterSeq !== undefined) { clauses.push('seq>?'); params.push(filter.afterSeq) }
+    return { where: clauses.join(' AND '), params }
+  }
+  private parsePost(json: string, id?: string): Post {
+    const result: unknown = JSON.parse(json)
+    if (result === null || typeof result !== 'object' || !('id' in result) || typeof result.id !== 'string' || (id !== undefined && result.id !== id)
+      || !('seq' in result) || !Number.isSafeInteger(result.seq)) throw new Error('Corrupt board post record')
+    return result as Post
   }
   /** Read chronological deltas, bounded for display and agent context. */
   events(missionId: string, limit: number, after = 0): SwarmEvent[] {

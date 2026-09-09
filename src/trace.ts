@@ -30,13 +30,13 @@ export type TraceStatus = (typeof TRACE_STATUSES)[number]
 export const TRACE_ERROR_TYPES = ['validation_error', 'authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'tool_error', 'internal_error', 'contract_error'] as const
 export type TraceErrorType = (typeof TRACE_ERROR_TYPES)[number]
 /** Closed step vocabulary: one row per orchestration step, no free-form names. */
-export const TRACE_STEPS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'delivery-apply'] as const
+export const TRACE_STEPS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_post', 'swarm_board', 'delivery-apply'] as const
 export type TraceStep = (typeof TRACE_STEPS)[number]
 const OPERATION_BY_STEP: Record<TraceStep, TraceOperation> = {
   swarm_stage: 'agent', swarm_launch: 'agent', swarm_budget: 'agent', swarm_create: 'agent', swarm_add_member: 'agent', swarm_workstream: 'agent',
   swarm_propose: 'tool', swarm_claim: 'agent', swarm_publish: 'tool', swarm_submit: 'tool', swarm_verify: 'review', swarm_message: 'tool',
   swarm_challenge: 'tool', swarm_handoff: 'agent', swarm_subscribe: 'tool', swarm_wait: 'tool', swarm_observe: 'tool', swarm_control: 'agent',
-  swarm_cancel: 'agent', 'delivery-apply': 'merge',
+  swarm_cancel: 'agent', swarm_post: 'tool', swarm_board: 'tool', 'delivery-apply': 'merge',
 }
 export const spanOperation = (step: TraceStep): TraceOperation => OPERATION_BY_STEP[step]
 export const isTraceOperation = (value: unknown): value is TraceOperation => typeof value === 'string' && (TRACE_OPERATIONS as readonly string[]).includes(value)
@@ -384,6 +384,30 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'task/budget-resumed': 'Preserved attempt resumed after the budget raise',
   'task/lease-expiring': 'Attempt lease is approaching expiry with no live operation',
   'tool/recorded': 'Host tool run recorded for evidence and audit',
+  // Round 9-C: the remaining types the runtime emits, including the four added
+  // by the liveness/review/check fixes. `eventVocabularyReport` must never
+  // report an emitted type as unrecognized; tests/event-vocabulary.test.mjs
+  // re-derives this set from src/ and fails if a new emitter is unregistered.
+  'admission/limit': 'Owner set an admission limit rule; recorded with its level, key and limit',
+  'admission/refused': 'Admission refused a task or member against a limit; recorded once per refusal row',
+  'member/effort-downgraded': 'Provider rejected the requested reasoning effort; the member runs without it',
+  'member/effort-rejected': 'Provider rejected the effort retry; admission failed and the member was stopped',
+  'task/check-changed': 'A replaced or re-submitted task declared a different check than the stored record',
+  'task/closeout-ready': 'Idle close-out re-pended the task after a checkpoint instead of abandoning it',
+  'task/closeout-exhausted': 'Idle close-out reached the recovery limit and left the task blocked',
+  'task/preparation-failed': 'Task preparation failed; the reason and recovery credit were recorded',
+  'task/reassigned': 'A failed attempt was re-routed to another live member',
+  'task/review-admitted': 'The runtime admitted an independent verification for a submitted task with no review',
+  'task/review-blocked': 'A submitted task has no review and no eligible reviewer; the reason is recorded',
+  'task/review-missing': 'A submitted task was detected without a review on the scheduler tick',
+  'task/start-failed': 'Worker start failed; the attempt was recovered or re-routed with the reason',
+  'mission/pause': 'Owner paused the mission',
+  'mission/stop': 'Owner stopped the mission',
+  'mission/complete': 'Owner completed the mission',
+  'mission/resume': 'Owner resumed the mission',
+  'mission/coordinator': 'Owner set the mission coordinator',
+  'delivery/applied': 'Owner applied an accepted result to the source checkout',
+  'delivery/conflicts': 'Owner applied a result that conflicted; no source write was kept',
 }
 export interface EventVocabularyReport {
   recognized: string[]

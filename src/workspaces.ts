@@ -10,15 +10,28 @@ import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean }
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
+/**
+ * Ignored dependency directories materialised into a clean verification
+ * checkout when `verificationDependencyDirs` is not configured. npm is the
+ * default ecosystem, but a foreign toolchain keeps its interpreter and packages
+ * in a project-local directory too: a Python `.venv`/`venv`, a Go `vendor`, a
+ * tox `.tox`. Each name is matched as a path component at any depth (a nested
+ * `packages/x/node_modules` or `services/y/.venv` is materialised as well), and
+ * only a gitignored directory is materialised. Configure the option to replace
+ * this list; `[]` disables materialisation.
+ */
+export const DEFAULT_VERIFICATION_DEPENDENCY_DIRS: readonly string[] = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
 export interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
   checkEnv?: Record<string, string>
   /**
-   * Ignored dependency directory names (such as `node_modules`) linked from the
-   * source checkout into each clean verification checkout, so declared checks
-   * find installed toolchains. Default: `['node_modules']`. Empty disables.
+   * Ignored dependency directory names (such as `node_modules` or a Python
+   * `.venv`) linked from the source checkout into each clean verification
+   * checkout, so declared checks find installed toolchains. Default:
+   * `DEFAULT_VERIFICATION_DEPENDENCY_DIRS` (`node_modules`, `.venv`, `venv`,
+   * `vendor`, `.tox`). Empty disables.
    */
   verificationDependencyDirs?: string[]
   /**
@@ -417,7 +430,7 @@ export class Workspaces {
 
   /** Dependency directory names the plugin links into checkouts; never member work. */
   private dependencyNames(): ReadonlySet<string> {
-    return new Set(this.options.verificationDependencyDirs ?? ['node_modules'])
+    return new Set(this.options.verificationDependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)
   }
 
   /**
@@ -842,7 +855,7 @@ export class Workspaces {
    * @returns the relative directories that were linked or copied.
    */
   private async linkDependencyDirs(source: string, checkout: string, signal: AbortSignal): Promise<string[]> {
-    const names = new Set(this.options.verificationDependencyDirs ?? ['node_modules'])
+    const names = new Set(this.options.verificationDependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)
     if (names.size === 0) return []
     const ignored = await this.git(source, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], signal, undefined, INVENTORY_BYTES)
     const linked: string[] = []

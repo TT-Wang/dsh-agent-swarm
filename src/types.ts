@@ -227,6 +227,58 @@ export interface ToolRun {
   isError: boolean
   createdAt: number
 }
+/**
+ * Sanctioned mission-board post kinds. A post is durable cross-task visibility:
+ * it carries provenance (sender, task/attempt, evidence and host run ids) and is
+ * filterable, but it is data only — it never grants authority, never changes a
+ * task's state and its body is never an instruction to the runtime.
+ */
+export type PostKind = 'ASK' | 'ANSWER' | 'IDEA' | 'ALERT' | 'ARTIFACT' | 'HANDOFF'
+/** Durable, immutable board post. `seq` is host-assigned and monotonic for delta reads. */
+export interface Post {
+  id: string
+  missionId: string
+  /** Host-assigned monotonic position; never supplied by the model. */
+  seq: number
+  kind: PostKind
+  /** Authenticated sender key: a member id or `owner`. */
+  fromMemberId: string
+  /** Absent means mission-wide; otherwise a member id or `owner`. */
+  toMemberId?: string
+  taskId?: string
+  attemptId?: string
+  body: string
+  /** Host-recorded evidence ids in this mission; cited, never promoted by posting. */
+  evidenceIds: string[]
+  /** Host-recorded tool run ids in this mission. */
+  toolRunIds: string[]
+  replyTo?: string
+  createdAt: number
+  /** Optional lifetime in milliseconds; expiry is computed on read, never enforced by mutation. */
+  ttlMs?: number
+}
+/** Model input for one board post; sender and sequence come from the host. */
+export interface PostInput {
+  kind: PostKind
+  body: string
+  to?: string
+  taskId?: string
+  attemptId?: string
+  evidenceIds?: string[]
+  toolRunIds?: string[]
+  replyTo?: string
+  ttlMs?: number
+}
+/** Bounded board read. `to: 'me'` is the inbox view: addressed to the caller or mission-wide. */
+export interface BoardQuery {
+  kind?: PostKind
+  to?: string
+  taskId?: string
+  after?: number
+  limit?: number
+  /** Read one full post record instead of a page. */
+  postId?: string
+}
 export interface Delivery {
   id: string
   missionId: string

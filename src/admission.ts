@@ -28,6 +28,36 @@ export function normalizeReviewDependencies(kind: string, reviewOf: string | und
   return dependencies.filter(dependency => kind !== 'verification' || dependency !== reviewOf)
 }
 
+/** The minimal task shape a review path needs: one verification task and its source. */
+export interface ReviewPathCandidate {
+  id: string
+  kind: string
+  reviewOf?: string
+  status: string
+  assigneeId?: string
+}
+
+/**
+ * The live independent review of one source, if any review can still reach a
+ * verdict. A review is live only while it can still start: its status is live
+ * (pending/running, or a quiescence-parked review the caller supplies), it does
+ * not review itself, it is not assigned to the source author, and it is not
+ * pinned to a retired member. A cancelled, accepted or author-assigned review is
+ * not a review path, so a submitted artifact that only has one is unreviewable
+ * and would otherwise sit submitted forever.
+ */
+export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], sourceId: string, authorId: string | undefined, liveMemberIds: ReadonlySet<string>,
+  isLiveStatus: (review: T) => boolean = review => review.status === 'pending' || review.status === 'running'): T | undefined {
+  return reviews.find(review => review.kind === 'verification' && review.reviewOf === sourceId && isLiveStatus(review)
+    && (authorId === undefined || review.assigneeId !== authorId)
+    && (review.assigneeId === undefined || liveMemberIds.has(review.assigneeId)))
+}
+
+/** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
+export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
+  return { code: 'review_path_missing', location: `task ${JSON.stringify(taskId)}`, message: reason }
+}
+
 /**
  * A stable, machine-checkable admission diagnostic. The same code is embedded
  * in the thrown repair message, so a caller can match programmatically instead
@@ -332,6 +362,75 @@ export function classifyCheck(command: string): CheckClassification {
   return { command, runnable: 'worker' }
 }
 
+/**
+ * Standard system locations every clean verification checkout shares with the
+ * host: the POSIX shells, the usual executable directories and the standard
+ * device files. Any other absolute path names a host-specific location (a home
+ * directory, the source checkout, a project toolchain) that the disposable
+ * checkout does not contain.
+ */
+export const SYSTEM_CHECK_PATH_ALLOWLIST: readonly string[] = [
+  '/bin', '/usr/bin', '/sbin', '/usr/sbin',
+  '/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr',
+]
+const SYSTEM_CHECK_PATH_PREFIXES = ['/bin/', '/usr/bin/', '/sbin/', '/usr/sbin/']
+
+/** Whether one absolute path token is a system location every checkout shares. */
+export function isSystemCheckPath(candidate: string): boolean {
+  return SYSTEM_CHECK_PATH_ALLOWLIST.includes(candidate) || SYSTEM_CHECK_PATH_PREFIXES.some(prefix => candidate.startsWith(prefix))
+}
+
+/**
+ * Absolute path tokens named by a shell command. The command is split into
+ * shell words, an assignment prefix (`VAR=value`) is peeled so its value is
+ * judged, and a path is recognised only where a path component can begin: at a
+ * word start, after `=` `:` `@` `,`, or after an attached short option
+ * (`-I/abs`). `https://…` and a `//`-leading segment are not local paths, and a
+ * `$PWD/…` expansion is not absolute. A `PATH`-style colon list is split so
+ * each entry is judged on its own. This is a bounded token scanner, not a shell
+ * parser: `${VAR}` indirection, `$(…)` output, `eval` and aliases/functions can
+ * still produce a host path and stay documented residuals.
+ */
+export function absoluteCheckPaths(command: string): string[] {
+  const found: string[] = []
+  const seen = new Set<string>()
+  const add = (candidate: string): void => {
+    for (const part of candidate.split(':')) {
+      if (!part.startsWith('/') || part.startsWith('//') || seen.has(part)) continue
+      seen.add(part); found.push(part)
+    }
+  }
+  const pattern = /(?:^|[=:@,]|-[A-Za-z]+)(\/(?!\/)[^\s;&|()<>"'`]*)/g
+  for (const word of command.split(/[\s;&|()<>"'`]+/).filter(Boolean)) {
+    let body = word
+    for (let assignment = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/s.exec(body); assignment !== null; assignment = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/s.exec(body)) body = assignment[1]!
+    pattern.lastIndex = 0
+    for (let match = pattern.exec(body); match !== null; match = pattern.exec(body)) add(match[1]!)
+  }
+  return found
+}
+
+/**
+ * A declared check runs in a clean verification checkout: a fresh worktree of
+ * the artifact commit under a random path below `workspacesRoot`. An absolute
+ * path therefore cannot identify anything in that checkout — including a path
+ * that points inside the mission workspace, because the source checkout is a
+ * different directory from the checkout under test. It is refused at admission
+ * with a field-level diagnostic (Round 9-C: a repair had swapped its check for
+ * the source project's `.venv/bin/python` and a host `uv`, preserving the
+ * acceptance text, and admission accepted it). Standard system locations stay
+ * admitted; relative paths and shell expansions such as `$PWD/...` are
+ * unaffected.
+ */
+export function reconcileCheckPaths(command: string, location: string): AdmissionDiagnostic[] {
+  return absoluteCheckPaths(command).filter(candidate => !isSystemCheckPath(candidate)).map(candidate => ({
+    code: 'check_absolute_path',
+    location,
+    path: candidate,
+    message: `the declared check names the absolute path ${JSON.stringify(candidate)}, which is not inside the disposable verification checkout. The verifier runs every check in a clean verification checkout — a fresh worktree of the artifact commit under a random path — so this host location (a home directory, the source checkout or a project toolchain) is not present there; the check would fail with exit 127 or silently test the source instead of the artifact. Use a checkout-relative path (for example ".venv/bin/python" or "node_modules/.bin/tool") or a standard system executable (${SYSTEM_CHECK_PATH_ALLOWLIST.slice(0, 2).map(item => JSON.stringify(item)).join(', ')}). Correct this field and retry the same task/request, preserving acceptance criteria and budget; never swap a check for a host-absolute path to make it pass.`,
+  }))
+}
+
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string): void {
   if (checks !== undefined) {
     if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
@@ -339,6 +438,11 @@ export function requireHostChecks(kind: string, checks: readonly string[] | unde
     if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command) })).find(item => item.classification.runnable === 'host-only')
     if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable checks (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
+    // Round 9-C: a check that names a host-absolute path cannot run in the
+    // disposable checkout. Refuse it here, at the shared admission point, so a
+    // repair cannot silently swap its check for the source toolchain.
+    const absolute = checks.map((command, index) => ({ index, diagnostics: reconcileCheckPaths(command, `${location}.checks[${index}]`) })).find(item => item.diagnostics.length > 0)
+    if (absolute) throw new Error(formatDiagnostic(absolute.diagnostics[0]!))
   }
   if ((kind === 'implementation' || kind === 'integration') && !checks?.length) {
     throw new Error(`${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add checks and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`)
