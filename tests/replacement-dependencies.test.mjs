@@ -146,7 +146,14 @@ test('ambiguous persisted accepted replacements fail closed instead of choosing 
   const integration = f.integration([original])
   await f.reject(original)
   const first = f.propose('First candidate', { replaces: [original.id] })
-  const second = f.propose('Second candidate', { replaces: [original.id] })
+  // A second replacement for one blocked task is rejected at admission (W2).
+  // Historical or imported state can still contain a conflicting candidate, so
+  // model that durable state directly and keep the ambiguity guard honest.
+  assert.throws(() => f.propose('Duplicate candidate', { replaces: [original.id] }), /already replaced by .*\(pending\)/)
+  const firstRecord = f.current(first)
+  const second = { ...structuredClone(firstRecord), id: 'task_imported_second_candidate', title: 'Second candidate',
+    status: 'pending', createdAt: firstRecord.createdAt + 1, evidenceIds: [], attempt: undefined, artifact: undefined, output: undefined }
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', second))
   await f.accept(first)
   await f.submit(second)
   // Historical or imported state can contain conflicting terminal candidates.

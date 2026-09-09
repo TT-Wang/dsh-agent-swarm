@@ -156,7 +156,13 @@ export interface Task {
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
   budgetResume?: { pauseId: string; attemptId: string; epoch: number }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
-  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' }
+  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout' }
+  /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
+  closeout?: { nudges: number; at: number }
+  /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
+  checkpoint?: { commit: string; at: number }
+  /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
+  gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
   evidenceIds: string[]
   reviewOf?: string
@@ -406,6 +412,8 @@ export interface RuntimeConfig {
   maxTasksPerMember: number
   /** Host verification timeout applied when a task does not choose one; index.ts Config supplies it. */
   checkTimeoutMs?: number
+  /** Idle close-out nudges before an open attempt is checkpointed and abandoned; defaults to 2. */
+  maxIdleCloseouts?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
 }

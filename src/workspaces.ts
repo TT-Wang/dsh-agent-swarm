@@ -50,6 +50,16 @@ interface TaskBase { taskId: string; epoch: number; baseCommit: string; captured
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string> }
+/**
+ * Worktree metadata mutation queues keyed by canonical git common dir. Git
+ * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
+ * `git worktree add` calls in one repository can observe a half-written file
+ * and fail with `git worktree failed (128): failed to read .../commondir`,
+ * which blocks the task. Module scope makes every Workspaces instance in one
+ * process share the queue for a repository.
+ */
+const worktreeQueues = new Map<string, Promise<void>>()
+const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
 
 /** Execute an argv with bounded output and a cancellation-owned process group. */
 export async function runProcess(argv: readonly string[], options: ProcessOptions): Promise<{ exitCode: number; output: string; truncated: boolean }> {
@@ -139,6 +149,7 @@ export class Workspaces {
   private readonly controllers = new Map<string, Set<AbortController>>()
   private readonly inFlight = new Set<Promise<unknown>>()
   private readonly baselines = new Map<string, Promise<WorkspaceBaseline>>()
+  private readonly commonDirs = new Map<string, Promise<string>>()
   private readonly cleanupIssues: string[] = []
   private closing = false
 
@@ -176,6 +187,51 @@ export class Workspaces {
     this.inFlight.add(work)
     void work.finally(() => { signal?.removeEventListener('abort', abort); active.delete(controller); if (active.size === 0) this.controllers.delete(memberId); this.inFlight.delete(work) }).catch(() => undefined)
     return work
+  }
+
+  /** Canonical git common dir of one repository; the unit its worktree metadata belongs to. */
+  private commonDir(cwd: string): Promise<string> {
+    const key = path.resolve(cwd)
+    const cached = this.commonDirs.get(key)
+    if (cached !== undefined) return cached
+    const pending = (async () => {
+      const resolved = await this.git(cwd, ['rev-parse', '--git-common-dir'])
+      const absolute = path.resolve(cwd, resolved)
+      return await realpath(absolute).catch(() => absolute)
+    })()
+    this.commonDirs.set(key, pending)
+    void pending.catch(() => { if (this.commonDirs.get(key) === pending) this.commonDirs.delete(key) })
+    return pending
+  }
+
+  /** Serialize worktree metadata mutation for one repository, never per member or mission. */
+  private async queueWorktree<T>(cwd: string, callback: () => Promise<T>): Promise<T> {
+    const key = await this.commonDir(cwd)
+    const previous = worktreeQueues.get(key) ?? Promise.resolve()
+    const result = previous.then(callback)
+    const tail = result.then(() => undefined, () => undefined)
+    worktreeQueues.set(key, tail)
+    try { return await result } finally { if (worktreeQueues.get(key) === tail) worktreeQueues.delete(key) }
+  }
+
+  /** Serialized `git worktree add` with one retry for a cross-process metadata race. */
+  private async worktreeAdd(cwd: string, target: string, commit: string, signal?: AbortSignal): Promise<void> {
+    await this.queueWorktree(cwd, async () => {
+      try { await this.git(cwd, ['worktree', 'add', '--detach', target, commit], signal); return }
+      catch (error) {
+        if (!(error instanceof Error) || !WORKTREE_METADATA_RACE.test(error.message)) throw error
+        // Another process outside this manager can still publish the metadata
+        // non-atomically. Drop the partial registration and retry exactly once.
+        await rm(target, { recursive: true, force: true }).catch(() => undefined)
+        await this.git(cwd, ['worktree', 'prune'], signal).catch(() => undefined)
+        await this.git(cwd, ['worktree', 'add', '--detach', target, commit], signal)
+      }
+    })
+  }
+
+  /** Serialized worktree metadata mutation (remove/prune) for one repository. */
+  private async worktreeGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
+    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal))
   }
 
   private async missionRecord(missionId: string): Promise<MissionWorkspace> {
@@ -231,7 +287,7 @@ export class Workspaces {
       })
       if (exists === undefined) {
         await mkdir(path.dirname(planningWorkspace), { recursive: true, mode: 0o700 })
-        await this.git(source, ['worktree', 'add', '--detach', planningWorkspace, baseline.snapshotCommit], ownedSignal)
+        await this.worktreeAdd(source, planningWorkspace, baseline.snapshotCommit, ownedSignal)
       } else if (exists !== planningWorkspace || await this.git(planningWorkspace, ['rev-parse', 'HEAD^{commit}'], ownedSignal) !== baseline.snapshotCommit || await this.git(planningWorkspace, ['status', '--porcelain=v1', '--untracked-files=all'], ownedSignal)) throw new Error('Planning snapshot checkout was changed; restore the saved snapshot before continuing')
       if (record.baseline === undefined) await writePrivateJson(manifest, { ...record, baseline })
       return baseline
@@ -276,10 +332,45 @@ export class Workspaces {
         return workspace
       }
       await mkdir(path.dirname(workspace), { recursive: true, mode: 0o700 })
-      await this.git(source, ['worktree', 'add', '--detach', workspace, saved.baseCommit], signal)
+      await this.worktreeAdd(source, workspace, saved.baseCommit, signal)
       await writePrivateJson(this.memberPath(mission.id, memberId), { version: 1, missionId: mission.id, memberId, workspace } satisfies MemberWorkspace)
       return workspace
     })
+  }
+
+  /** Dependency directory names the plugin links into checkouts; never member work. */
+  private dependencyNames(): ReadonlySet<string> {
+    return new Set(this.options.verificationDependencyDirs ?? ['node_modules'])
+  }
+
+  /**
+   * A member's dependency link (the `node_modules` symlink it creates to run
+   * declared checks, or a configured verification dependency directory) is not
+   * work. `.gitignore` declares `node_modules/`, a directory-only pattern, so a
+   * symlink of that name stays untracked and would otherwise block every task
+   * prepared after the member ran a check.
+   */
+  private async isDependencyLink(workspace: string, relative: string): Promise<boolean> {
+    if (!this.dependencyNames().has(path.basename(relative))) return false
+    const info = await lstat(path.join(workspace, relative)).catch(() => undefined)
+    return info !== undefined && (info.isSymbolicLink() || info.isDirectory())
+  }
+
+  /**
+   * Porcelain entries that are real uncommitted work. Untracked dependency
+   * links are ignored; a modified tracked path, a staged path, or any other
+   * untracked path (including a regular file merely named like a dependency
+   * directory) is returned and still refuses preparation.
+   */
+  private async uncommittedWork(workspace: string, signal: AbortSignal): Promise<string[]> {
+    const output = await this.git(workspace, ['status', '--porcelain=v1', '--untracked-files=all', '-z'], signal, undefined, INVENTORY_BYTES)
+    const work: string[] = []
+    for (const entry of output.split('\0')) {
+      if (entry === '') continue
+      if (entry.startsWith('?? ') && await this.isDependencyLink(workspace, entry.slice(3))) continue
+      work.push(entry)
+    }
+    return work
   }
 
   async prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> {
@@ -301,9 +392,10 @@ export class Workspaces {
         await this.saveTaskWorkspace(record)
         return
       }
-      if ((await this.git(member.workspace, ['status', '--porcelain=v1', '--untracked-files=all'], signal)).length > 0) throw new Error('Member workspace has uncommitted work; submit or resolve it before starting another task')
+      if ((await this.uncommittedWork(member.workspace, signal)).length > 0) throw new Error('Member workspace has uncommitted work; submit or resolve it before starting another task')
       const previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
       if (record.task !== undefined && previousHead !== (record.task.capturedCommit ?? record.task.baseCommit)) throw new Error('Member has unsubmitted commits; capture them before preparing another task')
+      if (record.task !== undefined && record.task.taskId !== task.id) await this.checkpointAbandonedTask(record, task.id)
       // Each task starts only with the mission base and explicitly accepted dependencies.
       // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
       const mission = await this.missionRecord(member.missionId)
@@ -338,6 +430,29 @@ export class Workspaces {
     if (record.task !== undefined) await writePrivateJson(this.taskPath(record.missionId, record.task.taskId), { ...record, task: record.task } satisfies TaskWorkspace)
   }
 
+  /**
+   * A member leaving a task for another one writes that task's immutable
+   * checkpoint, so a later attempt never hits the uncheckpointed-owner dead end.
+   * The member's workspace was just verified clean and at `capturedCommit ??
+   * baseCommit`. `saveTaskWorkspace` writes the member record before the task
+   * record, so a crash or failed write between the two leaves a split state:
+   * the member record holds the captured commit while the task record does not.
+   * That captured commit is repaired from the member record here; otherwise the
+   * quiescent base is written. The write happens only while this member's own
+   * task record is still current: after a handoff the task record names the new
+   * owner, and the previous owner must never overwrite it.
+   */
+  private async checkpointAbandonedTask(record: MemberWorkspace, nextTaskId: string): Promise<void> {
+    const previous = record.task
+    if (previous === undefined || previous.taskId === nextTaskId) return
+    const saved = await readJson(this.taskPath(record.missionId, previous.taskId))
+    if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
+    await writePrivateJson(this.taskPath(record.missionId, previous.taskId), {
+      version: 1, missionId: record.missionId, memberId: record.memberId, workspace: record.workspace,
+      task: { ...previous, capturedCommit: previous.capturedCommit ?? previous.baseCommit },
+    } satisfies TaskWorkspace)
+  }
+
   /** Carry a previous owner's quiescent partial work into a replacement attempt. */
   private async recoverTask(member: Member, task: Task): Promise<Pick<Artifact, 'commit' | 'baseCommit'> | undefined> {
     const value = await readJson(this.taskPath(member.missionId, task.id))
@@ -350,7 +465,14 @@ export class Workspaces {
       // is preserved if that check fails; no partial change is silently dropped.
       return await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch })
     }
-    if (!commitId(value.task.capturedCommit)) throw new Error('Previous task workspace has moved on without an immutable checkpoint')
+    if (!commitId(value.task.capturedCommit)) {
+      // The recorded owner moved on without ever capturing a commit. It could
+      // only leave for another task from a clean workspace at the recorded base
+      // (prepareTask refuses a dirty or ahead workspace), so that base is the
+      // immutable checkpoint. Recover from it instead of dead-ending the task
+      // permanently; a fresh record is written for the new attempt below.
+      return { commit: value.task.baseCommit, baseCommit: value.task.baseCommit }
+    }
     return { commit: value.task.capturedCommit, baseCommit: value.task.baseCommit }
   }
 
@@ -381,16 +503,42 @@ export class Workspaces {
     }
   }
 
+  /**
+   * Dependency links present in a member workspace that are not tracked in
+   * HEAD: the `node_modules` symlink the member creates to run checks and any
+   * configured verification dependency directory. They are toolchain state,
+   * not artifact content, so capture must neither record them nor treat them as
+   * out-of-scope work. A path tracked in HEAD is real content and is never a
+   * link. A link a previous capture attempt staged is included so it can be
+   * unstaged before the commit.
+   */
+  private async dependencyLinks(workspace: string, signal: AbortSignal): Promise<Set<string>> {
+    const candidates = new Set<string>()
+    for (const name of (await this.git(workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) candidates.add(name)
+    for (const name of (await this.git(workspace, ['diff', '--cached', '--name-only', '--diff-filter=A', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) candidates.add(name)
+    const links = new Set<string>()
+    for (const name of candidates) {
+      if (!await this.isDependencyLink(workspace, name)) continue
+      if (!await this.git(workspace, ['cat-file', '-e', `HEAD:${name}`], signal).then(() => true, () => false)) links.add(name)
+    }
+    return links
+  }
+
   async captureArtifact(member: Member, task: Task): Promise<Artifact> {
     return await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
       if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('Task has no matching prepared workspace baseline')
       const baseCommit = record.task.baseCommit
+      // Member-created dependency links are toolchain state, not work: they are
+      // excluded from the changed set, unstaged if an earlier capture staged
+      // them, and kept out of the commit. A tracked path of the same name stays
+      // ordinary work and is still scope-checked.
+      const links = await this.dependencyLinks(member.workspace, signal)
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
       // deleted source path too, instead of only the in-scope destination.
-      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
-      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) changed.add(name)
+      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean).filter(name => !links.has(name)))
+      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) if (!links.has(name)) changed.add(name)
       for (const name of changed) if (!withinScope(name, task.scope)) throw new Error(`Artifact changes path outside task scope: ${name}`)
       // Untracked symlinks are invisible to `git diff`; inspect every changed
       // working-tree path before committing so an escaping link is never
@@ -399,7 +547,8 @@ export class Workspaces {
         const info = await lstat(path.join(member.workspace, name)).catch(() => undefined)
         if (info?.isSymbolicLink()) assertContainedSymlink(member.workspace, name, await readlink(path.join(member.workspace, name)))
       }
-      await this.git(member.workspace, ['add', '--all', '--', '.'], signal)
+      for (const link of links) await this.git(member.workspace, ['rm', '--cached', '--force', '--quiet', '--', link], signal).catch(() => undefined)
+      await this.git(member.workspace, ['add', '--all', '--', '.', ...[...links].map(link => `:(exclude,literal)${link}`)], signal)
       const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
       if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
       const commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
@@ -423,7 +572,7 @@ export class Workspaces {
       const mission = await this.missionRecord(member.missionId)
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
       await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
-      await this.git(mission.source, ['worktree', 'add', '--detach', checkout, artifact.commit], signal)
+      await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
       try {
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
         const cache = this.checkCacheEnvironment(checkout)
@@ -469,16 +618,16 @@ export class Workspaces {
   private async cleanupVerification(source: string, checkout: string): Promise<void> {
     let failure: unknown
     try {
-      await this.git(source, ['worktree', 'remove', '--force', checkout])
+      await this.worktreeGit(source, ['worktree', 'remove', '--force', checkout])
       return
     } catch (error) { failure = error }
     if (!(await lstat(checkout).then(() => true, () => false))) {
-      try { await this.git(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
+      try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
       return
     }
     try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
     catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
-    try { await this.git(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
+    try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
     this.recordCleanupIssue(checkout, failure)
   }
 

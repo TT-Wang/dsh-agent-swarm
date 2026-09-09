@@ -68,6 +68,7 @@
     "test": "npm run build && node --test tests/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run test:harness && npm run test:pack && npm run test:profile && npm run test:web && npm run test:command-web",
     "test:harness": "node --expose-internals tests/harness-composition.mjs",
+    "test:faults": "node scripts/faults/run.mjs",
     "test:pack": "node scripts/smoke-pack.mjs",
     "test:profile": "node scripts/smoke-profile.mjs",
     "test:web": "node scripts/smoke-web.mjs",
