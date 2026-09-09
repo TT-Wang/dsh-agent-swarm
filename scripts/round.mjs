@@ -150,13 +150,19 @@ if (command === 'gate') {
 if (command === 'promote') {
   const commit = value('--commit', 'HEAD')
   const sha = execFileSync('git', ['-C', project, 'rev-parse', commit], { encoding: 'utf8' }).trim()
-  // An integration artifact's parent may be an internal merge commit, so its
-  // delta is not its content. --base names the mission baseline the artifact is
-  // authoritative against; default stays the parent for simple task artifacts.
-  const base = execFileSync('git', ['-C', project, 'rev-parse', value('--base', `${sha}^`)], { encoding: 'utf8' }).trim()
+  // The recorded green gate is the precondition, so refuse before any
+  // history-dependent work: a shallow clone may not contain the artifact's
+  // parent, and the refusal must still name the missing gate (fault F4).
   const gateFile = join(lab, 'gates', `${sha}.json`)
   const gate = existsSync(gateFile) ? JSON.parse(readFileSync(gateFile, 'utf8')) : undefined
   if (gate?.green !== true) fail(`no recorded green gate for ${sha.slice(0, 12)}; run: node scripts/round.mjs gate --commit ${sha.slice(0, 12)} --full`)
+  // An integration artifact's parent may be an internal merge commit, so its
+  // delta is not its content. --base names the mission baseline the artifact is
+  // authoritative against; default stays the parent for simple task artifacts.
+  const baseSpec = value('--base', `${sha}^`)
+  let base
+  try { base = execFileSync('git', ['-C', project, 'rev-parse', '--verify', `${baseSpec}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() }
+  catch { fail(`cannot resolve --base ${baseSpec}; a shallow clone may not contain the artifact's parent, so pass --base <commit> explicitly`) }
   const paths = execFileSync('git', ['-C', project, 'diff', '--name-only', base, sha], { encoding: 'utf8' }).trim().split('\n').filter(Boolean)
   const dirty = execFileSync('git', ['-C', project, 'status', '--porcelain', '--', ...paths], { encoding: 'utf8' }).trim()
   if (dirty) fail(`working tree is dirty in promoted paths:\n${dirty}`)
