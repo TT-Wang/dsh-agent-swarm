@@ -189,6 +189,47 @@ test('AC4: prefix confusion, traversal and symlink escapes are refused; a symlin
   await assert.rejects(workspaces.prepareBaseline(mission), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
 })
 
+/**
+ * T3e: the native /agent-swarm request path. `prepareStart` snapshots the
+ * request workspace through a synthetic baseline record; that record must carry
+ * the authorization source and root the request recorded, or the X3 fail-closed
+ * rule fences a session-cwd request before planning. The control proves X3 is
+ * not weakened: a granted request whose root the human removed still fences.
+ */
+test('T3e: prepareStart authorizes a session-cwd baseline and still fences a removed grant root', async t => {
+  const { temp, session, granted, project } = await fixture(t)
+  const initRepo = async cwd => {
+    const run = async (...args) => { const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 }); assert.equal(result.exitCode, 0, result.output) }
+    await run('init', '-q'); await run('commit', '-q', '--allow-empty', '-m', 'initial')
+  }
+  await initRepo(session); await initRepo(project)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const workspaces = new Workspaces({ workspacesRoot: join(temp, 'snapshots'), checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv, grants })
+  const adapter = { bind() {}, prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() }
+  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, adapter)
+  t.after(async () => { await runtime.dispose() })
+
+  // The native command path records a session authorization for the session cwd.
+  const owner = { sessionId: 'owner-t3e', agent: { id: 'owner-t3e', session: { header: { cwd: session } } } }
+  const request = runtime.requestStart(owner, { commandId: 't3e-session', goal: 'Plan the change', workspace: session })
+  assert.equal(request.workspaceAuthorizationSource, 'session', 'a session-cwd request records source session')
+  assert.equal(request.workspaceGrantRoot, session)
+  const prepared = await runtime.prepareStart(owner, request.id)
+  assert.ok(prepared.baseline.planningWorkspace.startsWith(join(temp, 'snapshots')), 'the baseline snapshot is prepared instead of fenced')
+  assert.equal(runtime.store.events(request.id, 500).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'a session baseline is not revoked')
+  assert.equal(runtime.store.get('starts', request.id).status, 'planning')
+
+  // Control: the human removed the granted root, so the granted request still
+  // fails closed at baseline preparation (X3 preserved).
+  const owner2 = { sessionId: 'owner-t3e-2', agent: { id: 'owner-t3e-2', session: { header: { cwd: session } } } }
+  const grantedRequest = runtime.requestStart(owner2, { commandId: 't3e-granted', goal: 'Plan granted work', workspace: project })
+  assert.equal(grantedRequest.workspaceAuthorizationSource, 'grant')
+  assert.equal(grantedRequest.workspaceGrantRoot, await realpath(granted))
+  grants.grants.length = 0
+  await assert.rejects(runtime.prepareStart(owner2, grantedRequest.id), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  assert.equal(runtime.store.get('starts', grantedRequest.id).baseline, undefined, 'a fenced baseline records no snapshot')
+})
+
 /** Criterion 5: workers never create missions or use grants; missions cannot be re-pointed. */
 test('AC5: a worker session cannot create a mission or use a grant, and another session cannot re-point a mission', async t => {
   const { temp, session, granted, project } = await fixture(t)
@@ -375,4 +416,51 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   assert.match(notice.content, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   assert.equal(restarted.store.events(sessionMission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'a session-cwd mission is never fenced')
   await restarted.addMember(sessionOwner, sessionMission.id, { name: 'Second', role: 'implementation' })
+})
+
+/**
+ * X3 (external review): revocation fencing must fail closed when the recorded
+ * authorization source is absent. `workspace === root` with `source` omitted
+ * must be judged by the configured set, never by the permissive session
+ * shortcut, at both the module and the runtime site.
+ */
+test('X3: a recorded root equal to the workspace fails closed when its source is missing and the root is revoked', async t => {
+  const { temp, granted } = await fixture(t)
+  const grantedPath = await realpath(granted)
+  const live = await loadWorkspaceGrants([{ path: granted }])
+  const removed = await loadWorkspaceGrants([])
+
+  // Direct module, workspace === root, source omitted.
+  const liveControl = await reauthorizeWorkspace(grantedPath, grantedPath, live, undefined)
+  assert.equal(liveControl.ok, true, 'a still-configured root authorizes an exact-root record with no source')
+  assert.equal(liveControl.source, 'grant', 'the configured set decides before any session shortcut')
+  const revokedControl = await reauthorizeWorkspace(grantedPath, grantedPath, removed, undefined)
+  assert.equal(revokedControl.ok, false, 'a missing source must not pick the permissive session branch')
+  assert.match(revokedControl.diagnostic, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  const explicitSession = await reauthorizeWorkspace(grantedPath, grantedPath, removed, 'session')
+  assert.equal(explicitSession.ok, true, 'an explicit session record stays authorized when its root is not configured')
+  assert.equal(explicitSession.source, 'session')
+  assert.equal((await reauthorizeWorkspace(grantedPath, grantedPath, removed, 'grant')).ok, false, 'an explicit grant record is refused once the root is revoked')
+
+  // Runtime path: a durable record that carries the anchor but no source must
+  // fence on revocation, and must stay staffable while the root is configured.
+  const before = new SwarmRuntime({ ...runtimeConfig(temp), grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) }, new Workers())
+  const owner = { sessionId: 'owner-x3' }
+  const mission = before.create(owner, { title: 'Missing source', objective: 'Fail closed on revocation', workspace: grantedPath, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  const stored = before.store.get('missions', mission.id)
+  delete stored.workspaceAuthorizationSource
+  before.store.transaction(() => before.store.put('missions', stored))
+  assert.equal(before.store.get('missions', mission.id).workspaceAuthorizationSource, undefined, 'the simulated record has no source')
+  await before.addMember(owner, mission.id, { name: 'Live control', role: 'implementation' })
+  assert.equal(before.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'the live root keeps the source-less record authorized')
+  await before.dispose()
+
+  const restarted = new SwarmRuntime({ ...runtimeConfig(temp), grants: removed, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, removed) }, new Workers())
+  t.after(async () => { await restarted.dispose() })
+  await assert.rejects(restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
+  assert.equal(revoked.length, 1, 'the source-less record is fenced exactly once on revocation')
+  assert.match(revoked[0].data.reason, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  assert.ok(restarted.store.list('deliveries', mission.id).some(delivery => delivery.to === 'owner' && delivery.kind === 'control'), 'the owner is notified of the revocation')
 })

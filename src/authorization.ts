@@ -158,11 +158,18 @@ export async function reauthorizeWorkspace(workspace: string, recordedRoot: stri
   if (resolved === undefined) return { ok: false, diagnostic: `Authorized workspace ${workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]` }
   const root = recordedRoot === undefined ? undefined : await realpath(recordedRoot).catch(() => undefined)
   if (root === undefined) return { ok: false, diagnostic: `Workspace ${workspace} has no recorded authorized root [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  // A session workspace records itself as its own root: it stays authorized
-  // while the path still resolves to that exact directory. A grant whose root
-  // happens to equal the workspace is NOT a session workspace, so the equality
-  // shortcut must not apply to it — otherwise removing the root never fences.
-  if (resolved === root && source !== 'grant') return { ok: true, workspace: resolved, source: 'session', grantRoot: root }
+  // X3: the configured set decides first. A recorded root that currently
+  // matches a configured grant is a grant even when the record omitted its
+  // source, so it stays authorized while the human keeps the root. A session
+  // workspace is admitted only when the record explicitly says 'session': a
+  // missing source on a root that is not configured could be a revoked grant
+  // whose root happens to equal the workspace, and that must fail closed.
+  if (resolved === root) {
+    const configured = activeGrants(loaded, now).find(candidate => candidate.path === root)
+    if (configured !== undefined) return { ok: true, workspace: resolved, source: 'grant', grantRoot: root, grant: configured }
+    if (source === 'session') return { ok: true, workspace: resolved, source: 'session', grantRoot: root }
+    return { ok: false, diagnostic: `Authorized root ${recordedRoot} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }
+  }
   if (!isContained(root, resolved)) return { ok: false, diagnostic: `Workspace ${workspace} escaped its recorded authorized root ${recordedRoot} [${WORKSPACE_AUTHORIZATION_CODE}]` }
   const grant = activeGrants(loaded, now).find(candidate => candidate.path === root)
   if (grant === undefined) return { ok: false, diagnostic: `Authorized root ${recordedRoot} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }

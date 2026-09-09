@@ -57,6 +57,15 @@ export const zh: Record<string, string> = {
   'activity': '活动', 'resume-failed': '恢复失败', 'workstream': '工作流', 'requested': '已请求',
   'lease-expiring': '租约即将到期', 'closeout-ready': '可收尾', 'closeout-exhausted': '收尾次数已用尽',
   'quiescence-recovered': '静止后已恢复', 'review-retired': '审查已退役', 'effort-downgraded': '推理强度已降级',
+  // R11-08: the review-path, check-change, restart-recovery and
+  // workspace-authorization event tokens, plus the residual vocabulary tokens
+  // the derived F-33 guard covers.
+  'review-missing': '缺少审查', 'review-admitted': '已准入审查', 'review-blocked': '审查受阻', 'check-changed': '检查已变更',
+  'start-failed': '启动失败', 'reassigned': '已重新分配', 'coordinator': '协调者',
+  'grant-loaded': '已加载授权', 'workspace-bound': '已绑定工作目录', 'workspace-revoked': '工作目录授权已撤销',
+  'pause': '暂停', 'resume': '继续', 'stop': '停止', 'complete': '完成',
+  'admission': '准入', 'limit': '上限', 'refused': '已拒绝', 'effort-rejected': '推理强度被拒绝',
+  'trace': '追踪', 'span': '跨度', 'verdict': '裁决',
   'A redundant review was retired': '已退役多余的审查', 'Worker reasoning effort downgraded': '成员的推理强度已降级',
   'Mission recovered': '任务已恢复', 'Budget warning': '预算警告',
   'Task ready to close out': '子任务可以收尾', 'Task close-out limit reached': '子任务收尾次数已达上限',
@@ -64,6 +73,21 @@ export const zh: Record<string, string> = {
   'Task ceiling reached': '子任务超出执行上限', 'Task preparation failed': '子任务准备失败',
   'Task resumed after budget pause': '子任务在预算暂停后已恢复', 'Task resume skipped': '已跳过子任务恢复',
   'Worker added': '成员已加入', 'Worker subscriptions updated': '成员订阅已更新',
+  // R11-08: review-path, check-change and workspace-authorization labels.
+  'Submitted work has no review': '已提交的工作尚无审查', 'Independent review admitted': '已自动准入独立审查',
+  'Submitted work cannot be reviewed': '已提交的工作无法审查', 'A declared check changed': '声明的检查已变更',
+  'Worker could not resume after restart': '成员重启后未能恢复', 'Task failed to start': '子任务启动失败',
+  'Task re-routed to another member': '子任务已改派给其他成员', 'Mission coordinator set': '已设置任务协调者',
+  'Authorized workspace root loaded': '已加载授权工作目录根', 'Mission bound to an authorized workspace': '任务已绑定到授权工作目录',
+  'Mission workspace authorization revoked': '任务工作目录授权已撤销',
+  // T3 integration: the arena-protocol, host-cap and isolation event tokens and
+  // labels the merged branches emit (R11-01/02/07/14/15/17/19).
+  'escalation': '升级', 'raised': '已发起', 'isolation': '隔离', 'temp-rendezvous': '临时目录会合',
+  'provider': '提供方', 'outage': '服务中断', 'store': '存储', 'restore-requested': '已请求恢复', 'restored': '已恢复',
+  'check-envelope': '检查并发区间', 'proposal-refused': '提议被拒绝', 'restart-repended': '重启后重新排队',
+  'A worker escalated to the owner': '成员已向主对话发起升级', 'Work proposal refused': '工作提议被拒绝',
+  'Provider route paused': '提供方服务中断，任务已暂停', 'Provider route recovered': '提供方服务已恢复',
+  'Task re-pended after host restart': '主机重启后子任务重新排队', 'Members shared a temp path': '成员共享了临时路径',
   'Project snapshot': '项目快照', 'existing changed files included': '个已有改动文件已纳入',
   'Your branch, staged changes and source files were preserved.': '创建快照时保留了你的分支、暂存状态和源文件。',
   'Collaboration result': '协作成果', 'View changes': '查看修改', 'Apply result': '应用结果',

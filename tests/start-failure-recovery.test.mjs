@@ -39,7 +39,11 @@ class StartFailureWorkers {
   async prepareWorkspace(mission, memberId) { return `/isolated/${memberId}` }
   async start(spec) {
     this.starts.push(spec.member.id)
-    if (spec.member.id === this.failMember) throw new Error(`provider unavailable for ${spec.member.name}`)
+    // Deliberately not provider-outage wording: R11-01 classifies "provider
+    // unavailable" as a quiescent outage with its own recovery policy and its
+    // own regression (tests/provider-outage.test.mjs). This suite tests the
+    // generic start-failure policy.
+    if (spec.member.id === this.failMember) throw new Error(`worker bootstrap failed for ${spec.member.name}`)
   }
   async deliver(member, delivery) { this.deliveries.push(delivery) }
   async stop() {}
@@ -82,7 +86,7 @@ test('R5-02: a start failure spends one credit, re-pends, and re-routes after k 
     'the first start failure did not spend a recovery credit')
   assert.equal(repended.status, 'pending', 'a recoverable start failure re-pends the task')
   assert.equal(repended.assigneeId, f.alpha.id, 'below the re-route limit the same live member retries')
-  assert.match(repended.output, /Worker could not start: (Error: )?provider unavailable for Alpha/)
+  assert.match(repended.output, /Worker could not start: (Error: )?worker bootstrap failed for Alpha/)
   const first = f.events('task/start-failed')
   assert.equal(first.length, 1, 'the start failure emits a durable task transition, not only member/resume-failed')
   assert.equal(first[0].data.taskId, proposed.id)
@@ -96,7 +100,7 @@ test('R5-02: a start failure spends one credit, re-pends, and re-routes after k 
   assert.equal(reassigned.data.from, f.alpha.id)
   assert.equal(reassigned.data.to, f.beta.id)
   assert.equal(reassigned.data.consecutiveFailures, K)
-  assert.match(reassigned.data.reason, /provider unavailable for Alpha/)
+  assert.match(reassigned.data.reason, /worker bootstrap failed for Alpha/)
   const credits = f.events('task/start-failed').filter(event => event.data.taskId === proposed.id)
   assert.deepEqual(credits.map(event => event.data.recoveryCount), [1, 2, 3], 'each start failure spends exactly one credit')
   assert.deepEqual(credits.map(event => event.data.consecutiveFailures), [1, 2, 3])
@@ -121,7 +125,7 @@ test('R5-02: a start failure blocks only when the task recovery limit is exhaust
   const blocked = await eventually(() => f.task(proposed.id).status === 'blocked' && f.task(proposed.id),
     'the task never blocked after exhausting its recovery limit')
   assert.equal(blocked.recoveryCount, 2)
-  assert.match(blocked.output, /Worker could not start: (Error: )?provider unavailable for Alpha/)
+  assert.match(blocked.output, /Worker could not start: (Error: )?worker bootstrap failed for Alpha/)
   const credits = f.events('task/start-failed').filter(event => event.data.taskId === proposed.id)
   assert.deepEqual(credits.map(event => event.data.status), ['pending', 'blocked'], 'the task re-pends until the limit and blocks only then')
   assert.deepEqual(credits.map(event => event.data.recoveryCount), [1, 2])

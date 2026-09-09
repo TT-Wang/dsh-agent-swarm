@@ -1,6 +1,7 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
 import { spawnSync } from 'node:child_process'
-import { isAbsolute } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
 import type { TaskCeiling, TaskCeilingDimension } from './types.ts'
 
@@ -353,11 +354,62 @@ const HOST_ONLY_CHECKS: Array<{ pattern: RegExp; requirement: string }> = [
   { pattern: /node\s+scripts\/smoke-command-web\.mjs/, requirement: 'the command-web smoke suite needs the host web/session boundary' },
   { pattern: /tests\/verification-isolation\.mjs/, requirement: 'the isolation suite asserts a real sandbox refusal and only runs on an unsandboxed host' },
   { pattern: /(?:^|[\s;&|()])(?:sandbox-exec|dsh\s+sandbox)\b/, requirement: 'a nested sandbox invocation is refused inside a worker sandbox' },
+  // R11-06: the remaining declared host-gate entry points. The name patterns
+  // keep plan validation honest without a manifest, and `classifyCheck` also
+  // resolves the script body when the manifest is available (see below).
+  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:deepseek(?:\s|$)/, requirement: 'the deepseek smoke needs a built Harness checkout and an unsandboxed host' },
+  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:command-deepseek(?:\s|$)/, requirement: 'the command-deepseek smoke needs a built Harness checkout and an unsandboxed host' },
+  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:sidebar-service(?:\s|$)/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
+  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:validation-repair-web(?:\s|$)/, requirement: 'the validation-repair web smoke needs the host web/session boundary' },
+  { pattern: /node\s+--expose-internals\s+scripts\/smoke-[\w.-]+\.mjs/, requirement: 'an expose-internals smoke needs a built Harness checkout and an unsandboxed host' },
+  { pattern: /node\s+scripts\/smoke-better-sidebar\.mjs/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
 ]
 
-export function classifyCheck(command: string): CheckClassification {
+/**
+ * R11-06: read the workspace manifest's declared scripts, read-only and
+ * bounded. The classifier uses it to judge an `npm run <name>` by the command
+ * the name actually resolves to, so a host-only suite cannot hide behind a
+ * neutral script name and a worker-runnable script is never refused by name.
+ * Returns undefined when the manifest is absent, unreadable, oversized or
+ * malformed; the name patterns above still apply.
+ */
+export function loadPackageScripts(workspace: string): Record<string, string> | undefined {
+  try {
+    const raw = readFileSync(join(workspace, 'package.json'), 'utf8')
+    if (raw.length > 1_000_000) return undefined
+    const parsed = JSON.parse(raw) as { scripts?: unknown }
+    const scripts = parsed?.scripts
+    if (scripts === null || typeof scripts !== 'object' || Array.isArray(scripts)) return undefined
+    const result: Record<string, string> = {}
+    for (const [name, body] of Object.entries(scripts as Record<string, unknown>)) if (typeof body === 'string') result[name] = body
+    return result
+  } catch { return undefined }
+}
+/** R11-06: bounded recursive resolution of `npm run <name>` to a host-only body. */
+function resolveHostOnlyScript(command: string, scripts: Record<string, string>, seen: Set<string>, depth: number): string | undefined {
+  if (depth > 4) return undefined
+  const pattern = /(?:^|[\s;&|()])npm\s+(?:run\s+|run-script\s+)?([A-Za-z0-9:_.-]+)/g
+  for (let match = pattern.exec(command); match !== null; match = pattern.exec(command)) {
+    const name = match[1]!
+    const body = scripts[name]
+    if (body === undefined || seen.has(name)) continue
+    seen.add(name)
+    for (const { pattern: hostPattern, requirement } of HOST_ONLY_CHECKS) {
+      if (hostPattern.test(body)) return `script ${JSON.stringify(name)} resolves to ${JSON.stringify(body)}, which ${requirement}`
+    }
+    const nested = resolveHostOnlyScript(body, scripts, seen, depth + 1)
+    if (nested !== undefined) return `script ${JSON.stringify(name)} resolves to ${JSON.stringify(body)}: ${nested}`
+  }
+  return undefined
+}
+
+export function classifyCheck(command: string, scripts?: Record<string, string>): CheckClassification {
   for (const { pattern, requirement } of HOST_ONLY_CHECKS) {
     if (pattern.test(command)) return { command, runnable: 'host-only', code: 'check_requires_host', requirement }
+  }
+  if (scripts !== undefined) {
+    const resolved = resolveHostOnlyScript(command, scripts, new Set(), 0)
+    if (resolved !== undefined) return { command, runnable: 'host-only', code: 'check_requires_host', requirement: resolved }
   }
   return { command, runnable: 'worker' }
 }
@@ -380,32 +432,219 @@ export function isSystemCheckPath(candidate: string): boolean {
   return SYSTEM_CHECK_PATH_ALLOWLIST.includes(candidate) || SYSTEM_CHECK_PATH_PREFIXES.some(prefix => candidate.startsWith(prefix))
 }
 
+/** One shell word after quote removal and backslash unescaping. */
+export interface ShellToken { text: string; offset: number }
+const SHELL_WORD_OPERATORS = new Set([';', '&', '|', '(', ')', '<', '>', '\n'])
 /**
- * Absolute path tokens named by a shell command. The command is split into
- * shell words, an assignment prefix (`VAR=value`) is peeled so its value is
- * judged, and a path is recognised only where a path component can begin: at a
- * word start, after `=` `:` `@` `,`, or after an attached short option
- * (`-I/abs`). `https://…` and a `//`-leading segment are not local paths, and a
- * `$PWD/…` expansion is not absolute. A `PATH`-style colon list is split so
- * each entry is judged on its own. This is a bounded token scanner, not a shell
- * parser: `${VAR}` indirection, `$(…)` output, `eval` and aliases/functions can
+ * R11-04: a bounded POSIX-ish word splitter. It resolves single/double quotes
+ * and backslash escapes (so `\/abs` and `"//abs"` become the words a shell would
+ * execute), splits unquoted shell operators into their own tokens, keeps
+ * backtick substitution bodies verbatim (a documented residual), and treats
+ * `$(` as an operator boundary so an absolute path inside a substitution stays
+ * visible. It is not a shell parser: `${VAR}`, `$'…'` ANSI-C quoting, `eval`
+ * and aliases/functions remain documented residuals.
+ */
+export function shellTokens(command: string): ShellToken[] {
+  const tokens: ShellToken[] = []
+  let text = ''
+  let offset = -1
+  let index = 0
+  const flush = (): void => { if (text !== '') { tokens.push({ text, offset }); text = ''; offset = -1 } }
+  while (index < command.length) {
+    const char = command[index]!
+    if (char === '\\' && index + 1 < command.length) {
+      if (offset < 0) offset = index
+      if (command[index + 1] !== '\n') text += command[index + 1]!
+      index += 2
+      continue
+    }
+    if (char === "'") {
+      const close = command.indexOf("'", index + 1)
+      const end = close === -1 ? command.length : close
+      if (offset < 0) offset = index
+      text += command.slice(index + 1, end)
+      index = close === -1 ? command.length : close + 1
+      continue
+    }
+    if (char === '"') {
+      if (offset < 0) offset = index
+      let cursor = index + 1
+      while (cursor < command.length && command[cursor] !== '"') {
+        const inner = command[cursor]!
+        if (inner === '\\' && cursor + 1 < command.length && ['$', '`', '"', '\\', '\n'].includes(command[cursor + 1]!)) {
+          if (command[cursor + 1] !== '\n') text += command[cursor + 1]!
+          cursor += 2
+        } else { text += inner; cursor++ }
+      }
+      index = cursor < command.length ? cursor + 1 : command.length
+      continue
+    }
+    if (char === '`') {
+      const close = command.indexOf('`', index + 1)
+      const end = close === -1 ? command.length : close
+      if (offset < 0) offset = index
+      text += command.slice(index + 1, end)
+      index = close === -1 ? command.length : close + 1
+      continue
+    }
+    if (SHELL_WORD_OPERATORS.has(char)) {
+      flush()
+      tokens.push({ text: char, offset: index })
+      index++
+      continue
+    }
+    if (char === ' ' || char === '\t' || char === '\r') { flush(); index++; continue }
+    if (offset < 0) offset = index
+    text += char
+    index++
+  }
+  flush()
+  return tokens
+}
+/**
+ * R11-04: command segments with the same operator boundaries the R6 git-write
+ * classifier always used (`;`, `|`, `&&`, `||`, newline). A single `&`, `(` and
+ * `)` stay inside a token, so the documented false negatives (`(git commit …)`,
+ * `sleep 1 & git commit …`) stay false instead of widening the denial surface.
+ */
+export function shellSegments(command: string): ShellToken[][] {
+  const segments: ShellToken[][] = [[]]
+  let text = ''
+  let offset = -1
+  let index = 0
+  const flush = (): void => { if (text !== '') { segments[segments.length - 1]!.push({ text, offset }); text = ''; offset = -1 } }
+  const split = (): void => { flush(); if (segments[segments.length - 1]!.length > 0) segments.push([]) }
+  while (index < command.length) {
+    const char = command[index]!
+    if (char === '\\' && index + 1 < command.length) {
+      if (offset < 0) offset = index
+      if (command[index + 1] !== '\n') text += command[index + 1]!
+      index += 2
+      continue
+    }
+    if (char === "'" || char === '"') {
+      const quote = char
+      if (offset < 0) offset = index
+      let cursor = index + 1
+      while (cursor < command.length && command[cursor] !== quote) {
+        const inner = command[cursor]!
+        if (quote === '"' && inner === '\\' && cursor + 1 < command.length && ['$', '`', '"', '\\', '\n'].includes(command[cursor + 1]!)) {
+          if (command[cursor + 1] !== '\n') text += command[cursor + 1]!
+          cursor += 2
+        } else { text += inner; cursor++ }
+      }
+      index = cursor < command.length ? cursor + 1 : command.length
+      continue
+    }
+    if (char === '`') {
+      const close = command.indexOf('`', index + 1)
+      const end = close === -1 ? command.length : close
+      if (offset < 0) offset = index
+      text += command.slice(index + 1, end)
+      index = close === -1 ? command.length : close + 1
+      continue
+    }
+    if (char === '\n' || char === ';' || char === '|' || (char === '&' && command[index + 1] === '&')) {
+      if (char === '&' || char === '|') index++
+      index++
+      split()
+      continue
+    }
+    if (char === ' ' || char === '\t' || char === '\r') { flush(); index++; continue }
+    if (offset < 0) offset = index
+    text += char
+    index++
+  }
+  flush()
+  return segments.filter(segment => segment.length > 0)
+}
+/**
+ * R11-04/A2-01: lexical POSIX normalization of an absolute path, with no
+ * filesystem access: collapse every run of slashes, drop `.` segments and
+ * resolve `..` segments against the already-resolved prefix (never above the
+ * root). `/usr/bin/../..//Users/x` and `/usr/bin/./../..//Users/x` both
+ * normalize to `/Users/x`, which is what the shell would execute, so the system
+ * exemption must be decided on the normalized result.
+ */
+export function normalizeAbsolutePath(candidate: string): string {
+  const segments: string[] = []
+  for (const part of candidate.replace(/^\/+/, '/').split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') { segments.pop(); continue }
+    segments.push(part)
+  }
+  // A trailing slash is preserved so a `/word/` regex literal stays
+  // distinguishable from a single-segment path (`/word`).
+  const trailing = segments.length > 0 && candidate.length > 1 && candidate.endsWith('/') ? '/' : ''
+  return `/${segments.join('/')}${trailing}`
+}
+/**
+ * R11-04: a candidate that is a shell pattern/regex/separator argument rather
+ * than a host filesystem path. The refusal must not reject ordinary correct
+ * checks: `awk -F/`, `sort -t/`, `tr / _` name the bare root as a separator,
+ * `grep -E '/(src|tests)/'` and `--test-name-pattern='/rejects/'` are regex
+ * arguments, and a single-segment `/word/` is a regex literal. A glob path
+ * argument is likewise treated as a pattern here; the residual is documented
+ * because declared-check admission cannot tell a pattern from a literal host
+ * path without executing the shell.
+ */
+const CHECK_PATTERN_METACHARACTERS = /[\^$\[\]()?+{}|*\\]/
+export function isCheckPattern(candidate: string): boolean {
+  if (candidate === '/') return true
+  if (CHECK_PATTERN_METACHARACTERS.test(candidate)) return true
+  return /^\/[^/]*\/$/.test(candidate)
+}
+/**
+ * R11-04/A2-01: absolute path tokens named by a shell command, scanned on the
+ * words a POSIX shell would actually execute. The tokenizer resolves quotes and
+ * backslash escapes, so a backslash-escaped leading slash (`cat \/Users/…`) and
+ * a doubled leading slash (`cat //Users/…`) are both normalized to the same
+ * host path the shell resolves. Every candidate is then lexically normalized
+ * (`normalizeAbsolutePath`), so a traversal or dot-segment through a system
+ * prefix (`/usr/bin/../..//Users/…`) is reported as the host path it resolves
+ * to and cannot inherit the `/usr/bin/` exemption. An assignment prefix
+ * (`VAR=value`) is peeled so its value is judged, and a path is recognised
+ * where a path component can begin: at a word start, after whitespace or inner
+ * shell punctuation inside a resolved quoted/backtick/eval word, after `=` `:`
+ * `@` `,`, or after an attached short option (`-I/abs`), so
+ * `sh -c "cat /abs"`, `eval "cat /abs"` and `node -e "require('/abs')"` are
+ * seen. A `<scheme>://…` URL value is not a local path token and stays admitted;
+ * the exemption requires the doubled slash and a scheme immediately before the
+ * colon, so `--url=https://…` and `PATH=x:https://…` stay admitted while
+ * `PATH=x:/abs` stays refused. A `PATH`-style colon list is split so each
+ * entry is judged on its own. This is a bounded tokenizer, not a shell parser:
+ * ANSI-C `$'\x2f…'`, `file://` URLs, `$IFS`, `$(…)` output that is not itself a
+ * literal path word, `${VAR}` indirection, `eval` and aliases/functions can
  * still produce a host path and stay documented residuals.
  */
 export function absoluteCheckPaths(command: string): string[] {
   const found: string[] = []
   const seen = new Set<string>()
   const add = (candidate: string): void => {
-    for (const part of candidate.split(':')) {
-      if (!part.startsWith('/') || part.startsWith('//') || seen.has(part)) continue
-      seen.add(part); found.push(part)
-    }
+    const normalized = normalizeAbsolutePath(candidate)
+    if (!normalized.startsWith('/') || seen.has(normalized)) return
+    seen.add(normalized); found.push(normalized)
   }
-  const pattern = /(?:^|[=:@,]|-[A-Za-z]+)(\/(?!\/)[^\s;&|()<>"'`]*)/g
-  for (const word of command.split(/[\s;&|()<>"'`]+/).filter(Boolean)) {
-    let body = word
-    for (let assignment = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/s.exec(body); assignment !== null; assignment = /^[A-Za-z_][A-Za-z0-9_]*=(.*)$/s.exec(body)) body = assignment[1]!
-    pattern.lastIndex = 0
-    for (let match = pattern.exec(body); match !== null; match = pattern.exec(body)) add(match[1]!)
+  // A candidate begins at a word start, after whitespace (a quoted, backtick or
+  // eval body resolves to one token but still contains separate shell words),
+  // after inner shell punctuation or an assignment/option separator, or after
+  // an attached short option (`-I/abs`).
+  const candidatePattern = /(?:^|[\s=:@,({\['"`$]|-[A-Za-z]+)(\/+[^\s;&|()<>"'`]*)/g
+  for (const token of shellTokens(command)) {
+    let body = token.text
+    for (let assignment = /^[A-Za-z_][A-Za-z0-9_]*=([\s\S]*)$/.exec(body); assignment !== null; assignment = /^[A-Za-z_][A-Za-z0-9_]*=([\s\S]*)$/.exec(body)) body = assignment[1]!
+    candidatePattern.lastIndex = 0
+    for (let match = candidatePattern.exec(body); match !== null; match = candidatePattern.exec(body)) {
+      const candidate = match[1]!
+      const start = match.index + match[0].length - candidate.length
+      // `<scheme>://host/path` is a URL value, not a host filesystem path. The
+      // candidate must be a doubled slash and the run immediately before the
+      // colon must be a scheme, so `--url=https://…` and `PATH=x:https://…`
+      // stay admitted while `PATH=x:/abs` (single slash) stays refused.
+      if (candidate.startsWith('//') && start >= 2 && body[start - 1] === ':'
+        && /(?:^|[^A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*$/.test(body.slice(0, start - 1))) continue
+      for (const part of candidate.split(':')) add(part)
+    }
   }
   return found
 }
@@ -419,11 +658,16 @@ export function absoluteCheckPaths(command: string): string[] {
  * with a field-level diagnostic (Round 9-C: a repair had swapped its check for
  * the source project's `.venv/bin/python` and a host `uv`, preserving the
  * acceptance text, and admission accepted it). Standard system locations stay
- * admitted; relative paths and shell expansions such as `$PWD/...` are
- * unaffected.
+ * admitted, and the decision uses the normalized path, so
+ * `/usr/bin/../..//Users/…` is judged as `/Users/…`. Pattern/regex/separator
+ * arguments (`awk -F/`, `grep -E '/(src|tests)/'`, `--test-name-pattern='/x/'`)
+ * are not host paths and stay admitted; relative paths and shell expansions
+ * such as `$PWD/...` are unaffected.
  */
 export function reconcileCheckPaths(command: string, location: string): AdmissionDiagnostic[] {
-  return absoluteCheckPaths(command).filter(candidate => !isSystemCheckPath(candidate)).map(candidate => ({
+  return absoluteCheckPaths(command)
+    .filter(candidate => !isSystemCheckPath(candidate) && !isCheckPattern(candidate))
+    .map(candidate => ({
     code: 'check_absolute_path',
     location,
     path: candidate,
@@ -431,12 +675,12 @@ export function reconcileCheckPaths(command: string, location: string): Admissio
   }))
 }
 
-export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string): void {
+export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
     if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
     if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
-    const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command) })).find(item => item.classification.runnable === 'host-only')
+    const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
     if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable checks (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
     // Round 9-C: a check that names a host-absolute path cannot run in the
     // disposable checkout. Refuse it here, at the shared admission point, so a

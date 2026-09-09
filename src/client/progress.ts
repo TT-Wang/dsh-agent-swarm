@@ -1,4 +1,4 @@
-import type { Member, Snapshot, Task, WorkerActivity } from '../types.ts'
+import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
 export interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
@@ -86,11 +86,70 @@ const meaningfulEvents: Record<string, string> = {
   'mission/budget-exhausted': 'Resource limit reached', 'member/failure': 'Worker reported a failure',
   'member/failed': 'Worker could not start', 'automatic/failed': 'Collaboration could not start',
   'delivery/applied': 'Result applied to project', 'delivery/conflicts': 'Result needs conflict resolution',
+  // R11-08: the review-path, check-change and workspace-authorization families
+  // were emitted but invisible on the compact panel.
+  'task/review-missing': 'Submitted work has no review', 'task/review-admitted': 'Independent review admitted',
+  'task/review-blocked': 'Submitted work cannot be reviewed', 'task/check-changed': 'A declared check changed',
+  // Restart/re-route recovery: a member or task that could not resume is not silent.
+  'member/resume-failed': 'Worker could not resume after restart', 'task/start-failed': 'Task failed to start',
+  'task/reassigned': 'Task re-routed to another member', 'mission/coordinator': 'Mission coordinator set',
+  // The promoted authorized-workspace feature's durable audit events.
+  'workspace/grant-loaded': 'Authorized workspace root loaded', 'mission/workspace-bound': 'Mission bound to an authorized workspace',
+  'mission/workspace-revoked': 'Mission workspace authorization revoked',
+  // T3 integration: the arena-protocol and host-cap emitters (R11-01/07/14/15/17).
+  'escalation/raised': 'A worker escalated to the owner', 'task/proposal-refused': 'Work proposal refused',
+  'provider/outage': 'Provider route paused', 'provider/recovered': 'Provider route recovered',
+  'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, 200) : undefined }
+function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
-const reasonFirst = new Set(['task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled'])
+const reasonFirst = new Set(['task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
+  'task/review-blocked', 'mission/workspace-revoked'])
+/** A bounded preview of a changed check list; the Activity view carries the full summary. */
+function checkPreview(value: unknown): string | undefined {
+  if (!Array.isArray(value)) return undefined
+  const checks = value.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+  if (!checks.length) return undefined
+  const shown = checks.slice(0, 2).join(' && ')
+  return checks.length > 2 ? `${shown} …` : shown
+}
+function recoveryCredit(data: Record<string, unknown>): string | undefined {
+  return typeof data.recoveryCount === 'number' && typeof data.maxRecoveryAttempts === 'number'
+    ? `recovery ${data.recoveryCount}/${data.maxRecoveryAttempts}` : undefined
+}
+/**
+ * The owner-facing detail for one compact event. Existing branches are
+ * unchanged; the R11-08 families name their payload instead of falling back to
+ * the task title (the review block reason, the changed check, the route, the
+ * authorization path).
+ */
+function eventDetail(type: string, data: Record<string, unknown>, task: Task | undefined, evidence: Evidence | undefined, reason: string | undefined): string | undefined {
+  if (type === 'task/git-write-denied') return [brief(data.command), brief(data.runId)].filter(present).join(' · ') || task?.title
+  if (type === 'task/ceiling-exhausted') {
+    return [brief(data.dimension), typeof data.used === 'number' && typeof data.limit === 'number' ? `${data.used}/${data.limit}` : undefined, brief(data.code)]
+      .filter(present).join(' · ') || task?.title
+  }
+  if (type === 'task/preparation-failed' || type === 'task/start-failed') return [reason, recoveryCredit(data)].filter(present).join(' · ') || task?.title
+  if (type === 'task/check-changed') return [reason, checkPreview(data.checks)].filter(present).join(' · ') || task?.title
+  if (type === 'task/reassigned') {
+    const route = brief(data.from) !== undefined || brief(data.to) !== undefined ? `${brief(data.from) ?? '?'} → ${brief(data.to) ?? '?'}` : undefined
+    return [route, reason].filter(present).join(' · ') || task?.title
+  }
+  if (type === 'member/resume-failed') return brief(data.error) ?? task?.title
+  if (type === 'mission/coordinator') return brief(data.coordinatorId) ?? task?.title
+  if (type === 'workspace/grant-loaded') return [brief(data.path), data.loaded === false ? 'unresolved' : undefined].filter(present).join(' · ')
+  if (type === 'mission/workspace-bound') return brief(data.workspace) ?? brief(data.grantRoot) ?? task?.title
+  // T3 integration: the new arena/host-cap families name their own payload.
+  if (type === 'escalation/raised') return [brief(data.memberId), brief(data.escalationId)].filter(present).join(' · ') || task?.title
+  if (type === 'task/proposal-refused') return [reason, typeof data.limit === 'number' ? `limit ${data.limit}` : undefined].filter(present).join(' · ') || task?.title
+  if (type === 'provider/outage') return [brief(data.class), typeof data.status === 'number' ? `HTTP ${data.status}` : undefined].filter(present).join(' · ') || task?.title
+  if (type === 'task/restart-repended') return [reason, recoveryCredit(data)].filter(present).join(' · ') || task?.title
+  if (type === 'isolation/temp-rendezvous') return brief(data.path) ?? task?.title
+  if (reasonFirst.has(type)) return reason ?? task?.title ?? evidence?.claim
+  return task?.title ?? reason ?? evidence?.claim ?? brief(data.title) ?? brief(data.claim)
+}
 
 /** Deliberately omit tool counters, heartbeat/accounting and transport events. */
 export function recentProgress(snapshot: Snapshot, limit = 3): ProgressEvent[] {
@@ -110,18 +169,9 @@ export function recentProgress(snapshot: Snapshot, limit = 3): ProgressEvent[] {
     // The blocked/cancelled reason is the actionable owner detail (W9); a git
     // denial names the exact command and host run id that was refused; a ceiling
     // block names the dimension and the exhausted limit; a preparation failure
-    // names the cause and how much recovery credit it spent.
-    const detail = type === 'task/git-write-denied'
-      ? [brief(data.command), brief(data.runId)].filter((part): part is string => part !== undefined).join(' · ') || task?.title
-      : type === 'task/ceiling-exhausted'
-        ? [brief(data.dimension), typeof data.used === 'number' && typeof data.limit === 'number' ? `${data.used}/${data.limit}` : undefined, brief(data.code)]
-          .filter((part): part is string => part !== undefined).join(' · ') || task?.title
-        : type === 'task/preparation-failed'
-          ? [reason, typeof data.recoveryCount === 'number' && typeof data.maxRecoveryAttempts === 'number'
-            ? `recovery ${data.recoveryCount}/${data.maxRecoveryAttempts}` : undefined]
-            .filter((part): part is string => part !== undefined).join(' · ') || task?.title
-          : reasonFirst.has(type) ? reason ?? task?.title ?? evidence?.claim
-            : task?.title ?? reason ?? evidence?.claim ?? brief(data.title) ?? brief(data.claim)
+    // names the cause and how much recovery credit it spent. The R11-08
+    // families name their own payload instead of falling back to the title.
+    const detail = eventDetail(type, data, task, evidence, reason)
     return [{ seq: event.seq, createdAt: event.createdAt, label, ...(detail ? { detail: detail.slice(0, 200) } : {}) }]
   }).slice(0, Math.max(0, limit))
 }

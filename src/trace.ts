@@ -30,13 +30,13 @@ export type TraceStatus = (typeof TRACE_STATUSES)[number]
 export const TRACE_ERROR_TYPES = ['validation_error', 'authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'tool_error', 'internal_error', 'contract_error'] as const
 export type TraceErrorType = (typeof TRACE_ERROR_TYPES)[number]
 /** Closed step vocabulary: one row per orchestration step, no free-form names. */
-export const TRACE_STEPS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_post', 'swarm_board', 'delivery-apply'] as const
+export const TRACE_STEPS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_escalate', 'swarm_post', 'swarm_board', 'swarm_restore', 'delivery-apply'] as const
 export type TraceStep = (typeof TRACE_STEPS)[number]
 const OPERATION_BY_STEP: Record<TraceStep, TraceOperation> = {
   swarm_stage: 'agent', swarm_launch: 'agent', swarm_budget: 'agent', swarm_create: 'agent', swarm_add_member: 'agent', swarm_workstream: 'agent',
   swarm_propose: 'tool', swarm_claim: 'agent', swarm_publish: 'tool', swarm_submit: 'tool', swarm_verify: 'review', swarm_message: 'tool',
   swarm_challenge: 'tool', swarm_handoff: 'agent', swarm_subscribe: 'tool', swarm_wait: 'tool', swarm_observe: 'tool', swarm_control: 'agent',
-  swarm_cancel: 'agent', swarm_post: 'tool', swarm_board: 'tool', 'delivery-apply': 'merge',
+  swarm_cancel: 'agent', swarm_registry: 'tool', swarm_post: 'tool', swarm_board: 'tool', swarm_escalate: 'tool', swarm_restore: 'agent', 'delivery-apply': 'merge',
 }
 export const spanOperation = (step: TraceStep): TraceOperation => OPERATION_BY_STEP[step]
 export const isTraceOperation = (value: unknown): value is TraceOperation => typeof value === 'string' && (TRACE_OPERATIONS as readonly string[]).includes(value)
@@ -413,6 +413,23 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'workspace/grant-loaded': 'One human-configured authorizedWorkspaces root loaded at plugin start, or named as unresolvable',
   'mission/workspace-bound': 'Mission bound to its resolved workspace and the matched authorized root',
   'mission/workspace-revoked': 'Mission fenced: its workspace is no longer inside a human-authorized root',
+  // Round 11 arena protocols: the typed owner escalation and the bounded
+  // per-member proposal allowance refusal (both recorded before the owner
+  // notice that carries the decision).
+  'escalation/raised': 'A member raised a typed durable owner escalation with its mission-state fingerprint',
+  'task/proposal-refused': 'A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified',
+  // Round 11 host caps: provider-outage routing, store snapshot, per-task
+  // restart and the measured check envelope (D2/D6/D8).
+  'provider/outage': 'Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent',
+  'provider/recovered': 'A quiescent provider route answered successfully again; the outage marker is cleared',
+  'task/restart-repended': 'Host restart re-pended a running task without spending recovery credit; the task and epoch are named',
+  'task/check-envelope': 'Measured declared-check envelope after a verification: limit, active, queued, wait and run times',
+  'store/snapshot': 'Periodic VACUUM INTO snapshot written beside the owner state file',
+  'store/restore-requested': 'Owner staged one validated snapshot restore for the next host start',
+  'store/restored': 'Plugin composition applied a staged snapshot restore before opening the store',
+  // R11-15: the shared temp roots are a cross-member channel; this row records
+  // two members naming the same temp path inside the rendezvous window.
+  'isolation/temp-rendezvous': 'Two members named the same shared temp path inside the rendezvous window; the path and both members are recorded',
 }
 export interface EventVocabularyReport {
   recognized: string[]

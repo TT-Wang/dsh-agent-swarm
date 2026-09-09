@@ -379,7 +379,7 @@ test('terminal worker status waits for actual quiescence and late idle events ca
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
 })
 
-test('primary-agent recovery limits replace the legacy host retry cap on restart', async t => {
+test('R11-07: a host restart preserves per-task recovery limits and spends no credit', async t => {
   for (const limit of [1, 5]) {
     const f = await fixture(t)
     f.input.tasks[0].maxRecoveryAttempts = limit
@@ -392,9 +392,14 @@ test('primary-agent recovery limits replace the legacy host retry cap on restart
     const recovered = new SwarmRuntime(f.config, new Workers())
     try {
       await recovered.start()
-      const restored = recovered.snapshot(f.owner, snapshot.mission.id).tasks.find(candidate => candidate.id === task.id)
-      assert.equal(restored.maxRecoveryAttempts, limit)
-      assert.equal(restored.status, limit === 1 ? 'blocked' : 'pending')
+      const view = recovered.snapshot(f.owner, snapshot.mission.id)
+      const restored = view.tasks.find(candidate => candidate.id === task.id)
+      assert.equal(restored.maxRecoveryAttempts, limit, 'the primary-agent limit is preserved')
+      // R11-07: a host-caused stop never blocks the task and never spends the
+      // task's credit; the per-task restart event names it.
+      assert.equal(restored.status, 'pending')
+      assert.equal(restored.recoveryCount ?? 0, limit === 5 ? 2 : 0)
+      assert.ok(view.events.some(event => event.type === 'task/restart-repended' && event.data.taskId === task.id && event.data.maxRecoveryAttempts === limit))
     } finally { await recovered.dispose() }
   }
 })

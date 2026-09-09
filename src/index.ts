@@ -4,6 +4,7 @@ import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
 import { authorizeWorkspace, loadWorkspaceGrants, type WorkspaceGrant } from './authorization.ts'
+import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
 import { HarnessWorkers } from './harness-workers.ts'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS } from './workspaces.ts'
@@ -29,8 +30,15 @@ export interface Config {
   maxCheckOutputBytes: number
   /** Ignored dependency directories materialised into verification checkouts; see DEFAULT_VERIFICATION_DEPENDENCY_DIRS. */
   verificationDependencyDirs: string[]
-  /** M6: `link` (default) symlinks source dependency directories read-through; `copy` clones them into each checkout. */
+  /** M6/R11-13: `link` symlinks source dependency directories read-through; `copy` (the effective default) clones them into each checkout. */
   verificationDependencyMode: 'link' | 'copy'
+  /**
+   * R11-13: explicit human opt-in for a read-through dependency link. A
+   * symlinked directory lets `node_modules/..` resolve into the source checkout
+   * and the F-29 sandbox governs writes, not reads, so `link` is honored only
+   * when this is true; otherwise the effective mode is `copy`.
+   */
+  allowDependencyLinkReads: boolean
   boundaryCompactionTokens: number
   /** O3: cost weight charged for cache-read input tokens (raw buckets stay visible to the UI). */
   cacheReadWeight: number
@@ -38,6 +46,12 @@ export interface Config {
   activityHeartbeatMs: number
   /** O4: budget fractions at which the runtime emits an approaching-limit warning. */
   budgetWarnAt: number[]
+  /**
+   * R11-19: maximum declared-check executions per host. Forwarded unchanged to
+   * the owned `Workspaces` semaphore, which queues the rest in FIFO order and
+   * measures the envelope.
+   */
+  checkConcurrency: number
   /**
    * Human-authorized workspace roots, loaded once at plugin start. A mission
    * may target a repository outside the calling session's cwd only when it is
@@ -59,10 +73,12 @@ export const Config: z<Config> = z.object({
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
   verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),
+  allowDependencyLinkReads: z.boolean().default(false),
   boundaryCompactionTokens: z.natural().default(250000),
   cacheReadWeight: z.number().min(0).max(1).default(0.1),
   activityHeartbeatMs: z.natural().min(0).default(1000),
   budgetWarnAt: z.array(z.number().min(0).max(1)).default([0.7, 0.9]),
+  checkConcurrency: z.natural().min(1).default(2),
   authorizedWorkspaces: z.array(z.object({
     path: z.string().required().description('Absolute authorized root, symlink-resolved once at start.'),
     note: z.string().description('Human-readable reason shown in the workspace/grant-loaded audit event.'),
@@ -84,9 +100,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // Human authorization is read exactly once here, from plugin configuration.
   // Nothing below re-reads the profile and no model tool can reach this value.
   const grants = await loadWorkspaceGrants(config.authorizedWorkspaces)
+  // R11-02: an owner-staged restore request is applied before the store opens,
+  // so a corrupted or deleted state file recovers at the next host start
+  // instead of starting empty. Applying here (not in a model tool) keeps the
+  // swap outside any live runtime's ownership.
+  const restored = applyPendingRestore(config.statePath)
   const workers = new HarnessWorkers(ctx, { ...config, grants })
   const runtime = new SwarmRuntime({ ...config, maxTasksPerMember: config.maxAttempts, grants,
     authorizeWorkspace: (workspace, sessionCwd) => authorizeWorkspace(workspace, sessionCwd, grants) }, workers)
+  if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
+    { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
   ctx.provide('swarm', runtime)
   registerTools(ctx, runtime, config.defaultBudget, grants)

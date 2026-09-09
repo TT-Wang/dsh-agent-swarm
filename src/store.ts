@@ -9,8 +9,8 @@
  * coordination and is out of scope. See `scripts/load/README.md`.
  */
 import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, basename, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
@@ -48,9 +48,18 @@ const CHANGE_HISTORY = 1024
 const DEFAULT_BUSY_TIMEOUT_MS = 5000
 const DEFAULT_WRITER_ATTEMPTS = 3
 const DEFAULT_WRITER_DELAY_MS = 25
-/** Bounds WAL growth between checkpoints; a checkpoint runs automatically every 1000 pages. */
+/** WAL growth is bounded between checkpoints; a checkpoint runs automatically every 1000 pages. */
 const WAL_AUTOCHECKPOINT_PAGES = 1000
 const WAL_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
+/**
+ * R11-02: periodic `VACUUM INTO` snapshots. The snapshot directory is derived
+ * from the state file, so it lives in the owner's state directory — never in a
+ * mission workspace or the source checkout — and an owner restore path can
+ * recover a truncated or deleted store instead of silently starting empty.
+ */
+const DEFAULT_SNAPSHOT_INTERVAL_MS = 5 * 60_000
+const DEFAULT_SNAPSHOT_KEEP = 5
+const SNAPSHOT_SUFFIX = '.snapshot.sqlite'
 /** Tuning for the single-writer boundary; tests and the load harness shorten it. */
 export interface StoreOptions {
   /** How long SQLite waits for a competing writer before raising SQLITE_BUSY. */
@@ -59,6 +68,29 @@ export interface StoreOptions {
   writerAttempts?: number
   /** Backoff between writer retries, multiplied by the attempt number. */
   writerDelayMs?: number
+  /** Directory for periodic snapshots; defaults to `<statePath>.snapshots`, a sibling of the state file. */
+  snapshotDir?: string
+  /** Periodic snapshot interval; 0 disables the timer (explicit `snapshot()` still works). */
+  snapshotIntervalMs?: number
+  /** How many snapshots to retain; the newest is always kept. */
+  snapshotKeep?: number
+}
+/**
+ * R11-02: the store cannot be opened safely and the owner must choose a
+ * recovery path. `code` is stable so callers branch on it, never on message
+ * text; `snapshots` names every available recovery point.
+ */
+export class StoreRecoveryError extends Error {
+  readonly code: 'store_corrupt' | 'store_missing_with_snapshots' | 'snapshot_invalid' | 'restore_blocked'
+  readonly statePath: string
+  readonly snapshots: string[]
+  constructor(code: StoreRecoveryError['code'], message: string, statePath: string, snapshots: string[] = []) {
+    super(message)
+    this.name = 'StoreRecoveryError'
+    this.code = code
+    this.statePath = statePath
+    this.snapshots = snapshots
+  }
 }
 /** A writer conflict that survived bounded retries; classified, never silent. */
 export class WriterBusyError extends Error {
@@ -77,6 +109,19 @@ export function isSqliteBusy(error: unknown): boolean {
   if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || errcode === 5 || errcode === 6) return true
   const message = error instanceof Error ? error.message : String(error)
   return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(message)
+}
+/**
+ * R11-02: a state file that is not a database, or is structurally corrupt.
+ * Distinct from contention (`isSqliteBusy`) and from an unsupported schema, so
+ * the open path can fail closed and name the snapshot recovery path instead of
+ * surfacing a raw SQLite string.
+ */
+export function isSqliteNotADatabase(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code
+  const errcode = (error as { errcode?: unknown } | undefined)?.errcode
+  if (code === 'SQLITE_NOTADB' || code === 'SQLITE_CORRUPT' || errcode === 26 || errcode === 11) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /file is not a database|SQLITE_NOTADB|database disk image is malformed|SQLITE_CORRUPT/i.test(message)
 }
 /** Synchronous bounded backoff; node:sqlite is synchronous, so timers cannot be awaited here. */
 function sleepSync(ms: number): void {
@@ -108,6 +153,13 @@ export class SwarmStore {
   private readonly busyTimeoutMs: number
   private readonly writerAttempts: number
   private readonly writerDelayMs: number
+  private readonly statePath: string
+  private readonly snapshotDir: string
+  private readonly snapshotIntervalMs: number
+  private readonly snapshotKeep: number
+  private snapshotTimer?: ReturnType<typeof setInterval>
+  private lastSnapshotRevision = -1
+  private lastSnapshotError?: string
   private closed = false
   private transactionScopes?: Set<string>
   private readonly listeners = new Set<() => void>()
@@ -115,9 +167,25 @@ export class SwarmStore {
     this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
     this.writerAttempts = Math.max(1, Math.trunc(options.writerAttempts ?? DEFAULT_WRITER_ATTEMPTS))
     this.writerDelayMs = Math.max(0, Math.trunc(options.writerDelayMs ?? DEFAULT_WRITER_DELAY_MS))
+    this.statePath = path
+    this.snapshotDir = options.snapshotDir ?? `${path}.snapshots`
+    this.snapshotIntervalMs = Math.max(0, Math.trunc(options.snapshotIntervalMs ?? DEFAULT_SNAPSHOT_INTERVAL_MS))
+    this.snapshotKeep = Math.max(1, Math.trunc(options.snapshotKeep ?? DEFAULT_SNAPSHOT_KEEP))
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.lockPath = `${path}.lock`
     this.acquireLock()
+    // R11-02: a state file that disappeared while snapshots exist is data loss,
+    // not a fresh install. Fail closed and name the recovery path instead of
+    // silently starting an empty board.
+    if (!existsSync(path)) {
+      const snapshots = this.listSnapshots()
+      if (snapshots.length > 0) {
+        this.releaseLock()
+        throw new StoreRecoveryError('store_missing_with_snapshots',
+          `Swarm state ${path} is missing but ${snapshots.length} snapshot(s) exist. Restore one before starting the host: SwarmStore.restore(statePath, snapshot). Latest: ${snapshots.at(-1)}`,
+          path, snapshots)
+      }
+    }
     try {
       this.db = new DatabaseSync(path)
       chmodSync(path, 0o600)
@@ -138,7 +206,17 @@ export class SwarmStore {
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
       } catch (error) { this.db.exec('ROLLBACK'); throw error }
-    } catch (error) { this.releaseLock(); throw error }
+    } catch (error) {
+      this.releaseLock()
+      if (isSqliteNotADatabase(error)) throw new StoreRecoveryError('store_corrupt',
+        `Swarm state ${this.statePath} is not a usable database (${error instanceof Error ? error.message : String(error)}). Restore a snapshot before starting the host: SwarmStore.restore(statePath, snapshot). Snapshots: ${this.listSnapshots().join(', ') || 'none'}`,
+        this.statePath, this.listSnapshots())
+      throw error
+    }
+    if (this.snapshotIntervalMs > 0) {
+      this.snapshotTimer = setInterval(() => this.periodicSnapshot(), this.snapshotIntervalMs)
+      this.snapshotTimer.unref()
+    }
   }
   private acquireLock(): void {
     try {
@@ -357,6 +435,113 @@ export class SwarmStore {
       : this.db.prepare('SELECT * FROM (SELECT * FROM events WHERE mission_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq').all(missionId, limit)
     return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
   }
+  /** Snapshot files, oldest first; the name orders by revision then timestamp. */
+  listSnapshots(): string[] {
+    try {
+      return readdirSync(this.snapshotDir).filter(name => name.endsWith(SNAPSHOT_SUFFIX)).sort().map(name => join(this.snapshotDir, name))
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
+  }
+  /** Snapshot metadata for the owner, newest first. */
+  snapshots(): Array<{ path: string; bytes: number; createdAt: number }> {
+    return this.listSnapshots().map(path => { const info = statSync(path); return { path, bytes: info.size, createdAt: info.mtimeMs } }).reverse()
+  }
+  /** R11-02 owner-visible snapshot status; a timer failure is reported, never thrown. */
+  snapshotState(): { dir: string; intervalMs: number; keep: number; lastRevision: number; snapshots: number; lastError?: string } {
+    return { dir: this.snapshotDir, intervalMs: this.snapshotIntervalMs, keep: this.snapshotKeep, lastRevision: this.lastSnapshotRevision, snapshots: this.listSnapshots().length,
+      ...(this.lastSnapshotError === undefined ? {} : { lastError: this.lastSnapshotError }) }
+  }
+  /**
+   * R11-02: one consistent `VACUUM INTO` snapshot beside the state file. The
+   * target directory is derived from the owner-configured state path, so it
+   * lives in the owner's state directory and never in a mission workspace or
+   * the source checkout. `VACUUM INTO` folds the WAL into a single complete
+   * database file, so a restore is one validated copy.
+   */
+  snapshot(): { path: string; revision: number; bytes: number } {
+    if (this.closed) throw new Error('Swarm store is closed')
+    if (this.transactionScopes) throw new Error('A snapshot cannot run inside a swarm transaction')
+    mkdirSync(this.snapshotDir, { recursive: true, mode: 0o700 })
+    const revision = this.revision()
+    const file = join(this.snapshotDir, `swarm-r${String(revision).padStart(12, '0')}-${Date.now()}-${randomUUID().slice(0, 8)}${SNAPSHOT_SUFFIX}`)
+    try {
+      this.db.prepare('VACUUM INTO ?').run(file)
+      chmodSync(file, 0o600)
+    } catch (error) {
+      rmSync(file, { force: true })
+      throw error
+    }
+    this.lastSnapshotRevision = revision
+    this.lastSnapshotError = undefined
+    this.pruneSnapshots()
+    const bytes = statSync(file).size
+    // Durable bookkeeping: the snapshot predates this event, so the file list
+    // (not the event) is authoritative for the owner restore path.
+    this.event('swarm/install', 'store/snapshot', 'runtime', { path: file, revision, bytes })
+    return { path: file, revision, bytes }
+  }
+  private periodicSnapshot(): void {
+    if (this.closed) return
+    try {
+      if (this.revision() === this.lastSnapshotRevision && this.listSnapshots().length > 0) return
+      this.snapshot()
+    } catch (error) {
+      this.lastSnapshotError = error instanceof Error ? error.message : String(error)
+    }
+  }
+  private pruneSnapshots(): void {
+    const files = this.listSnapshots()
+    for (const file of files.slice(0, Math.max(0, files.length - this.snapshotKeep))) rmSync(file, { force: true })
+  }
+  /**
+   * R11-02 owner restore path. Validates the snapshot's integrity and schema,
+   * refuses while another live runtime owns the state file, then atomically
+   * replaces the state file and drops stale WAL sidecars. Deliberately not a
+   * model-callable tool: recovery is an owner action, so a worker can never
+   * roll the mission back.
+   */
+  static restore(statePath: string, snapshotPath: string): { restoredFrom: string; bytes: number } {
+    if (!existsSync(snapshotPath)) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} does not exist`, statePath)
+    const lockPath = `${statePath}.lock`
+    if (existsSync(lockPath)) {
+      let pid: number | undefined
+      try { pid = (JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number }).pid } catch { pid = undefined }
+      let alive = false
+      if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, 0); alive = true } catch (error) { alive = (error as NodeJS.ErrnoException).code === 'EPERM' }
+      }
+      throw new StoreRecoveryError('restore_blocked',
+        `Swarm state ${statePath} is owned by a live runtime${alive && pid !== undefined ? ` (pid ${pid})` : ''}; stop the host before restoring a snapshot`, statePath)
+    }
+    SwarmStore.validateSnapshot(statePath, snapshotPath)
+    mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 })
+    const staging = `${statePath}.restore-${randomUUID()}.tmp`
+    copyFileSync(snapshotPath, staging)
+    chmodSync(staging, 0o600)
+    renameSync(staging, statePath)
+    for (const suffix of ['-wal', '-shm']) rmSync(`${statePath}${suffix}`, { force: true })
+    return { restoredFrom: snapshotPath, bytes: statSync(statePath).size }
+  }
+  /** R11-02: validate a snapshot without applying it (existence, integrity and schema). */
+  static validateSnapshot(statePath: string, snapshotPath: string): { bytes: number } {
+    if (!existsSync(snapshotPath)) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} does not exist`, statePath)
+    const probe = new DatabaseSync(snapshotPath, { readOnly: true })
+    try {
+      const check = probe.prepare('PRAGMA integrity_check').get() as { integrity_check?: unknown }
+      if (check?.integrity_check !== 'ok') throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} failed integrity_check: ${String(check?.integrity_check)}`, statePath)
+      const version = probe.prepare('PRAGMA user_version').get()?.user_version
+      if (version !== 0 && version !== 1 && version !== 2 && version !== SCHEMA_VERSION) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} has unsupported schema ${String(version)}; expected ${SCHEMA_VERSION}`, statePath)
+    } catch (error) {
+      if (error instanceof StoreRecoveryError) throw error
+      throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} is not a usable database: ${error instanceof Error ? error.message : String(error)}`, statePath)
+    } finally { probe.close() }
+    return { bytes: statSync(snapshotPath).size }
+  }
+  /** The newest snapshot for `statePath`, for the owner restore path. */
+  static latestSnapshot(statePath: string, snapshotDir = `${statePath}.snapshots`): string | undefined {
+    let names: string[]
+    try { names = readdirSync(snapshotDir).filter(name => name.endsWith(SNAPSHOT_SUFFIX)).sort() } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+    return names.length ? join(snapshotDir, names.at(-1)!) : undefined
+  }
   /**
    * Close the database before releasing its exclusive runtime lock. A best-effort
    * checkpoint truncates the WAL so a clean shutdown leaves no growth behind; the
@@ -365,10 +550,69 @@ export class SwarmStore {
   close(): void {
     if (this.closed) return
     this.closed = true
+    if (this.snapshotTimer) clearInterval(this.snapshotTimer)
     this.publish()
     this.listeners.clear()
     try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch { /* Another reader may still hold the WAL; the next open recovers it. */ }
     this.db.close()
     this.releaseLock()
   }
+}
+
+/** R11-02: a staged owner restore request, applied by the plugin composition at the next host start. */
+export interface PendingRestore {
+  snapshot: string
+  requestedAt: number
+  requestedBy?: string
+  appliedAt?: number
+}
+const RESTORE_REQUEST_SUFFIX = '.restore.json'
+/**
+ * R11-02 owner restore path (staging half). Validate a snapshot inside the
+ * managed directory and record one request for the next host start. A live
+ * runtime keeps ownership: applying is deliberately impossible while the store
+ * is open, so the model surface can request a restore but never swap the
+ * database under a running mission.
+ */
+export function stageRestore(statePath: string, snapshotPath: string, requestedBy?: string, snapshotDir = `${statePath}.snapshots`): PendingRestore {
+  const dir = resolve(snapshotDir)
+  const file = resolve(snapshotPath)
+  if (dirname(file) !== dir || !basename(file).endsWith(SNAPSHOT_SUFFIX)) {
+    throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} is not inside the managed snapshot directory ${dir}`, statePath)
+  }
+  SwarmStore.validateSnapshot(statePath, file)
+  const request: PendingRestore = { snapshot: basename(file), requestedAt: Date.now(), ...(requestedBy === undefined ? {} : { requestedBy }) }
+  const target = `${statePath}${RESTORE_REQUEST_SUFFIX}`
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+  const staging = `${target}.${randomUUID()}.tmp`
+  writeFileSync(staging, JSON.stringify(request), { mode: 0o600 })
+  renameSync(staging, target)
+  return request
+}
+/** Read one staged restore request, if present. A malformed request fails closed. */
+export function pendingRestore(statePath: string, snapshotDir = `${statePath}.snapshots`): PendingRestore | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(`${statePath}${RESTORE_REQUEST_SUFFIX}`, 'utf8')) as Partial<PendingRestore>
+    if (typeof parsed.snapshot !== 'string' || !parsed.snapshot.endsWith(SNAPSHOT_SUFFIX) || basename(parsed.snapshot) !== parsed.snapshot) {
+      throw new StoreRecoveryError('snapshot_invalid', `Restore request for ${statePath} names an invalid snapshot; inspect ${statePath}${RESTORE_REQUEST_SUFFIX}`, statePath)
+    }
+    return { snapshot: parsed.snapshot, requestedAt: typeof parsed.requestedAt === 'number' ? parsed.requestedAt : 0, ...(typeof parsed.requestedBy === 'string' ? { requestedBy: parsed.requestedBy } : {}) }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    if (error instanceof StoreRecoveryError) throw error
+    throw new StoreRecoveryError('snapshot_invalid', `Restore request for ${statePath} is unreadable: ${error instanceof Error ? error.message : String(error)}`, statePath)
+  }
+}
+/**
+ * R11-02 owner restore path (apply half). Called by `src/index.ts` before the
+ * runtime opens the store, so a staged request recovers a corrupted or deleted
+ * state file at the next host start. Returns the applied request, or undefined
+ * when nothing was staged.
+ */
+export function applyPendingRestore(statePath: string, snapshotDir = `${statePath}.snapshots`): PendingRestore | undefined {
+  const request = pendingRestore(statePath, snapshotDir)
+  if (request === undefined) return undefined
+  const applied = SwarmStore.restore(statePath, join(snapshotDir, request.snapshot))
+  rmSync(`${statePath}${RESTORE_REQUEST_SUFFIX}`, { force: true })
+  return { ...request, snapshot: applied.restoredFrom, appliedAt: Date.now() }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Fault-injection suite F1-F17.
+ * Fault-injection suite F1-F20.
  *
  * Each scenario is a standalone module under tests/faults/ that injects one
  * fault, proves the injection fired, and then asserts the durable recovery
@@ -29,7 +29,7 @@ const value = name => { const index = args.indexOf(name); return index === -1 ? 
 const asJson = args.includes('--json')
 const only = (value('--only') ?? '').split(',').map(item => item.trim().toUpperCase()).filter(Boolean)
 const timeoutMs = Number(value('--timeout') ?? 300_000)
-const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14']
+const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F19', 'F20']
 
 const scenarioId = file => file.replace(/\.mjs$/, '').replace(/^f(\d+)([a-z]?)-.*$/, (_match, number, suffix) => `F${Number(number)}${suffix.toUpperCase()}`)
 

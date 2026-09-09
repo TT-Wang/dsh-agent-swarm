@@ -111,7 +111,7 @@ A submitted artifact is a real Git commit. To accept it, the host:
 
 Any non-zero exit rejects the artifact. A command that is not found reports that it was an environment failure rather than a defect in the work, so a reviewer does not retry the same artifact blindly.
 
-If your project keeps its toolchain in other directories, name them in `verificationDependencyDirs`; the configured list replaces the default set, and `[]` disables materialisation. Use `verificationDependencyMode: "copy"` when a read-through symlink is not acceptable; `link` is the default and is cheaper.
+If your project keeps its toolchain in other directories, name them in `verificationDependencyDirs`; the configured list replaces the default set, and `[]` disables materialisation. The effective default is `verificationDependencyMode: "copy"`: the ignored directory is copied into the disposable checkout, so `node_modules/..` and `node_modules/pkg/../..` resolve inside that checkout and a declared check cannot read uncommitted source state. A read-through `link` is honored only with the explicit `allowDependencyLinkReads: true` opt-in, because a symlinked directory lets `..` resolve to the source checkout and the F-29 sandbox governs writes, not reads.
 
 ## Resource limits and cost
 
@@ -148,6 +148,19 @@ An **Advanced: configure a mission** disclosure remains available for explicit m
 
 Peer messages never grant authority to widen scope or budgets, change ownership, or waive review. Coordination policy lives in the runtime; lifecycle and sandboxing use native Harness services. See [design traceability](docs/design.md).
 
+### Arena contracts and the no-silent-state invariant
+
+- **No silent state.** Every non-terminal board state leaves the owner a durable witness: progress, an owner-decision notice keyed by the mission-state fingerprint `F(S)`, or a stall notice for `F(S)`. `F(S)` is a stable digest of the owner-observable board (task/member status, dispatchable readiness, unreviewable submissions, pending deliveries, open challenges and hit ceilings); wall-clock fields are excluded, so an idle tick never re-notifies and a state that changes and returns can. `tests/faults/f19-no-silent-state.mjs` enumerates the condition classes and asserts the witness class and fingerprint.
+- **Typed escalation.** `swarm_escalate` lets a member raise a first-class durable escalation to the owner (authenticated sender, mission, task/attempt, fingerprint). It is not a board post and grants no authority; it appears in the owner's notice ledger and arena view.
+- **Bounded proposals.** A worker's board share is bounded inside the owner-set mission ceiling (`ceil(maxTasks / maxWorkers)`, floor 1). A refusal for the allowance, the task budget or the experiment budget records a durable `task/proposal-refused` event and wakes the owner with the member, the limit and the reason; only the owner raises the allowance, by raising the ceiling.
+- **Read-only registry.** `swarm_registry` is the owner-only, read-only cross-mission artifact registry (commit, task, mission, acceptance state, review verdict). Per-mission artifact refs are private, so this durable projection is the sanctioned cross-mission read path.
+- **Notice ledger.** Every owner notice records its class, the fingerprint it announced and its sent/queued/claimed lifecycle; the owner reads the ledger read-only through `swarm_observe`.
+- **Per-host check semaphore.** `checkConcurrency` bounds declared-check executions per host; the rest queue in FIFO order and the measured envelope (limit, active, queued, wait and run times) is recorded as `task/check-envelope`.
+- **Provider-outage routing.** A classified quota, rate-limit or unavailable provider failure is a quiescent route, not a worker failure: the attempt is preserved, no recovery credit is spent, the owner is told once per class transition, and the work is routed to another live member when one exists.
+- **Store snapshot and restore.** The store writes periodic `VACUUM INTO` snapshots beside the state file. A truncated or deleted store fails closed naming its snapshot, and the owner stages one validated snapshot with `swarm_restore`; the next host start applies it before the store opens.
+- **Host restart.** A host-caused stop re-pends the task without spending recovery credit and records a per-task `task/restart-repended` event, so a `maxRecoveryAttempts: 1` task survives one restart.
+- **Isolation.** Verification checkouts copy ignored dependency directories by default. The shared temp roots are a cross-member channel, so the runtime records a bounded `isolation/temp-rendezvous` event when two members name the same shared-temp path inside the window.
+
 ## Storage and configuration
 
 The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [src/index.ts](src/index.ts):
@@ -157,7 +170,9 @@ The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [
 | `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | Coordination state. One live runtime per file. |
 | `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | Snapshots, worker worktrees, verification checkouts. Must be outside your source repository. |
 | `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | Installed dependency directories made available to verification checkouts. |
-| `verificationDependencyMode` | `"link"` | `link` symlinks them read-through; `copy` clones them per checkout. |
+| `verificationDependencyMode` | `"link"` | `link` is honored only with `allowDependencyLinkReads`; otherwise the effective mode is `copy` (clones them per checkout). |
+| `allowDependencyLinkReads` | `false` | Human opt-in that makes a configured `verificationDependencyMode: "link"` effective. |
+| `checkConcurrency` | `2` | Maximum declared-check executions per host; the rest queue in FIFO order and the measured envelope is recorded. |
 | `cacheReadWeight` | `0.1` | Budget weight for cached input. Raw buckets are unaffected. |
 | `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned per dimension. |
 | `authorizedWorkspaces` | `[]` | Human-authorized roots (`{ path, note?, expiresAt? }`) a mission may target outside the session cwd. Loaded once at start; no tool can change it. |
@@ -201,7 +216,7 @@ Suites use temporary profiles and Git workspaces, with the model boundary script
 
 - **Local, single-host.** Git workspaces and POSIX process groups are required. Distributed workers and non-Git workspaces are not implemented.
 - **Verification proves that your commands ran, not that they are sufficient.** The host executes exactly what a task declares, against the exact submitted commit. It cannot infer a complete test oracle from a natural-language goal.
-- **The verification checkout borrows your installed toolchain.** Linked dependency directories come from your working copy, so they are not a fresh install and may differ from CI.
+- **The verification checkout borrows your installed toolchain.** Dependency directories are copied into the disposable checkout by default (so `..` cannot resolve into your source checkout); a read-through `link` requires the explicit `allowDependencyLinkReads` opt-in. Either way they are not a fresh install and may differ from CI.
 - **Budget accounting is provider-reported.** In-flight requests are estimated, so an unusually large one can still cross a ceiling. Attempts that report no usage cannot be counted.
 - **Confinement follows the configured Harness sandbox.** Artifact capture checks changed paths against declared scopes. The plugin adds no independent network or credential isolation, and its tool restrictions are not a complete boundary for every side-effecting tool.
 - **Recovery is bounded.** Attempt leases renew only while a live operation is observed, within the mission deadline; this does not detect every stuck request. Retained worktrees and Git refs require explicit cleanup.

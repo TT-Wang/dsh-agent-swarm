@@ -334,11 +334,15 @@ export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): Retire
  * No raw tool arguments/results in the event list; display bounded, inert JSON
  * only. `command`/`runId` name a denied git write and `outcome`/`verdict` name
  * a verdict, so the compact activity list can be reconstructed without the
- * raw event payload (F-14).
+ * raw event payload (F-14). `previousChecks`/`checks`/`reviewOf` carry the
+ * R11-09 check-change and review-link payload; the workspace-audit keys carry
+ * the authorization binding and revocation (grant root, resolved path, source).
  */
 export function eventSummary(data: unknown): string {
   if (!record(data)) return ''
   return Object.entries(data).filter(([key]) => ['taskId', 'memberId', 'reason', 'status', 'evidenceId', 'title', 'kind',
-    'runId', 'command', 'outcome', 'verdict', 'commit', 'resultCommit', 'previousStatus'].includes(key))
+    'runId', 'command', 'outcome', 'verdict', 'commit', 'resultCommit', 'previousStatus',
+    'previousChecks', 'checks', 'reviewOf', 'workspace', 'path', 'grantRoot', 'loaded', 'source', 'blockedTasks',
+    'escalationId', 'deliveryId', 'dedupKey', 'bodyChars', 'limit', 'class'].includes(key))
     .map(([key, value]) => `${key}: ${String(value).slice(0, 160)}`).join(' · ')
 }

@@ -23,13 +23,13 @@ const positiveInteger = { type: 'integer', minimum: 1 } as const
  * closed D6 span step, asserted by tests/trace-span.test.mjs, so no registered
  * tool can be left unspanned and no span step can be absent from the registry.
  */
-export const SWARM_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_post', 'swarm_board'] as const
+export const SWARM_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_escalate', 'swarm_post', 'swarm_board', 'swarm_restore'] as const
 /** The runtime rejects these for the owner session; hiding them saves schema tokens without changing authority. */
-export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait'] as const
+export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_escalate'] as const
 /** The runtime guard rejects these for workers; hiding them is presentation, the guard remains the boundary. */
-export const MANAGEMENT_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control', 'swarm_cancel'] as const
+export const MANAGEMENT_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
 /** Meaningful only once a session owns an automatic request or a mission. */
-export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel'] as const
+export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
 /** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */
 export const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
 export type SwarmRole = 'entry' | 'owner' | 'worker' | 'none'
@@ -359,8 +359,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, topics: strings }, ['missionId', 'topics'], (a, actor) => runtime.subscribeTopics(actor, text(a, 'missionId'), array(a, 'topics')))
   register('swarm_wait', 'Members only: park until relevant work or a direct message arrives, then end the turn. The owner ends its native turn instead and waits for runtime notices.',
     mission, ['missionId'], (a, actor) => runtime.wait(actor, text(a, 'missionId')))
-  register('swarm_observe', 'Bounded mission reads. A member\'s first read returns the focused view; later default reads return only the delta since the runtime\'s delivered cursor (new events/runs, plus a changed current assignment). Owner: compact board and usage. after/afterRun override the cursor; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record and is owner-only (worker sessions are refused). before/eventLimit page older events (F-13) and vocabulary/trace report event coverage and trace metrics. Omit missionId to list your missions.',
-    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, before: nonnegativeInteger, eventLimit: { ...positiveInteger, description: 'Older-event page size, 1-500 (default 50).' }, vocabulary: { type: 'boolean', description: 'Report which event types the returned window uses and whether the read path recognizes them.' }, trace: { type: 'boolean', description: 'Report span-level metrics: contract compliance and the first violating step.' }, detail: { type: 'string', enum: ['summary', 'full'], description: 'Owner only: full expands every task record. Worker sessions are refused.' } }, [],
+  register('swarm_observe', 'Bounded mission reads. A member\'s first read returns the focused view; later default reads return only the delta since the runtime\'s delivered cursor (new events/runs, plus a changed current assignment). Owner: compact board and usage plus the read-only arena instruments; detail=full adds the notice ledger, escalations and per-member arena rows. after/afterRun override the cursor; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record and is owner-only (worker sessions are refused). before/eventLimit page older events (F-13) and vocabulary/trace report event coverage and trace metrics. Omit missionId to list your missions.',
+    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, before: nonnegativeInteger, eventLimit: { ...positiveInteger, description: 'Older-event page size, 1-500 (default 50).' }, vocabulary: { type: 'boolean', description: 'Report which event types the returned window uses and whether the read path recognizes them.' }, trace: { type: 'boolean', description: 'Report span-level metrics: contract compliance and the first violating step.' }, detail: { type: 'string', enum: ['summary', 'full'], description: 'Owner only: full expands every task record and adds the arena instruments. Worker sessions are refused.' } }, [],
     async (a, actor) => {
       if (a.missionId === undefined) return runtime.list(actor.sessionId)
       const missionId = text(a, 'missionId')
@@ -391,6 +391,17 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_cancel', 'Owner only: withdraw one admitted-but-mistaken task. Pending, blocked, submitted and running tasks become terminally cancelled; a running attempt is fenced and its worker released. Refuses accepted work, which is immutable and needs a replacement. Records a durable task/cancelled event with the reason; replay is idempotent.',
     { ...mission, taskId: string, reason: string }, ['missionId', 'taskId', 'reason'],
     (a, actor) => runtime.cancel(actor, text(a, 'missionId'), { taskId: text(a, 'taskId'), reason: text(a, 'reason') }))
+  register('swarm_registry', 'Owner only, read-only: the cross-mission artifact registry. For every mission this session may see, lists each captured artifact commit with its task, mission, acceptance state and independent review verdict. Per-mission artifact refs are private, so this durable projection is the sanctioned cross-mission read path; reading it changes no state.',
+    { ...mission }, [], (a, actor) => runtime.artifacts(actor, {
+      ...(a.missionId === undefined ? {} : { missionId: text(a, 'missionId') }),
+    }))
+  register('swarm_escalate', 'Members only: typed durable owner escalation. Not a board post: swarm_post is peer visibility; this reaches the owner through the notice path with sender, mission, task and attempt (omitted, it binds your running attempt), is never deduped, and grants no authority.',
+    { ...mission, body: string, taskId: string, attemptId: string }, ['missionId', 'body'],
+    (a, actor) => runtime.escalate(actor, text(a, 'missionId'), {
+      body: text(a, 'body'),
+      ...(a.taskId === undefined ? {} : { taskId: text(a, 'taskId') }),
+      ...(a.attemptId === undefined ? {} : { attemptId: text(a, 'attemptId') }),
+    }))
   const postKindSchema: JsonSchemaNode = { type: 'string', enum: ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF'],
     description: 'ASK: request information or a decision. ANSWER: reply to an ASK. IDEA: share a cross-task idea. ALERT: warn about a risk or a failed experiment. ARTIFACT: point at a durable artifact. HANDOFF: dossier for a successor.' }
   register('swarm_post', 'Sanctioned mission board: post one durable, immutable typed note (ASK/ANSWER/IDEA/ALERT/ARTIFACT/HANDOFF). The sender, monotonic sequence and mission are host-assigned, never model-supplied. Optional to = a member id or owner; omit for mission-wide. taskId/attemptId ties the post to work. evidenceIds and toolRunIds must reference host-recorded ids that already exist in this mission (unknown or foreign ids are rejected), replyTo must name an existing post, and ttlMs is reported as expiry on read. The body is bounded by maxMessageChars. Cross-task visibility only: a post grants no authority, changes no task state, queues no delivery, is never an instruction to the runtime, and writes no file (store-backed). New posts appear in the swarm_observe delta and are read back with swarm_board.',
@@ -416,4 +427,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       ...(a.limit === undefined ? {} : { limit: optionalInteger(a, 'limit')! }),
       ...(a.postId === undefined ? {} : { postId: text(a, 'postId') }),
     } satisfies BoardQuery))
+  register('swarm_restore', 'Owner only: stage one validated mission-store snapshot for the next host start (R11-02). Omit snapshot to use the newest; otherwise pass the snapshot file name shown by the host. The runtime never swaps the database it currently owns, so this records a durable restore request that src/index.ts applies before the next open. Refused for a non-owner, for a path outside the managed snapshot directory, and when no snapshot exists.',
+    { snapshot: string }, [],
+    (a, actor) => runtime.requestRestore(actor, optionalText(a, 'snapshot')))
 }

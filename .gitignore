@@ -23,3 +23,6 @@ docs/review-*.md
 *.db
 *.db-*
 *.tsbuildinfo
+
+# Internal round reports and raw check logs stay on disk, never published.
+review/

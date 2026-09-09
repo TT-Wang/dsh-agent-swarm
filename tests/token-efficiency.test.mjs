@@ -134,8 +134,13 @@ test('routine progress reaches the UI only; the owner is woken for rejection, st
   await settle()
   assert.deepEqual(f.controls(), [], 'submission is not an owner notice')
   await f.reviewed(task)
-  await settle()
-  assert.deepEqual(f.controls(), [], 'acceptance is not an owner notice')
+  // R10-14: a coverage-complete owner-assembled mission announces readiness
+  // instead of returning silently; acceptance itself is still not a
+  // rejection/stall notice, and the mission stays active for the owner's decision.
+  const readiness = await eventually(() => f.controls().find(delivery => /ready to complete/.test(delivery.content)), 'a coverage-complete board must announce readiness')
+  assert.match(readiness.content, /every acceptance criterion is independently covered/)
+  assert.deepEqual(f.controls().filter(delivery => !/ready to complete/.test(delivery.content)), [], 'acceptance wakes the owner only with the coverage-complete decision')
+  assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active', 'the owner keeps the completion decision')
   const events = f.runtime.snapshot(f.owner, f.mission.id).events.map(event => event.type)
   assert(events.includes('task/submitted') && events.includes('task/accepted'), 'progress is durable for the panel')
   const rejected = await f.submitted()
@@ -165,7 +170,7 @@ test('replacement errors name the failing condition and the live replacement', a
 test('a verification cannot be assigned to its source author or review finished work; sibling reviews are cancelled by the verdict', async t => {
   const f = await manual(t)
   const task = await f.submitted()
-  assert.throws(() => f.propose(f.actorB, { kind: 'verification', reviewOf: task.id, checks: [], assigneeId: f.a.id }), /authored .* independent review must be assigned to a different member/)
+  assert.throws(() => f.propose(f.actorB, { kind: 'verification', reviewOf: task.id, checks: [], assigneeId: f.a.id }), /authored .* independent review must be assigned to a member who never owned it/)
   const sibling = f.propose(f.actorB, { kind: 'verification', reviewOf: task.id, checks: [] })
   await f.reviewed(task)
   assert.equal(f.current(sibling).status, 'cancelled'); assert.match(f.current(sibling).output, /Superseded/)

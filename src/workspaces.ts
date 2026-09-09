@@ -6,7 +6,8 @@ import path from 'node:path'
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline } from './types.js'
+export type { CheckEnvelope }
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean }
 /** Full-repository path inventories are metadata, not user-visible check output. */
@@ -37,17 +38,28 @@ export interface WorkspaceOptions {
   verificationDependencyDirs?: string[]
   /**
    * How ignored dependency directories reach a verification checkout.
-   * `link` (default) symlinks the source directory: checks read the real
-   * toolchain without copying it. The link is not itself a write boundary, but
-   * production confines every check with the Harness sandbox rooted at the
-   * checkout and requires full enforcement (F-29); that enforcement compares
-   * resolved paths, so a write through the link into the source is refused.
-   * `copy` clones the directory into the checkout instead, so write isolation
-   * does not depend on the sandbox backend, at the cost of copying the tree
-   * for every verification. An unconfined `Workspaces` (the identity
-   * `confineCheck` used by unit tests) has no such boundary.
+   * `copy` (the effective default) clones the directory into the checkout, so
+   * no path inside the materialised directory can resolve back into the source
+   * checkout and a declared check cannot read uncommitted host state through
+   * `node_modules/../UNCOMMITTED.txt` (R11-13). `link` symlinks the source
+   * directory read-through and is honored only with the explicit
+   * `allowDependencyLinkReads` opt-in, because a symlinked directory lets `..`
+   * resolve to the symlink target's parent chain: the check reads the real
+   * toolchain without copying it, at the cost of exposing the source checkout.
+   * Every check still runs under the Harness sandbox rooted at the checkout and
+   * is refused unless the host reports full enforcement (F-29), but that
+   * enforcement governs writes, not reads.
    */
   verificationDependencyMode?: 'link' | 'copy'
+  /**
+   * R11-13: explicitly accept the read-through dependency link and the source
+   * checkout reads it enables. Default false: even a configured `link` mode
+   * materialises a copy, because a symlinked dependency directory lets a
+   * declared check resolve `node_modules/..` (and `node_modules/pkg/../..`)
+   * back to the source checkout and read uncommitted files. Set true only on a
+   * host that knowingly accepts that cross-tenant read channel.
+   */
+  allowDependencyLinkReads?: boolean
   /**
    * Called when a disposable verification checkout cannot be removed. Cleanup
    * failure is recorded here and never masks the check results.
@@ -68,8 +80,92 @@ export interface WorkspaceOptions {
    * `Workspaces` directly; the recorded admission result then stands.
    */
   grants?: WorkspaceGrantSnapshot
+  /**
+   * R11-19: maximum declared-check executions per host process. Verifications
+   * beyond the limit wait in a FIFO queue; every wait and run is measured and
+   * reported through `checkEnvelope()` / `onCheckEnvelope`. Default 2.
+   */
+  checkConcurrency?: number
+  /** R11-19: called once per declared check with its measured wait and run time. */
+  onCheckEnvelope?(info: CheckEnvelopeSample): void
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
+}
+/** R11-19: one declared check's measured queue wait and execution time. */
+export interface CheckEnvelopeSample {
+  memberId: string
+  taskId: string
+  command: string
+  waitMs: number
+  runMs: number
+  /** Check executions active when this one started. */
+  active: number
+  /** Checks still waiting when this one started. */
+  queued: number
+  limit: number
+}
+const DEFAULT_CHECK_CONCURRENCY = 2
+/**
+ * R11-19: a per-host FIFO semaphore over declared-check executions. A queued
+ * verification is not lost and not run unconfined; its wait is measured so the
+ * owner can see the queueing the lease has to survive.
+ */
+export class CheckSemaphore {
+  private active = 0
+  private readonly waiters: Array<{ resolve: (handedOff: boolean) => void; reject: (error: unknown) => void; signal?: AbortSignal; onAbort?: () => void }> = []
+  private maxActive = 0
+  private completed = 0
+  private totalWaitMs = 0
+  private maxWaitMs = 0
+  private totalRunMs = 0
+  private maxRunMs = 0
+  constructor(readonly limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('checkConcurrency must be a positive safe integer')
+  }
+  /**
+   * Resolves with the queue wait in milliseconds; rejects when the caller
+   * aborts while queued. A slot freed by `release` is handed directly to the
+   * oldest waiter, so `active` can never exceed the configured limit even when
+   * a new caller arrives in the same tick.
+   */
+  async acquire(signal?: AbortSignal): Promise<number> {
+    if (signal?.aborted) throw signal.reason ?? new Error('Aborted before the check could be queued')
+    const started = Date.now()
+    const handedOff = this.active >= this.limit && await new Promise<boolean>((resolve, reject) => {
+      const waiter: (typeof this.waiters)[number] = { resolve, reject, signal }
+      if (signal !== undefined) {
+        waiter.onAbort = () => {
+          const index = this.waiters.indexOf(waiter)
+          if (index >= 0) this.waiters.splice(index, 1)
+          reject(signal.reason ?? new Error('Aborted while queued for a check slot'))
+        }
+        signal.addEventListener('abort', waiter.onAbort, { once: true })
+      }
+      this.waiters.push(waiter)
+    })
+    const waitMs = Math.max(0, Date.now() - started)
+    if (!handedOff) {
+      this.active++
+      this.maxActive = Math.max(this.maxActive, this.active)
+    }
+    this.totalWaitMs += waitMs
+    this.maxWaitMs = Math.max(this.maxWaitMs, waitMs)
+    return waitMs
+  }
+  /** Release one slot: hand it to the oldest waiter, or free it. */
+  release(runMs: number): void {
+    this.completed++
+    this.totalRunMs += Math.max(0, runMs)
+    this.maxRunMs = Math.max(this.maxRunMs, Math.max(0, runMs))
+    const next = this.waiters.shift()
+    if (next === undefined) { this.active = Math.max(0, this.active - 1); return }
+    if (next.onAbort !== undefined) next.signal?.removeEventListener('abort', next.onAbort)
+    next.resolve(true)
+  }
+  state(): CheckEnvelope {
+    return { limit: this.limit, active: this.active, queued: this.waiters.length, maxActive: this.maxActive, completed: this.completed,
+      totalWaitMs: this.totalWaitMs, maxWaitMs: this.maxWaitMs, totalRunMs: this.totalRunMs, maxRunMs: this.maxRunMs }
+  }
 }
 /** Durable record of a recovery that could not capture the previous owner's partial work. */
 export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; previousOwnerId: string; commit: string; reason: string }
@@ -235,14 +331,32 @@ export class Workspaces {
   private readonly inFlight = new Set<Promise<unknown>>()
   private readonly baselines = new Map<string, Promise<WorkspaceBaseline>>()
   private readonly commonDirs = new Map<string, Promise<string>>()
+  /** One in-flight self-contained artifact repository creation per mission. */
+  private readonly artifactRepos = new Map<string, Promise<string>>()
   private readonly cleanupIssues: string[] = []
   private readonly recoveryIssues: string[] = []
+  /** R11-19: one per-host semaphore over declared-check executions. */
+  private readonly checks: CheckSemaphore
+  private readonly checkSamples: CheckEnvelopeSample[] = []
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
     this.root = path.resolve(options.workspacesRoot)
     if (!Number.isSafeInteger(options.checkTimeoutMs) || options.checkTimeoutMs < 1) throw new Error('checkTimeoutMs must be positive')
     if (!Number.isSafeInteger(options.maxCheckOutputBytes) || options.maxCheckOutputBytes < 64) throw new Error('maxCheckOutputBytes must be at least 64')
+    this.checks = new CheckSemaphore(options.checkConcurrency ?? DEFAULT_CHECK_CONCURRENCY)
+  }
+
+  /** R11-19: the host's measured check envelope (limit, active, queued, wait and run times). */
+  checkEnvelope(): CheckEnvelope { return this.checks.state() }
+  /** R11-19: the most recent measured checks, oldest first (bounded). */
+  checkEnvelopeSamples(): readonly CheckEnvelopeSample[] { return [...this.checkSamples] }
+  private recordCheckEnvelope(member: Member, task: Task, command: string, waitMs: number, runMs: number): void {
+    const state = this.checks.state()
+    const sample: CheckEnvelopeSample = { memberId: member.id, taskId: task.id, command, waitMs, runMs, active: state.active, queued: state.queued, limit: state.limit }
+    this.checkSamples.push(sample)
+    if (this.checkSamples.length > 100) this.checkSamples.splice(0, this.checkSamples.length - 100)
+    try { this.options.onCheckEnvelope?.(sample) } catch { /* host-side recording must not mask check results */ }
   }
 
   /** Non-fatal verification-checkout cleanup failures, oldest first (bounded). */
@@ -259,6 +373,89 @@ export class Workspaces {
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
   private memberPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.workspace.json`) }
   private taskPath(missionId: string, taskId: string): string { return path.join(this.missionDir(missionId), 'tasks', `${segment(taskId)}.json`) }
+  /** Per-mission private artifact repository: refs live outside the shared source repo. */
+  private artifactRepoDir(missionId: string): string { return path.join(this.missionDir(missionId), 'artifacts.git') }
+
+  /**
+   * R11-14 (A2-04): artifact and baseline refs are published into a per-mission
+   * bare repository under the mission directory instead of `refs/swarm/*` in the
+   * shared source repository. Every member worktree of the source repo could
+   * enumerate and read all missions' refs through the common git dir, which is a
+   * cross-tenant read channel; a per-mission repository removes the discovery
+   * channel.
+   *
+   * The repository is SELF-CONTAINED (T1c2 durability repair): it is created as
+   * a local bare clone of the source — objects hardlinked on the same
+   * filesystem, copied otherwise — and every later push transfers the new
+   * objects into it. It therefore owns its objects (`count-objects` > 0) and
+   * resolves every recorded ref without the source or an alternate, so a source
+   * `gc --prune=now` after the member worktree is removed cannot make a
+   * recorded artifact unreadable. An earlier revision borrowed the source
+   * object store through `objects/info/alternates`; that variant left 0 own
+   * objects and was disproved by the T1cv durability probe, so a legacy
+   * alternate-backed repository is rebuilt here with its refs re-pushed from
+   * the source. The sanctioned read path for cross-mission artifacts is the
+   * runtime registry, never a git ref.
+   */
+  private artifactRepo(missionId: string, source: string, signal?: AbortSignal): Promise<string> {
+    const existing = this.artifactRepos.get(missionId)
+    if (existing !== undefined) return existing
+    const pending = this.createArtifactRepo(missionId, source, signal)
+    this.artifactRepos.set(missionId, pending)
+    void pending.catch(() => { if (this.artifactRepos.get(missionId) === pending) this.artifactRepos.delete(missionId) })
+    return pending
+  }
+
+  private async createArtifactRepo(missionId: string, source: string, signal?: AbortSignal): Promise<string> {
+    const dir = this.artifactRepoDir(missionId)
+    const marker = path.join(dir, 'swarm-artifacts.json')
+    const saved = await readJson(marker)
+    if (isRecord(saved)) {
+      if (saved.version !== 1 || saved.missionId !== missionId) throw new Error('Invalid per-mission artifact repository marker')
+      // A legacy repository that borrows the source through an alternate is not
+      // durable: rebuild it self-contained and carry every ref over.
+      if (!(await lstat(path.join(dir, 'objects', 'info', 'alternates')).then(() => true, () => false))) return dir
+      const refs = (await this.git(dir, ['for-each-ref', '--format=%(objectname) %(refname)']))
+        .split('\n').map(line => line.trim()).filter(Boolean)
+        .map(line => { const [commit, ref] = line.split(' '); return { commit: commit!, ref: ref! } })
+      await rm(dir, { recursive: true, force: true })
+      await this.cloneArtifactRepo(missionId, source, dir, signal)
+      for (const { commit, ref } of refs) await this.git(source, ['push', '--quiet', '--force', dir, `${commit}:${ref}`], signal)
+      return dir
+    }
+    // `git clone` refuses a non-empty destination, so drop a partial directory
+    // from an interrupted first attempt before cloning.
+    if (await lstat(dir).then(() => true, () => false)) await rm(dir, { recursive: true, force: true })
+    await this.cloneArtifactRepo(missionId, source, dir, signal)
+    return dir
+  }
+
+  /** A self-contained local bare clone plus its identity marker. */
+  private async cloneArtifactRepo(missionId: string, source: string, dir: string, signal?: AbortSignal): Promise<void> {
+    await mkdir(path.dirname(dir), { recursive: true, mode: 0o700 })
+    await this.git(path.dirname(dir), ['clone', '--bare', '--quiet', source, dir], signal)
+    // Keep only the mission's own namespaces: a cloned branch or tag would
+    // widen the repository's surface and make its reachability depend on the
+    // source's branches. The objects stay reachable from the mission refs.
+    const inherited = await this.git(dir, ['for-each-ref', '--format=%(refname)'])
+    for (const ref of inherited.split('\n').map(line => line.trim()).filter(Boolean)) {
+      if (ref.startsWith('refs/artifacts/') || ref.startsWith('refs/baselines/')) continue
+      await this.git(dir, ['update-ref', '-d', ref], signal)
+    }
+    await writeFile(path.join(dir, 'swarm-artifacts.json'), JSON.stringify({ version: 1, missionId }), { mode: 0o600 })
+  }
+
+  /**
+   * Publish one immutable ref into the mission's private repository and drop the
+   * pre-R11-14 shared ref for exactly this mission, so a mission the host
+   * touches no longer exposes its artifacts to other missions' worktrees. The
+   * legacy delete is scoped to the mission's own namespace and is best effort.
+   */
+  private async publishArtifactRef(missionId: string, cwd: string, commit: string, ref: string, legacyRef: string, signal?: AbortSignal): Promise<void> {
+    const repo = await this.artifactRepo(missionId, cwd, signal)
+    await this.git(cwd, ['push', '--quiet', '--force', repo, `${commit}:${ref}`], signal)
+    await this.git(cwd, ['update-ref', '-d', legacyRef], signal).catch(() => undefined)
+  }
 
   /**
    * Re-validate the human authorization behind a mission before its first
@@ -397,7 +594,7 @@ export class Workspaces {
       if (baseline.planningWorkspace !== planningWorkspace) throw new Error('Planning workspace is outside its owned mission directory')
       // Persist the baseline identity before its ref/checkout. Interrupted
       // publication resumes that exact commit, never another source snapshot.
-      await this.git(source, ['update-ref', `refs/swarm/${segment(mission.id)}/baseline`, baseline.snapshotCommit], ownedSignal)
+      await this.publishArtifactRef(mission.id, source, baseline.snapshotCommit, 'refs/baselines/baseline', `refs/swarm/${segment(mission.id)}/baseline`, ownedSignal)
       const exists = await realpath(planningWorkspace).then(value => value, error => {
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return undefined
         throw error
@@ -781,7 +978,7 @@ export class Workspaces {
       // The commit is authoritative: re-check the recorded blobs so a working
       // tree edited after staging cannot smuggle a symlink into the artifact.
       await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
-      await this.git(member.workspace, ['update-ref', `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, commit], signal)
+      await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
       await this.saveTaskWorkspace(record)
       return { commit, baseCommit, workspace: member.workspace, changedPaths }
@@ -796,29 +993,46 @@ export class Workspaces {
       // Revocation fencing: the verification checkout is created only after the
       // persisted mission manifest still authorizes its recorded root.
       await this.assertWorkspaceAuthorized(mission.source, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
+      // R11-19: declared-check executions are bounded per host. A verification
+      // beyond the limit waits here in FIFO order (abort-aware), and its wait is
+      // measured. The adapter reports `verification` activity for the whole
+      // call, so the runtime's lease renewal keeps the queued attempt alive.
+      const waitMs = await this.checks.acquire(signal)
+      const startedAt = Date.now()
+      let released = false
+      const release = (): void => { if (!released) { released = true; this.checks.release(Date.now() - startedAt) } }
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
-      await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
-      await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
       try {
+        await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
+        await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
         const cache = this.checkCacheEnvironment(checkout)
         await mkdir(path.join(checkout, '.swarm-check-cache'), { recursive: true, mode: 0o700 }).catch(() => undefined)
         const parentEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
         const env = this.options.checkEnv === undefined ? { ...parentEnv, ...cache } : { ...cache, ...this.options.checkEnv }
         const results: CheckResult[] = []
+        let first = true
         for (const command of task.checks) {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
+          const commandStarted = Date.now()
           const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env })
           // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
           const output = result.exitCode === 127
-            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${(this.options.verificationDependencyMode ?? 'link') === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
+            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
             : result.output
           results.push({ command, exitCode: result.exitCode, output, truncated: result.truncated })
+          // The queue wait belongs to the first check of this verification; the
+          // run time is the check's own execution.
+          this.recordCheckEnvelope(member, task, command, first ? waitMs : 0, Date.now() - commandStarted)
+          first = false
           if (result.exitCode !== 0) break
         }
         return results
-      } finally { await this.cleanupVerification(mission.source, checkout) }
+      } finally {
+        release()
+        await this.cleanupVerification(mission.source, checkout)
+      }
     }, signal)
   }
 
@@ -888,27 +1102,30 @@ export class Workspaces {
   cancel(memberId: string): void { for (const controller of this.controllers.get(memberId) ?? []) controller.abort('member stopped') }
 
   /** Preserve mission worktrees as deliverables, while draining all owned execution. */
+  /** R11-13: the effective dependency materialisation mode; `link` needs the explicit unsafe opt-in. */
+  private dependencyMode(): 'link' | 'copy' {
+    return this.options.verificationDependencyMode === 'link' && this.options.allowDependencyLinkReads === true ? 'link' : 'copy'
+  }
   /**
    * Clean checkouts contain only committed files, so toolchains installed in the
    * source (ignored `node_modules` and similar) are absent. By default those
-   * ignored directories are symlinked read-through from the source at the same
-   * relative paths: the artifact commit is unchanged and the check reads the
-   * real toolchain. The link grants reads, not writes: production wraps every
-   * check in the Harness sandbox rooted at the checkout and requires full
-   * enforcement (F-29), whose resolved-path matching refuses a write that lands
-   * in the source. `verificationDependencyMode: 'copy'` clones the directory
-   * into the checkout instead, so isolation does not depend on the backend, at
-   * the cost of copying the tree. Package-manager caches are always pointed
-   * inside the checkout. Build outputs and other ignored paths are never linked
-   * or copied.
-   * @returns the relative directories that were linked or copied.
+   * ignored directories are COPIED into the checkout at the same relative
+   * paths: the artifact commit is unchanged, the check reads the real toolchain,
+   * and no path inside the materialised directory can resolve back into the
+   * source checkout (R11-13). A read-through symlink (`verificationDependencyMode:
+   * 'link'` with `allowDependencyLinkReads: true`) lets `node_modules/..` and
+   * `node_modules/pkg/../..` resolve to the symlink target's parent chain and
+   * read uncommitted source state, so it is never used unless the host
+   * explicitly opts in. Package-manager caches are always pointed inside the
+   * checkout. Build outputs and other ignored paths are never linked or copied.
+   * @returns the relative directories that were copied or linked.
    */
   private async linkDependencyDirs(source: string, checkout: string, signal: AbortSignal): Promise<string[]> {
     const names = new Set(this.options.verificationDependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)
     if (names.size === 0) return []
     const ignored = await this.git(source, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], signal, undefined, INVENTORY_BYTES)
     const linked: string[] = []
-    const copy = (this.options.verificationDependencyMode ?? 'link') === 'copy'
+    const copy = this.dependencyMode() === 'copy'
     for (const entry of ignored.split('\0')) {
       if (!entry.endsWith('/')) continue
       const relative = entry.slice(0, -1)

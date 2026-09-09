@@ -5,6 +5,7 @@
  * side of F-12/F-13 (durable verdict naming, retained event window).
  */
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import React from 'react'
@@ -22,6 +23,59 @@ import { graphLayout } from '../lib/types/client/DependencyGraph.js'
 const render = (component, props, chinese = false) => {
   const element = React.createElement(component, props)
   return renderToStaticMarkup(chinese ? React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, element) : element)
+}
+
+/**
+ * The emitted event vocabulary, re-derived from `src/*.ts` exactly like
+ * `tests/event-vocabulary.test.mjs`: a new emitter that is neither labeled by
+ * the compact projection nor named in `OMITTED` fails the F-14/F-33 guards.
+ */
+const SRC = new URL('../src/', import.meta.url)
+const DYNAMIC_EVENTS = ['mission/pause', 'mission/stop', 'mission/complete', 'mission/resume', 'mission/coordinator',
+  'delivery/applied', 'delivery/conflicts']
+function emittedEventTypes() {
+  const emitted = new Set()
+  for (const file of readdirSync(SRC)) {
+    if (!file.endsWith('.ts')) continue
+    const text = readFileSync(new URL(file, SRC), 'utf8')
+    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*'([^']+)'/g)) emitted.add(match[1])
+    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*[^,?]+\?\s*'([^']+)'\s*:\s*'([^']+)'/g)) {
+      emitted.add(match[1]); emitted.add(match[2])
+    }
+  }
+  return [...new Set([...emitted, ...DYNAMIC_EVENTS])].sort()
+}
+/** Emitted types deliberately kept off the compact panel, each with its owner-facing surface. */
+const OMITTED = {
+  'member/activity': 'lease-liveness heartbeat; the activity projection already shows it',
+  'tool/recorded': 'per-tool counter; the transcript and evidence provenance own it',
+  'trace/span': 'trace payload; the trace/replay surface owns it',
+  'message/queued': 'transport; the delivery panel owns it',
+  'mission/created': 'the mission header and status show creation',
+  'plan/edited': 'draft-scoped; never in a mission snapshot',
+  'plan/staged': 'draft-scoped; never in a mission snapshot',
+  'task/proposed': 'the pending task card appears on the board',
+  'workstream/created': 'board structure, not progress',
+  'member/stopped': 'the team disclosure shows member status',
+  'member/waiting': 'the activity projection shows the parked member',
+  'admission/limit': 'owner notice; no task event',
+  'admission/refused': 'owner notice; no task event',
+  'evidence/verdict': 'normalized duplicate of evidence/verified|refuted',
+  'automatic/requested': 'planning start; automatic/completed|failed carry the outcome',
+  'member/effort-rejected': 'paired with member/failed (Worker could not start)',
+  'mission/budget-quiesced': 'follow-up to mission/budget-exhausted',
+  'mission/budget-updated': 'accounting; the metrics show the new ceilings',
+  // T3 integration: install-scoped and metrics rows the merged branches emit.
+  'store/snapshot': 'install-scoped VACUUM INTO row; never in a mission snapshot (the store audit owns it)',
+  'store/restore-requested': 'install-scoped owner tool result; the restore happens at the next host start',
+  'store/restored': 'install-scoped startup row; emitted before any mission exists',
+  'task/check-envelope': 'measured check envelope; the verification verdict and check-failure rows carry the owner-facing outcome',
+}
+/** One isolated durable event so a projection test cannot pass on another event's label. */
+function eventOnlySnapshot(type, data = {}) {
+  const snapshot = uiSnapshot()
+  snapshot.events = [{ seq: 1, missionId: snapshot.mission.id, type, actor: 'runtime', data, createdAt: snapshot.mission.updatedAt }]
+  return snapshot
 }
 function panelProps(state) {
   const sessionState = { current: 'owner', byId: { owner: { id: 'owner', displayTitle: 'Owner conversation' } } }
@@ -84,6 +138,74 @@ test('F-14: the compact panel surfaces every recovery/control event type and pre
   assert.match(summary, /runId: run_123/)
   assert.match(summary, /outcome: supported/)
   assert.doesNotMatch(summary, /rawArguments|secret/)
+  // R11-09: the check-change and review-link payload is reconstructible.
+  const change = eventSummary({ taskId: 't2', reason: 'replacement', previousChecks: ['npm run typecheck'], checks: ['npm run build'],
+    reviewOf: 't1', rawArguments: 'secret' })
+  assert.match(change, /previousChecks: npm run typecheck/)
+  assert.match(change, /checks: npm run build/)
+  assert.match(change, /reviewOf: t1/)
+  assert.doesNotMatch(change, /rawArguments|secret/)
+  // The workspace-audit payload is reconstructible too.
+  const binding = eventSummary({ workspace: '/repo', grantRoot: '/granted', source: 'grant', loaded: false, path: '/granted', blockedTasks: ['t2'] })
+  assert.match(binding, /workspace: \/repo/)
+  assert.match(binding, /grantRoot: \/granted/)
+  assert.match(binding, /source: grant/)
+  assert.match(binding, /loaded: false/)
+  assert.match(binding, /path: \/granted/)
+  assert.match(binding, /blockedTasks: t2/)
+
+  // R11-08 vocabulary guard: every emitted type is either labeled by the
+  // compact projection or explicitly omitted here. A new emitter with no
+  // classification fails this suite instead of staying silently invisible.
+  const allEmitted = emittedEventTypes()
+  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
+  for (const type of allEmitted) {
+    const surfaced = recentProgress(eventOnlySnapshot(type), 20)
+    if (OMITTED[type]) {
+      assert.deepEqual(surfaced, [], `${type} is declared omitted from the compact panel but produced a label`)
+      continue
+    }
+    assert.equal(surfaced.length, 1, `${type} is emitted but has no compact label; add one or name it in OMITTED with a reason`)
+    const label = surfaced[0].label
+    assert.ok(zh[label], `the compact label for ${type} has no zh translation: ${label}`)
+    assert.ok(render(RecentProgress, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
+      `the compact panel does not translate ${label} for ${type}`)
+  }
+  // The R11-08 families and the promoted workspace-audit types are labeled.
+  for (const type of ['task/review-missing', 'task/review-admitted', 'task/review-blocked', 'task/check-changed',
+    'workspace/grant-loaded', 'mission/workspace-bound', 'mission/workspace-revoked']) {
+    assert.ok(!OMITTED[type], `${type} must be labeled, not omitted`)
+    assert.equal(recentProgress(eventOnlySnapshot(type), 20).length, 1, `${type} must surface on the compact panel`)
+  }
+})
+
+test('R11-08: the review-path, check-change and restart-recovery payloads are the compact detail', () => {
+  const missing = recentProgress(eventOnlySnapshot('task/review-missing', { taskId: 't2', kind: 'implementation',
+    reason: 'no live independent verification task reviews this submitted implementation artifact' }), 20)[0]
+  assert.equal(missing.label, 'Submitted work has no review')
+  assert.equal(missing.detail, 'Implement lease renewal and fencing', 'the task title is the compact detail')
+  const admitted = recentProgress(eventOnlySnapshot('task/review-admitted', { taskId: 't3', reviewOf: 't2',
+    reason: 'no live review existed for the submitted artifact' }), 20)[0]
+  assert.equal(admitted.label, 'Independent review admitted')
+  assert.equal(admitted.detail, 'Verify stale attempts cannot commit')
+  const blocked = recentProgress(eventOnlySnapshot('task/review-blocked', { taskId: 't2', kind: 'implementation',
+    reason: 'the mission task budget is exhausted (20/20 admitted tasks), so no verification task can be admitted' }), 20)[0]
+  assert.equal(blocked.label, 'Submitted work cannot be reviewed')
+  assert.match(blocked.detail, /task budget is exhausted/, 'the review-block reason is the owner-facing detail')
+  const changed = recentProgress(eventOnlySnapshot('task/check-changed', { taskId: 't2', sourceTaskId: 't2', reason: 'replacement',
+    previousChecks: ['npm run typecheck'], checks: ['npm run build', 'node --test'] }), 20)[0]
+  assert.equal(changed.label, 'A declared check changed')
+  assert.equal(changed.detail, 'replacement · npm run build && node --test', 'the changed checks are previewed')
+  const startFailed = recentProgress(eventOnlySnapshot('task/start-failed', { taskId: 't2', reason: 'worker start failed',
+    recoveryCount: 1, maxRecoveryAttempts: 3 }), 20)[0]
+  assert.equal(startFailed.label, 'Task failed to start')
+  assert.equal(startFailed.detail, 'worker start failed · recovery 1/3')
+  const reassigned = recentProgress(eventOnlySnapshot('task/reassigned', { taskId: 't2', from: 'b', to: 'a', reason: 'start failed twice' }), 20)[0]
+  assert.equal(reassigned.label, 'Task re-routed to another member')
+  assert.equal(reassigned.detail, 'b → a · start failed twice')
+  const chinese = render(RecentProgress, { snapshot: eventOnlySnapshot('task/check-changed', { taskId: 't2', reason: 'replacement', checks: ['npm run build'] }) }, true)
+  assert.match(chinese, /声明的检查已变更/)
+  assert.doesNotMatch(chinese, />A declared check changed</)
 })
 
 test('task/ceiling-exhausted renders a compact ceiling block with a translated label', () => {
@@ -221,6 +343,19 @@ test('F-33: zh translates dynamic verdict, kind and event vocabulary', () => {
     type, actor: 'runtime', data: {}, createdAt: vocabularySnapshot.mission.updatedAt + index }))
   const translated = render(SwarmBoard, { snapshot: vocabularySnapshot, initialView: 'activity' }, true)
   assert.doesNotMatch(translated, /task \/ rejected|mission \/ recovered|budget-warning|member \/ added|subscribed|lease-expiring|closeout-ready|closeout-exhausted|budget-resumed|budget-resume-skipped|quiescence-recovered|workstream \/ created|member \/ activity|resume-failed|automatic \/ requested|review-retired|effort-downgraded|budget-quiesced|preparation-failed/)
+
+  // Derived vocabulary guard: every path segment of every emitted type has a
+  // zh token and the Activity view renders the translation, so a new emitter
+  // with an untranslated token fails the suite instead of rendering English.
+  const allEmitted = emittedEventTypes()
+  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
+  for (const type of allEmitted) for (const token of type.split('/')) assert.ok(zh[token], `zh token ${token} missing for ${type}`)
+  for (const type of allEmitted) {
+    const cell = (render(SwarmBoard, { snapshot: eventOnlySnapshot(type), initialView: 'activity' }, true)
+      .match(/<div class="sw-event-type">([\s\S]*?)<\/div>/) ?? [])[1]
+    assert.ok(cell, `the Activity view did not render ${type}`)
+    assert.equal(cell, type.split('/').map(token => zh[token]).join(' / '), `the Activity view left an untranslated token for ${type}`)
+  }
 })
 
 /** Counts calls and predicate probes for every find/filter on the task array. */

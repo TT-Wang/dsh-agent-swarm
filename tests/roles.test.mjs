@@ -1,7 +1,7 @@
 /** Real Harness tool registry and prompt assembly: sessions see only their role's swarm tools and protocol. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -71,6 +71,14 @@ async function fixture(t, responder, workerOptions = {}) {
   return { ctx, runtime, workers, requests, source, scoper }
 }
 const prompt = text => ({ kind: 'text', text })
+
+test('T3d: the entry-visible surface equals the model-visible golden fixture', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/model-visible.expected.json', import.meta.url), 'utf8'))
+  const visible = SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name) && !OWNER_SESSION_TOOLS.includes(name)).sort()
+  assert.deepEqual(visible, fixture.visibleSwarmTools, 'the entry-visible swarm tool set must equal the golden fixture')
+  assert.ok(!visible.includes('swarm_restore'), 'swarm_restore is owner-session-only, so an entry session cannot see it')
+  assert.ok(fixture.ownerSwarmTools.includes('swarm_restore'), 'an owner session still sees swarm_restore')
+})
 
 test('an ordinary session sees the entry set and prompt; owning a request promotes it to the owner set before its planning turn', async t => {
   const f = await fixture(t, () => prompt('ok'))

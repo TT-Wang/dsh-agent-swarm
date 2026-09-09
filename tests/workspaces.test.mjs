@@ -30,7 +30,7 @@ async function fixture(t, options = {}) {
 }
 
 test('member work and artifact commit never change the source branch or files', async t => {
-  const { source, head, workspaces, member, task } = await fixture(t)
+  const { temp, source, head, workspaces, mission, member, task } = await fixture(t)
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
   const artifact = await workspaces.captureArtifact(member, task)
@@ -40,7 +40,11 @@ test('member work and artifact commit never change the source branch or files', 
   assert.equal(await readFile(path.join(source, 'src', 'answer.txt'), 'utf8'), 'base\n')
   assert.equal(await git(source, 'rev-parse', 'HEAD'), head)
   assert.equal(await git(source, 'status', '--porcelain'), '')
-  assert.equal(await git(source, 'rev-parse', 'refs/swarm/mission-one/task-one/1'), artifact.commit)
+  // R11-14: the artifact ref is published into the mission's private repository,
+  // never the shared source repo, so another mission's worktree cannot enumerate it.
+  const artifacts = path.join(temp, 'worktrees', mission.id, 'artifacts.git')
+  assert.equal(await git(artifacts, 'rev-parse', 'refs/artifacts/task-one/1'), artifact.commit)
+  assert.equal(await git(source, 'for-each-ref', '--format=%(refname)', 'refs/swarm/'), '', 'the shared cross-mission ref namespace is never used')
 })
 
 test('scope enforcement sees staged, committed and untracked files before capture', async t => {
@@ -54,7 +58,7 @@ test('scope enforcement sees staged, committed and untracked files before captur
 })
 
 test('dirty snapshots preserve the real index and include working content, ignored tracked additions, modes, links and binary files', async t => {
-  const { source, head, workspaces } = await fixture(t)
+  const { temp, source, head, workspaces } = await fixture(t)
   await writeFile(path.join(source, '.gitignore'), '.env\nlocal-*\n')
   await writeFile(path.join(source, 'src', 'answer.txt'), 'staged user answer\n')
   await writeFile(path.join(source, 'local-tracked'), 'already staged despite ignore\n')
@@ -75,7 +79,8 @@ test('dirty snapshots preserve the real index and include working content, ignor
   assert.notEqual(baseline.snapshotCommit, head)
   assert.deepEqual(await readFile(path.join(source, '.git', 'index')), index, 'real staging bytes are unchanged')
   assert.equal(await git(source, 'rev-parse', 'HEAD'), head)
-  assert.equal(await git(source, 'rev-parse', 'refs/swarm/mission-dirty/baseline'), baseline.snapshotCommit)
+  assert.equal(await git(path.join(temp, 'worktrees', 'mission-dirty', 'artifacts.git'), 'rev-parse', 'refs/baselines/baseline'), baseline.snapshotCommit)
+  assert.equal(await git(source, 'for-each-ref', '--format=%(refname)', 'refs/swarm/'), '', 'the baseline ref is private to the mission, not shared')
   assert.equal(await git(source, 'show', ':src/answer.txt'), 'staged user answer')
   assert.equal(await readFile(path.join(source, 'src', 'answer.txt'), 'utf8'), 'latest unstaged user answer\n')
   assert.equal(await readFile(path.join(baseline.planningWorkspace, 'src', 'answer.txt'), 'utf8'), 'latest unstaged user answer\n')

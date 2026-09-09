@@ -143,14 +143,44 @@ test('admission refuses a declared check that names a host-absolute path outside
   reject(['true; /opt/homebrew/bin/node check.cjs'])
   reject(['true\n/opt/homebrew/bin/node check.cjs'])
   reject(['-Wl,-rpath,/opt/homebrew/lib node check.cjs'])
-  // System executables, relative paths and shell expansions stay admitted.
+  // A2-01 (R11-12): the shell resolves a backslash-escaped or doubled leading
+  // slash to the same host path, so both spellings are refused here too.
+  reject(['cat \\/Users/tongtao/secret'])
+  reject(['cat //Users/tongtao/secret'])
+  reject(['test -f \\/Users/tongtao/code/memem-publish/package.json'])
+  // R11-12 class closure: a traversal or dot-segment through a system prefix
+  // normalizes to the host path, so it cannot inherit the `/usr/bin/` exemption.
+  reject(['/usr/bin/../..//Users/tongtao/secret run pytest'])
+  reject(['/usr/bin/./../..//Users/tongtao/secret run pytest'])
+  reject(['/usr/bin/../../opt/homebrew/bin/node check.cjs'])
+  // R11-12 follow-up: a quoted, backtick, eval or nested-quote body resolves to
+  // one shell word, but its inner host path is still refused.
+  reject(['sh -c "cat /Users/tongtao/secret"'])
+  reject(["sh -c 'cat /Users/tongtao/secret'"])
+  reject(['cat `echo /Users/tongtao/secret`'])
+  reject(['eval "cat /Users/tongtao/secret"'])
+  reject(["node -e \"require('/Users/tongtao/secret')\""])
+  reject(['bash -c "cd /Users/tongtao && make"'])
+  reject(['echo "test -f /Users/tongtao/secret"'])
+  reject(['PATH=x:/Users/tongtao/secret node check.cjs'])
+  // System executables, relative paths, shell expansions and ordinary
+  // pattern/separator arguments stay admitted (the paired false-positive fix).
   for (const accepted of ['node check.cjs', '/bin/sh -c "node check.cjs"', '/usr/bin/env node check.cjs',
     'PATH=/usr/bin:/bin node check.cjs', 'PATH=/usr/bin:$PATH node check.cjs',
     'PATH="$PWD/node_modules/.bin:$PATH" toolchain-check', 'npm_config_cache="$PWD/.cache" npm test',
     'curl https://example.com/check.json', 'test -f "$PWD/package.json"',
     'test -f "$PWD/.venv/bin/python" && "$PWD/.venv/bin/python" -m pytest',
     '.venv/bin/python -m pytest', 'node_modules/.bin/tsc --noEmit', 'test -c /dev/null', 'python3 -m pytest',
-    'node -e "console.log(1)"', '~/.local/bin/uv run pytest', '$HOME/.local/bin/uv run pytest']) {
+    'node -e "console.log(1)"', '~/.local/bin/uv run pytest', '$HOME/.local/bin/uv run pytest',
+    // A normalized system path is still a system path.
+    '/usr/bin/../bin/sh -c "node check.cjs"', '/bin/../bin/sh -c true', '/usr/bin/./env node check.cjs',
+    // Separator flags name the bare root, not a host file.
+    'awk -F/ \'{print $1}\' package.json', 'sort -t/ -k1 file', 'tr / _ < file', 'cut -d/ -f1 file',
+    // Regex/pattern arguments are not host paths, and a slash inside a word is prose.
+    'grep -E \'/(src|tests)/\' package.json', 'grep -E \'/[a-z]+/\' package.json',
+    'node --test --test-name-pattern=\'/rejects/\' tests/x.test.mjs', 'echo "a and/or b"',
+    // A URL value is not a host path (doubled slash plus scheme before the colon).
+    'curl --url=https://example.com/check.json', 'PATH=x:https://example.com/check.json node x.cjs']) {
     const input = plan('/workspace')
     input.tasks[1].checks = [accepted]
     assert.doesNotThrow(() => validatePlan(input), accepted)
@@ -175,8 +205,16 @@ test('admission refuses a declared check that names a host-absolute path outside
   // The F4v ground-(b) probes are refused at this admission point too.
   for (const probe of ['PATH=$PATH:/opt/homebrew/bin node check.cjs', 'PATH=:/opt/homebrew/bin node check.cjs',
     'PYTHONPATH=$PYTHONPATH:/Users/tongtao/code/memem-publish/.venv/lib python -m pytest',
-    'python -m pytest @/Users/tongtao/code/memem-publish/args.txt', 'node -I/opt/homebrew/lib check.cjs']) {
+    'python -m pytest @/Users/tongtao/code/memem-publish/args.txt', 'node -I/opt/homebrew/lib check.cjs',
+    'cat \\/Users/tongtao/secret', 'cat //Users/tongtao/secret',
+    '/usr/bin/../..//Users/tongtao/secret run pytest', '/usr/bin/./../..//Users/tongtao/secret run pytest',
+    'sh -c "cat /Users/tongtao/secret"', "sh -c 'cat /Users/tongtao/secret'", 'eval "cat /Users/tongtao/secret"',
+    "node -e \"require('/Users/tongtao/secret')\"", 'PATH=x:/Users/tongtao/secret node check.cjs']) {
     assert.throws(() => propose({ title: 'Probe', checks: [probe] }), /\[check_absolute_path\]/, probe)
+  }
+  for (const accepted of ['/usr/bin/../bin/sh -c "node check.cjs"', 'awk -F/ \'{print $1}\' package.json',
+    'grep -E \'/(src|tests)/\' package.json', 'curl --url=https://example.com/check.json', 'echo "a and/or b"']) {
+    assert.equal(propose({ title: 'Accepted probe', checks: [accepted] }).checks[0], accepted)
   }
   assert.equal(propose({ title: 'Relative check' }).checks[0], 'node check.cjs', 'a checkout-relative check is admitted')
 })

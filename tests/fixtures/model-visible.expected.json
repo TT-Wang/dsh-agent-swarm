@@ -24,6 +24,8 @@
     "swarm_observe",
     "swarm_post",
     "swarm_propose",
+    "swarm_registry",
+    "swarm_restore",
     "swarm_stage",
     "swarm_workstream"
   ],
@@ -31,6 +33,7 @@
     "swarm_board",
     "swarm_challenge",
     "swarm_claim",
+    "swarm_escalate",
     "swarm_handoff",
     "swarm_message",
     "swarm_observe",

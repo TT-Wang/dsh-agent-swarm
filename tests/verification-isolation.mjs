@@ -13,9 +13,12 @@
  *   `src/harness-workers.ts` path) and is refused unless the host reports FULL
  *   enforcement (F-29);
  * - a check that writes to an absolute path in the source checkout is refused;
- * - with the default `verificationDependencyMode: 'link'` the check reads the
- *   source toolchain, but a write through that link resolves into the source
- *   and is refused by the full-enforcement sandbox (F-C2);
+ * - the default `verificationDependencyMode: 'copy'` materialises a private
+ *   directory, so a check reads the copied toolchain and cannot read the source
+ *   through `node_modules/..` (R11-13);
+ * - the explicit `verificationDependencyMode: 'link'` + `allowDependencyLinkReads`
+ *   opt-in reads the source toolchain, but a write through that link resolves
+ *   into the source and is refused by the full-enforcement sandbox (F-C2);
  * - a check may still write inside its own verification checkout;
  * - `copy` mode isolates the write without relying on the sandbox.
  *
@@ -99,8 +102,22 @@ test('a verification check cannot write into the source checkout', async t => {
   assert.equal(await exists(sentinel), false, 'the refused write left no file in the source checkout')
 })
 
-test('default link mode reads the source toolchain but cannot write through it', async t => {
+test('the default copy mode reads the toolchain but not uncommitted source state through node_modules/..', async t => {
   const { source, workspaces, member, task, artifact } = await fixture(t)
+  const read = await runCheck(workspaces, member, task, artifact, 'test -d node_modules && test ! -L node_modules && cat node_modules/dep/tool.txt && echo private-copy-ok')
+  assert.equal(read.exitCode, 0, JSON.stringify(read))
+  assert.match(read.output, /toolchain/)
+  assert.match(read.output, /private-copy-ok/)
+  // Uncommitted source state created after the artifact was captured is not in
+  // the checkout, and the copied dependency directory cannot point at the source.
+  await writeFile(path.join(source, 'UNCOMMITTED.txt'), 'SECRET-SOURCE-STATE\n')
+  const escape = await runCheck(workspaces, member, task, artifact, 'cat node_modules/../UNCOMMITTED.txt')
+  assert.notEqual(escape.exitCode, 0, `the source read must fail closed: ${JSON.stringify(escape)}`)
+  assert.doesNotMatch(escape.output, /SECRET-SOURCE-STATE/)
+})
+
+test('the explicit link opt-in reads the source toolchain but cannot write through it', async t => {
+  const { source, workspaces, member, task, artifact } = await fixture(t, { verificationDependencyMode: 'link', allowDependencyLinkReads: true })
   const read = await runCheck(workspaces, member, task, artifact, 'test -L node_modules && cat node_modules/dep/tool.txt && echo read-through-ok')
   assert.equal(read.exitCode, 0, JSON.stringify(read))
   assert.match(read.output, /toolchain/)

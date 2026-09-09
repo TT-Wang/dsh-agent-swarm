@@ -61,6 +61,36 @@ export interface DeliveryApplication {
   changedPaths: string[]
   conflicts: string[]
 }
+/**
+ * R11-01: closed provider-outage classes. The adapter classifies an HTTP/class
+ * condition (402/429/5xx, quota, provider-unavailable) into one of these so the
+ * runtime can pause, route or re-assign without parsing provider text.
+ */
+export type ProviderOutageClass = 'quota' | 'rate-limit' | 'unavailable'
+/** R11-01: one classified provider outage; `status` is the HTTP status when known. */
+export interface ProviderOutage {
+  class: ProviderOutageClass
+  status?: number
+  message: string
+}
+/** The last classified outage observed for a member, used to avoid spending recovery credit. */
+export interface MemberProviderOutage extends ProviderOutage { at: number }
+/**
+ * R11-19: the host's measured declared-check envelope. Structural mirror of the
+ * `Workspaces` value so the adapter interface never imports the Node-only
+ * workspace module.
+ */
+export interface CheckEnvelope {
+  limit: number
+  active: number
+  queued: number
+  maxActive: number
+  completed: number
+  totalWaitMs: number
+  maxWaitMs: number
+  totalRunMs: number
+  maxRunMs: number
+}
 export interface Mission {
   id: string
   ownerSessionId: string
@@ -105,6 +135,16 @@ export interface Mission {
   ownerUsage?: UsageBuckets
   /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
   stallNotice?: string
+  /**
+   * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
+   * `F(S)` of the board state at the moment the last owner-decision notice was
+   * emitted, and its witness class. A notice is fresh only for the fingerprint
+   * it was emitted for, so an unchanged board never re-notifies and a board that
+   * changes and changes back does. Wall-clock `at` is never part of `F(S)`.
+   */
+  witness?: { fingerprint: string; kind: 'W2' | 'W3'; at: number }
+  /** R10-14: fingerprint of the coverage-complete state the owner was told about. */
+  coverageNotice?: string
   /** Highest approaching-limit threshold already warned per budget dimension. */
   budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
@@ -140,6 +180,13 @@ export interface Member {
   accountedTokens?: number
   /** Cumulative bucketed usage from this worker's persisted session log. */
   usage?: UsageBuckets
+  /**
+   * R11-01: the last provider outage classified for this member. Present means
+   * the member's route is quiescent (capacity/quota/availability), so a start
+   * failure or stop must not spend the task's recovery credit; it is cleared by
+   * a successful start or a successful operation.
+   */
+  providerOutage?: MemberProviderOutage
 }
 export interface Workstream {
   id: string
@@ -206,11 +253,24 @@ export interface Task {
   /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
+  /**
+   * Authenticated proposer key (`owner` or a member id). Set at admission so
+   * the per-member proposal allowance is counted from durable records and can
+   * never be raised by the member it bounds.
+   */
+  proposedBy?: string
   evidenceIds: string[]
   reviewOf?: string
   reviewedCommit?: string
   /** Blocked tasks whose acceptance obligations this replacement covers. */
   replaces?: string[]
+  /**
+   * X1 (P0): every member that ever owned an attempt on this task. Independence
+   * is decided from the union of the current attempt owner and this list, so a
+   * handoff, lease expiry, idle close-out, start-failure reroute, cancellation
+   * or host restart cannot make an earlier owner eligible to review the work.
+   */
+  priorOwnerIds?: string[]
   handoff?: string
   createdAt: number
 }
@@ -297,18 +357,65 @@ export interface BoardQuery {
   /** Read one full post record instead of a page. */
   postId?: string
 }
+/**
+ * Closed owner-notice classes. The runtime dedups its own budget/ceiling
+ * refusals per (class, mission-state fingerprint, sender) so an unchanged board
+ * cannot spam the owner; decision notices carry the liveness engine's own
+ * witness dedup and are always recorded, so a state that changes and returns
+ * can re-notify. Escalations are never deduplicated.
+ */
+export type NoticeClass = 'decision' | 'blocker' | 'failure' | 'budget' | 'stall' | 'progress' | 'completion' | 'escalation'
+/**
+ * Delivery lifecycle of one owner notice. `sent` is the durable record,
+ * `queued` is the outbox entry awaiting the owner session, and `claimed` is the
+ * adapter delivery that put it in front of the owner. The dedup key is the
+ * mission-state fingerprint the notice was emitted for, so the ledger proves
+ * which states were announced and which are still silent.
+ */
+export interface NoticeEnvelope {
+  dedupKey: string
+  class: NoticeClass
+  sentAt: number
+  queuedAt: number
+  claimedAt?: number
+}
+/**
+ * Typed durable owner escalation raised by a mission member. A board post is
+ * visibility only; an escalation is a first-class record that reaches the owner
+ * through the notice path. It carries the authenticated sender plus the task
+ * and attempt it was raised against, and it grants no authority: recording one
+ * changes no task, member or budget state.
+ */
+export interface Escalation {
+  id: string
+  missionId: string
+  /** Authenticated sender member id; never model-supplied. */
+  fromMemberId: string
+  taskId?: string
+  attemptId?: string
+  body: string
+  /** Mission-state fingerprint F(S) at raise time. */
+  dedupKey: string
+  createdAt: number
+  /** Delivery record that carries it to the owner through the notice path. */
+  deliveryId: string
+}
 export interface Delivery {
   id: string
   missionId: string
   from: string
   to: string
-  kind: 'assignment' | 'question' | 'finding' | 'challenge' | 'handoff' | 'control'
+  kind: 'assignment' | 'question' | 'finding' | 'challenge' | 'handoff' | 'control' | 'escalation'
   content: string
   topic?: string
   createdAt: number
   deliveredAt?: number
   taskId?: string
   attemptId?: string
+  /** Present on owner notices: dedup key and sent/queued/claimed lifecycle. */
+  notice?: NoticeEnvelope
+  /** Present when this delivery carries a typed owner escalation. */
+  escalation?: Escalation
 }
 export interface SwarmEvent {
   seq: number
@@ -442,7 +549,7 @@ export interface ObserveQuery {
   offset?: number
   /** Read one evidence record including challenges. */
   evidenceId?: string
-  /** `full` includes complete task records and evidence claims for the whole board. */
+  /** `full` includes complete task records, evidence claims and the owner arena instruments. */
   detail?: 'summary' | 'full'
 }
 export interface ProposeTaskInput {
@@ -500,6 +607,12 @@ export interface WorkerCallbacks {
   /** Synchronous final guard on all tools, including alternate dispatch surfaces. */
   guard(memberId: string, toolName: string): string | undefined
   failure(memberId: string, error: string): void
+  /**
+   * R11-01: a classified provider outage (quota, rate limit, provider
+   * unavailable). The adapter classifies; the runtime emits the durable event,
+   * keeps the attempt alive and never spends recovery credit on the pause.
+   */
+  providerOutage?(memberId: string, outage: ProviderOutage): void
 }
 /** Worker handles and all effectful execution remain owned by the adapter. */
 export interface WorkerAdapter {
@@ -520,6 +633,8 @@ export interface WorkerAdapter {
   captureArtifact(member: Member, task: Task): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
   verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<Array<{ command: string; exitCode: number; output: string }>>
+  /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
+  checkEnvelope?(): CheckEnvelope
   /** Materialize accepted dependencies or a prior task checkpoint. Stop/fence the old owner before preparing a later epoch. */
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void>
   dispose(): Promise<void>

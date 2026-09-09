@@ -19,7 +19,8 @@ import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
-import type { Artifact, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import { classifyProviderOutage } from './scheduler.js'
+import type { Artifact, CheckEnvelope, Delivery, Member, Mission, ProviderOutage, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -41,8 +42,14 @@ export interface HarnessWorkerOptions {
   grants?: WorkspaceGrantSnapshot
   /** Ignored dependency directories linked from the source into verification checkouts. */
   verificationDependencyDirs?: string[]
-  /** M6: `link` (default) symlinks those directories read-through; `copy` clones them into each checkout. */
+  /** M6/R11-13: `link` symlinks those directories read-through; `copy` (the effective default) clones them into each checkout. */
   verificationDependencyMode?: 'link' | 'copy'
+  /**
+   * R11-13: explicit human opt-in that makes a configured `link` mode effective.
+   * Without it the owned `Workspaces` copies dependency directories instead, so
+   * a read-through `..` can never resolve into the source checkout.
+   */
+  allowDependencyLinkReads?: boolean
   /** Prompt-token pressure (uncached + cached input of the last request) above which an idle worker compacts at a task boundary; 0 disables. */
   boundaryCompactionTokens?: number
   /**
@@ -59,6 +66,12 @@ export interface HarnessWorkerOptions {
    * disables the timer. Defaults to 1000 ms.
    */
   activityHeartbeatMs?: number
+  /**
+   * R11-19: maximum declared-check executions per host, passed to the owned
+   * `Workspaces` semaphore. `src/index.ts` supplies it from plugin config;
+   * absent means the Workspaces default (2).
+   */
+  checkConcurrency?: number
 }
 /** The confinement surface a declared verification check must pass through. */
 export interface VerificationSandbox {
@@ -274,6 +287,14 @@ export class HarnessWorkers implements WorkerAdapter {
     return this.callbacks
   }
   private failure(memberId: string, error: unknown): void {
+    // R11-01: classify at the boundary where the provider error is still
+    // structured, then report both the raw failure (existing contract) and the
+    // typed outage. A callback failure must never mask the other report.
+    const outage = classifyProviderOutage(error)
+    if (outage !== undefined) {
+      try { this.observer().providerOutage?.(memberId, outage) }
+      catch (callbackError) { this.ctx.logger.error(`Swarm provider-outage observer failed: ${errorText(callbackError)}`) }
+    }
     try { this.observer().failure(memberId, errorText(error)) }
     catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
@@ -683,6 +704,8 @@ export class HarnessWorkers implements WorkerAdapter {
     return resident?.handle !== undefined && resident.stopping === undefined && resident.observations.size === 0 && resident.handle.agent.status === 'idle' && !resident.handle.agent.inbox.hasPending
   }
   captureArtifact(member: Member, task: Task): Promise<Artifact> { return this.workspaces.captureArtifact(member, task) }
+  /** R11-19: the owned Workspaces' measured declared-check envelope. */
+  checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {
     const resident = this.residents.get(member.id)
     const activity = resident === undefined ? undefined : this.beginActivity(resident, { kind: 'verification' }, signal)

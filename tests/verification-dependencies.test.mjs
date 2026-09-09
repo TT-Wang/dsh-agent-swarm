@@ -43,29 +43,42 @@ async function fixture(t, options = {}) {
   return { temp, source, workspaces, member, task, artifact }
 }
 
-test('ignored dependency directories are linked at every depth into the clean checkout; build outputs are not', async t => {
+test('R11-13: ignored dependency directories are materialised at every depth as a private copy; build outputs are not', async t => {
   const seen = []
   const { source, workspaces, member, task, artifact, temp } = await fixture(t, { confineCheck: (argv, cwd) => { seen.push(cwd); return argv } })
   const results = await workspaces.verifyArtifact(member, { ...task, checks: [
     'PATH="$PWD/node_modules/.bin:$PATH" toolchain-check',
     'node packages/inner/index.js',
     'test ! -e lib/stale.js && echo no-build-output',
-    'test -L node_modules && test -L packages/inner/node_modules && echo linked',
+    // R11-13: the materialised dependency directories are real directories in
+    // the checkout, so `node_modules/..` can never resolve to the source.
+    'test -d node_modules && test -d packages/inner/node_modules && test ! -L node_modules && test ! -L packages/inner/node_modules && echo private-copy',
   ] }, artifact)
   assert.deepEqual(results.map(result => result.exitCode), [0, 0, 0, 0], JSON.stringify(results, null, 2))
   assert.match(results[0].output, new RegExp(`toolchain from ${seen[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), 'the check runs in the checkout, not the source')
-  assert.match(results[1].output, /42/); assert.match(results[2].output, /no-build-output/); assert.match(results[3].output, /linked/)
-  assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the checkout and its links are removed')
+  assert.match(results[1].output, /42/); assert.match(results[2].output, /no-build-output/); assert.match(results[3].output, /private-copy/)
+  assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the checkout and its copies are removed')
   assert.equal(await readFile(path.join(source, 'src', 'answer.txt'), 'utf8'), 'base\n', 'the source is untouched')
   assert.equal((await lstat(path.join(source, 'node_modules'))).isDirectory(), true, 'the source toolchain remains a real directory')
   const tree = await git(source, 'ls-tree', '-r', '--name-only', artifact.commit)
-  assert(!tree.includes('node_modules'), 'linked dependencies never enter the committed artifact')
+  assert(!tree.includes('node_modules'), 'materialised dependencies never enter the committed artifact')
 })
 
-test('a missing command is diagnosed as an environment failure, and linking can be disabled', async t => {
+test('R11-13: the explicit read-through link opt-in still links at every depth (documented residual)', async t => {
+  const { workspaces, member, task, artifact } = await fixture(t, { verificationDependencyMode: 'link', allowDependencyLinkReads: true })
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: [
+    'PATH="$PWD/node_modules/.bin:$PATH" toolchain-check',
+    'node packages/inner/index.js',
+    'test -L node_modules && test -L packages/inner/node_modules && echo linked',
+  ] }, artifact)
+  assert.deepEqual(results.map(result => result.exitCode), [0, 0, 0], JSON.stringify(results, null, 2))
+  assert.match(results[2].output, /linked/)
+})
+
+test('a missing command is diagnosed as an environment failure, and materialisation can be disabled', async t => {
   const { workspaces, member, task, artifact } = await fixture(t, { verificationDependencyDirs: [] })
   const results = await workspaces.verifyArtifact(member, { ...task, checks: ['test ! -e node_modules && echo unlinked', 'toolchain-check'] }, artifact)
   assert.equal(results[0].exitCode, 0); assert.match(results[0].output, /unlinked/)
   assert.equal(results[1].exitCode, 127)
-  assert.match(results[1].output, /exit 127: a command in this check was not found in the clean verification checkout\. Linked dependency directories from the source: none/)
+  assert.match(results[1].output, /exit 127: a command in this check was not found in the clean verification checkout\. Copied dependency directories from the source: none/)
 })

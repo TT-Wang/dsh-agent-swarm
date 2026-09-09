@@ -18,8 +18,39 @@
  * classified as `writer_busy` and retried with bounded backoff. See
  * `scripts/load/README.md` and `src/store.ts`.
  */
+import { errorChain, isQuotaExceededError } from '@deepseek-ai/dsh-llm'
+import type { ProviderOutage } from './types.ts'
 export const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
 export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
+
+/**
+ * R11-01: classify a provider failure as a capacity/quota/availability outage.
+ * The adapter classifies at the boundary where the provider error is still
+ * structured (HTTP status and the Harness' stable codes), and the runtime
+ * routes on the returned class, never on message text. Returns undefined for a
+ * task/worker defect that should spend recovery credit normally.
+ */
+export function classifyProviderOutage(error: unknown): ProviderOutage | undefined {
+  const record = error !== null && typeof error === 'object' ? error as { status?: unknown; statusCode?: unknown; code?: unknown; failure?: { status?: unknown } } : undefined
+  let status: number | undefined
+  for (const candidate of [record?.status, record?.statusCode, record?.failure?.status]) {
+    if (typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= 100 && candidate <= 599) { status = candidate; break }
+  }
+  const code = typeof record?.code === 'string' ? record.code : undefined
+  const message = errorChain(error)
+  const detail = `${code ?? ''} ${status ?? ''} ${message}`
+  const bounded = message.length > 500 ? `${message.slice(0, 500)}…` : message
+  if (status === 402) return { class: 'quota', status, message: bounded }
+  if (status === 429) return { class: 'rate-limit', status, message: bounded }
+  if (status !== undefined && status >= 500) return { class: 'unavailable', status, message: bounded }
+  if (code === 'QUOTA' || isQuotaExceededError(detail)) return { class: 'quota', ...(status === undefined ? {} : { status }), message: bounded }
+  if (code === 'RATE_LIMIT' || /\brate[\s_-]*limit\b|\btoo many requests\b/i.test(detail)) return { class: 'rate-limit', ...(status === undefined ? {} : { status }), message: bounded }
+  if (code === 'SERVER' || code === 'TIMEOUT' || code === 'TRANSPORT' || code === 'PROVIDER_UNAVAILABLE'
+    || /\bprovider\b[^.]{0,40}\b(?:unavailable|unreachable|down)\b|\bservice unavailable\b|\boverloaded\b|\b(?:502|503|504)\b|socket hang up|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|upstream connect error/i.test(detail)) {
+    return { class: 'unavailable', ...(status === undefined ? {} : { status }), message: bounded }
+  }
+  return undefined
+}
 
 /** Broadest to narrowest: a candidate must have a free slot at every level. */
 export const LIMIT_LEVELS = ['scope', 'taskClass', 'agent'] as const

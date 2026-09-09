@@ -308,7 +308,7 @@ test('the board is store-backed: posting writes no workspace or state file', asy
 
 test('the registered tools expose the board with a host-derived sender and emit closed-vocabulary spans', async t => {
   const f = await fixture(t)
-  assert.deepEqual([...SWARM_TOOLS].slice(-2), ['swarm_post', 'swarm_board'], 'the board tools are part of the single closed registry')
+  assert.deepEqual([...SWARM_TOOLS].slice(-3), ['swarm_post', 'swarm_board', 'swarm_restore'], 'the board and owner-restore tools are part of the single closed registry')
   assert.ok(SWARM_TOOLS.every(tool => TRACE_STEPS.includes(tool)), 'every registered tool is a closed span step')
   assert.ok(!hiddenToolsFor('worker').includes('swarm_post') && !hiddenToolsFor('worker').includes('swarm_board'))
   assert.ok(!hiddenToolsFor('owner').includes('swarm_post') && !hiddenToolsFor('owner').includes('swarm_board'))
