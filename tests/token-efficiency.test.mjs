@@ -88,8 +88,15 @@ test('member observation is a focused, bounded view with cursors and by-id reads
   const delta = f.runtime.observe(f.actorA, f.mission.id, { after: view.nextAfter, afterRun: view.nextAfterRun })
   assert.deepEqual(delta.toolRuns.map(run => run.id), [second]); assert.deepEqual(delta.events.map(event => event.type), ['tool/recorded'])
   assert(delta.events[0].seq > view.nextAfter)
+  // The runtime remembers the delivered cursor, so the default read is a delta
+  // even when the model passes no after/afterRun.
+  const defaultDelta = f.runtime.observe(f.actorA, f.mission.id)
+  assert.equal(defaultDelta.delta, true)
+  assert.deepEqual(defaultDelta.events, []); assert.deepEqual(defaultDelta.toolRuns, [])
+  assert(!('board' in defaultDelta) && !('current' in defaultDelta) && !('evidence' in defaultDelta), 'no superseded snapshot content is re-sent')
   const evidence = f.runtime.publish(f.actorA, f.mission.id, { taskId: task.id, attemptId: task.attempt.id, claim: 'z'.repeat(3000), outcome: 'supported', toolRunIds: [runId] })
-  assert(f.runtime.observe(f.actorA, f.mission.id).evidence[0].claim.length < 500, 'claims are excerpted in the default view')
+  const focusedAgain = f.runtime.observe(f.actorA, f.mission.id, { after: view.nextAfter, afterRun: view.nextAfterRun })
+  assert(focusedAgain.evidence[0].claim.length < 500, 'claims are excerpted in the focused view')
   assert.equal(f.runtime.observe(f.actorA, f.mission.id, { evidenceId: evidence.id }).evidence.claim.length, 3000)
   const focus = f.runtime.observe(f.owner, f.mission.id, { taskId: task.id })
   assert.equal(focus.task.objective, 'Fix module'); assert.equal(focus.toolRuns.length, 2); assert.equal(focus.evidence[0].claim.length, 3000)

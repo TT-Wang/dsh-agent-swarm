@@ -43,13 +43,42 @@ function jsonResult(block) {
   return JSON.parse(rendered)
 }
 function latestObservation(messages) {
-  for (const block of toolBlocks(messages).toReversed()) {
+  const observations = []
+  for (const block of toolBlocks(messages)) {
     if (block.isError) continue
     let body
     try { body = JSON.parse(texts(block).join('\n')) } catch { continue }
-    if (body.result?.member !== undefined) return body
+    if (body.result?.member !== undefined || body.result?.delta === true) observations.push(body)
   }
-  return undefined
+  if (observations.length === 0) return undefined
+  return mergeObservationWindows(observations)
+}
+
+/**
+ * Merge the parsed observation bodies of one worker session in delivery order.
+ * Every window's result is folded in delivery order so later fields win — the
+ * runtime only emits `current` in a delta when the assignment changed
+ * (src/runtime.ts:1525), so the window that names a new assignment is often not
+ * the last one. result.toolRuns becomes the union of every window's runs,
+ * deduplicated by run id in first-seen order, so an empty or partial delta can
+ * never drop the focused window's recorded runs.
+ */
+function mergeObservationWindows(observations) {
+  const focused = observations.findLast(body => body.result.member !== undefined) ?? observations.at(-1)
+  const merged = { ...focused, result: observations.reduce((acc, body) => ({ ...acc, ...body.result }), {}) }
+  const runs = []
+  const seen = new Set()
+  for (const body of observations) {
+    const list = body.result?.toolRuns
+    if (!Array.isArray(list)) continue
+    for (const run of list) {
+      if (run?.id === undefined || seen.has(run.id)) continue
+      seen.add(run.id)
+      runs.push(run)
+    }
+  }
+  if (runs.length > 0) merged.result.toolRuns = runs
+  return merged
 }
 
 setResponder(options => {

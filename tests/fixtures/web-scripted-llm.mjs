@@ -5,6 +5,33 @@ import { importHarness } from './built-harness.mjs'
 export const name = 'swarm-web-scripted-llm'
 export const inject = ['llm']
 
+/**
+ * Merge the parsed observation bodies of one worker session in delivery order.
+ * The focused view carries the bounded run window; every later default read is
+ * a delta that carries only the runs after its delivered cursor and only the
+ * `current` assignment when it changed (src/runtime.ts:1525). Fold every
+ * window's result in delivery order so later fields win, and union
+ * result.toolRuns by run id in first-seen order so an empty or partial delta can
+ * never drop the focused window's recorded runs.
+ */
+function mergeObservationWindows(observations) {
+  const focused = observations.findLast(body => body.result.member !== undefined) ?? observations.at(-1)
+  const merged = { ...focused, result: observations.reduce((acc, body) => ({ ...acc, ...body.result }), {}) }
+  const runs = []
+  const seen = new Set()
+  for (const body of observations) {
+    const list = body.result?.toolRuns
+    if (!Array.isArray(list)) continue
+    for (const run of list) {
+      if (run?.id === undefined || seen.has(run.id)) continue
+      seen.add(run.id)
+      runs.push(run)
+    }
+  }
+  if (runs.length > 0) merged.result.toolRuns = runs
+  return merged
+}
+
 /** Only model output is controlled: the web product, transport, tools and workers are real. */
 export async function apply(ctx, config) {
   const { LlmAdapter, ToolCallId } = await importHarness(config.harnessRoot, '@deepseek-ai/dsh-llm')
@@ -73,11 +100,13 @@ export async function apply(ctx, config) {
     let script = scripts.get(key)
     if (!script) { script = { stage: 'work' }; scripts.set(key, script); return tool('swarm_observe', { missionId: assignment.missionId }) }
     if (script.stage === 'done') return answer('Assignment finished; awaiting further work.')
-    const observation = blocks(options.messages).toReversed().map(block => {
+    const observations = blocks(options.messages).map(block => {
       try { return resultBody(block) } catch { return undefined }
-    }).find(body => body?.result?.member !== undefined && body.result.current?.task?.id === assignment.task.id)
-    assert(observation, 'worker must see its focused task view through swarm_observe')
-    const task = observation.result.current.task
+    }).filter(body => body?.result?.member !== undefined || body?.result?.delta === true)
+    assert(observations.length > 0, 'worker must see its focused task view through swarm_observe')
+    const observation = mergeObservationWindows(observations)
+    const task = observation.result.current?.task
+    assert(task?.id === assignment.task.id, 'worker must see its focused task view through swarm_observe')
     const current = { missionId: assignment.missionId, taskId: task.id, attemptId: task.attempt.id }
     if (task.kind === 'verification') { script.stage = 'done'; return tool('swarm_verify', { ...current, verdict: 'accept', reason: 'The host independently executes the declared check against the submitted commit.' }) }
     if (script.stage === 'work') { script.stage = 'record'; return tool('bash', { command: "printf 'module.exports = 2\\n' > value.cjs && node check.cjs", description: 'Implement and check the scoped fixture change.' }) }

@@ -325,16 +325,19 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, topics: strings }, ['missionId', 'topics'], (a, actor) => runtime.subscribeTopics(actor, text(a, 'missionId'), array(a, 'topics')))
   register('swarm_wait', 'Members only: park until relevant work or a direct message arrives, then end the turn. The owner ends its native turn instead and waits for runtime notices.',
     mission, ['missionId'], (a, actor) => runtime.wait(actor, text(a, 'missionId')))
-  register('swarm_observe', 'Bounded mission reads. Default: your current task, prerequisites, review source, your run references and recent events (owner: compact board and usage). after/afterRun return only newer events/runs; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record. before/eventLimit page older events (F-13) and vocabulary/trace report event coverage and trace metrics. Omit missionId to list your missions.',
-    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, before: nonnegativeInteger, eventLimit: { ...positiveInteger, description: 'Older-event page size, 1-500 (default 50).' }, vocabulary: { type: 'boolean', description: 'Report which event types the returned window uses and whether the read path recognizes them.' }, trace: { type: 'boolean', description: 'Report span-level metrics: contract compliance and the first violating step.' }, detail: { type: 'string', enum: ['summary', 'full'] } }, [],
+  register('swarm_observe', 'Bounded mission reads. A member\'s first read returns the focused view; later default reads return only the delta since the runtime\'s delivered cursor (new events/runs, plus a changed current assignment). Owner: compact board and usage. after/afterRun override the cursor; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record and is owner-only (worker sessions are refused). before/eventLimit page older events (F-13) and vocabulary/trace report event coverage and trace metrics. Omit missionId to list your missions.',
+    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, before: nonnegativeInteger, eventLimit: { ...positiveInteger, description: 'Older-event page size, 1-500 (default 50).' }, vocabulary: { type: 'boolean', description: 'Report which event types the returned window uses and whether the read path recognizes them.' }, trace: { type: 'boolean', description: 'Report span-level metrics: contract compliance and the first violating step.' }, detail: { type: 'string', enum: ['summary', 'full'], description: 'Owner only: full expands every task record. Worker sessions are refused.' } }, [],
     async (a, actor) => {
       if (a.missionId === undefined) return runtime.list(actor.sessionId)
       const missionId = text(a, 'missionId')
+      // A history window replaces the event list below; keep the delivered
+      // cursor where it is so those events are still delivered later.
+      const historyRequested = a.before !== undefined || a.eventLimit !== undefined || a.vocabulary === true
       const view = object(runtime.observe(actor, missionId, {
         after: optionalInteger(a, 'after'), afterRun: optionalInteger(a, 'afterRun'), offset: optionalInteger(a, 'offset'),
         taskId: optionalText(a, 'taskId'), runId: optionalText(a, 'runId'), evidenceId: optionalText(a, 'evidenceId'),
         ...(a.detail === undefined ? {} : { detail: a.detail as ObserveQuery['detail'] }),
-      }))
+      }, { advanceEventCursor: !historyRequested }))
       let result = view
       if (a.before !== undefined || a.eventLimit !== undefined || a.vocabulary === true) {
         const history = readEventHistory(runtime.store, missionId, { before: optionalInteger(a, 'before'), limit: optionalInteger(a, 'eventLimit') })

@@ -17,8 +17,136 @@ const LEASE_MS_PER_OUTPUT_TOKEN = 20
 const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
 /** Idle close-out nudges before an open attempt is checkpointed and re-pended. */
 const DEFAULT_IDLE_CLOSEOUTS = 2
+/**
+ * R5-02: consecutive `workers.start` failures for one member before its work is
+ * re-routed to another capable live member. A transient start failure self-heals
+ * on the next tick; only a route that keeps failing is retired.
+ */
+const START_FAILURE_REROUTE_LIMIT = 3
 /** A worker-side git write that the sandbox refused; the action names the supported exit. */
 const gitWriteDeniedMessage = (command: string): string => `Worker git writes are denied by the workspace sandbox: ${command} could not write git metadata (index.lock EPERM). Workers cannot commit; do not retry git add/commit. Publish the workspace with swarm_submit, which captures it host-side, or release the attempt with swarm_handoff/swarm_wait.`
+/**
+ * F14: only a shell-executing tool runs a command line that can attempt a git
+ * write. `bash`/`pwsh` carry it in `command`, a persistent terminal carries the
+ * typed shell input in `text`. Every other tool (edit, grep, read, write) may
+ * quote a git-write phrase in its arguments and may even return file text that
+ * contains index.lock/EPERM; that text was never executed, so it must neither
+ * claim the typed denial nor latch the attempt.
+ */
+const SHELL_COMMAND_KEYS = new Map<string, readonly string[]>([
+  ['bash', ['command']], ['pwsh', ['command']], ['shell', ['command']],
+  ['terminal', ['text']], ['terminal_send', ['text']],
+])
+/** The executed command line of a shell tool, or undefined for any other tool. */
+function executedShellCommand(tool: string, args: unknown): string | undefined {
+  const keys = SHELL_COMMAND_KEYS.get(tool)
+  if (keys === undefined || args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
+  const record = args as Record<string, unknown>
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+/**
+ * The command with shell comments and quoted spans removed, so a phrase that
+ * merely appears as data (a search pattern, an edit body, a message) is not
+ * mistaken for an executed command. Direct commands and compound command words
+ * keep their text; a command hidden inside a nested shell string is not seen.
+ */
+function unquotedShellText(command: string): string {
+  let text = ''
+  let quote: '"' | "'" | undefined
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index]!
+    if (quote !== undefined) {
+      if (char === '\\' && quote === '"') index++
+      else if (char === quote) quote = undefined
+      continue
+    }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (char === '#') {
+      const newline = command.indexOf('\n', index)
+      if (newline === -1) break
+      index = newline
+      text += '\n'
+      continue
+    }
+    text += char
+  }
+  return text
+}
+/** Shell separators that start a new command segment. */
+const SHELL_SEPARATORS = /&&|\|\||[;|\n]/
+/** Global git options that take a separate value token, so the subcommand is one token later. */
+const GIT_OPTION_ARGUMENTS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace', '--config-env'])
+/** Commands that may precede `git` without being the executed program themselves. */
+const COMMAND_WRAPPERS = new Set(['env', 'command', 'sudo', 'nohup', 'time', 'exec', 'nice', 'doas', 'builtin'])
+/** Wrapper options that consume a separate value token. */
+const WRAPPER_OPTION_ARGUMENTS = new Set(['-u', '-g', '-p', '-C', '-h', '-U', '-r', '-t', '-D', '-n', '-f', '-o', '-a', '--user', '--group', '--prompt', '--host', '--other-user', '--role', '--type', '--close-from', '--chdir', '--unset', '--format', '--output', '--adjustment'])
+/**
+ * R6-I2c: true when tokens[0..index) are only environment assignments and/or
+ * known wrappers with their option tokens, so the token at `index` is the
+ * executed program. A bare `git` token in another program's arguments
+ * (`grep -rn git add .`) is data, never the command.
+ */
+function atCommandPosition(tokens: string[], index: number): boolean {
+  let position = 0
+  while (position < index) {
+    const token = tokens[position]!
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { position++; continue }
+    if (COMMAND_WRAPPERS.has(token)) { position++; continue }
+    if (token.startsWith('-')) {
+      const name = token.split('=')[0]!
+      position += WRAPPER_OPTION_ARGUMENTS.has(name) && !token.includes('=') && position + 1 < index ? 2 : 1
+      continue
+    }
+    return false
+  }
+  return true
+}
+/**
+ * R6-02: the git subcommand actually executed at command position, or undefined
+ * when the command runs no git write. Only a token at subcommand position
+ * counts, so a read-only command that merely mentions a write word in a pattern,
+ * path or argument (`git log --grep=commit`, `git grep add`,
+ * `git diff --stat | grep reset`) is data and never a denial. R6-I2c: the `git`
+ * token itself must sit at command position (assignments and wrappers only
+ * before it), so `grep -rn git add .` is data too. Global options and their
+ * values are skipped; the R6-01 property (result text never decides) is
+ * preserved.
+ */
+function gitWriteSubcommand(command: string): string | undefined {
+  for (const segment of command.split(SHELL_SEPARATORS)) {
+    const tokens = segment.trim().split(/\s+/).filter(Boolean)
+    for (let git = 0; git < tokens.length; git++) {
+      if (tokens[git] !== 'git' || !atCommandPosition(tokens, git)) continue
+      let index = git + 1
+      while (index < tokens.length) {
+        const token = tokens[index]!
+        if (!token.startsWith('-')) break
+        index += GIT_OPTION_ARGUMENTS.has(token.split('=')[0]!) && !token.includes('=') ? 2 : 1
+      }
+      const subcommand = tokens[index]
+      if (subcommand !== undefined && GIT_WRITE.test(`git ${subcommand}`)) return subcommand
+    }
+  }
+  return undefined
+}
+/**
+ * A git metadata-write subcommand named on one executed command line. R6-01:
+ * read-only and worktree-only subcommands (`apply`, `worktree`, `branch`,
+ * `config`, `fetch`, `pull`, `tag`, `stash`) are excluded, because their
+ * read-only forms (`git worktree list`, `git apply --reject`) are not sandbox
+ * denials and must never latch an attempt.
+ */
+const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
+/**
+ * The sandbox's own refusal text. R6-01: retained as the documented refusal
+ * vocabulary of the accepted guard artifact, but the denial no longer scans the
+ * result, so incidental output text can never claim it or latch an attempt.
+ */
+const GIT_WRITE_REFUSAL = /index\.lock|Operation not permitted|EPERM/i
 const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
 export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): UsageBuckets {
@@ -67,6 +195,21 @@ function unsupportedEffort(error: unknown): { requested?: string; message: strin
   return { ...(requested === undefined ? {} : { requested }), message }
 }
 
+/**
+ * `detail=full` is an owner-only read. Worker guidance alone did not prevent its
+ * use (docs/observe-context-measurement.md), so the runtime refuses it; callers
+ * branch on the class, never on message text. The message names the owner gate
+ * so the trace classifier records an authorization error.
+ */
+export class ObserveDetailRefusedError extends Error {
+  readonly code = 'observe_detail_full_owner_only'
+  constructor() {
+    super('Only the mission owner may read detail=full; workers read bounded records with taskId, runId, evidenceId, after or afterRun')
+    this.name = 'ObserveDetailRefusedError'
+  }
+}
+/** The model-visible position already delivered to one member; the next default read starts after it. */
+interface DeliveredCursor { eventSeq: number; runSeq: number; current?: string }
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 export class SwarmRuntime {
   readonly store: SwarmStore
@@ -78,6 +221,14 @@ export class SwarmRuntime {
   private readonly budgetStops = new Set<string>()
   /** Members that ended a turn while still owning an attempt; drives the bounded close-out. */
   private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
+  /** Consecutive `workers.start` failures per member; a successful start clears the count (R5-02). */
+  private readonly startFailures = new Map<string, number>()
+  /**
+   * Delivered observe positions per member. This is a context cache, not mission
+   * state: a restart re-sends one bounded focused view and then resumes deltas,
+   * so a stale position can never hide events from a member.
+   */
+  private readonly observeCursors = new Map<string, DeliveredCursor>()
   private timer?: ReturnType<typeof setInterval>
   private closed = false
   private shuttingDown = false
@@ -507,12 +658,31 @@ export class SwarmRuntime {
   }
   private ready(task: Task, member: Member, tasks?: Task[]): boolean {
     if (task.status !== 'pending' || (task.assigneeId && task.assigneeId !== member.id)) return false
+    return this.capable(task, member, tasks)
+  }
+  /**
+   * R5-02: whether a member could take this task if it were pending and
+   * unassigned. Same prerequisites and review-independence guard as `ready`,
+   * without the status/assignee pin, so a start-failure re-route can evaluate
+   * candidates before committing the re-pend. The author check matches
+   * admission's definition (`attempt?.ownerId ?? assigneeId`), so a re-route can
+   * never assign a verification to the author of the source it reviews.
+   */
+  private capable(task: Task, member: Member, tasks?: Task[]): boolean {
     if (!task.dependencies.every(dep => this.dependencySatisfied(task.missionId, dep, tasks))) return false
     if (task.reviewOf) {
       const source = this.task(task.missionId, task.reviewOf)
-      if (source.status !== 'submitted' || source.attempt?.ownerId === member.id) return false
+      const author = source.attempt?.ownerId ?? source.assigneeId
+      if (source.status !== 'submitted' || author === member.id) return false
     }
     return true
+  }
+  /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
+  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
+    const candidates = this.store.list('members', missionId)
+      .filter(member => member.id !== failedId && member.status !== 'stopped' && this.capable(task, member))
+    const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
+    return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }
   /**
    * Effective hierarchical limits: durable owner rules, with the worker-budget
@@ -1341,13 +1511,22 @@ export class SwarmRuntime {
    * events; the owner sees a compact board and usage. Full records are read by
    * id (`taskId`, `runId` paged by `offset`, `evidenceId`). The complete board
    * stays in the UI projection instead of every model request.
+   *
+   * After a member's first read the runtime remembers the delivered event/run
+   * position and the default read returns only the delta — new events and tool
+   * runs, plus the current assignment when it changed — so appended content
+   * keeps the cached prompt prefix intact instead of re-sending superseded
+   * snapshots (docs/observe-context-measurement.md). `detail=full` is owner-only.
    */
-  observe(actor: Actor, missionId: string, query: ObserveQuery = {}): unknown {
+  observe(actor: Actor, missionId: string, query: ObserveQuery = {}, options: { advanceEventCursor?: boolean } = {}): unknown {
     actor.signal?.throwIfAborted()
     const { mission, member, owner } = this.participant(actor, missionId)
     for (const key of ['after', 'afterRun', 'offset'] as const) {
       if (query[key] !== undefined && (!Number.isSafeInteger(query[key]) || Number(query[key]) < 0)) throw new Error(`${key} must be a nonnegative integer`)
     }
+    // Worker guidance alone did not prevent detail=full, so the runtime refuses
+    // it for worker sessions while the owner path keeps the complete view.
+    if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
     const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
@@ -1356,9 +1535,9 @@ export class SwarmRuntime {
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}) })
     const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
-    const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number) => {
-      const all = this.store.toolRuns(missionId, { ...filter, afterSeq: query.afterRun })
-      const shown = query.afterRun === undefined ? all.slice(-limit) : all.slice(0, limit)
+    const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
+      const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })
+      const shown = afterSeq === undefined ? all.slice(-limit) : all.slice(0, limit)
       return { toolRuns: shown.map(runRef), totalToolRuns: all.length, ...(shown.length ? { nextAfterRun: shown.at(-1)!.seq ?? 0 } : {}), ...(all.length > shown.length ? { omittedToolRuns: all.length - shown.length } : {}) }
     }
     if (query.runId !== undefined) {
@@ -1378,17 +1557,47 @@ export class SwarmRuntime {
       const task = this.task(missionId, query.taskId)
       return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
         dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
-        ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40) }
+        ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
     }
+    // A member's delivered position is the default cursor; an explicit
+    // after/afterRun overrides it for one read and still advances it.
+    const delivered = member === undefined ? undefined : this.observeCursors.get(member.id)
+    const after = query.after ?? delivered?.eventSeq
+    const afterRun = query.afterRun ?? delivered?.runSeq
     const eventLimit = 12
-    const fetched = this.store.events(missionId, query.after ? eventLimit + 1 : eventLimit, query.after)
+    // `after: 0` keeps its original meaning (no cursor): a member cursor of 0
+    // only occurs when nothing was delivered yet, so the last window is correct.
+    const fetched = this.store.events(missionId, after ? eventLimit + 1 : eventLimit, after ?? 0)
     const events = fetched.slice(0, eventLimit).map(event => ({ seq: event.seq, type: event.type, actor: event.actor, summary: excerpt(event.data, 240) }))
     const eventCursor = { ...(events.length ? { nextAfter: events.at(-1)!.seq } : {}), ...(fetched.length > eventLimit ? { moreEvents: true } : {}) }
     const budget = { usedTokens: mission.usedTokens, maxTokens: mission.budget.maxTokens, usedSteps: mission.usedSteps, maxSteps: mission.budget.maxSteps, deadline: mission.deadline, inFlightTokensEstimate: this.inFlightEstimate(members) }
     const full = query.detail === 'full'
     if (member) {
       const current = tasks.find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+      const currentKey = current === undefined ? undefined : `${current.id}:${current.attempt!.id}:${current.status}`
       const source = current?.reviewOf ? this.task(missionId, current.reviewOf) : undefined
+      const runs = runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20, afterRun)
+      // Record only what this response delivers. A history page swapped in by
+      // tools.ts suppresses the event advance so no unseen event is skipped.
+      const advanceEvents = options.advanceEventCursor !== false
+      if (delivered !== undefined || advanceEvents) this.observeCursors.set(member.id, {
+        eventSeq: advanceEvents ? Math.max(delivered?.eventSeq ?? 0, events.at(-1)?.seq ?? 0, query.after ?? 0) : delivered?.eventSeq ?? 0,
+        runSeq: Math.max(delivered?.runSeq ?? 0, runs.toolRuns.at(-1)?.seq ?? 0, query.afterRun ?? 0),
+        ...(currentKey === undefined ? {} : { current: currentKey }),
+      })
+      // The first read is the focused view; later default reads are deltas.
+      if (delivered !== undefined && query.after === undefined && query.afterRun === undefined) return {
+        // A changed current assignment is new content the member must see; an
+        // unchanged one stays in the cached prefix and is not re-sent.
+        ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : {
+          task: taskRecord(current!, 2400), attemptId: current!.attempt!.id,
+          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
+        } }),
+        events, ...eventCursor, ...runs,
+        delta: true,
+        detail: 'Delta since your last delivered cursor: new events and tool runs, plus your current assignment when it changed. Read taskId, runId or evidenceId for one full record.',
+      }
       return {
         mission: { id: mission.id, title: mission.title, status: mission.status, ...budget },
         member: { id: member.id, name: member.name, role: member.role, status: member.status },
@@ -1398,10 +1607,10 @@ export class SwarmRuntime {
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } : null,
         evidence: current ? evidenceOf(current) : [],
-        ...runsWindow(current?.attempt ? { memberId: member.id, taskId: current.id, attemptId: current.attempt.id } : { memberId: member.id }, 20),
+        ...runs,
         events, ...eventCursor,
         board: full ? tasks.map(task => taskRecord(task, 2400)) : tasks.map(taskRef), members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status })),
-        detail: full ? 'Focused view with complete task records. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.' : 'Focused view. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
+        detail: full ? 'Focused view with complete task records. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.' : 'Focused view; later default reads return only the delta of new events and tool runs. taskId reads one task with full evidence and runs; runId with offset reads one stored run; evidenceId reads one claim; after/afterRun return only changes.',
       }
     }
     const evidence = this.store.list('evidence', missionId)
@@ -1956,24 +2165,24 @@ export class SwarmRuntime {
     this.commit(mission.id, () => this.store.put('tasks', task))
   }
   /**
-   * A worker-side git write that the sandbox refused (index.lock EPERM). Only
-   * a git write command that failed with a permission denial qualifies, so a
-   * read-only git command or an unrelated EPERM never claims the typed path.
+   * A worker-side git write that the sandbox refused (index.lock EPERM). Only a
+   * shell-executing tool runs a command line, so only its executed command is
+   * inspected; a quoted span that merely names a git-write phrase (a search
+   * pattern, an edit body, a message) is data, never a denial and never a latch,
+   * and a successful command is never a denial. R6-01: the result text is not
+   * inspected either, because a failed command that merely prints the refusal
+   * phrase is not a sandbox refusal; a denial is a failed run of an executed
+   * metadata-write command. R6-02: the subcommand must sit at command position
+   * in one shell segment, so a write word mentioned in a pattern or path is data
+   * even when the command fails. A command hidden inside a nested shell string
+   * is not seen: the sandbox still blocks it and the worker sees the raw refusal.
    */
-  private deniedGitWrite(input: { arguments: unknown; result: unknown }): string | undefined {
-    const strings: string[] = []
-    const collect = (value: unknown, depth = 0): void => {
-      if (depth > 4) return
-      if (typeof value === 'string') strings.push(value)
-      else if (Array.isArray(value)) for (const item of value) collect(item, depth + 1)
-      else if (value !== null && typeof value === 'object') for (const item of Object.values(value as Record<string, unknown>)) collect(item, depth + 1)
-    }
-    collect(input.arguments)
-    const command = strings.find(text => /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|stash|tag|update-ref|rm|mv|apply|am|push|pull|fetch|branch|config|worktree|init|gc|repack)\b/.test(text))
-    if (command === undefined) return undefined
-    if (!/index\.lock|Operation not permitted|EPERM/i.test(JSON.stringify(input.result ?? ''))) return undefined
+  private deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined {
+    const command = executedShellCommand(input.tool, input.arguments)
+    if (command === undefined || !input.isError || gitWriteSubcommand(unquotedShellText(command)) === undefined) return undefined
     return command.length > 200 ? `${command.slice(0, 200)}…` : command
   }
+
   private async recordToolRun(memberId: string, input: Omit<ToolRun, 'id' | 'seq' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<string | undefined> {
     if (this.closed || input.tool.startsWith('swarm_')) return undefined
     const member = this.store.get('members', memberId)
@@ -2101,6 +2310,67 @@ export class SwarmRuntime {
       : `${member.name} failed: ${error}`
     this.commit(member.missionId, () => { this.store.event(member.missionId, 'member/failure', memberId, { error }); this.notify(member.missionId, message) })
   }
+  /**
+   * R5-02: a `workers.start` failure is a recoverable interruption, not a
+   * permanent block of the member's work. Mirror the preparation, lease-expiry
+   * and close-out policy: spend exactly one recovery credit per affected task
+   * and re-pend while its limit is not exhausted (blocking only at the limit,
+   * with the reason in `task.output`). The same member is retried for
+   * `START_FAILURE_REROUTE_LIMIT` consecutive failures so a transient start
+   * error self-heals; at the limit the route is retired and its work re-routed
+   * to another capable live member with a durable `task/reassigned` event. A
+   * successful start clears the member's consecutive failure counter.
+   */
+  private onStartFailure(mission: Mission, member: Member, error: unknown): void {
+    if (this.closed || this.shuttingDown) return
+    const missionId = mission.id
+    const current = this.store.get('missions', missionId)
+    if (current === undefined || current.status !== 'active') return
+    const reason = `Worker could not start: ${String(error)}`
+    const consecutiveFailures = (this.startFailures.get(member.id) ?? 0) + 1
+    this.startFailures.set(member.id, consecutiveFailures)
+    const reroute = consecutiveFailures >= START_FAILURE_REROUTE_LIMIT
+    // Below the limit the member stays live so the next tick retries the same
+    // route; at the limit it is retired exactly like a dead session.
+    member.status = reroute ? 'stopped' : 'idle'
+    this.commit(missionId, () => {
+      this.store.put('members', member)
+      for (const task of this.store.list('tasks', missionId)) {
+        if (task.assigneeId !== member.id || !['pending', 'running'].includes(task.status)) continue
+        task.recoveryCount = (task.recoveryCount ?? 0) + 1
+        task.output = reason
+        task.epoch++
+        delete task.attempt; delete task.closeout; delete task.gitWriteDenied
+        const pinned = task.assigneeId
+        delete task.assigneeId
+        task.status = 'pending'
+        const limit = task.maxRecoveryAttempts ?? this.config.maxTasksPerMember
+        const target = reroute ? this.rerouteTarget(missionId, task, member.id) : undefined
+        // Re-route wins over the credit limit: the obligation moves to another
+        // live route instead of blocking, and the credit spent so far travels
+        // with the task so the new owner still has a bounded budget.
+        if (target !== undefined) task.assigneeId = target.id
+        // No capable target: keep the same live route below the limit, and
+        // release the work to any live member once the route is retired.
+        else if (!reroute) task.assigneeId = pinned
+        const exhausted = target === undefined && task.recoveryCount >= limit
+        task.status = exhausted ? 'blocked' : 'pending'
+        this.store.put('tasks', task)
+        this.store.event(missionId, 'task/start-failed', 'runtime', { taskId: task.id, epoch: task.epoch, reason, recoveryCount: task.recoveryCount, maxRecoveryAttempts: limit, status: task.status, consecutiveFailures })
+        if (target !== undefined) {
+          this.store.event(missionId, 'task/reassigned', 'runtime', { taskId: task.id, from: member.id, to: target.id, reason, consecutiveFailures })
+          continue
+        }
+        if (!exhausted) continue
+        this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
+        this.notify(missionId, `${reason} (${task.id} exhausted its recovery limit of ${limit})`)
+      }
+      this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error), consecutiveFailures, rerouted: reroute })
+      this.notify(missionId, reroute
+        ? `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work was re-routed to a live member.`
+        : `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its work was re-pended with one recovery credit.`)
+    })
+  }
   private defer(fn: () => Promise<void>): void {
     if (this.shuttingDown) return
     const operation = new Promise<void>(resolve => setImmediate(resolve)).then(fn)
@@ -2123,8 +2393,10 @@ export class SwarmRuntime {
     for (const member of this.store.list('members', mission.id)) {
       if (this.shuttingDown) return
       if (member.status === 'stopped') continue
-      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
-      catch (error) { this.onFailure(member.id, `Cannot resume: ${String(error)}`) }
+      // R5-02: a failed resume is recovered by the same policy as the scheduler
+      // start path; a successful start clears the consecutive failure counter.
+      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }); this.startFailures.delete(member.id) }
+      catch (error) { this.onStartFailure(mission, member, error) }
     }
   }
   private async schedule(missionId: string): Promise<void> {
@@ -2206,20 +2478,10 @@ export class SwarmRuntime {
         // Disposing the adapter cancels in-flight starts. This is recoverable host
         // shutdown, not a permanent worker failure to persist across restart.
         if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-        member.status = 'stopped'
-        this.commit(missionId, () => {
-          this.store.put('members', member)
-          for (const abandoned of this.store.list('tasks', missionId)) {
-            if (abandoned.assigneeId !== member.id || !['pending', 'running'].includes(abandoned.status)) continue
-            abandoned.status = 'blocked'; abandoned.epoch++; delete abandoned.attempt
-            abandoned.output = `Worker could not resume: ${String(error)}. Propose a replacement with a live worker.`
-            this.store.put('tasks', abandoned)
-          }
-          this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error) })
-          this.notify(missionId, `${member.name} could not resume: ${String(error)}`)
-        })
+        this.onStartFailure(mission, member, error)
         continue
       }
+      this.startFailures.delete(member.id)
       if (this.shuttingDown || this.mission(missionId).status !== 'active') return
       if (!this.workers.isIdle(member.id)) continue
       const open = this.store.list('tasks', missionId).find(t => t.status === 'running' && t.attempt?.ownerId === member.id)

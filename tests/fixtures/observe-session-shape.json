@@ -1,0 +1,30 @@
+{
+  "source": "docs/observe-context-measurement.md — owner measurement 2026-09-09 (decoded session JSONL, replay cost charged per content block)",
+  "recorded": {
+    "before": {
+      "sessionA": { "observeCalls": 9, "charsPerCall": 41000, "redundantShare": 0.446 },
+      "sessionB": { "observeCalls": 9, "charsPerCall": 40300, "redundantShare": 0.517 }
+    },
+    "after": {
+      "sessionA": { "observeCalls": 33, "charsPerCall": 12600, "redundantShare": 0.076 },
+      "sessionB": { "observeCalls": 24, "charsPerCall": 20200, "redundantShare": 0.113 }
+    },
+    "cursorCallsShare": 0.1,
+    "detailFullCharsPerCall": 50000
+  },
+  "replay": {
+    "note": "One worker session, nine observe calls with activity between reads: tool runs every turn, a published finding every third turn, and one mid-session reassignment so a changed assignment is delivered exactly once.",
+    "observeCalls": 9,
+    "turns": [
+      { "runs": 2, "evidence": false, "reassign": false },
+      { "runs": 1, "evidence": true, "reassign": false },
+      { "runs": 3, "evidence": false, "reassign": false },
+      { "runs": 1, "evidence": true, "reassign": true },
+      { "runs": 2, "evidence": false, "reassign": false },
+      { "runs": 1, "evidence": false, "reassign": false },
+      { "runs": 4, "evidence": true, "reassign": false },
+      { "runs": 1, "evidence": false, "reassign": false },
+      { "runs": 2, "evidence": false, "reassign": false }
+    ]
+  }
+}
