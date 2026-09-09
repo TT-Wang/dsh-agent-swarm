@@ -65,6 +65,24 @@ export interface Mission {
   id: string
   ownerSessionId: string
   workspace: string
+  /**
+   * Durable human-authorization anchor for `workspace`: the calling session's
+   * cwd for a session workspace, or the configured `authorizedWorkspaces` root
+   * the workspace resolved inside. Recorded at admission and re-validated at
+   * every workspace preparation and verification checkout, so removing a root
+   * fences the mission instead of letting it continue against an unauthorized
+   * root. Absent only on missions recorded before this feature existed.
+   */
+  workspaceGrantRoot?: string
+  /**
+   * Host-derived origin of the workspace authorization: `session` when the
+   * workspace is the calling session's own cwd, `grant` when it was accepted
+   * because it sits inside a configured root. Recorded at admission and never
+   * taken from model input; it decides whether removal of a root fences the
+   * mission (a grant) or must not (a session workspace). Absent on missions
+   * recorded before this field existed.
+   */
+  workspaceAuthorizationSource?: 'session' | 'grant'
   title: string
   objective: string
   scope: string[]
@@ -319,6 +337,16 @@ export interface CreateMissionInput {
   title: string
   objective: string
   workspace: string
+  /**
+   * Human-authorization anchor for `workspace`, computed by the admission site
+   * from the session cwd or a configured `authorizedWorkspaces` root. Model
+   * tools never supply it directly: `boundPlanWorkspace` overwrites the
+   * workspace and passes the host-derived root, and the runtime re-derives it
+   * through `RuntimeConfig.authorizeWorkspace` when that check is configured.
+   */
+  workspaceGrantRoot?: string
+  /** Host-derived authorization origin, computed with `workspaceGrantRoot` at admission. */
+  workspaceAuthorizationSource?: 'session' | 'grant'
   scope: string[]
   acceptance: string[]
   budget: Budget
@@ -365,7 +393,12 @@ export interface DraftPlan {
   ownerSessionId: string
   revision: number
   status: 'draft' | 'launching' | 'launched' | 'failed' | 'discarded'
+  /** Validated plan exactly as supplied; the authorization anchor lives beside it, never inside. */
   input: PlanInput
+  /** Human-authorization anchor captured at staging; carried into the launched mission. */
+  workspaceGrantRoot?: string
+  /** Host-derived authorization origin captured with the anchor; never inside `input`. */
+  workspaceAuthorizationSource?: 'session' | 'grant'
   createdAt: number
   updatedAt: number
   missionId?: string
@@ -376,6 +409,10 @@ export interface RequestStartInput {
   commandId: string
   goal: string
   workspace: string
+  /** Human-authorization anchor for `workspace`; defaults to the workspace itself. */
+  workspaceGrantRoot?: string
+  /** Host-derived authorization origin; defaults from the anchor for automatic starts. */
+  workspaceAuthorizationSource?: 'session' | 'grant'
   /** Optional legacy hint. The primary agent supplies the actual plan budget. */
   budget?: Budget
 }
@@ -468,7 +505,7 @@ export interface WorkerCallbacks {
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
   /** Freeze once before planning; optional only for adapters without Git execution. */
-  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
+  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
   inspectDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
@@ -500,4 +537,34 @@ export interface RuntimeConfig {
   maxIdleCloseouts?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
+  /**
+   * Human-authorized workspace predicate, loaded once from plugin configuration
+   * at start. When present the runtime re-derives every mission's grant root
+   * from it and fences a mission whose root was revoked; when absent (unit
+   * runtimes and adapters without Git) the recorded admission result stands.
+   * It is a value on the runtime's own config, never a model-callable surface.
+   */
+  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined) => Promise<WorkspaceAuthorization>
+  /**
+   * The roots `authorizeWorkspace` closes over, carried so revocation fencing
+   * can name the recorded root without re-reading configuration. Never
+   * re-loaded at runtime.
+   */
+  grants?: WorkspaceGrantSnapshot
+}
+
+/**
+ * Structural mirror of the authorization types in `src/authorization.ts`. They
+ * live here so the browser typecheck (which includes this file) never pulls in
+ * Node built-ins; the runtime values are assignable to these shapes.
+ */
+export interface WorkspaceGrant { path: string; note?: string; expiresAt?: number }
+export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; loadedAt: number; unresolved: readonly string[] }
+export interface WorkspaceAuthorization {
+  ok: boolean
+  workspace?: string
+  source?: 'session' | 'grant'
+  grantRoot?: string
+  grant?: WorkspaceGrant
+  diagnostic?: string
 }

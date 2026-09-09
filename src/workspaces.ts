@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, Member, Mission, Task, WorkspaceBaseline } from './types.js'
@@ -58,6 +59,15 @@ export interface WorkspaceOptions {
    * is left untouched; this reports the fallback for host-side observability.
    */
   onRecoveryFallback?(info: RecoveryFallback): void
+  /**
+   * Human-authorized roots loaded once at plugin start. When supplied, every
+   * baseline preparation, member workspace and verification checkout
+   * re-validates the mission's recorded `workspaceGrantRoot`, so a root the
+   * human removed from configuration fences the mission instead of letting it
+   * continue against an unauthorized root. Absent in unit fixtures that drive
+   * `Workspaces` directly; the recorded admission result then stands.
+   */
+  grants?: WorkspaceGrantSnapshot
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
 }
@@ -120,7 +130,7 @@ export async function assertContainedSymlinkChain(relative: string, target: stri
     queue.unshift(...next.split('/'))
   }
 }
-interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
+interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline; workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; recovery?: TaskRecovery }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
@@ -249,6 +259,22 @@ export class Workspaces {
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
   private memberPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.workspace.json`) }
   private taskPath(missionId: string, taskId: string): string { return path.join(this.missionDir(missionId), 'tasks', `${segment(taskId)}.json`) }
+
+  /**
+   * Re-validate the human authorization behind a mission before its first
+   * filesystem effect (baseline snapshot, member worktree, verification
+   * checkout). The recorded `workspaceGrantRoot` — falling back to the mission
+   * record, then to the workspace itself for records written before this
+   * feature — anchors the check, and the loaded grant snapshot decides whether
+   * that root is still configured and unexpired. A root the human removed
+   * therefore fences the mission here instead of silently continuing.
+   */
+  private async assertWorkspaceAuthorized(workspace: string, recordedRoot: string | undefined, source?: 'session' | 'grant'): Promise<void> {
+    const grants = this.options.grants
+    if (grants === undefined) return
+    const authorization = await reauthorizeWorkspace(workspace, recordedRoot ?? workspace, grants, source)
+    if (!authorization.ok) throw new Error(authorization.diagnostic)
+  }
   private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
     const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.options.checkTimeoutMs, maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
@@ -326,12 +352,13 @@ export class Workspaces {
       if (!isRecord(saved) || !commitId(saved.sourceHead) || saved.snapshotCommit !== value.baseCommit || typeof saved.planningWorkspace !== 'string' || !Array.isArray(saved.changedPaths) || saved.changedPaths.some(item => typeof item !== 'string') || !Number.isSafeInteger(saved.createdAt)) throw new Error('Invalid mission snapshot metadata')
       baseline = { sourceHead: saved.sourceHead, snapshotCommit: value.baseCommit, planningWorkspace: saved.planningWorkspace, changedPaths: saved.changedPaths as string[], createdAt: saved.createdAt as number }
     }
-    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }) }
+    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }), ...(typeof value.workspaceGrantRoot === 'string' ? { workspaceGrantRoot: value.workspaceGrantRoot } : {}), ...(value.workspaceAuthorizationSource === 'session' || value.workspaceAuthorizationSource === 'grant' ? { workspaceAuthorizationSource: value.workspaceAuthorizationSource } : {}) }
   }
 
   /** Freeze one source baseline before planning; all members and restarts reuse it. */
-  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
+  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
     signal?.throwIfAborted()
+    await this.assertWorkspaceAuthorized(mission.workspace, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
     const existing = this.baselines.get(mission.id)
     if (existing !== undefined) {
       const baseline = await existing
@@ -353,10 +380,17 @@ export class Workspaces {
         // Full repository path inventories need a metadata bound independent
         // of the much smaller user-visible check-output retention limit.
         const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, INVENTORY_BYTES), ownedSignal)
-        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace } }
+        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace }, ...(mission.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: mission.workspaceGrantRoot }), ...(mission.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: mission.workspaceAuthorizationSource }) }
         await writePrivateJson(manifest, record)
       } else record = await this.missionRecord(mission.id)
       if (record.source !== source) throw new Error('Mission source workspace changed')
+      // Re-validate the persisted root, not just the in-memory mission: a
+      // manifest written before the root was recorded still fences correctly.
+      await this.assertWorkspaceAuthorized(source, record.workspaceGrantRoot ?? mission.workspaceGrantRoot, record.workspaceAuthorizationSource ?? mission.workspaceAuthorizationSource)
+      if ((record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined) || (record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined)) {
+        record = { ...record, ...(record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined ? { workspaceGrantRoot: mission.workspaceGrantRoot } : {}), ...(record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined ? { workspaceAuthorizationSource: mission.workspaceAuthorizationSource } : {}) }
+        await writePrivateJson(manifest, record)
+      }
       // Older manifests must retain their original baseline even if the source
       // now has unrelated edits. Add only the planning-view metadata.
       const baseline = record.baseline ?? { sourceHead: record.baseCommit, snapshotCommit: record.baseCommit, planningWorkspace, changedPaths: [], createdAt: Date.now() }
@@ -378,6 +412,18 @@ export class Workspaces {
     this.baselines.set(mission.id, pending)
     try { return await pending }
     finally { if (this.baselines.get(mission.id) === pending) this.baselines.delete(mission.id) }
+  }
+
+  /**
+   * Re-validate one recorded mission before a verification checkout is created.
+   * A verification can be the first filesystem effect after a host restart, so
+   * the checkout path checks independently against the persisted manifest.
+   */
+  private async assertRecordAuthorized(missionId: string, source: string): Promise<void> {
+    if (this.options.grants === undefined) return
+    const record = await this.missionRecord(missionId)
+    if (record.source !== source) throw new Error('Mission source workspace changed')
+    await this.assertWorkspaceAuthorized(source, record.workspaceGrantRoot)
   }
 
   private async memberRecord(member: Pick<Member, 'missionId' | 'id' | 'workspace'>): Promise<MemberWorkspace> {
@@ -747,6 +793,9 @@ export class Workspaces {
       await this.memberRecord(member)
       await this.validateArtifact(member, artifact)
       const mission = await this.missionRecord(member.missionId)
+      // Revocation fencing: the verification checkout is created only after the
+      // persisted mission manifest still authorizes its recorded root.
+      await this.assertWorkspaceAuthorized(mission.source, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
       await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
       await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)

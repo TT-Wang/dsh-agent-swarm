@@ -1,6 +1,8 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
 import { randomUUID } from 'node:crypto'
+import { realpath } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
+import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { SwarmStore, WriterBusyError, type PostFilter, type StoreOptions } from './store.ts'
 import { AdmissionRefusedError, admissionRowId, decideAdmission, defaultLimitRules, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type AdmissionUsage, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope } from './scope.ts'
@@ -407,6 +409,17 @@ function unsupportedEffort(error: unknown): { requested?: string; message: strin
 }
 
 /**
+ * A mission's recorded workspace is no longer inside a human-authorized root.
+ * Distinct from an ordinary preparation failure because it is terminal for this
+ * host process: the mission is fenced immediately instead of spending recovery
+ * credit, and the owner is woken with the durable reason.
+ */
+export class WorkspaceRevokedError extends Error {
+  readonly code = 'workspace_revoked'
+  constructor(readonly diagnostic: string) { super(diagnostic); this.name = 'WorkspaceRevokedError' }
+}
+
+/**
  * `detail=full` is an owner-only read. Worker guidance alone did not prevent its
  * use (docs/observe-context-measurement.md), so the runtime refuses it; callers
  * branch on the class, never on message text. The message names the owner gate
@@ -485,8 +498,19 @@ export class SwarmRuntime {
       failure: (memberId, error) => this.onFailure(memberId, error),
     })
   }
-  /** Recover active missions without requiring a live coordinator or user session. */
-  async start(): Promise<void> {
+  /**
+   * Recover active missions without requiring a live coordinator or user session.
+   * `grants` is the human authorization loaded once by the plugin; when given,
+   * each root is recorded durably as `workspace/grant-loaded` so the audit shows
+   * exactly what the host was authorized to do in this process.
+   */
+  async start(grants?: WorkspaceGrantSnapshot): Promise<void> {
+    if (grants !== undefined) {
+      this.store.transaction(() => {
+        for (const grant of grants.grants) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: grant.path, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
+        for (const unresolved of grants.unresolved) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: unresolved, loaded: false })
+      })
+    }
     // Persisted activity is presentation history, never proof that an execution survived a restart.
     for (const member of this.store.list('members')) if (member.activity !== undefined) {
       delete member.activity
@@ -726,6 +750,93 @@ export class SwarmRuntime {
   private notify(missionId: string, content: string, from = 'runtime'): void {
     this.store.put('deliveries', { id: id('msg'), missionId, from, to: 'owner', kind: 'control', content, createdAt: Date.now() })
   }
+  /**
+   * The runtime-side half of the workspace authorization boundary. `create` is
+   * synchronous, so the full realpath check happened at admission; here the
+   * runtime proves the recorded workspace really resolves inside the root the
+   * admission site reported, so a caller that fabricates a wider
+   * `workspaceGrantRoot` cannot widen its own authorization. When the plugin
+   * installed `config.authorizeWorkspace`/`config.grants`, the workspace must
+   * also still sit inside a root that is currently loaded and unexpired.
+   */
+  private assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } {
+    const claimed = grantRoot ?? workspace
+    if (!isContained(claimed, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claimed} [${WORKSPACE_AUTHORIZATION_CODE}]`)
+    const grants = this.config.grants
+    if (this.config.authorizeWorkspace === undefined || grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
+    const now = Date.now()
+    // A session authorization wins over a root that happens to contain the
+    // session cwd: the human authorized that directory directly, so removing a
+    // root must not fence it. The admission site computed this source.
+    if (source === 'session' && claimed === workspace) return { grantRoot: workspace, source: 'session' }
+    // The recorded root is the configured root that actually contains the
+    // workspace — never the caller's claim. A caller that fabricates a wider
+    // root therefore cannot record it, and a fabricated narrower root is
+    // refused by the containment check above.
+    const matched = grants.grants
+      .filter(grant => isContained(grant.path, workspace) && (grant.expiresAt === undefined || grant.expiresAt > now))
+      .sort((left, right) => right.path.length - left.path.length)[0]
+    if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
+    if (claimed === workspace) return { grantRoot: claimed, source: source ?? 'session' }
+    throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
+  }
+  /**
+   * Re-validate a recorded mission against the human authorization loaded at
+   * start. Returns without error when this runtime has no authorization
+   * predicate (unit runtimes and adapters without Git). Otherwise the mission's
+   * own durable `workspaceGrantRoot` anchors the check: a session workspace
+   * stays authorized exactly while it still resolves to itself, and a
+   * grant-bound mission stays authorized only while that same root is still
+   * configured and unexpired. Removing a root therefore fences the mission at
+   * its next prepare or verification checkout.
+   */
+  private async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): Promise<void> {
+    const authorize = this.config.authorizeWorkspace
+    if (authorize === undefined) return
+    const anchor = mission.workspaceGrantRoot
+    // A mission recorded before this feature has no anchor; its workspace is its
+    // own anchor, which is exactly the pre-feature session-cwd authorization.
+    if (anchor === undefined) return
+    const resolved = await realpath(mission.workspace).catch(() => undefined)
+    const root = await realpath(anchor).catch(() => undefined)
+    let diagnostic: string | undefined
+    if (resolved === undefined) diagnostic = `Authorized workspace ${mission.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]`
+    // A session workspace records its own directory as the anchor: it stays
+    // authorized exactly while that path still resolves to itself. A grant whose
+    // root equals the workspace is not a session workspace, so the equality
+    // shortcut must not apply to it — the live-root predicate below decides.
+    else if (resolved === root && mission.workspaceAuthorizationSource !== 'grant') return
+    else if (root === undefined || !isContained(root, resolved)) diagnostic = `Workspace ${mission.workspace} escaped its recorded authorized root ${anchor} [${WORKSPACE_AUTHORIZATION_CODE}]`
+    else {
+      // The recorded root must still be one the human configured and has not
+      // expired. The configured predicate is the single source of truth, so a
+      // secondary field that was not wired can never fabricate a revocation.
+      const live = await authorize(mission.workspace, undefined)
+      if (!live.ok || live.grantRoot !== root) diagnostic = `Authorized root ${anchor} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]`
+    }
+    if (diagnostic !== undefined) { this.fenceWorkspace(mission.id, diagnostic); throw new WorkspaceRevokedError(diagnostic) }
+  }
+  /**
+   * Fence a mission whose human authorization was withdrawn: block every
+   * schedulable task with the durable reason, record the revocation event, and
+   * wake the owner once. Revocation is terminal for this host process
+   * (restoring the root requires a human config edit and restart), so it does
+   * not spend recovery credit the way a transient preparation failure does.
+   */
+  private fenceWorkspace(missionId: string, reason: string): void {
+    const mission = this.store.get('missions', missionId)
+    if (mission === undefined || terminal(mission)) return
+    if (this.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')) return
+    const blocked = this.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
+    this.commit(missionId, () => {
+      for (const task of blocked) {
+        task.status = 'blocked'; task.output = reason; task.epoch++; this.store.put('tasks', task)
+        this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
+      }
+      this.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
+    })
+    this.notify(missionId, reason)
+  }
   /** Create a mission with explicitly bounded resources and scope. */
   create(actor: Actor, input: CreateMissionInput, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
     if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
@@ -733,14 +844,21 @@ export class SwarmRuntime {
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (!isAbsolute(input.workspace)) throw new Error('workspace must be an absolute path')
     requireStrings(input.scope, 'scope'); requireStrings(input.acceptance, 'acceptance')
+    const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'scope')
     const budget = validatedBudget(input.budget)
     const now = Date.now()
     if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new Error('Mission duration exceeds the supported clock range')
-    const mission: Mission = { ...input, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, deadline: now + budget.maxDurationMs }
+    const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, deadline: now + budget.maxDurationMs }
     if (this.store.get('missions', mission.id)) throw new Error('Mission already exists')
-    this.commit(mission.id, () => { this.store.put('missions', mission); this.store.event(mission.id, 'mission/created', 'owner', mission) })
+    this.commit(mission.id, () => {
+      this.store.put('missions', mission)
+      this.store.event(mission.id, 'mission/created', 'owner', mission)
+      // The durable audit of where the authorization came from: the matched
+      // root and the resolved workspace path, recorded with the mission.
+      this.store.event(mission.id, 'mission/workspace-bound', 'owner', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, source: mission.workspaceAuthorizationSource })
+    })
     return mission
   }
   /** Owner-only membership admission keeps authority and aggregate capacity bounded. */
@@ -767,6 +885,8 @@ export class SwarmRuntime {
       if (members.filter(m => m.status !== 'stopped').length >= mission.budget.maxWorkers) throw new Error('Mission worker budget exhausted')
       if (members.some(m => m.name === input.name)) throw new Error('Worker name already exists')
       const memberId = admittedId ?? id('member')
+      // Re-validate before the first filesystem effect of this mission.
+      await this.assertWorkspaceAuthorized(mission)
       if (!mission.baseline && this.workers.prepareBaseline) {
         const baseline = await this.workers.prepareBaseline(mission, actor.signal)
         const current = this.active(actor, missionId, admittedId !== undefined).mission
@@ -1119,6 +1239,7 @@ export class SwarmRuntime {
       if (!member) throw new Error('Only a member can claim work')
       const task = this.task(missionId, taskId)
       if (!this.ready(task, member)) throw new Error('Task is not ready for this member')
+      await this.assertWorkspaceAuthorized(this.mission(missionId))
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
       this.active(actor, missionId)
       const fresh = this.task(missionId, taskId)
@@ -1219,6 +1340,8 @@ export class SwarmRuntime {
         this.ownAttempt(actor, missionId, task.id, input.attemptId)
       }
       const evidenceRevision = JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))
+      // Re-validate before the verification checkout is created.
+      await this.assertWorkspaceAuthorized(this.mission(missionId))
       const checks = await this.workers.verifyArtifact(member, source, artifact, actor.signal)
       this.ownAttempt(actor, missionId, task.id, input.attemptId)
       const currentSource = this.task(missionId, source.id)
@@ -1797,7 +1920,8 @@ export class SwarmRuntime {
     if (this.starts(actor).some(request => ['planning', 'launching', 'running'].includes(request.status))) throw new Error('This session already has an automatic swarm request in progress')
     if (this.starts(actor).filter(request => request.status === 'failed').length >= 32) throw new Error('Too many failed automatic requests; retry a saved request')
     const now = Date.now()
-    const request: AutoStart = { id: id('start'), ownerSessionId: actor.sessionId, commandId: input.commandId, goal, workspace: input.workspace,
+    const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    const request: AutoStart = { id: id('start'), ownerSessionId: actor.sessionId, commandId: input.commandId, goal, workspace: input.workspace, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source,
       budget, status: 'planning', createdAt: now, updatedAt: now }
     this.commit(request.id, () => {
       this.store.put('starts', request)
@@ -1851,7 +1975,7 @@ export class SwarmRuntime {
   }
   /** Automatic requests must contain a complete independently verifiable topology. */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
-    const plan = validatePlan({ ...input, workspace: request.workspace })
+    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) })
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
     const issues: string[] = []
     if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
@@ -1975,7 +2099,14 @@ export class SwarmRuntime {
     if (this.drafts(actor).filter(d => ['draft', 'failed', 'launching'].includes(d.status)).length >= 32) throw new Error('Discard unused drafts before creating more')
     const now = Date.now()
     if (admittedId && this.store.get('drafts', admittedId)) throw new Error('Draft admission identity already exists')
-    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: validatePlan(input), createdAt: now, updatedAt: now }
+    // A staged draft carries the same authorization anchor as a created
+    // mission, so launching it cannot introduce a root the admission check did
+    // not already accept. The anchor is stored on the draft record, never
+    // inside `input`: the saved plan stays exactly the validated plan.
+    const admitted = validatePlan(input)
+    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
+    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: clean, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, createdAt: now, updatedAt: now }
     this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/staged', 'owner', { draftId: draft.id, revision: draft.revision }) })
     return draft
   }
@@ -1983,7 +2114,10 @@ export class SwarmRuntime {
     const draft = this.ownedDraft(actor, draftId)
     if (draft.revision !== revision) throw new Error('Draft changed; reload before saving')
     if (draft.status !== 'draft') throw new Error('Only unlaunched drafts can be edited; discard a failed launch to create a different plan')
-    draft.input = validatePlan(input); draft.revision++; draft.updatedAt = Date.now()
+    const admitted = validatePlan(input)
+    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
+    draft.input = clean; draft.workspaceGrantRoot = authorized.grantRoot; draft.workspaceAuthorizationSource = authorized.source; draft.revision++; draft.updatedAt = Date.now()
     this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/edited', 'owner', { draftId, revision: draft.revision }) })
     return draft
   }
@@ -2017,7 +2151,10 @@ export class SwarmRuntime {
         let mission = this.store.get('missions', missionId)
         if (!mission) {
           const { title, objective, workspace, scope, acceptance, budget } = input
-          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, { id: missionId, status: 'staged' })
+          const extra = input as PlanInput & { workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
+          const anchor = draft.workspaceGrantRoot ?? extra.workspaceGrantRoot
+          const source = draft.workspaceAuthorizationSource ?? extra.workspaceAuthorizationSource
+          mission = this.create(actor, { title, objective, workspace, ...(anchor === undefined ? {} : { workspaceGrantRoot: anchor }), ...(source === undefined ? {} : { workspaceAuthorizationSource: source }), scope, acceptance, budget }, { id: missionId, status: 'staged' })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new Error('The partially assembled mission cannot be launched')
         for (const member of input.members) await this.addMember(actor, missionId, member, `member_${draft.id}_${member.key}`)
@@ -3137,6 +3274,9 @@ export class SwarmRuntime {
       const task = tasks[0]
       if (!task) continue
       try {
+        // Revocation fencing: a mission whose human authorization was withdrawn
+        // is blocked here, before any adapter prepares a workspace or checkout.
+        await this.assertWorkspaceAuthorized(this.mission(missionId))
         await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
         if (this.shuttingDown || this.mission(missionId).status !== 'active') return
         const fresh = this.task(missionId, task.id)
@@ -3147,6 +3287,9 @@ export class SwarmRuntime {
         // pending and a later tick re-evaluates it when a slot frees up.
         if (error instanceof AdmissionRefusedError) continue
         if (this.shuttingDown || this.mission(missionId).status !== 'active') return
+        // A withdrawn authorization is terminal for this host process, not a
+        // transient preparation failure: fence the mission now, never retry.
+        if (error instanceof WorkspaceRevokedError) { this.fenceWorkspace(missionId, error.diagnostic); return }
         const fresh = this.task(missionId, task.id)
         if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
         // W18: a workspace or worker preparation failure is recoverable, not

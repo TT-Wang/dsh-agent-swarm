@@ -1,7 +1,7 @@
 /** Model tools are thin, authenticated consumers of the swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { realpath } from 'node:fs/promises'
+import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -89,19 +89,22 @@ function optionalText(args: Args, key: string): string | undefined { return args
 
 /**
  * Bind a model-supplied plan workspace to the calling agent session.
- * The browser path already canonicalizes against `header.cwd`; model tools must
- * enforce the same boundary so a misled or injected model cannot direct a swarm
- * outside the user-authorized workspace. Fail closed when the session has no cwd,
- * and return the realpath so the mission records a canonical source that
- * delivery can apply.
+ *
+ * The browser path already enforces this boundary; model tools must enforce the
+ * same one so a misled or injected model cannot direct a swarm outside the
+ * user-authorized workspace. A workspace is accepted only when it equals the
+ * calling session's cwd or resolves inside a root the human configured once in
+ * `authorizedWorkspaces`; the roots are a value captured at plugin start and no
+ * tool argument can add, widen or revoke one. Fail closed when the session has
+ * no cwd, and return the canonical workspace plus the matched root so the
+ * mission records both durably.
  */
-async function boundPlanWorkspace(exec: ToolExecution, requested: string): Promise<string> {
+async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot): Promise<WorkspaceAuthorized> {
   const cwd = exec.agent?.session?.header?.cwd
   if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('Swarm planning tools require an agent session workspace')
-  const session = await realpath(cwd).catch(() => undefined)
-  const workspace = await realpath(requested).catch(() => undefined)
-  if (session === undefined || workspace === undefined || workspace !== session) throw new Error('Plan workspace must match the selected session workspace')
-  return workspace
+  const authorization = await authorizeWorkspace(requested, cwd, grants)
+  if (!authorization.ok) throw new Error(authorization.diagnostic)
+  return authorization
 }
 
 /** Launch confirmation the model needs: identities and the graph, not every record. */
@@ -179,7 +182,10 @@ function emitVerdictEvents(store: SwarmStore, missionId: string, review: Task, a
 }
 
 /** Install tools with host-derived identity and durable UI metadata. */
-export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget): void {
+export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget, grants?: WorkspaceGrantSnapshot): void {
+  // No grants supplied (unit fixtures) means the only authorization is the
+  // calling session's own cwd — the pre-feature H4 boundary, never wider.
+  const authorized: WorkspaceGrantSnapshot = grants ?? { grants: [], loadedAt: Date.now(), unresolved: [] }
   // One recorder per runtime: every mission-scoped orchestration step emits a
   // durable `trace/span` row whose input/output bytes live in a
   // content-addressed directory beside the state file.
@@ -208,8 +214,14 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         exec.signal.throwIfAborted()
         if (!exec.agent) throw new Error('Swarm tools require an authenticated Harness agent session')
         let args = object(value)
-        // H4: planning workspaces are bound to the calling session, never the model's word.
-        if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) args = { ...args, workspace: await boundPlanWorkspace(exec, text(args, 'workspace')) }
+        // H4: planning workspaces are bound to the calling session or a root the
+        // human configured once, never to the model's word. The matched root is
+        // attached for the mission record; the runtime re-derives it when the
+        // plugin installed its own authorization predicate.
+        if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) {
+          const bound = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
+          args = { ...args, workspace: bound.workspace, workspaceGrantRoot: bound.grantRoot, workspaceAuthorizationSource: bound.source }
+        }
         const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
         const step = name as TraceStep
         const startedAt = Date.now()
@@ -259,7 +271,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; pair each deliverable with a verification task via reviewOf. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
-    ...a, budget: object(a.budget),
+    ...a, budget: object(a.budget), workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+    workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource'),
   } as unknown as PlanInput))
   const launchProperties: Record<string, JsonSchemaNode> = structuredClone(planProperties)
   delete launchProperties.workspace
@@ -301,7 +314,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema },
     ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], (a, actor) => runtime.create(actor, {
       title: text(a, 'title'), objective: text(a, 'objective'), workspace: text(a, 'workspace'), scope: array(a, 'scope'), acceptance: array(a, 'acceptance'),
-      budget: object(a.budget) as unknown as Budget,
+      budget: object(a.budget) as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+      workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
     } satisfies CreateMissionInput))
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree.',
     { ...mission, name: string, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'name', 'role'],

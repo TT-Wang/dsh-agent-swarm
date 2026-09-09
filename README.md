@@ -160,9 +160,14 @@ The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [
 | `verificationDependencyMode` | `"link"` | `link` symlinks them read-through; `copy` clones them per checkout. |
 | `cacheReadWeight` | `0.1` | Budget weight for cached input. Raw buckets are unaffected. |
 | `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned per dimension. |
+| `authorizedWorkspaces` | `[]` | Human-authorized roots (`{ path, note?, expiresAt? }`) a mission may target outside the session cwd. Loaded once at start; no tool can change it. |
 | `checkTimeoutMs` | `60000` | Fallback per-command timeout when a task does not choose one. |
 | `leaseMs` | `120000` | Attempt lease, renewed only while a real operation is observed. |
 | `tickMs` | `1000` | Scheduler tick. |
+
+### Authorized workspaces (human-only surface)
+
+A mission workspace is accepted only when it equals the calling session's working directory or resolves (realpath, symlink-resolved) inside one of the roots in `authorizedWorkspaces`. The roots are read once from plugin configuration at start; **no model-callable tool can create, widen or revoke a root**, and changing the set requires a human editing the profile/`cordis.patch.yml` and restarting the host. `swarm_create` and `swarm_stage` overwrite the model-supplied workspace with the resolved path and record the matched root durably as `mission.workspaceGrantRoot` plus a `mission/workspace-bound` audit event; `workspace/grant-loaded` records each configured root at start. An unauthorized path is refused with a field-level `[workspace_not_authorized]` diagnostic naming the requirement and how a human grants it. Removing a root and restarting refuses new missions and fences a running one (durable blocked reason plus an owner notice) at its next workspace preparation or verification checkout. Worker sessions never create missions or use a grant. See [known limitations](docs/known-limitations.md) for the residual risks (model write access to the configuration file, TOCTOU on a replaced root, authorization is not confidentiality).
 
 Only one live runtime may own a database. To run independent Harness processes, give each an absolute `statePath` and `workspacesRoot` through its profile overlay. **Changing `DSH_HOME` alone does not isolate this plugin's storage.**
 

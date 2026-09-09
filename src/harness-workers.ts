@@ -14,6 +14,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import { readFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { Workspaces, writePrivateJson } from './workspaces.js'
+import type { WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
@@ -30,6 +31,14 @@ export interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
+  /**
+   * The human-authorized roots loaded once at plugin start. When supplied, the
+   * owned `Workspaces` re-validates every workspace preparation and verification
+   * checkout against them, so a revoked root fences the mission instead of
+   * silently continuing. Absent in unit fixtures that drive `Workspaces`
+   * directly, where the recorded admission result stands.
+   */
+  grants?: WorkspaceGrantSnapshot
   /** Ignored dependency directories linked from the source into verification checkouts. */
   verificationDependencyDirs?: string[]
   /** M6: `link` (default) symlinks those directories read-through; `copy` clones them into each checkout. */
@@ -175,6 +184,7 @@ export class HarnessWorkers implements WorkerAdapter {
     this.workspaces = new Workspaces({
       ...options,
       checkEnv: scrubbedParentEnv(),
+      ...(options.grants === undefined ? {} : { grants: options.grants }),
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')
         if (sandbox === undefined) throw new Error('Artifact verification requires a Harness sandbox provider')
@@ -321,7 +331,7 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   prepareWorkspace(mission: Mission, memberId: string): Promise<string> { return this.workspaces.prepareWorkspace(mission, memberId) }
-  prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
+  prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal) {
     if (!mission.baseline) throw new Error('This mission has no saved delivery baseline')
     return inspectDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)

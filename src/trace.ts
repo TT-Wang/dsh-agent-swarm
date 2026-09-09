@@ -46,7 +46,7 @@ export const isTraceErrorType = (value: unknown): value is TraceErrorType => typ
 /** Map a thrown orchestration failure onto the closed `error.type` vocabulary. */
 export function errorTypeFor(error: unknown): TraceErrorType {
   const message = error instanceof Error ? error.message : String(error)
-  if (/not a participant|unauthorized|Only the mission owner|Only a member|Only the primary user|Workers cannot|authenticated|bypass mission authority|owner session/i.test(message)) return 'authorization_error'
+  if (/not a participant|unauthorized|Only the mission owner|Only a member|Only the primary user|Workers cannot|authenticated|bypass mission authority|owner session|workspace_not_authorized/i.test(message)) return 'authorization_error'
   if (/budget|exhausted|deadline/i.test(message)) return 'budget_error'
   if (/lease|no longer current|fenced|already owns an open task/i.test(message)) return 'lease_error'
   if (/changed during|already exists|is terminal|conflict/i.test(message)) return 'conflict_error'
@@ -408,6 +408,11 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'mission/coordinator': 'Owner set the mission coordinator',
   'delivery/applied': 'Owner applied an accepted result to the source checkout',
   'delivery/conflicts': 'Owner applied a result that conflicted; no source write was kept',
+  // User-authorized per-mission workspace: the human authorization surface and
+  // its durable binding/revocation audit.
+  'workspace/grant-loaded': 'One human-configured authorizedWorkspaces root loaded at plugin start, or named as unresolvable',
+  'mission/workspace-bound': 'Mission bound to its resolved workspace and the matched authorized root',
+  'mission/workspace-revoked': 'Mission fenced: its workspace is no longer inside a human-authorized root',
 }
 export interface EventVocabularyReport {
   recognized: string[]
