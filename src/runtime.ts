@@ -49,14 +49,28 @@ function executedShellCommand(tool: string, args: unknown): string | undefined {
   return undefined
 }
 /**
- * The command with shell comments and quoted spans removed, so a phrase that
- * merely appears as data (a search pattern, an edit body, a message) is not
- * mistaken for an executed command. Direct commands and compound command words
- * keep their text; a command hidden inside a nested shell string is not seen.
+ * The command with shell comments, quoted spans, arithmetic expressions,
+ * `$[...]`/`${...}` literal spans and heredoc bodies removed, so a phrase that
+ * merely appears as data (a search pattern, an edit body, a message, a heredoc
+ * body) is not mistaken for an executed command. Direct commands and compound
+ * command words keep their text; a command hidden inside a nested shell string
+ * is not seen. R7-01: a `<<`/`<<-` heredoc body is data, so a line-start
+ * `git add`/`git commit` inside a runbook written by `cat` is never classified
+ * as an executed write, even when another command in the same call fails.
+ * R7-01b/c: only an operator that really starts a heredoc is recognized —
+ * `<<<` here-strings, `<<` inside arithmetic (`$((...))`, `((...))`), inside
+ * `$[...]`, inside unquoted `${...}` and inside quotes/comments stay command
+ * text, and an operator whose body has no terminator line stays command text
+ * too, so a phantom operator can never swallow a later real write.
  */
 function unquotedShellText(command: string): string {
   let text = ''
   let quote: '"' | "'" | undefined
+  let arithmetic = 0
+  let literal: '[' | '{' | undefined
+  let literalQuote: '"' | "'" | undefined
+  let literalDepth = 0
+  const heredocs: { delimiter: string; stripTabs: boolean }[] = []
   for (let index = 0; index < command.length; index++) {
     const char = command[index]!
     if (quote !== undefined) {
@@ -64,17 +78,155 @@ function unquotedShellText(command: string): string {
       else if (char === quote) quote = undefined
       continue
     }
+    if (literal !== undefined) {
+      // R7-01c: `$[...]` and unquoted `${...}` are literal spans. Their text is
+      // kept, but a `<<` inside them is never a heredoc operator. Quotes inside
+      // the span are tracked locally so `${x:-"a}b"}` does not end early.
+      if (literalQuote !== undefined) {
+        if (char === '\\' && literalQuote === '"' && index + 1 < command.length) {
+          text += char + command[index + 1]!
+          index++
+          continue
+        }
+        if (char === literalQuote) literalQuote = undefined
+        text += char
+        continue
+      }
+      if (char === '"' || char === "'") { literalQuote = char; text += char; continue }
+      if (char === literal) literalDepth++
+      else if (char === (literal === '[' ? ']' : '}')) {
+        literalDepth--
+        if (literalDepth === 0) { literal = undefined; literalQuote = undefined }
+      }
+      text += char
+      continue
+    }
+    if (arithmetic > 0) {
+      // Inside arithmetic a `<<` is a shift and parens are balanced; the text
+      // stays so a malformed expansion can never hide a later command.
+      if (char === '(') arithmetic++
+      else if (char === ')') arithmetic--
+      text += char
+      continue
+    }
     if (char === '"' || char === "'") { quote = char; continue }
     if (char === '#') {
+      // Leave the newline for the heredoc flush below: a trailing comment on a
+      // heredoc operator's line must not skip the body that follows it.
       const newline = command.indexOf('\n', index)
       if (newline === -1) break
-      index = newline
-      text += '\n'
+      index = newline - 1
       continue
+    }
+    if (char === '$' && command[index + 1] === '(' && command[index + 2] === '(') {
+      arithmetic = 2
+      index += 2
+      continue
+    }
+    if (char === '$' && command[index + 1] === '[') {
+      literal = '['; literalDepth = 0; text += char
+      continue
+    }
+    if (char === '$' && command[index + 1] === '{') {
+      literal = '{'; literalDepth = 0; text += char
+      continue
+    }
+    if (char === '(' && command[index + 1] === '(') {
+      arithmetic = 2
+      index += 1
+      continue
+    }
+    if (char === '<') {
+      let run = 0
+      while (command[index + run] === '<') run++
+      if (run === 2) {
+        const operator = heredocOperator(command, index)
+        if (operator !== undefined) {
+          heredocs.push({ delimiter: operator.delimiter, stripTabs: operator.stripTabs })
+          index = operator.next - 1
+          continue
+        }
+      } else if (run >= 3) {
+        // A here-string `<<<` (or a longer run) is not a heredoc operator.
+        text += '<'.repeat(run)
+        index += run - 1
+        continue
+      }
+    }
+    if (char === '\n' && heredocs.length > 0) {
+      const bodyEnd = heredocBodyEnd(command, index + 1, heredocs)
+      heredocs.length = 0
+      if (bodyEnd !== undefined) {
+        text += '\n'
+        index = bodyEnd - 1
+        continue
+      }
+      // No complete terminator sequence: the queued operators were not real
+      // heredocs, so the text stays commands and a later write is still seen.
     }
     text += char
   }
   return text
+}
+/**
+ * R7-01b: the index just past every queued heredoc body, or undefined when any
+ * queued operator has no terminator line. A body starts after the operator's
+ * command line and ends at the first line equal to its delimiter; `<<-` strips
+ * leading tabs from body and terminator lines. Requiring the terminator keeps a
+ * phantom operator (a shift or here-string the scanner misread) from swallowing
+ * the rest of the call.
+ */
+function heredocBodyEnd(command: string, start: number, heredocs: readonly { delimiter: string; stripTabs: boolean }[]): number | undefined {
+  let cursor = start
+  for (const { delimiter, stripTabs } of heredocs) {
+    let found = false
+    for (;;) {
+      const lineEnd = command.indexOf('\n', cursor)
+      const line = command.slice(cursor, lineEnd === -1 ? command.length : lineEnd)
+      if ((stripTabs ? line.replace(/^\t+/, '') : line) === delimiter) {
+        cursor = lineEnd === -1 ? command.length : lineEnd + 1
+        found = true
+        break
+      }
+      if (lineEnd === -1) break
+      cursor = lineEnd + 1
+    }
+    if (!found) return undefined
+  }
+  return cursor
+}
+/**
+ * R7-01b: a `<<`/`<<-` operator and its delimiter word, or undefined when the
+ * `<<` does not start a heredoc. `<<<` here-strings, arithmetic shifts and the
+ * `$[...]`/`${...}` literal spans never reach this function. The delimiter may
+ * be a bare shell word (letters, digits, `_`, `-`), single/double quoted or
+ * backslash-quoted, and must end at whitespace, a shell operator or `)` (the
+ * inline `x=$(cat <<EOF)` form). The body is skipped only when `heredocBodyEnd`
+ * finds its terminator line.
+ */
+function heredocOperator(command: string, start: number): { delimiter: string; stripTabs: boolean; next: number } | undefined {
+  let cursor = start + 2
+  const stripTabs = command[cursor] === '-'
+  if (stripTabs) cursor++
+  while (command[cursor] === ' ' || command[cursor] === '\t') cursor++
+  let delimiter: string
+  const opener = command[cursor]
+  if (opener === "'" || opener === '"') {
+    const close = command.indexOf(opener, cursor + 1)
+    if (close === -1) return undefined
+    delimiter = command.slice(cursor + 1, close)
+    cursor = close + 1
+  } else {
+    if (opener === '\\') cursor++
+    const word = /^[A-Za-z0-9_][A-Za-z0-9_-]*/.exec(command.slice(cursor))?.[0]
+    if (word === undefined) return undefined
+    delimiter = word
+    cursor += word.length
+  }
+  if (!delimiter) return undefined
+  const after = command[cursor]
+  if (after !== undefined && !/[\s;&|<>)]/.test(after)) return undefined
+  return { delimiter, stripTabs, next: cursor }
 }
 /** Shell separators that start a new command segment. */
 const SHELL_SEPARATORS = /&&|\|\||[;|\n]/
