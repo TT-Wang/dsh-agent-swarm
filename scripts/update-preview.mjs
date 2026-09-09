@@ -33,11 +33,11 @@
  */
 import { cpSync, copyFileSync, existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveHarnessRoot } from './harness-target.mjs'
+import { changedPaths, selectLaunchUrl, summarizePaths } from './preview-log.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const self = fileURLToPath(import.meta.url)
@@ -48,7 +48,6 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const now = () => new Date().toISOString()
 /** Filesystem-safe timestamp for per-restart bookkeeping files. */
 const stamp = () => now().replaceAll(':', '-').replaceAll('.', '-')
-const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex')
 const fail = message => { process.stderr.write(`update-preview: ${message}\n`); process.exit(1) }
 
 if (flag('--restart-worker')) { await runWorker(value('--state', '')); process.exit(0) }
@@ -119,23 +118,21 @@ function copyEntries(from, to, entries) {
     else copyFileSync(source, target)
   }
 }
-function summarize() {
-  const paths = ['lib/index.js', 'lib/client.js'].filter(path => existsSync(join(pluginDir, path)))
-  return Object.fromEntries(paths.map(path => [path, hash(join(pluginDir, path))]))
-}
 
 // ---------------------------------------------------------------- build
-const before = noSync ? {} : summarize()
+// The sync entry list is known before the build, so the before-summary and the
+// built-summary hash exactly the same packaged paths.
+const entries = noSync ? [] : packagedEntries()
+const before = noSync ? {} : summarizePaths(pluginDir, entries)
 if (skipBuild) log('skipping build (--skip-build)')
 else {
   log('building plugin from ' + project)
   if (!dryRun) execFileSync('npm', ['run', 'build'], { cwd: project, stdio: 'inherit' })
 }
 for (const required of ['lib/index.js', 'lib/client.js']) if (!existsSync(join(project, required))) fail(`build did not produce ${required}`)
-const built = Object.fromEntries(['lib/index.js', 'lib/client.js'].map(path => [path, hash(join(project, path))]))
+const built = noSync ? {} : summarizePaths(project, entries)
 
 // ---------------------------------------------------------------- sync
-const entries = noSync ? [] : packagedEntries()
 let backup
 if (!noSync) {
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
@@ -147,8 +144,8 @@ if (!noSync) {
     for (const stale of readdirSync(dirname(pluginDir)).filter(name => /^plugin\.bak-/.test(name)).sort().slice(0, -3)) rmSync(join(dirname(pluginDir), stale), { recursive: true, force: true })
   }
 } else log('linked checkout (--no-sync): skipping snapshot copy')
-const after = noSync ? {} : summarize()
-const changed = noSync ? [] : Object.keys(built).filter(path => before[path] !== built[path])
+const after = noSync ? {} : summarizePaths(pluginDir, entries)
+const changed = noSync ? [] : changedPaths(before, built)
 
 // ---------------------------------------------------------------- preflight
 const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }
@@ -197,7 +194,11 @@ async function runWorker(statePath) {
   delete env.DEEPSEEK_API_KEY
   const serverPath = join(state.preview, 'server.json')
   const launchPath = join(state.preview, 'launch.url')
+  const serverLogPath = join(state.preview, 'server.log')
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+  // Read as text so the offset is a string offset: it stays stable across
+  // appends even when previous log lines contain multibyte characters.
+  const logLength = () => { try { return readFileSync(serverLogPath, 'utf8').length } catch { return 0 } }
 
   const stop = async pid => {
     if (!Number.isInteger(pid) || pid < 1) return
@@ -208,20 +209,24 @@ async function runWorker(statePath) {
     await sleep(1500)
   }
   const start = async () => {
-    const out = openSync(join(state.preview, 'server.log'), 'a', 0o600)
+    // Append-only server.log: its length captured before this host is spawned is
+    // the only trustworthy boundary between this host's token and every
+    // previous host's. Without it, awaitLaunchUrl would immediately return the
+    // old token that the log still carries and the link would 401.
+    const sinceOffset = logLength()
+    const out = openSync(serverLogPath, 'a', 0o600)
     const child = spawn(process.execPath, ['--expose-internals', state.cli, '--profile', 'web', '--patch', state.patch, '--port', String(state.port), '--no-open'], { cwd: state.workspace, env, detached: true, stdio: ['ignore', out, out] })
     child.unref(); closeSync(out)
     log(`started host ${child.pid}`)
     writeFileSync(serverPath, JSON.stringify({ status: 'starting', pid: child.pid, url: `http://127.0.0.1:${state.port}`, home: state.home, plugin: state.pluginDir, model: state.model, port: state.port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 })
-    return child
+    return { child, sinceOffset }
   }
-  const awaitLaunchUrl = async child => {
-    const pattern = new RegExp(`http://127\\.0\\.0\\.1:${state.port}/\\?token=[A-Za-z0-9_.-]+`, 'g')
+  const awaitLaunchUrl = async (child, sinceOffset) => {
     for (let attempt = 0; attempt < 450; attempt++) {
       await sleep(200)
       try {
-        const found = readFileSync(join(state.preview, 'server.log'), 'utf8').match(pattern)
-        if (found) { writeFileSync(launchPath, found.at(-1) + '\n', { mode: 0o600 }); return found.at(-1) }
+        const found = selectLaunchUrl(readFileSync(serverLogPath, 'utf8'), sinceOffset, state.port)
+        if (found) { writeFileSync(launchPath, found + '\n', { mode: 0o600 }); return found }
       } catch { /* the log may not exist yet */ }
       try { process.kill(child.pid, 0) } catch { return undefined }
     }
@@ -232,8 +237,8 @@ async function runWorker(statePath) {
   try {
     await sleep(state.delayMs)
     await stop(state.previousPid)
-    let child = await start()
-    let url = await awaitLaunchUrl(child)
+    let { child, sinceOffset } = await start()
+    let url = await awaitLaunchUrl(child, sinceOffset)
     if (!url) {
       log('new host did not publish a launch url; rolling back the plugin snapshot')
       await stop(child.pid)
@@ -245,8 +250,10 @@ async function runWorker(statePath) {
           if (statSync(source).isDirectory()) cpSync(source, target, { recursive: true }); else copyFileSync(source, target)
         }
       }
-      child = await start()
-      url = await awaitLaunchUrl(child)
+      // A fresh offset for the retry: the first host's token, if it ever
+      // printed one, must not be mistaken for the retried host's.
+      ;({ child, sinceOffset } = await start())
+      url = await awaitLaunchUrl(child, sinceOffset)
     }
     if (url) { commit(child, url); log(`restart complete: ${url}`) }
     else { writeFileSync(serverPath, JSON.stringify({ status: 'failed', pid: null, previousPid: state.previousPid, url: `http://127.0.0.1:${state.port}`, home: state.home, plugin: state.pluginDir, port: state.port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 }); log('restart failed: inspect server.log; snapshot backup at ' + state.backup) }
