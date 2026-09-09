@@ -1,11 +1,11 @@
-import { useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
-import { LANES, compactNumber, dependencyMet, evidenceCounts, eventSummary, remainingPercent, shortId, taskLane } from './projection.ts'
+import { LANES, boardIndex, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useNow } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
 import { MissionProgress, RecentProgress, ResultSummary } from './MissionProgress.tsx'
-import { activityLabels, memberActivity, type ConnectionState } from './progress.ts'
+import { activityLabels, memberActivity, runningByOwner, taskReasons, type ConnectionState } from './progress.ts'
 
 type View = 'board' | 'evidence' | 'activity' | 'graph'
 function time(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
@@ -37,15 +37,21 @@ function UsageBreakdown({ worker, owner, steps }: { worker?: UsageBuckets; owner
     <p className="sw-small">{t('Worker requests are physical model calls; steps count logical worker turns')} · {steps} {t('steps')}. {t('Owner usage is attributed by time window and is not charged to the worker budget.')}</p>
   </details>
 }
-function TaskCard({ task, snapshot, live, now }: { task: Task; snapshot: Snapshot; live: boolean; now: number }) {
+function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, onCancel }: {
+  task: Task; snapshot: Snapshot; live: boolean; now: number; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
+  reason?: string; onCancel?: (task: Task) => void;
+}) {
   const t = useCopy()
-  const member = snapshot.members.find(item => item.id === (task.attempt?.ownerId ?? task.assigneeId))
-  const dependencies = task.dependencies.map(id => snapshot.tasks.find(item => item.id === id))
-  const blocked = task.dependencies.filter(id => !dependencyMet(id, snapshot.tasks))
-  const reviewSource = task.reviewOf ? snapshot.tasks.find(item => item.id === task.reviewOf) : undefined
+  const [arming, setArming] = useState(false)
+  // Every lookup resolves through the per-render index/member map, never a
+  // linear scan of the task array (F-34).
+  const member = memberById.get(task.attempt?.ownerId ?? task.assigneeId ?? '')
+  const dependencies = task.dependencies.map(id => index.byId.get(id))
+  const blocked = index.blockedDependencies(task)
+  const reviewSource = task.reviewOf ? index.byId.get(task.reviewOf) : undefined
   const expired = task.attempt !== undefined && leaseExpired(task.attempt.leaseUntil, live ? now : snapshot.mission.updatedAt)
-  return <article className="sw-task" data-lane={taskLane(task, snapshot.tasks)}>
-    <div className="sw-row"><span className="sw-eyebrow">{task.kind}</span><span className="sw-code sw-muted">{shortId(task.id)}</span></div>
+  return <article className="sw-task" data-lane={lane}>
+    <div className="sw-row"><span className="sw-eyebrow">{t(task.kind)}</span><span className="sw-code sw-muted">{shortId(task.id)}</span></div>
     <div className="sw-task-title">{task.title}</div>
     <div className="sw-task-meta"><span>{member?.name ?? t('Unassigned')}{task.experiment ? ` · ${t('experiment')}` : ''}</span>
       {task.attempt && <span title={`${t('Attempt')} ${task.attempt.id}`}>{t('Attempt')} {task.attempt.epoch} · {t('lease')} {time(task.attempt.leaseUntil)}{expired ? ` ${t('(expired)')}` : ''}</span>}
@@ -54,6 +60,8 @@ function TaskCard({ task, snapshot, live, now }: { task: Task; snapshot: Snapsho
       {task.evidenceIds.length > 0 && <span>{task.evidenceIds.length} {t(task.evidenceIds.length === 1 ? 'evidence record' : 'evidence records')}</span>}
       {task.artifact && <span className="sw-code" title={task.artifact.commit}>{t('Artifact')} {shortId(task.artifact.commit)}</span>}
     </div>
+    {/* W9/W15: the durable reason is visible on the card, not only in the collapsed disclosure. */}
+    {reason && <p className="sw-small sw-focus-note" data-swarm-task-reason="">{reason}</p>}
     {(task.dependencies.length > 0 || task.output || task.scope?.length > 0) && <details><summary>{t('Task details')}</summary>
       {task.objective && <p className="sw-small">{task.objective}</p>}
       {task.dependencies.length > 0 && <p className="sw-refs">{t('Prerequisites')}: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}
@@ -61,12 +69,18 @@ function TaskCard({ task, snapshot, live, now }: { task: Task; snapshot: Snapsho
       {task.reviewOf && <p className="sw-refs">{t('Reviews')} {shortId(task.reviewOf)}{task.reviewedCommit ? ` ${t('at')} ${shortId(task.reviewedCommit)}` : ''}</p>}
       {task.output && <p className="sw-small" style={{ marginTop: 8 }}>{task.output}</p>}
     </details>}
+    {onCancel && !['accepted', 'cancelled'].includes(task.status) && <div className="sw-row" style={{ marginTop: 8 }}>
+      {arming ? <>
+        <button className="sw-link" data-action="confirm-cancel-task" onClick={() => { setArming(false); onCancel(task) }}>{t('Confirm cancel')}</button>
+        <button className="sw-link" data-action="dismiss-cancel-task" onClick={() => setArming(false)}>{t('Cancel')}</button>
+      </> : <button className="sw-link" data-action="cancel-task" onClick={() => setArming(true)}>{t('Cancel task')}</button>}
+    </div>}
   </article>
 }
-function Worker({ member, tasks, onOpen }: { member: Member; tasks: Task[]; onOpen?: (member: Member) => void }) {
+function Worker({ member, running, onOpen }: { member: Member; running: ReadonlyMap<string, Task>; onOpen?: (member: Member) => void }) {
   const t = useCopy()
-  const current = tasks.find(task => task.status === 'running' && (task.attempt?.ownerId ?? task.assigneeId) === member.id)
-  const activity = memberActivity(member, tasks)
+  const current = running.get(member.id)
+  const activity = memberActivity(member, running)
   return <article className="sw-worker"><div className="sw-row"><div className="sw-person">
     <span className="sw-avatar" aria-hidden="true">{member.name.slice(0, 2).toUpperCase()}</span>
     <div><div className="sw-worker-name">{member.name}</div><div className="sw-small">{member.role}</div></div>
@@ -77,16 +91,28 @@ function Worker({ member, tasks, onOpen }: { member: Member; tasks: Task[]; onOp
     {onOpen && <button className="sw-link" data-worker-session={member.sessionId} onClick={() => onOpen(member)}>{t('Open conversation')} ↗</button>}
   </article>
 }
-function EvidenceCard({ evidence, snapshot }: { evidence: Evidence; snapshot: Snapshot }) {
+function EvidenceCard({ evidence, index, memberById, verdicts, retiredBySource }: {
+  evidence: Evidence; index: BoardIndex; memberById: ReadonlyMap<string, Member>;
+  verdicts: ReadonlyMap<string, DurableVerdict>; retiredBySource: ReadonlyMap<string, RetiredReview[]>;
+}) {
   const t = useCopy()
-  const author = snapshot.members.find(item => item.id === evidence.authorId)?.name ?? shortId(evidence.authorId)
-  const task = snapshot.tasks.find(item => item.id === evidence.taskId)
-  return <article className="sw-evidence"><div className="sw-row"><span className="sw-code sw-muted">{shortId(evidence.id)} · {evidence.outcome}</span>
+  const author = memberById.get(evidence.authorId)?.name ?? shortId(evidence.authorId)
+  const task = index.byId.get(evidence.taskId)
+  // F-12: a verdict is reconstructible from the durable log only when an event
+  // names this evidence id; otherwise the panel states the gap instead of
+  // presenting a state change as recorded history.
+  const verdict = verdicts.get(evidence.id)
+  const retired = retiredBySource.get(evidence.taskId) ?? []
+  return <article className="sw-evidence"><div className="sw-row"><span className="sw-code sw-muted">{shortId(evidence.id)} · {t(evidence.outcome)}</span>
     <Badge value={evidence.status} /></div><p className="sw-claim">{evidence.claim}</p>
     <div className="sw-provenance"><span>{t('By')} {author}</span><span>·</span><span>{task?.title ?? shortId(evidence.taskId)}</span>
       <span>·</span><span>{evidence.toolRunIds.length} {t(evidence.toolRunIds.length === 1 ? 'host tool record' : 'host tool records')}</span>
       {evidence.artifact && <><span>·</span><span className="sw-code" title={evidence.artifact.commit}>{t('commit')} {shortId(evidence.artifact.commit)}</span></>}
     </div>
+    {['verified', 'refuted'].includes(evidence.status) && (verdict
+      ? <p className="sw-refs" data-swarm-verdict-event={verdict.seq}>{t('Durable verdict event')}: {verdict.type}</p>
+      : <p className="sw-small sw-muted" data-swarm-verdict-event="missing">{t('No durable event names this verdict yet.')}</p>)}
+    {retired.length > 0 && <p className="sw-refs" data-swarm-retired="">{t('Retired reviews')}: {retired.map(review => review.title).join('; ')}</p>}
     <details><summary>{t('Evidence provenance')}</summary>
       <p className="sw-refs">{t('Host tool run IDs')}: {evidence.toolRunIds.length > 0 ? evidence.toolRunIds.join(', ') : t('None recorded')}</p>
       {evidence.artifact && <><p className="sw-refs">{t('Artifact commit')}: {evidence.artifact.commit}</p>
@@ -95,15 +121,15 @@ function EvidenceCard({ evidence, snapshot }: { evidence: Evidence; snapshot: Sn
       {evidence.supersedes?.length > 0 && <p className="sw-refs">{t('Supersedes')}: {evidence.supersedes.join(', ')}</p>}
     </details>
     {evidence.challenges.map((challenge, index) => <div className="sw-challenge" key={index}>
-      <strong>{t('Challenge')} · {snapshot.members.find(item => item.id === challenge.authorId)?.name ?? shortId(challenge.authorId)}</strong>
+      <strong>{t('Challenge')} · {memberById.get(challenge.authorId)?.name ?? shortId(challenge.authorId)}</strong>
       <p>{challenge.reason}</p><p className="sw-refs">{t('Tool records')}: {challenge.toolRunIds.join(', ') || t('None')}</p>
     </div>)}
   </article>
 }
 
 /** Read-only projection. Rendering never performs a request or interprets peer text as code. */
-export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, connection = 'connected', actions, delivery, technicalDetails }: {
-  snapshot: Snapshot; initialView?: View; onOpenWorker?: (member: Member) => void; live?: boolean;
+export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, live = false, connection = 'connected', actions, delivery, technicalDetails }: {
+  snapshot: Snapshot; initialView?: View; onOpenWorker?: (member: Member) => void; onCancelTask?: (task: Task) => void; live?: boolean;
   connection?: ConnectionState; actions?: ReactNode; delivery?: ReactNode; technicalDetails?: ReactNode;
 }) {
   const t = useCopy()
@@ -112,12 +138,25 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
   const [stream, setStream] = useState('all')
   const now = useNow(live)
   const { mission } = snapshot
+  // One index and one lane pass per render; every card, edge and count reuses
+  // them, so cost stays linear in tasks + edges (F-34).
+  const index = useMemo(() => boardIndex(snapshot.tasks), [snapshot.tasks])
+  const lanes = useMemo(() => {
+    const map = new Map<string, BoardLane>()
+    for (const task of snapshot.tasks) map.set(task.id, index.lane(task, snapshot.members))
+    return map
+  }, [index, snapshot.tasks, snapshot.members])
+  const reasons = useMemo(() => taskReasons(snapshot), [snapshot])
+  const memberById = useMemo(() => new Map(snapshot.members.map(member => [member.id, member])), [snapshot.members])
+  const running = useMemo(() => runningByOwner(snapshot.tasks), [snapshot.tasks])
+  const verdicts = useMemo(() => durableVerdicts(snapshot), [snapshot])
+  const retiredBySource = useMemo(() => retiredReviewsBySource(snapshot), [snapshot])
   const tasks = snapshot.tasks.filter(task => stream === 'all' || task.workstreamId === stream)
   const evidence = snapshot.evidence.filter(item => stream === 'all' || item.workstreamId === stream)
   const counts = evidenceCounts(snapshot.evidence)
   const accepted = snapshot.tasks.filter(task => task.status === 'accepted').length
   const activeWorkers = snapshot.members.filter(member => member.status === 'working').length
-  const blocked = snapshot.tasks.filter(task => taskLane(task, snapshot.tasks) === 'blocked').length
+  const blocked = snapshot.tasks.filter(task => lanes.get(task.id) === 'blocked').length
   return <section data-swarm="" aria-label={`Agent Swarm mission: ${mission.title}`}>
     <header className="sw-head"><div className="sw-row"><span className="sw-eyebrow">{t(live ? 'Current mission' : 'Mission snapshot')}</span><Badge value={mission.status} /></div>
       <h2>{mission.title}</h2>
@@ -130,7 +169,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
       <RecentProgress snapshot={snapshot} />
       <details className="sw-disclosure" data-swarm-details="team"><summary>{t('Team')} <span className="sw-detail-count">{snapshot.members.length}</span></summary>
         <div className="sw-workers">{snapshot.members.length === 0 ? <p className="sw-muted">{t('Workers appear when the mission delegates work.')}</p>
-          : snapshot.members.map(member => <Worker key={member.id} member={member} tasks={snapshot.tasks} onOpen={onOpenWorker} />)}</div>
+          : snapshot.members.map(member => <Worker key={member.id} member={member} running={running} onOpen={onOpenWorker} />)}</div>
       </details>
     </div>
     <details className="sw-disclosure sw-technical" data-swarm-details="technical" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
@@ -160,9 +199,10 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
           title={item.objective} onClick={() => setStream(item.id)}>{item.title}</button>)}
       </div>}
       {view === 'board' && <><div className="sw-board">{LANES.map(lane => {
-        const items = tasks.filter(task => taskLane(task, snapshot.tasks) === lane.id)
+        const items = tasks.filter(task => lanes.get(task.id) === lane.id)
         return <section className="sw-lane" key={lane.id} aria-label={t(lane.label)}><div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
-          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live} now={now} />)}
+          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live} now={now} index={index} memberById={memberById}
+            lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} onCancel={onCancelTask} />)}
         </section>
       })}</div>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">
@@ -173,16 +213,16 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, live = false, 
       </>}
       {view === 'graph' && <DependencyGraph snapshot={snapshot} tasks={tasks} />}
       {view === 'evidence' && <><div className="sw-row" style={{ marginBottom: 14 }}><h3>{t('Claims and provenance')}</h3>
-        <span className="sw-small">{counts.verified} verified · {counts.challenged} challenged</span></div>
+        <span className="sw-small">{counts.verified} {t('verified')} · {counts.challenged} {t('challenged')}</span></div>
         {evidence.length === 0 ? <div className="sw-empty">{t('No evidence in this workstream yet. Claims will show their host tool records and artifact commits here.')}</div>
-          : evidence.map(item => <EvidenceCard key={item.id} evidence={item} snapshot={snapshot} />)}
+          : evidence.map(item => <EvidenceCard key={item.id} evidence={item} index={index} memberById={memberById} verdicts={verdicts} retiredBySource={retiredBySource} />)}
       </>}
-      {view === 'activity' && <><div className="sw-row"><h3>{t('Recent events')}</h3><span className="sw-small">{snapshot.pendingDeliveries} pending deliveries</span></div>
-        {snapshot.events.length === 0 ? <div className="sw-empty">{t('No activity recorded yet.')}</div> : snapshot.events.slice(-40).reverse().map(event => <div className="sw-event" key={event.seq}>
-          <span className="sw-small">{time(event.createdAt)}</span><div><div className="sw-event-type">{event.type.replaceAll('.', ' / ').replaceAll('_', ' ')}</div>
+      {view === 'activity' && <><div className="sw-row"><h3>{t('Recent events')}</h3><span className="sw-small">{snapshot.pendingDeliveries} {t('pending deliveries')}</span></div>
+        {snapshot.events.length === 0 ? <div className="sw-empty">{t('No activity recorded yet.')}</div> : [...snapshot.events].reverse().map(event => <div className="sw-event" key={event.seq}>
+          <span className="sw-small">{time(event.createdAt)}</span><div><div className="sw-event-type">{event.type.replaceAll('.', '/').replaceAll('_', ' ').split('/').map(token => t(token.trim())).join(' / ')}</div>
             <div className="sw-event-data">{event.actor} · {eventSummary(event.data)}</div></div>
         </div>)}
-        {snapshot.events.length > 40 && <p className="sw-small" style={{ marginTop: 12 }}>Showing the latest 40 events from this snapshot.</p>}
+        {snapshot.events.length > 0 && <p className="sw-small" style={{ marginTop: 12 }}>{t('Showing the latest')} {snapshot.events.length} {t('events retained in this snapshot.')}</p>}
       </>}
     </div>
     </>}

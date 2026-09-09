@@ -1,0 +1,11 @@
+{
+  "commands": [
+    "dispatch:task#1:member#1",
+    "dispatch:task#2:member#1",
+    "stop:member#1",
+    "dispatch:task#2:member#1",
+    "dispatch:task#3:member#2",
+    "verify:task#2"
+  ],
+  "digest": "sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e"
+}

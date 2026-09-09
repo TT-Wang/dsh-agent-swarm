@@ -35,7 +35,8 @@
     "dsh-plugin.naming.json",
     "docs/design.md",
     "docs/validation.md",
-    "docs/known-limitations.md"
+    "docs/known-limitations.md",
+    "scripts/packed-smoke.mjs"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -69,7 +70,11 @@
     "verify": "npm run typecheck && npm test && npm run test:harness && npm run test:pack && npm run test:profile && npm run test:web && npm run test:command-web",
     "test:harness": "node --expose-internals tests/harness-composition.mjs",
     "test:faults": "node scripts/faults/run.mjs",
+    "test:replay": "node scripts/replay/replay.mjs",
+    "test:isolation": "node --test tests/verification-isolation.mjs",
+    "test:load": "node scripts/load/run.mjs",
     "test:pack": "node scripts/smoke-pack.mjs",
+    "test:packed": "node scripts/packed-smoke.mjs",
     "test:profile": "node scripts/smoke-profile.mjs",
     "test:web": "node scripts/smoke-web.mjs",
     "test:deepseek": "node --expose-internals scripts/smoke-deepseek.mjs",

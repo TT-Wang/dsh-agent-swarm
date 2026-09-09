@@ -41,3 +41,33 @@ test('H5: the pack manifest ships both declared entry points', () => {
     rmSync(cache, { recursive: true, force: true })
   }
 })
+
+test('F-21: the packed artifact ships the smoke it declares and documents the repository requirement', () => {
+  const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'))
+  assert.equal(pkg.scripts?.['test:packed'], 'node scripts/packed-smoke.mjs', 'the packed-artifact smoke must be declared')
+  const cache = mkdtempSync(join(tmpdir(), 'swarm-pack-cache-'))
+  try {
+    const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts', '--cache', cache], {
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']
+    })
+    const [manifest] = JSON.parse(output)
+    const files = new Set(manifest.files.map(file => file.path))
+    assert.ok(files.has('scripts/packed-smoke.mjs'), 'the packed-artifact smoke script must be in the tarball')
+    const shippedDocs = readFileSync(new URL('README.md', root), 'utf8') + readFileSync(new URL('docs/known-limitations.md', root), 'utf8')
+    const documented = /requires the repository checkout/.test(shippedDocs)
+    for (const [name, command] of Object.entries(pkg.scripts ?? {})) {
+      if (name === 'test:packed') continue
+      const referenced = /(?:^|\s)((?:scripts|tests)\/[^\s'"]+)/.exec(command)?.[1]
+      if (referenced === undefined || files.has(referenced)) continue
+      assert.ok(documented, `${name} needs ${referenced}, which is not packed; the shipped docs must state the repository requirement`)
+    }
+  } finally {
+    rmSync(cache, { recursive: true, force: true })
+  }
+})
+
+test('F-21: the packed-artifact smoke passes on the built tree', () => {
+  assert.ok(existsSync(new URL('lib/index.js', root)), 'run the build before the suite (npm run build)')
+  const output = execFileSync(process.execPath, ['scripts/packed-smoke.mjs'], { cwd: root, encoding: 'utf8' })
+  assert.match(output, /packed-smoke: \d+ export target\(s\)/)
+})

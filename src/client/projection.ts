@@ -1,4 +1,4 @@
-import type { Snapshot, Task, Evidence } from '../types.ts'
+import type { Member, Snapshot, Task, Evidence } from '../types.ts'
 
 export type BoardLane = 'ready' | 'active' | 'review' | 'done' | 'blocked'
 export const LANES: readonly { id: BoardLane; label: string }[] = [
@@ -8,25 +8,89 @@ export const LANES: readonly { id: BoardLane; label: string }[] = [
 ]
 
 /** A dependency on a replaced task is met by its accepted repair, mirroring the runtime's lineage rule. */
-export function dependencyMet(id: string, tasks: readonly Task[]): boolean {
-  let current = tasks.find(item => item.id === id)
-  const seen = new Set<string>()
-  while (current && (current.status === 'cancelled' || current.status === 'blocked') && !seen.has(current.id)) {
-    seen.add(current.id)
-    const replacements = tasks.filter(item => item.replaces?.includes(current!.id) && item.kind === current!.kind && !seen.has(item.id))
-    current = replacements.find(item => item.status === 'accepted') ?? replacements.find(item => item.status !== 'cancelled') ?? undefined
+export interface BoardIndex {
+  byId: ReadonlyMap<string, Task>
+  /** The task a dependency reference currently stands for after repair lineage, or undefined. */
+  effective(id: string): Task | undefined
+  dependencyMet(id: string): boolean
+  blockedDependencies(task: Task): string[]
+  lane(task: Task, members?: readonly Member[]): BoardLane
+}
+
+function oldest(tasks: readonly Task[]): Task | undefined {
+  let best: Task | undefined
+  for (const task of tasks) {
+    if (best === undefined || task.createdAt < best.createdAt
+      || (task.createdAt === best.createdAt && task.id < best.id)) best = task
   }
-  return current?.status === 'accepted'
+  return best
+}
+
+/**
+ * One pass over the task list that resolves every lane and lineage question
+ * through maps. The board and graph call this once per render, so their cost
+ * stays O(tasks + edges) instead of rescanning the task array per task and per
+ * edge (F-34). The lineage rule matches the runtime exactly: two accepted
+ * repairs for one obligation is ambiguous history and fails closed, otherwise
+ * the oldest live repair wins with the id as a total tie-break.
+ */
+export function boardIndex(tasks: readonly Task[]): BoardIndex {
+  const byId = new Map<string, Task>()
+  const replacements = new Map<string, Task[]>()
+  for (const task of tasks) {
+    byId.set(task.id, task)
+    for (const target of task.replaces ?? []) {
+      const list = replacements.get(target)
+      if (list === undefined) replacements.set(target, [task])
+      else list.push(task)
+    }
+  }
+  const resolved = new Map<string, Task | undefined>()
+  const effective = (id: string): Task | undefined => {
+    if (resolved.has(id)) return resolved.get(id)
+    let current = byId.get(id)
+    const seen = new Set<string>()
+    while (current && (current.status === 'cancelled' || current.status === 'blocked') && !seen.has(current.id)) {
+      seen.add(current.id)
+      const candidates = (replacements.get(current.id) ?? []).filter(task => task.kind === current!.kind && !seen.has(task.id))
+      const accepted = candidates.filter(task => task.status === 'accepted')
+      // Two accepted artifacts for one obligation is ambiguous history: no arbitrary artifact is trusted.
+      const next = accepted.length > 1 ? undefined
+        : (accepted[0] ?? oldest(candidates.filter(task => ['pending', 'running', 'submitted'].includes(task.status)))
+          ?? oldest(candidates.filter(task => task.status === 'blocked' || task.status === 'cancelled')))
+      if (!next) break
+      current = next
+    }
+    resolved.set(id, current)
+    return current
+  }
+  const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
+  const blockedDependencies = (task: Task): string[] => task.dependencies.filter(id => !dependencyMet(id))
+  const lane = (task: Task, members?: readonly Member[]): BoardLane => {
+    if (task.status === 'accepted') return 'done'
+    if (task.status === 'running') return 'active'
+    if (task.status === 'submitted') return 'review'
+    if (task.status === 'blocked' || task.status === 'cancelled') return 'blocked'
+    // A review whose source is not submitted can never be dispatched, and a
+    // pending task assigned to a stopped member has no live owner; the runtime
+    // classifies both as unschedulable, so the board must not advertise them.
+    if (task.reviewOf && byId.get(task.reviewOf)?.status !== 'submitted') return 'blocked'
+    if (blockedDependencies(task).length > 0) return 'blocked'
+    if (members !== undefined && task.assigneeId !== undefined
+      && !members.some(member => member.id === task.assigneeId && member.status !== 'stopped')) return 'blocked'
+    return 'ready'
+  }
+  return { byId, effective, dependencyMet, blockedDependencies, lane }
+}
+
+/** Compatibility wrapper for a single lineage query; render paths reuse one `boardIndex`. */
+export function dependencyMet(id: string, tasks: readonly Task[]): boolean {
+  return boardIndex(tasks).dependencyMet(id)
 }
 
 /** Dependent pending work is visibly blocked instead of advertised as dispatchable. */
 export function taskLane(task: Task, tasks: readonly Task[]): BoardLane {
-  if (task.status === 'accepted') return 'done'
-  if (task.status === 'running') return 'active'
-  if (task.status === 'submitted') return 'review'
-  if (task.status === 'blocked' || task.status === 'cancelled') return 'blocked'
-  if (task.reviewOf && tasks.find(item => item.id === task.reviewOf)?.status !== 'submitted') return 'blocked'
-  return task.dependencies.some(id => !dependencyMet(id, tasks)) ? 'blocked' : 'ready'
+  return boardIndex(tasks).lane(task)
 }
 
 export function remainingPercent(used: number, limit: number): number {
@@ -94,6 +158,7 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     || !finite(mission.baseline.createdAt))) return undefined
   if (typeof mission.id !== 'string' || typeof mission.title !== 'string'
     || typeof mission.objective !== 'string' || typeof mission.status !== 'string'
+    || (mission.reason !== undefined && typeof mission.reason !== 'string')
     || !finite(mission.updatedAt) || !finite(mission.createdAt) || !finite(mission.deadline)
     || !finite(mission.usedSteps) || !finite(mission.usedTokens)
     || !record(mission.budget) || !strings(mission.scope) || !strings(mission.acceptance)) return undefined
@@ -107,9 +172,25 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     && typeof candidate.appliedDelivery.resultCommit === 'string'
     && (candidate.appliedDelivery.appliedAt === undefined || finite(candidate.appliedDelivery.appliedAt)))) return undefined
   if (!['members', 'tasks', 'workstreams', 'evidence', 'events'].every(key => Array.isArray(candidate[key]))) return undefined
+  if (candidate.pendingDeliveries !== undefined && !finite(candidate.pendingDeliveries)) return undefined
+  // Every field a renderer dereferences is validated here: a malformed or
+  // version-skewed snapshot must be rejected instead of throwing mid-render.
   if (!(candidate.tasks as unknown[]).every(task => record(task) && typeof task.id === 'string'
     && typeof task.title === 'string' && typeof task.status === 'string' && typeof task.kind === 'string'
     && strings(task.dependencies) && strings(task.evidenceIds) && strings(task.scope)
+    && (task.output === undefined || typeof task.output === 'string')
+    && (task.objective === undefined || typeof task.objective === 'string')
+    && (task.workstreamId === undefined || typeof task.workstreamId === 'string')
+    && (task.assigneeId === undefined || typeof task.assigneeId === 'string')
+    && (task.reviewOf === undefined || typeof task.reviewOf === 'string')
+    && (task.reviewedCommit === undefined || typeof task.reviewedCommit === 'string')
+    && (task.replaces === undefined || strings(task.replaces))
+    && (task.checks === undefined || strings(task.checks))
+    && (task.acceptance === undefined || strings(task.acceptance))
+    && (task.experiment === undefined || typeof task.experiment === 'boolean')
+    && (task.priority === undefined || finite(task.priority))
+    && (task.epoch === undefined || finite(task.epoch))
+    && (task.createdAt === undefined || finite(task.createdAt))
     && attempt(task.attempt) && artifact(task.artifact))) return undefined
   if (!(candidate.members as unknown[]).every(member => record(member) && typeof member.id === 'string'
     && typeof member.name === 'string' && typeof member.role === 'string' && typeof member.status === 'string')) return undefined
@@ -120,7 +201,8 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     && Array.isArray(evidence.challenges) && evidence.challenges.every(challenge => record(challenge)
       && typeof challenge.reason === 'string' && typeof challenge.authorId === 'string' && strings(challenge.toolRunIds)))) return undefined
   if (!(candidate.workstreams as unknown[]).every(stream => record(stream) && typeof stream.id === 'string'
-    && typeof stream.title === 'string')) return undefined
+    && typeof stream.title === 'string'
+    && (stream.objective === undefined || typeof stream.objective === 'string'))) return undefined
   if (!(candidate.events as unknown[]).every(event => record(event) && typeof event.seq === 'number'
     && typeof event.type === 'string' && typeof event.createdAt === 'number')) return undefined
   return candidate as unknown as Snapshot
@@ -198,9 +280,65 @@ export function evidenceCounts(evidence: readonly Evidence[]): { verified: numbe
     challenged: evidence.filter(item => item.status === 'challenged').length, total: evidence.length }
 }
 
-/** No raw tool arguments/results in the event list; display bounded, inert JSON only. */
+export interface DurableVerdict { seq: number; type: string }
+
+/** The latest durable verdict event per evidence id, built in one pass over the events (F-34). */
+export function durableVerdicts(snapshot: Snapshot): Map<string, DurableVerdict> {
+  const verdicts = new Map<string, DurableVerdict>()
+  for (const event of snapshot.events) {
+    if (!record(event.data)) continue
+    const type = event.type.replaceAll('.', '/')
+    if (!/(?:verdict|verified|refuted|challenged)/.test(type)) continue
+    const named = typeof event.data.evidenceId === 'string' ? event.data.evidenceId
+      : type.startsWith('evidence/') && typeof event.data.id === 'string' ? event.data.id : undefined
+    if (named === undefined) continue
+    const previous = verdicts.get(named)
+    if (previous === undefined || event.seq >= previous.seq) verdicts.set(named, { seq: event.seq, type })
+  }
+  return verdicts
+}
+
+/**
+ * The durable event that names this evidence's verdict, if any. `verify`
+ * mutates `evidence.status` without emitting an event naming the evidence id
+ * (round-3 F-12, owned by the runtime trace task); until such an event exists
+ * the panel must not present the state change as recorded history. Any
+ * `evidence/*` verdict event carrying this evidence id is accepted, so the
+ * projection starts working as soon as the runtime emits one.
+ */
+export function durableVerdict(snapshot: Snapshot, evidenceId: string): DurableVerdict | undefined {
+  return durableVerdicts(snapshot).get(evidenceId)
+}
+
+export interface RetiredReview { id: string; title: string }
+
+/** Withdrawn verification tasks per reviewed source, built in one pass over tasks (F-34). */
+export function retiredReviewsBySource(snapshot: Snapshot): Map<string, RetiredReview[]> {
+  const retired = new Map<string, RetiredReview[]>()
+  for (const task of snapshot.tasks) {
+    if (task.kind !== 'verification' || task.reviewOf === undefined || task.status !== 'cancelled') continue
+    const list = retired.get(task.reviewOf)
+    const review = { id: task.id, title: task.title }
+    if (list === undefined) retired.set(task.reviewOf, [review])
+    else list.push(review)
+  }
+  return retired
+}
+
+/** Verification tasks of one source that the owner or runtime withdrew (F-12 sibling surface). */
+export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): RetiredReview[] {
+  return retiredReviewsBySource(snapshot).get(sourceTaskId) ?? []
+}
+
+/**
+ * No raw tool arguments/results in the event list; display bounded, inert JSON
+ * only. `command`/`runId` name a denied git write and `outcome`/`verdict` name
+ * a verdict, so the compact activity list can be reconstructed without the
+ * raw event payload (F-14).
+ */
 export function eventSummary(data: unknown): string {
   if (!record(data)) return ''
-  return Object.entries(data).filter(([key]) => ['taskId', 'memberId', 'reason', 'status', 'evidenceId', 'title', 'kind'].includes(key))
+  return Object.entries(data).filter(([key]) => ['taskId', 'memberId', 'reason', 'status', 'evidenceId', 'title', 'kind',
+    'runId', 'command', 'outcome', 'verdict', 'commit', 'resultCommit', 'previousStatus'].includes(key))
     .map(([key, value]) => `${key}: ${String(value).slice(0, 160)}`).join(' · ')
 }

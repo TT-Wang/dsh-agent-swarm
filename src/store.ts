@@ -1,9 +1,19 @@
-/** Transactional single-host state and outbox. SQLite commits precede notifications. */
+/**
+ * Transactional single-host state and outbox. SQLite commits precede notifications.
+ *
+ * Boundary (single-host, single-writer): WAL gives readers-don't-block-writers but
+ * permits exactly one writer at a time, and WAL requires every process on the same
+ * host. The exclusive lock below refuses a second live runtime, so a competing
+ * writer is either this process retried (`withWriterRetry`) or a classified
+ * `WriterBusyError`; it is never silently lost. Multi-host scale-out needs external
+ * coordination and is out of scope. See `scripts/load/README.md`.
+ */
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 
 interface Tables {
   missions: Mission
@@ -15,28 +25,90 @@ interface Tables {
   deliveries: Delivery
   drafts: DraftPlan
   starts: AutoStart
+  admissions: AdmissionRecord
+  limits: LimitRule
 }
 export type Table = keyof Tables
-const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts']
+const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits']
 const SCHEMA_VERSION = 2
 const CHANGE_HISTORY = 1024
+const DEFAULT_BUSY_TIMEOUT_MS = 5000
+const DEFAULT_WRITER_ATTEMPTS = 3
+const DEFAULT_WRITER_DELAY_MS = 25
+/** Bounds WAL growth between checkpoints; a checkpoint runs automatically every 1000 pages. */
+const WAL_AUTOCHECKPOINT_PAGES = 1000
+const WAL_JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
+/** Tuning for the single-writer boundary; tests and the load harness shorten it. */
+export interface StoreOptions {
+  /** How long SQLite waits for a competing writer before raising SQLITE_BUSY. */
+  busyTimeoutMs?: number
+  /** Bounded retries after a classified SQLITE_BUSY. */
+  writerAttempts?: number
+  /** Backoff between writer retries, multiplied by the attempt number. */
+  writerDelayMs?: number
+}
+/** A writer conflict that survived bounded retries; classified, never silent. */
+export class WriterBusyError extends Error {
+  readonly reason = 'writer_busy' as const
+  readonly attempts: number
+  constructor(message: string, attempts: number, readonly cause?: unknown) {
+    super(message)
+    this.name = 'WriterBusyError'
+    this.attempts = attempts
+  }
+}
+/** SQLITE_BUSY (5) and SQLITE_LOCKED (6) are contention, not corruption. */
+export function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code
+  const errcode = (error as { errcode?: unknown } | undefined)?.errcode
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || errcode === 5 || errcode === 6) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(message)
+}
+/** Synchronous bounded backoff; node:sqlite is synchronous, so timers cannot be awaited here. */
+function sleepSync(ms: number): void {
+  if (ms <= 0) return
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+/** Run a writer operation, retrying a classified SQLITE_BUSY with bounded backoff. */
+export function withWriterRetry<T>(operation: () => T, options: { attempts?: number; delayMs?: number; onBusy?: (attempt: number, error: unknown) => void } = {}): T {
+  const attempts = Math.max(1, Math.trunc(options.attempts ?? DEFAULT_WRITER_ATTEMPTS))
+  const delayMs = Math.max(0, Math.trunc(options.delayMs ?? DEFAULT_WRITER_DELAY_MS))
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try { return operation() } catch (error) {
+      if (!isSqliteBusy(error)) throw error
+      lastError = error
+      options.onBusy?.(attempt, error)
+      if (attempt < attempts) sleepSync(delayMs * attempt)
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError)
+  throw new WriterBusyError(`SQLite writer stayed busy after ${attempts} attempt(s): ${message}`, attempts, lastError)
+}
 export interface StoreChange { revision: number; scopes: string[] }
 /** SQLite-backed source of truth. Only one live runtime may own a state file. */
 export class SwarmStore {
   private readonly db: DatabaseSync
   private readonly lockPath: string
   private readonly nonce = randomUUID()
+  private readonly busyTimeoutMs: number
+  private readonly writerAttempts: number
+  private readonly writerDelayMs: number
   private closed = false
   private transactionScopes?: Set<string>
   private readonly listeners = new Set<() => void>()
-  constructor(path: string) {
+  constructor(path: string, options: StoreOptions = {}) {
+    this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
+    this.writerAttempts = Math.max(1, Math.trunc(options.writerAttempts ?? DEFAULT_WRITER_ATTEMPTS))
+    this.writerDelayMs = Math.max(0, Math.trunc(options.writerDelayMs ?? DEFAULT_WRITER_DELAY_MS))
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.lockPath = `${path}.lock`
     this.acquireLock()
     try {
       this.db = new DatabaseSync(path)
       chmodSync(path, 0o600)
-      this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;')
+      this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${this.busyTimeoutMs}; PRAGMA wal_autocheckpoint=${WAL_AUTOCHECKPOINT_PAGES}; PRAGMA journal_size_limit=${WAL_JOURNAL_SIZE_LIMIT};`)
       const version = this.db.prepare('PRAGMA user_version').get()?.user_version
       if (version !== 0 && version !== 1 && version !== SCHEMA_VERSION) throw new Error(`Unsupported swarm schema ${String(version)}; expected ${SCHEMA_VERSION}`)
       this.db.exec('BEGIN IMMEDIATE')
@@ -81,7 +153,9 @@ export class SwarmStore {
   transaction<T>(operation: () => T): T {
     if (this.closed) throw new Error('Swarm store is closed')
     if (this.transactionScopes) throw new Error('Nested swarm transactions are not supported')
-    this.db.exec('BEGIN IMMEDIATE')
+    // Only lock acquisition and commit are retried: the body is caller code and
+    // runs exactly once, so a retry can never double-apply a side effect.
+    withWriterRetry(() => this.db.exec('BEGIN IMMEDIATE'), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes = new Set()
     let result: T, changed = false
     try {
@@ -93,9 +167,12 @@ export class SwarmStore {
         this.db.prepare('INSERT INTO state_changes(revision,scopes) VALUES(?,?)').run(revision, JSON.stringify([...this.transactionScopes]))
         this.db.prepare('DELETE FROM state_changes WHERE revision<=?').run(revision - CHANGE_HISTORY)
       }
-      this.db.exec('COMMIT')
-    } catch (error) { this.db.exec('ROLLBACK'); throw error }
-    finally { this.transactionScopes = undefined }
+      withWriterRetry(() => this.db.exec('COMMIT'), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    } catch (error) {
+      try { this.db.exec('ROLLBACK') } catch { /* A failed commit may already have ended the transaction. */ }
+      if (error instanceof WriterBusyError || !isSqliteBusy(error)) throw error
+      throw new WriterBusyError(`SQLite writer conflicted during a swarm transaction: ${error instanceof Error ? error.message : String(error)}`, this.writerAttempts, error)
+    } finally { this.transactionScopes = undefined }
     // Observers see only committed data, and cannot roll back another observer's work.
     if (changed) this.publish()
     return result
@@ -140,15 +217,41 @@ export class SwarmStore {
   /** Write a detached record inside its caller's transaction. */
   put<T extends Table>(table: T, value: Tables[T]): void {
     const missionId = 'missionId' in value && value.missionId !== undefined ? value.missionId : value.id
-    this.db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET mission_id=excluded.mission_id,value=excluded.value`).run(value.id, missionId, JSON.stringify(value))
+    const statement = this.db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET mission_id=excluded.mission_id,value=excluded.value`)
+    withWriterRetry(() => statement.run(value.id, missionId, JSON.stringify(value)), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
     if ('ownerSessionId' in value) this.transactionScopes?.add(value.ownerSessionId)
     if ('sessionId' in value) this.transactionScopes?.add(value.sessionId)
   }
   /** Append an immutable coordination event inside the same state transaction. */
   event(missionId: string, type: string, actor: string, data: unknown): void {
-    this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)').run(missionId, type, actor, JSON.stringify(data), Date.now())
+    const statement = this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)')
+    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), Date.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
+  }
+  /**
+   * Upsert one admission decision. A repeated refusal for the same candidate and
+   * reason merges in place — the count grows, the row does not — so a mission
+   * refused every tick keeps a bounded ledger.
+   */
+  recordAdmission(next: AdmissionRecord): AdmissionRecord {
+    const previous = this.get('admissions', next.id)
+    const merged: AdmissionRecord = previous === undefined
+      ? next
+      : { ...next, count: previous.count + 1, firstAt: previous.firstAt, lastAt: Math.max(previous.lastAt, next.lastAt) }
+    this.put('admissions', merged)
+    return merged
+  }
+  /** Read the admission ledger for a mission, newest last. */
+  admissions(missionId: string, filter: { reason?: AdmissionReason; admitted?: boolean; memberId?: string; taskId?: string; limit?: number } = {}): AdmissionRecord[] {
+    const clauses = ['mission_id=?'], params: Array<string | number> = [missionId]
+    if (filter.reason !== undefined) { clauses.push("json_extract(value,'$.reason')=?"); params.push(filter.reason) }
+    if (filter.memberId !== undefined) { clauses.push("json_extract(value,'$.memberId')=?"); params.push(filter.memberId) }
+    if (filter.taskId !== undefined) { clauses.push("json_extract(value,'$.taskId')=?"); params.push(filter.taskId) }
+    if (filter.admitted !== undefined) { clauses.push("json_extract(value,'$.admitted')=?"); params.push(filter.admitted ? 1 : 0) }
+    let sql = `SELECT value FROM admissions WHERE ${clauses.join(' AND ')} ORDER BY rowid`
+    if (filter.limit !== undefined) { sql += ' LIMIT ?'; params.push(filter.limit) }
+    return this.db.prepare(sql).all(...params).map(row => this.parse<'admissions'>(String(row.value)))
   }
   /** Number of runs recorded for a mission; the next run's per-mission position is count + 1. */
   countToolRuns(missionId: string): number {
@@ -175,12 +278,17 @@ export class SwarmStore {
       : this.db.prepare('SELECT * FROM (SELECT * FROM events WHERE mission_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq').all(missionId, limit)
     return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
   }
-  /** Close the database before releasing its exclusive runtime lock. */
+  /**
+   * Close the database before releasing its exclusive runtime lock. A best-effort
+   * checkpoint truncates the WAL so a clean shutdown leaves no growth behind; the
+   * running policy is `wal_autocheckpoint=1000` pages with a 64 MiB journal limit.
+   */
   close(): void {
     if (this.closed) return
     this.closed = true
     this.publish()
     this.listeners.clear()
+    try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch { /* Another reader may still hold the WAL; the next open recovers it. */ }
     this.db.close()
     this.releaseLock()
   }

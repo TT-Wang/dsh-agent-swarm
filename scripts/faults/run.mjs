@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * Fault-injection suite F1-F14.
+ * Fault-injection suite F1-F17.
  *
  * Each scenario is a standalone module under tests/faults/ that injects one
  * fault, proves the injection fired, and then asserts the durable recovery
- * contract. Scenarios run in separate child processes so a crash scenario
- * cannot poison the run. The suite never binds a port, never uses the network
- * and never touches the controller host.
+ * contract. A scenario only counts as a pass when its `FAULT_OK` record is
+ * present and valid for the selected id (F-36). Scenarios run in separate child
+ * processes so a crash scenario cannot poison the run. The suite never binds a
+ * port, never uses the network and never touches the controller host.
  *
  * Host limitation (recorded for the integrator): this host refuses
  * `sandbox-exec`, so the provider-fault tier (F3a/F3b/F3c) runs the real
@@ -19,6 +20,7 @@ import { execFile } from 'node:child_process'
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseFaultOk } from './record.mjs'
 
 const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
 const FAULTS_DIR = join(PROJECT, 'tests/faults')
@@ -32,6 +34,14 @@ const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7',
 const scenarioId = file => file.replace(/\.mjs$/, '').replace(/^f(\d+)([a-z]?)-.*$/, (_match, number, suffix) => `F${Number(number)}${suffix.toUpperCase()}`)
 
 const files = (await readdir(FAULTS_DIR)).filter(name => /^f\d+[a-z]?-.*\.mjs$/.test(name)).sort()
+// F-36: a selective run must not hide a missing or misspelled module. Every
+// requested id has to exist in the expected set and in the discovered inventory.
+const inventory = new Set(files.map(scenarioId))
+const unknown = only.filter(id => !EXPECTED.includes(id) || !inventory.has(id))
+if (unknown.length) {
+  process.stderr.write(`faults: unknown scenario id(s): ${unknown.join(', ')}\n`)
+  process.exit(1)
+}
 const selected = files.filter(file => !only.length || only.includes(scenarioId(file)))
 if (!selected.length) {
   process.stderr.write(`faults: no scenario matched ${JSON.stringify(only)}\n`)
@@ -42,12 +52,13 @@ function runOne(file) {
   return new Promise(resolve => {
     const started = Date.now()
     execFile(process.execPath, [join(FAULTS_DIR, file)], { cwd: PROJECT, timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-      const line = String(stdout).split('\n').find(item => item.startsWith('FAULT_OK '))
-      let record
-      if (line) { try { record = JSON.parse(line.slice('FAULT_OK '.length)) } catch { record = undefined } }
+      // F-36: a scenario passes only when its record is present and valid for
+      // this exact id; a plausible record for another fault is a failure.
+      const parsed = parseFaultOk(stdout, scenarioId(file))
+      const record = parsed.record
       resolve({
         file, id: scenarioId(file), ok: !error && record !== undefined, ms: Date.now() - started, record,
-        reason: error ? (error.killed ? `timed out after ${timeoutMs}ms` : String(stderr || error).trim().slice(-1500)) : record === undefined ? `no FAULT_OK result: ${String(stdout).trim().slice(-400)}` : undefined,
+        reason: error ? (error.killed ? `timed out after ${timeoutMs}ms` : String(stderr || error).trim().slice(-1500)) : parsed.error,
       })
     })
   })

@@ -347,14 +347,23 @@ test('handoff checkpoints partial work, and a later handoff back uses the latest
   assert.deepEqual(artifact.changedPaths, ['src/answer.txt'])
 })
 
-test('handoff scope failure preserves previous owner files and leaves the new owner untouched', async t => {
-  const { workspaces, mission, member, task } = await fixture(t)
+test('handoff scope failure preserves previous owner files and re-creates a clean baseline for the new owner', async t => {
+  const { temp, head, workspaces, mission, member, task } = await fixture(t)
   const peer = { id: 'member-peer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-peer') }
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'outside.txt'), 'out of scope partial edit\n')
-  await assert.rejects(workspaces.prepareTask(peer, { ...task, epoch: 3 }, []), /outside task scope/)
-  assert.equal(await readFile(path.join(member.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n')
-  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'original\n')
+  // W9: a previous owner's uncapturable workspace can no longer dead-end the
+  // task. The partial work stays in place and the new owner starts from the
+  // recorded base with a durable recovery record instead of a permanent block.
+  await workspaces.prepareTask(peer, { ...task, epoch: 3 }, [])
+  assert.equal(await readFile(path.join(member.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is never modified')
+  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'original\n', 'the new owner starts from the recorded base')
+  assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD'), head)
+  assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner baseline is clean')
+  assert(workspaces.recoveryFallbacks().some(entry => entry.includes(task.id) && /outside task scope/.test(entry)), 'the fallback is recorded for the host')
+  const record = JSON.parse(await readFile(path.join(temp, 'worktrees', mission.id, 'tasks', `${task.id}.json`), 'utf8'))
+  assert.equal(record.memberId, peer.id, 'the recovered record names the new owner')
+  assert.equal(record.task.recovery.commit, head, 'the durable recovery record names the fallback commit')
 })
 
 test('reviewer reads the submitted exact commit while its edits cannot change the source artifact', async t => {

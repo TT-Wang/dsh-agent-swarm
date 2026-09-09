@@ -5,6 +5,7 @@ import { constants } from 'node:fs'
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, rmdir, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { assertContainedSymlinkChain, type SymlinkChainLookup } from './workspaces.js'
 
 export interface DeliveryInput { source: string; baselineCommit: string; resultCommit: string }
 export interface DeliveryInspection { baselineCommit: string; resultCommit: string; changedPaths: string[]; diff: string; truncated: boolean }
@@ -23,13 +24,31 @@ function same(a?: Entry, b?: Entry): boolean { return a === undefined || b === u
 function validPath(value: string): void {
   if (!value || value.includes('\0') || value.includes('\\') || path.posix.isAbsolute(value) || value.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git' || part.includes(':'))) throw new Error(`Unsafe delivery path: ${JSON.stringify(value)}`)
 }
-/** A delivery never materializes a link whose target leaves the repository. */
-function assertContainedSymlink(relative: string, target: Buffer): void {
-  let value: string
-  try { value = new TextDecoder('utf-8', { fatal: true }).decode(target) } catch { throw new Error(`Delivery symlink target is not valid UTF-8: ${relative}`) }
-  if (!value || value.includes('\0') || path.posix.isAbsolute(value)) throw new Error(`Delivery symlink escapes the repository: ${relative} -> ${JSON.stringify(value)}`)
-  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(relative), value))
-  if (resolved === '..' || resolved.startsWith('../')) throw new Error(`Delivery symlink escapes the repository: ${relative} -> ${JSON.stringify(value)}`)
+/** A delivery never materializes a link whose resolved chain leaves the repository. */
+function decodeTarget(relative: string, target: Buffer): string {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(target) } catch { throw new Error(`Delivery symlink target is not valid UTF-8: ${relative}`) }
+}
+/**
+ * Resolve one path in the result commit, falling back to the source working
+ * tree for paths the commit does not contain. A delivered link is followed
+ * through the commit (the authoritative post-apply tree) and through any
+ * user-local link it would traverse after apply, so a chain through a
+ * pre-existing escaping link is refused before the first write (F-C1).
+ */
+function resultLookup(source: string, commit: string, signal?: AbortSignal): SymlinkChainLookup {
+  return async relative => {
+    const row = (await git(source, ['ls-tree', '-z', commit, '--', relative], signal)).output.toString('utf8')
+    const match = /^(\d+) (blob|tree|commit) ([a-f0-9]+)\t/.exec(row)
+    if (match) {
+      if (match[1] === '120000') return { kind: 'symlink', target: decodeTarget(relative, (await git(source, ['cat-file', 'blob', match[3]!], signal)).output) }
+      return { kind: match[2] === 'tree' ? 'directory' : 'file' }
+    }
+    const target = path.join(source, relative)
+    const info = await lstat(target).catch(() => undefined)
+    if (info === undefined) return undefined
+    if (info.isSymbolicLink()) return { kind: 'symlink', target: decodeTarget(relative, await readlink(target, { encoding: 'buffer' })) }
+    return { kind: info.isDirectory() ? 'directory' : 'file' }
+  }
 }
 function environment(): NodeJS.ProcessEnv {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')))
@@ -272,15 +291,17 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
     temporary = await mkdtemp(path.join(tmpdir(), 'dsh-swarm-delivery-'))
     const changes: Change[] = []
     const conflicts: string[] = []
+    const lookup = resultLookup(source, input.resultCommit, signal)
     for (const relative of changedPaths) {
       signal?.throwIfAborted()
       const original = await local(source, relative)
       if (original.directory) { conflicts.push(relative); continue }
       const base = await treeEntry(source, input.baselineCommit, relative, signal)
       const result = await treeEntry(source, input.resultCommit, relative, signal)
-      // The result tree is what this call can materialize; a link that escapes
-      // the repository is refused before any source write.
-      if (result?.kind === 'symlink') assertContainedSymlink(relative, result.bytes)
+      // The result tree is what this call can materialize; a link whose
+      // resolved chain escapes the repository is refused before any source
+      // write, including a chain through a pre-existing escaping link (F-C1).
+      if (result?.kind === 'symlink') await assertContainedSymlinkChain(relative, decodeTarget(relative, result.bytes), lookup, 'Delivery symlink escapes the repository')
       const merged = await mergeEntry(base, original.entry, result, temporary, signal)
       if (merged.conflict) {
         // A recorded apply already wrote this result. If the user has since

@@ -28,8 +28,14 @@ await runScenario({
       await rejected(f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: cancelled.id, attemptId: 'terminal-attempt', output: 'late' }), /Stale|unauthorized|terminal/i, 'a cancelled task cannot be re-submitted')
       refusals += 1
       assert.throws(() => f.propose({ title: 'Replacement for accepted work', replaces: [accepted.id] }), /only blocked work can be replaced/, 'accepted work needs a replacement path, not a repair')
+      // W12: cancellation is terminal for the withdrawn record but not for the
+      // obligation; exactly one live repair restores the lineage, and a second
+      // replacement is still refused.
+      const repair = f.propose({ title: 'Repair for withdrawn work', replaces: [cancelled.id] })
+      assert.equal(repair.status, 'pending', 'a cancelled task admits one live repair')
+      assert.deepEqual(repair.replaces, [cancelled.id])
       refusals += 1
-      assert.throws(() => f.propose({ title: 'Replacement for withdrawn work', replaces: [cancelled.id] }), /only blocked work can be replaced/, 'cancelled work is terminal too')
+      assert.throws(() => f.propose({ title: 'Second replacement for withdrawn work', replaces: [cancelled.id] }), /already replaced by/, 'only one live repair per cancelled task')
       assert.deepEqual(json(taskOf(f.runtime, accepted.id)), json(before.accepted), 'I11: the accepted record is byte-for-byte unchanged')
       assert.deepEqual(json(taskOf(f.runtime, review.id)), json(before.review), 'I11: the accepted review record is unchanged')
       assert.deepEqual(json(taskOf(f.runtime, cancelled.id)), json(before.cancelled), 'I11: the cancelled record is unchanged')

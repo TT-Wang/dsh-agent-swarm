@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { DraftPlan, Member, Snapshot } from '../types.ts'
+import type { DraftPlan, Member, Snapshot, Task } from '../types.ts'
 import { SwarmMonitor } from './monitor.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { DraftEditor } from './DraftEditor.tsx'
@@ -100,11 +100,23 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     {data?.writable && ['paused', 'blocked'].includes(status!) && <button data-action="resume" disabled={disabled} onClick={() => { void control('resume') }}>{t('Resume')}</button>}
     {busy && <span role="status">{t('Working')}…</span>}
   </div>
-  const advancedControls = snapshot && data?.writable && !['completed', 'stopped', 'staged'].includes(status!) && <div className="sw-mission-controls">
+  // Stop and Complete are mission controls, not technical details: they stay in
+  // the overview and never depend on the collapsed disclosure being open (F-15).
+  const advancedControls = snapshot && data?.writable && !['completed', 'stopped', 'staged'].includes(status!) && <div className="sw-mission-controls" data-swarm-advanced-controls="">
     {!starts.some(item => item.missionId === snapshot.mission.id) && <CompletionControls snapshot={snapshot} disabled={disabled} onComplete={() => { void control('complete') }} />}
     <button data-action="stop" disabled={disabled} onClick={() => stopArmed ? void control('stop') : setStopArmed(true)}>{t(stopArmed ? 'Confirm stop' : 'Stop')}</button>
     {stopArmed && <span className="sw-small">{t('Stop ends this mission and its workers.')} <button onClick={() => setStopArmed(false)}>{t('Cancel')}</button></span>}
   </div>
+  const cancelTask = async (task: Task) => {
+    if (!owner || !snapshot || !data?.writable || connection !== 'connected') return
+    setBusy(`cancel:${task.id}`); setError('')
+    await selectedOperation(stillSelected,
+      () => monitor.request<{ snapshot: Snapshot }>('cancel', { sessionId: owner, missionId: snapshot.mission.id, taskId: task.id, reason: `User cancelled task ${task.id} in the Agent Swarm monitor.` }), {
+        success: async result => { setLocalMission(result.snapshot); await monitor.refresh() },
+        failure: failure => setError(failure instanceof Error ? failure.message : String(failure)),
+        settled: () => setBusy(''),
+      })
+  }
   return <aside data-swarm="" data-swarm-panel="" data-swarm-session={owner} aria-label={t('Mission control')}>
     <header className="sw-panel-title">
       <div><strong>{t('Agent Swarm')}</strong><small data-swarm-connection={connection}><span className="sw-live-dot" data-connection={connection} />{t(connectionLabels[connection])}</small></div>
@@ -142,8 +154,9 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
           onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
           onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
       </details>}
-      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={controls}
-        technicalDetails={<>{snapshot.mission.baseline && <BaselineNotice baseline={snapshot.mission.baseline} />}{advancedControls}</>}
+      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={<>{controls}{advancedControls}</>}
+        onCancelTask={data?.writable ? task => { void cancelTask(task) } : undefined}
+        technicalDetails={snapshot.mission.baseline ? <BaselineNotice baseline={snapshot.mission.baseline} /> : undefined}
         delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && deliverableCommit(snapshot) !== undefined ?
           <DeliveryPanel key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} sessionId={owner} request={monitor.request} onApplied={() => { void monitor.refresh() }} disabled={connection !== 'connected'} /> : undefined}
         onOpenWorker={member => { try { onOpenWorker(member) } catch (failure) { if (stillSelected()) setError(String(failure)) } }} />}

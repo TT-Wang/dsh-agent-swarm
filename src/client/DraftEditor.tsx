@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import type { Budget, DraftPlan, PlanInput, PlanMember, PlanTask, Snapshot } from '../types.ts'
 import type { ModelDirectory } from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { Request } from './monitor.ts'
@@ -62,6 +62,8 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
   const [modelError, setModelError] = useState('')
   const dirty = JSON.stringify(input) !== baseline
   const editable = !saved || saved.status === 'draft'
+  // One key map per render; a `find` per task made the editor Theta(tasks^2) (F-34).
+  const taskByKey = useMemo(() => new Map(input.tasks.map(task => [task.key, task])), [input.tasks])
   const loadModels = () => { setModelError(''); void directory?.load().catch((failure: unknown) => setModelError(String(failure))) }
   useEffect(() => { loadModels() }, [directory])
   useEffect(() => {
@@ -117,6 +119,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
           <div className="sw-fields"><label>{t('Name')}<input value={member.name} required onChange={event => updateMember(member.key, { name: event.currentTarget.value })} /></label><label>{t('Role')}<input value={member.role} required onChange={event => updateMember(member.key, { role: event.currentTarget.value })} /></label></div>
           {directory ? <ModelPicker member={member} directory={directory} onChange={patch => updateMember(member.key, patch)} /> : <p className="sw-small">{t('Use owner model')}</p>}
         </div>)}
+        <p className="sw-small" data-swarm-model-hint="">{t('The provider must accept the selected model and reasoning effort.')}</p>
       </section>
       <section className="sw-section"><div className="sw-row"><h3>{t('Workstreams')}</h3><button type="button" onClick={() => update({ workstreams: [...input.workstreams, { key: freshKey('stream'), title: '', objective: '' }] })}>{t('Add workstream')}</button></div>
         {input.workstreams.map(stream => <div className="sw-edit-item" key={stream.key}><div className="sw-row"><code>{stream.key}</code><button type="button" disabled={input.tasks.some(task => task.workstreamKey === stream.key)} onClick={() => update({ workstreams: input.workstreams.filter(item => item.key !== stream.key) })}>{t('Remove')}</button></div><div className="sw-fields">
@@ -138,8 +141,9 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
           <div className="sw-prereqs"><label><input type="checkbox" checked={task.experiment ?? false} onChange={event => updateTask(task.key, { experiment: event.currentTarget.checked })} />{t('Optional experiment')}</label></div>
           <div className="sw-prereqs"><span>{t('Prerequisites')}</span>{input.tasks.filter(item => item.key !== task.key && item.key !== task.reviewOf).map(item => <label key={item.key}><input type="checkbox" checked={task.dependencies?.includes(item.key) ?? false} onChange={event => updateTask(task.key, { dependencies: event.currentTarget.checked ? [...(task.dependencies ?? []), item.key] : task.dependencies?.filter(key => key !== item.key) })} />{item.title}</label>)}</div>
           <div className="sw-fields"><label>{t('Scope')}<textarea value={task.scope.join('\n')} required onChange={event => updateTask(task.key, { scope: lines(event.currentTarget.value) })} /></label><label>{t('Acceptance')}<textarea value={task.acceptance.join('\n')} required onChange={event => updateTask(task.key, { acceptance: lines(event.currentTarget.value) })} /></label></div>
-          <label>{t('Checks')}<textarea value={task.kind === 'verification' ? input.tasks.find(item => item.key === task.reviewOf)?.checks?.join('\n') ?? '' : task.checks?.join('\n') ?? ''} readOnly={task.kind === 'verification'} required={['implementation', 'integration'].includes(task.kind)} placeholder={t('One command per line')} onChange={event => updateTask(task.key, { checks: lines(event.currentTarget.value) })} /></label>
-          {task.kind === 'verification' ? <p className="sw-small">{t('Verification runs the selected source task’s checks on its immutable artifact.')}</p> : ['implementation', 'integration'].includes(task.kind) && <p className="sw-small">{t('Replace the default check with commands that prove your acceptance criteria.')}</p>}
+          <label>{t('Checks')}<textarea value={task.kind === 'verification' ? taskByKey.get(task.reviewOf ?? '')?.checks?.join('\n') ?? '' : task.checks?.join('\n') ?? ''} readOnly={task.kind === 'verification'} required={['implementation', 'integration'].includes(task.kind)} placeholder={t('One command per line')} onChange={event => updateTask(task.key, { checks: lines(event.currentTarget.value) })} /></label>
+          {task.kind === 'verification' ? <p className="sw-small">{t('Verification runs the selected source task’s checks on its immutable artifact.')}</p> : ['implementation', 'integration'].includes(task.kind) && <><p className="sw-small">{t('Replace the default check with commands that prove your acceptance criteria.')}</p>
+            <p className="sw-small" data-swarm-checks-hint="">{t('Checks run inside the isolated worker sandbox; a command that needs a nested sandbox or host-only tool may fail before your code runs.')}</p></>}
         </details>)}
       </section>
     </fieldset>

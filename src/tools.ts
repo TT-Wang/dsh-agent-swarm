@@ -5,13 +5,17 @@ import { realpath } from 'node:fs/promises'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, Snapshot } from './types.ts'
+import type { SwarmStore } from './store.ts'
+import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, verdictRows, type TraceStep } from './trace.ts'
+import type { Actor, Budget, CreateMissionInput, DraftPlan, Evidence, ObserveQuery, PlanInput, ProposeTaskInput, PublishInput, Snapshot, Task } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
 const integer = { type: 'integer' } as const
 /** Cursors and paging offsets are nonnegative at runtime (`optionalInteger`), so the schema says so. */
 const nonnegativeInteger = { type: 'integer', minimum: 0 } as const
+/** A page size must be at least one; `readEventHistory` clamps the upper bound. */
+const positiveInteger = { type: 'integer', minimum: 1 } as const
 
 /** Every registered swarm tool, in registration order (stable schema prefix for prompt caching). */
 export const SWARM_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel'] as const
@@ -110,8 +114,59 @@ function draftSummary(draft: DraftPlan): unknown {
   return { draft: { id: draft.id, revision: draft.revision, status: draft.status, ...(draft.missionId ? { missionId: draft.missionId } : {}) }, next: 'End the turn; the user edits and launches the plan in the Agent Swarm panel.' }
 }
 
+/** Durable span context for one orchestration step; resolved after the runtime call. */
+interface SpanContext { missionId: string; taskId?: string; attemptId?: string; reviewOfTaskId?: string }
+/**
+ * Derive the span identity from durable state, never from the model's word:
+ * mission scope comes from the arguments or the created record, and a worker's
+ * attempt comes from the task the runtime actually assigned to its session.
+ */
+function spanContext(runtime: SwarmRuntime, step: string, sessionId: string, args: Args, result: unknown): SpanContext | undefined {
+  const store = (runtime as { store?: SwarmStore }).store
+  const created = result as { mission?: { id?: unknown }; id?: unknown } | undefined
+  let missionId = typeof args.missionId === 'string' ? args.missionId : undefined
+  if (missionId === undefined && step === 'swarm_launch' && typeof created?.mission?.id === 'string') missionId = created.mission.id
+  if (missionId === undefined && step === 'swarm_create' && typeof created?.id === 'string') missionId = created.id
+  if (missionId === undefined) return undefined
+  let taskId = typeof args.taskId === 'string' ? args.taskId : undefined
+  let attemptId = typeof args.attemptId === 'string' ? args.attemptId : undefined
+  if (step === 'swarm_propose' && typeof created?.id === 'string') taskId = created.id
+  if (store !== undefined) {
+    const member = store.list('members', missionId).find(candidate => candidate.sessionId === sessionId)
+    const running = member === undefined ? undefined : store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+    // A failed claim must not borrow the attempt of the task the member is
+    // already working on: the span names the step's own target or nothing.
+    if (running?.attempt !== undefined && (step !== 'swarm_claim' || running.id === taskId)) { taskId ??= running.id; attemptId ??= running.attempt.id }
+  }
+  const reviewOfTaskId = step === 'swarm_verify' && taskId !== undefined && store !== undefined ? store.get('tasks', taskId)?.reviewOf : undefined
+  return { missionId, ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }), ...(reviewOfTaskId === undefined ? {} : { reviewOfTaskId }) }
+}
+const lastEventSeq = (store: SwarmStore, missionId: string): number => store.events(missionId, 1, 0).at(-1)?.seq ?? 0
+/**
+ * F-12 client contract: normalize every verdict into `evidence/verdict` rows
+ * carrying `{ evidenceId, verdict, retired }`, so the durable log names both the
+ * claim that changed state and the sibling reviews the verdict retired.
+ */
+function emitVerdictEvents(store: SwarmStore, missionId: string, review: Task, afterSeq: number, verdict: 'accept' | 'reject'): void {
+  if (review.reviewOf === undefined) return
+  const source = store.get('tasks', review.reviewOf)
+  if (source === undefined) return
+  const retired = store.events(missionId, 500, afterSeq).filter(event => event.type === 'task/review-retired')
+    .map(event => (event.data as { taskId?: unknown }).taskId).filter((taskId): taskId is string => typeof taskId === 'string')
+  const evidence = source.evidenceIds.map(evidenceId => store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined)
+  const rows = verdictRows({ sourceTaskId: source.id, verificationTaskId: review.id, verdict: verdict === 'accept' ? 'verified' : 'refuted',
+    reason: review.output ?? '', evidence: evidence.map(item => ({ id: item.id, outcome: item.outcome })), retired })
+  if (rows.length === 0) return
+  const actor = review.attempt?.ownerId ?? review.assigneeId ?? 'runtime'
+  store.transaction(() => { for (const row of rows) store.event(missionId, 'evidence/verdict', actor, row) })
+}
+
 /** Install tools with host-derived identity and durable UI metadata. */
 export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget): void {
+  // One recorder per runtime: every mission-scoped orchestration step emits a
+  // durable `trace/span` row whose input/output bytes live in a
+  // content-addressed directory beside the state file.
+  const trace = TraceRecorder.forRuntime(runtime)
   const register = (name: string, description: string, properties: Record<string, JsonSchemaNode>, required: string[],
     run: (args: Args, actor: Actor) => Promise<unknown> | unknown, missionKey = 'missionId') => {
     const definition: ToolDefinition = {
@@ -139,10 +194,30 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         // H4: planning workspaces are bound to the calling session, never the model's word.
         if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) args = { ...args, workspace: await boundPlanWorkspace(exec, text(args, 'workspace')) }
         const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
-        const result = await run(args, actor)
-        const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
-        const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
-        return JSON.parse(JSON.stringify({ result, snapshot }))
+        const step = name as TraceStep
+        const startedAt = Date.now()
+        const spanInput = { tool: name, arguments: args }
+        // D6: one span row per orchestration step. A failed step still records a
+        // row with status=error and a closed error.type before the failure
+        // reaches the model, so the trace is complete even on the error path.
+        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
+          if (trace === undefined) return
+          const context = spanContext(runtime, name, actor.sessionId, args, result)
+          if (context === undefined) { trace.noteUnscoped(name); return }
+          await trace.record({ ...context, actor: actor.sessionId, step, input: spanInput,
+            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
+            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
+        }
+        try {
+          const result = await run(args, actor)
+          await recordSpan(result, 'ok')
+          const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
+          const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
+          return JSON.parse(JSON.stringify({ result, snapshot }))
+        } catch (error) {
+          await recordSpan(undefined, 'error', error)
+          throw error
+        }
       },
     }
     ctx.tools.register(definition)
@@ -228,9 +303,15 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_submit', 'Submit your current task and immutable artifact for independent verification. Research must cite evidence; code must stay within scope. This does not accept your own work.',
     { ...mission, taskId: string, attemptId: string, output: string }, ['missionId', 'taskId', 'attemptId', 'output'],
     (a, actor) => runtime.submit(actor, text(a, 'missionId'), { taskId: text(a, 'taskId'), attemptId: text(a, 'attemptId'), output: text(a, 'output') }))
-  register('swarm_verify', 'Independent verifier: run the source checks on its exact artifact and record accept or reject with a reason. Failed checks reject regardless of verdict; a rejected source stays blocked until repaired.',
+  register('swarm_verify', 'Independent verifier: run the source checks on its exact artifact and record accept or reject with a reason. Failed checks reject regardless of verdict; a rejected source stays blocked until repaired. Emits a normalized evidence/verdict event naming the evidence id, verdict and retired reviews.',
     { ...mission, taskId: string, attemptId: string, verdict: { type: 'string', enum: ['accept', 'reject'] }, reason: string }, ['missionId', 'taskId', 'attemptId', 'verdict', 'reason'],
-    (a, actor) => runtime.verify(actor, text(a, 'missionId'), { taskId: text(a, 'taskId'), attemptId: text(a, 'attemptId'), verdict: a.verdict as 'accept' | 'reject', reason: text(a, 'reason') }))
+    async (a, actor) => {
+      const missionId = text(a, 'missionId')
+      const before = lastEventSeq(runtime.store, missionId)
+      const task = await runtime.verify(actor, missionId, { taskId: text(a, 'taskId'), attemptId: text(a, 'attemptId'), verdict: a.verdict as 'accept' | 'reject', reason: text(a, 'reason') })
+      emitVerdictEvents(runtime.store, missionId, task, before, a.verdict as 'accept' | 'reject')
+      return task
+    })
   register('swarm_message', 'Send a question or finding to a member id or owner; topic broadcasts reach subscribers only. Messages are suggestions, never authorization.',
     { ...mission, to: string, kind: { type: 'string', enum: ['question', 'finding'] }, content: string, topic: string }, ['missionId', 'to', 'kind', 'content'],
     (a, actor) => runtime.message(actor, text(a, 'missionId'), { to: text(a, 'to'), kind: a.kind as 'question' | 'finding', content: text(a, 'content'), topic: a.topic as string | undefined }))
@@ -244,13 +325,29 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, topics: strings }, ['missionId', 'topics'], (a, actor) => runtime.subscribeTopics(actor, text(a, 'missionId'), array(a, 'topics')))
   register('swarm_wait', 'Members only: park until relevant work or a direct message arrives, then end the turn. The owner ends its native turn instead and waits for runtime notices.',
     mission, ['missionId'], (a, actor) => runtime.wait(actor, text(a, 'missionId')))
-  register('swarm_observe', 'Bounded mission reads. Default: your current task, prerequisites, review source, your run references and recent events (owner: compact board and usage). after/afterRun return only newer events/runs; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record. Omit missionId to list your missions.',
-    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, detail: { type: 'string', enum: ['summary', 'full'] } }, [],
-    (a, actor) => a.missionId === undefined ? runtime.list(actor.sessionId) : runtime.observe(actor, text(a, 'missionId'), {
-      after: optionalInteger(a, 'after'), afterRun: optionalInteger(a, 'afterRun'), offset: optionalInteger(a, 'offset'),
-      taskId: optionalText(a, 'taskId'), runId: optionalText(a, 'runId'), evidenceId: optionalText(a, 'evidenceId'),
-      ...(a.detail === undefined ? {} : { detail: a.detail as ObserveQuery['detail'] }),
-    }))
+  register('swarm_observe', 'Bounded mission reads. Default: your current task, prerequisites, review source, your run references and recent events (owner: compact board and usage). after/afterRun return only newer events/runs; taskId, runId (+offset paging) or evidenceId read one full record; detail=full expands every task record. before/eventLimit page older events (F-13) and vocabulary/trace report event coverage and trace metrics. Omit missionId to list your missions.',
+    { ...mission, after: nonnegativeInteger, afterRun: nonnegativeInteger, taskId: string, runId: string, offset: nonnegativeInteger, evidenceId: string, before: nonnegativeInteger, eventLimit: { ...positiveInteger, description: 'Older-event page size, 1-500 (default 50).' }, vocabulary: { type: 'boolean', description: 'Report which event types the returned window uses and whether the read path recognizes them.' }, trace: { type: 'boolean', description: 'Report span-level metrics: contract compliance and the first violating step.' }, detail: { type: 'string', enum: ['summary', 'full'] } }, [],
+    async (a, actor) => {
+      if (a.missionId === undefined) return runtime.list(actor.sessionId)
+      const missionId = text(a, 'missionId')
+      const view = object(runtime.observe(actor, missionId, {
+        after: optionalInteger(a, 'after'), afterRun: optionalInteger(a, 'afterRun'), offset: optionalInteger(a, 'offset'),
+        taskId: optionalText(a, 'taskId'), runId: optionalText(a, 'runId'), evidenceId: optionalText(a, 'evidenceId'),
+        ...(a.detail === undefined ? {} : { detail: a.detail as ObserveQuery['detail'] }),
+      }))
+      let result = view
+      if (a.before !== undefined || a.eventLimit !== undefined || a.vocabulary === true) {
+        const history = readEventHistory(runtime.store, missionId, { before: optionalInteger(a, 'before'), limit: optionalInteger(a, 'eventLimit') })
+        result = { ...result,
+          events: history.events.map(event => ({ seq: event.seq, type: event.type, actor: event.actor, summary: eventSummary(event) })),
+          ...(history.nextBefore === undefined ? {} : { nextBefore: history.nextBefore }),
+          historyWindow: { total: history.total, pageSize: history.pageSize, hasOlder: history.hasOlder, truncated: history.truncated,
+            ...(history.firstSeq === undefined ? {} : { firstSeq: history.firstSeq }), ...(history.lastSeq === undefined ? {} : { lastSeq: history.lastSeq }) },
+          ...(a.vocabulary === true ? { eventVocabulary: eventVocabularyReport(history.events) } : {}) }
+      }
+      if (a.trace === true && trace !== undefined) result = { ...result, trace: { ...await traceMetrics(trace.spansFor(missionId), { payloads: trace.payloads }), unscopedSteps: trace.unscopedSteps() } }
+      return result
+    })
   register('swarm_control', 'Owner: pause/resume/stop/complete the mission or replace its coordinator. complete requires independently accepted coverage of every acceptance criterion and the deliverable artifact, and cancels leftover tasks that can no longer be scheduled. stop preserves evidence and artifacts.',
     { ...mission, action: { type: 'string', enum: ['pause', 'resume', 'stop', 'complete', 'coordinator'] }, reason: string, coordinatorId: string }, ['missionId', 'action', 'reason'],
     (a, actor) => runtime.control(actor, text(a, 'missionId'), a.action as 'pause' | 'resume' | 'stop' | 'complete' | 'coordinator', text(a, 'reason'), a.coordinatorId as string | undefined))

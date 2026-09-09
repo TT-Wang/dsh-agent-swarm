@@ -24,10 +24,14 @@ export interface WorkspaceOptions {
   /**
    * How ignored dependency directories reach a verification checkout.
    * `link` (default) symlinks the source directory: checks read the real
-   * toolchain, and writes through the link reach the source checkout because
-   * the link target is not redirected by the sandbox. `copy` clones the
-   * directory into the checkout so checks can write without touching the
-   * source, at the cost of copying the tree for every verification.
+   * toolchain without copying it. The link is not itself a write boundary, but
+   * production confines every check with the Harness sandbox rooted at the
+   * checkout and requires full enforcement (F-29); that enforcement compares
+   * resolved paths, so a write through the link into the source is refused.
+   * `copy` clones the directory into the checkout instead, so write isolation
+   * does not depend on the sandbox backend, at the cost of copying the tree
+   * for every verification. An unconfined `Workspaces` (the identity
+   * `confineCheck` used by unit tests) has no such boundary.
    */
   verificationDependencyMode?: 'link' | 'copy'
   /**
@@ -35,18 +39,76 @@ export interface WorkspaceOptions {
    * failure is recorded here and never masks the check results.
    */
   onCleanupFailure?(info: { checkout: string; error: string }): void
+  /**
+   * Called when a cross-owner recovery cannot capture the previous owner's
+   * workspace and re-creates a clean baseline instead (W9). The dirty worktree
+   * is left untouched; this reports the fallback for host-side observability.
+   */
+  onRecoveryFallback?(info: RecoveryFallback): void
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
 }
-/** Reject a symlink whose target leaves its owning workspace. */
+/** Durable record of a recovery that could not capture the previous owner's partial work. */
+export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; previousOwnerId: string; commit: string; reason: string }
+/** Persisted on the task workspace record so the fallback survives restarts. */
+interface TaskRecovery { commit: string; previousOwnerId: string; reason: string; at: number }
+/** Reject a symlink whose target string alone leaves its owning workspace (fast pre-commit check). */
 function assertContainedSymlink(workspace: string, relative: string, target: string): void {
   if (!target || target.includes('\0') || path.isAbsolute(target)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
   const root = path.resolve(workspace)
   const resolved = path.resolve(path.dirname(path.join(root, relative)), target)
   if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
 }
+/** One resolved component of a symlink-chain walk; a non-link entry stops resolution. */
+export type SymlinkChainEntry = { kind: 'file' } | { kind: 'directory' } | { kind: 'symlink'; target: string }
+/** Look up one workspace-relative path in the tree being validated, or undefined when absent. */
+export type SymlinkChainLookup = (relative: string) => Promise<SymlinkChainEntry | undefined>
+/** Bound a chain so a symlink cycle cannot spin; the kernel's own limit is platform-specific. */
+const MAX_SYMLINK_CHAIN = 40
+
+/**
+ * Reject a symlink whose *resolved chain* leaves its owning workspace. A target
+ * string that is lexically contained is not enough (F-C1): the base tree can
+ * already contain an escaping link, or a link to one, so every component of the
+ * resolved path is walked through `lookup` until a non-link entry or the root
+ * is reached. `lookup` reads the authoritative tree (a commit for artifacts and
+ * deliveries), never the link's target string alone, so a chain is refused
+ * exactly when materializing it would read outside the root.
+ * @param relative - the link's workspace-relative path.
+ * @param target - the link's raw target string (already decoded as UTF-8).
+ * @param lookup - resolves one relative path in the same tree.
+ * @param prefix - the error message prefix naming what is being validated.
+ */
+export async function assertContainedSymlinkChain(relative: string, target: string, lookup: SymlinkChainLookup, prefix: string): Promise<void> {
+  const reject = (): never => { throw new Error(`${prefix}: ${relative} -> ${JSON.stringify(target)}`) }
+  if (!target || target.includes('\0') || path.isAbsolute(target)) reject()
+  // Resolve the link's parent directory and its target together: a symlink
+  // component is replaced in place by its target, relative to the link's own
+  // directory, exactly like the kernel's component-by-component lookup.
+  const queue = [...relative.split('/').slice(0, -1), ...target.split('/')]
+  const resolved: string[] = []
+  let links = 0
+  while (queue.length > 0) {
+    const part = queue.shift()!
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      if (resolved.length === 0) reject()
+      resolved.pop()
+      continue
+    }
+    if (part.includes('\0')) reject()
+    resolved.push(part)
+    const entry = await lookup(resolved.join('/'))
+    if (entry === undefined || entry.kind !== 'symlink') continue
+    if (++links > MAX_SYMLINK_CHAIN) throw new Error(`${prefix} does not resolve within ${MAX_SYMLINK_CHAIN} links: ${relative} -> ${JSON.stringify(target)}`)
+    const next = entry.target
+    if (!next || next.includes('\0') || path.isAbsolute(next)) reject()
+    resolved.pop()
+    queue.unshift(...next.split('/'))
+  }
+}
 interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
-interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string }
+interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; recovery?: TaskRecovery }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string> }
@@ -151,6 +213,7 @@ export class Workspaces {
   private readonly baselines = new Map<string, Promise<WorkspaceBaseline>>()
   private readonly commonDirs = new Map<string, Promise<string>>()
   private readonly cleanupIssues: string[] = []
+  private readonly recoveryIssues: string[] = []
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
@@ -161,6 +224,13 @@ export class Workspaces {
 
   /** Non-fatal verification-checkout cleanup failures, oldest first (bounded). */
   cleanupFailures(): readonly string[] { return [...this.cleanupIssues] }
+
+  /**
+   * W9 recoveries that could not capture the previous owner's workspace and
+   * re-created a clean baseline instead, oldest first (bounded). The previous
+   * owner's worktree is never modified by such a fallback.
+   */
+  recoveryFallbacks(): readonly string[] { return [...this.recoveryIssues] }
 
   private missionDir(missionId: string): string { return path.join(this.root, segment(missionId)) }
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
@@ -309,7 +379,14 @@ export class Workspaces {
       const task = value.task
       if (!isRecord(task) || typeof task.taskId !== 'string' || !Number.isSafeInteger(task.epoch) || !commitId(task.baseCommit)) throw new Error('Invalid persisted task baseline')
       if (task.capturedCommit !== undefined && !commitId(task.capturedCommit)) throw new Error('Invalid persisted captured commit')
-      record.task = { taskId: task.taskId, epoch: task.epoch as number, baseCommit: task.baseCommit, ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}) }
+      const saved = task.recovery
+      let recovery: TaskRecovery | undefined
+      if (saved !== undefined) {
+        if (!isRecord(saved) || !commitId(saved.commit) || typeof saved.previousOwnerId !== 'string' || typeof saved.reason !== 'string' || !Number.isSafeInteger(saved.at)) throw new Error('Invalid persisted recovery fallback')
+        recovery = { commit: saved.commit, previousOwnerId: saved.previousOwnerId, reason: saved.reason, at: saved.at as number }
+      }
+      record.task = { taskId: task.taskId, epoch: task.epoch as number, baseCommit: task.baseCommit,
+        ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}), ...(recovery === undefined ? {} : { recovery }) }
     }
     const mission = await this.missionRecord(member.missionId)
     const common = async (cwd: string): Promise<string> => await realpath(path.resolve(cwd, await this.git(cwd, ['rev-parse', '--git-common-dir'])))
@@ -344,30 +421,38 @@ export class Workspaces {
   }
 
   /**
-   * A member's dependency link (the `node_modules` symlink it creates to run
-   * declared checks, or a configured verification dependency directory) is not
-   * work. `.gitignore` declares `node_modules/`, a directory-only pattern, so a
-   * symlink of that name stays untracked and would otherwise block every task
-   * prepared after the member ran a check.
+   * The shortest prefix of `relative` that names a dependency directory
+   * (`node_modules` or a configured name) and exists as a directory or symlink,
+   * or undefined when the path is real work. `git status --untracked-files=all`
+   * lists the files inside an untracked directory and never the directory name,
+   * so the check must walk ancestors (advisory A2). A regular file that merely
+   * shares a dependency name is ordinary work and is still refused.
    */
-  private async isDependencyLink(workspace: string, relative: string): Promise<boolean> {
-    if (!this.dependencyNames().has(path.basename(relative))) return false
-    const info = await lstat(path.join(workspace, relative)).catch(() => undefined)
-    return info !== undefined && (info.isSymbolicLink() || info.isDirectory())
+  private async dependencyPrefix(workspace: string, relative: string): Promise<string | undefined> {
+    const names = this.dependencyNames()
+    const parts = relative.split('/').filter(part => part !== '')
+    for (let index = 1; index <= parts.length; index++) {
+      if (!names.has(parts[index - 1]!)) continue
+      const prefix = parts.slice(0, index).join('/')
+      const info = await lstat(path.join(workspace, prefix)).catch(() => undefined)
+      if (info !== undefined && (info.isSymbolicLink() || info.isDirectory())) return prefix
+    }
+    return undefined
   }
 
   /**
    * Porcelain entries that are real uncommitted work. Untracked dependency
-   * links are ignored; a modified tracked path, a staged path, or any other
-   * untracked path (including a regular file merely named like a dependency
-   * directory) is returned and still refuses preparation.
+   * links and the files inside untracked dependency directories are ignored; a
+   * modified tracked path, a staged path, or any other untracked path
+   * (including a regular file merely named like a dependency directory) is
+   * returned and still refuses preparation.
    */
   private async uncommittedWork(workspace: string, signal: AbortSignal): Promise<string[]> {
     const output = await this.git(workspace, ['status', '--porcelain=v1', '--untracked-files=all', '-z'], signal, undefined, INVENTORY_BYTES)
     const work: string[] = []
     for (const entry of output.split('\0')) {
       if (entry === '') continue
-      if (entry.startsWith('?? ') && await this.isDependencyLink(workspace, entry.slice(3))) continue
+      if (entry.startsWith('?? ') && await this.dependencyPrefix(workspace, entry.slice(3)) !== undefined) continue
       work.push(entry)
     }
     return work
@@ -413,7 +498,8 @@ export class Workspaces {
           try { await this.git(member.workspace, ['merge', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
           catch (error) { throw new Error(`Dependency integration conflict for ${dependency.id}: ${String(error)}`) }
         }
-        record.task = { taskId: task.id, epoch: task.epoch, baseCommit: recovery?.baseCommit ?? await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal) }
+        record.task = { taskId: task.id, epoch: task.epoch, baseCommit: recovery?.baseCommit ?? await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal),
+          ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }) }
         await this.saveTaskWorkspace(record)
       } catch (error) {
         // Entry required a clean owned checkout; rollback restores exactly that
@@ -425,9 +511,40 @@ export class Workspaces {
     })
   }
 
+  /**
+   * Serialize one task record's read-check-write across members and processes.
+   * The member record is per member, but the task record is shared by the
+   * previous owner, the recovering owner and capture; without mutual exclusion
+   * a repair could read a stale record and clobber a newer owner's write (W1
+   * advisory A1). The lock is a leaf lock: it is never held while another lock
+   * or a git operation runs.
+   */
+  private async withTaskRecordLock<T>(taskPath: string, callback: () => Promise<T>): Promise<T> {
+    const lockPath = `${taskPath}.lock`
+    const staleAfterMs = 30_000
+    const started = Date.now()
+    await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 })
+    for (;;) {
+      try { await writeFile(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); break }
+      catch (error) {
+        const code = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
+        if (code !== 'EEXIST') throw error
+        const info = await lstat(lockPath).catch(() => undefined)
+        if (info === undefined) continue
+        if (Date.now() - info.mtimeMs > staleAfterMs) { await rm(lockPath, { force: true }).catch(() => undefined); continue }
+        if (Date.now() - started > staleAfterMs) throw new Error(`Timed out waiting for the task workspace record lock: ${taskPath}`)
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+    }
+    try { return await callback() } finally { await rm(lockPath, { force: true }).catch(() => undefined) }
+  }
+
   private async saveTaskWorkspace(record: MemberWorkspace): Promise<void> {
     await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
-    if (record.task !== undefined) await writePrivateJson(this.taskPath(record.missionId, record.task.taskId), { ...record, task: record.task } satisfies TaskWorkspace)
+    const task = record.task
+    if (task === undefined) return
+    const taskPath = this.taskPath(record.missionId, task.taskId)
+    await this.withTaskRecordLock(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
   }
 
   /**
@@ -445,16 +562,21 @@ export class Workspaces {
   private async checkpointAbandonedTask(record: MemberWorkspace, nextTaskId: string): Promise<void> {
     const previous = record.task
     if (previous === undefined || previous.taskId === nextTaskId) return
-    const saved = await readJson(this.taskPath(record.missionId, previous.taskId))
-    if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
-    await writePrivateJson(this.taskPath(record.missionId, previous.taskId), {
-      version: 1, missionId: record.missionId, memberId: record.memberId, workspace: record.workspace,
-      task: { ...previous, capturedCommit: previous.capturedCommit ?? previous.baseCommit },
-    } satisfies TaskWorkspace)
+    const taskPath = this.taskPath(record.missionId, previous.taskId)
+    // Read, compare and write under one lock: a newer owner's record written
+    // while this checkpoint was deciding can never be clobbered (advisory A1).
+    await this.withTaskRecordLock(taskPath, async () => {
+      const saved = await readJson(taskPath)
+      if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
+      await writePrivateJson(taskPath, {
+        version: 1, missionId: record.missionId, memberId: record.memberId, workspace: record.workspace,
+        task: { ...previous, capturedCommit: previous.capturedCommit ?? previous.baseCommit },
+      } satisfies TaskWorkspace)
+    })
   }
 
   /** Carry a previous owner's quiescent partial work into a replacement attempt. */
-  private async recoverTask(member: Member, task: Task): Promise<Pick<Artifact, 'commit' | 'baseCommit'> | undefined> {
+  private async recoverTask(member: Member, task: Task): Promise<(Pick<Artifact, 'commit' | 'baseCommit'> & { recovery?: TaskRecovery }) | undefined> {
     const value = await readJson(this.taskPath(member.missionId, task.id))
     if (value === undefined) return undefined
     if (!isRecord(value) || value.version !== 1 || value.missionId !== member.missionId || typeof value.memberId !== 'string' || typeof value.workspace !== 'string' || !isRecord(value.task) || value.task.taskId !== task.id || !Number.isSafeInteger(value.task.epoch) || !commitId(value.task.baseCommit)) throw new Error('Invalid task recovery metadata')
@@ -463,7 +585,19 @@ export class Workspaces {
     if (prior.task?.taskId === task.id) {
       // Task scoping is checked before committing partial work. The old worktree
       // is preserved if that check fails; no partial change is silently dropped.
-      return await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch })
+      try {
+        return await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch })
+      } catch (error) {
+        // W9: the previous owner's workspace cannot be captured (out-of-scope,
+        // dirty or otherwise). Never dead-end the task permanently: leave that
+        // worktree exactly as it is, fall back to the last durable checkpoint or
+        // the recorded task base, and record the fallback durably so the next
+        // attempt starts from a clean baseline instead of blocking forever.
+        const commit = commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit
+        const recovery: TaskRecovery = { commit, previousOwnerId: value.memberId, reason: error instanceof Error ? error.message : String(error), at: Date.now() }
+        this.recordRecoveryFallback(member.missionId, task.id, task.epoch, recovery)
+        return { commit, baseCommit: value.task.baseCommit, recovery }
+      }
     }
     if (!commitId(value.task.capturedCommit)) {
       // The recorded owner moved on without ever capturing a commit. It could
@@ -476,6 +610,15 @@ export class Workspaces {
     return { commit: value.task.capturedCommit, baseCommit: value.task.baseCommit }
   }
 
+  /** Bounded, host-visible record of a W9 recovery fallback; never masks the recovery. */
+  private recordRecoveryFallback(missionId: string, taskId: string, epoch: number, recovery: TaskRecovery): void {
+    const message = `Recovery fallback for ${taskId} (epoch ${epoch}): could not capture ${recovery.previousOwnerId}'s workspace (${recovery.reason}); started from ${recovery.commit}`
+    this.recoveryIssues.push(message)
+    if (this.recoveryIssues.length > 50) this.recoveryIssues.splice(0, this.recoveryIssues.length - 50)
+    try { this.options.onRecoveryFallback?.({ missionId, taskId, epoch, previousOwnerId: recovery.previousOwnerId, commit: recovery.commit, reason: recovery.reason }) }
+    catch { /* reporting must not mask recovery */ }
+  }
+
   private async validateArtifact(member: Member, artifact: Artifact): Promise<void> {
     if (!commitId(artifact.commit) || !commitId(artifact.baseCommit)) throw new Error('Artifact requires exact commit hashes')
     const mission = await this.missionRecord(member.missionId)
@@ -484,33 +627,49 @@ export class Workspaces {
     await this.git(mission.source, ['merge-base', '--is-ancestor', mission.baseCommit, artifact.commit])
   }
 
+  /** Resolve one path inside a committed tree, following symlink blobs (F-C1). */
+  private treeSymlinkLookup(workspace: string, commit: string, signal: AbortSignal): SymlinkChainLookup {
+    return async relative => {
+      // Literal pathspec: a committed filename may itself contain glob characters.
+      const raw = await this.git(workspace, ['ls-tree', '-z', commit, '--', `:(literal)${relative}`], signal, undefined, INVENTORY_BYTES, true)
+      const match = /^(\d+) (blob|tree|commit) ([a-f0-9]+)\t/.exec(raw)
+      if (!match) return undefined
+      if (match[1] === '120000') return { kind: 'symlink', target: await this.git(workspace, ['cat-file', 'blob', match[3]!], signal, undefined, INVENTORY_BYTES, true) }
+      return { kind: match[2] === 'tree' ? 'directory' : 'file' }
+    }
+  }
+
   /**
-   * Reject artifact symlinks whose target is absolute or leaves the member
-   * workspace. Applied artifacts materialize these links in the source
-   * checkout, so a read-through link to `/etc/hosts` or `../../..` would let a
-   * worker plant a link that later tooling follows outside the repository.
-   * Relative in-repository links stay allowed.
+   * Reject artifact symlinks whose target is absolute or whose resolved chain
+   * leaves the member workspace. Applied artifacts materialize these links in
+   * the source checkout, so a read-through link to `/etc/hosts` or `../../..`
+   * would let a worker plant a link that later tooling follows outside the
+   * repository. A relative in-repository link stays allowed, but it is resolved
+   * through the committed tree component by component (F-C1): a link to a
+   * pre-existing escaping link is refused even though its target string is
+   * lexically contained.
    */
   private async assertCommittedSymlinks(workspace: string, baseCommit: string, commit: string, signal: AbortSignal): Promise<void> {
     const raw = await this.git(workspace, ['diff', '--raw', '--no-abbrev', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)
     const fields = raw.split('\0')
+    const lookup = this.treeSymlinkLookup(workspace, commit, signal)
     for (let index = 0; index + 1 < fields.length; index += 2) {
       const meta = fields[index]!.split(' ')
       const relative = fields[index + 1]!
       if (!relative || meta[1] !== '120000' || meta[3] === undefined) continue
       const target = await this.git(workspace, ['cat-file', 'blob', meta[3]!], signal, undefined, INVENTORY_BYTES, true)
-      assertContainedSymlink(workspace, relative, target)
+      await assertContainedSymlinkChain(relative, target, lookup, 'Artifact symlink escapes the mission workspace')
     }
   }
 
   /**
-   * Dependency links present in a member workspace that are not tracked in
-   * HEAD: the `node_modules` symlink the member creates to run checks and any
-   * configured verification dependency directory. They are toolchain state,
-   * not artifact content, so capture must neither record them nor treat them as
-   * out-of-scope work. A path tracked in HEAD is real content and is never a
-   * link. A link a previous capture attempt staged is included so it can be
-   * unstaged before the commit.
+   * Dependency prefixes present in a member workspace that are not tracked in
+   * HEAD: the `node_modules` symlink or directory the member creates to run
+   * checks and any configured verification dependency directory. They are
+   * toolchain state, not artifact content, so capture must neither record them
+   * nor treat them as out-of-scope work. A path tracked in HEAD is real content
+   * and is never a link. A prefix a previous capture attempt staged is included
+   * so it can be unstaged before the commit.
    */
   private async dependencyLinks(workspace: string, signal: AbortSignal): Promise<Set<string>> {
     const candidates = new Set<string>()
@@ -518,8 +677,9 @@ export class Workspaces {
     for (const name of (await this.git(workspace, ['diff', '--cached', '--name-only', '--diff-filter=A', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) candidates.add(name)
     const links = new Set<string>()
     for (const name of candidates) {
-      if (!await this.isDependencyLink(workspace, name)) continue
-      if (!await this.git(workspace, ['cat-file', '-e', `HEAD:${name}`], signal).then(() => true, () => false)) links.add(name)
+      const prefix = await this.dependencyPrefix(workspace, name)
+      if (prefix === undefined) continue
+      if (!await this.git(workspace, ['cat-file', '-e', `HEAD:${prefix}`], signal).then(() => true, () => false)) links.add(prefix)
     }
     return links
   }
@@ -534,11 +694,15 @@ export class Workspaces {
       // them, and kept out of the commit. A tracked path of the same name stays
       // ordinary work and is still scope-checked.
       const links = await this.dependencyLinks(member.workspace, signal)
+      // A dependency prefix covers the directory and everything inside it, so a
+      // real untracked dependency directory is excluded as one unit (A2).
+      const linkList = [...links]
+      const dependencyContent = (name: string): boolean => linkList.some(link => name === link || name.startsWith(`${link}/`))
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
       // deleted source path too, instead of only the in-scope destination.
-      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean).filter(name => !links.has(name)))
-      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) if (!links.has(name)) changed.add(name)
+      const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean).filter(name => !dependencyContent(name)))
+      for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) if (!dependencyContent(name)) changed.add(name)
       for (const name of changed) if (!withinScope(name, task.scope)) throw new Error(`Artifact changes path outside task scope: ${name}`)
       // Untracked symlinks are invisible to `git diff`; inspect every changed
       // working-tree path before committing so an escaping link is never
@@ -547,7 +711,7 @@ export class Workspaces {
         const info = await lstat(path.join(member.workspace, name)).catch(() => undefined)
         if (info?.isSymbolicLink()) assertContainedSymlink(member.workspace, name, await readlink(path.join(member.workspace, name)))
       }
-      for (const link of links) await this.git(member.workspace, ['rm', '--cached', '--force', '--quiet', '--', link], signal).catch(() => undefined)
+      for (const link of links) await this.git(member.workspace, ['rm', '--cached', '-r', '--force', '--quiet', '--', link], signal).catch(() => undefined)
       await this.git(member.workspace, ['add', '--all', '--', '.', ...[...links].map(link => `:(exclude,literal)${link}`)], signal)
       const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
       if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
@@ -666,13 +830,15 @@ export class Workspaces {
    * Clean checkouts contain only committed files, so toolchains installed in the
    * source (ignored `node_modules` and similar) are absent. By default those
    * ignored directories are symlinked read-through from the source at the same
-   * relative paths: the artifact commit is unchanged, but the link target is
-   * NOT redirected by the sandbox, so a check that writes through it modifies
-   * the source checkout (and caches can leak source state into the result).
-   * `verificationDependencyMode: 'copy'` clones the directory into the checkout
-   * instead, isolating writes at the cost of copying the tree. Package-manager
-   * caches are always pointed inside the checkout. Build outputs and other
-   * ignored paths are never linked or copied.
+   * relative paths: the artifact commit is unchanged and the check reads the
+   * real toolchain. The link grants reads, not writes: production wraps every
+   * check in the Harness sandbox rooted at the checkout and requires full
+   * enforcement (F-29), whose resolved-path matching refuses a write that lands
+   * in the source. `verificationDependencyMode: 'copy'` clones the directory
+   * into the checkout instead, so isolation does not depend on the backend, at
+   * the cost of copying the tree. Package-manager caches are always pointed
+   * inside the checkout. Build outputs and other ignored paths are never linked
+   * or copied.
    * @returns the relative directories that were linked or copied.
    */
   private async linkDependencyDirs(source: string, checkout: string, signal: AbortSignal): Promise<string[]> {

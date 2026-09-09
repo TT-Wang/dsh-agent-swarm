@@ -9,7 +9,9 @@ Version **0.6.0** was checked on 2026-09-08. The full regression baseline and th
 
 Both targets use isolated SDK links. The rc.1 copy runs the same emitted JavaScript against rc.1 dependencies and its actual CLI; it is not an alpha.2-linked plugin with only a different CLI environment variable. Host and client TypeScript are also checked against the selected SDK without re-emitting that copy.
 
-## Current revision baseline (2026-09-09)
+## Historical revision baseline (2026-09-09, superseded)
+
+This table is retained as historical evidence: it describes revision `a226108`, not the round-4 head. The round-4 baseline below supersedes it.
 
 Measured on the integrated remediation of revision `a226108` (the `dec5fe7` feature head plus `scripts/update-preview.mjs`) after assembling the six accepted implementation artifacts — runtime `3c470f7d`, capture `6e911c7c`, surface `87b5bdbd`, adapter `66ae0f4c`, client `11d56f61`, packaging `66bdafdb` — and the integration hand-offs. The digest algorithm documented below reproduces the recorded `1c58738` baseline digest `008061c3b73adcf4c82b4e710735d11f060999a1c602e4851897468d173b8ea3` (43 files), so the current digest is computed the same way. The emitted set grows by one file versus `a226108` because the client remediation adds `src/client/clock.ts`.
 
@@ -24,6 +26,63 @@ Measured on the integrated remediation of revision `a226108` (the `dec5fe7` feat
 | `npm run test:web` / `npm run test:command-web` | Not re-run in this integration; they must be run sequentially on an idle host (see below) |
 
 The two sections that follow record the historical 0.6.0 release baseline and final watch-lifecycle correction. They are retained as first-baseline evidence and are not re-digested against later revisions. Recompute this table whenever source changes land after the measurement above: the digest covers emitted `lib/` output and the behavioral count covers the full test suite.
+
+## Round-4 baseline (T9 tree, 2026-09-09, superseded by the integrated measurement)
+
+This is the round-4 measurement taken on the T9 artifact base — the accepted T4 scalability artifact `832b6335` plus the T9 documentation and packaging changes — not on the final integration. The integration task and the owner's gate must recompute the same three numbers on the integrated artifact with the commands below; if they differ, this table is superseded by the integrated measurement.
+
+| Check | Result on the T9 tree |
+| --- | --- |
+| Host/client TypeScript and production browser build | Passed (`npm run build`) |
+| Emitted JavaScript | 45 files, SHA-256 `ef872275e787196d4b80865e27e76577aa66414cb8a45d20edcaffc5757024dc` |
+| Complete behavioral suite (`node --test tests/*.test.mjs`) | **357/357 passed**, 0 failed, 0 skipped |
+| Clean pack manifest (`npm pack --dry-run --json --ignore-scripts` after a build) | `files=145`; `scripts/packed-smoke.mjs` included; `lib/index.js` and `lib/client.js` present |
+| `npm run test:packed` | Passed (`packed-smoke: 10 export target(s) and 8 shipped file(s) present`) |
+| `npm run test:load` | Passed: measured envelope at N=16/32 (maximum concurrent leases 8/16, queue high-water 16/32, admission p50/p95 sub-millisecond, exact limit hit `queue_full@taskClass(implementation)=8/16`, per-worker observation 829B → 832B) |
+| `npm run test:faults` | Runs without a sandbox; provider tier B (F3a/F3b/F3c) needs a built Harness checkout (see below) |
+| `npm run test:harness`, `test:pack`, `test:profile` | Host-only: they compose a real Harness profile and need a host that permits nested `sandbox_apply`; the owner runs them in the round gate |
+| `npm run test:isolation` | Host-only: it drives the real sandbox provider and needs a built Harness checkout; the owner runs it in the round gate |
+| `npm run test:web`, `test:command-web` | Not re-run here; they must run sequentially on an idle host (see below) |
+
+Recompute the digest, the file count and the unit count after any source change lands:
+
+```sh
+npm run link:dsh && npm run build
+# Emitted JavaScript: sorted lib-relative .js paths, a NUL separator and file contents.
+node --input-type=module -e "import {createHash} from 'node:crypto';import {readdir,readFile} from 'node:fs/promises';import {join} from 'node:path';const lib=join(process.cwd(),'lib');const files=(await readdir(lib,{recursive:true})).filter(p=>p.endsWith('.js')).sort();const h=createHash('sha256');for(const p of files){h.update(p+'\0');h.update(await readFile(join(lib,p)))};console.log(files.length,h.digest('hex'))"
+# Behavioral suite: the final `# tests` and `# pass` lines are the count.
+node --test tests/*.test.mjs | tail -12
+# Packed manifest: file count with lifecycle scripts disabled after a build.
+npm pack --dry-run --json --ignore-scripts --cache "$(mktemp -d)" | node -e "const [m]=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log('files='+m.files.length)"
+```
+
+## Round-4 baseline (integrated head, 2026-09-09)
+
+This is the round-4 measurement recomputed on the integrated artifact
+(`task_24f706c6`: the T4 chain + W18 + T7 + the client repair + the D1 defaults +
+the materialized trace/ceiling/replay lineage), with the commands above. It
+supersedes the T9-tree table for the final round-4 claim.
+
+| Check | Result on the integrated head |
+| --- | --- |
+| Host/client TypeScript and production browser build | Passed (`npm run typecheck`, `npm run build`) |
+| Emitted JavaScript | 46 files, SHA-256 `381f8844b17a85e68c0b796f87719d299b5853fb1eced8ec849352e39c4fec19` |
+| Complete behavioral suite (`node --test tests/*.test.mjs`) | **409/409 passed**, 0 failed, 0 skipped |
+| Clean pack manifest (`npm pack --dry-run --json --ignore-scripts` after a build) | `files=148` |
+| `npm run test:packed` | Passed (`packed-smoke: 10 export target(s) and 8 shipped file(s) present`) |
+| `npm run test:replay` | `REPLAY OK` — 13 spans, 6 commands compared, contract compliance 1.000, causal closure 1.000, 26/26 payloads verified, 0 provider calls |
+| `npm run test:faults` | **20/20 fault scenarios passed** (F1–F17, each proving its injected fault fired) |
+| `npm run test:load` | Passed: N=16/32, maximum concurrent leases 8/16, queue high-water 16/32, admission p50/p95 sub-millisecond, exact limit `queue_full@taskClass(implementation)=8/16`, per-worker observation 861B → 864B (BOUNDED) |
+| `npm run test:harness`, `test:pack`, `test:profile` | Host-only: they compose a real Harness profile whose sandbox requests `workspace-write`; inside the worker sandbox macOS denies nested `sandbox_apply` (`SandboxUnavailableError`). The owner runs them in the gate |
+| `npm run test:isolation` | Host-only: it drives the real sandbox provider through `confinedCheckArgv`; the owner runs it in the gate |
+| `npm run test:web`, `test:command-web` | Not run here; they are load-sensitive browser smokes and must run sequentially on an idle host |
+
+The `test:pack` clean checkout materializes only `git ls-files`, so it cannot see
+files that the host capture has not committed yet. The integration verified the
+equivalent condition directly: a clean directory containing exactly the tracked
+tree plus the new untracked sources builds and packs with lifecycle scripts
+enabled (208 files, `npm run build` exit 0, `npm pack` produced the tarball). The
+owner gate re-runs `test:pack` on the committed artifact.
 
 ## Full regression baseline
 
@@ -103,8 +162,12 @@ Use a built checkout of an exact revision in [compatibility.json](../compatibili
 npm run link:dsh
 npm run typecheck
 npm test
+npm run test:faults
+npm run test:replay
+npm run test:load
 npm run test:harness
 npm run test:pack
+npm run test:packed
 npm run test:profile
 npm run test:web
 npm run test:command-web
@@ -116,6 +179,8 @@ Browser checks need the matching Harness Web build and Playwright browser enviro
 The behavioral tests import the built `lib/` output. `npm test` builds first; a bare `node --test tests/*.test.mjs` needs `npm run link:dsh` and `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout without linked dependencies stops earlier at `tsc: command not found`.
 
 `npm run test:harness`, `npm run test:pack` and `npm run test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they require a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt the composition anyway. `npm run test:harness` runs the composition directly and reports the same `SandboxUnavailableError`.
+
+`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or `~/.dsh/source/current` (or a sibling `deepseek-harness-rc1`/`deepseek-harness-latest`) with built `lib/` entries matching [compatibility.json](../compatibility.json). Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only the built entry points, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`, so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
 
 `npm run test:web` and `npm run test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host, without other large suites or browsers in parallel, and re-run a timeout before treating it as a product defect.
 

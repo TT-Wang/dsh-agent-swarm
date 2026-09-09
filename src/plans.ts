@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { assertScopeSelectors, normalizeReviewDependencies, normalizeScopeSelectors, requireHostChecks } from './admission.ts'
+import { assertScopeSelectors, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks } from './admission.ts'
 import type { PlanInput, PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
@@ -51,6 +51,9 @@ export function validatePlan(value: unknown): PlanInput {
   for (const name of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments']) {
     if (!Number.isSafeInteger(value.budget[name]) || Number(value.budget[name]) < (name === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${name}`)
   }
+  // Mission-level write directives and named deliverables reconcile before any task is admitted.
+  for (const diagnostic of reconcileObjectiveScope(String(value.objective), value.scope as string[], 'objective')) admissionIssues.push(formatDiagnostic(diagnostic))
+  for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), String(value.objective), value.acceptance as string[], 'objective')) admissionIssues.push(formatDiagnostic(diagnostic))
   const members = keyed(value.members, 'Members'), streams = keyed(value.workstreams, 'Workstreams'), tasks = keyed(value.tasks, 'Tasks')
   if (members.size > Number(value.budget.maxWorkers)) throw new Error('Roster exceeds worker budget')
   if (tasks.size > Number(value.budget.maxTasks) || streams.size > Number(value.budget.maxTasks)) throw new Error('Plan exceeds task/workstream budget')
@@ -81,6 +84,18 @@ export function validatePlan(value: unknown): PlanInput {
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new Error(`${at}.maxRecoveryAttempts must be a positive safe integer`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new Error(`${at}.checkTimeoutMs must be a positive integer within the platform timer range`) })
     if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key)))
+    // Every admitted task carries its own step/finding ceiling; the runtime blocks the task at this limit.
+    inspectAdmission(() => {
+      const ceilings = normalizeTaskCeilings(task as { maxSteps?: number; maxFindings?: number }, Number((value.budget as Record<string, unknown>).maxSteps), `tasks[${index}]`)
+      task.maxSteps = ceilings.maxSteps
+      task.maxFindings = ceilings.maxFindings
+    })
+    if (typeof task.objective === 'string') {
+      const taskScope = Array.isArray(task.scope) ? task.scope as string[] : []
+      const taskAcceptance = Array.isArray(task.acceptance) ? task.acceptance as string[] : []
+      for (const diagnostic of reconcileObjectiveScope(task.objective, taskScope, `${at}.objective`)) admissionIssues.push(formatDiagnostic(diagnostic))
+      for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), task.objective, taskAcceptance, at)) admissionIssues.push(formatDiagnostic(diagnostic))
+    }
     inspectAdmission(() => { if (task.assigneeKey !== undefined && (typeof task.assigneeKey !== 'string' || !members.has(task.assigneeKey))) throw new Error(`${at}.assigneeKey must name an existing member key`) })
     inspectAdmission(() => { if (task.priority !== undefined && (!Number.isInteger(task.priority) || Number(task.priority) < 0 || Number(task.priority) > 100)) throw new Error(`${at}.priority must be 0–100`) })
     inspectAdmission(() => { if (task.experiment !== undefined && typeof task.experiment !== 'boolean') throw new Error(`${at}.experiment must be boolean`) })
@@ -108,8 +123,8 @@ export function validatePlan(value: unknown): PlanInput {
       maxDurationMs: raw.budget.maxDurationMs, maxTasks: raw.budget.maxTasks, maxExperiments: raw.budget.maxExperiments },
     members: raw.members.map(({ key, name, role, provider, model, reasoningEffort, maxOutputTokens }) => ({ key, name, role, provider, model, reasoningEffort, maxOutputTokens })),
     workstreams: raw.workstreams.map(({ key, title, objective }) => ({ key, title, objective })),
-    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf }) =>
-      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf })),
+    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf }) =>
+      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf })),
   }
   orderedTasks(plan.tasks)
   return plan

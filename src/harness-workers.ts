@@ -51,6 +51,22 @@ export interface HarnessWorkerOptions {
    */
   activityHeartbeatMs?: number
 }
+/** The confinement surface a declared verification check must pass through. */
+export interface VerificationSandbox {
+  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): { argv: string[]; enforcement: 'full' | 'partial' }
+}
+/**
+ * F-29: run a declared check only under FULL host enforcement. A partial
+ * backend (Windows ACL, an older Landlock ABI) does not govern every promised
+ * file effect, so it cannot establish the D7 boundary that a verification
+ * check cannot write into the source checkout. Refusing here is fail-closed:
+ * the check never runs unconfined and the caller records a check failure.
+ */
+export function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): string[] {
+  const confined = sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
+  if (confined.enforcement !== 'full') throw new Error(`Artifact verification requires full sandbox enforcement: the host provider reports ${JSON.stringify(confined.enforcement)} enforcement for workspace-write, so a declared check could write outside the verification checkout. Refusing to run it.`)
+  return confined.argv
+}
 interface Composition {
   version: 1
   sessionId: string
@@ -162,7 +178,7 @@ export class HarnessWorkers implements WorkerAdapter {
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')
         if (sandbox === undefined) throw new Error('Artifact verification requires a Harness sandbox provider')
-        return sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd }).argv
+        return confinedCheckArgv(sandbox, argv, cwd)
       },
     })
     const owner = this

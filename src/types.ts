@@ -4,6 +4,22 @@ export type TaskKind = 'research' | 'implementation' | 'verification' | 'integra
 export type TaskStatus = 'pending' | 'running' | 'submitted' | 'accepted' | 'blocked' | 'cancelled'
 export type MemberStatus = 'idle' | 'working' | 'waiting' | 'stopped'
 export type EvidenceStatus = 'unverified' | 'verified' | 'challenged' | 'refuted'
+/** Per-task effort dimensions that block the task itself instead of draining the mission budget. */
+export type TaskCeilingDimension = 'maxSteps' | 'maxFindings'
+/**
+ * Durable per-task ceiling exhaustion. The runtime blocks the task at its own
+ * limit and records this reason, so a runaway task never consumes the mission
+ * budget first and the owner can raise or replace it explicitly.
+ */
+export interface TaskCeiling {
+  dimension: TaskCeilingDimension
+  limit: number
+  used: number
+  /** Stable machine-checkable reason code; never reword without a migration. */
+  code: 'task_ceiling_exhausted'
+  reason: string
+  at: number
+}
 export interface Budget {
   maxTokens: number
   maxSteps: number
@@ -151,6 +167,14 @@ export interface Task {
   recoveryCount?: number
   /** Primary-agent choice; absent only on legacy/manual tasks. */
   maxRecoveryAttempts?: number
+  /** Per-task model-step ceiling admitted with the task; the runtime blocks the task at this limit. */
+  maxSteps?: number
+  /** Per-task finding (published evidence) ceiling admitted with the task. */
+  maxFindings?: number
+  /** Steps charged to this task's live attempt; durable so a restart cannot reset the ceiling. */
+  usedSteps?: number
+  /** Durable block reason when the task exhausted one of its own ceilings. */
+  ceiling?: TaskCeiling
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
@@ -268,6 +292,10 @@ export interface PlanTask {
   acceptance: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
+  /** Per-task step ceiling; admission derives a bounded default when the plan omits it. */
+  maxSteps?: number
+  /** Per-task finding ceiling; admission derives a bounded default when the plan omits it. */
+  maxFindings?: number
   checkTimeoutMs?: number
   priority?: number
   experiment?: boolean
@@ -338,6 +366,10 @@ export interface ProposeTaskInput {
   acceptance: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
+  /** Per-task step ceiling; admission derives a bounded default when the proposal omits it. */
+  maxSteps?: number
+  /** Per-task finding ceiling; admission derives a bounded default when the proposal omits it. */
+  maxFindings?: number
   checkTimeoutMs?: number
   priority?: number
   experiment?: boolean
