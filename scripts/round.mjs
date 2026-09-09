@@ -4,7 +4,9 @@
  * The swarm missions themselves are agent-driven; this script owns the
  * deterministic half so a round cannot skip them:
  *   gate    - prove a commit green in a clean checkout (typecheck, build, full
- *             unit suite, clean-pack assertion) before anything is promoted;
+ *             unit suite, clean-pack assertion, plus every declared optional
+ *             suite: test:faults, test:replay, test:load, test:isolation)
+ *             before anything is promoted;
  *   mount   - build + preflight + restart the lab host from the linked checkout
  *             (never the controller host that serves the user's session);
  *   new     - open a round record;
@@ -122,6 +124,11 @@ if (command === 'gate') {
     rmSync(checkout, { recursive: true, force: true })
     execFileSync('git', ['-C', project, 'worktree', 'add', '--detach', checkout, sha], { stdio: ['ignore', 'pipe', 'inherit'] })
     symlinkSync(join(project, 'node_modules'), join(checkout, 'node_modules'), 'dir')
+    // Optional suites: run any the artifact declares, so a new suite cannot
+    // silently stay outside the gate the way round-2's test:faults did.
+    const optionalSuites = ['test:faults', 'test:replay', 'test:load', 'test:isolation']
+    const declaredScripts = new Set(Object.keys(JSON.parse(readFileSync(join(checkout, 'package.json'), 'utf8')).scripts ?? {}))
+    for (const name of optionalSuites) if (declaredScripts.has(name)) commands.push([name, `npm run ${name}`])
     for (const [name, shell] of commands) {
       const started = Date.now()
       const result = spawnSync('sh', ['-c', shell], { cwd: checkout, env: { ...process.env, npm_config_cache: join(checkout, '.npm-cache') }, stdio: 'inherit' })
