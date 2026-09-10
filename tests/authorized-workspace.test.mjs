@@ -413,7 +413,11 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   assert.equal(revoked.length, 1, 'exactly one durable revocation event')
   const notice = restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.kind === 'control')
   assert.ok(notice, 'the owner is notified of the revocation')
-  assert.match(notice.content, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  // S4b: `fenceWorkspace` now emits the shared coded workspace terminal, so the
+  // owner notice carries that stable code plus the substantive revocation
+  // reason; the underlying authorization code stays in the durable event detail.
+  assert.match(notice.content, /\[workspace_terminal\]/, 'the owner notice carries the shared coded terminal')
+  assert.match(notice.content, /removed from authorizedWorkspaces/, 'the notice still names why the root was revoked')
   assert.equal(restarted.store.events(sessionMission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'a session-cwd mission is never fenced')
   await restarted.addMember(sessionOwner, sessionMission.id, { name: 'Second', role: 'implementation' })
 })

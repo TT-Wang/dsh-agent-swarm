@@ -9,6 +9,17 @@
  */
 import { randomUUID } from 'node:crypto'
 import { hasNotice } from './arena.ts'
+import { emitGuardTerminal } from './refusals.ts'
+
+/**
+ * The detail a terminal message embeds. A guard's own message may already carry
+ * a coded diagnostic (`[workspace_uncommitted] ...`); the terminal renders its
+ * own stable code, so the nested token is stripped here rather than delivered as
+ * a second, contradictory diagnostic. The durable event keeps the raw detail.
+ * (The general helper belongs inside `guardTerminal` in src/refusals.ts, which
+ * is outside this task's write scope: hand-off note in the submission.)
+ */
+const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
@@ -300,8 +311,12 @@ export class Attempts {
       this.rt.commit(mission.id, () => {
         this.rt.store.put('tasks', failed)
         this.rt.store.event(mission.id, 'task/closeout-failed', 'runtime', { taskId: failed.id, ownerId: member.id, reason: failed.output })
-        this.rt.notify(mission.id, failed.output!)
       })
+      // S4b: the terminal element of the attempt/lease chain. The workspace
+      // checkpoint guard (a dirty or unprovisioned worktree) and the close-out
+      // guard co-fire here, so the owner gets the shared coded decision request
+      // naming the task and the exits instead of a prose-only reason.
+      emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: failed.id, memberId: member.id, detail: terminalDetail(failed.output!) })
       return
     }
     const current = this.rt.task(mission.id, task.id)
@@ -321,6 +336,14 @@ export class Attempts {
       this.rt.store.put('tasks', current)
       this.rt.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount })
     })
+    // S4b (owner finding, measured: 7 of 8 silent): an abandoned close-out is a
+    // stuck transition the owner was never told about. It emits the shared coded
+    // escalation, naming the task and the attempt, while the durable checkpoint
+    // event above keeps the audit trail. Co-firing guards: the attempt/lease
+    // chain fires with the workspace capture guard that produced the checkpoint,
+    // with the dispatch sweep that re-pends the task, and (when the recovery
+    // limit is already spent) with the close-out exhaustion terminal below.
+    emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
     this.rt.defer(async () => {
       await this.rt.workers.stop(member.id)
@@ -338,6 +361,12 @@ export class Attempts {
           this.rt.store.put('tasks', fresh)
           this.rt.store.event(mission.id, exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready', 'runtime', { taskId: fresh.id, memberId: member.id })
         })
+        // S4b (owner finding, measured: 2 of 2 silent): the exhausted close-out
+        // leaves the task blocked with a durable event and no owner decision.
+        // The re-pended branch is progress and stays silent. Co-firing guards:
+        // the recovery-limit guard meets the close-out guard here, and the
+        // workspace checkpoint guard is the one that produced the checkpoint.
+        if (exhausted) emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: fresh.id, memberId: member.id, detail: `idle close-out reached the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
       })
       this.rt.kick(mission.id)
     })
@@ -406,8 +435,12 @@ export class Attempts {
                   const reason = `Lease-expiry checkpoint failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}. The member workspace is preserved; recovery will refuse a dirty workspace instead of losing it.`
                   this.rt.commit(missionId, () => {
                     this.rt.store.event(missionId, 'task/checkpoint-failed', 'runtime', { taskId: task.id, ownerId: oldOwner, reason })
-                    this.rt.notify(missionId, reason)
                   })
+                  // S4b: the lease-expiry checkpoint failure is the terminal of
+                  // the attempt/lease chain for this attempt: the workspace guard
+                  // refused the capture, so recovery will refuse a dirty
+                  // workspace too. The coded decision request replaces the prose.
+                  emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: oldOwner, detail: terminalDetail(reason) })
                 }
               }
             }
@@ -434,8 +467,13 @@ export class Attempts {
           await this.rt.workers.stop(oldOwner)
           const reopened = this.rt.task(missionId, task.id)
           if (reopened.epoch !== expiring.epoch || reopened.status !== 'blocked') continue
-          reopened.status = (reopened.recoveryCount ?? 0) >= (reopened.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember) ? 'blocked' : 'pending'; delete reopened.resumeAfterStop
+          const limit = reopened.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember
+          const exhausted = (reopened.recoveryCount ?? 0) >= limit
+          reopened.status = exhausted ? 'blocked' : 'pending'; delete reopened.resumeAfterStop
           this.rt.commit(missionId, () => { this.rt.store.put('tasks', reopened) })
+          // S4b: exhausting the recovery limit on a lease expiry left a durable
+          // event and no owner decision; the re-pend branch is progress.
+          if (exhausted) emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: reopened.id, memberId: oldOwner, detail: `lease expiry exhausted the recovery limit (${reopened.recoveryCount ?? 0}/${limit}) and left the task blocked` })
         }
     return true
   }

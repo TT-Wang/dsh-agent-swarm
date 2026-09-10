@@ -9,6 +9,7 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { arenaView as projectArenaView } from './arena.ts'
 import { excerpt } from './declared-checks.ts'
+import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Budget, Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
 
@@ -334,8 +335,16 @@ export class RuntimeGates {
       for (const member of this.rt.store.list('members', mission.id)) { delete member.activity; this.rt.store.put('members', member) }
       this.rt.upsertBudgetRefusals(mission, mission.reason!)
       this.rt.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps, dimensions })
-      this.rt.notify(mission.id, mission.reason!)
     })
+    // S4b: the budget chain's terminal. The mission is durably blocked and the
+    // in-flight attempts are preserved; the owner gets the shared coded decision
+    // request (chain budget, exits swarm_budget/swarm_cancel/swarm_control)
+    // instead of a prose-only reason. `emitGuardTerminal` proceeds for the
+    // non-terminal `blocked` status (S4r-D5), which is exactly this state.
+    // Co-firing guards: the budget guard fires with the attempt/lease chain (the
+    // preserved attempts) and with the dispatch sweep (nothing new is admitted
+    // while the pause holds).
+    emitGuardTerminal(this.rt, mission.id, 'budget', { detail: mission.reason! })
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 

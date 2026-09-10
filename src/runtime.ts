@@ -8,7 +8,7 @@ import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type Pen
 import { Attempts } from './attempts.ts'
 import { WorkspaceAdmission, WorkspaceRevokedError, executedShellCommand, gitWriteDeniedMessage, gitWriteSubcommand, sharedTempPaths, tempRendezvousDecision, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS } from './notices.ts'
-import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, missionFingerprint, BOARD_BODY_EXCERPT, BOARD_DELTA_POSTS, DEFAULT_BUDGET_WARN_AT, postView, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
@@ -756,7 +756,16 @@ export class SwarmRuntime {
     // D1: reconcile the objective's write directives with the task scope and the
     // named deliverables with the effective ignore rules at the production
     // admission point, so a plan error is rejected here instead of at submit.
-    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task')
+    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task', {
+      // R12-F9: the guard needs the content-carrying edges (the declared
+      // dependencies plus a review source, which `prepareTask` merges into the
+      // worktree like a dependency) and the durable identities this mission
+      // already holds, so the diagnostic can say whether the named content exists
+      // here (add the dependency that carries it) or must be obtained (state how).
+      dependencies: [...(input.dependencies ?? []), ...(input.reviewOf === undefined ? [] : [input.reviewOf])],
+      replaces: input.replaces,
+      knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
+    })
     if (reconciliation.length) throw new Error(reconciliation.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')
@@ -765,11 +774,17 @@ export class SwarmRuntime {
       // The owner is the only actor who can raise the ceiling; a worker refusal
       // is a decision the owner must see, not just an error in a tool result.
       if (!owner) this.refuseProposal(mission, key, input.title, `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)`, mission.budget.maxTasks)
+      // S4b: the ceiling that refuses the owner is a terminal too. The owner's
+      // tool result carries the prose; the durable coded decision request makes
+      // the refusal a recorded decision with the executable exits (raise the
+      // ceiling with swarm_budget, or withdraw work with swarm_cancel).
+      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)` })
       throw new Error('Mission task budget exhausted')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
       const used = tasks.filter(t => t.experiment).length
       if (!owner) this.refuseProposal(mission, key, input.title, `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)`, mission.budget.maxExperiments)
+      emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)` })
       throw new Error('Mission experiment budget exhausted')
     }
     // R11-17: a worker's board share is bounded inside the mission task ceiling.
@@ -2455,8 +2470,10 @@ export class SwarmRuntime {
       this.store.put('tasks', task)
       if (member !== undefined) this.store.put('members', member)
       this.store.event(mission.id, 'task/ceiling-exhausted', 'runtime', { taskId: task.id, dimension: ceiling.dimension, limit: ceiling.limit, used: ceiling.used, code: ceiling.code })
-      this.notify(mission.id, `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked. Repair it with a replacement task or adjust the plan; the mission budget was not charged for the blocked step.`, ownerId)
     })
+    // S4b: the durable event carried the code, the owner notice did not. The
+    // shared coded terminal names the task, the dimension and the exits.
+    emitGuardTerminal(this, mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
     this.kick(mission.id)
   }
   
@@ -2708,8 +2725,11 @@ export class SwarmRuntime {
       // violation (so it is re-derivable and clears only when repaired) and the
       // owner notice is a durable delivery with the executable exit.
       this.store.put('missions', mission)
-      this.notify(missionId, `Isolation invariant refused a dispatch to ${member.name} (${member.id}): ${violation}. No worker was started and no task was assigned into a shared or unprovisioned worktree; repair the member workspaces so each live member has its own isolated worktree, then the task stays pending for the next pass.`)
     })
+    // S4b: the isolation refusal is the workspace chain's terminal for this
+    // dispatch. The violation is preserved verbatim as the detail and the owner
+    // gets the shared coded decision request instead of prose.
+    emitGuardTerminal(this, missionId, 'workspace', { memberId: member.id, detail: `isolation invariant refused a dispatch to ${member.name} (${member.id}): ${violation}` })
   }
   
   
