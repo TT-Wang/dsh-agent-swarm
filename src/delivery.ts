@@ -21,6 +21,32 @@ const sourceIdentities = new Map<string, string>()
 function missing(error: unknown): boolean { return error instanceof Error && 'code' in error && error.code === 'ENOENT' }
 function sha(value: string | Buffer): string { return createHash('sha256').update(value).digest('hex') }
 function same(a?: Entry, b?: Entry): boolean { return a === undefined || b === undefined ? a === b : a.kind === b.kind && a.mode === b.mode && a.bytes.equals(b.bytes) }
+/**
+ * R15-F5: one scratch directory under the ambient temp root, with a
+ * checkout-local fallback when the environment denies that root.
+ *
+ * The host check sandbox roots its write policy at the disposable checkout
+ * while `TMPDIR`/`TMP`/`TEMP` stay inherited from the caller, so the ambient
+ * root can be unwritable (EPERM/EACCES), missing (ENOENT) or a file (ENOTDIR)
+ * and an unguarded `mkdtemp` then fails the operation. Only those four codes
+ * fall through; any other failure is a real error and is rethrown rather than
+ * hidden behind a second attempt.
+ *
+ * The fallback root is caller-declared and must be a path capture cannot read as
+ * work: production passes the delivery's own private metadata directory inside
+ * `.git`, and `tests/temp-root.mjs` re-exports this helper with its git-ignored
+ * `.swarm/test-tmp` default, so the fixtures and the production path cannot
+ * drift apart. Each call gets its own `mkdtemp` directory and the caller keeps
+ * its existing cleanup obligation.
+ */
+const FALLBACK_TEMP_CODES = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR'])
+export async function tempDirectory(prefix: string, fallbackRoot: string = path.join(process.cwd(), '.swarm', 'test-tmp')): Promise<string> {
+  try { return await mkdtemp(path.join(tmpdir(), prefix)) } catch (error) {
+    if (!(error instanceof Error && 'code' in error && FALLBACK_TEMP_CODES.has(String(error.code)))) throw error
+    await mkdir(fallbackRoot, { recursive: true })
+    return await mkdtemp(path.join(fallbackRoot, prefix))
+  }
+}
 function validPath(value: string): void {
   if (!value || value.includes('\0') || value.includes('\\') || path.posix.isAbsolute(value) || value.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git' || part.includes(':'))) throw new Error(`Unsafe delivery path: ${JSON.stringify(value)}`)
 }
@@ -288,7 +314,10 @@ export async function applyDelivery(input: DeliveryInput, signal?: AbortSignal):
         if (unchanged) return { status: 'applied', changedPaths, conflicts: [] }
       }
     } catch (error) { if (!missing(error)) throw error }
-    temporary = await mkdtemp(path.join(tmpdir(), 'dsh-swarm-delivery-'))
+    // R15-F5: delivery's scratch root uses the shared fallback policy, anchored
+    // in its own private metadata directory (inside `.git`, so no scratch
+    // directory is ever visible to capture as work).
+    temporary = await tempDirectory('dsh-swarm-delivery-', path.join(metadata, 'tmp'))
     const changes: Change[] = []
     const conflicts: string[] = []
     const lookup = resultLookup(source, input.resultCommit, signal)

@@ -145,7 +145,16 @@ const EVENT_CENSUS = [
 /*
  * TOOL CENSUS — one row per SWARM_TOOLS entry: [tool, decision, readerRole, proof, job].
  * A tool is a model-facing affordance: the reader is the worker or owner whose
- * decision uses it, and the proof is the test or handler that exercises it.
+ * decision uses it. The proof states exactly what proves the row, and there are
+ * two kinds, checked by the tool-proof test below:
+ *  - the test that exercises the tool's handler under `tests/` — 22 of 24 rows;
+ *  - the handler module `src/tools.ts` for `swarm_challenge` and
+ *    `swarm_subscribe`, whose model-visible surface is the golden fixture
+ *    `tests/fixtures/model-visible.expected.json` (their worker tool set), read
+ *    by `tests/harness-composition.mjs` and `tests/roles.test.mjs`.
+ * The blanket claim that every row was proven by a test that exercises the tool
+ * was false for those two rows (R16-G7); it now states the split, and the test
+ * fails if either kind of proof stops holding.
  */
 const TOOL_CENSUS = [
   ["swarm_stage", "keep", "worker-decision", "tests/authorized-workspace.test.mjs", "Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls"],
@@ -246,9 +255,16 @@ const DELETED_EVENT_KINDS = [
  * still renders; the round's rule allows a compatibility decoder to outlive the
  * writer that stopped emitting. Recorded here so the label-coverage check below
  * cannot be satisfied by an undocumented exception.
+ *
+ * `why` is a claim, so it is checked: every repository path it names must exist
+ * AND must itself mention the kind, and the recorded reader in its `proof` file
+ * must carry the kind in the site the reason names. A reason that cites a file
+ * which never mentions the label (the R16-G7 defect: the row claimed
+ * `tests/ui-progress.test.mjs` rendered `attempt/started`, which occurs nowhere
+ * in that file or its fixtures) fails the compatibility-reader test below.
  */
 const COMPATIBILITY_LABELS = [
-  ['attempt/started', 'tests/ui-progress.test.mjs renders it as historical card data; the live kind is `task/claimed`, and no writer in this repository history emits the label', 'src/client/progress.ts'],
+  ['attempt/started', 'no writer in this repository history emits the label and the live kind is `task/claimed`; the readers that keep it are the label map `meaningfulEvents` (renders "Task started") and `recoveryEventTypes` (treats such a row as a recovery step) in src/client/progress.ts', 'src/client/progress.ts'],
 ]
 
 function tree(...prefixes) {
@@ -364,6 +380,29 @@ test('every tool in SWARM_TOOLS has a recorded decision, a real reader and a job
   }
 })
 
+test('a tool row states exactly what proves it: an exercising test, or the handler plus the model-visible fixture', () => {
+  const fixturePath = 'tests/fixtures/model-visible.expected.json'
+  const fixture = textOf(fixturePath)
+  assert.ok(fixture.length > 0, `${fixturePath}: the model-visible golden fixture must be readable`)
+  for (const reader of ['tests/harness-composition.mjs', 'tests/roles.test.mjs']) {
+    assert.ok(textOf(reader).includes('fixtures/model-visible.expected.json'), `${reader} must read the model-visible golden fixture`)
+  }
+  // The split the census documents: 22 rows carry an exercising test, and the
+  // two handler-proofed rows are named. A third kind of proof, or a row that
+  // moves from one kind to the other without the document changing, fails here.
+  const handlerProofed = TOOL_CENSUS.filter(([, , , proof]) => proof === 'src/tools.ts').map(([tool]) => tool)
+  assert.deepEqual(handlerProofed, ['swarm_challenge', 'swarm_subscribe'], 'the handler-proofed rows changed; docs/known-limitations.md states 22 of 24 tools are proven by a test that exercises the tool')
+  assert.equal(TOOL_CENSUS.length - handlerProofed.length, 22, 'the exercising-test row count changed; docs/known-limitations.md states 22 of 24')
+  const workerVisible = JSON.parse(fixture).workerSwarmTools
+  for (const tool of handlerProofed) {
+    assert.ok(workerVisible.includes(tool), `${tool}: the handler-proofed row must be covered by the model-visible worker tool set`)
+  }
+  for (const [tool, , , proof] of TOOL_CENSUS) {
+    if (proof === 'src/tools.ts') continue
+    assert.ok(proof.startsWith('tests/'), `${tool}: an exercising-test proof must live under tests/, got ${proof}`)
+  }
+})
+
 test('every examined payload field is recorded, real, and names its reader', () => {
   const src = TREE.filter(path => path.startsWith('src/'))
   for (const [event, field, decision, role, proof] of PAYLOAD_CENSUS) {
@@ -411,6 +450,25 @@ test('every client label key is a vocabulary kind, a compatibility label, or a d
     assert.ok(writersOf(kind).length === 0, `${kind}: a compatibility label must have no writer`)
     assert.ok(textOf('src/client/progress.ts').includes(kind), `${kind}: ${why}`)
     assert.ok(existsSync(join(ROOT, proof)), `${kind}: compatibility proof ${proof} does not exist`)
+  }
+})
+
+test('a compatibility label names its real reader, and every reader the reason cites carries the label', () => {
+  const progress = textOf('src/client/progress.ts')
+  const recovery = /const recoveryEventTypes = new Set\(\[([\s\S]*?)\]\)/.exec(progress)
+  assert.ok(recovery, 'src/client/progress.ts must still declare recoveryEventTypes')
+  const labelMap = new Set([...progress.matchAll(/'([a-z][a-z0-9-]*\/[a-z0-9-]+)':/g)].map(match => match[1]))
+  for (const [kind, why, proof] of COMPATIBILITY_LABELS) {
+    assert.ok(labelMap.has(kind), `${kind}: the label map in ${proof} must carry it`)
+    assert.ok(recovery[1].includes(`'${kind}'`), `${kind}: the recorded reader recoveryEventTypes must carry it`)
+    // The recorded reason is a claim about this repository: every path it names
+    // must exist and must itself mention the kind. A reason citing a file that
+    // never names the label is the R16-G7 defect, and it fails here.
+    for (const match of why.matchAll(/(?:src|tests|scripts)\/[A-Za-z0-9_./-]+/g)) {
+      const named = match[0].replace(/[.,;:]$/, '')
+      assert.ok(existsSync(join(ROOT, named)), `${kind}: the recorded reason names ${named}, which does not exist`)
+      assert.ok(textOf(named).includes(kind), `${kind}: the recorded reason names ${named} as a reader, but that file never mentions the kind`)
+    }
   }
 })
 
