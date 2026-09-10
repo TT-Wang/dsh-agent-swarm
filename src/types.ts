@@ -128,7 +128,14 @@ export interface Mission {
   reason?: string
   baseline?: WorkspaceBaseline
   /** Durable gate while budget exhaustion stops the previous worker activity. */
-  budgetPause?: { id: string; quiesced: boolean }
+  /**
+   * S5r: the durable stop claim. `stopping` is written before the deferred stop
+   * touches the adapter, so clearing the in-memory `budgetStops` mirror cannot
+   * re-run a stop that is already in flight. A claim from another runtime
+   * instance, or one older than the declared pass bound, is a crashed stop and
+   * does not gate a fresh attempt.
+   */
+  budgetPause?: { id: string; quiesced: boolean; stopping?: { instanceId: string; at: number } }
   /** Bucketed worker usage behind `usedTokens`; absent on missions recorded before bucket accounting. */
   workerUsage?: UsageBuckets
   /** Owner-session usage attributed by time window (planning and coordination). Outside the worker pool budget. */
@@ -241,6 +248,21 @@ export interface Task {
   status: TaskStatus
   priority: number
   experiment: boolean
+  /**
+   * S5: this task's own revision. Every detached record read from the store
+   * carries the revision it was read at, and `SwarmStore.put('tasks', …)`
+   * accepts the write only when the presented revision equals the durable one
+   * (then stamps `current + 1` onto the caller's object). A writer that read the
+   * task before another accepted write presents a disagreeing value and is
+   * refused with `StaleTaskRevisionError`, which names the current revision and
+   * the imperative next step (re-read, retry once). Absent only on rows written
+   * before per-task revisions existed; the first accepted write stamps one.
+   *
+   * This is what makes an update lost-update-free without an in-memory flag: the
+   * compare happens against the durable row inside the caller's transaction, so
+   * the serialized decision path cannot overwrite a decision it never read.
+   */
+  revision?: number
   assigneeId?: string
   /** Plan-intended owner; restored when a lease expiry re-pends the task and the member is still live. */
   plannedAssigneeId?: string
@@ -716,6 +738,16 @@ export interface SchedulingPass {
   noProgressPasses: number
   /** Set when the pass neither advanced nor terminated within the declared bound. */
   stalled?: { reason: 'pass-timeout' | 'no-progress'; at: number; boundMs: number; unschedulable: string[] }
+  /**
+   * S5r hand-off: the runId this pass released, recorded durably on the row
+   * instead of only in `Scheduling.releasedPasses`. `Scheduling.passReleased`
+   * must read this field (and the row's `releasedAt` age) rather than the
+   * in-memory Set, so clearing the Set cannot let an abandoned pass body resume.
+   * Writing it is a src/runtime.ts/src/scheduling.ts change outside the S5r
+   * scope; the field exists here so that change is mechanical.
+   */
+  releasedRunId?: string
+  releasedAt?: number
 }
 export interface RuntimeConfig {
   statePath: string
