@@ -51,7 +51,7 @@ import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmissi
 import { refusalSites, assessRefusal, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events } from './faults/harness.mjs'
 
-const CHAINS = ['budget', 'workspace', 'attempt_lease', 'task_ceiling', 'review_admission', 'dispatch_preconditions', 'admission']
+import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
 /**
  * Run one message through the *real* refusal lint: the production message text
@@ -69,136 +69,6 @@ function lintRefusal(message) {
 /* ------------------------------------------------------------------------- *
  * 1. The property test over generated board states.
  * ------------------------------------------------------------------------- */
-
-const TASK_STATUS = ['pending', 'running', 'submitted', 'blocked', 'accepted', 'cancelled']
-const ATTEMPTS = [{ label: 'no-attempt' }, { label: 'live-attempt', attempt: { leaseLive: true } }, { label: 'lapsed-attempt', attempt: { leaseLive: false } }]
-const WORKSPACES = ['authorized', 'revoked', 'dirty', 'unprovisioned']
-const MEMBER_STATUS = ['idle', 'working', 'waiting', 'stopped']
-const BUDGETS = [{ label: 'clear' }, { label: 'paused', budgetPaused: true }, { label: 'blocked', budgetBlocked: 'token budget exhausted (9/9)' }]
-/**
- * The conditions that are not one of the five named dimensions, but that decide
- * which chain the terminal names. Each becomes its own seed for the reachable
- * closure below, so every chain is exercised without pretending these flags are
- * freely reachable from a healthy board.
- */
-const FLAGS = [
-  { label: 'plain' },
-  { label: 'ceiling-exhausted', ceilingExhausted: true },
-  { label: 'preparation-exhausted', preparationExhausted: true },
-  { label: 'assumed-content', assumedContent: true },
-  { label: 'review-dead', reviewOf: 'task_source', reviewSourceLive: false },
-  { label: 'review-live', reviewOf: 'task_source', reviewSourceLive: true },
-  { label: 'dependency-unsatisfied', dependenciesSatisfied: false },
-  { label: 'dependency-dead', dependenciesDead: true },
-]
-const MISSION_BASE = { status: 'active', workspace: 'authorized' }
-/** S4r-D5: mission status is a generated dimension, including `blocked` (a budget stop). */
-const MISSION_STATUS = ['active', 'blocked', 'paused', 'staged', 'completed', 'stopped']
-const TASK_ID = 'task_generated'
-const MEMBER_ID = 'member_generated'
-
-const budgetFields = budget => (budget.budgetPaused === true ? { budgetPaused: true } : budget.budgetBlocked === undefined ? {} : { budgetBlocked: budget.budgetBlocked })
-const flagFields = flag => {
-  const fields = {}
-  if (flag.ceilingExhausted) fields.ceilingExhausted = true
-  if (flag.preparationExhausted) fields.preparationExhausted = true
-  if (flag.assumedContent) fields.assumedContent = true
-  if (flag.dependenciesSatisfied === false) fields.dependenciesSatisfied = false
-  if (flag.dependenciesDead === true) fields.dependenciesDead = true
-  if (flag.reviewOf !== undefined) { fields.reviewOf = flag.reviewOf; fields.reviewSourceLive = flag.reviewSourceLive }
-  return fields
-}
-
-/** The full enumerated cross product: the state space the generator considers. */
-function generatedBoards() {
-  const boards = []
-  for (const status of TASK_STATUS) for (const attempt of ATTEMPTS) for (const workspace of WORKSPACES)
-    for (const member of MEMBER_STATUS) for (const budget of BUDGETS) for (const flag of FLAGS) for (const missionStatus of MISSION_STATUS) {
-      boards.push({
-        mission: { ...MISSION_BASE, status: missionStatus, workspace, ...budgetFields(budget) },
-        tasks: [{ id: TASK_ID, status, ...(attempt.attempt ?? {}), ...flagFields(flag) }],
-        members: [{ id: MEMBER_ID, status: member }],
-      })
-    }
-  return boards
-}
-
-const keyOf = board => JSON.stringify([board.mission, board.tasks, board.members])
-/**
- * One transition relation over the five named dimensions. It is the closure of
- * board changes a real scheduler and its actors can make: work is dispatched,
- * an attempt's lease lapses, a lapsed attempt is recovered to blocked or
- * pending, running work is submitted, a verdict accepts or a rejection blocks
- * the source, blocked work is re-pended or withdrawn, the budget is paused or
- * blocked, the workspace state moves, and a member stops, parks, idles or works.
- * It is deliberately permissive: over-approximating reachability asserts the
- * property on *more* states than a real board can take, which is the safe
- * direction for this property.
- */
-function nextStates(board) {
-  const next = []
-  const task = board.tasks[0]
-  const push = patch => next.push({ ...board, ...patch })
-  for (const workspace of WORKSPACES) if (workspace !== board.mission.workspace) push({ mission: { ...board.mission, workspace } })
-  for (const budget of BUDGETS) push({ mission: { ...board.mission, ...budgetFields(budget) } })
-  // S4r-D5: the mission can leave `active` for a non-terminal status (a budget
-  // stop blocks it) or reach a terminal one; both are part of the closure now.
-  for (const status of MISSION_STATUS) if (status !== board.mission.status) push({ mission: { ...board.mission, status } })
-  for (const status of MEMBER_STATUS) if (status !== board.members[0].status) push({ members: [{ ...board.members[0], status }] })
-  if (task.status === 'running' && task.attempt?.leaseLive === true) push({ tasks: [{ ...task, attempt: { leaseLive: false } }] })
-  if (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseLive === false) {
-    push({ tasks: [{ ...task, status: 'blocked', attempt: undefined }] })
-    push({ tasks: [{ ...task, status: 'pending', attempt: undefined }] })
-  }
-  if (task.status === 'pending') {
-    push({ tasks: [{ ...task, status: 'running', attempt: { leaseLive: true } }] })
-    push({ tasks: [{ ...task, status: 'cancelled', attempt: undefined }] })
-  }
-  if (task.status === 'running') {
-    if (task.attempt?.leaseLive === true) push({ tasks: [{ ...task, status: 'submitted', attempt: undefined }] })
-    push({ tasks: [{ ...task, status: 'blocked', attempt: undefined }] })
-  }
-  if (task.status === 'submitted') {
-    push({ tasks: [{ ...task, status: 'accepted', attempt: undefined }] })
-    push({ tasks: [{ ...task, status: 'blocked', attempt: undefined }] })
-  }
-  if (task.status === 'blocked') {
-    push({ tasks: [{ ...task, status: 'pending' }] })
-    push({ tasks: [{ ...task, status: 'cancelled' }] })
-  }
-  return next
-}
-
-/** Breadth-first closure from one seed, bounded so a future transition loop cannot hang the suite. */
-function reachableFrom(seed, limit = 4000) {
-  const seen = new Map([[keyOf(seed), seed]])
-  const queue = [seed]
-  while (queue.length > 0 && seen.size < limit) {
-    const board = queue.shift()
-    for (const candidate of nextStates(board)) if (!seen.has(keyOf(candidate))) { seen.set(keyOf(candidate), candidate); queue.push(candidate) }
-  }
-  return seen
-}
-
-/**
- * What this generator does NOT reach, stated rather than implied:
- *  - multi-task boards: dependency graphs, review-task pairs, several members,
- *    and two tasks competing for one admission slot;
- *  - concurrency and interleaving: a lease that expires mid-await, a writer-busy
- *    transaction, a pass released by the watchdog, adapter start failures;
- *  - wall-clock behaviour: the review grace window and the no-progress window
- *    are inputs here, not durations;
- *  - the terminal task states accepted/cancelled with an attempt attached, which
- *    the transition relation cannot produce because no actor can attach one.
- *    (Mission status IS a generated dimension since S4r: active, blocked, paused,
- *    staged, completed and stopped are all reached, and the test asserts that the
- *    closure includes a budget-blocked mission — the state that hid S4r-D5.)
- * The runtime-level tests below cover the first two classes for the two real
- * pairs; the remaining gaps are named in the round's hand-off notes.
- */
-const generatorLimits = {
-  unreachedExample: { mission: { ...MISSION_BASE }, tasks: [{ id: TASK_ID, status: 'accepted', attempt: { leaseLive: true } }], members: [{ id: MEMBER_ID, status: 'idle' }] },
-}
 
 test('R14 property: every reachable non-terminal board state has an executable action, and the chain terminal escalates', () => {
   const reachable = new Map()
