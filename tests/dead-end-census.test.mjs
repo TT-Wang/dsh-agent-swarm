@@ -47,11 +47,17 @@
  * *discriminating* number is the owner-gated count (0 dead ends is structural:
  * the terminal element of every chain is unconditional).
  *
- * The qualification the owner's census earned, stated: the DEAD END branch is
- * reachable only for a state the runtime does not produce — the terminal element
- * of every chain is unconditional, so for any real board a live task with no
- * action is covered by an escalation. The *discriminating* number is therefore
- * the owner-gated count, not the dead-end count. What this file makes checkable:
+ * The qualification, CORRECTED by DEADrv: the DEAD END branch is NOT unreachable
+ * for a state the runtime produces. The property above is scoped to NON-TERMINAL
+ * boards (`guardMissionTerminal(board)` is skipped), and outside that scope a
+ * terminal mission can hold a live task with no action: `runtime.control(action=
+ * 'stop')` cancels running tasks and blocked tasks carrying `resumeAfterStop`, but
+ * leaves a pending task in place, after which `guardActions` is empty and the
+ * census reports DEAD END for that board (reproduction: pending task censuses
+ * RECOVERABLE:1 while active, then stop -> mission stopped, task still pending,
+ * census DEAD END:1). For a real NON-TERMINAL board the terminal element of every
+ * chain is unconditional, so 0 dead ends is structural there, and the
+ * *discriminating* number is the owner-gated count, not the dead-end count. What this file makes checkable:
  * the classification and the counts, the reachability of the DEAD END branch
  * (by mutation), and the well-formedness of every escalation's exits. What stays
  * a lint property: whether the named tools and parameters resolve in the real

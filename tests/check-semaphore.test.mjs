@@ -41,7 +41,7 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
     await mkdir(path.join(member.workspace, 'src'), { recursive: true })
     await writeFile(path.join(member.workspace, 'src', 'answer.txt'), `answer ${index}\n`)
     const artifact = await workspaces.captureArtifact(member, task)
-    prepared.push({ member, task: { ...task, checks: [checkCommand] }, artifact })
+    prepared.push({ member, task: { ...task, checks: [typeof checkCommand === 'function' ? checkCommand(temp) : checkCommand] }, artifact })
   }
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   return { temp, source, workspaces, prepared, checkStarts }
@@ -75,9 +75,19 @@ test('R11-19: checkConcurrency 1 serializes declared checks and records the meas
 })
 
 test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', async t => {
-  const f = await semaphoreFixture(t, { checkConcurrency: 3 })
-  const results = await Promise.all(f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact)))
-  for (const result of results) assert.deepEqual(result.map(check => check.exitCode), [0])
+  // Deterministic overlap instead of a race against a 150 ms sleep: every check
+  // holds until this test releases it, so "three ran at once" is observed by
+  // construction even when process spawn takes longer than the hold. The previous
+  // form asserted `maxActive === 3` against `sleep 0.15` and went red under load
+  // (FLK-R2v heavy window, tests/check-semaphore.test.mjs:83).
+  const f = await semaphoreFixture(t, { checkConcurrency: 3 }, 3, temp => {
+    const sentinel = path.join(temp, 'overlap-release')
+    return `node -e "const fs=require('fs');const d=Date.now()+30000;while(!fs.existsSync('${sentinel}')&&Date.now()<d){}"`
+  })
+  const results = f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact))
+  await eventually(() => f.workspaces.checkEnvelope().maxActive === 3, 'all three declared checks were never active at once', 30000)
+  await writeFile(path.join(f.temp, 'overlap-release'), 'release\n')
+  for (const result of await Promise.all(results)) assert.deepEqual(result.map(check => check.exitCode), [0])
   const envelope = f.workspaces.checkEnvelope()
   assert.equal(envelope.limit, 3)
   assert.equal(envelope.maxActive, 3, 'all three checks overlapped')
