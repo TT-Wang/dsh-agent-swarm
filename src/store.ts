@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, basename, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SchedulingPass, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 
 interface Tables {
@@ -27,9 +27,10 @@ interface Tables {
   starts: AutoStart
   admissions: AdmissionRecord
   limits: LimitRule
+  passes: SchedulingPass
 }
 export type Table = keyof Tables
-const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits']
+const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits', 'passes']
 /** Bounded board filters. `inboxFor` means "addressed to this key or mission-wide". */
 export interface PostFilter {
   kind?: PostKind

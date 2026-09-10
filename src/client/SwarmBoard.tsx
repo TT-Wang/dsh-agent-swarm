@@ -182,6 +182,10 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
         remaining={remainingPercent(mission.usedTokens, mission.budget.maxTokens)} />
       <Metric label={t('STEPS USED')} value={`${mission.usedSteps} / ${mission.budget.maxSteps}`} detail={`Deadline ${time(mission.deadline)}`}
         remaining={remainingPercent(mission.usedSteps, mission.budget.maxSteps)} />
+      {/* S6: critical-path length beside the spend it is charged against, so a
+          worker that did not shorten the longest branch earns nothing visible. */}
+      <Metric label={t('CRITICAL PATH')} value={`${snapshot.criticalPath?.length ?? 0}`}
+        detail={`${snapshot.criticalPath?.remaining ?? 0} open · ${snapshot.criticalPath?.usedSteps ?? 0} steps on the longest chain`} />
       <Metric label={t('WORKERS')} value={`${activeWorkers} active`} detail={`${snapshot.members.length} workers · cap ${mission.budget.maxWorkers}`} />
     </div>
     <UsageBreakdown worker={mission.workerUsage} owner={mission.ownerUsage} steps={mission.usedSteps} />

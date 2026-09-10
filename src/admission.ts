@@ -17,10 +17,13 @@ export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
 
 export function assertScopeSelectors(scopes: readonly string[], location: string, parent?: readonly string[]): void {
   const invalid = scopes.findIndex(selector => !validScope(selector))
-  if (invalid !== -1) throw new Error(`${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct this field and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation.`)
+  // The code token trails the pinned `location[` prefix so the browser's
+  // actionable-message allowlist in src/web-api.ts (out of this task's scope)
+  // keeps exposing this refusal; every refusal still carries its stable code.
+  if (invalid !== -1) throw new Error(`${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_invalid]`)
   if (parent && !scopeSubset(scopes, parent)) {
     const offending = scopes.find(selector => !scopeSubset([selector], parent))
-    throw new Error(`${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Correct this field and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation.`)
+    throw new Error(`${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow \`scope\` to a subset of the mission \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]`)
   }
 }
 
@@ -56,6 +59,10 @@ export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T
 
 /** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
 export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
+  // The message is the caller's reason; the only call site (Runtime's review
+  // notification) composes the imperative exit next to it. The rendered form is
+  // pinned byte-for-byte by tests/review-path-admission.test.mjs, so the
+  // actionable half travels with the caller, not inside this stable code carrier.
   return { code: 'review_path_missing', location: `task ${JSON.stringify(taskId)}`, message: reason }
 }
 
@@ -95,7 +102,7 @@ export const DEFAULT_TASK_MAX_STEPS = 150
 export const DEFAULT_TASK_MAX_FINDINGS = 50
 
 function assertCeilingValue(value: number, location: string, dimension: TaskCeilingDimension): void {
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Choose a per-task limit the runtime can enforce and retry the same task/request.`)
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Set \`maxSteps\` or \`maxFindings\` on this task to a positive safe integer and retry the same task/request.`)
 }
 
 /**
@@ -108,7 +115,7 @@ export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: n
   const maxFindings = task.maxFindings ?? DEFAULT_TASK_MAX_FINDINGS
   assertCeilingValue(maxSteps, location, 'maxSteps')
   assertCeilingValue(maxFindings, location, 'maxFindings')
-  if (maxSteps > missionMaxSteps) throw new Error(`[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Lower this task's maxSteps or raise the mission budget, and retry the same task/request.`)
+  if (maxSteps > missionMaxSteps) throw new Error(`[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`)
   return { maxSteps, maxFindings }
 }
 
@@ -134,7 +141,10 @@ export function taskCeilingBlock(task: TaskCeilingState, now = Date.now()): Task
   if (!exhausted) return undefined
   return {
     dimension: exhausted.dimension, limit: exhausted.limit, used: exhausted.used, code: 'task_ceiling_exhausted',
-    reason: `Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. The task blocks at its own ceiling instead of consuming the mission budget; raise this task's ceiling or replace the task.`,
+    // The durable reason is thrown and notified verbatim, so the code travels in
+    // the message itself and the exit names the two parameters that exist on
+    // `swarm_propose` after S3 exposed them.
+    reason: `[task_ceiling_exhausted] Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. The task blocks at its own ceiling instead of consuming the mission budget; raise this task's ceiling by proposing its replacement with \`swarm_propose\` — name this task in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` within the mission budget — while keeping its acceptance criteria and kind verbatim.`,
     at: now,
   }
 }
@@ -235,7 +245,7 @@ export function reconcileObjectiveScope(objective: string, scope: readonly strin
     code: 'objective_write_outside_scope',
     location,
     path,
-    message: `the objective directs a write to ${JSON.stringify(path)}, which the scope ${JSON.stringify(scope)} does not cover. A worker cannot commit that path (capture rejects out-of-scope changes), so the objective would fail at submit after the work is done. Narrow the objective to an in-scope path or widen the task scope within mission scope; never broaden scope just to pass validation.`,
+    message: `the objective directs a write to ${JSON.stringify(path)}, which the scope ${JSON.stringify(scope)} does not cover. A worker cannot commit that path (capture rejects out-of-scope changes), so the objective would fail at submit after the work is done. Narrow the \`objective\` to an in-scope path or widen the task \`scope\` within mission scope, then retry the same task/request; never broaden scope just to pass validation.`,
   }))
 }
 
@@ -314,7 +324,7 @@ export function reconcileDeliverableIgnores(workspace: string, objective: string
     code: 'deliverable_path_ignored',
     location,
     path: hit.path,
-    message: `the named deliverable ${JSON.stringify(hit.path)} is ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). Capture only records untracked, non-ignored paths, so this deliverable would be silently absent from the artifact. Add a negation for this exact path inside the task's own scope or rename the deliverable, and retry the same task/request.`,
+    message: `the named deliverable ${JSON.stringify(hit.path)} is ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). Capture only records untracked, non-ignored paths, so this deliverable would be silently absent from the artifact. Add a negation for this exact path inside the task's own \`scope\`, or rename the deliverable in the \`objective\` and \`acceptance\`, and retry the same task/request.`,
   }))
 }
 
@@ -671,17 +681,17 @@ export function reconcileCheckPaths(command: string, location: string): Admissio
     code: 'check_absolute_path',
     location,
     path: candidate,
-    message: `the declared check names the absolute path ${JSON.stringify(candidate)}, which is not inside the disposable verification checkout. The verifier runs every check in a clean verification checkout — a fresh worktree of the artifact commit under a random path — so this host location (a home directory, the source checkout or a project toolchain) is not present there; the check would fail with exit 127 or silently test the source instead of the artifact. Use a checkout-relative path (for example ".venv/bin/python" or "node_modules/.bin/tool") or a standard system executable (${SYSTEM_CHECK_PATH_ALLOWLIST.slice(0, 2).map(item => JSON.stringify(item)).join(', ')}). Correct this field and retry the same task/request, preserving acceptance criteria and budget; never swap a check for a host-absolute path to make it pass.`,
+    message: `the declared check names the absolute path ${JSON.stringify(candidate)}, which is not inside the disposable verification checkout. The verifier runs every check in a clean verification checkout — a fresh worktree of the artifact commit under a random path — so this host location (a home directory, the source checkout or a project toolchain) is not present there; the check would fail with exit 127 or silently test the source instead of the artifact. Replace it in \`checks\` with a checkout-relative path (for example ".venv/bin/python" or "node_modules/.bin/tool") or a standard system executable (${SYSTEM_CHECK_PATH_ALLOWLIST.slice(0, 2).map(item => JSON.stringify(item)).join(', ')}), then retry the same task/request; never swap a check for a host-absolute path to make it pass.`,
   }))
 }
 
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
-    if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
+    if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
-    if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
+    if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
-    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable checks (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate. Correct this field and retry the same task/request, preserving acceptance criteria and budget.`)
+    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
     // Round 9-C: a check that names a host-absolute path cannot run in the
     // disposable checkout. Refuse it here, at the shared admission point, so a
     // repair cannot silently swap its check for the source toolchain.
@@ -689,6 +699,6 @@ export function requireHostChecks(kind: string, checks: readonly string[] | unde
     if (absolute) throw new Error(formatDiagnostic(absolute.diagnostics[0]!))
   }
   if ((kind === 'implementation' || kind === 'integration') && !checks?.length) {
-    throw new Error(`${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add checks and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`)
+    throw new Error(`${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. [check_required] Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add a real \`checks\` command and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`)
   }
 }

@@ -569,7 +569,7 @@ export class Workspaces {
       if (relativeRoot === '' || (!relativeRoot.startsWith(`..${path.sep}`) && relativeRoot !== '..' && !path.isAbsolute(relativeRoot))) throw new Error('Swarm snapshot storage must be outside the source repository')
       await mkdir(this.root, { recursive: true, mode: 0o700 })
       if (await realpath(this.root) !== this.root) throw new Error('workspacesRoot must be canonical, without symlinks')
-      if (await this.git(source, ['rev-parse', '--show-toplevel'], ownedSignal) !== source) throw new Error('Mission workspace must be the Git repository root')
+      if (await this.git(source, ['rev-parse', '--show-toplevel'], ownedSignal) !== source) throw new Error('[workspace_not_repository_root] Mission workspace must be the Git repository root Correct `workspace` with `swarm_create` and retry.')
       const manifest = path.join(this.missionDir(mission.id), 'mission.json')
       const planningWorkspace = path.join(this.missionDir(mission.id), 'planning')
       let record: MissionWorkspace
@@ -626,7 +626,7 @@ export class Workspaces {
   private async memberRecord(member: Pick<Member, 'missionId' | 'id' | 'workspace'>): Promise<MemberWorkspace> {
     const value = await readJson(this.memberPath(member.missionId, member.id))
     const expected = path.join(this.missionDir(member.missionId), 'members', segment(member.id))
-    if (!isRecord(value) || value.version !== 1 || value.memberId !== member.id || value.missionId !== member.missionId || value.workspace !== expected || path.resolve(member.workspace) !== expected) throw new Error('Workspace is not owned by this swarm member')
+    if (!isRecord(value) || value.version !== 1 || value.memberId !== member.id || value.missionId !== member.missionId || value.workspace !== expected || path.resolve(member.workspace) !== expected) throw new Error('[workspace_not_owned] Workspace is not owned by this swarm member Read `taskId` with `swarm_observe` and retry from the member that owns the task.')
     const actual = await realpath(expected)
     if (actual !== expected) throw new Error('Swarm worktrees must not be replaced with symlinks')
     if (await this.git(expected, ['rev-parse', '--show-toplevel']) !== expected) throw new Error('Member workspace is no longer its owned Git worktree')
@@ -718,9 +718,9 @@ export class Workspaces {
     await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
       if (task.reviewOf !== undefined) {
-        if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('Verification requires its exact submitted review source artifact')
+        if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
         await this.validateArtifact(member, reviewSource.artifact)
-      } else if (reviewSource !== undefined) throw new Error('Only a verification task can name a review source')
+      } else if (reviewSource !== undefined) throw new Error('[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
       const taskOwner = await readJson(this.taskPath(member.missionId, task.id))
       const ownsRecovery = taskOwner === undefined || (isRecord(taskOwner) && taskOwner.memberId === member.id)
       const sameReview = reviewSource === undefined || record.task?.baseCommit === reviewSource.artifact?.commit
@@ -733,9 +733,9 @@ export class Workspaces {
         await this.saveTaskWorkspace(record)
         return
       }
-      if ((await this.uncommittedWork(member.workspace, signal)).length > 0) throw new Error('Member workspace has uncommitted work; submit or resolve it before starting another task')
+      if ((await this.uncommittedWork(member.workspace, signal)).length > 0) throw new Error('[workspace_uncommitted] Member workspace has uncommitted work; submit or resolve it before starting another task Submit the work with `swarm_submit` and its `taskId`, then retry.')
       const previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
-      if (record.task !== undefined && previousHead !== (record.task.capturedCommit ?? record.task.baseCommit)) throw new Error('Member has unsubmitted commits; capture them before preparing another task')
+      if (record.task !== undefined && previousHead !== (record.task.capturedCommit ?? record.task.baseCommit)) throw new Error('[commits_unsubmitted] Member has unsubmitted commits; capture them before preparing another task Submit the commits with `swarm_submit` and its `taskId`, then retry.')
       if (record.task !== undefined && record.task.taskId !== task.id) await this.checkpointAbandonedTask(record, task.id)
       // Each task starts only with the mission base and explicitly accepted dependencies.
       // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
@@ -943,7 +943,7 @@ export class Workspaces {
   async captureArtifact(member: Member, task: Task): Promise<Artifact> {
     return await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
-      if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('Task has no matching prepared workspace baseline')
+      if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('[workspace_baseline_missing] Task has no matching prepared workspace baseline Retry the task with `swarm_claim` and its `taskId`.')
       const baseCommit = record.task.baseCommit
       // Member-created dependency links are toolchain state, not work: they are
       // excluded from the changed set, unstaged if an earlier capture staged

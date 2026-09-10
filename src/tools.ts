@@ -66,23 +66,23 @@ export const SWARM_PROMPT = ENTRY_PROMPT
 
 type Args = Record<string, unknown>
 function object(value: unknown): Args {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object')
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
   return value as Args
 }
 function text(args: Args, key: string): string {
   const value = args[key]
-  if (typeof value !== 'string' || value.trim() === '') throw new Error(`${key} must be a non-empty string`)
+  if (typeof value !== 'string' || value.trim() === '') throw new Error(`[tool_argument_invalid] ${key} must be a non-empty string; supply a nonempty string for this parameter and retry the same tool call.`)
   return value
 }
 function array(args: Args, key: string): string[] {
   const value = args[key]
-  if (!Array.isArray(value) || !value.every(x => typeof x === 'string' && x.trim() !== '')) throw new Error(`${key} must be a string array`)
+  if (!Array.isArray(value) || !value.every(x => typeof x === 'string' && x.trim() !== '')) throw new Error(`[tool_argument_invalid] ${key} must be a string array; supply a nonempty array of nonempty strings for this parameter and retry the same tool call.`)
   return value
 }
 function optionalInteger(args: Args, key: string): number | undefined {
   const value = args[key]
   if (value === undefined) return undefined
-  if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`${key} must be a nonnegative integer`)
+  if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`[tool_argument_invalid] ${key} must be a nonnegative integer; supply a nonnegative integer for this parameter and retry the same tool call.`)
   return Number(value)
 }
 function optionalText(args: Args, key: string): string | undefined { return args[key] === undefined ? undefined : text(args, key) }
@@ -101,9 +101,12 @@ function optionalText(args: Args, key: string): string | undefined { return args
  */
 async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot): Promise<WorkspaceAuthorized> {
   const cwd = exec.agent?.session?.header?.cwd
-  if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('Swarm planning tools require an agent session workspace')
+  if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('[session_workspace_missing] Swarm planning tools require an agent session workspace; call `swarm_stage` or `swarm_create` from a session whose cwd is inside the authorized `workspace` and retry the same request.')
   const authorization = await authorizeWorkspace(requested, cwd, grants)
-  if (!authorization.ok) throw new Error(authorization.diagnostic)
+  // The authorization diagnostic already carries `[workspace_not_authorized]`;
+  // append the executable exit here so the thrown message is coded *and*
+  // actionable without duplicating the code token.
+  if (!authorization.ok) throw new Error(`${authorization.diagnostic} Correct \`workspace\` to the session workspace or a configured authorized root and retry the same request; only the human changes the root configuration.`)
   return authorization
 }
 
@@ -212,7 +215,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       presentCall: () => ({ card: 'generic', title: name.replaceAll('_', ' '), kind: 'read' }),
       async execute(value, exec) {
         exec.signal.throwIfAborted()
-        if (!exec.agent) throw new Error('Swarm tools require an authenticated Harness agent session')
+        if (!exec.agent) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
         let args = object(value)
         // H4: planning workspaces are bound to the calling session or a root the
         // human configured once, never to the model's word. The matched root is
@@ -256,6 +259,17 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   }
   const mission = { missionId: string }
   const budgetSchema: JsonSchemaNode = { type: 'object', additionalProperties: false, properties: Object.fromEntries(Object.keys(defaultBudget).map(k => [k, integer])), required: Object.keys(defaultBudget) }
+  /**
+   * S3: the per-task ceilings the admission path already enforces
+   * (`normalizeTaskCeilings`) must be settable through the tool schema that
+   * offers the task, or the durable `task_ceiling_exhausted` refusal names a
+   * remedy the caller cannot execute. A value above the mission budget is still
+   * refused by admission with `task_ceiling_exceeds_mission_budget`.
+   */
+  const taskCeilingSchema: Record<'maxSteps' | 'maxFindings', JsonSchemaNode> = {
+    maxSteps: { ...integer, description: 'This task\'s own model-step ceiling. Admission derives min(mission maxSteps, 150) when omitted and refuses a value above the mission maxSteps budget with task_ceiling_exceeds_mission_budget; the runtime blocks the task at its ceiling instead of draining the mission budget.' },
+    maxFindings: { ...integer, description: 'This task\'s own finding (published evidence) ceiling. Admission derives 50 when omitted and refuses a non-positive value with task_ceiling_invalid; the runtime blocks the task at its ceiling instead of draining the mission budget.' },
+  }
   const scopeSchema: JsonSchemaNode = { ...strings, description: 'Repository-relative paths only: exact files, directory prefixes ending in /, or ** for an authorized whole-repository task. Prose belongs in objective/acceptance. Do not broaden scope to fix a validation error.' }
   const kindSchema: JsonSchemaNode = { type: 'string', enum: ['research', 'implementation', 'verification', 'integration'], description: 'research: analysis, read-only audit or evidence-backed synthesis. implementation: code changes. integration: assembly of several accepted implementation artifacts. Both code kinds require checks. verification: independent review of reviewOf.' }
   const dependenciesSchema: JsonSchemaNode = { ...strings, description: 'Tasks that must be accepted first. For verification omit the reviewOf source: its submitted artifact starts the review. A dependency on a later-replaced task is satisfied by its accepted replacement.' }
@@ -267,7 +281,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     workstreams: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { key: string, title: string, objective: string }, required: ['key', 'title', 'objective'] } },
     tasks: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
       key: string, workstreamKey: string, title: string, objective: string, kind: kindSchema,
-      scope: scopeSchema, acceptance: strings, checks: checksSchema, assigneeKey: string, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer, maxRecoveryAttempts: integer, checkTimeoutMs: integer, experiment: { type: 'boolean' },
+      scope: scopeSchema, acceptance: strings, checks: checksSchema, assigneeKey: string, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' },
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; pair each deliverable with a verification task via reviewOf. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
@@ -287,8 +301,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_launch', 'Launch the complete plan for a native /agent-swarm request identified by requestId; no user confirmation is needed and the workspace is the frozen request snapshot. Validation errors list every field to repair: fix them all and retry the same requestId. Completion is automatic after verified acceptance; end your turn after a successful launch.', launchProperties, ['requestId', 'title', 'objective', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], async (a, actor) => {
     const requestId = text(a, 'requestId')
     const request = runtime.starts(actor).find(item => item.id === requestId)
-    if (!request) throw new Error('Unknown automatic start request for this owner')
-    if (!Array.isArray(a.members)) throw new Error('members must be an array')
+    if (!request) throw new Error('[start_request_unknown] Unknown automatic start request for this owner; list the pending requests with `swarm_observe` (omit `missionId`) and retry `swarm_launch` with the exact `requestId`.')
+    if (!Array.isArray(a.members)) throw new Error('[members_invalid] members must be an array; pass each member with `key`, `name` and `role` and retry the same `requestId` launch.')
     const members = a.members.map(value => {
       const member = object(value)
       return { key: text(member, 'key'), name: text(member, 'name'), role: text(member, 'role'),
@@ -304,7 +318,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       const syntax = await runProcess(['/bin/sh', '-n', '-c', command], { cwd: request.workspace, signal: actor.signal, timeoutMs: 10000, maxBytes: 2000 })
       if (syntax.exitCode !== 0) syntaxIssues.push(`tasks[${taskIndex}].checks[${checkIndex}] has invalid shell syntax: ${syntax.output.trim()}`)
     }
-    if (syntaxIssues.length) throw new Error(`${syntaxIssues.join('\n')}\nPrefer the existing repository check commands; repair every listed command and retry the complete plan.`)
+    if (syntaxIssues.length) throw new Error(`[check_syntax_invalid] ${syntaxIssues.join('\n')}\nPrefer the existing repository check commands; repair every command in the \`checks\` array and retry the complete plan with the same \`requestId\`.`)
     return runtime.startPlan(actor, requestId, plan)
   })
   register('swarm_budget', 'Owner only: set all six resource ceilings from observed progress, with a reason. Consumed tokens, steps and admitted work are never reset; a paused or blocked mission still needs swarm_control resume.',
@@ -325,8 +339,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_workstream', 'Create a durable workstream in this mission; any member can propose work under it.',
     { ...mission, title: string, objective: string, coordinatorId: string }, ['missionId', 'title', 'objective'],
     (a, actor) => runtime.workstream(actor, text(a, 'missionId'), { title: text(a, 'title'), objective: text(a, 'objective'), coordinatorId: a.coordinatorId as string | undefined }))
-  register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. Repairs name replaces (blocked task ids) and keep their acceptance verbatim. Field errors are yours to correct and retry.',
-    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: strings, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, reviewOf: reviewSchema, replaces: strings },
+  register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. Repairs name replaces (blocked task ids) and keep their acceptance verbatim. To raise a blocked task\'s own ceiling, name it in replaces and pass the raised maxSteps/maxFindings (still refused above the mission budget). Field errors are yours to correct and retry.',
+    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: strings, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, reviewOf: reviewSchema, replaces: strings },
     ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'acceptance'],
     (a, actor) => runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput))
   register('swarm_claim', 'Claim ready work as yourself; ownership is atomic and expires. Use the returned attemptId on every result. The scheduler also assigns idle workers automatically.',

@@ -136,6 +136,14 @@ export interface Mission {
   /** Fingerprint of the last stalled state the owner was notified about; suppresses repeats. */
   stallNotice?: string
   /**
+   * S1: fingerprint of the last state the scheduling-pass watchdog escalated.
+   * Kept separate from `stallNotice` so the pass-level witness (a pass that
+   * neither advanced nor terminated, or one that never returned) does not
+   * silence the board-level stall notice, while still deduplicating repeats for
+   * one unchanged board. Cleared when a pass advances durable state.
+   */
+  schedulingStallNotice?: string
+  /**
    * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
    * `F(S)` of the board state at the moment the last owner-decision notice was
    * emitted, and its witness class. A notice is fresh only for the fingerprint
@@ -149,6 +157,18 @@ export interface Mission {
   budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
   appliedDelivery?: { resultCommit: string; appliedAt: number }
+  /**
+   * S2: the last outbox delivery attempt the pump abandoned at its bound (the
+   * adapter call did not settle). Durable so a starved notice is visible without
+   * the hung call ever returning; cleared by the next successful delivery.
+   */
+  outboxStarved?: { deliveryId: string; attempts: number; at: number }
+  /**
+   * S7: the isolation invariant refusal already recorded for this mission
+   * (`<memberId>:<violation>`). Dedup only: an unchanged violation is not
+   * re-announced, and a changed one is.
+   */
+  isolationRefusal?: string
 }
 /** Host-observed operation; lifecycle timestamps are not a completion estimate. */
 export interface WorkerActivity {
@@ -248,6 +268,14 @@ export interface Task {
   resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout' }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
   closeout?: { nudges: number; at: number }
+  /**
+   * S5: durable form of the adapter's "this member ended a turn while still
+   * owning this attempt" signal. The scheduling path re-reads it from the store
+   * instead of trusting the in-memory `idleSignals` map, which is now only a
+   * cache: a lost cache delays the bounded close-out until lease expiry, it
+   * cannot make the close-out wrong. Attempt-scoped, so a stale signal is inert.
+   */
+  idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
   checkpoint?: { commit: string; at: number }
   /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
@@ -425,6 +453,23 @@ export interface SwarmEvent {
   data: unknown
   createdAt: number
 }
+/**
+ * S6: critical-path accounting for one mission, projected next to its total
+ * spend. `length` is the number of tasks in the longest chain of dependent
+ * steps, so a worker that does not shorten the longest branch earns nothing;
+ * `remaining` is how much of that chain is still open. Pure accounting: the
+ * numbers never change budget enforcement.
+ */
+export interface CriticalPath {
+  /** Tasks in the longest chain of dependent steps (1 when every task is independent). */
+  length: number
+  /** Tasks on that chain that are neither accepted nor cancelled. */
+  remaining: number
+  /** Steps charged to the chain's tasks: the part of the spend the chain owns. */
+  usedSteps: number
+  /** The chain itself, dependency-first. */
+  taskIds: string[]
+}
 export interface Snapshot {
   mission: Mission
   members: Member[]
@@ -437,6 +482,8 @@ export interface Snapshot {
   deliveryTarget?: { taskId: string; commit: string }
   /** Whether control('complete') would be accepted now, with the exact rejection reason. */
   completion?: { eligible: boolean; reason?: string }
+  /** S6: longest chain of dependent steps, reported beside the mission's spend. */
+  criticalPath?: CriticalPath
   /** Last successful apply, projected past the bounded event window. */
   appliedDelivery?: { resultCommit: string; appliedAt?: number }
 }
@@ -639,6 +686,37 @@ export interface WorkerAdapter {
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void>
   dispose(): Promise<void>
 }
+/**
+ * S1: one durable scheduling-pass record per mission (`pass_<missionId>`, the
+ * row is overwritten by each pass). The scheduling guard is this row, re-read
+ * from the store; the in-memory `scheduled` Set it replaces could swallow the
+ * tick timer's only liveness action and leave a mission invisible for 120
+ * minutes. A row whose status is `running` older than the configured bound is
+ * *not* a guard: the watchdog releases it, commits the stall event and lets
+ * later ticks proceed.
+ */
+export interface SchedulingPass {
+  /** Stable row key (`pass_<missionId>`): the guard, re-read from the store. */
+  id: string
+  /** Identity of this pass execution; a released body is fenced by it, never by the stable key. */
+  runId: string
+  /** Runtime process that opened the pass. A row from another instance never gates. */
+  instanceId: string
+  missionId: string
+  status: 'running' | 'finished'
+  startedAt: number
+  finishedAt?: number
+  /** Store revisions around the pass body (the pass's own bookkeeping excluded). */
+  revisionBefore: number
+  revisionAfter?: number
+  /** Mission-scoped durable-state digest before and after the pass body. */
+  fingerprintBefore: string
+  fingerprintAfter?: string
+  /** Consecutive passes that changed no durable mission state and terminated nothing. */
+  noProgressPasses: number
+  /** Set when the pass neither advanced nor terminated within the declared bound. */
+  stalled?: { reason: 'pass-timeout' | 'no-progress'; at: number; boundMs: number; unschedulable: string[] }
+}
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
@@ -652,6 +730,20 @@ export interface RuntimeConfig {
   maxIdleCloseouts?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
+  /**
+   * S1: consecutive scheduling passes that advance no durable mission state and
+   * terminate nothing before the mission escalates. Defaults to 3, i.e. a
+   * window of 3 × `tickMs`; the count and the window are configuration, never a
+   * constant a stalled board can be trapped behind.
+   */
+  stallPasses?: number
+  /**
+   * S1: bound on one scheduling pass before the runtime declares it wedged,
+   * escalates and releases the guard. Defaults to 30 × `tickMs`. A pass is only
+   * declared wedged when the mission has no live lease or in-flight quiescence:
+   * a lease renewed by recorded operations is progress, not a stall.
+   */
+  stallPassTimeoutMs?: number
   /**
    * Human-authorized workspace predicate, loaded once from plugin configuration
    * at start. When present the runtime re-derives every mission's grant root

@@ -130,7 +130,7 @@ export const zh: Record<string, string> = {
   'Cannot complete': '无法完成',
   'Open conversation': '打开对话', 'Mission contract and limits': '任务约定及限制', 'Claims and provenance': '结论及来源',
   'Evidence provenance': '证据来源', 'Recent events': '最近活动', 'ACCEPTED WORK': '已验收任务',
-  'TOKENS USED': '已用令牌', 'STEPS USED': '已用步数', 'WORKERS': '工作智能体',
+  'TOKENS USED': '已用令牌', 'STEPS USED': '已用步数', 'WORKERS': '工作智能体', 'CRITICAL PATH': '关键路径',
   'Usage breakdown': '用量明细', 'Uncached input': '未缓存输入', 'Cache read': '缓存读取', 'Cache write': '缓存写入', 'Output': '输出', 'Requests': '请求数',
   'reasoning': '推理', 'Owner conversation': '主对话', 'steps': '步', 'Worker requests are physical model calls; steps count logical worker turns': '请求数为实际模型调用次数，步数为成员的逻辑执行步',
   'Owner usage is attributed by time window and is not charged to the worker budget.': '主对话用量按时间窗归属到此任务，不计入成员预算。',

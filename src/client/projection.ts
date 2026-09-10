@@ -173,6 +173,11 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     && (candidate.appliedDelivery.appliedAt === undefined || finite(candidate.appliedDelivery.appliedAt)))) return undefined
   if (!['members', 'tasks', 'workstreams', 'evidence', 'events'].every(key => Array.isArray(candidate[key]))) return undefined
   if (candidate.pendingDeliveries !== undefined && !finite(candidate.pendingDeliveries)) return undefined
+  // S6: the critical-path projection is rendered, so it is validated like every
+  // other rendered field; a malformed projection is dropped, not rendered.
+  if (candidate.criticalPath !== undefined && !(record(candidate.criticalPath)
+    && finite(candidate.criticalPath.length) && finite(candidate.criticalPath.remaining)
+    && finite(candidate.criticalPath.usedSteps) && strings(candidate.criticalPath.taskIds))) return undefined
   // Every field a renderer dereferences is validated here: a malformed or
   // version-skewed snapshot must be rejected instead of throwing mid-render.
   if (!(candidate.tasks as unknown[]).every(task => record(task) && typeof task.id === 'string'
