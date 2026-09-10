@@ -502,6 +502,29 @@ function boundedOutput(output: string): string {
 function ambientEnvironment(): Record<string, string> {
   return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
+/** ENV: the scoped roots one declared check receives live under this checkout subdirectory. */
+export const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
+/**
+ * R16-B: the temp root one declared check receives, beside the scoped cache
+ * roots. The check sandbox is rooted at the disposable verification checkout, so
+ * an inherited member scratch root is denied (EPERM) before a fixture can run;
+ * the measured round-15 shape was 2/22 inside the sandbox against 22/22 outside.
+ * TMPDIR/TMP/TEMP therefore point at one directory inside the checkout, created
+ * before the check starts (a TMPDIR that does not exist fails `mkdtemp` with
+ * ENOENT, which would turn the fix into a different failure).
+ *
+ * This is deliberately NOT part of `checkCacheEnvironment`: that record becomes
+ * the envelope's `checkCacheRoots`, which `selfRunEnvironmentFacts` spreads into
+ * a member's self-run facts and re-derives only for the four package-manager
+ * names. Recording a checkout-scoped TMPDIR there would make every self-run
+ * falsely claim the envelope's disposable temp root. The envelope still records
+ * the scoped roots it always did; no new field is added and the blocking half of
+ * `compareCheckEnvironments` sees no new field at all.
+ */
+export function checkTempEnvironment(cacheRoot: string): Record<string, string> {
+  const temp = path.join(cacheRoot, 'tmp')
+  return { TMPDIR: temp, TMP: temp, TEMP: temp }
+}
 /** Whether a path names an existing directory; an absent cache root is recorded, never invented. */
 function isDirectory(target: string | null): boolean {
   if (target === null) return false
@@ -550,11 +573,29 @@ export class Workspaces {
    * are excluded from the reproduction comparison.
    */
   selfRunEnvironment(): CheckEnvironment { return this.checkEnvironment(ambientEnvironment(), CHECKOUT_PLACEHOLDER, false) }
-  /** The environment one declared check receives, including the scoped cache roots. */
+  /**
+   * R16-B: the environment one declared check receives. The scoped roots are
+   * merged LAST so they win over the adapter's overlay (`checkEnv`), which is the
+   * member session's environment and names the member's scratch root as TMPDIR:
+   * the check sandbox is rooted at the checkout, so that inherited root is denied
+   * and every fixture that calls `mkdtemp` dies before its first assertion.
+   *
+   * Co-firing guards, named: the sandbox policy the envelope records (workspace-write
+   * rooted at the checkout — the temp root must be inside that root) x the
+   * dependency-link exclusion in capture (the checkout is a disposable git
+   * worktree of the artifact commit; `.swarm-check-cache` is untracked there and
+   * is removed with the checkout, so the redirect adds no capture noise) x the
+   * ENV reproduction comparison (TMPDIR/TMP/TEMP are not envelope fields; see
+   * `checkTempEnvironment` for why recording them as a scoped root would lie).
+   */
   private checkProcessEnv(checkout: string): Record<string, string> {
     const cache = this.checkCacheEnvironment(checkout)
-    if (this.options.checkEnv !== undefined) return { ...cache, ...this.options.checkEnv }
-    return { ...ambientEnvironment(), ...cache }
+    const temp = checkTempEnvironment(this.checkCacheRoot(checkout))
+    // The overlay, when present, is the base — the ambient environment is NOT
+    // merged under it, because the overlay is what scrubbed the parent's
+    // node-test context (`NODE_TEST_CONTEXT` makes a nested `node --test` report
+    // success without running the file) and re-adding it would undo the scrub.
+    return { ...(this.options.checkEnv ?? ambientEnvironment()), ...cache, ...temp }
   }
   /** ENV: turn a process environment into the facts the envelope records. */
   private checkEnvironment(env: Record<string, string>, checkout: string, scoped: boolean): CheckEnvironment {
@@ -572,7 +613,7 @@ export class Workspaces {
       sandboxPolicy: { mode: this.options.sandboxPolicy?.mode ?? 'workspace-write', enforcement: this.options.sandboxPolicy?.enforcement ?? 'full',
         workspaceRoot: scoped ? checkout : null },
       dependencyLinks: { mode: this.dependencyMode(), dirs: [...(this.options.verificationDependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)] },
-      checkCacheRoot: scoped ? path.join(checkout, '.swarm-check-cache') : null,
+      checkCacheRoot: scoped ? this.checkCacheRoot(checkout) : null,
       checkCacheRoots: roots,
     }
   }
@@ -1243,7 +1284,13 @@ export class Workspaces {
         await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
         await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
-        await mkdir(path.join(checkout, '.swarm-check-cache'), { recursive: true, mode: 0o700 }).catch(() => undefined)
+        // R16-B: both scoped roots are created before the check starts. The temp
+        // root must exist: a TMPDIR pointing at a missing directory fails
+        // `mkdtemp` with ENOENT, which is a different failure from the denied
+        // member scratch root this redirects away from.
+        const cacheRoot = this.checkCacheRoot(checkout)
+        await mkdir(cacheRoot, { recursive: true, mode: 0o700 }).catch(() => undefined)
+        await mkdir(path.join(cacheRoot, 'tmp'), { recursive: true, mode: 0o700 }).catch(() => undefined)
         const env = this.checkProcessEnv(checkout)
         // ENV: the facts this check runs under, recorded with it so a reader can
         // compare them with the envelope delivered to the assignee.
@@ -1283,9 +1330,12 @@ export class Workspaces {
     }, signal)
   }
 
+  /** The scoped cache root inside one disposable verification checkout. */
+  private checkCacheRoot(checkout: string): string { return path.join(checkout, CHECK_CACHE_DIRNAME) }
+
   /** Keep package-manager caches inside the disposable checkout, never the source. */
   private checkCacheEnvironment(checkout: string): Record<string, string> {
-    const cache = path.join(checkout, '.swarm-check-cache')
+    const cache = this.checkCacheRoot(checkout)
     return {
       npm_config_cache: path.join(cache, 'npm'),
       YARN_CACHE_FOLDER: path.join(cache, 'yarn'),
