@@ -18,7 +18,7 @@ import { readFile, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import {
-  TraceContractError, TracePayloadStore, ReplayCorruptionError, ReplayDivergenceError, ReplayTruncationError,
+  TraceContractError, TracePayloadStore, ReplayCorruptionError, ReplayDivergenceError, ReplayGraphError, ReplayTruncationError,
   assertReplayParity, decodeDurableLog, orchestratorCommands, replayDigest, replayLabels, stableCommandKey, traceMetrics,
 } from '../../lib/trace.js'
 import { runScenario } from './scenario.mjs'
@@ -111,6 +111,23 @@ async function main() {
       expect(cut > 0, 'scenario never accepted the reviewed source')
       orchestratorCommands(events.slice(0, cut))
     })
+    // DEAD: the graph validator runs on the replay path with the same function
+    // admission uses, so a hand-corrupted graph is refused, not replayed.
+    await expectFailure('illegal graph: dangling dependency', 'ReplayGraphError', () => {
+      const bad = structuredClone(events)
+      const proposed = bad.find(event => event.type === 'task/proposed' && Array.isArray(event.data.dependencies))
+      expect(proposed !== undefined, 'the scenario never proposed a task with a dependency list')
+      proposed.data.dependencies = [...proposed.data.dependencies, 'task_never_admitted']
+      orchestratorCommands(bad)
+    })
+    await expectFailure('illegal graph: dependency cycle', 'ReplayGraphError', () => {
+      const bad = structuredClone(events)
+      const proposed = bad.filter(event => event.type === 'task/proposed')
+      expect(proposed.length >= 2, `the scenario must propose at least two tasks to carry a cycle, saw ${proposed.length}`)
+      proposed[0].data.dependencies = [proposed[1].data.id]
+      proposed[1].data.dependencies = [proposed[0].data.id]
+      orchestratorCommands(bad)
+    })
     await expectFailure('tampered dispatch', 'ReplayDivergenceError', () => {
       const bad = structuredClone(events)
       const claim = bad.find(event => event.type === 'task/claimed')
@@ -137,6 +154,6 @@ async function main() {
 
 main().catch(error => {
   console.error(`REPLAY FAILED: ${error?.name ?? 'Error'}: ${error?.message ?? error}`)
-  if (error instanceof ReplayDivergenceError || error instanceof ReplayTruncationError || error instanceof ReplayCorruptionError || error instanceof TraceContractError) console.error(`  ${error.name}: ${JSON.stringify({ index: error.index, expected: error.expected, actual: error.actual, unresolved: error.unresolved, seq: error.seq })}`)
+  if (error instanceof ReplayDivergenceError || error instanceof ReplayTruncationError || error instanceof ReplayCorruptionError || error instanceof TraceContractError || error instanceof ReplayGraphError) console.error(`  ${error.name}: ${JSON.stringify({ index: error.index, expected: error.expected, actual: error.actual, unresolved: error.unresolved, seq: error.seq, defects: error.defects })}`)
   process.exitCode = 1
 })

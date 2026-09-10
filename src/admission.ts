@@ -57,6 +57,96 @@ export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T
     && (review.assigneeId === undefined || liveMemberIds.has(review.assigneeId)))
 }
 
+/* ------------------------------------------------------------------------- *
+ * Round 14 DEAD: the durable task-graph validator.
+ *
+ * An illegal graph — an edge to an identity no task carries, an edge to itself,
+ * a duplicated identity, or a dependency/review cycle — must not exist in the
+ * durable log at all, so the check runs on every path that can write state:
+ *  - admission: `reconcileTaskAdmission`, which the propose path calls with the
+ *    mission's durable identities in `knownContents`;
+ *  - replay: `orchestratorCommands` in `src/trace.ts`, over the `task/proposed`
+ *    graph reconstructed from the durable log.
+ * One function, two callers, so the two paths cannot drift into separate rule
+ * sets. Pure and total: it reads only its arguments and never throws; each
+ * caller decides whether a defect is a refusal (it is, on both paths).
+ * ------------------------------------------------------------------------- */
+
+/** One node of the durable task graph: exactly the edges the runtime stores. */
+export interface TaskGraphNode {
+  id: string
+  dependencies: readonly string[]
+  reviewOf?: string
+}
+
+export type TaskGraphDefectCode = 'task_graph_duplicate' | 'task_graph_self_edge' | 'task_graph_unknown_edge' | 'task_graph_cycle'
+
+export interface TaskGraphDefect {
+  code: TaskGraphDefectCode
+  taskId: string
+  target: string
+  message: string
+}
+
+/**
+ * Every defect in `nodes`. `known` is the set of identities the caller can prove
+ * exist — the mission's durable task ids at admission, the replayed ids on the
+ * replay path; when it is omitted, the node ids are the known set. The edges of
+ * a node are its `dependencies` plus its `reviewOf` source, which `prepareTask`
+ * merges into the worktree like a dependency.
+ */
+export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: ReadonlySet<string>): TaskGraphDefect[] {
+  const defects: TaskGraphDefect[] = []
+  const knownIds = known ?? new Set(nodes.map(node => node.id))
+  const seen = new Set<string>()
+  const edges = (node: TaskGraphNode): string[] => [...node.dependencies, ...(node.reviewOf === undefined ? [] : [node.reviewOf])]
+  for (const node of nodes) {
+    if (seen.has(node.id)) {
+      defects.push({ code: 'task_graph_duplicate', taskId: node.id, target: node.id,
+        message: `task ${JSON.stringify(node.id)} appears more than once in the graph, so its edges are ambiguous. Withdraw the duplicate with \`swarm_cancel\` by naming its \`taskId\` and a \`reason\`, then re-check the board with \`swarm_observe\` and its \`taskId\`, and retry the same task/request.` })
+    }
+    seen.add(node.id)
+  }
+  for (const node of nodes) for (const target of edges(node)) {
+    if (target === node.id) {
+      defects.push({ code: 'task_graph_self_edge', taskId: node.id, target,
+        message: `task ${JSON.stringify(node.id)} declares an edge to itself. Remove ${JSON.stringify(node.id)} from its own \`dependencies\` and re-propose it with \`swarm_propose\`, then retry the same task/request.` })
+      continue
+    }
+    if (!knownIds.has(target)) {
+      defects.push({ code: 'task_graph_unknown_edge', taskId: node.id, target,
+        message: `task ${JSON.stringify(node.id)} declares edge ${JSON.stringify(target)}, which no task in this mission carries. Add the task that carries it with \`swarm_propose\` by passing its \`dependencies\`, or remove the edge from \`dependencies\`/\`reviewOf\` and retry the same task/request.` })
+    }
+  }
+  // A cycle is an edge that closes a path back to a node already on the current
+  // depth-first stack; one defect per closing edge, naming both ends.
+  const byId = new Map(nodes.map(node => [node.id, node]))
+  const open = new Set<string>()
+  const done = new Set<string>()
+  const visit = (id: string): void => {
+    if (open.has(id) || done.has(id)) return
+    open.add(id)
+    const node = byId.get(id)
+    for (const target of node === undefined ? [] : edges(node)) {
+      if (target === id || !byId.has(target)) continue
+      if (open.has(target)) {
+        defects.push({ code: 'task_graph_cycle', taskId: id, target,
+          message: `task ${JSON.stringify(id)} depends on ${JSON.stringify(target)}, which (directly or through other tasks) depends back on it, so neither can ever be accepted first. Remove one edge of the cycle from \`dependencies\` or \`reviewOf\` and re-propose the work with \`swarm_propose\`, then retry the same task/request.` })
+        continue
+      }
+      visit(target)
+    }
+    open.delete(id); done.add(id)
+  }
+  for (const node of nodes) visit(node.id)
+  return defects
+}
+
+/** Render one defect as an admission diagnostic; the code is the same token. */
+export function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): AdmissionDiagnostic {
+  return { code: defect.code, location, path: defect.target, message: defect.message }
+}
+
 /** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
 export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
   // The message is the caller's reason; the only call site (Runtime's review
@@ -336,6 +426,16 @@ export function reconcileTaskAdmission(task: TaskAdmissionInput, workspace: stri
   // It fires only when the caller supplies the task's dependency set, so a call
   // site that does not know the edges can never refuse a legitimate task.
   diagnostics.push(...dependencyAssumptions(task, location, context))
+  // DEAD, admission-time half: the same graph validator the replay path runs.
+  // It fires only when the caller supplies the mission's durable identities —
+  // without them, "unknown edge" cannot be distinguished from "not loaded yet",
+  // and the guard must never guess. The candidate's own id is not part of the
+  // admission input, so the self-edge and cycle checks are the replay path's
+  // (a brand-new node cannot close a cycle: nothing references it yet).
+  if (context.knownContents !== undefined) {
+    const candidate: TaskGraphNode = { id: `${location} candidate`, dependencies: context.dependencies ?? task.dependencies ?? [] }
+    for (const defect of taskGraphDefects([candidate], context.knownContents)) diagnostics.push(taskGraphDiagnostic(defect, location))
+  }
   return diagnostics
 }
 

@@ -18,6 +18,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import type { SwarmEvent } from './types.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
@@ -70,6 +71,16 @@ export class ReplayTruncationError extends Error {
 }
 export class ReplayDivergenceError extends Error {
   constructor(message: string, readonly index: number, readonly expected?: string, readonly actual?: string) { super(message); this.name = 'ReplayDivergenceError' }
+}
+/**
+ * DEAD: the replayed task graph is illegal (an unknown edge, a self edge, a
+ * duplicated identity or a cycle). The same validator runs at admission
+ * (`reconcileTaskAdmission`, src/admission.ts), so an illegal graph cannot exist
+ * in the durable log at all; a log that carries one is refused here instead of
+ * being replayed into a sequence of commands that never really happened.
+ */
+export class ReplayGraphError extends Error {
+  constructor(message: string, readonly defects: readonly TaskGraphDefect[]) { super(message); this.name = 'ReplayGraphError' }
 }
 
 /** Deterministic JSON so a digest is stable across processes and key order. */
@@ -588,6 +599,24 @@ export interface ReplayResult {
 export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResult {
   const commands: ReplayCommand[] = []
   const open = new Map<string, { taskId: string; memberId: string }>()
+  // DEAD: the same graph validator the admission path runs, over the graph the
+  // durable log carries. A log whose `task/proposed` rows describe an illegal
+  // graph is refused here, before any command is derived from it, rather than
+  // replayed into a sequence that no legal mission could have produced.
+  const graph: TaskGraphNode[] = []
+  for (const event of events) {
+    if (event.type !== 'task/proposed') continue
+    const data = asObject(event.data, event.seq, event.type)
+    graph.push({
+      id: required(data, 'id', event.seq),
+      dependencies: Array.isArray(data.dependencies) ? data.dependencies.filter((id): id is string => typeof id === 'string') : [],
+      ...(typeof data.reviewOf === 'string' && data.reviewOf ? { reviewOf: data.reviewOf } : {}),
+    })
+  }
+  const graphDefects = taskGraphDefects(graph)
+  if (graphDefects.length > 0) {
+    throw new ReplayGraphError(`replayed task graph is illegal: ${graphDefects.map(defect => defect.message).join(' ')}`, graphDefects)
+  }
   let previous = 0
   for (const event of events) {
     if (!Number.isSafeInteger(event.seq) || event.seq <= previous) throw new ReplayCorruptionError(`durable log is not ordered at seq ${String(event.seq)}`, event.seq)
