@@ -648,7 +648,7 @@ export class SwarmRuntime {
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
   private readonly notices = new Notices(this)
-  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string): void { return this.notices.notify(missionId, content, from, noticeClass, dedupe, dedupKey) }
+  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string, subjects?: string[]): void { return this.notices.notify(missionId, content, from, noticeClass, dedupe, dedupKey, subjects) }
   noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
   private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
@@ -1955,7 +1955,7 @@ export class SwarmRuntime {
     if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && m.status !== 'stopped')) throw new Error('Unknown new owner')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
-    task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff' }
+    task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', at: Date.now() }
     this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary }) })
     this.defer(async () => {
       await this.workers.stop(member.id)

@@ -330,7 +330,7 @@ export class Attempts {
     // instead of a different member starting from the mission baseline.
     current.assigneeId = member.id
     current.plannedAssigneeId ??= member.id
-    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout' }
+    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout', at: Date.now() }
     const epoch = current.epoch
     this.rt.commit(mission.id, () => {
       this.rt.store.put('tasks', current)
@@ -462,7 +462,7 @@ export class Attempts {
           const planned = expiring.plannedAssigneeId === undefined ? undefined : this.rt.store.get('members', expiring.plannedAssigneeId)
           if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
           else delete expiring.assigneeId
-          expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired' }
+          expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired', at: Date.now() }
           this.rt.commit(missionId, () => { this.rt.store.put('tasks', expiring); this.rt.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner }) })
           await this.rt.workers.stop(oldOwner)
           const reopened = this.rt.task(missionId, task.id)

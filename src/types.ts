@@ -287,7 +287,7 @@ export interface Task {
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
   budgetResume?: { pauseId: string; attemptId: string; epoch: number }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
-  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout' }
+  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
   closeout?: { nudges: number; at: number }
   /**
@@ -462,6 +462,13 @@ export interface Delivery {
   deliveredAt?: number
   taskId?: string
   attemptId?: string
+  /**
+   * R14-F2(a): the tasks this notice is about, as `taskId@epoch`, written in the
+   * same transaction as the state transition that produced it. A notice can then
+   * be deduplicated against other notices about the same task instead of being
+   * consumed by an unrelated one.
+   */
+  subjects?: string[]
   /** Present on owner notices: dedup key and sent/queued/claimed lifecycle. */
   notice?: NoticeEnvelope
   /** Present when this delivery carries a typed owner escalation. */
