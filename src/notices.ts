@@ -74,6 +74,49 @@ export interface NotifyOptions {
 const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
 
 /**
+ * R16-A: the durable families of owner decisions. A family is read from the
+ * dedup key the runtime itself writes (never from prose), because that key is the
+ * identity the notice ledger and the dedup logic already use.
+ */
+const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'guard-terminal', 'integration-gap', 'parked', 'review-blocked'] as const
+/**
+ * The families whose claim is "no live path will advance this subject". Only
+ * these can be false wakes when the named subject's lineage is live. A
+ * `dispatch-question` or `guard-terminal` names a subject for a different claim
+ * and is deliberately not judged by the wake-precision predicate.
+ */
+const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])
+
+/** R16-A: the family of one durable owner notice, from its dedup key or class. */
+export function noticeFamily(delivery: Pick<Delivery, 'notice' | 'kind'>): string {
+  const key = delivery.notice?.dedupKey ?? ''
+  const prefix = key.includes(':') ? key.slice(0, key.indexOf(':')) : ''
+  if ((DECISION_FAMILIES as readonly string[]).includes(prefix)) return prefix
+  if (delivery.kind === 'escalation' || delivery.notice?.class === 'escalation') return 'escalation'
+  return delivery.notice?.class ?? 'unknown'
+}
+
+/** R16-A: the task a `taskId@epoch` subject names, only while that epoch is still the live row. */
+function taskFromSubject(subject: string, tasks: readonly Task[]): Task | undefined {
+  const match = /^(.*)@(\d+)$/.exec(subject)
+  if (match === null) return undefined
+  const task = tasks.find(candidate => candidate.id === match[1])
+  return task !== undefined && task.epoch === Number(match[2]) ? task : undefined
+}
+
+/**
+ * R16-A: the durable wake-precision projection. Counts owner decisions by family,
+ * false wakes and missed obligations from the store alone.
+ */
+export interface WakePrecision {
+  missionId: string
+  decisions: { total: number; byFamily: Record<string, number> }
+  falseWakes: { total: number; byFamily: Record<string, number>; subjects: string[] }
+  missedObligations: { total: number; subjects: string[] }
+  note: string
+}
+
+/**
  * F2: how long a submitted code deliverable may stay without a live review
  * before the runtime concludes none is coming. One scheduler period gives the
  * author the turn in which it submitted to propose its own review; the floor
@@ -164,6 +207,18 @@ export class Notices {
   }
 
   /**
+   * R16-A: the single owner gate for the read-only owner instruments. The notice
+   * ledger and the wake-precision projection ask the same question, so the second
+   * instrument reuses this one refusal site instead of adding another: the
+   * retained S3 inventory counts uncoded throw sites and may only shrink, and the
+   * ledger's observable message is preserved verbatim through `instrument`.
+   */
+  private requireOwner(actor: Actor, missionId: string, instrument: string): void {
+    const { owner } = this.rt.participant(actor, missionId)
+    if (!owner) throw new Error(`Only the mission owner can read the ${instrument}`)
+  }
+
+  /**
    * Read-only notice-delivery ledger: every owner notice with its class, dedup
    * key and sent/queued/claimed lifecycle, newest first. Owner-only: owner
    * notices are control-plane decisions, not worker-visible board content.
@@ -183,8 +238,7 @@ export class Notices {
    * row, not the prose, is the authority for what the notice was about).
    */
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown {
-    const { owner } = this.rt.participant(actor, missionId)
-    if (!owner) throw new Error('Only the mission owner can read the notice-delivery ledger')
+    this.requireOwner(actor, missionId, 'notice-delivery ledger')
     const limit = query.limit === undefined ? 20 : Math.max(1, Math.min(100, Math.trunc(query.limit)))
     const rows = this.rt.store.list('deliveries', missionId)
     const subjectRow = (deliveryId: string): string[] | undefined => {
@@ -213,6 +267,73 @@ export class Notices {
     requireText(text, 'content')
     if (text.length > this.rt.config.maxMessageChars) throw new Error(`Content exceeds ${this.rt.config.maxMessageChars} characters`)
     return text
+  }
+
+  /**
+   * R16-A precision instrument: the wake precision of one mission's owner
+   * decisions, projected from durable rows only (deliveries, tasks and the
+   * submission events), never from a cache or from notice prose. It answers three
+   * questions the round's outcome report needs as numbers:
+   *
+   * - decisions by family: how many owner notices of each durable family the
+   *   mission produced (the family is the dedup key the runtime itself wrote);
+   * - false wakes: a decision of a family that claims "no live path will advance
+   *   this subject" (fall-through, stall-root) naming a subject whose lineage
+   *   still has a live path on the durable board. `waitsLegitimately` is the
+   *   classifier; for a stall root the question is whether the same row is still
+   *   a root now (`stallRoots`), because a blocked root may legitimately wait on
+   *   a live predecessor while still owing a repair decision;
+   * - missed obligations: a non-terminal task with no live path that no owner
+   *   decision names at its current epoch.
+   *
+   * Boundary (stated, not hidden): the judgement is made against the durable rows
+   * at READ time. A decision whose subject has since advanced to another epoch is
+   * not judged — its epoch is gone from the board — so historical false wakes are
+   * not reconstructed here; the projection measures whether the decisions still
+   * standing on the board are true now. Read-only: it changes no task, member,
+   * budget or delivery state.
+   */
+  wakePrecision(actor: Actor, missionId: string): WakePrecision {
+    this.requireOwner(actor, missionId, 'wake-precision projection')
+    const tasks = this.rt.store.list('tasks', missionId)
+    const deliveries = this.rt.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner')
+    const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))
+    const byFamily: Record<string, number> = {}
+    const falseByFamily: Record<string, number> = {}
+    const falseSubjects: string[] = []
+    const named = new Set<string>()
+    for (const delivery of deliveries) {
+      const family = noticeFamily(delivery)
+      byFamily[family] = (byFamily[family] ?? 0) + 1
+      for (const subject of delivery.subjects ?? []) named.add(subject)
+      if (!NO_LIVE_PATH_FAMILIES.has(family)) continue
+      for (const subject of delivery.subjects ?? []) {
+        const task = taskFromSubject(subject, tasks)
+        if (task === undefined) continue
+        const falseWake = family === 'stall-root'
+          ? task.status === 'blocked' && !roots.has(subject)
+          : this.waitsLegitimately(task, tasks)
+        if (!falseWake) continue
+        falseByFamily[family] = (falseByFamily[family] ?? 0) + 1
+        falseSubjects.push(subject)
+      }
+    }
+    const missed: string[] = []
+    for (const task of tasks) {
+      if (TERMINAL_STATES.has(task.status)) continue
+      if (this.waitsLegitimately(task, tasks)) continue
+      const subject = taskSubject(task)
+      if (named.has(subject)) continue
+      missed.push(subject)
+    }
+    const uniqueFalseSubjects = [...new Set(falseSubjects)]
+    return {
+      missionId,
+      decisions: { total: deliveries.length, byFamily },
+      falseWakes: { total: uniqueFalseSubjects.length, byFamily: falseByFamily, subjects: uniqueFalseSubjects },
+      missedObligations: { total: missed.length, subjects: missed },
+      note: 'Read-only projection over the durable rows at read time. `byFamily` comes from the notice dedup keys the runtime wrote. A false wake is a fall-through naming a subject `waitsLegitimately` still recognises, or a stall-root whose row is still blocked at that epoch and is no longer in `stallRoots`. A missed obligation is a non-terminal task with no live path that no owner decision names at its current epoch. A decision whose subject has advanced epochs is not judged against the current board.',
+    }
   }
 
   /**
@@ -411,16 +532,7 @@ export class Notices {
    */
   stallRoots(tasks: Task[]): Task[] {
     // A live replacement marks every id in its transitive lineage as covered.
-    const replaced = new Set<string>()
-    const cover = (task: Task): void => {
-      for (const source of task.replaces ?? []) {
-        if (replaced.has(source)) continue
-        replaced.add(source)
-        const origin = tasks.find(candidate => candidate.id === source)
-        if (origin !== undefined) cover(origin)
-      }
-    }
-    for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) cover(task)
+    const replaced = this.replacementCoverage(tasks)
     return tasks.filter(task => {
       if (task.status !== 'blocked' || replaced.has(task.id)) return false
       // A verdict record is not a repairable root: its source carries the repair.
@@ -436,7 +548,41 @@ export class Notices {
     })
   }
 
-  /** R14-F2(b): the tasks that depend on one root, transitively, still unfinished. */
+  /**
+   * R16-A: the ids whose obligation is carried by a live task through `replaces`,
+   * transitively. Shared by `stallRoots` (a covered task is not a root) and
+   * `waitsLegitimately` (a covered task is waiting on its repair), so the two
+   * classifiers cannot disagree about a task that is inside a live lineage.
+   * Co-fires with: the lineage-resolved dependency rule (both read the same
+   * durable `replaces` edges the dispatcher's `effectiveDependency` walks) and
+   * the fall-through, which may name a subject only when this set does not
+   * contain it.
+   */
+  private replacementCoverage(tasks: Task[]): Set<string> {
+    const replaced = new Set<string>()
+    const cover = (task: Task): void => {
+      for (const source of task.replaces ?? []) {
+        if (replaced.has(source)) continue
+        replaced.add(source)
+        const origin = tasks.find(candidate => candidate.id === source)
+        if (origin !== undefined) cover(origin)
+      }
+    }
+    for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) cover(task)
+    return replaced
+  }
+
+  /**
+   * R14-F2(b): the tasks that depend on one root, transitively, still unfinished.
+   *
+   * R16-A: the edge set is the durable one the board really has — `dependencies`,
+   * `replaces` AND `reviewOf`. A blocked source's notice now enumerates the
+   * pending review that waits on it, so the review's subject is not left out of
+   * the decision the source's repair owes. Co-fires with: the stall-root
+   * classifier (which is what calls this) and the review-grace rule in
+   * `waitsLegitimately` (a review whose source is terminal is dead and named;
+   * while the source is live this enumeration is how its notice names the review).
+   */
   dependentsOf(root: Task, tasks: Task[]): Task[] {
     const found = new Map<string, Task>()
     let grew = true
@@ -444,7 +590,7 @@ export class Notices {
       grew = false
       for (const task of tasks) {
         if (task.id === root.id || TERMINAL_STATES.has(task.status) || found.has(task.id)) continue
-        const dependsOnRoot = [root.id, ...found.keys()].some(id => task.dependencies.includes(id) || (task.replaces ?? []).includes(id))
+        const dependsOnRoot = [root.id, ...found.keys()].some(id => task.dependencies.includes(id) || (task.replaces ?? []).includes(id) || task.reviewOf === id)
         if (dependsOnRoot) { found.set(task.id, task); grew = true }
       }
     }
@@ -453,14 +599,32 @@ export class Notices {
 
   /**
    * R14-F2(c): whether an unfinished task is waiting on something still alive —
-   * a live lease, the bounded review grace, a stop inside its bound, or an
-   * unfinished predecessor. Anything else is unnamed silence and must escalate.
+   * a live lease, the bounded review grace, a stop inside its bound, a live
+   * repair carrying its obligation, or an unfinished EFFECTIVE predecessor.
+   * Anything else is unnamed silence and must escalate.
+   *
+   * R16-A: the predecessor edge is resolved through the dispatcher's own lineage
+   * seam (`rt.unfinishedDependencies`), never the raw id, so a task whose
+   * cancelled dependency has a live running repair is waiting, not dead. And a
+   * task whose own obligation is carried by a live replacement is waiting too,
+   * read from the same coverage `stallRoots` uses, so the fall-through can name a
+   * subject only when its whole lineage is terminal.
+   *
+   * Co-firing guards, named: this classifier x the stall-root classifier (a
+   * blocked predecessor is the ROOT's subject, named by the root notice with its
+   * dependents, never re-named here) x the review grace (`reviewable` and the
+   * review-admission terminal: a pending review follows its SOURCE identity, so a
+   * cancelled source with a live repair still has no review path) x the off-pass
+   * wedged-pass classification (D1/D2: the wedge changes who generates the
+   * decision, never which boards are waiting).
    */
   waitsLegitimately(task: Task, tasks: Task[]): boolean {
-    const unfinished = (id: string): boolean => {
-      const found = tasks.find(candidate => candidate.id === id)
-      return found !== undefined && !TERMINAL_STATES.has(found.status)
-    }
+    if (TERMINAL_STATES.has(task.status)) return false
+    // R16-A: a task whose obligation is carried by a live replacement has a live
+    // path whatever its own row says — the repair advances it. Exactly the
+    // coverage `stallRoots` reads to keep a replaced task from being named as a
+    // root, so the two classifiers agree instead of each inventing a rule.
+    if (this.replacementCoverage(tasks).has(task.id)) return true
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
     if (task.status === 'submitted') {
       const submission = this.rt.latestSubmission(task.missionId, task.id)
@@ -474,8 +638,7 @@ export class Notices {
       // keeps the two in agreement instead of leaving the state both silent and
       // unnamed (a pre-upgrade durable row reaches exactly this shape).
       if (stop !== undefined) return stop.at !== undefined && Date.now() - stop.at <= this.rt.stallPassTimeoutMs
-      if (task.dependencies.some(unfinished)) return true
-      return false
+      return this.rt.unfinishedDependencies(task.missionId, task, tasks).length > 0
     }
     if (task.status === 'pending') {
       // R15-F1: a verification task carries no `dependencies` by protocol; its
@@ -486,6 +649,9 @@ export class Notices {
       // worked is a false notice (found live on T1v/T2v/T3v). A source that is
       // terminal or missing can never make the review dispatchable again, so that
       // state is NOT waiting and stays in the fall-through's named escalation.
+      // The edge is the SOURCE IDENTITY, not the obligation: a cancelled source
+      // with a live repair still leaves this review without a path, exactly as
+      // `capable` says (`source.status !== 'submitted'`).
       //
       // Co-firing guards: this classifier x the stall-root classifier (a blocked
       // source is the root's subject, not this review's) and x `reviewable`/the
@@ -494,7 +660,7 @@ export class Notices {
         const source = tasks.find(candidate => candidate.id === task.reviewOf)
         return source !== undefined && !TERMINAL_STATES.has(source.status)
       }
-      return task.dependencies.some(unfinished)
+      return this.rt.unfinishedDependencies(task.missionId, task, tasks).length > 0
     }
     return false
   }

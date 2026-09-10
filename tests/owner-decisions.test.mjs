@@ -29,6 +29,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
+import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 
@@ -613,4 +614,466 @@ test('R15-B: the sidebar phase, recovery age and pending decision come from dura
   const working = sidebarState(snapshot([{ id: 't5', epoch: 1, status: 'running', kind: 'implementation', dependencies: [], createdAt: 1 }]), 'connected', 2000)
   assert.equal(working.phase, 'working')
   assert.equal(working.modelTurn, false)
+})
+
+/**
+ * R16-A: wake precision. The fall-through classifier resolves a dependency
+ * through the EFFECTIVE replacement lineage (`runtime.effectiveDependency`), not
+ * the raw id, and a task whose own obligation is carried by a live replacement is
+ * waiting rather than dead. The measured defect: `task.dependencies.some(unfinished)`
+ * named a dependent seven times on the round-15 mission while the running repair
+ * of its cancelled dependency was the live path.
+ *
+ * The tests below ENUMERATE the classifier over constructed boards instead of
+ * sampling examples: every (predecessor status × repair status × subject status ×
+ * stop shape × review shape) combination is materialised as durable rows and
+ * compared with an independent reference that reads the runtime's lineage seam
+ * directly, and the emitted notices are checked against the same rules.
+ */
+
+const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
+
+/**
+ * R16-A1r2: whether the runtime's OWN lineage seam carries this task's
+ * obligation — the effective dependency differs from the task and is not
+ * terminal. This is `runtime.effectiveDependency`, the same walk the dispatcher
+ * uses, so the coverage predicate is never checked against a test-local copy of
+ * the production helper (that copy hid a non-transitive production helper: a
+ * two-hop repair chain still covered the original through the seam while the
+ * weakened classifier did not).
+ */
+function referenceCarried(runtime, missionId, task, tasks) {
+  const tail = runtime.effectiveDependency(missionId, task.id, tasks)
+  return tail.id !== task.id && !TERMINAL_STATES.has(tail.status)
+}
+
+/**
+ * The independent reference for `waitsLegitimately`, written against the
+ * runtime's own lineage seam (`effectiveDependency`) rather than the classifier.
+ * Removing the lineage resolution from the classifier makes these disagree on
+ * the cancelled-A / live-A' / B-depends-on-A board, and a non-transitive
+ * replacement-coverage helper makes them disagree on the two-hop chain, which is
+ * what the mutation proofs exercise.
+ */
+function referenceWaiting(runtime, missionId, task, tasks) {
+  if (TERMINAL_STATES.has(task.status)) return false
+  if (referenceCarried(runtime, missionId, task, tasks)) return true
+  if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
+  if (task.status === 'submitted') {
+    const submission = runtime.latestSubmission(missionId, task.id)
+    return submission === undefined || submission.age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+  }
+  if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
+    const stop = task.resumeAfterStop
+    return stop.at !== undefined && Date.now() - stop.at <= runtime.stallPassTimeoutMs
+  }
+  if (task.status === 'pending' && task.reviewOf !== undefined) {
+    const source = tasks.find(candidate => candidate.id === task.reviewOf)
+    return source !== undefined && !TERMINAL_STATES.has(source.status)
+  }
+  return task.dependencies.some(id => {
+    if (!tasks.some(candidate => candidate.id === id)) return false
+    return !TERMINAL_STATES.has(runtime.effectiveDependency(missionId, id, tasks).status)
+  })
+}
+
+/** The independent reference for `stallRoots` membership of one blocked task. */
+function referenceStallRoot(runtime, missionId, task, tasks, stallPassTimeoutMs) {
+  if (task.status !== 'blocked') return false
+  if (referenceCarried(runtime, missionId, task, tasks)) return false
+  if (task.reviewOf !== undefined) return false
+  const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+  if (stop === undefined) return true
+  return stop.at === undefined || Date.now() - stop.at > stallPassTimeoutMs
+}
+
+test('R16-A1: the waiting classifier is enumerated over every constructed board and resolves through the effective lineage', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: 'r16-a1' }
+  const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const now = Date.now()
+  let seq = 0
+  const materialize = (id, status, extra = {}) => {
+    const row = {
+      id, missionId: mission.id, workstreamId: stream.id, title: id, objective: id, kind: 'implementation',
+      dependencies: [], scope: ['src/'], acceptance: ['works'], checks: [], priority: 50, experiment: false,
+      status, epoch: 1, proposedBy: 'owner', evidenceIds: [], createdAt: now, maxSteps: 10, maxFindings: 5, ...extra,
+    }
+    f.runtime.store.put('tasks', row)
+    return row
+  }
+  const depStatuses = ['pending', 'running', 'submitted', 'blocked', 'accepted', 'cancelled', 'missing']
+  const replacementStatuses = ['none', 'pending', 'running', 'submitted', 'accepted', 'cancelled']
+  const subjectStatuses = ['pending', 'blocked', 'running', 'submitted']
+  const stopShapes = ['none', 'in-bound', 'expired', 'unbounded']
+  const reviewShapes = ['none', 'live', 'terminal', 'missing']
+  const mismatches = []
+  const naiveDivergences = []
+  const naiveWaiting = (task, tasks) => {
+    // The pre-fix rule: raw ids, no lineage, no replacement coverage.
+    if (TERMINAL_STATES.has(task.status)) return false
+    if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
+    if (task.status === 'submitted') {
+      const submission = f.runtime.latestSubmission(mission.id, task.id)
+      return submission === undefined || submission.age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    }
+    if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
+      const stop = task.resumeAfterStop
+      return stop.at !== undefined && Date.now() - stop.at <= f.runtime.stallPassTimeoutMs
+    }
+    if (task.status === 'pending' && task.reviewOf !== undefined) {
+      const source = tasks.find(candidate => candidate.id === task.reviewOf)
+      return source !== undefined && !TERMINAL_STATES.has(source.status)
+    }
+    return task.dependencies.some(id => {
+      const found = tasks.find(candidate => candidate.id === id)
+      return found !== undefined && !TERMINAL_STATES.has(found.status)
+    })
+  }
+  let checked = 0
+  for (const depStatus of depStatuses) {
+    for (const replacement of replacementStatuses) {
+      for (const subjectStatus of subjectStatuses) {
+        for (const stopShape of stopShapes) {
+          for (const reviewShape of reviewShapes) {
+            seq += 1
+            const depId = `task_r16a1_dep_${seq}`
+            const replacementId = `task_r16a1_rep_${seq}`
+            const subjectId = `task_r16a1_sub_${seq}`
+            const sourceId = `task_r16a1_src_${seq}`
+            const tasks = []
+            if (depStatus !== 'missing') tasks.push(materialize(depId, depStatus))
+            if (replacement !== 'none') tasks.push(materialize(replacementId, replacement, { replaces: [depId] }))
+            const subject = materialize(subjectId, subjectStatus, { dependencies: [depId] })
+            if (stopShape !== 'none') {
+              const at = stopShape === 'in-bound' ? Date.now() - 100 : stopShape === 'expired' ? Date.now() - 5000 : undefined
+              subject.resumeAfterStop = { epoch: subject.epoch, reason: 'handoff', ...(at === undefined ? {} : { at }) }
+              f.runtime.store.put('tasks', subject)
+            }
+            if (reviewShape !== 'none') {
+              subject.reviewOf = sourceId
+              if (reviewShape === 'live') tasks.push(materialize(sourceId, 'submitted'))
+              else if (reviewShape === 'terminal') tasks.push(materialize(sourceId, 'cancelled'))
+              f.runtime.store.put('tasks', subject)
+            }
+            tasks.push(subject)
+            const got = f.runtime.notices.waitsLegitimately(subject, tasks)
+            const want = referenceWaiting(f.runtime, mission.id, subject, tasks)
+            if (got !== want) mismatches.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape, got, want })
+            const rootTask = { ...subject }
+            const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
+            const wantRoot = referenceStallRoot(f.runtime, mission.id, rootTask, tasks, f.runtime.stallPassTimeoutMs)
+            if (gotRoot !== wantRoot) mismatches.push({ kind: 'stallRoot', depStatus, replacement, subjectStatus, stopShape, reviewShape, gotRoot, wantRoot })
+            if (naiveWaiting(subject, tasks) !== want) naiveDivergences.push({ depStatus, replacement, subjectStatus, stopShape, reviewShape })
+            checked += 1
+          }
+        }
+      }
+    }
+  }
+  assert.equal(checked, depStatuses.length * replacementStatuses.length * subjectStatuses.length * stopShapes.length * reviewShapes.length, 'every combination is visited')
+
+  // R16-A1r/A1r2: the SUBJECT-covered dimension, derived from the runtime's own
+  // lineage seam. Every board above gives the subject a dependency edge (or a
+  // stop/review that decides it), so the classifier's replacement-coverage branch
+  // is never load-bearing there. These boards give the subject NO dependency, no
+  // review and no stop: its own repair lineage is the only possible live path.
+  //
+  // Only BLOCKED subjects are enumerated here. Admission replaces only blocked or
+  // cancelled work (pending, running and submitted sources are refused, and a
+  // different-kind replacement is refused), so a covered pending/running/submitted
+  // subject is unreachable through the public API and the seam reference
+  // intentionally does not model the classifier's answer for it.
+  //
+  // The chains are the reachable shapes: one hop, and a two-hop chain through a
+  // cancelled first repair — exactly where a non-transitive production coverage
+  // helper stops covering the original while the seam still resolves it to the
+  // running tail.
+  const coverageChains = [
+    { name: 'none', chain: [] },
+    { name: 'one-hop pending', chain: ['pending'] },
+    { name: 'one-hop running', chain: ['running'] },
+    { name: 'one-hop submitted', chain: ['submitted'] },
+    { name: 'one-hop accepted', chain: ['accepted'] },
+    { name: 'one-hop cancelled', chain: ['cancelled'] },
+    { name: 'two-hop live through cancelled', chain: ['cancelled', 'running'] },
+    { name: 'two-hop accepted through cancelled', chain: ['cancelled', 'accepted'] },
+    { name: 'two-hop terminal', chain: ['cancelled', 'cancelled'] },
+  ]
+  const coverageDriven = []
+  let coverageChecked = 0
+  for (const shape of coverageChains) {
+    seq += 1
+    const subjectId = `task_r16a1r_sub_${seq}`
+    const tasks = []
+    const subject = materialize(subjectId, 'blocked')
+    const rows = []
+    let previous = subjectId
+    for (const [index, status] of shape.chain.entries()) {
+      const row = materialize(`task_r16a1r_rep_${seq}_${index}`, status, { replaces: [previous] })
+      rows.push(row)
+      previous = row.id
+    }
+    tasks.push(...rows, subject)
+    const got = f.runtime.notices.waitsLegitimately(subject, tasks)
+    const want = referenceWaiting(f.runtime, mission.id, subject, tasks)
+    if (got !== want) mismatches.push({ kind: 'subjectCoverage', shape: shape.name, got, want })
+    const gotRoot = f.runtime.notices.stallRoots(tasks).some(root => root.id === subject.id)
+    const wantRoot = referenceStallRoot(f.runtime, mission.id, { ...subject }, tasks, f.runtime.stallPassTimeoutMs)
+    if (gotRoot !== wantRoot) mismatches.push({ kind: 'subjectCoverageRoot', shape: shape.name, gotRoot, wantRoot })
+    // The board without the final repair row: when it stops waiting, the coverage
+    // predicate is what makes this board live.
+    if (want && rows.length > 0) {
+      const withoutTail = tasks.filter(row => row.id !== rows.at(-1).id)
+      if (!referenceWaiting(f.runtime, mission.id, subject, withoutTail)) coverageDriven.push(shape.name)
+    }
+    coverageChecked += 1
+  }
+  assert.deepEqual(mismatches.slice(0, 5), [], `the classifier agrees with the lineage reference on every constructed board including the subject-covered dimension (${mismatches.length} mismatches)`)
+  assert.equal(coverageChecked, coverageChains.length, 'every subject-covered shape is visited')
+  assert.ok(coverageDriven.includes('one-hop running'), `the blocked subject with a running repair is coverage-driven: ${JSON.stringify(coverageDriven)}`)
+  assert.ok(coverageDriven.includes('two-hop live through cancelled'), `the two-hop chain through a cancelled repair is coverage-driven: ${JSON.stringify(coverageDriven)}`)
+
+  // The enumeration is sensitive: the raw-id rule really disagrees on the measured
+  // shape (a cancelled predecessor with a live repair), so the mutation proof
+  // cannot pass vacuously.
+  assert.ok(naiveDivergences.some(board => board.depStatus === 'cancelled' && board.replacement === 'running' && board.subjectStatus === 'pending'), `the raw-id rule diverges on the cancelled-A/live-A' shape: ${JSON.stringify(naiveDivergences.slice(0, 3))}`)
+  assert.ok(naiveDivergences.length > 0, 'the enumeration contains boards the pre-fix rule gets wrong')
+})
+
+test("R16-A2: a cancelled predecessor with a live repair leaves its dependent waiting, and the fall-through returns only when the whole lineage is terminal", async t => {
+  const f = await scenario(t)
+  const builder = await f.addMember('Builder')
+  const siblingMember = await f.addMember('Sibling')
+  const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id })
+  await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  const original = f.propose('Withdrawn original', { assigneeId: builder.id })
+  const dependent = f.propose('Waits on the original', { assigneeId: builder.id })
+  const dependentRow = f.runtime.store.get('tasks', dependent.id)
+  dependentRow.dependencies = [original.id]
+  f.runtime.store.put('tasks', dependentRow)
+  await f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'withdrawn' })
+  const repair = f.propose('Live repair of the original', { replaces: [original.id], assigneeId: builder.id })
+  await f.runtime.claim(f.actorFor(builder), f.mission.id, repair.id)
+  const fallthroughs = () => f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
+  await sleep(300)
+  assert.deepEqual(fallthroughs(), [], `the dependent waits on the running repair instead of being named: ${JSON.stringify(fallthroughs().map(delivery => delivery.content.slice(0, 80)))}`)
+  assert.equal(f.runtime.dependencySatisfied(f.mission.id, original.id), false, 'the dispatcher still cannot start the dependent: its effective dependency is running, not accepted')
+  const live = f.runtime.store.get('tasks', dependent.id)
+  assert.equal(f.runtime.notices.waitsLegitimately(live, f.runtime.store.list('tasks', f.mission.id)), true, 'the dependent is waiting on the live repair, not dead')
+  // Pair: closing the repair's whole lineage makes the same dependent a named
+  // decision — the fall-through may appear only when no live path remains.
+  const repairRow = f.runtime.store.get('tasks', repair.id)
+  repairRow.status = 'cancelled'
+  f.runtime.store.put('tasks', repairRow)
+  await sleep(350)
+  const named = fallthroughs()
+  assert.equal(named.length, 1, `the dead lineage is named: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  assert.ok(named[0].subjects.includes(`${dependent.id}@${live.epoch}`), `the notice names the dependent at its epoch: ${JSON.stringify(named[0].subjects)}`)
+})
+
+/**
+ * R16-A1r pair: the SUBJECT side of the same rule. A blocked task whose repair is
+ * running has a live path through its own replacement lineage, so no owner
+ * decision may name it and the stall-root classifier must not treat it as a root;
+ * closing the whole lineage makes the same subject a named decision. This is the
+ * pair the coverage-line deletion mutation must redden.
+ */
+test('R16-A1r pair: a blocked subject with a running repair is never named, and closing the repair names it', async t => {
+  const f = await scenario(t)
+  const builder = await f.addMember('Builder')
+  const siblingMember = await f.addMember('Sibling')
+  // research kind keeps the fixture free of integration-gap notices, whose
+  // subjects legitimately name every implementation branch.
+  const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
+  await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  const source = f.block(f.propose('Blocked subject', { assigneeId: builder.id, kind: 'research' }))
+  const repair = f.propose('Live repair of the subject', { replaces: [source.id], assigneeId: builder.id, kind: 'research' })
+  await f.runtime.claim(f.actorFor(builder), f.mission.id, repair.id)
+  const namesSubject = () => f.notices().filter(delivery => Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${source.id}@`)))
+  await sleep(300)
+  const tasks = f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.store.get('tasks', source.id), tasks), true, 'the blocked subject waits on its running repair')
+  assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === source.id), false, 'a subject carried by a live repair is not a stall root')
+  assert.deepEqual(namesSubject(), [], `no owner decision names the covered subject: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  // Pair: closing the whole lineage makes the same subject a named decision.
+  const repairRow = f.runtime.store.get('tasks', repair.id)
+  repairRow.status = 'cancelled'
+  f.runtime.store.put('tasks', repairRow)
+  await sleep(350)
+  const named = namesSubject()
+  assert.ok(named.length > 0, `a subject whose repair lineage is terminal is named: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  assert.ok(named.some(delivery => Array.isArray(delivery.subjects) && delivery.subjects.includes(`${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`)), 'the notice names the subject at its current epoch')
+})
+
+/**
+ * R16-A1r2 pair: the two-hop repair chain through a cancelled first repair. The
+ * original is blocked, its first repair is cancelled and its second repair is
+ * running, so the runtime's own seam resolves the original to the running second
+ * repair. A non-transitive production coverage helper loses the original there
+ * and emits a stall-root decision for a subject whose lineage is live — this test
+ * is the gate that must redden that mutation.
+ *
+ * The cancelled first repair is written directly (the same fixture idiom `block`
+ * uses) so the second proposal is reached without a scheduling pass between the
+ * two synchronous writes; the second repair is admitted through the real
+ * proposal path, which is the shape admission allows.
+ */
+test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the original unnamed until the whole chain closes', async t => {
+  const f = await scenario(t)
+  const builder = await f.addMember('Builder')
+  const siblingMember = await f.addMember('Sibling')
+  const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
+  await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  const original = f.block(f.propose('Blocked original', { assigneeId: builder.id, kind: 'research' }))
+  const firstRepair = f.propose('First repair', { replaces: [original.id], assigneeId: builder.id, kind: 'research' })
+  const firstRow = f.runtime.store.get('tasks', firstRepair.id)
+  firstRow.status = 'cancelled'
+  f.runtime.store.put('tasks', firstRow)
+  const secondRepair = f.propose('Second repair', { replaces: [firstRepair.id], assigneeId: builder.id, kind: 'research' })
+  await f.runtime.claim(f.actorFor(builder), f.mission.id, secondRepair.id)
+  const coveredAt = Date.now()
+  const namesOriginal = since => f.notices().filter(delivery => delivery.createdAt >= since
+    && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${original.id}@`)))
+  await sleep(300)
+  const tasks = f.runtime.store.list('tasks', f.mission.id)
+  const tail = f.runtime.effectiveDependency(f.mission.id, original.id, tasks)
+  assert.equal(tail.id, secondRepair.id, 'the runtime seam resolves the original through the cancelled first repair to the second')
+  assert.equal(tail.status, 'running', 'the seam tail is the running second repair')
+  assert.equal(f.runtime.notices.waitsLegitimately(f.runtime.store.get('tasks', original.id), tasks), true, 'the original waits on the running second repair')
+  assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === original.id), false, 'a two-hop covered subject is not a stall root')
+  assert.deepEqual(namesOriginal(coveredAt), [], `no owner decision names the covered original after the second repair was admitted: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  // Pair: closing the whole chain makes the original a named decision.
+  const secondRow = f.runtime.store.get('tasks', secondRepair.id)
+  secondRow.status = 'cancelled'
+  f.runtime.store.put('tasks', secondRow)
+  await sleep(350)
+  const named = namesOriginal(coveredAt)
+  assert.ok(named.length > 0, `closing the chain names the original: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  assert.ok(named.some(delivery => Array.isArray(delivery.subjects) && delivery.subjects.includes(`${original.id}@${f.runtime.store.get('tasks', original.id).epoch}`)), 'the notice names the original at its current epoch')
+})
+
+test('R16-A3: a blocked source enumerates the pending review that waits on it (reviewOf edge)', async t => {
+  const f = await scenario(t)
+  const builder = await f.addMember('Builder')
+  const source = f.propose('Blocked source', { assigneeId: builder.id })
+  const root = f.block(source)
+  const review = f.propose('Review waiting on the source', { kind: 'research', assigneeId: builder.id })
+  const reviewRow = f.runtime.store.get('tasks', review.id)
+  reviewRow.kind = 'verification'
+  reviewRow.reviewOf = root.id
+  reviewRow.dependencies = []
+  f.runtime.store.put('tasks', reviewRow)
+  await sleep(250)
+  const roots = f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('stall-root:'))
+  assert.equal(roots.length, 1, `exactly one stall-root notice: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  const notice = roots[0]
+  assert.match(notice.content, new RegExp(review.id), 'the notice enumerates the review as a dependent of the root')
+  assert.ok(notice.subjects.includes(`${review.id}@${reviewRow.epoch}`), `the review is a named subject: ${JSON.stringify(notice.subjects)}`)
+  assert.ok(notice.subjects.includes(`${root.id}@${root.epoch}`), 'the blocked source is the root subject')
+  const event = f.runtime.store.events(f.mission.id, 200).filter(item => item.type === 'mission/stalled' && item.data?.cause === 'stall-root').at(-1)
+  assert.ok(event.data.dependents.includes(review.id), `the durable stall event enumerates the review: ${JSON.stringify(event.data.dependents)}`)
+})
+
+test('R16-A4 pair: the off-pass sweep of a wedged pass applies the lineage-resolved waiting rule (D1/D2)', async t => {
+  const workers = new Workers({ idle: () => false })
+  const f = await scenario(t, { workers, config: { stallPassTimeoutMs: 120 } })
+  const builder = await f.addMember('Builder')
+  const original = f.propose('Withdrawn original', { assigneeId: builder.id })
+  const dependent = f.propose('Waits on the original', { assigneeId: builder.id })
+  const dependentRow = f.runtime.store.get('tasks', dependent.id)
+  dependentRow.dependencies = [original.id]
+  f.runtime.store.put('tasks', dependentRow)
+  await f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'withdrawn' })
+  const repair = f.propose('Live repair of the original', { replaces: [original.id], assigneeId: builder.id })
+  await f.runtime.claim(f.actorFor(builder), f.mission.id, repair.id)
+  const startedAt = Date.now()
+  workers.options.hangStart = true
+  await sleep(700)
+  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged past its declared bound')
+  const fresh = f.notices().filter(delivery => delivery.createdAt >= startedAt)
+  const falseWake = fresh.filter(delivery => typeof delivery.notice?.dedupKey === 'string'
+    && delivery.notice.dedupKey.startsWith('fallthrough:')
+    && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${dependent.id}@`)))
+  assert.deepEqual(falseWake, [], `the wedged sweep must not name a dependent whose repair is the live path: ${JSON.stringify(falseWake.map(delivery => delivery.content.slice(0, 80)))}`)
+  assert.equal(f.runtime.store.get('tasks', dependent.id).status, 'pending', 'the dependent really is still undispatched')
+  assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair really is the live path')
+})
+
+test('R16-A5: the wake-precision projection counts decisions, false wakes and missed obligations from the store', async t => {
+  const f = await scenario(t, { workers: new Workers({ idle: () => false }), config: { tickMs: 600000 } })
+  const builder = await f.addMember('Builder')
+  const now = Date.now()
+  const put = (id, status, extra = {}) => {
+    const row = {
+      id, missionId: f.mission.id, workstreamId: f.stream.id, title: id, objective: id, kind: 'implementation',
+      dependencies: [], scope: ['src/'], acceptance: ['works'], checks: [], priority: 50, experiment: false,
+      status, epoch: 1, proposedBy: 'owner', evidenceIds: [], createdAt: now, maxSteps: 10, maxFindings: 5, ...extra,
+    }
+    f.runtime.store.put('tasks', row)
+    return row
+  }
+  const original = put('task_r16a5_original', 'cancelled')
+  const repair = put('task_r16a5_repair', 'running', { replaces: [original.id], attempt: { id: 'attempt_r16a5_repair', epoch: 1, ownerId: builder.id, leaseUntil: now + 600000 } })
+  const dependent = put('task_r16a5_dependent', 'pending', { dependencies: [original.id] })
+  const root = put('task_r16a5_root', 'blocked')
+  const covered = put('task_r16a5_covered', 'blocked')
+  const cover = put('task_r16a5_cover', 'running', { replaces: [covered.id], attempt: { id: 'attempt_r16a5_cover', epoch: 1, ownerId: builder.id, leaseUntil: now + 600000 } })
+  const deliver = (id, family, subjects) => f.runtime.store.put('deliveries', {
+    id, missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: `${family} decision`, createdAt: now,
+    notice: { dedupKey: `${family}:${f.mission.id}:${subjects.join(',')}`, class: 'decision', sentAt: now, queuedAt: now }, subjects,
+  })
+  // The round-15 defect shape as a durable row: a fall-through naming the
+  // dependent whose cancelled predecessor has a live repair.
+  deliver('msg_r16a5_fallthrough', 'fallthrough', [`${dependent.id}@${dependent.epoch}`])
+  // A stall root whose blocked subject is carried by a live replacement again.
+  deliver('msg_r16a5_stall_root', 'stall-root', [`${covered.id}@${covered.epoch}`])
+  const precision = f.runtime.wakePrecision(f.owner, f.mission.id)
+  assert.equal(precision.decisions.byFamily.fallthrough, 1, 'the fall-through family is counted')
+  assert.equal(precision.decisions.byFamily['stall-root'], 1, 'the stall-root family is counted')
+  assert.equal(precision.falseWakes.byFamily.fallthrough, 1, 'a fall-through naming a live-waiting subject is a false wake')
+  assert.equal(precision.falseWakes.byFamily['stall-root'], 1, 'a stall-root whose subject is covered by a live replacement is a false wake')
+  assert.deepEqual([...precision.falseWakes.subjects].sort(), [`${covered.id}@${covered.epoch}`, `${dependent.id}@${dependent.epoch}`].sort())
+  assert.equal(precision.missedObligations.subjects.includes(`${root.id}@${root.epoch}`), true, 'a blocked subject with no live path and no notice is a missed obligation')
+  assert.equal(precision.missedObligations.subjects.includes(`${dependent.id}@${dependent.epoch}`), false, 'the waiting dependent is not a missed obligation')
+  assert.equal(precision.missedObligations.subjects.includes(`${repair.id}@${repair.epoch}`), false, 'the running repair is live work')
+  const board = f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(f.runtime.notices.stallRoots(board).some(candidate => candidate.id === covered.id), false, 'the covered blocked task is not a stall root')
+  assert.equal(f.runtime.notices.waitsLegitimately(cover, board), true, 'the live cover is running work, not silence')
+  assert.equal(cover.replaces[0], covered.id)
+  // Pair: a fall-through naming a genuinely dead subject is not a false wake, and
+  // stops being a missed obligation once a decision names it.
+  deliver('msg_r16a5_fallthrough_dead', 'fallthrough', [`${root.id}@${root.epoch}`])
+  const reread = f.runtime.wakePrecision(f.owner, f.mission.id)
+  assert.equal(reread.decisions.byFamily.fallthrough, 2, 'the second fall-through is counted')
+  assert.equal(reread.falseWakes.byFamily.fallthrough, 1, 'the dead subject is not counted as a false wake')
+  assert.equal(reread.missedObligations.subjects.includes(`${root.id}@${root.epoch}`), false, 'and the decision clears the missed obligation')
+  // A non-owner cannot read the instrument.
+  assert.throws(() => f.runtime.wakePrecision(f.actorFor(builder), f.mission.id), /owner/)
+})
+
+test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a review identity (review grace × lineage)', async t => {
+  const f = await scenario(t, { config: { tickMs: 600000 } })
+  const now = Date.now()
+  const put = (id, status, extra = {}) => {
+    const row = {
+      id, missionId: f.mission.id, workstreamId: f.stream.id, title: id, objective: id, kind: 'implementation',
+      dependencies: [], scope: ['src/'], acceptance: ['works'], checks: [], priority: 50, experiment: false,
+      status, epoch: 1, proposedBy: 'owner', evidenceIds: [], createdAt: now, maxSteps: 10, maxFindings: 5, ...extra,
+    }
+    f.runtime.store.put('tasks', row)
+    return row
+  }
+  const source = put('task_r16a6_source', 'cancelled')
+  const repair = put('task_r16a6_repair', 'running', { replaces: [source.id], attempt: { id: 'attempt_r16a6', epoch: 1, ownerId: 'member_r16a6', leaseUntil: now + 600000 } })
+  const dependent = put('task_r16a6_dependent', 'pending', { dependencies: [source.id] })
+  const review = put('task_r16a6_review', 'pending', { kind: 'verification', reviewOf: source.id, dependencies: [] })
+  const tasks = f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(f.runtime.dependencySatisfied(f.mission.id, source.id), false, 'the effective dependency is running, not accepted')
+  assert.equal(f.runtime.notices.waitsLegitimately(dependent, tasks), true, 'an ordinary dependent waits on the live repair')
+  assert.equal(f.runtime.notices.waitsLegitimately(review, tasks), false, 'the review follows its source IDENTITY, which is terminal: a review of a cancelled task has no path even when the obligation is repaired')
+  assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === review.id), false, 'a verdict record is never a stall root')
+  assert.equal(f.runtime.notices.stallRoots(tasks).some(root => root.id === dependent.id), false, 'a pending dependent is never a stall root')
+  assert.equal(repair.status, 'running')
 })
