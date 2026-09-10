@@ -1,6 +1,6 @@
 import type { Snapshot } from '../types.ts'
 import { useEffect, useState } from 'react'
-import { acceptanceSummary, activityDuration, currentProgress, recentProgress, type ConnectionState } from './progress.ts'
+import { acceptanceSummary, activityDuration, currentProgress, recentProgress, sidebarState, type ConnectionState } from './progress.ts'
 import { useCopy } from './locale.tsx'
 
 function timestamp(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }
@@ -14,7 +14,11 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     return () => clearInterval(timer)
   }, [live, connection, current.activity?.id])
   const duration = current.activity ? activityDuration(current.activity.startedAt, live ? clock : current.activity.updatedAt) : undefined
-  return <div className="sw-focus" data-swarm-current={current.activity?.kind ?? snapshot.mission.status} data-stale={live && current.stale}>
+  // R15-B: the owner-facing phase, its recovery age and any pending decision are
+  // derived from durable rows only (see `sidebarState`); this render adds no
+  // timer, request or model turn.
+  const owner = sidebarState(snapshot, connection, live && connection === 'connected' ? clock : (current.observedAt ?? snapshot.mission.updatedAt))
+  return <div className="sw-focus" data-swarm-phase={owner.phase} data-swarm-current={current.activity?.kind ?? snapshot.mission.status} data-stale={live && (current.stale || owner.stale)}>
     {(!live || current.stale) && <small>{t(!live ? 'Recorded state' : 'Last observed state')}</small>}
     <strong>{t(current.label)}</strong>
     {current.task && <p>{current.task.title}</p>}
@@ -25,7 +29,10 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
       {current.activity.kind === 'retry' && current.activity.retryAt && <> · {t('Retry scheduled for')} {timestamp(current.activity.retryAt)}</>}
       {current.activity.kind === 'retry' && current.activity.retryAttempt && <> · {t('Attempt')} {current.activity.retryAttempt}</>}
     </p>}
-    {live && current.stale && <p className="sw-focus-note">{t('Current execution is unconfirmed until updates resume.')}</p>}
+    {owner.recovery && <p className="sw-focus-note" data-swarm-recovery={owner.recovery.subject}>{t(owner.recovery.action)}
+      {owner.recovery.ageMs === undefined ? '' : ` · ${Math.round(owner.recovery.ageMs / 1000)}${t('sec')}`}{owner.recovery.since === undefined ? ` · ${t('start time unknown')}` : ''}</p>}
+    {owner.decision && <p className="sw-focus-note" data-swarm-decision={owner.decision.subject}>{t('Waiting for you')}: {owner.decision.subject} · {t('consumption unknown')}</p>}
+    {live && (current.stale || owner.stale) && <p className="sw-focus-note">{t('Current execution is unconfirmed until updates resume.')}</p>}
   </div>
 }
 

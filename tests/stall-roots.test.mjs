@@ -9,6 +9,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
+import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -26,7 +27,7 @@ class Workers {
 }
 
 async function fixture(t, config = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-stall-roots-'))
+  const directory = await tempDirectory('swarm-stall-roots-')
   const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
   await runtime.start()
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })

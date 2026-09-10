@@ -9,6 +9,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
+import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -26,7 +27,7 @@ class Workers {
 }
 
 async function fixture(t, config = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-fallthrough-'))
+  const directory = await tempDirectory('swarm-fallthrough-')
   const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
   await runtime.start()
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
@@ -53,7 +54,7 @@ test('R14-F2(a): an owner notice carries the task subjects it was produced for',
   // A notice written for one task is not consumed by another task's notice: the
   // dedup key is the root's identity, not the board fingerprint.
   const unrelated = f.propose('Unrelated work')
-  f.runtime.notify(f.mission.id, 'Unrelated owner notice about another task', 'runtime', 'decision', false, undefined, [`${unrelated.id}@1`])
+  f.runtime.notify(f.mission.id, 'Unrelated owner notice about another task', [`${unrelated.id}@1`], { from: 'runtime', noticeClass: 'decision', dedupe: false })
   await sleep(150)
   assert.equal(f.notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('stall-root:')).length, 1, 'an unrelated notice does not consume or duplicate the stall root')
 })

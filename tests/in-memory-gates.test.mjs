@@ -388,7 +388,7 @@ const GATE_TESTS = {
       // durable state (the pass row, the budget stop claim, the outbox), so a
       // lost drain cannot make a durable transition wrong. The queued owner
       // notice below is the durable record a later pump delivers from.
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', 'runtime', 'decision', false))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', [`mission:${f.mission.id}`], { from: 'runtime', noticeClass: 'decision', dedupe: false }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.deliveredAt === undefined)
       assert.ok(queued.length >= 1, 'the deferred notice is durable in the outbox, so a later pump re-derives it')
     } finally { await f.cleanup() }
@@ -650,7 +650,7 @@ const GATE_TESTS = {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100 } })
     try {
       const first = f.propose({ title: 'Notice' })
-      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5 outbox probe', 'runtime', 'decision', false))
+      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5 outbox probe', [`mission:${f.mission.id}`], { from: 'runtime', noticeClass: 'decision', dedupe: false }))
       const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner')
       assert.ok(queued.length >= 1)
       // Gate the adapter delivery, so the per-attempt claim is observable and
