@@ -14,14 +14,20 @@
  * The check execution is real throughout: a committed `node --test` file that
  * fails, run through `Workspaces.verifyArtifact` in a clean verification
  * checkout, truncated at the host's output bound.
+ *
+ * R16-B: every fixture in this file uses `tests/temp-root.mjs`, because the host
+ * check runner inherits TMPDIR from a directory its sandbox denies (the measured
+ * round-15 shape: 2/22 pass, every fixture `mkdtemp` EPERM), and the declared
+ * check itself now receives TMPDIR/TMP/TEMP inside the disposable checkout,
+ * pinned by the R16-B tests below.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { SwarmRuntime, compareCheckEnvironments, selfRunEnvironmentSource, selfRunEnvironmentFacts, SELF_RUN_EXTRACTOR_LIMITATIONS } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { Workspaces, checkTempEnvironment, runProcess } from '../lib/workspaces.js'
+import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
@@ -44,6 +50,33 @@ const FAILING_SUITE = [
 
 /** The check the fixture declares: a named stage, then the real failing suite. */
 const FAILING_CHECK = `echo "# stage: fixture-failing-suite" && node --test ${FIXTURE_TEST}`
+
+/**
+ * R16-B: a real check that fails unless TMPDIR/TMP/TEMP name one writable
+ * directory inside the checkout it runs in. This is the measured round-15 shape:
+ * the check sandbox is rooted at the checkout and denies the member scratch root
+ * the session overlay names as TMPDIR, so every fixture `mkdtemp` died with EPERM.
+ */
+const TMP_PROBE = 'tests/tmp-root-probe.mjs'
+const TMP_PROBE_CHECK = `node ${TMP_PROBE}`
+const TMP_PROBE_SOURCE = [
+  "import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'",
+  "import { tmpdir } from 'node:os'",
+  "import { join, sep } from 'node:path'",
+  "const dir = process.env.TMPDIR",
+  "const tmp = process.env.TMP",
+  "const temp = process.env.TEMP",
+  "if (!dir || !tmp || !temp) { console.error(`unset temp root TMPDIR=${dir} TMP=${tmp} TEMP=${temp}`); process.exit(3) }",
+  "if (dir !== tmp || dir !== temp) { console.error(`temp roots disagree TMPDIR=${dir} TMP=${tmp} TEMP=${temp}`); process.exit(4) }",
+  "if (tmpdir() !== dir) { console.error(`tmpdir()=${tmpdir()} TMPDIR=${dir}`); process.exit(5) }",
+  "const cwd = process.cwd()",
+  "if (dir !== cwd && !dir.startsWith(cwd + sep)) { console.error(`TMPDIR ${dir} is outside the checkout ${cwd}`); process.exit(6) }",
+  "const probe = mkdtempSync(join(dir, 'swarm-tmp-probe-'))",
+  "writeFileSync(join(probe, 'ok'), 'ok')",
+  "rmSync(probe, { recursive: true, force: true })",
+  "console.log(`tmp-root-ok ${dir}`)",
+  '',
+].join('\n')
 
 /**
  * The check environment with an explicit HOME. The variables this suite itself
@@ -72,13 +105,14 @@ async function cacheHome(root, warm) {
  * reproduce.
  */
 async function workspaceFixture(t, options = {}) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-check-envelope-')))
+  const temp = await realpath(await tempDirectory('swarm-check-envelope-'))
   const source = path.join(temp, 'source')
   await mkdir(path.join(source, 'src'), { recursive: true })
   await mkdir(path.join(source, 'tests'), { recursive: true })
   await git(source, 'init', '-b', 'main')
   await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
   await writeFile(path.join(source, FIXTURE_TEST), FAILING_SUITE)
+  await writeFile(path.join(source, TMP_PROBE), TMP_PROBE_SOURCE)
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'fixture baseline')
   const workspaces = new Workspaces({
@@ -151,7 +185,7 @@ async function missionFixture(t, options = {}) {
  * ------------------------------------------------------------------ */
 
 test('ENV: the envelope states HOME, the user cache roots, the sandbox policy and the dependency links', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await workspaceFixture(t, { checkEnv: checkEnvFor(home) })
   const envelope = fixture.workspaces.checkEnvelope()
@@ -200,7 +234,7 @@ test('ENV: a completed check records the environment it ran under and its attrib
  * ------------------------------------------------------------------ */
 
 test('ENV: truncating a real failing run at the bound keeps the failing test, the TAP summary and the stage', async t => {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-tap-')))
+  const temp = await realpath(await tempDirectory('swarm-env-tap-'))
   t.after(async () => rm(temp, { recursive: true, force: true }))
   await mkdir(path.join(temp, 'tests'), { recursive: true })
   await writeFile(path.join(temp, FIXTURE_TEST), FAILING_SUITE)
@@ -250,7 +284,7 @@ test('ENV: a failed declared check is attributable from durable state ahead of t
  * ------------------------------------------------------------------ */
 
 test('ENV: the assignment of an implementing and a verifying attempt delivers the envelope facts', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const assignmentFor = taskId => fixture.deliveries().filter(delivery => delivery.kind === 'assignment' && delivery.taskId === taskId).at(-1)
@@ -274,7 +308,7 @@ test('ENV: the assignment of an implementing and a verifying attempt delivers th
  * ------------------------------------------------------------------ */
 
 test('ENV: a verification whose self-run cannot reproduce the envelope reports the mismatch instead of accepting', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
@@ -304,7 +338,7 @@ test('ENV: a verification whose self-run cannot reproduce the envelope reports t
 })
 
 test('ENV: an attempt whose recorded tool runs cannot reproduce the envelope is reported with that evidence', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
@@ -326,7 +360,7 @@ test('ENV: an attempt whose recorded tool runs cannot reproduce the envelope is 
 })
 
 test('ENV: a cold user cache is recorded as advisory and never refuses an acceptance', async t => {
-  const coldHome = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), false)
+  const coldHome = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), false)
   t.after(async () => rm(path.dirname(coldHome), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   // The envelope promises a warm cache root; the self-run facts (the ambient
@@ -348,7 +382,7 @@ test('ENV: a cold user cache is recorded as advisory and never refuses an accept
  * ------------------------------------------------------------------ */
 
 test('ENV × check-semaphore: a mismatch refusal after a queued check hands its slot back', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, {
     checkEnv: checkEnvFor(home),
@@ -373,7 +407,7 @@ test('ENV × check-semaphore: a mismatch refusal after a queued check hands its 
 })
 
 test('ENV × rejection: a failing check still blocks the source and records the mismatch', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: ['true'] })
   const reviewer = fixture.reviews[0]
@@ -391,7 +425,7 @@ test('ENV × rejection: a failing check still blocks the source and records the 
 })
 
 test('ENV × rejection: an accept with a failing check is blocked by the failure, never accepted', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: ['true'] })
   const reviewer = fixture.reviews[0]
@@ -444,8 +478,8 @@ test('ENV-R: the extractor reads only the environment a command declares for its
 })
 
 test('ENV-R: a recorded self-run command that overrides HOME refuses the acceptance with its own environment', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
-  const other = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-other-')))
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
+  const other = await realpath(await tempDirectory('swarm-env-other-'))
   await mkdir(path.join(other, '.cache'), { recursive: true })
   t.after(async () => { await rm(path.dirname(home), { recursive: true, force: true }); await rm(other, { recursive: true, force: true }) })
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
@@ -485,8 +519,8 @@ test('ENV-R: a recorded self-run command that overrides HOME refuses the accepta
 })
 
 test('ENV-R: a quoted mention of HOME is not an override and the acceptance proceeds', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
-  const other = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-other-')))
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
+  const other = await realpath(await tempDirectory('swarm-env-other-'))
   t.after(async () => { await rm(path.dirname(home), { recursive: true, force: true }); await rm(other, { recursive: true, force: true }) })
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
@@ -525,11 +559,59 @@ test('ENV-R: the scoped check roots are reported as advisory divergences, never 
 })
 
 /* ------------------------------------------------------------------ *
+ * R16-B: the scoped temp root, the envelope decision, and the blocking half.
+ * ------------------------------------------------------------------ */
+
+test('R16-B: the scoped temp environment is one directory beside the cache roots', () => {
+  assert.deepEqual(checkTempEnvironment('/checkout/.swarm-check-cache'), {
+    TMPDIR: '/checkout/.swarm-check-cache/tmp',
+    TMP: '/checkout/.swarm-check-cache/tmp',
+    TEMP: '/checkout/.swarm-check-cache/tmp',
+  })
+})
+
+test('R16-B: a real check runs with TMPDIR/TMP/TEMP inside the checkout even when the overlay names the member scratch root', async t => {
+  const hostile = path.join(await realpath(await tempDirectory('swarm-hostile-scratch-')), 'member-scratch')
+  await mkdir(hostile, { recursive: true, mode: 0o700 })
+  t.after(async () => rm(path.dirname(hostile), { recursive: true, force: true }))
+  const fixture = await missionFixture(t, {
+    // The production shape: the adapter's per-member overlay names the member's
+    // own scratch root as TMPDIR, and the check sandbox rooted at the checkout
+    // denies it.
+    checkEnv: { ...checkEnvFor(process.env.HOME), TMPDIR: hostile, TMP: hostile, TEMP: hostile },
+    sourceChecks: [TMP_PROBE_CHECK],
+  })
+  const reviewer = fixture.reviews[0]
+  const accepted = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent host checks validate the submitted artifact' })
+  assert.equal(accepted.status, 'accepted', 'the probe check passes under the redirected temp root')
+  const probe = fixture.toolRuns().filter(run => run.taskId === reviewer.review.id).at(-1)
+  assert.match(String(probe.result.output), /tmp-root-ok /, 'the check itself observed the redirected temp root')
+  // Pair: the scoped roots live in the disposable verification checkout, never in
+  // the member worktree, so the capture path that excludes dependency links never
+  // sees them and no artifact can record a check's temp state.
+  await assert.rejects(stat(path.join(fixture.author.workspace, '.swarm-check-cache')), /ENOENT/, 'no scoped check root is written into the member worktree')
+  // The envelope decision, made explicit: the scoped roots it records are still
+  // exactly the five package-manager roots. TMPDIR/TMP/TEMP are deliberately not
+  // envelope fields: a self-run cannot reproduce a disposable checkout path, and
+  // recording the temp root as a scoped root would make `selfRunEnvironmentFacts`
+  // spread it into every self-run as if the member's own run had used it.
+  const environment = fixture.workers.workspaces.checkEnvelope().environment
+  assert.deepEqual(Object.keys(environment.checkCacheRoots).sort(), ['GOCACHE', 'PIP_CACHE_DIR', 'XDG_CACHE_HOME', 'YARN_CACHE_FOLDER', 'npm_config_cache'])
+  assert.equal(Object.keys(environment).some(field => /temp|tmp/i.test(field)), false, 'no temp field is added to the delivered envelope')
+  // The blocking half stays empty on this real accept path: the redirect is a
+  // scoped root, exactly like the cache roots the comparison already treats as
+  // advisory.
+  const record = fixture.events().filter(event => event.type === 'task/check-envelope' && event.data?.reproduction === 'check-environment-mismatch').at(-1)
+  assert.ok(record, 'the reproduction comparison is durable')
+  assert.deepEqual(record.data.blocking, [], `the redirect adds no blocking divergence: ${JSON.stringify(record.data.blocking)}`)
+})
+
+/* ------------------------------------------------------------------ *
  * ENV-R2: every assignment for an attempt carries the envelope.
  * ------------------------------------------------------------------ */
 
 test('ENV-R2: the budget-resume assignment carries the check envelope too', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
@@ -631,8 +713,8 @@ test('ENV-R5: a heredoc body nested inside a shell -c body is not read as code e
 })
 
 test('ENV-R5: the reviewer\'s nested shape really runs with the ambient HOME and is accepted, with the body printed as data', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
-  const other = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-other-')))
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
+  const other = await realpath(await tempDirectory('swarm-env-other-'))
   t.after(async () => { await rm(path.dirname(home), { recursive: true, force: true }); await rm(other, { recursive: true, force: true }) })
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
@@ -656,8 +738,8 @@ DOC"`
 })
 
 test('ENV-R3: a command that leaves HOME untouched is not refused, and one that removes or overrides it is', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
-  const other = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-other-')))
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
+  const other = await realpath(await tempDirectory('swarm-env-other-'))
   t.after(async () => { await rm(path.dirname(home), { recursive: true, force: true }); await rm(other, { recursive: true, force: true }) })
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
@@ -745,7 +827,7 @@ test('ENV-R4: export -n declares nothing, for the value form and the no-value fo
 })
 
 test('ENV-R4: a command whose heredoc body mentions HOME really runs with the ambient HOME and is not refused', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
@@ -764,7 +846,7 @@ test('ENV-R4: a command whose heredoc body mentions HOME really runs with the am
 })
 
 test('ENV-R4: export -n HOME=/x really runs without HOME in the child and records no override', async t => {
-  const home = await cacheHome(await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-env-home-'))), true)
+  const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]

@@ -11,12 +11,12 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
-import { readFile, mkdir } from 'node:fs/promises'
+import { readFile, mkdir, lstat, open, readdir, realpath } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { Workspaces, writePrivateJson } from './workspaces.js'
-import type { WorkspaceGrantSnapshot } from './authorization.js'
+import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
@@ -97,6 +97,21 @@ export function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], 
  * that read those names instead.
  */
 export type SessionEnvironment = { TMPDIR: string; TMP: string; TEMP: string }
+/**
+ * R16-G6: one bounded read of a member's own preserved scratch content.
+ * `root` is always the reading member's deterministic scratch root; `path` is
+ * relative to it. A directory read returns sorted entry names (bounded); a file
+ * read returns UTF-8 content (bounded) and says so with `truncated`.
+ */
+export interface ScratchRead {
+  root: string
+  path: string
+  kind: 'file' | 'directory'
+  entries?: string[]
+  content?: string
+  bytes: number
+  truncated: boolean
+}
 interface Composition {
   version: 1
   sessionId: string
@@ -475,6 +490,61 @@ export class HarnessWorkers implements WorkerAdapter {
     const root = this.scratchRoot(missionId, memberId)
     await mkdir(root, { recursive: true, mode: 0o700 })
     return { TMPDIR: root, TMP: root, TEMP: root }
+  }
+
+  /**
+   * R16-G6: the ONE host-mediated read path for a member's own preserved scratch
+   * content. The scratch root is deterministic per (mission, member) and survives
+   * attempt replacement, but nothing could read it back — a member session's own
+   * tools are scoped to its workspace and another member can never enter this
+   * 0700 tree — so cross-member relay fell back to a shared `/tmp` path and the
+   * runtime's own rendezvous detector warned (round 15). This method is the
+   * sanctioned primitive: the host, holding the member row, reads that member's
+   * own root, and nothing else.
+   *
+   * Authorization is structural, not a parameter: the root is derived from
+   * `member.missionId` + `member.id` through the same `scratchRoot` the session
+   * composition uses, the requested path must be relative and must stay inside
+   * that root (lexically and after `realpath`, so a symlink or a symlinked parent
+   * cannot escape), a symlink is refused rather than followed, and only regular
+   * files and one bounded directory listing are read. Content is bounded and the
+   * result states `truncated`; the read never writes, creates or deletes.
+   *
+   * Exactly one path: no tool was added (the swarm tool surface is unchanged) and
+   * no other method reads scratch. Callers that need to relay content hand the
+   * returned bytes to the existing message/evidence paths.
+   *
+   * Co-firing guards, named: the composition fence (`assertCompositionScratch`,
+   * which refuses a composition naming another member's root — this method
+   * derives the same root from the member row) x the session composition
+   * (`sessionEnvironment`, which creates the 0700 root this reads) x the
+   * duplicate-path census (`tests/operation-bound.test.mjs`: two members and two
+   * missions never share a root, so containment cannot reach another's tree).
+   */
+  async readScratch(member: Member, relativePath = '.', options: { maxBytes?: number; maxEntries?: number } = {}): Promise<ScratchRead> {
+    const root = this.scratchRoot(member.missionId, member.id)
+    if (path.isAbsolute(relativePath)) throw new Error(`Scratch reads are relative to the member's own scratch root; ${JSON.stringify(relativePath)} is absolute`)
+    const resolved = path.resolve(root, relativePath)
+    if (!isContained(root, resolved)) throw new Error(`Scratch read escapes the member's own scratch root: ${JSON.stringify(relativePath)}`)
+    const info = await lstat(resolved).catch(() => undefined)
+    if (info === undefined) throw new Error(`Scratch path does not exist for this member: ${JSON.stringify(relativePath)}`)
+    if (info.isSymbolicLink()) throw new Error(`Scratch reads never follow a symlink: ${JSON.stringify(relativePath)}`)
+    const rootReal = await realpath(root)
+    const targetReal = await realpath(resolved)
+    if (!isContained(rootReal, targetReal)) throw new Error(`Scratch read resolves outside the member's own scratch root: ${JSON.stringify(relativePath)}`)
+    const relative = path.relative(root, resolved) || '.'
+    if (info.isDirectory()) {
+      const maxEntries = Math.max(1, Math.min(1024, Math.trunc(options.maxEntries ?? 64)))
+      const names = (await readdir(resolved)).sort()
+      return { root, path: relative, kind: 'directory', entries: names.slice(0, maxEntries), bytes: 0, truncated: names.length > maxEntries }
+    }
+    if (!info.isFile()) throw new Error(`Scratch reads only regular files and directories: ${JSON.stringify(relativePath)}`)
+    const maxBytes = Math.max(1, Math.min(256 * 1024, Math.trunc(options.maxBytes ?? 16 * 1024)))
+    const buffer = Buffer.alloc(maxBytes)
+    const handle = await open(resolved, 'r')
+    let bytesRead = 0
+    try { bytesRead = (await handle.read(buffer, 0, maxBytes, 0)).bytesRead } finally { await handle.close() }
+    return { root, path: relative, kind: 'file', content: buffer.subarray(0, bytesRead).toString('utf8'), bytes: bytesRead, truncated: info.size > bytesRead }
   }
   prepareWorkspace(mission: Mission, memberId: string): Promise<string> { return this.workspaces.prepareWorkspace(mission, memberId) }
   prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
