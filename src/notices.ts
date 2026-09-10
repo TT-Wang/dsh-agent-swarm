@@ -13,6 +13,11 @@ import { requireText } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Delivery, Member, Mission, NoticeClass, Task } from './types.ts'
 
+/** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
+export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
+/** The states that leave a task no future. */
+const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
+
 /**
  * F2: how long a submitted code deliverable may stay without a live review
  * before the runtime concludes none is coming. One scheduler period gives the
@@ -52,7 +57,7 @@ export class Notices {
    * (class, fingerprint, sender); decision notices pass through so the liveness
    * engine's witness dedup stays in charge of them.
    */
-  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string): void {
+  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string, subjects?: string[]): void {
     const mission = this.rt.store.get('missions', missionId)
     // No-silent-state witness W2: every owner-decision notice is durable under
     // the fingerprint of the board it was emitted for, so the owner can verify
@@ -61,7 +66,7 @@ export class Notices {
       mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
       this.rt.store.put('missions', mission)
     }
-    this.enqueueOwnerNotice(missionId, content, from, noticeClass, {}, dedupe, dedupKey)
+    this.enqueueOwnerNotice(missionId, content, from, noticeClass, subjects === undefined ? {} : { subjects }, dedupe, dedupKey)
   }
 
   /** The notice dedup key: F(S) with the owner-notice channel excluded. */
@@ -136,6 +141,10 @@ export class Notices {
     const members = this.rt.store.list('members', missionId)
     // Row 17: the owner has not planned work yet; `stalled` uses the same rule.
     if (!tasks.length) return
+    // R14-F2(b): stall roots are classified BEFORE the F(S) dedup. A root is an
+    // owner decision no other notice can advance, so an unrelated notice that
+    // consumed the board fingerprint must not silence it.
+    this.notifyStallRoots(mission, tasks)
     const fingerprint = this.rt.fingerprint(missionId)
     if (mission.witness?.fingerprint === fingerprint) return
     // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
@@ -182,7 +191,126 @@ export class Notices {
       this.notifyStall(mission, tasks, members, this.rt.completionError(mission, { cancelUnschedulable: true }) ?? this.rt.completionError(mission) ?? 'no task can make progress')
       return
     }
-    this.notify(missionId, `Mission ${mission.title} made no progress this tick and no task is dispatchable. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`)
+    // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
+    // legitimately waiting, the runtime stays silent; otherwise it escalates
+    // UNCONDITIONALLY and names every task its classifier did not recognise, so
+    // no state can be silent and unnamed at the same time.
+    // A task the root classifier already named is recognised: the fall-through
+    // names only what no other witness speaks for.
+    const roots = new Set(this.stallRoots(tasks).map(task => task.id))
+    const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks))
+    if (!unrecognised.length) return
+    const subjects = unrecognised.map(taskSubject)
+    this.notify(missionId, `Mission ${mission.title} has unfinished work that no live path will advance: ${unrecognised.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`, 'runtime', 'decision', true,
+      `fallthrough:${missionId}:${subjects.slice().sort().join(',')}`, subjects)
+  }
+
+  /**
+   * R14-F2(b): exactly one named `decision` notice per stall root at its epoch,
+   * whether or not other tasks in the mission are running. A stall root is a
+   * blocked task that is not stopping, is not a verdict record, and has no live
+   * replacement anywhere in its lineage; a blocked task whose waited-on stop has
+   * exceeded the declared bound is a root too, because the stop it waits on is
+   * no longer bounded. The dedup key is the root's own identity, not the board
+   * fingerprint, so an unrelated notice can never consume it.
+   */
+  notifyStallRoots(mission: Mission, tasks: Task[]): void {
+    for (const root of this.stallRoots(tasks)) {
+      const subject = taskSubject(root)
+      const key = `stall-root:${mission.id}:${subject}`
+      if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) continue
+      const dependents = this.dependentsOf(root, tasks)
+      const stop = root.resumeAfterStop?.epoch === root.epoch ? root.resumeAfterStop : undefined
+      const cause = stop !== undefined
+        ? (stop.at === undefined
+          ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`
+          : `its stop has been awaited for ${Math.max(0, Date.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
+        : 'no live replacement exists anywhere in its lineage'
+      this.rt.commit(mission.id, () => {
+        this.rt.store.event(mission.id, 'mission/stalled', 'runtime', {
+          cause: 'stall-root', taskId: root.id, epoch: root.epoch, reason: root.output ?? null,
+          dependents: dependents.map(task => task.id), boundMs: this.rt.stallPassTimeoutMs,
+          // R14-F2v D1: the W3 stall event carries `unschedulable` and readers
+          // (fault F19 row 7) take it from the LATEST mission/stalled event; a
+          // stall-root event without it broke that reader. The root plus the
+          // tasks that depend on it is the honest value.
+          unschedulable: [root.id, ...dependents.map(task => task.id)],
+        })
+        this.notify(mission.id, `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and ${cause}${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.map(task => task.id).join(', ')})` : ''}${root.output === undefined ? '' : `. Recorded reason: ${root.output}`}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`, 'runtime', 'decision', true, key, [subject, ...dependents.map(taskSubject)])
+      })
+    }
+  }
+
+  /**
+   * R14-F2(b): the stall roots of one board, in board order. Purely a function
+   * of durable rows, so the pass, the timer-driven notice path and a test all
+   * classify the same board identically.
+   */
+  stallRoots(tasks: Task[]): Task[] {
+    // A live replacement marks every id in its transitive lineage as covered.
+    const replaced = new Set<string>()
+    const cover = (task: Task): void => {
+      for (const source of task.replaces ?? []) {
+        if (replaced.has(source)) continue
+        replaced.add(source)
+        const origin = tasks.find(candidate => candidate.id === source)
+        if (origin !== undefined) cover(origin)
+      }
+    }
+    for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) cover(task)
+    return tasks.filter(task => {
+      if (task.status !== 'blocked' || replaced.has(task.id)) return false
+      // A verdict record is not a repairable root: its source carries the repair.
+      if (task.reviewOf !== undefined) return false
+      const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+      if (stop === undefined) return true
+      const at = stop.at
+      // R14-F2v D2: a stop inside the declared bound is progress, not a root, but
+      // an absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so
+      // the state escalates as a root rather than becoming silence (a pre-upgrade
+      // durable row reaches exactly this state).
+      return at === undefined || Date.now() - at > this.rt.stallPassTimeoutMs
+    })
+  }
+
+  /** R14-F2(b): the tasks that depend on one root, transitively, still unfinished. */
+  dependentsOf(root: Task, tasks: Task[]): Task[] {
+    const found = new Map<string, Task>()
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const task of tasks) {
+        if (task.id === root.id || TERMINAL_STATES.has(task.status) || found.has(task.id)) continue
+        const dependsOnRoot = [root.id, ...found.keys()].some(id => task.dependencies.includes(id) || (task.replaces ?? []).includes(id))
+        if (dependsOnRoot) { found.set(task.id, task); grew = true }
+      }
+    }
+    return [...found.values()]
+  }
+
+  /**
+   * R14-F2(c): whether an unfinished task is waiting on something still alive —
+   * a live lease, the bounded review grace, a stop inside its bound, or an
+   * unfinished predecessor. Anything else is unnamed silence and must escalate.
+   */
+  waitsLegitimately(task: Task, tasks: Task[]): boolean {
+    const unfinished = (id: string): boolean => {
+      const found = tasks.find(candidate => candidate.id === id)
+      return found !== undefined && !TERMINAL_STATES.has(found.status)
+    }
+    if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
+    if (task.status === 'submitted') {
+      const submission = this.rt.latestSubmission(task.missionId, task.id)
+      return submission === undefined || submission.age < Math.max(this.rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    }
+    if (task.status === 'blocked') {
+      const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+      if (stop !== undefined) return stop.at !== undefined && Date.now() - stop.at <= this.rt.stallPassTimeoutMs
+      if (task.dependencies.some(unfinished)) return true
+      return false
+    }
+    if (task.status === 'pending') return task.dependencies.some(unfinished)
+    return false
   }
 
   /** Wake the owner once per distinct stalled state; idle workers cannot resolve it themselves. */
