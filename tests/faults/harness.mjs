@@ -15,9 +15,9 @@
  */
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { tempDirectory } from '../temp-root.mjs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 
@@ -53,7 +53,7 @@ export async function git(cwd, ...args) {
 
 /** A scratch git repository with one committed file. */
 export async function makeRepo(prefix, files = { 'src/answer.txt': 'base\n' }) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), `${prefix}-`)))
+  const root = await realpath(await tempDirectory(`${prefix}-`))
   const source = join(root, 'source')
   await mkdir(source)
   await git(source, 'init', '-b', 'main')
@@ -150,7 +150,7 @@ export class WorkspaceWorkers extends FakeWorkers {
  * admission, scheduler and outbox are real; only the adapter is controlled.
  */
 export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['true'], workspace } = {}) {
-  const dir = await realpath(await mkdtemp(join(tmpdir(), 'swarm-faults-')))
+  const dir = await realpath(await tempDirectory('swarm-faults-'))
   const runtime = new SwarmRuntime({
     statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
     maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, ...config,

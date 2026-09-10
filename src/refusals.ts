@@ -9,6 +9,7 @@
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
 import { hasNotice, proposalAllowance } from './arena.ts'
+import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
 
@@ -183,7 +184,11 @@ export class RefusalRegistry {
     const terminal = guardTerminal('budget', { memberId: proposer, detail: `the proposal ${JSON.stringify(title)} was refused: ${reason} (limit ${limit})` })
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit })
-      this.rt.notify(mission.id, terminal.message, proposer, 'budget', true)
+      // R15-A1: a refused proposal has no task to name yet, so the mission root is
+      // the exact lineage root of the decision. Guard pair: budget refusal x
+      // reason-less writer-busy (the `WriterBusyError` catch below) — the subject is
+      // computed before the write, so a busy writer never turns it into silence.
+      this.rt.notify(mission.id, terminal.message, [missionSubject(mission)], { from: proposer, noticeClass: 'budget', dedupe: true })
     })
     // The owner notice must not wait for the next scheduler tick; flush it now.
     this.rt.kick(mission.id)
@@ -383,7 +388,12 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
         taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null,
         coFires: terminal.coFires, fingerprint, ownerNotified: true,
       })
-      rt.notify(missionId, terminal.message, 'runtime', 'decision', true, key)
+      // R15-A1: the guard chain names the subject it terminated for: the task it
+      // was asked about, else the member's own unfinished work, else the mission
+      // root. Guard pair: guard-terminal x writer-busy, x the board-level witness
+      // (both are recorded for the same fingerprint; the subject is what tells the
+      // two apart without reparsing prose).
+      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key })
     })
   } catch (error) {
     // A busy writer must not turn an escalation into an unhandled rejection.

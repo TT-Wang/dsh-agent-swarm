@@ -15,6 +15,61 @@ import type { Actor, Delivery, Member, Mission, NoticeClass, Task } from './type
 
 /** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
 export function taskSubject(task: Pick<Task, 'id' | 'epoch'>): string { return `${task.id}@${task.epoch}` }
+/**
+ * R15-A1: the mission-scoped subject for a decision that names no single task (a
+ * wedged scheduling pass, a failed member with no assigned work, an escalation).
+ * It is the exact lineage root of such a decision, never a placeholder, so an
+ * owner-facing notice always has something to be attributed to.
+ */
+export function missionSubject(mission: Pick<Mission, 'id'>): string { return `mission:${mission.id}` }
+/**
+ * R15-A1: the subjects of a set of tasks, with the mission root as the honest
+ * fallback when the set is empty. Deduplicated and order-preserving.
+ */
+export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mission: Pick<Mission, 'id'>): string[] {
+  const subjects: string[] = []
+  for (const task of tasks) { const subject = taskSubject(task); if (!subjects.includes(subject)) subjects.push(subject) }
+  return subjects.length ? subjects : [missionSubject(mission)]
+}
+/**
+ * R15-A1: a notice without a subject is unattributable, so it is refused rather
+ * than written as an anonymous durable row. This is the runtime end of the
+ * contract the enumerated `notify()`-site test enforces in source.
+ *
+ * Co-fires with: `taskSubject`/`missionSubject`/`subjectsOfTasks` (whose absence
+ * this guard detects), the ledger's dedup (`hasNotice`, which must never see an
+ * empty-subject decision row) and every caller that can produce an empty task
+ * set (the W3 stall notice, the coverage-complete notice, the member-scoped
+ * failure notices). Those callers fall back to `missionSubject`, so this guard
+ * is reachable only from a genuine programming error.
+ */
+export function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<Mission, 'id'>): string[] {
+  const clean = Array.isArray(subjects) ? subjects.filter(subject => typeof subject === 'string' && subject.length > 0) : []
+  if (clean.length === 0) {
+    // R15-A1: a caller that dropped its subjects must not produce an anonymous
+    // durable row, and the omission must not be silent either. The enumerated
+    // source test is the enforcement; this is the last-resort attribution: the
+    // notice is still written under the mission root, and the omission is
+    // reported where the runtime reports its other internal faults. (No new
+    // refusal site: the retained S3 inventory pins the coded/uncoded split of
+    // these files, and a programming error here is not a user-facing refusal.)
+    process.stderr.write('[agent-swarm] owner notice without subjects; attributed to the mission root\n')
+    return [missionSubject(mission)]
+  }
+  return clean
+}
+/**
+ * R15-A1: the delivery options one notice call site passes. The subjects are a
+ * required positional argument; every other field has a documented default, so a
+ * new call site cannot inherit "no subject" by omission.
+ */
+export interface NotifyOptions {
+  from?: string
+  noticeClass?: NoticeClass
+  dedupe?: boolean
+  dedupKey?: string
+  stampWitness?: boolean
+}
 /** The states that leave a task no future. */
 const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
 
@@ -56,17 +111,26 @@ export class Notices {
    * lifecycle. The runtime's own budget/ceiling refusals are deduplicated per
    * (class, fingerprint, sender); decision notices pass through so the liveness
    * engine's witness dedup stays in charge of them.
+   *
+   * R15-A1: the subjects are a required positional argument, refused when empty,
+   * and written into the same durable delivery row as the content (never merged
+   * in later). A call site that cannot name one task passes the mission root via
+   * `missionSubject`; it can no longer pass nothing.
    */
-  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string, subjects?: string[], stampWitness = true): void {
+  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): void {
+    const from = options.from ?? 'runtime'
+    const noticeClass = options.noticeClass ?? 'decision'
+    const dedupe = options.dedupe ?? noticeClass === 'budget'
     const mission = this.rt.store.get('missions', missionId)
+    const attributed = noticeSubjects(subjects, mission ?? { id: missionId })
     // No-silent-state witness W2: every owner-decision notice is durable under
     // the fingerprint of the board it was emitted for, so the owner can verify
     // that no non-terminal state was silent. A terminal mission needs no witness.
-    if (stampWitness && mission !== undefined && !this.rt.isMissionTerminal(mission)) {
+    if ((options.stampWitness ?? true) && mission !== undefined && !this.rt.isMissionTerminal(mission)) {
       mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
       this.rt.store.put('missions', mission)
     }
-    this.enqueueOwnerNotice(missionId, content, from, noticeClass, subjects === undefined ? {} : { subjects }, dedupe, dedupKey)
+    this.enqueueOwnerNotice(missionId, content, from, noticeClass, { subjects: attributed }, dedupe, options.dedupKey)
   }
 
   /** The notice dedup key: F(S) with the owner-notice channel excluded. */
@@ -103,17 +167,45 @@ export class Notices {
    * Read-only notice-delivery ledger: every owner notice with its class, dedup
    * key and sent/queued/claimed lifecycle, newest first. Owner-only: owner
    * notices are control-plane decisions, not worker-visible board content.
+   *
+   * R15-A1/B: three facts that are never collapsed into one.
+   * - delivery/transport: `sentAt`/`queuedAt` and `state` (`queued` / `claimed`
+   *   by the adapter call that put the notice in front of the owner session);
+   * - consumption: reported as `unknown`, because this host exposes no reliable
+   *   native signal proving the owner consumed the notice. A `claimed` transport
+   *   is never relabelled as handled;
+   * - resolution: not a transport event at all. It is the mission/task/owner
+   *   transition that made the decision moot, and it is not recorded here. A
+   *   resolution never clears another subject's pending decision, and a healthy
+   *   sibling never resets this subject's clock.
+   *
+   * The projected subjects are merged back from the durable delivery row (the
+   * row, not the prose, is the authority for what the notice was about).
    */
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown {
     const { owner } = this.rt.participant(actor, missionId)
     if (!owner) throw new Error('Only the mission owner can read the notice-delivery ledger')
     const limit = query.limit === undefined ? 20 : Math.max(1, Math.min(100, Math.trunc(query.limit)))
-    const entries = projectNoticeLedger(this.rt.store.list('deliveries', missionId), limit)
+    const rows = this.rt.store.list('deliveries', missionId)
+    const subjectRow = (deliveryId: string): string[] | undefined => {
+      // A bounded linear lookup rather than a second in-memory index: the ledger
+      // is a read-only page of at most `limit` rows over one mission's deliveries.
+      for (const row of rows) if (row.id === deliveryId) return row.subjects
+      return undefined
+    }
+    const entries = projectNoticeLedger(rows, limit).map(entry => {
+      const subjects = subjectRow(entry.deliveryId)
+      return {
+        ...entry,
+        ...(subjects === undefined ? {} : { subjects }),
+        consumption: 'unknown' as const,
+      }
+    })
     return {
       ledger: entries,
       page: { limit, returned: entries.length },
       fingerprint: this.rt.fingerprint(missionId),
-      note: 'Read-only: each row names the mission-state fingerprint it announced and whether the owner notice is still queued or was claimed by the owner session. Recording a notice changes no task, member or budget state.',
+      note: 'Read-only: each row names the subjects the notice is about (`taskId@epoch` or `mission:<id>`) and the mission-state fingerprint it announced. `state` is the transport fact (queued, or claimed by the adapter that put it in front of the owner session); consumption is unknown because this host exposes no reliable signal for it; resolution is a task/mission transition, never a transport event. Recording a notice changes no task, member or budget state.',
     }
   }
 
@@ -133,8 +225,19 @@ export class Notices {
    * `AUTO_REVIEW_GRACE_MS`, not on the tick the artifact was submitted. A
    * submitted artifact with no live review path is witnessed even while
    * unrelated work runs, because no other witness can ever advance it.
+   *
+   * R15-A2: this is the same decision function the tick timer drives when no
+   * live scheduling pass exists (`options.offPass`), so a mission whose pass
+   * never returns (a hung `workers.start`) still names its subjects instead of
+   * staying silent. The one branch that is only meaningful at the end of a pass
+   * — the dispatcher's "ready but not dispatched" question — is skipped
+   * off-pass: before a pass has run, a ready task is not yet a decision.
+   *
+   * Every notice below is recorded inside `rt.commit`, so the delivery row that
+   * carries the subjects is written in the SAME transaction as the transition
+   * (the witness stamp, the stall event) that produced it.
    */
-  ensureWitness(missionId: string): void {
+  ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void {
     const mission = this.rt.mission(missionId)
     if (mission.status !== 'active') return
     const tasks = this.rt.store.list('tasks', missionId)
@@ -146,22 +249,57 @@ export class Notices {
     // consumed the board fingerprint must not silence it.
     const stallRootNotices = this.notifyStallRoots(mission, tasks)
     const fingerprint = this.rt.fingerprint(missionId)
-    if (mission.witness?.fingerprint === fingerprint) return
+    // R15-D1: a WEDGED pass is its own subject, exactly like a stall root. The
+    // board witness records that *some* notice announced this fingerprint; an
+    // unrelated notice (the integration-gap warning, a coverage notice) must not
+    // consume the decision a dead pass owes its task. The pass-scoped path keeps
+    // the dedup: there, an unchanged board is exactly what the witness means.
+    if (options.wedged !== true && mission.witness?.fingerprint === fingerprint) return
     // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
     // waiting member can run it. A working member is busy, not a silent board.
     const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
     const dispatchable = tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks)))
+    if (dispatchable.length && options.offPass === true && options.wedged !== true) {
+      // R15-D3: between passes the dispatcher's branch owns this state, and it may
+      // still dispatch the task in this same tick. The sweep must not invent a
+      // cause the dispatcher's own branch refuses — silently returning here is what
+      // keeps "ready but the only eligible handle is busy" from becoming a false
+      // "no live path will advance" wake (the round-14 dirty-workspace shape).
+      return
+    }
     if (dispatchable.length) {
-      // T3 integration: the adapter's `isIdle` precondition decides whether the
-      // runtime could actually start an eligible member. When every eligible
-      // member is busy by the adapter's contract, the board is not "dispatchable
-      // but undispatched" — those members are working, and no witness is owed.
-      // A parked (`waiting`) member is always startable (R10-09/S3).
-      const startable = runnable.some(member => member.status === 'waiting' || this.rt.workers.isIdle(member.id))
-      if (!startable) return
-      // A dispatchable task that survived a full pass is an admission refusal,
-      // not silence: say which task and why the owner may need to act.
-      this.notify(missionId, `Task ${dispatchable[0]!.id} (${dispatchable[0]!.title}) is ready for an eligible member but could not be dispatched this tick (mission admission limits or budget). Free a slot, raise a limit with swarm_budget, or withdraw the blocking work with swarm_cancel.`)
+      // A handle that is working is not a silent board: when no runnable member
+      // could be started at all, those members are working and no witness is owed
+      // (the T3 integration rule; a false stall notice is as bad as a missing
+      // one). The dispatcher's question is owed only when the board LOOKS
+      // dispatchable — at least one startable member exists — and the task still
+      // did not dispatch.
+      //
+      // R15-A4: the false-cause sentence is then replaced by the dispatcher's own
+      // question, asked per (task, assignee) with the sweep's predicates. It names
+      // the member whose handle holds the task when that is the blocker, and it
+      // stays silent when the question has no blocker to name (an open attempt the
+      // W6 close-out path is already nudging, or no eligible member at all).
+      // Co-firing guard pairs: dispatch question x parked-member hatch, x W6
+      // open-attempt close-out, x admission refusal — see
+      // `Scheduling.dispatchQuestion`.
+      // R15-D1: a wedged pass never reached its own dispatch question, so the
+      // startable gate must not silence the subject: the question is asked even
+      // when every eligible handle is busy, and the holder-naming answer is what
+      // tells the owner which member is holding the task while the pass is dead.
+      // For a completed pass the T3 rule stands: an all-busy board is working, not
+      // silent, and owes no witness.
+      if (options.wedged !== true) {
+        const startable = runnable.some(member => member.status === 'waiting' || this.rt.workers.isIdle(member.id))
+        if (!startable) return
+      }
+      const question = this.rt.dispatchQuestion(missionId, tasks, members, dispatchable)
+      if (question === undefined) return
+      this.rt.commit(missionId, () => {
+        // The dedup key belongs to the task and its epoch, so the wedged path can
+        // re-run every tick without repeating the same wake.
+        this.notify(missionId, question.message, question.subjects, { dedupe: true, dedupKey: question.dedupKey })
+      })
       return
     }
     const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks))
@@ -178,7 +316,12 @@ export class Notices {
         const submission = this.rt.latestSubmission(missionId, task.id)
         return submission === undefined || submission.age >= grace
       })
-      if (ripe.length) this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`)
+      if (ripe.length) {
+        const subjects = subjectsOfTasks(ripe, mission)
+        this.rt.commit(missionId, () => {
+          this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`, subjects)
+        })
+      }
       return
     }
     // Row 3 (documented scope): only a board whose *every* non-terminal task is
@@ -205,17 +348,21 @@ export class Notices {
       // If the classifier recognises every task and no stall fires, those decision
       // notices are this board's evidence: stamp the W2 witness here instead (row 7b).
       if (stallRootNotices > 0) {
-        const board = this.rt.store.get('missions', missionId)
-        if (board !== undefined && !this.rt.isMissionTerminal(board)) {
-          board.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
-          this.rt.store.put('missions', board)
-        }
+        this.rt.commit(missionId, () => {
+          const board = this.rt.store.get('missions', missionId)
+          if (board !== undefined && !this.rt.isMissionTerminal(board)) {
+            board.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
+            this.rt.store.put('missions', board)
+          }
+        })
       }
       return
     }
     const subjects = unrecognised.map(taskSubject)
-    this.notify(missionId, `Mission ${mission.title} made no progress this tick and has unfinished work that no live path will advance: ${unrecognised.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`, 'runtime', 'decision', true,
-      `fallthrough:${missionId}:${subjects.slice().sort().join(',')}`, subjects)
+    this.rt.commit(missionId, () => {
+      this.notify(missionId, `Mission ${mission.title} made no progress this tick and has unfinished work that no live path will advance: ${unrecognised.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`, subjects,
+        { dedupe: true, dedupKey: `fallthrough:${missionId}:${subjects.slice().sort().join(',')}` })
+    })
   }
 
   /**
@@ -251,7 +398,7 @@ export class Notices {
           unschedulable: [root.id, ...dependents.map(task => task.id)],
         })
         emitted += 1
-        this.notify(mission.id, `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and ${cause}${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.map(task => task.id).join(', ')})` : ''}${root.output === undefined ? '' : `. Recorded reason: ${root.output}`}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`, 'runtime', 'decision', true, key, [subject, ...dependents.map(taskSubject)], false)
+        this.notify(mission.id, `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and ${cause}${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.map(task => task.id).join(', ')})` : ''}${root.output === undefined ? '' : `. Recorded reason: ${root.output}`}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`, [subject, ...dependents.map(taskSubject)], { dedupe: true, dedupKey: key, stampWitness: false })
       })
     }
     return emitted
@@ -321,11 +468,34 @@ export class Notices {
     }
     if (task.status === 'blocked') {
       const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+      // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
+      // "cannot judge" case must never be the silent one: `stallRoots` classifies
+      // the same row as a root, and this classifier refusing it here is what
+      // keeps the two in agreement instead of leaving the state both silent and
+      // unnamed (a pre-upgrade durable row reaches exactly this shape).
       if (stop !== undefined) return stop.at !== undefined && Date.now() - stop.at <= this.rt.stallPassTimeoutMs
       if (task.dependencies.some(unfinished)) return true
       return false
     }
-    if (task.status === 'pending') return task.dependencies.some(unfinished)
+    if (task.status === 'pending') {
+      // R15-F1: a verification task carries no `dependencies` by protocol; its
+      // prerequisite is the source it reviews. While that source exists and is not
+      // terminal the review is legitimately waiting — the scheduler's `capable`
+      // refuses to run it until the source is `submitted`, so no live pass can
+      // advance it, and claiming "no live path" while the source is still being
+      // worked is a false notice (found live on T1v/T2v/T3v). A source that is
+      // terminal or missing can never make the review dispatchable again, so that
+      // state is NOT waiting and stays in the fall-through's named escalation.
+      //
+      // Co-firing guards: this classifier x the stall-root classifier (a blocked
+      // source is the root's subject, not this review's) and x `reviewable`/the
+      // review-admission terminal (which speak for a submitted source).
+      if (task.reviewOf !== undefined) {
+        const source = tasks.find(candidate => candidate.id === task.reviewOf)
+        return source !== undefined && !TERMINAL_STATES.has(source.status)
+      }
+      return task.dependencies.some(unfinished)
+    }
     return false
   }
 
@@ -341,7 +511,14 @@ export class Notices {
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
       this.rt.store.event(mission.id, 'mission/stalled', 'runtime', { reason, fingerprint, unschedulable: leftover.map(task => task.id) })
-      this.notify(mission.id, `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`)
+      // R15-A1: the W3 stall notice names the tasks it is about (the unschedulable
+      // leftovers, or every non-terminal task when the stall class is an empty
+      // leftover list), with the mission root as the honest fallback. Guard pair:
+      // W3 stall x stall-root classifier — a root the classifier named does not
+      // stop the board-level notice, and this notice no longer depends on prose
+      // to say which subject is stuck.
+      const stuck = leftover.length ? leftover : tasks.filter(task => !TERMINAL_STATES.has(task.status))
+      this.notify(mission.id, `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Subjects: ${subjectsOfTasks(stuck, mission).join(', ')}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`, subjectsOfTasks(stuck, mission))
       // W3: the stall notice is the no-silent-state witness for this state.
       mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
       this.rt.store.put('missions', mission)
@@ -360,7 +537,9 @@ export class Notices {
     mission.coverageNotice = fingerprint
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
-      this.notify(mission.id, `Mission ${mission.title} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`)
+      // R15-A1: the deliverable's lineage is the subject (every accepted task),
+      // never an anonymous mission-scoped sentence.
+      this.notify(mission.id, `Mission ${mission.title} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`, subjectsOfTasks(this.rt.store.list('tasks', mission.id).filter(task => TERMINAL_STATES.has(task.status)), mission))
     })
   }
 
@@ -375,7 +554,7 @@ export class Notices {
     if (this.parkedNotices.has(key) && hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     this.parkedNotices.add(key)
     this.rt.commit(mission.id, () => {
-      this.notify(mission.id, `Task ${task.id} (${task.title}) is held by a parked member and cannot make progress while parked. A fresh assignment wakes it; if the lease expires the task re-pends without spending a recovery attempt.`, 'runtime', 'decision', true, key)
+      this.notify(mission.id, `Task ${task.id} (${task.title}) is held by a parked member and cannot make progress while parked. A fresh assignment wakes it; if the lease expires the task re-pends without spending a recovery attempt.`, [taskSubject(task)], { dedupe: true, dedupKey: key })
     })
   }
 
@@ -395,7 +574,7 @@ export class Notices {
     this.integrationGapWarned.add(key)
     const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
     this.rt.commit(mission.id, () => {
-      this.notify(mission.id, `${diagnostic}. The mission now has ${implementations.length} implementation branches (${implementations.map(task => task.id).join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`, 'runtime', 'decision', true, key)
+      this.notify(mission.id, `${diagnostic}. The mission now has ${implementations.length} implementation branches (${implementations.map(task => task.id).join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`, subjectsOfTasks(implementations, mission), { dedupe: true, dedupKey: key })
     })
   }
 
@@ -408,7 +587,7 @@ export class Notices {
     const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      this.notify(mission.id, `${diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${source.id}) or cancel the source task; the mission cannot complete while it is unreviewable.`, 'runtime', 'decision', true, key)
+      this.notify(mission.id, `${diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${source.id}) or cancel the source task; the mission cannot complete while it is unreviewable.`, [taskSubject(source)], { dedupe: true, dedupKey: key })
     })
     this.reviewPathNotices.add(key)
   }

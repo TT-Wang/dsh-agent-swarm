@@ -8,6 +8,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { WorkspaceRevokedError } from './workspace-admission.ts'
@@ -25,6 +26,22 @@ export const STALL_GRACE_PASSES = 30
 export const STALL_GRACE_MAX_MS = 1000
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
+
+/**
+ * R15-A4: the dispatcher's answer to "why did this ready task not dispatch?",
+ * asked per (task, assignee) after a pass. `holder` is present only when the
+ * blocker is a member handle that still holds an unfinished turn; the mission
+ * admission refusal has no holder. Both carry the task's subject and a dedup key
+ * that belongs to the task and epoch, so an unrelated notice can never consume
+ * this decision.
+ */
+export interface DispatchQuestion {
+  task: Task
+  holder?: Member
+  message: string
+  subjects: string[]
+  dedupKey: string
+}
 
 /**
  * S5c: the durable release record on the pass row. `SchedulingPass`
@@ -96,7 +113,11 @@ export class Scheduling {
           // non-idle handle); an assignment is exactly the fresh input that unparks
           // it, so the runtime must not let that precondition leave the board silent.
           const parkedMember = member.status === 'waiting'
-          if (!parkedMember && !this.rt.workers.isIdle(member.id)) continue
+          // R15-A4/A5: the sweep and the owner-facing explanation ask the same
+          // question (`startBlocker`), so a member the sweep skipped is never
+          // described to the owner with a cause the sweep did not test. The
+          // parked-member hatch keeps priority: a parked member is dispatchable.
+          if (this.startBlocker(member) !== undefined) continue
           const open = this.rt.store.list('tasks', missionId).find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
@@ -208,6 +229,67 @@ export class Scheduling {
   }
 
   /**
+   * R15-A4/A5: the dispatcher's startability question for one member, shared by
+   * the sweep and by the explanation `ensureWitness` gives the owner, so both
+   * answer with the same predicate.
+   *
+   * Guards it can co-fire with:
+   * - the parked-member hatch (`member.status === 'waiting'`, R10-09/S3): a parked
+   *   member is startable even when the adapter reports a pending inbox item, so
+   *   the hatch wins here exactly as it does in `dispatch`;
+   * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which now
+   *   drains a stranded `nextStep` item instead of stranding the member (R15-A5);
+   * - the W6 open-attempt close-out, which owns a member that already has a
+   *   running attempt — `dispatch` handles that member before it dispatches, and
+   *   `dispatchQuestion` refuses to answer for a task with an open attempt.
+   */
+  startBlocker(member: Member): 'handle-busy' | undefined {
+    if (member.status === 'waiting') return undefined
+    return this.rt.workers.isIdle(member.id) ? undefined : 'handle-busy'
+  }
+
+  /**
+   * R15-A4: the dispatcher's own question, asked per (task, assignee) after a
+   * pass that dispatched nothing, so the owner notice names the real cause and
+   * the member whose handle holds the task instead of claiming an admission
+   * refusal that was never recorded.
+   *
+   * Returns undefined — no owner decision — when:
+   * - every dispatchable task carries an open attempt (the close-out path is
+   *   already nudging it; W6 owns that state), or
+   * - no eligible member exists at all (nothing is ready for a member; the board
+   *   is someone else's witness, not this notice's).
+   *
+   * Otherwise the returned notice is one of exactly two honest answers:
+   * - `handle-busy`: every member eligible for the task is working by the
+   *   adapter's contract. The named holder is the task's assignee when the task
+   *   is pinned, else the first eligible member whose handle is busy;
+   * - admission: at least one eligible member is startable, so the dispatcher
+   *   could have dispatched and did not — the refusal came from admission limits,
+   *   budget or a task ceiling.
+   */
+  dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
+    for (const task of dispatchable) {
+      // An open attempt is not a dispatch candidate: the close-out path nudges it
+      // (W6) or the lease path recovers it, and a second owner wake would be noise.
+      if (task.attempt !== undefined) continue
+      const eligible = members.filter(member => member.status !== 'stopped' && this.ready(task, member, tasks))
+      if (!eligible.length) continue
+      const subjects = [taskSubject(task)]
+      const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
+      if (eligible.some(member => this.startBlocker(member) === undefined)) {
+        return { task, subjects, dedupKey,
+          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for an eligible member the dispatcher could start but was not dispatched this tick, and no member handle is holding it: the dispatch was refused by mission admission limits or budget. Free a slot, raise a limit with swarm_budget, or withdraw the blocking work with swarm_cancel.` }
+      }
+      const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
+      const holder = pinned ?? eligible[0]!
+      return { task, holder, subjects, dedupKey,
+        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), re-propose the task with a different assigneeId, or withdraw it with swarm_cancel.` }
+    }
+    return undefined
+  }
+
+  /**
    * Round 14: the terminal element of a guard chain, made unconditional.
    *
    * A chain's earlier elements may each answer "no" for a good reason; when
@@ -273,7 +355,23 @@ export class Scheduling {
             ? { assumedContent: true } : {}),
         }
       }),
-      members: members.map(member => ({ id: member.id, status: member.status })),
+      // R15-F2: the guard board derives a member's status from the live attempt as
+      // well as from the stored row, so a stale `idle` row cannot make the model's
+      // progress action hide a member that currently owns running work. Co-firing
+      // guards: this derivation x the W6 idle close-out (same attempt) and x the
+      // parked-member hatch (`waiting` is preserved: a parked owner still holds
+      // its work).
+      // Upgrade-only, exactly like the runtime's reconciliation: a stale `idle` row
+      // must not hide a member that owns a live attempt (the reported seam), while a
+      // stored `working` row is preserved — the retained DEADr D1 pair depends on
+      // the stored status reaching the guard model, and the paths that END an
+      // attempt write `idle` themselves.
+      members: members.map(member => {
+        if (member.status === 'waiting' || member.status === 'stopped') return { id: member.id, status: member.status }
+        const ownsLiveAttempt = tasks.some(task => task.status === 'running' && task.attempt !== undefined
+          && task.attempt.leaseUntil >= now && task.attempt.ownerId === member.id)
+        return { id: member.id, status: ownsLiveAttempt ? 'working' : member.status }
+      }),
     }
   }
 
@@ -442,6 +540,26 @@ export class Scheduling {
     return this.hasLiveWork(missionId) ? row : undefined
   }
 
+  /**
+   * R15-D1/D2: a pass body that is still `running` past its declared bound, from
+   * THIS instance. `livePass` deliberately keeps such a row as a guard while the
+   * mission has live work (a sibling lease, an in-flight stop acknowledgement),
+   * so the watchdog does not abandon a pass that may legitimately be inside a long
+   * adapter await. That gate must not silence another subject's clock: the
+   * queue-external decision sweep reads this predicate and names the subjects the
+   * wedged pass cannot finish, even while a healthy sibling holds its lease.
+   *
+   * Co-firing guards: `livePass` (still the scheduling gate), the wedge watchdog
+   * (`checkSchedulingPasses`, which releases only with no live work), the
+   * off-pass decision sweep (the only caller) and `hasLiveWork`.
+   */
+  passWedged(missionId: string): boolean {
+    const row = this.rt.store.get('passes', this.passKey(missionId))
+    if (row === undefined || row.missionId !== missionId) return false
+    if (row.instanceId !== this.instanceId || row.status !== 'running') return false
+    return Date.now() - row.startedAt > this.rt.stallPassTimeoutMs
+  }
+
   /** Open a pass and record it durably before any scheduling work starts. */
   openPass(missionId: string): SchedulingPass | undefined {
     if (this.rt.closed || this.rt.shuttingDown) return undefined
@@ -583,9 +701,27 @@ export class Scheduling {
     if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return
     const fingerprint = info.fingerprintNow
     if (mission.schedulingStallNotice === fingerprint) return
-    const witnessed = mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
+    // A pass-timeout wedge is its own subject: the pass body was abandoned and its
+    // guard released. A board-level witness (another notice that announced the
+    // same fingerprint) must not suppress it — that cross-subject conflation is
+    // exactly what round 15 removes, and fault F21 requires the wedge to be named
+    // inside the declared bound whether or not the board was already announced.
+    // The no-progress variant is a statement about the board, so a fresh witness
+    // for that board does suppress it, as before.
+    const witnessed = info.reason === 'pass-timeout'
+      ? false
+      : mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
     if (witnessed) return
     const unschedulable = info.pass.stalled?.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
+    // R15-A1/A2: a wedged or no-progress pass names the work it never reached, so
+    // the notice carries subjects even though `unschedulable` is legitimately
+    // empty (nothing is unschedulable: the pass simply never ran to a decision).
+    // Guard pair: scheduling-pass stall x stall-root classifier — both can fire for
+    // one board, and each keeps its own subject and dedup key; the mission root is
+    // the fallback only when the board has no non-terminal task left.
+    const unreached = this.rt.store.list('tasks', missionId).filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
+    const subjects = subjectsOfTasks(unreached, mission)
+    const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
     mission.schedulingStallNotice = fingerprint
@@ -608,8 +744,8 @@ export class Scheduling {
         missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
       })
       this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.`
-        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`)
+        ? `Scheduling pass ${info.pass.id} for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}. Work the pass never reached: ${unreachedText}. Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects)
     })
     // The notice path must not share the fate of the pass that could not report
     // it: the queue-external pump delivers it, never the wedged mission queue.

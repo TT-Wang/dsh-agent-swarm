@@ -15,10 +15,10 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { FakeWorkers, SwarmRuntime, acceptThroughReview, blockThroughReview, clone, eventually, events, runScenario, setup, taskOf } from './harness.mjs'
+import { tempDirectory } from '../temp-root.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.kind === 'control')
@@ -434,7 +434,7 @@ await runScenario({
     // Row 17 — zero-task, zero-member active mission: documented exemption; the
     // test asserts no notice and a fingerprint stable across ticks.
     {
-      const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-f19-empty-')))
+      const directory = await realpath(await tempDirectory('swarm-f19-empty-'))
       const workers = new FakeWorkers()
       const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10,
         maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, workers)

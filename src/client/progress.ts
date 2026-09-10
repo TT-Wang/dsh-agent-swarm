@@ -203,3 +203,193 @@ export function taskReasons(snapshot: Snapshot): Map<string, string> {
   }
   return reasons
 }
+
+/* ------------------------------------------------------------------------- *
+ * Round 15, Objective B: the owner-facing sidebar state.
+ *
+ * Six phases, each derived from a durable fact (a mission/task row or a
+ * persisted event) and never from a transport heartbeat, an animation or a
+ * model turn:
+ *
+ * | phase | durable fact |
+ * |---|---|
+ * | `finished` | `mission.status` is `completed` or `stopped` |
+ * | `paused` | `mission.status` is `paused`, or a budget pause is recorded |
+ * | `disconnected` | the client connection is not `connected` |
+ * | `recovering` | a task durably holds a stop transition (`resumeAfterStop` at its epoch) or a live attempt past its first recovery credit |
+ * | `waiting-for-owner` | a blocked task, an unreviewable submission, a staged plan or an empty board: a decision only the owner can make |
+ * | `working` | a live attempt, or pending work the runtime can still dispatch itself |
+ *
+ * The projection is pure: it takes a snapshot and returns a value. It starts no
+ * request, no timer and no model turn for a state the runtime already handles,
+ * so an ordinary dispatch or recovery does not cost the owner a wake. Ages come
+ * from the durable row or the newest persisted event for that subject; a
+ * missing timestamp is reported as an unknown age instead of being invented.
+ * ------------------------------------------------------------------------- */
+
+export type OwnerPhase = 'working' | 'recovering' | 'waiting-for-owner' | 'paused' | 'disconnected' | 'finished'
+
+/** One unresolved decision, with delivery state kept separate from consumption. */
+export interface OwnerDecisionView {
+  /** The decision's subject: `taskId@epoch` or `mission:<id>`. */
+  subject: string
+  content: string
+  /** When the runtime recorded the decision durably. */
+  queuedAt: number
+  /**
+   * Consumption is a separate fact from delivery, and the host exposes no
+   * reliable signal for it, so it is reported as unknown rather than relabelled.
+   */
+  consumption: 'unknown'
+}
+
+/** The recovery the runtime is currently performing for one subject. */
+export interface OwnerRecoveryView {
+  action: string
+  subject: string
+  /** Durable start of the current recovery step, when one is recorded. */
+  since?: number
+  /** `now - since`, or undefined when no durable start exists (never invented). */
+  ageMs?: number
+}
+
+export interface SidebarStateView {
+  phase: OwnerPhase
+  label: string
+  note?: string
+  /** The transport state, not the work state: a stale view, never a stalled one. */
+  stale: boolean
+  recovery?: OwnerRecoveryView
+  decision?: OwnerDecisionView
+  /** Durable evidence this phase was derived from, for the details pane. */
+  evidence: string
+  /** This projection is pure and never causes a model turn, in every phase. */
+  modelTurn: false
+}
+
+const submissionEventTypes = new Set(['task/submitted'])
+const recoveryEventTypes = new Set(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
+
+/** Newest persisted event for one task among `types`, or undefined. */
+function lastEventAt(snapshot: Snapshot, taskId: string, types: ReadonlySet<string>): number | undefined {
+  for (let index = snapshot.events.length - 1; index >= 0; index--) {
+    const event = snapshot.events[index]!
+    if (!types.has(event.type)) continue
+    const data = event.data as { taskId?: unknown } | undefined
+    if (data?.taskId === taskId) return event.createdAt
+  }
+  return undefined
+}
+
+function taskSubject(task: Task): string { return `${task.id}@${task.epoch}` }
+
+function recoveryAge(since: number | undefined, now: number): number | undefined {
+  return since === undefined || !Number.isFinite(since) ? undefined : Math.max(0, now - since)
+}
+
+/** A submitted task no live review can accept: only the owner can admit one. */
+function unreviewable(task: Task, tasks: readonly Task[]): boolean {
+  if (task.status !== 'submitted') return false
+  return !tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
+    && (review.status === 'pending' || review.status === 'running'))
+}
+
+/**
+ * Derive the sidebar phase from durable facts. `now` is injectable so the age of
+ * a recovery step is testable without sleeping.
+ */
+export function sidebarState(snapshot: Snapshot, connection: ConnectionState = 'connected', now = Date.now()): SidebarStateView {
+  const { mission } = snapshot
+  const stale = connection !== 'connected'
+  const base = { stale, modelTurn: false } as const
+  if (mission.status === 'completed') return { ...base, phase: 'finished', label: 'Collaboration completed', note: mission.reason, evidence: 'mission.status=completed' }
+  if (mission.status === 'stopped') return { ...base, phase: 'finished', label: 'Mission stopped', note: mission.reason, evidence: 'mission.status=stopped' }
+  if (mission.status === 'paused' || mission.budgetPause !== undefined) {
+    return { ...base, phase: 'paused', label: 'Mission paused', note: mission.reason, evidence: mission.budgetPause ? `mission.budgetPause=${mission.budgetPause.id}` : 'mission.status=paused' }
+  }
+  // Transport loss labels the view stale instead of continuing an execution
+  // animation: no phase below this line may be shown as live.
+  if (stale) return { ...base, phase: 'disconnected', label: 'Connection unavailable', note: 'The view is stale: it shows the last durable state, and no execution is confirmed until updates resume.', evidence: `connection=${connection}` }
+  if (mission.status === 'staged') {
+    return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you',
+      note: 'The plan is staged and has not been launched.',
+      decision: { subject: `mission:${mission.id}`, content: mission.reason ?? 'Launch the staged plan or edit it.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      evidence: 'mission.status=staged' }
+  }
+  // One pass over the durable task rows (F-34: the board render must not rescan
+  // per task or per event), keeping the first row of each class in board order.
+  const tasks = snapshot.tasks
+  const reviewed: Record<string, true> = {}
+  for (const task of tasks) {
+    if (task.kind === 'verification' && task.reviewOf !== undefined
+      && (task.status === 'pending' || task.status === 'running' || (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch))) reviewed[task.reviewOf] = true
+  }
+  let stopping: Task | undefined
+  let blocked: Task | undefined
+  let unreviewed: Task | undefined
+  let recovering: Task | undefined
+  let firstRunning: Task | undefined
+  let runningCount = 0
+  let pendingCount = 0
+  for (const task of tasks) {
+    if (task.status === 'blocked') {
+      if (task.resumeAfterStop?.epoch === task.epoch) { if (stopping === undefined) stopping = task }
+      else if (blocked === undefined) blocked = task
+    } else if (task.status === 'submitted') {
+      if (unreviewed === undefined && reviewed[task.id] !== true) unreviewed = task
+    } else if (task.status === 'running') {
+      runningCount += 1
+      if (firstRunning === undefined) firstRunning = task
+      if (recovering === undefined && (task.recoveryCount ?? 0) > 0) recovering = task
+    } else if (task.status === 'pending') pendingCount += 1
+  }
+  // A durable stop transition is the runtime's own recovery step, with its age.
+  if (stopping !== undefined) {
+    const stop = stopping.resumeAfterStop!
+    const since = stop.at
+    const start = since ?? lastEventAt(snapshot, stopping.id, recoveryEventTypes)
+    return { ...base, phase: 'recovering',
+      label: 'Recovering',
+      note: 'The worker handle is acknowledging its stop before the task can be re-pended; no recovery credit is spent.',
+      recovery: { action: `Stop acknowledged (${stop.reason})`, subject: taskSubject(stopping), since, ageMs: recoveryAge(start, now) },
+      evidence: `task ${stopping.id} resumeAfterStop@${stop.epoch}` }
+  }
+  if (blocked !== undefined) {
+    return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
+      note: blocked.output ?? `Task ${blocked.id} cannot make progress without a repair.`,
+      decision: { subject: taskSubject(blocked), content: blocked.output ?? `Repair or withdraw ${blocked.id}.`, queuedAt: lastEventAt(snapshot, blocked.id, recoveryEventTypes) ?? mission.updatedAt, consumption: 'unknown' },
+      evidence: `task ${blocked.id} status=blocked epoch ${blocked.epoch}` }
+  }
+  if (unreviewed !== undefined) {
+    const queuedAt = lastEventAt(snapshot, unreviewed.id, submissionEventTypes) ?? mission.updatedAt
+    return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
+      note: 'A submitted artifact has no live independent review path.',
+      decision: { subject: taskSubject(unreviewed), content: `Admit a verification task for ${unreviewed.id} or cancel it.`, queuedAt, consumption: 'unknown' },
+      evidence: `task ${unreviewed.id} status=submitted without a live review` }
+  }
+  if (recovering !== undefined) {
+    const since = lastEventAt(snapshot, recovering.id, recoveryEventTypes)
+    const limit = recovering.maxRecoveryAttempts
+    const attemptNumber = (recovering.recoveryCount ?? 0) + 1
+    return { ...base, phase: 'recovering', label: 'Recovering',
+      note: `Attempt ${attemptNumber}${limit === undefined ? '' : ` of ${limit}`} for ${recovering.title}.`,
+      recovery: { action: `Attempt ${attemptNumber}${limit === undefined ? '' : ` of ${limit}`}`, subject: taskSubject(recovering), since, ageMs: recoveryAge(since, now) },
+      evidence: `task ${recovering.id} recoveryCount=${recovering.recoveryCount ?? 0}` }
+  }
+  if (firstRunning !== undefined) {
+    return { ...base, phase: 'working', label: runningCount > 1 ? `${runningCount} tasks in progress` : 'Task in progress',
+      note: firstRunning.title, evidence: `task ${firstRunning.id} status=running` }
+  }
+  if (pendingCount > 0) {
+    // Pending work with a live member is the runtime's own dispatch turn: the
+    // projection does not wake the owner for a state the runtime handles.
+    return { ...base, phase: 'working', label: 'Scheduling the next task', note: `${pendingCount} task(s) ready to dispatch.`, evidence: `${pendingCount} task(s) status=pending` }
+  }
+  if (!tasks.length) {
+    return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you', note: 'No work has been admitted yet.',
+      decision: { subject: `mission:${mission.id}`, content: 'Admit work with swarm_propose or inspect the plan.', queuedAt: mission.updatedAt, consumption: 'unknown' },
+      evidence: 'no tasks admitted' }
+  }
+  return { ...base, phase: 'finished', label: 'No task can make further progress', note: mission.reason,
+    evidence: 'every task is terminal' }
+}

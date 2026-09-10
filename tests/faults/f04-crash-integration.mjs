@@ -1,9 +1,9 @@
 /** F4: kill -9 of the host during integration. Restart recovers; no half-applied artifact; promote refuses without a green gate. */
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { makeRepo, runNode, runScenario } from './harness.mjs'
+import { tempDirectory } from '../temp-root.mjs'
 
 await runScenario({
   id: 'F4', title: 'A SIGKILL during integration recovers without a half-applied artifact and promote still needs a green gate', invariants: ['I7'],
@@ -31,7 +31,7 @@ await runScenario({
     assert.equal(state.appliedDelivery, null, 'I7: no delivery is recorded as applied')
     assert.equal(state.partial, before.partial, 'I7: the partial integration workspace is preserved')
     // Promotion still requires a recorded green gate for the exact commit.
-    const lab = await mkdtemp(join(tmpdir(), 'swarm-faults-lab-'))
+    const lab = await tempDirectory('swarm-faults-lab-')
     const promoted = await runNode(['scripts/round.mjs', 'promote', '--commit', 'HEAD', '--lab', lab])
     assert.equal(promoted.code, 2, 'I7: promote refuses without a recorded gate')
     assert.match(promoted.stderr, /no recorded green gate/, 'I7: the refusal names the missing gate')
