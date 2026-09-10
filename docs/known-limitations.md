@@ -102,3 +102,37 @@ Round 2 deferred four defects and accepted two advisories without ranking them. 
 **Single-host, single-writer.** Admission, lease and budget accounting is durable but scoped to one host and one writer process at a time: every mutation serializes through a single SQLite writer connection. A competing writer is classified as `writer_busy` and retried with bounded backoff; progress is not guaranteed under sustained contention. Two writers against one store file, or one store shared across hosts, are unsupported. Multi-host horizontal scaling requires external coordination and is out of scope for this release.
 
 **The full verification suite requires the repository checkout, not the installed tarball.** The published tarball ships built `lib/`, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`. `npm run test:packed` verifies that shipped layout. `test`, `test:harness`, `test:faults`, `test:pack`, `test:profile`, `test:web`, `test:command-web` and the host-only `test:isolation` need `src/`, `tsconfig*.json`, `scripts/` and `tests/` from the repository; fault tier B additionally needs a built Harness checkout.
+
+## Round 15 Pass 2 — the reader census and what it deleted
+
+The census is a repository fact, not a note: `tests/reader-census.test.mjs` records one decision per
+`SWARM_TOOLS` entry, one per `EVENT_VOCABULARY` kind and one per examined payload field, and fails when a
+registry addition has no decision, when a recorded proof does not exist or does not name its kind, or when a
+deleted kind comes back. Counts measured on this artifact: **24 tools, 89 event kinds, 44 examined payload
+fields**. The historical 24/92 figures are not a baseline and were not a quota.
+
+**Deleted (proven dead surface).** Four vocabulary entries were removed — `mission/paused`, `mission/resumed`,
+`mission/stopped`, `mission/completed`. Each is the `-ed` twin of a live *dynamic* kind (`mission/pause`,
+`mission/resume`, `mission/stop`, `mission/complete`); the runtime emits only the dynamic form
+(`src/runtime.ts`: ``event(missionId, `mission/${action}`)``), the client labels only the dynamic form, and the
+`-ed` names never had a writer in this repository's history (checked at the promoted import commit, where they
+appeared only in `src/trace.ts`). No store this plugin produced can contain them, so no historical reader is
+lost; `tests/reader-census.test.mjs` additionally replays a legacy row carrying one of them and asserts that the
+event still returns with its payload (only the description is reported missing), so a future decoder that needs
+the old names has to say so explicitly.
+
+**Kept with a compatibility reason.** `src/client/progress.ts` still labels `attempt/started`, which no writer in
+this repository emits (the live kind is `task/claimed`). It is kept because a historical card can still hold
+such rows and `tests/ui-progress.test.mjs` renders exactly that fixture; the census records it as a named
+compatibility label rather than an undocumented exception, and the label-coverage check fails if a new label
+appears with neither a vocabulary kind nor such an entry.
+
+**Kept because a reader exists.** All 24 tools keep their decision and their named reader (the worker or owner
+decision that uses them, proven by a test that exercises the tool). Event kinds whose only reader is the durable
+log itself are recorded as `audit` rows and are accepted only because the same kind has a writer — a vocabulary
+description alone is not treated as proof of value, and a test-only reference is rejected by the census rule.
+
+**Boundary of the payload examination.** The payload census is deliberately bounded to the four densest durable
+payloads (the three `mission/stalled` shapes, `task/check-envelope`, `tool/recorded` and
+`isolation/temp-rendezvous`). Fields outside those payloads were not examined and therefore carry no decision;
+the census is honest about that rather than implying full coverage.

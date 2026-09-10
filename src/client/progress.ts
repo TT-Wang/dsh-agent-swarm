@@ -61,6 +61,10 @@ export function activityDuration(startedAt: number, now: number): { minutes: num
 export interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
 const meaningfulEvents: Record<string, string> = {
   'workspace/snapshot': 'Project snapshot saved', 'plan/launched': 'Collaboration started',
+  // Compatibility label: no writer in this repository's history emits
+  // `attempt/started` (the live kind is `task/claimed`), but a historical card
+  // may still hold rows with it — see tests/reader-census.test.mjs, decision
+  // `keep (compatibility)`.
   'task/claimed': 'Task started', 'attempt/started': 'Task started', 'task/submitted': 'Work submitted for review',
   'task/accepted': 'Work accepted', 'task/rejected': 'Review requested changes', 'task/blocked': 'Task needs attention',
   'task/invalidated': 'Dependent work needs another review', 'task/handoff-started': 'Task handoff started',
