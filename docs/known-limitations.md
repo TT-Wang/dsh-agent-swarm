@@ -144,3 +144,43 @@ rejected by the census rule.
 payloads (the three `mission/stalled` shapes, `task/check-envelope`, `tool/recorded` and
 `isolation/temp-rendezvous`). Fields outside those payloads were not examined and therefore carry no decision;
 the census is honest about that rather than implying full coverage.
+
+## Round-16 integration (assembled head, base `b4c9516`)
+
+**What the assembled tree carries.** Four accepted branches merged onto `b4c9516`: the wake-precision branch
+(lineage-resolved waiting through the runtime's own `effectiveDependency` seam, `dependentsOf` review edges, the
+`wakePrecision` projection and the predicate enumeration that fails when the lineage resolution is removed), the
+check-environment branch (TMPDIR/TMP/TEMP inside the disposable checkout, the durable declared-check retry pair,
+`HarnessWorkers.readScratch`), the delivery-temp-root and census branch, and the bounded-release/reporting branch.
+The union of changed paths is exactly the branches' declared scopes; no path outside them changed against the base.
+
+**Bounds and their tree.** A scheduling pass whose body does not return is released past
+`stallPassTimeoutMs + stallPassLiveGraceMs` (defaults: 30 ticks plus one grace period of the same length —
+7,500 ms and 15,000 ms under a 250 ms tick), with the release recorded on the durable pass row and the live work
+it preserved named in the escalation; an attempt whose durable progress passes `attemptSilenceBoundMs`
+(default 600,000 ms) escalates with `taskId@epoch` and its member. Both are configuration. **These instruments
+were not live on the deployed round-15 build**, so the round's live-mission silence numbers are read-time
+projections of the fixed artifact over deployed-build rows, not a record that the escalation fired on the live
+mission; a direct live proof requires redeploying onto this head.
+
+**The wake-precision instrument is a read-time judgement.** `runtime.wakePrecision` counts a fall-through notice
+false only when `waitsLegitimately` still recognises its subject at read time, and it does not judge a decision
+whose subject has advanced epochs. A historical false wake whose whole lineage has since terminated therefore
+reads as not-false: on the round-15 mission the instrument reports zero false wakes over 17 fall-through
+decisions, while the at-the-time measurement found the same family naming a subject with a live replacement seven
+times in 28 minutes. The fixed-build proof is the shipped predicate enumeration plus the emission pairs, re-run on
+the assembled head; the live-ledger counts remain a qualified observation about the deployed build.
+
+**The three facts stay separate.** Deliveries carry a transport state (`sent`/`queued`/`claimed`); consumption is
+recorded as `unknown` in the runtime ledger, and the host instrument that can observe it is the inbound
+`agent/inbox/claimed` event plus its durable `user/message` twin. No host signal shows that a notice was acted on,
+so **"handled" is UNTESTABLE with the missing instrument**; resolutions remain task or mission transitions. A
+recorded design hazard for wiring consumption: `flushOutbox` writes the whole delivery row after `deliver()`
+returns, so a stale whole-row put can clobber a concurrently recorded `consumedAt`.
+
+**Open hand-offs.** The attempt-closer vocabulary in the scheduling branch duplicates the private attempt-closer
+set in `src/trace.ts` (the replay truncation check is the cross-check; the duplication is recorded here rather
+than silently shared). The six host-only suites (`test:harness`, `test:pack`, `test:profile`, `test:isolation`,
+`test:web`, `test:command-web`) are blocked by the nested-sandbox environment — measured `SandboxUnavailableError`
+(`sandbox-exec: sandbox_apply: Operation not permitted`) and, for isolation, an `EPERM` `mkdtemp` under `$HOME` —
+so the accept-host-only-or-change-policy decision is owed to the owner rather than silently declared.
