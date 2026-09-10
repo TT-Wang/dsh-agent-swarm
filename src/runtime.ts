@@ -5,6 +5,15 @@ import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
+import { Attempts } from './attempts.ts'
+import { WorkspaceAdmission, WorkspaceRevokedError, executedShellCommand, gitWriteDeniedMessage, gitWriteSubcommand, sharedTempPaths, tempRendezvousDecision, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS } from './notices.ts'
+import { RefusalRegistry, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { Scheduling } from './scheduling.ts'
+export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
+import { RuntimeGates, emptyUsage, addUsage, missionFingerprint, BOARD_BODY_EXCERPT, BOARD_DELTA_POSTS, DEFAULT_BUDGET_WARN_AT, postView, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
+import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
+export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
 import { arenaView as projectArenaView, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, admissionRowId, classifyProviderOutage, decideAdmission, defaultLimitRules, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type AdmissionUsage, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope } from './scope.ts'
@@ -16,77 +25,28 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
 /** Closed board kind vocabulary; a free-form kind is a validation error. */
 const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
-/** A board page shows a bounded body excerpt; the full body is read by postId. */
-const BOARD_BODY_EXCERPT = 600
+
 /** Board delta reads are bounded to this page size unless the caller asks for less. */
 const BOARD_PAGE_MAX = 100
 const BOARD_PAGE_DEFAULT = 20
-/** Observe shows only the newest few new posts; the board tool pages the rest. */
-const BOARD_DELTA_POSTS = 3
-/** Host verification timeout when a task chose none; matches the plugin config default. */
-const DEFAULT_CHECK_TIMEOUT_MS = 60000
-/** A rejection names at most this many failing checks; the rest are counted. */
-const MAX_REPORTED_CHECK_FAILURES = 4
-/** Extra lease headroom per allowed output token while a model stream is observably live. */
-const LEASE_MS_PER_OUTPUT_TOKEN = 20
-const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
+
+
+
+
 /** R11-01: how long a classified provider outage keeps a member's route quiescent. */
 const PROVIDER_OUTAGE_WINDOW_MS = 5 * 60_000
 /** R11-01: bound the durable outage log to one row per member and class per window. */
 const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
 /** Idle close-out nudges before an open attempt is checkpointed and re-pended. */
-const DEFAULT_IDLE_CLOSEOUTS = 2
-/**
- * R11-15: the shared temp roots every workspace-write execution may write
- * (DSH `roots.ts`: the workspace root, `/tmp` and `os.tmpdir()`). They are
- * shared across members and missions, so they are a cross-tenant channel.
- */
-const SHARED_TEMP_ROOTS: readonly string[] = [...new Set(['/tmp', '/var/tmp', tmpdir()].flatMap(root => {
-  const clean = root.replace(/\/+$/, '')
-  return [clean, `/private${clean}`]
-}))]
-/** R11-15: how long two members naming the same shared temp path still count as a rendezvous. */
-export const TEMP_RENDEZVOUS_WINDOW_MS = 10 * 60_000
-/** R11-15: bounded per-path mention history and reported-pair bookkeeping. */
-const TEMP_RENDEZVOUS_MAX_PATHS = 2048
-const TEMP_RENDEZVOUS_MAX_MENTIONS = 8
-/** R11-15: one member's host-recorded mention of a shared temp path. */
-export interface TempMention { memberId: string; taskId: string; at: number }
-/**
- * R11-15: the shared-temp absolute paths one host-recorded tool call names.
- * Shell commands are tokenized by the same POSIX-ish scanner admission uses and
- * file tools contribute their path argument. This is a bounded heuristic over
- * host-recorded input, not proof that the path was written: it surfaces a
- * rendezvous attempt between members, never file contents.
- */
-export function sharedTempPaths(input: { tool: string; arguments: unknown }): string[] {
-  const candidates: string[] = []
-  const args = input.arguments
-  if (args !== null && typeof args === 'object') {
-    const record = args as Record<string, unknown>
-    if (typeof record.command === 'string') candidates.push(...absoluteCheckPaths(record.command))
-    for (const key of ['file_path', 'filePath', 'path', 'notebook_path'] as const) if (typeof record[key] === 'string') candidates.push(record[key] as string)
-  }
-  const found: string[] = []
-  for (const candidate of candidates) {
-    const normalized = candidate.replace(/^\/+/, '/')
-    if (!SHARED_TEMP_ROOTS.some(root => normalized === root || normalized.startsWith(`${root}/`))) continue
-    if (!found.includes(normalized)) found.push(normalized)
-  }
-  return found
-}
-/** R11-15: the first mention by a different member still inside the window, or undefined. */
-export function tempRendezvousDecision(mentions: readonly TempMention[], memberId: string, now: number, windowMs = TEMP_RENDEZVOUS_WINDOW_MS): TempMention | undefined {
-  return mentions.find(mention => mention.memberId !== memberId && now - mention.at <= windowMs)
-}
-/**
- * Round-8 F1: scheduling passes an unreviewed submission must persist before
- * the board is reported stalled. The owner may be admitting the review it just
- * planned; a submission that stays unreviewable past this bounded grace is a
- * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
- */
-const STALL_GRACE_PASSES = 30
-const STALL_GRACE_MAX_MS = 1000
+
+
+
+
+
+
+
+
+
 /**
  * S1: consecutive scheduling passes that advance no durable mission state and
  * terminate nothing before the runtime escalates. Defaults are expressed as
@@ -109,420 +69,37 @@ const START_FAILURE_REROUTE_LIMIT = 3
  * consume an unbounded share of the mission budget.
  */
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
-/**
- * F2: how long a submitted code deliverable may stay without a live review
- * before the runtime concludes none is coming. One scheduler period gives the
- * author the turn in which it submitted to propose its own review; the floor
- * keeps a fast tick from turning a same-turn proposal into a race.
- */
-const AUTO_REVIEW_GRACE_MS = 1000
-/** A worker-side git write that the sandbox refused; the action names the supported exit. */
-const gitWriteDeniedMessage = (command: string): string => `Worker git writes are denied by the workspace sandbox: ${command} could not write git metadata (index.lock EPERM). Workers cannot commit; do not retry git add/commit. Publish the workspace with swarm_submit, which captures it host-side, or release the attempt with swarm_handoff/swarm_wait.`
-/**
- * F14: only a shell-executing tool runs a command line that can attempt a git
- * write. `bash`/`pwsh` carry it in `command`, a persistent terminal carries the
- * typed shell input in `text`. Every other tool (edit, grep, read, write) may
- * quote a git-write phrase in its arguments and may even return file text that
- * contains index.lock/EPERM; that text was never executed, so it must neither
- * claim the typed denial nor latch the attempt.
- */
-const SHELL_COMMAND_KEYS = new Map<string, readonly string[]>([
-  ['bash', ['command']], ['pwsh', ['command']], ['shell', ['command']],
-  ['terminal', ['text']], ['terminal_send', ['text']],
-])
-/** The executed command line of a shell tool, or undefined for any other tool. */
-function executedShellCommand(tool: string, args: unknown): string | undefined {
-  const keys = SHELL_COMMAND_KEYS.get(tool)
-  if (keys === undefined || args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
-  const record = args as Record<string, unknown>
-  for (const key of keys) {
-    const value = record[key]
-    if (typeof value === 'string') return value
-  }
-  return undefined
-}
-/**
- * The command with shell comments, quoted spans, arithmetic expressions,
- * `$[...]`/`${...}` literal spans and heredoc bodies removed, so a phrase that
- * merely appears as data (a search pattern, an edit body, a message, a heredoc
- * body) is not mistaken for an executed command. Direct commands and compound
- * command words keep their text; a command hidden inside a nested shell string
- * is not seen. R7-01: a `<<`/`<<-` heredoc body is data, so a line-start
- * `git add`/`git commit` inside a runbook written by `cat` is never classified
- * as an executed write, even when another command in the same call fails.
- * R7-01b/c: only an operator that really starts a heredoc is recognized —
- * `<<<` here-strings, `<<` inside arithmetic (`$((...))`, `((...))`), inside
- * `$[...]`, inside unquoted `${...}` and inside quotes/comments stay command
- * text, and an operator whose body has no terminator line stays command text
- * too, so a phantom operator can never swallow a later real write.
- */
-function unquotedShellText(command: string): string {
-  let text = ''
-  let quote: '"' | "'" | undefined
-  let arithmetic = 0
-  let literal: '[' | '{' | undefined
-  let literalQuote: '"' | "'" | undefined
-  let literalDepth = 0
-  const heredocs: { delimiter: string; stripTabs: boolean }[] = []
-  for (let index = 0; index < command.length; index++) {
-    const char = command[index]!
-    if (quote !== undefined) {
-      if (char === '\\' && quote === '"') index++
-      else if (char === quote) quote = undefined
-      continue
-    }
-    if (literal !== undefined) {
-      // R7-01c: `$[...]` and unquoted `${...}` are literal spans. Their text is
-      // kept, but a `<<` inside them is never a heredoc operator. Quotes inside
-      // the span are tracked locally so `${x:-"a}b"}` does not end early.
-      if (literalQuote !== undefined) {
-        if (char === '\\' && literalQuote === '"' && index + 1 < command.length) {
-          text += char + command[index + 1]!
-          index++
-          continue
-        }
-        if (char === literalQuote) literalQuote = undefined
-        text += char
-        continue
-      }
-      if (char === '"' || char === "'") { literalQuote = char; text += char; continue }
-      if (char === literal) literalDepth++
-      else if (char === (literal === '[' ? ']' : '}')) {
-        literalDepth--
-        if (literalDepth === 0) { literal = undefined; literalQuote = undefined }
-      }
-      text += char
-      continue
-    }
-    if (arithmetic > 0) {
-      // Inside arithmetic a `<<` is a shift and parens are balanced; the text
-      // stays so a malformed expansion can never hide a later command.
-      if (char === '(') arithmetic++
-      else if (char === ')') arithmetic--
-      text += char
-      continue
-    }
-    if (char === '"' || char === "'") { quote = char; continue }
-    if (char === '#') {
-      // Leave the newline for the heredoc flush below: a trailing comment on a
-      // heredoc operator's line must not skip the body that follows it.
-      const newline = command.indexOf('\n', index)
-      if (newline === -1) break
-      index = newline - 1
-      continue
-    }
-    if (char === '$' && command[index + 1] === '(' && command[index + 2] === '(') {
-      arithmetic = 2
-      index += 2
-      continue
-    }
-    if (char === '$' && command[index + 1] === '[') {
-      literal = '['; literalDepth = 0; text += char
-      continue
-    }
-    if (char === '$' && command[index + 1] === '{') {
-      literal = '{'; literalDepth = 0; text += char
-      continue
-    }
-    if (char === '(' && command[index + 1] === '(') {
-      arithmetic = 2
-      index += 1
-      continue
-    }
-    if (char === '<') {
-      let run = 0
-      while (command[index + run] === '<') run++
-      if (run === 2) {
-        const operator = heredocOperator(command, index)
-        if (operator !== undefined) {
-          heredocs.push({ delimiter: operator.delimiter, stripTabs: operator.stripTabs })
-          index = operator.next - 1
-          continue
-        }
-      } else if (run >= 3) {
-        // A here-string `<<<` (or a longer run) is not a heredoc operator.
-        text += '<'.repeat(run)
-        index += run - 1
-        continue
-      }
-    }
-    if (char === '\n' && heredocs.length > 0) {
-      const bodyEnd = heredocBodyEnd(command, index + 1, heredocs)
-      heredocs.length = 0
-      if (bodyEnd !== undefined) {
-        text += '\n'
-        index = bodyEnd - 1
-        continue
-      }
-      // No complete terminator sequence: the queued operators were not real
-      // heredocs, so the text stays commands and a later write is still seen.
-    }
-    text += char
-  }
-  return text
-}
-/**
- * R7-01b: the index just past every queued heredoc body, or undefined when any
- * queued operator has no terminator line. A body starts after the operator's
- * command line and ends at the first line equal to its delimiter; `<<-` strips
- * leading tabs from body and terminator lines. Requiring the terminator keeps a
- * phantom operator (a shift or here-string the scanner misread) from swallowing
- * the rest of the call.
- */
-function heredocBodyEnd(command: string, start: number, heredocs: readonly { delimiter: string; stripTabs: boolean }[]): number | undefined {
-  let cursor = start
-  for (const { delimiter, stripTabs } of heredocs) {
-    let found = false
-    for (;;) {
-      const lineEnd = command.indexOf('\n', cursor)
-      const line = command.slice(cursor, lineEnd === -1 ? command.length : lineEnd)
-      if ((stripTabs ? line.replace(/^\t+/, '') : line) === delimiter) {
-        cursor = lineEnd === -1 ? command.length : lineEnd + 1
-        found = true
-        break
-      }
-      if (lineEnd === -1) break
-      cursor = lineEnd + 1
-    }
-    if (!found) return undefined
-  }
-  return cursor
-}
-/**
- * R7-01b: a `<<`/`<<-` operator and its delimiter word, or undefined when the
- * `<<` does not start a heredoc. `<<<` here-strings, arithmetic shifts and the
- * `$[...]`/`${...}` literal spans never reach this function. The delimiter may
- * be a bare shell word (letters, digits, `_`, `-`), single/double quoted or
- * backslash-quoted, and must end at whitespace, a shell operator or `)` (the
- * inline `x=$(cat <<EOF)` form). The body is skipped only when `heredocBodyEnd`
- * finds its terminator line.
- */
-function heredocOperator(command: string, start: number): { delimiter: string; stripTabs: boolean; next: number } | undefined {
-  let cursor = start + 2
-  const stripTabs = command[cursor] === '-'
-  if (stripTabs) cursor++
-  while (command[cursor] === ' ' || command[cursor] === '\t') cursor++
-  let delimiter: string
-  const opener = command[cursor]
-  if (opener === "'" || opener === '"') {
-    const close = command.indexOf(opener, cursor + 1)
-    if (close === -1) return undefined
-    delimiter = command.slice(cursor + 1, close)
-    cursor = close + 1
-  } else {
-    if (opener === '\\') cursor++
-    const word = /^[A-Za-z0-9_][A-Za-z0-9_-]*/.exec(command.slice(cursor))?.[0]
-    if (word === undefined) return undefined
-    delimiter = word
-    cursor += word.length
-  }
-  if (!delimiter) return undefined
-  const after = command[cursor]
-  if (after !== undefined && !/[\s;&|<>)]/.test(after)) return undefined
-  return { delimiter, stripTabs, next: cursor }
-}
-/** Global git options that take a separate value token, so the subcommand is one token later. */
-const GIT_OPTION_ARGUMENTS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--exec-path', '--namespace', '--config-env'])
-/** Commands that may precede `git` without being the executed program themselves. */
-const COMMAND_WRAPPERS = new Set(['env', 'command', 'sudo', 'nohup', 'time', 'exec', 'nice', 'doas', 'builtin'])
-/** Wrapper options that consume a separate value token. */
-const WRAPPER_OPTION_ARGUMENTS = new Set(['-u', '-g', '-p', '-C', '-h', '-U', '-r', '-t', '-D', '-n', '-f', '-o', '-a', '--user', '--group', '--prompt', '--host', '--other-user', '--role', '--type', '--close-from', '--chdir', '--unset', '--format', '--output', '--adjustment'])
-/**
- * R6-I2c: true when tokens[0..index) are only environment assignments and/or
- * known wrappers with their option tokens, so the token at `index` is the
- * executed program. A bare `git` token in another program's arguments
- * (`grep -rn git add .`) is data, never the command.
- */
-function atCommandPosition(tokens: string[], index: number): boolean {
-  let position = 0
-  while (position < index) {
-    const token = tokens[position]!
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { position++; continue }
-    if (COMMAND_WRAPPERS.has(token)) { position++; continue }
-    if (token.startsWith('-')) {
-      const name = token.split('=')[0]!
-      position += WRAPPER_OPTION_ARGUMENTS.has(name) && !token.includes('=') && position + 1 < index ? 2 : 1
-      continue
-    }
-    return false
-  }
-  return true
-}
-/**
- * R6-02: the git subcommand actually executed at command position, or undefined
- * when the command runs no git write. Only a token at subcommand position
- * counts, so a read-only command that merely mentions a write word in a pattern,
- * path or argument (`git log --grep=commit`, `git grep add`,
- * `git diff --stat | grep reset`) is data and never a denial. R6-I2c: the `git`
- * token itself must sit at command position (assignments and wrappers only
- * before it), so `grep -rn git add .` is data too. Global options and their
- * values are skipped; the R6-01 property (result text never decides) is
- * preserved.
- */
-function gitWriteSubcommand(command: string): string | undefined {
-  for (const segment of shellSegments(command)) {
-    const tokens = segment.map(token => token.text)
-    for (let git = 0; git < tokens.length; git++) {
-      if (tokens[git] !== 'git' || !atCommandPosition(tokens, git)) continue
-      let index = git + 1
-      while (index < tokens.length) {
-        const token = tokens[index]!
-        if (!token.startsWith('-')) break
-        index += GIT_OPTION_ARGUMENTS.has(token.split('=')[0]!) && !token.includes('=') ? 2 : 1
-      }
-      const subcommand = tokens[index]
-      if (subcommand !== undefined && GIT_WRITE.test(`git ${subcommand}`)) return subcommand
-    }
-  }
-  return undefined
-}
-/**
- * A git metadata-write subcommand named on one executed command line. R6-01:
- * read-only and worktree-only subcommands (`apply`, `worktree`, `branch`,
- * `config`, `fetch`, `pull`, `tag`, `stash`) are excluded, because their
- * read-only forms (`git worktree list`, `git apply --reject`) are not sandbox
- * denials and must never latch an attempt.
- */
-const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
-/**
- * The sandbox's own refusal text. R6-01: retained as the documented refusal
- * vocabulary of the accepted guard artifact, but the denial no longer scans the
- * result, so incidental output text can never claim it or latch an attempt.
- */
-const GIT_WRITE_REFUSAL = /index\.lock|Operation not permitted|EPERM/i
-const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
-export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
-export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): UsageBuckets {
-  const result = { ...(base ?? emptyUsage()) }
-  for (const key of USAGE_KEYS) result[key] += Math.max(0, delta[key])
-  return result
-}
-/** Cumulative logs never shrink; a smaller bucket means a replayed snapshot and contributes nothing. */
-function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
-  const result = emptyUsage()
-  for (const key of USAGE_KEYS) result[key] = Math.max(0, next[key] - (previous?.[key] ?? 0))
-  return result
-}
-function validUsage(value: unknown): value is UsageBuckets {
-  return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
-}
-/**
- * One task's owner-observable slice of the no-silent-state board. `ready` and
- * `unreviewed` are derived by the runtime from durable state (`ready()` and the
- * live review path); they are never supplied by a caller's claim.
- */
-export interface MissionFingerprintTask {
-  id: string
-  status: Task['status']
-  /** The attempt owner only; a planned assignee is not an observed owner. */
-  attemptOwner?: string
-  /** A pending task at least one idle or waiting member can run right now. */
-  ready: boolean
-  /** A submitted task no live independent review can accept. */
-  unreviewed: boolean
-}
-/** The owner-observable board slice `missionFingerprint` digests (spec §4). */
-export interface MissionFingerprintBoard {
-  status: Mission['status']
-  tasks: readonly MissionFingerprintTask[]
-  members: ReadonlyArray<{ id: string; status: Member['status'] }>
-  /** Undelivered worker outbox rows whose recipient can no longer receive them. */
-  pendingDeliveries: number
-  challengedEvidence: number
-  /** Ceilings already hit: the budget pause id and each task's exhausted dimension. */
-  ceilings: readonly string[]
-}
-/**
- * Stable digest `F(S)` of the owner-observable board (docs/no-silent-state-spec.md
- * §4). Every field is durable state; wall-clock fields are excluded by
- * construction, so an idle tick never changes the fingerprint and an unchanged
- * board cannot re-notify. Pure so a test can recompute it from the board.
- */
-export function missionFingerprint(board: MissionFingerprintBoard): string {
-  const order = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-  const tasks = [...board.tasks].sort(order).map(task => [task.id, task.status, task.attemptOwner ?? null, task.ready ? 1 : 0, task.unreviewed ? 1 : 0])
-  const members = [...board.members].sort(order).map(member => [member.id, member.status])
-  const canonical = JSON.stringify({
-    status: board.status,
-    tasks,
-    ready: board.tasks.filter(task => task.ready).length,
-    notReady: board.tasks.filter(task => task.status === 'pending' && !task.ready).length,
-    unreviewed: board.tasks.filter(task => task.unreviewed).length,
-    members,
-    pendingDeliveries: board.pendingDeliveries,
-    challengedEvidence: board.challengedEvidence,
-    ceilings: [...board.ceilings].sort(),
-  })
-  return createHash('sha256').update(canonical).digest('hex').slice(0, 32)
-}
-/** Bounded text for model-visible views; the stored record remains complete. */
-function excerpt(value: unknown, limit: number): string {
-  const raw = typeof value === 'string' ? value : JSON.stringify(value) ?? ''
-  return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
-}
-/**
- * Bounded board projection. `full` is used only by the single-post read; every
- * page carries an excerpt and says how many characters were withheld, so a
- * board page can never flood a model context. TTL expiry is reported, never
- * enforced by mutating the post.
- */
-function postView(post: Post, full = false): Record<string, unknown> {
-  return {
-    id: post.id, seq: post.seq, kind: post.kind, fromMemberId: post.fromMemberId,
-    ...(post.toMemberId === undefined ? {} : { toMemberId: post.toMemberId }),
-    ...(post.taskId === undefined ? {} : { taskId: post.taskId }),
-    ...(post.attemptId === undefined ? {} : { attemptId: post.attemptId }),
-    body: full ? post.body : excerpt(post.body, BOARD_BODY_EXCERPT),
-    ...(full || post.body.length <= BOARD_BODY_EXCERPT ? {} : { bodyChars: post.body.length, bodyTruncated: true }),
-    ...(post.evidenceIds.length ? { evidenceIds: post.evidenceIds } : {}),
-    ...(post.toolRunIds.length ? { toolRunIds: post.toolRunIds } : {}),
-    ...(post.replyTo === undefined ? {} : { replyTo: post.replyTo }),
-    createdAt: post.createdAt,
-    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: Date.now() >= post.createdAt + post.ttlMs }),
-  }
-}
-function requireText(value: string, name: string): void { if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`) }
-function requireStrings(value: string[], name: string): void {
-  if (!Array.isArray(value) || value.length === 0 || !value.every(x => typeof x === 'string' && x.trim())) throw new Error(`${name} must contain nonempty strings`)
-}
-/** Exact ordered comparison of declared check lists (Round 9-C check integrity). */
-function sameChecks(left: readonly string[] | undefined, right: readonly string[] | undefined): boolean {
-  const a = left ?? [], b = right ?? []
-  return a.length === b.length && a.every((value, index) => value === b[index])
-}
-function validatedBudget(input: Budget): Budget {
-  const budget = {} as Budget
-  for (const key of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'] as const) {
-    const value = input?.[key]
-    if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${key}`)
-    budget[key] = value
-  }
-  return budget
-}
-/**
- * A provider rejection of an explicit reasoning effort. The Harness LLM layer
- * raises `UNSUPPORTED_REASONING_EFFORT` for a route whose model declares no such
- * effort; the same text can also reach the runtime as a plain string from the
- * worker adapter's failure callback, so both shapes are recognized.
- */
-function unsupportedEffort(error: unknown): { requested?: string; message: string } | undefined {
-  const message = error instanceof Error ? error.message : String(error)
-  const code = error !== null && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
-  if (code !== 'UNSUPPORTED_REASONING_EFFORT' && !/does not support reasoning effort/i.test(message)) return undefined
-  const requested = /reasoning effort "([^"]+)"/i.exec(message)?.[1]
-  return { ...(requested === undefined ? {} : { requested }), message }
-}
 
-/**
- * A mission's recorded workspace is no longer inside a human-authorized root.
- * Distinct from an ordinary preparation failure because it is terminal for this
- * host process: the mission is fenced immediately instead of spending recovery
- * credit, and the owner is woken with the durable reason.
- */
-export class WorkspaceRevokedError extends Error {
-  readonly code = 'workspace_revoked'
-  constructor(readonly diagnostic: string) { super(diagnostic); this.name = 'WorkspaceRevokedError' }
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /**
  * `detail=full` is an owner-only read. Worker guidance alone did not prevent its
@@ -568,7 +145,7 @@ export class SwarmRuntime {
    */
   readonly store: SwarmStore
   private readonly listeners = new Set<(missionId: string) => void>()
-  private readonly queues = new Map<string, Promise<unknown>>()
+  readonly queues = new Map<string, Promise<unknown>>()
   /**
    * S5: the scheduling guard is a durable per-mission `passes` row (S1), re-read
    * from the store on every kick. There is deliberately no in-memory `scheduled`
@@ -577,23 +154,16 @@ export class SwarmRuntime {
    */
   private readonly operations = new Set<Promise<unknown>>()
   private readonly startControllers = new Map<string, AbortController>()
-  private readonly budgetStops = new Set<string>()
-  /**
-   * S1: pass ids the watchdog released after the declared bound. Fences an
-   * abandoned pass body so it cannot dispatch into the newer pass's turn.
-   * Cache-only (S5): a lost entry lets the abandoned body repeat idempotent
-   * work, no durable transition becomes wrong.
-   */
-  private readonly releasedPasses = new Set<string>()
+  
+  
   /**
    * Members that ended a turn while still owning an attempt; drives the bounded
    * close-out. S5 cache: the durable signal is `Task.idleSignal`, written by
    * `onIdle` and re-read by the scheduling pass, so losing this map only delays
    * the close-out until lease expiry.
    */
-  private readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
   /** Consecutive `workers.start` failures per member; a successful start clears the count (R5-02). */
-  private readonly startFailures = new Map<string, number>()
+  readonly startFailures = new Map<string, number>()
   /**
    * Delivered observe positions per member. This is a context cache, not mission
    * state: a restart re-sends one bounded focused view and then resumes deltas,
@@ -601,10 +171,10 @@ export class SwarmRuntime {
    */
   private readonly observeCursors = new Map<string, DeliveredCursor>()
   private timer?: ReturnType<typeof setInterval>
-  private closed = false
-  private shuttingDown = false
+  closed = false
+  shuttingDown = false
   /** A classified SQLITE_BUSY that must become a durable `writer_busy` admission row. */
-  private writerBusy?: { at: number; attempts: number; candidate: AdmissionCandidate; detail: string }
+  writerBusy?: { at: number; attempts: number; candidate: AdmissionCandidate; detail: string }
   /**
    * F2: automatic review admissions per submitted source, and the exact
    * owner-notice already sent for an unreviewable one. The map keeps the
@@ -613,21 +183,121 @@ export class SwarmRuntime {
    * every tick.
    */
   private readonly autoReviewAdmissions = new Map<string, string>()
-  private readonly reviewPathNotices = new Set<string>()
+  
   /** Missing-review records already written, keyed by mission:source:submission seq. */
   private readonly reviewPathReported = new Set<string>()
-  /** R10-15 parked-holder signals already emitted, keyed by mission:task:epoch. */
-  private readonly parkedNotices = new Set<string>()
-  /** R11-03 integration-gap diagnostics already emitted, keyed by mission:implementation count. */
-  private readonly integrationGapWarned = new Set<string>()
-  /** F(S) cache keyed by the store revision: the digest is pure over durable state. */
-  private readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()
+  
+  
+  
   /** Open runtime transactions; a cached F(S) is not trusted inside one. */
-  private commitDepth = 0
+  commitDepth = 0
   /** R11-15: bounded per-path shared-temp mentions, newest last. */
-  private readonly tempMentions = new Map<string, TempMention[]>()
+  
   /** R11-15: `path|memberA|memberB` pairs already reported inside the window. */
-  private readonly tempRendezvousReported = new Map<string, number>()
+  
+
+  /** M1a seam 6/7: workspace and admission surface. */
+  private readonly workspaceAdmission = new WorkspaceAdmission(this)
+  /** The mission is terminal: no further scheduling or fencing applies. */
+  isMissionTerminal(mission: Mission): boolean { return terminal(mission) }
+  // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
+  assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } { return this.workspaceAdmission.assertAuthorizedRoot(workspace, grantRoot, source) }
+  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): Promise<void> { return this.workspaceAdmission.assertWorkspaceAuthorized(mission) }
+  fenceWorkspace(missionId: string, reason: string): void { return this.workspaceAdmission.fenceWorkspace(missionId, reason) }
+  deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined { return this.workspaceAdmission.deniedGitWrite(input) }
+  tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined { return this.workspaceAdmission.tempRendezvous(memberId, taskId, input) }
+  isolationAllows(missionId: string, member: Member): boolean { return this.workspaceAdmission.isolationAllows(missionId, member) }
+  isolationViolations(missionId: string): string[] { return this.workspaceAdmission.isolationViolations(missionId) }
+
+  readonly attempts = new Attempts(this)
+  /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery. */
+  private readonly refusals = new RefusalRegistry(this)
+  private admissionRulesFor(mission: Mission): LimitRule[] { return this.refusals.admissionRulesFor(mission) }
+  private admissionUsage(missionId: string, candidate: AdmissionCandidate, member: Member): AdmissionUsage { return this.refusals.admissionUsage(missionId, candidate, member) }
+  private budgetBlocked(mission: Mission): string | undefined { return this.refusals.budgetBlocked(mission) }
+  private admissionCandidate(missionId: string, task: Task, member: Member): AdmissionCandidate { return this.refusals.admissionCandidate(missionId, task, member) }
+  private admissionDecision(mission: Mission, member: Member, task: Task): { candidate: AdmissionCandidate; decision: AdmissionDecision } { return this.refusals.admissionDecision(mission, member, task) }
+  private admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord { return this.refusals.admissionRecord(candidate, decision, latencyMs) }
+  private shouldRecordRefusal(next: AdmissionRecord): boolean { return this.refusals.shouldRecordRefusal(next) }
+  upsertAdmission(record: AdmissionRecord): void { return this.refusals.upsertAdmission(record) }
+  private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void { return this.refusals.recordRefusal(candidate, decision, latencyMs) }
+  upsertBudgetRefusals(mission: Mission, reason: string): void { return this.refusals.upsertBudgetRefusals(mission, reason) }
+  private recordWriterBusyRecovery(mission: Mission): void { return this.refusals.recordWriterBusyRecovery(mission) }
+  private refuseProposal(mission: Mission, proposer: string, title: string, reason: string, limit: number): never { return this.refusals.refuseProposal(mission, proposer, title, reason, limit) }
+
+  /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
+  private readonly notices = new Notices(this)
+  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string): void { return this.notices.notify(missionId, content, from, noticeClass, dedupe, dedupKey) }
+  noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
+  private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
+  noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
+  private bounded(text: string): string { return this.notices.bounded(text) }
+  private ensureWitness(missionId: string): void { return this.notices.ensureWitness(missionId) }
+  notifyStall(mission: Mission, tasks: Task[], members: Member[], reason: string): void { return this.notices.notifyStall(mission, tasks, members, reason) }
+  notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
+  notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
+  private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
+  private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, reason) }
+  private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
+  async flushOutbox(missionId: string): Promise<void> { return this.notices.flushOutbox(missionId) }
+  private recordOutboxStarvation(missionId: string, delivery: Delivery): void { return this.notices.recordOutboxStarvation(missionId, delivery) }
+  pumpOutbox(): void { return this.notices.pumpOutbox() }
+
+  /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
+  private readonly scheduling = new Scheduling(this)
+  ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
+  private capable(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.capable(task, member, tasks) }
+  unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
+  reviewable(task: Task, tasks: Task[]): boolean { return this.scheduling.reviewable(task, tasks) }
+  private unreviewedStall(missionId: string, unreviewed: Task[]): boolean { return this.scheduling.unreviewedStall(missionId, unreviewed) }
+  stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
+  private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
+  private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
+  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
+  private passKey(missionId: string): string { return this.scheduling.passKey(missionId) }
+  private livePass(missionId: string): SchedulingPass | undefined { return this.scheduling.livePass(missionId) }
+  private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
+  private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
+  private passReleased(pass: SchedulingPass | undefined): boolean { return this.scheduling.passReleased(pass) }
+  private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
+  private escalateSchedulingStall(missionId: string, info: { pass: SchedulingPass; reason: 'pass-timeout' | 'no-progress'; boundMs: number; revisionNow: number; fingerprintNow: string }): void { return this.scheduling.escalateSchedulingStall(missionId, info) }
+  private boardCannotProgress(missionId: string): boolean { return this.scheduling.boardCannotProgress(missionId) }
+  private hasLiveWork(missionId: string): boolean { return this.scheduling.hasLiveWork(missionId) }
+  private reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
+  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined { return this.scheduling.rerouteTarget(missionId, task, failedId) }
+
+  /** M1a seam 5/7: the declared-check execution path. */
+  private readonly declaredChecks = new DeclaredChecks(this)
+  /** M1a seam 2/7: derived fingerprints, usage accounting and the budget gate. */
+  private readonly gates = new RuntimeGates(this)
+  fingerprint(missionId: string): string { return this.gates.fingerprint(missionId) }
+  fingerprintRecords(missionId: string): { mission: Mission; tasks: Task[]; members: Member[]; evidence: Evidence[]; deliveries: Delivery[] } { return this.gates.fingerprintRecords(missionId) }
+  fingerprintBoard(missionId: string): MissionFingerprintBoard { return this.gates.fingerprintBoard(missionId) }
+  private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> { return this.gates.ownerInstruments(missionId, full) }
+  private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> { return this.gates.boardWindow(missionId, memberId, afterSeq) }
+  private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
+  private async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> { return this.gates.usageSnapshot(memberId, totalTokens, usage) }
+  private recordOwnerUsage(sessionId: string, usage: UsageBuckets): void { return this.gates.recordOwnerUsage(sessionId, usage) }
+  private exhaustedDimensions(mission: Mission): string[] { return this.gates.exhaustedDimensions(mission) }
+  private warnBudget(mission: Mission): void { return this.gates.warnBudget(mission) }
+  private blockBudget(mission: Mission): void { return this.gates.blockBudget(mission) }
+  private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
+  private resumeBudgetTasks(mission: Mission): void { return this.gates.resumeBudgetTasks(mission) }
+
+  /**
+   * M1a: the moved in-memory caches stay reachable on the runtime under the same
+   * names. Each is a live getter onto the module that now owns the collection, so
+   * the cache-only tests clear and inspect exactly the object the scheduling path
+   * reads (loss of each changes no durable outcome; S5's inventory names them).
+   */
+  get idleSignals() { return this.attempts.idleSignals }
+  get budgetStops() { return this.gates.budgetStops }
+  get fingerprintCache() { return this.gates.fingerprintCache }
+  get releasedPasses() { return this.scheduling.releasedPasses }
+  get parkedNotices() { return this.notices.parkedNotices }
+  get reviewPathNotices() { return this.notices.reviewPathNotices }
+  get integrationGapWarned() { return this.notices.integrationGapWarned }
+  get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.store = new SwarmStore(config.statePath, storeOptions)
@@ -758,13 +428,13 @@ export class SwarmRuntime {
     }, this.config.tickMs)
     this.timer.unref()
   }
-  private async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
+  async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(missionId) ?? Promise.resolve()
     const current = previous.catch(() => {}).then(fn)
     this.queues.set(missionId, current)
     try { return await current } finally { if (this.queues.get(missionId) === current) this.queues.delete(missionId) }
   }
-  private commit<T>(missionId: string, fn: () => T): T {
+  commit<T>(missionId: string, fn: () => T): T {
     if (this.closed) throw new Error('Swarm runtime is closed')
     this.commitDepth += 1
     let result: T
@@ -774,19 +444,19 @@ export class SwarmRuntime {
   }
   /** Subscribe to committed state changes. */
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
-  private mission(missionId: string): Mission {
+  mission(missionId: string): Mission {
     const mission = this.store.get('missions', missionId)
     if (!mission) throw new Error('Unknown mission')
     return mission
   }
-  private participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
+  participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
     const member = this.store.list('members', missionId).find(m => m.sessionId === actor.sessionId && m.status !== 'stopped')
     if (!member) throw new Error('Session is not a participant in this mission')
     return { mission, member, key: member.id, owner: false }
   }
-  private active(actor: Actor, missionId: string, allowStaged = false) {
+  active(actor: Actor, missionId: string, allowStaged = false) {
     if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
     actor.signal?.throwIfAborted()
     const participant = this.participant(actor, missionId)
@@ -795,7 +465,7 @@ export class SwarmRuntime {
     if (participant.mission.status !== 'staged' && Date.now() >= participant.mission.deadline) throw new Error('Mission duration budget exhausted')
     return participant
   }
-  private task(missionId: string, taskId: string): Task {
+  task(missionId: string, taskId: string): Task {
     const task = this.store.get('tasks', taskId)
     if (!task || task.missionId !== missionId) throw new Error('Task is not in this mission')
     return task
@@ -830,32 +500,22 @@ export class SwarmRuntime {
     return chain
   }
   /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
-  private effectiveDependencies(missionId: string, task: Task): Task[] {
+  effectiveDependencies(missionId: string, task: Task): Task[] {
     const seen = new Set<string>()
     return task.dependencies.map(dep => this.effectiveDependency(missionId, dep)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
   }
-  private effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
-  private dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
+  effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
+  dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
   /** Every identity a dependency reference stands for, including the current effective repair. */
-  private dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }
-  private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
-    const { member } = this.active(actor, missionId)
-    const task = this.task(missionId, taskId)
-    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < Date.now()) throw new Error('Stale or unauthorized task attempt; stop work and observe the current assignment')
-    if (!task.dependencies.every(dep => this.dependencySatisfied(missionId, dep))) throw new Error('A task prerequisite is no longer accepted; stop work')
-    return { task, member }
-  }
-  /**
-   * Extend the current attempt's lease before a long host operation. Bounded by
-   * the mission deadline so a stored lease can never outlive the mission.
-   */
-  private fenceAttempt(mission: Mission, task: Task, windowMs: number): void {
-    if (!task.attempt) throw new Error('Task has no active attempt')
-    const leaseUntil = Math.min(mission.deadline, Date.now() + Math.max(this.config.leaseMs, windowMs))
-    if (!Number.isSafeInteger(leaseUntil)) throw new Error('Attempt lease exceeds the supported clock range')
-    task.attempt.leaseUntil = leaseUntil
-    this.commit(mission.id, () => this.store.put('tasks', task))
-  }
+  dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }
+  // M1a: lease/attempt accounting lives in src/attempts.ts; these forwarders keep
+  // the call sites unchanged.
+  private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } { return this.attempts.ownAttempt(actor, missionId, taskId, attemptId) }
+  private fenceAttempt(mission: Mission, task: Task, windowMs: number): void { return this.attempts.fenceAttempt(mission, task, windowMs) }
+  dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
+  private renewActiveOperation(task: Task, mission: Mission): void { return this.attempts.renewActiveOperation(task, mission) }
+  private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task) }
   /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
   private replacementLineage(missionId: string, task: Task): Set<string> {
     const tasks = this.store.list('tasks', missionId)
@@ -872,127 +532,13 @@ export class SwarmRuntime {
     }
     return seen
   }
-  private bounded(text: string): string {
-    requireText(text, 'content')
-    if (text.length > this.config.maxMessageChars) throw new Error(`Content exceeds ${this.config.maxMessageChars} characters`)
-    return text
-  }
-  /**
-   * The durable rejection reason: the reviewer's own prose plus, per failing
-   * declared check, the command, the exit code and a bounded output excerpt.
-   * The Round-8 benchmark lost the real failure here — the reviewer wrote that
-   * every criterion passed while the host check had exited 127, and the only
-   * copy lived in a tool run. A rejection on judgement (no failing check) keeps
-   * the prose untouched. The combined text never exceeds `maxMessageChars`, and
-   * every reported command and exit code survives truncation because only
-   * output excerpts are cut.
-   */
-  private rejectionReason(reason: string, checks: ReadonlyArray<{ command: string; exitCode: number; output: string; truncated?: boolean }>): string {
-    const failures = checks.filter(check => check.exitCode !== 0)
-    if (failures.length === 0) return reason
-    const shown = failures.slice(0, MAX_REPORTED_CHECK_FAILURES)
-    const omitted = failures.length - shown.length
-    const heading = failures.length === 1 ? 'Host check failed' : `Host checks failed (${failures.length})`
-    const heads = shown.map((check, index) => `check ${index + 1} \`${check.command}\` exited ${check.exitCode}${check.truncated === true ? ' (host output truncated at the check-output bound)' : ''}: `)
-    const omission = omitted === 0 ? '' : `\n… ${omitted} more failing check(s) not shown`
-    const marker = ' …[output excerpt truncated]'
-    const fixed = 1 + heading.length + 2 + heads.reduce((total, head) => total + head.length + 1, 0) + marker.length + omission.length
-    let prose = reason
-    if (prose.length + fixed > this.config.maxMessageChars) {
-      // The check evidence is the part that must never be lost: excerpt the prose to fit.
-      const proseBudget = Math.max(0, this.config.maxMessageChars - fixed - 48)
-      prose = `${prose.slice(0, proseBudget)} …[reviewer reason truncated]`
-    }
-    let remaining = Math.max(0, this.config.maxMessageChars - prose.length - fixed)
-    const parts: string[] = []
-    for (const [index, check] of shown.entries()) {
-      const output = check.output.trimEnd()
-      const share = index === shown.length - 1 ? remaining : Math.max(0, Math.floor(remaining / (shown.length - index)))
-      const excerpt = output.length === 0 ? '(no output captured)'
-        : output.length <= share ? output : `${output.slice(0, Math.max(0, share - marker.length))}${marker}`
-      remaining = Math.max(0, remaining - excerpt.length)
-      parts.push(`${heads[index]}${excerpt}`)
-    }
-    const report = `${prose}\n${heading}:\n${parts.join('\n')}${omission}`
-    return report.length <= this.config.maxMessageChars ? report : `${report.slice(0, Math.max(0, this.config.maxMessageChars - marker.length))}${marker}`
-  }
-  /**
-   * Owner notices wake the primary agent and replay its whole context, so only
-   * decisions, blockers, failures, budget exhaustion and final delivery use
-   * them. Routine progress is already a durable event shown by the UI.
-   *
-   * Every notice is recorded in the notice-delivery ledger with the mission
-   * state fingerprint it announces (`noticeFingerprint`, the spec §4 digest
-   * with the announcement channel itself excluded) and its sent/queued/claimed
-   * lifecycle. The runtime's own budget/ceiling refusals are deduplicated per
-   * (class, fingerprint, sender); decision notices pass through so the liveness
-   * engine's witness dedup stays in charge of them.
-   */
-  private notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string): void {
-    const mission = this.store.get('missions', missionId)
-    // No-silent-state witness W2: every owner-decision notice is durable under
-    // the fingerprint of the board it was emitted for, so the owner can verify
-    // that no non-terminal state was silent. A terminal mission needs no witness.
-    if (mission !== undefined && !terminal(mission)) {
-      mission.witness = { fingerprint: this.fingerprint(missionId), kind: 'W2', at: Date.now() }
-      this.store.put('missions', mission)
-    }
-    this.enqueueOwnerNotice(missionId, content, from, noticeClass, {}, dedupe, dedupKey)
-  }
-  /** The notice dedup key: F(S) with the owner-notice channel excluded. */
-  private noticeKey(missionId: string): string {
-    return computeNoticeKey(this.fingerprintRecords(missionId))
-  }
-  private fingerprintRecords(missionId: string): { mission: Mission; tasks: Task[]; members: Member[]; evidence: Evidence[]; deliveries: Delivery[] } {
-    return {
-      mission: this.mission(missionId),
-      tasks: this.store.list('tasks', missionId),
-      members: this.store.list('members', missionId),
-      evidence: this.store.list('evidence', missionId),
-      deliveries: this.store.list('deliveries', missionId),
-    }
-  }
-  /**
-   * Record one owner-addressed notice (or an escalation) durably. Returns the
-   * delivery, or undefined when the same class already announced the same
-   * fingerprint from the same sender: the runtime's own budget/ceiling refusals
-   * are deduplicated per state so an unchanged board never spams the owner.
-   * Decision notices are always recorded — the liveness engine deduplicates its
-   * own witnesses per fingerprint and clears them when the board leaves the
-   * class, so change-and-return must be able to re-notify. Callers may already
-   * be inside a transaction; this method only reads and writes through the
-   * store and never opens one.
-   */
-  private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined {
-    const dedupKey = dedupKeyOverride ?? this.noticeKey(missionId)
-    if (dedupe && hasNotice(this.store.list('deliveries', missionId), { class: noticeClass, dedupKey, from })) return undefined
-    const at = Date.now()
-    const delivery: Delivery = {
-      id: id('msg'), missionId, from, to: 'owner', kind: noticeClass === 'escalation' ? 'escalation' : 'control',
-      content, createdAt: at,
-      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at },
-      ...extra,
-    }
-    this.store.put('deliveries', delivery)
-    return delivery
-  }
-  /**
-   * Read-only notice-delivery ledger: every owner notice with its class, dedup
-   * key and sent/queued/claimed lifecycle, newest first. Owner-only: owner
-   * notices are control-plane decisions, not worker-visible board content.
-   */
-  noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown {
-    const { owner } = this.participant(actor, missionId)
-    if (!owner) throw new Error('Only the mission owner can read the notice-delivery ledger')
-    const limit = query.limit === undefined ? 20 : Math.max(1, Math.min(100, Math.trunc(query.limit)))
-    const entries = projectNoticeLedger(this.store.list('deliveries', missionId), limit)
-    return {
-      ledger: entries,
-      page: { limit, returned: entries.length },
-      fingerprint: this.fingerprint(missionId),
-      note: 'Read-only: each row names the mission-state fingerprint it announced and whether the owner notice is still queued or was claimed by the owner session. Recording a notice changes no task, member or budget state.',
-    }
-  }
+  
+  
+  
+  
+  
+  
+  
   /**
    * S6: critical-path accounting. The longest chain of dependent steps is read
    * from the durable task graph and reported next to the mission's total spend,
@@ -1048,165 +594,12 @@ export class SwarmRuntime {
    * owner's routine observe response small. A pure projection of durable
    * records; it writes nothing.
    */
-  /**
-   * Read-only owner instruments (docs/no-silent-state-spec.md §6): the current
-   * no-silent-state fingerprint `F(S)`, the last witness class and time, the
-   * pending-dispatchable count, the notice-delivery ledger and durable
-   * escalations. `full` adds the per-member arena rows and the ledger page; the
-   * compact form keeps the owner's routine observe response small. A pure
-   * projection of durable records; it writes nothing.
-   */
-  private ownerInstruments(missionId: string, full: boolean): Record<string, unknown> {
-    const records = this.fingerprintRecords(missionId)
-    const view = projectArenaView({ ...records, missionId, now: Date.now(), leaseMs: this.config.leaseMs })
-    const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
-    return {
-      // T3d: the owner-visible fingerprint is the no-silent-state F(S) the
-      // witness record and F19 use, never the arena ledger's dedup digest.
-      fingerprint: this.fingerprint(missionId),
-      noticeDedupKey: this.noticeKey(missionId),
-      pendingDispatchable: view.pendingDispatchable,
-      ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
-      notices: counts,
-      ...(full ? { noticeLedger: view.notices, escalations: view.escalations, arena: { missionId: view.missionId, status: view.status, members: view.members } } : {}),
-      note: 'Read-only arena instruments: fingerprint, last witness, pending dispatchable tasks, notice counts' + (full ? ', the notice-delivery ledger, escalations and per-member presence/activity/attempt age/pending dependencies' : '') + '. Reading them changes no state.',
-    }
-  }
-  /**
-   * The owner-observable fingerprint board built from durable state only. The
-   * readiness/review counts come from the same predicates the scheduler and the
-   * completion check use, so the digest cannot disagree with the board.
-   */
-  fingerprintBoard(missionId: string): MissionFingerprintBoard {
-    const mission = this.mission(missionId)
-    const tasks = this.store.list('tasks', missionId)
-    const members = this.store.list('members', missionId)
-    // Spec §2: dispatchable means a pending task at least one member whose
-    // status is idle or waiting can run. A working member is already busy.
-    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-    const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.ready(task, member, tasks))).map(task => task.id))
-    const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks)).map(task => task.id))
-    return {
-      status: mission.status,
-      tasks: tasks.map(task => ({ id: task.id, status: task.status,
-        ...(task.attempt?.ownerId === undefined ? {} : { attemptOwner: task.attempt.ownerId }),
-        ready: ready.has(task.id), unreviewed: unreviewed.has(task.id) })),
-      members: members.map(member => ({ id: member.id, status: member.status })),
-      // Owner-observable outbox backlog only: a delivery to a live member is the
-      // wake channel and is flushed in the same scheduling pass, and the owner
-      // notice being emitted is the witness for this state. Counting either
-      // would make every notice change the fingerprint it was keyed by.
-      pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => delivery.deliveredAt === undefined
-        && delivery.to !== 'owner'
-        && !members.some(member => member.id === delivery.to && member.status !== 'stopped')).length,
-      challengedEvidence: this.store.list('evidence', missionId).filter(evidence => evidence.status === 'challenged').length,
-      ceilings: [
-        ...(mission.budgetPause === undefined ? [] : [`budget:${mission.budgetPause.id}`]),
-        ...tasks.filter(task => task.ceiling !== undefined).map(task => `task:${task.id}:${task.ceiling!.dimension}`),
-      ],
-    }
-  }
-  /** Current `F(S)`; the dedup key every owner notice and stall notice is emitted under. */
-  fingerprint(missionId: string): string {
-    // Cache per store revision: F(S) is pure over durable state, so a tick that
-    // changed nothing cannot change it, and the scheduler's per-tick witness
-    // check stays cheap under a large board. Never trust the cache inside an open
-    // transaction: the revision has not advanced yet while the board is mutating.
-    if (this.commitDepth > 0) return missionFingerprint(this.fingerprintBoard(missionId))
-    const revision = this.store.revision()
-    const cached = this.fingerprintCache.get(missionId)
-    if (cached !== undefined && cached.revision === revision) return cached.fingerprint
-    const fingerprint = missionFingerprint(this.fingerprintBoard(missionId))
-    this.fingerprintCache.set(missionId, { revision, fingerprint })
-    return fingerprint
-  }
-  /**
-   * The runtime-side half of the workspace authorization boundary. `create` is
-   * synchronous, so the full realpath check happened at admission; here the
-   * runtime proves the recorded workspace really resolves inside the root the
-   * admission site reported, so a caller that fabricates a wider
-   * `workspaceGrantRoot` cannot widen its own authorization. When the plugin
-   * installed `config.authorizeWorkspace`/`config.grants`, the workspace must
-   * also still sit inside a root that is currently loaded and unexpired.
-   */
-  private assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } {
-    const claimed = grantRoot ?? workspace
-    if (!isContained(claimed, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claimed} [${WORKSPACE_AUTHORIZATION_CODE}]`)
-    const grants = this.config.grants
-    if (this.config.authorizeWorkspace === undefined || grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
-    const now = Date.now()
-    // A session authorization wins over a root that happens to contain the
-    // session cwd: the human authorized that directory directly, so removing a
-    // root must not fence it. The admission site computed this source.
-    if (source === 'session' && claimed === workspace) return { grantRoot: workspace, source: 'session' }
-    // The recorded root is the configured root that actually contains the
-    // workspace — never the caller's claim. A caller that fabricates a wider
-    // root therefore cannot record it, and a fabricated narrower root is
-    // refused by the containment check above.
-    const matched = grants.grants
-      .filter(grant => isContained(grant.path, workspace) && (grant.expiresAt === undefined || grant.expiresAt > now))
-      .sort((left, right) => right.path.length - left.path.length)[0]
-    if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
-    if (claimed === workspace) return { grantRoot: claimed, source: source ?? 'session' }
-    throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
-  }
-  /**
-   * Re-validate a recorded mission against the human authorization loaded at
-   * start. Returns without error when this runtime has no authorization
-   * predicate (unit runtimes and adapters without Git). Otherwise the mission's
-   * own durable `workspaceGrantRoot` anchors the check: a session workspace
-   * stays authorized exactly while it still resolves to itself, and a
-   * grant-bound mission stays authorized only while that same root is still
-   * configured and unexpired. Removing a root therefore fences the mission at
-   * its next prepare or verification checkout.
-   */
-  private async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): Promise<void> {
-    const authorize = this.config.authorizeWorkspace
-    if (authorize === undefined) return
-    const anchor = mission.workspaceGrantRoot
-    // A mission recorded before this feature has no anchor; its workspace is its
-    // own anchor, which is exactly the pre-feature session-cwd authorization.
-    if (anchor === undefined) return
-    const resolved = await realpath(mission.workspace).catch(() => undefined)
-    const root = await realpath(anchor).catch(() => undefined)
-    let diagnostic: string | undefined
-    if (resolved === undefined) diagnostic = `Authorized workspace ${mission.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]`
-    else if (root === undefined || !isContained(root, resolved)) diagnostic = `Workspace ${mission.workspace} escaped its recorded authorized root ${anchor} [${WORKSPACE_AUTHORIZATION_CODE}]`
-    else {
-      // X3: the configured predicate decides first. A recorded root that is
-      // still a live configured grant authorizes the mission even when the
-      // record omitted its source; an explicit 'session' record authorizes a
-      // workspace that is its own root; anything else — including a missing
-      // source on a root that is no longer configured — fails closed, because
-      // it could be a revoked grant whose root happens to equal the workspace.
-      const live = await authorize(mission.workspace, undefined)
-      const liveGrant = live.ok && live.grantRoot === root
-      const sessionWorkspace = resolved === root && mission.workspaceAuthorizationSource === 'session'
-      if (!liveGrant && !sessionWorkspace) diagnostic = `Authorized root ${anchor} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]`
-    }
-    if (diagnostic !== undefined) { this.fenceWorkspace(mission.id, diagnostic); throw new WorkspaceRevokedError(diagnostic) }
-  }
-  /**
-   * Fence a mission whose human authorization was withdrawn: block every
-   * schedulable task with the durable reason, record the revocation event, and
-   * wake the owner once. Revocation is terminal for this host process
-   * (restoring the root requires a human config edit and restart), so it does
-   * not spend recovery credit the way a transient preparation failure does.
-   */
-  private fenceWorkspace(missionId: string, reason: string): void {
-    const mission = this.store.get('missions', missionId)
-    if (mission === undefined || terminal(mission)) return
-    if (this.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')) return
-    const blocked = this.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
-    this.commit(missionId, () => {
-      for (const task of blocked) {
-        task.status = 'blocked'; task.output = reason; task.epoch++; this.store.put('tasks', task)
-        this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
-      }
-      this.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
-    })
-    this.notify(missionId, reason)
-  }
+  
+  
+  
+  
+  
+  
   /** Create a mission with explicitly bounded resources and scope. */
   create(actor: Actor, input: CreateMissionInput, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
     if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
@@ -1363,7 +756,16 @@ export class SwarmRuntime {
     // D1: reconcile the objective's write directives with the task scope and the
     // named deliverables with the effective ignore rules at the production
     // admission point, so a plan error is rejected here instead of at submit.
-    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task')
+    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task', {
+      // R12-F9: the guard needs the content-carrying edges (the declared
+      // dependencies plus a review source, which `prepareTask` merges into the
+      // worktree like a dependency) and the durable identities this mission
+      // already holds, so the diagnostic can say whether the named content exists
+      // here (add the dependency that carries it) or must be obtained (state how).
+      dependencies: [...(input.dependencies ?? []), ...(input.reviewOf === undefined ? [] : [input.reviewOf])],
+      replaces: input.replaces,
+      knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
+    })
     if (reconciliation.length) throw new Error(reconciliation.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')
@@ -1461,173 +863,33 @@ export class SwarmRuntime {
     this.kick(missionId)
     return task
   }
-  /**
-   * Refuse a worker proposal for an allowance, budget or ceiling reason and
-   * make it an owner decision: the refusal is recorded durably, an owner notice
-   * names the member, the limit and the reason, and the same refusal is thrown
-   * so the worker's tool result carries it. Never called for the owner, who
-   * sees the error directly and is the actor who can raise the ceiling.
-   */
-  private refuseProposal(mission: Mission, proposer: string, title: string, reason: string, limit: number): never {
-    const message = `Worker ${proposer} cannot propose ${JSON.stringify(title)}: ${reason} (limit ${limit}). The owner can raise the mission ceiling with swarm_budget or admit the work with swarm_propose.`
-    this.commit(mission.id, () => {
-      this.store.event(mission.id, 'task/proposal-refused', proposer, { memberId: proposer, title, reason, limit })
-      this.notify(mission.id, message, proposer, 'budget')
-    })
-    // The owner notice must not wait for the next scheduler tick; flush it now.
-    this.kick(mission.id)
-    throw new Error(message)
-  }
-  /**
-   * X1 (P0): drop an attempt and remember its owner durably. Every path that
-   * abandons an attempt without a verdict calls this, so the union below can
-   * never forget a member who already touched the work.
-   */
-  private dropAttempt(task: Task, ownerId?: string): void {
-    const owner = ownerId ?? task.attempt?.ownerId
-    if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
-    delete task.attempt
-  }
+  
   /**
    * X1 (P0): every member who ever owned this task or is planned to own it. None
    * of them may be admitted to, claim, or accept its review — independence is a
    * property of the whole ownership history, not only the last attempt.
    */
-  private authorIds(task: Task): Set<string> {
+  authorIds(task: Task): Set<string> {
     const ids = new Set(task.priorOwnerIds ?? [])
     if (task.attempt?.ownerId !== undefined) ids.add(task.attempt.ownerId)
     if (task.assigneeId !== undefined) ids.add(task.assigneeId)
     return ids
   }
-  private ready(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (task.status !== 'pending' || (task.assigneeId && task.assigneeId !== member.id)) return false
-    return this.capable(task, member, tasks)
-  }
-  /**
-   * R5-02: whether a member could take this task if it were pending and
-   * unassigned. Same prerequisites and review-independence guard as `ready`,
-   * without the status/assignee pin, so a start-failure re-route can evaluate
-   * candidates before committing the re-pend. The author check matches
-   * admission's definition (`attempt?.ownerId ?? assigneeId`), so a re-route can
-   * never assign a verification to the author of the source it reviews.
-   */
-  private capable(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (!task.dependencies.every(dep => this.dependencySatisfied(task.missionId, dep, tasks))) return false
-    if (task.reviewOf) {
-      const source = this.task(task.missionId, task.reviewOf)
-      if (source.status !== 'submitted' || this.authorIds(source).has(member.id)) return false
-    }
-    return true
-  }
-  /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
-  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
-    const candidates = this.store.list('members', missionId)
-      .filter(member => member.id !== failedId && member.status !== 'stopped' && this.capable(task, member))
-    const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
-    return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
-  }
-  /**
-   * Effective hierarchical limits: durable owner rules, with the worker-budget
-   * default kept only for a level the owner has not overridden with a `*` rule.
-   */
-  private admissionRulesFor(mission: Mission): LimitRule[] {
-    const durable = this.store.list('limits', mission.id)
-    return [...durable, ...defaultLimitRules(mission.id, mission.budget.maxWorkers)
-      .filter(rule => !durable.some(overridden => overridden.level === rule.level && overridden.key === '*'))]
-  }
-  /** Concurrent slots in use, derived from live leases rather than a memory queue. */
-  private admissionUsage(missionId: string, candidate: AdmissionCandidate, member: Member): AdmissionUsage {
-    const running = this.store.list('tasks', missionId).filter(task => task.status === 'running')
-    return {
-      scope: running.filter(task => scopeKeysOverlap(task.scope[0] ?? '**', candidate.scope)).length,
-      taskClass: running.filter(task => task.kind === candidate.taskClass).length,
-      agent: running.filter(task => task.attempt?.ownerId === member.id).length,
-    }
-  }
-  /** Budget dimensions that must refuse a new lease; undefined when the mission can admit. */
-  private budgetBlocked(mission: Mission): string | undefined {
-    if (Date.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
-    if (mission.usedTokens >= mission.budget.maxTokens) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
-    if (mission.usedSteps >= mission.budget.maxSteps) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
-    return undefined
-  }
-  private admissionCandidate(missionId: string, task: Task, member: Member): AdmissionCandidate {
-    return { missionId, memberId: member.id, taskId: task.id, taskClass: task.kind, scope: task.scope[0] ?? '**', epoch: task.epoch }
-  }
-  private admissionDecision(mission: Mission, member: Member, task: Task): { candidate: AdmissionCandidate; decision: AdmissionDecision } {
-    const candidate = this.admissionCandidate(mission.id, task, member)
-    const usage = this.admissionUsage(mission.id, candidate, member)
-    const signals: { budgetExceeded?: string; leaseConflict?: string } = {}
-    const blocked = this.budgetBlocked(mission)
-    if (blocked !== undefined) signals.budgetExceeded = blocked
-    if (usage.agent > 0) signals.leaseConflict = `member ${member.id} already owns a running lease`
-    return { candidate, decision: decideAdmission(candidate, this.admissionRulesFor(mission), usage, signals) }
-  }
-  private admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord {
-    const at = Date.now()
-    return {
-      id: admissionRowId(candidate, decision.reason), missionId: candidate.missionId, memberId: candidate.memberId, taskId: candidate.taskId, epoch: candidate.epoch,
-      reason: decision.reason, admitted: decision.admitted, taskClass: candidate.taskClass, scope: candidate.scope,
-      ...(decision.level !== undefined ? { level: decision.level } : {}), ...(decision.key !== undefined ? { key: decision.key } : {}),
-      ...(decision.limit !== undefined ? { limit: decision.limit } : {}), ...(decision.inUse !== undefined ? { inUse: decision.inUse } : {}),
-      count: 1, latencyMs, detail: decision.detail, firstAt: at, lastAt: at,
-    }
-  }
-  /** Refusals merge in place; a changed cause or a second of staleness refreshes the row. */
-  private shouldRecordRefusal(next: AdmissionRecord): boolean {
-    const previous = this.store.get('admissions', next.id)
-    if (previous === undefined) return true
-    return previous.level !== next.level || previous.limit !== next.limit || previous.inUse !== next.inUse
-      || previous.detail !== next.detail || next.lastAt - previous.lastAt >= 1000
-  }
-  /** Caller owns the transaction: upsert the refusal and announce it once. */
-  private upsertAdmission(record: AdmissionRecord): void {
-    const existing = this.store.get('admissions', record.id)
-    this.store.recordAdmission(record)
-    if (existing === undefined) this.store.event(record.missionId, 'admission/refused', 'runtime', {
-      taskId: record.taskId, memberId: record.memberId, reason: record.reason, level: record.level, key: record.key,
-      limit: record.limit, inUse: record.inUse, detail: record.detail,
-    })
-  }
-  private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void {
-    const record = this.admissionRecord(candidate, decision, latencyMs)
-    if (!this.shouldRecordRefusal(record)) return
-    try {
-      this.commit(candidate.missionId, () => this.upsertAdmission(record))
-    } catch (error) {
-      if (error instanceof WriterBusyError) {
-        this.writerBusy = { at: Date.now(), attempts: error.attempts, candidate, detail: error.message }
-        return
-      }
-      throw error
-    }
-  }
-  /** Caller owns the transaction: one durable budget_exceeded row per waiting task. */
-  private upsertBudgetRefusals(mission: Mission, reason: string): void {
-    for (const task of this.store.list('tasks', mission.id)) {
-      if (task.status !== 'pending') continue
-      const memberId = task.assigneeId ?? task.plannedAssigneeId ?? 'unassigned'
-      const candidate: AdmissionCandidate = { missionId: mission.id, memberId, taskId: task.id, taskClass: task.kind, scope: task.scope[0] ?? '**', epoch: task.epoch }
-      const record = this.admissionRecord(candidate, { reason: 'budget_exceeded', admitted: false, detail: `budget_exceeded: ${reason}` }, 0)
-      if (this.shouldRecordRefusal(record)) this.upsertAdmission(record)
-    }
-  }
-  /**
-   * Flush the classified writer conflict as a durable `writer_busy` admission row
-   * once the writer is free again. The flag survives while the store stays busy.
-   */
-  private recordWriterBusyRecovery(mission: Mission): void {
-    const busy = this.writerBusy
-    if (busy === undefined) return
-    const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, Date.now() - busy.at))
-    try {
-      this.commit(mission.id, () => this.upsertAdmission(record))
-      this.writerBusy = undefined
-    } catch (error) {
-      if (!(error instanceof WriterBusyError)) { this.writerBusy = undefined; throw error }
-    }
-  }
-  private assign(task: Task, member: Member): Task {
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  assign(task: Task, member: Member): Task {
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
     this.recordWriterBusyRecovery(mission)
@@ -1775,8 +1037,8 @@ export class SwarmRuntime {
       this.bounded(input.reason)
       const artifact = source.artifact
       if (source.checks.length) {
-        const checkTimeoutMs = source.checkTimeoutMs ?? this.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
-        const verificationWindow = checkTimeoutMs * Math.max(1, source.checks.length) + this.config.leaseMs
+        // M1a seam 5/7: the check window is src/declared-checks.ts#windowFor.
+        const verificationWindow = this.declaredChecks.windowFor(source)
         if (!Number.isSafeInteger(verificationWindow)) throw new Error('Verification check duration exceeds the supported clock range')
         this.fenceAttempt(this.mission(missionId), task, verificationWindow)
         this.ownAttempt(actor, missionId, task.id, input.attemptId)
@@ -1786,12 +1048,9 @@ export class SwarmRuntime {
       await this.assertWorkspaceAuthorized(this.mission(missionId))
       return { member, source, artifact, evidenceRevision }
     })
-    const checks = await this.workers.verifyArtifact(prepared.member, prepared.source, prepared.artifact, actor.signal)
-    // R11-19: record the measured envelope durably, even when the verdict below
-    // fails closed because the world moved during the check.
-    const envelope = this.workers.checkEnvelope?.()
-    if (envelope !== undefined) this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', prepared.member.id,
-      { taskId: input.taskId, sourceTaskId: prepared.source.id, ...envelope }))
+    // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
+    const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, actor.signal)
+    this.declaredChecks.recordEnvelope(missionId, input.taskId, prepared.source.id, prepared.member.id)
     return this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       const source = this.task(missionId, prepared.source.id)
@@ -1800,19 +1059,14 @@ export class SwarmRuntime {
       if (prepared.evidenceRevision !== JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))) throw new Error('[evidence_changed_during_verification] Evidence changed during verification; inspect the new challenge and verify again. Inspect `evidenceId` with `swarm_observe`, then verify again with `swarm_verify` and its `verdict`.')
       const independentRuns = this.store.list('tool_runs', missionId).filter(run => run.memberId === member.id && run.taskId === task.id && run.attemptId === input.attemptId && !run.isError)
       if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
-      const passed = input.verdict === 'accept' && checks.every(c => c.exitCode === 0)
-      const failingChecks = checks.filter(check => check.exitCode !== 0)
+      const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
-      const rejection = passed ? input.reason : this.rejectionReason(input.reason, checks)
+      const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       const runIds: string[] = []
       const released = new Set<string>()
       this.commit(missionId, () => {
-        let seq = this.store.countToolRuns(missionId)
-        for (const check of checks) {
-          const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: member.id, taskId: task.id, attemptId: input.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
-          this.store.put('tool_runs', run); runIds.push(run.id)
-        }
+        runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks))
         source.status = passed ? 'accepted' : 'blocked'
         task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(rejection); task.reviewedCommit = artifact.commit
         this.store.put('tasks', source); this.store.put('tasks', task)
@@ -1910,13 +1164,7 @@ export class SwarmRuntime {
     this.store.event('swarm/install', 'store/restore-requested', 'runtime', { ...staged })
     return staged
   }
-  private topicDelivery(missionId: string, from: string, topic: string, content: string): void {
-    for (const member of this.store.list('members', missionId)) {
-      if (member.id !== from && member.status !== 'stopped' && (member.subscriptions.includes(topic) || member.subscriptions.includes('*'))) {
-        this.store.put('deliveries', { id: id('msg'), missionId, from, to: member.id, topic, kind: 'finding', content, createdAt: Date.now() })
-      }
-    }
-  }
+  
   /** Authenticated directed messages and selective topic broadcasts. */
   message(actor: Actor, missionId: string, input: { to: string; kind: 'question' | 'finding'; content: string; topic?: string }): { queued: boolean } {
     const { key } = this.active(actor, missionId)
@@ -2264,7 +1512,7 @@ export class SwarmRuntime {
     }
   }
   /** The newest durable submission of one task: how long ago, and its event seq. */
-  private latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined {
+  latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined {
     const events = this.store.events(missionId, this.config.maxEvents)
     for (let index = events.length - 1; index >= 0; index--) {
       const event = events[index]!
@@ -2360,29 +1608,8 @@ export class SwarmRuntime {
       }))
     } catch { /* The next tick re-derives the live review from the admitted task. */ }
   }
-  /** Wake the owner once per distinct blocker for one unreviewable submitted deliverable. */
-  private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void {
-    const key = `review-blocked:${mission.id}:${source.id}:${reason}`
-    // S5: the durable notice ledger (class, key, sender) is the gate; the set is
-    // only a cache, so losing it cannot produce a second notice for the state.
-    if (this.reviewPathNotices.has(key) && hasNotice(this.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
-    this.commit(mission.id, () => {
-      this.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      this.notify(mission.id, `${diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${source.id}) or cancel the source task; the mission cannot complete while it is unreviewable.`, 'runtime', 'decision', true, key)
-    })
-    this.reviewPathNotices.add(key)
-  }
-  /**
-   * F2: the board makes no progress except for submitted work. Unlike `stalled`,
-   * a submitted task is not progress: an artifact whose review path is broken
-   * can never reach a verdict by itself.
-   */
-  private reviewPathStalled(tasks: Task[], members: Member[]): boolean {
-    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const live = members.filter(member => member.status !== 'stopped')
-    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
-  }
+  
+  
   /**
    * Owner-only withdrawal of admitted-but-mistaken work. Pending, blocked,
    * submitted and running tasks become terminally cancelled; a running attempt
@@ -2955,23 +2182,7 @@ export class SwarmRuntime {
       ...(owner ? {} : { note: 'Non-member observer' }),
     }
   }
-  /**
-   * Bounded board window for observe: counts plus the newest few posts after
-   * the member's delivered cursor. Older unseen posts are counted and named as
-   * omitted rather than re-sent; `swarm_board` pages them with an explicit
-   * cursor, so nothing is lost and no delta grows without bound.
-   */
-  private boardWindow(missionId: string, memberId: string, afterSeq: number): Record<string, unknown> {
-    const count = this.store.countPosts(missionId, { afterSeq })
-    const newest = this.store.posts(missionId, { afterSeq, newest: true, limit: BOARD_DELTA_POSTS })
-    return {
-      count,
-      addressed: this.store.countPosts(missionId, { inboxFor: memberId, afterSeq }),
-      newest: newest.map(post => postView(post)),
-      ...(count > newest.length ? { omitted: count - newest.length } : {}),
-      ...(newest.length ? { nextAfter: newest.at(-1)!.seq } : {}),
-    }
-  }
+  
   /** Requests already streaming have no reported usage yet; estimate each at its worker's average. */
   private inFlightEstimate(members: Member[]): number {
     let total = 0
@@ -2984,39 +2195,8 @@ export class SwarmRuntime {
     }
     return total
   }
-  /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
-  private selectDeliveryTarget(missionId: string, tasks: Task[]): Task {
-    const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
-    // A dependency reference to a replaced original also covers its accepted repair.
-    const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
-      if (seen.has(task.id)) return false
-      seen.add(task.id)
-      return task.dependencies.some(id => {
-        const identities = this.dependencyIdentities(missionId, id, tasks)
-        return identities.has(sourceId) || tasks.some(parent => identities.has(parent.id) && covers(parent, sourceId, seen))
-      })
-    }
-    if (!tasks.some(task => task.kind === 'integration')) {
-      // A single reviewed implementation is the deliverable when the plan needed no assembly step.
-      if (implementations.length === 1 && implementations[0]!.artifact) return implementations[0]!
-      throw new Error('A unique independently accepted implementation artifact is required when the plan has no integration task')
-    }
-    const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
-    // A later integration may subsume an earlier one; never guess among independent final artifacts.
-    const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && covers(other, candidate.id)))
-    if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required')
-    return finals[0]!
-  }
-  /** One completion policy is shared by manual controls and automatic requests. */
-  private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
-    actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
-    const mission = this.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
-    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
-    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
-    return { mission, task: this.selectDeliveryTarget(missionId, this.store.list('tasks', missionId)) }
-  }
+  
+  
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
     if (!this.workers.inspectDelivery) throw new Error('This worker adapter does not support delivery inspection')
@@ -3041,87 +2221,12 @@ export class SwarmRuntime {
       return result
     })
   }
-  /**
-   * Tasks that can never be dispatched again: pending work whose dependency
-   * lineage or review source is dead, reviews assigned to their own author, and
-   * blocked work. They contribute nothing further; completion may cancel them
-   * once every acceptance criterion is independently covered.
-   */
-  private unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
-    const live = members.filter(member => member.status !== 'stopped')
-    // W15: a blocked task with a matching stop marker is alive, not dead. Handoff,
-    // worker close-out and lease expiry hold the task at `blocked` +
-    // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
-    // unschedulable lets `control complete` cancel recoverable work.
-    const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))
-    // Fixpoint: work waiting on dead prerequisites or an unreachable review source is dead too.
-    for (let changed = true; changed;) {
-      changed = false
-      for (const task of tasks) {
-        if (dead.has(task.id) || task.status !== 'pending') continue
-        const stuck = task.dependencies.some(dep => { const effective = this.effectiveDependency(mission.id, dep, tasks); return effective.status === 'cancelled' || dead.has(effective.id) })
-          || (task.reviewOf !== undefined && (() => {
-            const source = this.task(mission.id, task.reviewOf)
-            return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
-              || (task.assigneeId !== undefined && this.authorIds(source).has(task.assigneeId))
-          })())
-          || (task.assigneeId !== undefined && !live.some(member => member.id === task.assigneeId))
-        if (stuck) { dead.add(task.id); changed = true }
-      }
-    }
-    return tasks.filter(task => dead.has(task.id))
-  }
-  /**
-   * A durable stop transition is in flight: the task is blocked only until the
-   * old worker handle acknowledges the stop, then it re-pends. Every scheduler
-   * and completion decision treats it as live work.
-   */
-  private quiescencePending(task: Task): boolean { return task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch }
-  /**
-   * A submitted task is progress only while a live review can still accept it.
-   * A review that was never admitted or was retired leaves the submission
-   * unreviewable forever; counting it as progress hid a stalled board from the
-   * owner (Round-8 F1). Pending and running reviews are live, and a parked
-   * review (blocked with a matching stop marker) re-pends after the stop
-   * acknowledgement, so it still counts.
-   */
-  private reviewable(task: Task, tasks: Task[]): boolean {
-    return tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
-      && (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)))
-  }
-  /**
-   * A submission with no live review is a stall candidate, not a stall, until
-   * the same unreviewed artifact has aged past the grace. S5: the grace is read
-   * from the durable `task/submitted` event of each unreviewed task, not from an
-   * in-memory timer — a restart (or a lost cache) can no longer restart the
-   * window, and the answer is identical for the same durable board.
-   */
-  private unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
-    const grace = Math.min(this.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    const events = this.store.events(missionId, this.config.maxEvents)
-    return unreviewed.every(task => {
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]!
-        if (event.type !== 'task/submitted' || (event.data as { taskId?: string } | undefined)?.taskId !== task.id) continue
-        return Date.now() - event.createdAt >= grace
-      }
-      // No durable submission record: the grace cannot have elapsed yet.
-      return false
-    })
-  }
-  /** Nothing is running, reviewably submitted or dispatchable: workers would stay idle forever. */
-  private stalled(mission: Mission, tasks: Task[], members: Member[]): boolean {
-    // An empty board is a mission the owner has not planned yet, not a stall.
-    if (!tasks.length) return false
-    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks))
-    if (unreviewed.length) {
-      if (!this.unreviewedStall(mission.id, unreviewed)) return false
-    }
-    const live = members.filter(member => member.status !== 'stopped')
-    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
-  }
-  private completionError(mission: Mission, options: { cancelUnschedulable?: boolean } = {}): string | undefined {
+  
+  
+  
+  
+  
+  completionError(mission: Mission, options: { cancelUnschedulable?: boolean } = {}): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
     const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()
@@ -3193,138 +2298,11 @@ export class SwarmRuntime {
     })
     return true
   }
-  /** Wake the owner once per distinct stalled state; idle workers cannot resolve it themselves. */
-  private notifyStall(mission: Mission, tasks: Task[], members: Member[], reason: string): void {
-    const leftover = this.unschedulable(mission, tasks, members)
-    // The stall dedup key is the same owner-observable fingerprint as every
-    // other witness, so a stall is fresh exactly when the board changed.
-    const fingerprint = this.fingerprint(mission.id)
-    if (mission.stallNotice === fingerprint) return
-    mission.stallNotice = fingerprint; mission.updatedAt = Date.now()
-    const detail = leftover.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
-    this.commit(mission.id, () => {
-      this.store.put('missions', mission)
-      this.store.event(mission.id, 'mission/stalled', 'runtime', { reason, fingerprint, unschedulable: leftover.map(task => task.id) })
-      this.notify(mission.id, `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`)
-      // W3: the stall notice is the no-silent-state witness for this state.
-      mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
-      this.store.put('missions', mission)
-    })
-  }
-  /**
-   * R10-14: the board is coverage-complete but the mission is still active
-   * (owner-assembled plans do not auto-complete). Emit exactly one durable
-   * owner-decision notice per distinct coverage-complete state so the owner
-   * knows the deliverable is ready without the runtime taking the decision.
-   */
-  private notifyCoverageComplete(mission: Mission): void {
-    const fingerprint = this.fingerprint(mission.id)
-    if (mission.coverageNotice === fingerprint) return
-    mission.coverageNotice = fingerprint
-    this.commit(mission.id, () => {
-      this.store.put('missions', mission)
-      this.notify(mission.id, `Mission ${mission.title} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`)
-    })
-  }
-  /**
-   * No-silent-state backstop (docs/no-silent-state-spec.md §2). Runs after a
-   * scheduling pass that changed nothing: a non-terminal mission must still
-   * leave the owner with a witness. Exemptions are the documented ones — the
-   * empty board the owner is still planning (row 17) and a board whose
-   * non-terminal work is running under a live lease (row 3). The bounded
-   * missing-review grace is respected: the row-5 notice arrives after
-   * `AUTO_REVIEW_GRACE_MS`, not on the tick the artifact was submitted. A
-   * submitted artifact with no live review path is witnessed even while
-   * unrelated work runs, because no other witness can ever advance it.
-   */
-  private ensureWitness(missionId: string): void {
-    const mission = this.mission(missionId)
-    if (mission.status !== 'active') return
-    const tasks = this.store.list('tasks', missionId)
-    const members = this.store.list('members', missionId)
-    // Row 17: the owner has not planned work yet; `stalled` uses the same rule.
-    if (!tasks.length) return
-    const fingerprint = this.fingerprint(missionId)
-    if (mission.witness?.fingerprint === fingerprint) return
-    // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
-    // waiting member can run it. A working member is busy, not a silent board.
-    const runnable = members.filter(member => member.status === 'idle' || member.status === 'waiting')
-    const dispatchable = tasks.filter(task => task.status === 'pending' && runnable.some(member => this.ready(task, member, tasks)))
-    if (dispatchable.length) {
-      // T3 integration: the adapter's `isIdle` precondition decides whether the
-      // runtime could actually start an eligible member. When every eligible
-      // member is busy by the adapter's contract, the board is not "dispatchable
-      // but undispatched" — those members are working, and no witness is owed.
-      // A parked (`waiting`) member is always startable (R10-09/S3).
-      const startable = runnable.some(member => member.status === 'waiting' || this.workers.isIdle(member.id))
-      if (!startable) return
-      // A dispatchable task that survived a full pass is an admission refusal,
-      // not silence: say which task and why the owner may need to act.
-      this.notify(missionId, `Task ${dispatchable[0]!.id} (${dispatchable[0]!.title}) is ready for an eligible member but could not be dispatched this tick (mission admission limits or budget). Free a slot, raise a limit with swarm_budget, or withdraw the blocking work with swarm_cancel.`)
-      return
-    }
-    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks))
-    if (unreviewed.length) {
-      // A submitted artifact no live review can accept is an owner decision. The
-      // documented `AUTO_REVIEW_GRACE_MS` floor is honored here, not only inside
-      // `stalled`, because `stalled` returns before its unreviewed check when
-      // any unrelated work is running; without this an unreviewable submission
-      // could stay silent behind live work forever (verifier-1 challenge,
-      // evidence_a454a771). The age comes from the durable submission event, so
-      // a restart cannot reset the grace.
-      const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
-      const ripe = unreviewed.filter(task => {
-        const submission = this.latestSubmission(missionId, task.id)
-        return submission === undefined || submission.age >= grace
-      })
-      if (ripe.length) this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`)
-      return
-    }
-    // Row 3 (documented scope): only a board whose *every* non-terminal task is
-    // running under a live lease is exempt. Running work plus a pending or
-    // blocked task falls through to the witnesses below, so a dependent that
-    // cannot start yet still leaves the owner a decision (T1av2 evidence_978a4694).
-    const nonTerminal = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status))
-    if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= Date.now())) return
-    if (this.stalled(mission, tasks, members)) {
-      this.notifyStall(mission, tasks, members, this.completionError(mission, { cancelUnschedulable: true }) ?? this.completionError(mission) ?? 'no task can make progress')
-      return
-    }
-    this.notify(missionId, `Mission ${mission.title} made no progress this tick and no task is dispatchable. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`)
-  }
-  /**
-   * R10-15: a running attempt whose owner is parked cannot progress until it is
-   * woken or re-pended. Record the parked holder durably and tell the owner once
-   * per attempt, so the state is never silent while the lease is alive.
-   */
-  private notifyParkedHolder(mission: Mission, task: Task): void {
-    const key = `parked:${mission.id}:${task.id}:${task.epoch}`
-    // S5: the durable notice ledger is the gate; the set is only a cache.
-    if (this.parkedNotices.has(key) && hasNotice(this.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.parkedNotices.add(key)
-    this.commit(mission.id, () => {
-      this.notify(mission.id, `Task ${task.id} (${task.title}) is held by a parked member and cannot make progress while parked. A fresh assignment wakes it; if the lease expires the task re-pends without spending a recovery attempt.`, 'runtime', 'decision', true, key)
-    })
-  }
-  /**
-   * R11-03: the completion rule must not first appear when the owner tries to
-   * complete. When a second implementation branch is admitted while the plan has
-   * no integration task, emit the same diagnostic `completionError` would.
-   */
-  private warnIntegrationGap(mission: Mission, admitted: Task): void {
-    if (admitted.kind !== 'implementation') return
-    const tasks = this.store.list('tasks', mission.id)
-    const implementations = tasks.filter(task => task.kind === 'implementation')
-    if (implementations.length < 2 || tasks.some(task => task.kind === 'integration')) return
-    const key = `integration-gap:${mission.id}:${implementations.length}`
-    // S5: the durable notice ledger is the gate; the set is only a cache.
-    if (this.integrationGapWarned.has(key) && hasNotice(this.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.integrationGapWarned.add(key)
-    const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
-    this.commit(mission.id, () => {
-      this.notify(mission.id, `${diagnostic}. The mission now has ${implementations.length} implementation branches (${implementations.map(task => task.id).join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`, 'runtime', 'decision', true, key)
-    })
-  }
+  
+  
+  
+  
+  
   /** Primary-agent resource decisions change ceilings without resetting consumed work. */
   updateBudget(actor: Actor, missionId: string, input: Budget, reason?: string): Budget {
     actor.signal?.throwIfAborted()
@@ -3490,166 +2468,14 @@ export class SwarmRuntime {
     })
     this.kick(mission.id)
   }
-  private async usage(memberId: string, tokens: number): Promise<void> {
-    if (!Number.isFinite(tokens) || tokens < 0 || this.closed) return
-    const member = this.store.get('members', memberId)
-    if (!member) return
-    const mission = this.mission(member.missionId)
-    mission.usedTokens += Math.ceil(tokens)
-    this.commit(mission.id, () => { this.store.put('missions', mission) })
-    this.warnBudget(mission)
-    if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
-  }
-  /** Reconcile durable Harness usage cumulatively, including after a crash before SQLite accounting. */
-  private async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> {
-    if (this.closed) return
-    if (!Number.isSafeInteger(totalTokens) || totalTokens < 0) throw new Error('Invalid authoritative usage snapshot')
-    if (usage !== undefined && !validUsage(usage)) throw new Error('Invalid usage buckets')
-    const member = this.store.get('members', memberId)
-    if (!member) throw new Error('Unknown worker in usage accounting')
-    const mission = this.mission(member.missionId)
-    const previouslyAccounted = member.accountedTokens ?? 0
-    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, member.usage)
-    if (totalTokens <= previouslyAccounted && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0))) return
-    member.accountedTokens = Math.max(previouslyAccounted, totalTokens)
-    mission.usedTokens += Math.max(0, totalTokens - previouslyAccounted)
-    if (bucketDelta !== undefined) { member.usage = usage; mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
-    this.commit(mission.id, () => { this.store.put('members', member); this.store.put('missions', mission) })
-    this.warnBudget(mission)
-    if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
-  }
-  /**
-   * Owner-session usage (planning, coordination, replies to notices) is not
-   * charged to the worker pool but is attributed to that owner's newest live
-   * mission, or to its planning request before launch, so the total cost of a
-   * collaboration stays visible.
-   */
-  private recordOwnerUsage(sessionId: string, usage: UsageBuckets): void {
-    if (this.closed || this.shuttingDown || !validUsage(usage) || this.isWorkerSession(sessionId)) return
-    const mission = this.store.list('missions').filter(item => item.ownerSessionId === sessionId && !terminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
-    if (mission) {
-      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = Date.now()
-      this.commit(mission.id, () => this.store.put('missions', mission))
-      return
-    }
-    const request = this.store.list('starts').filter(item => item.ownerSessionId === sessionId && (item.status === 'planning' || item.status === 'launching')).sort((a, b) => b.createdAt - a.createdAt)[0]
-    if (!request) return
-    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = Date.now()
-    this.commit(request.id, () => this.store.put('starts', request))
-  }
-  /** Budget dimensions that are currently exhausted; used by the pause reason and event. */
-  private exhaustedDimensions(mission: Mission): string[] {
-    const dimensions: string[] = []
-    if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
-    if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
-    if (Date.now() >= mission.deadline) dimensions.push('maxDurationMs')
-    return dimensions
-  }
-  /**
-   * Emit at most one approaching-limit warning per dimension per threshold. The
-   * first signal is an event, not a fatal pause; thresholds default to 0.7/0.9.
-   */
-  private warnBudget(mission: Mission): void {
-    if (mission.status !== 'active' || mission.budgetPause) return
-    const thresholds = [...(this.config.budgetWarnAt ?? DEFAULT_BUDGET_WARN_AT)]
-      .filter(value => Number.isFinite(value) && value > 0 && value < 1).sort((a, b) => a - b)
-    if (!thresholds.length) return
-    const dimensions: Array<{ dimension: string; used: number; limit: number }> = [
-      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens },
-      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps },
-      { dimension: 'maxDurationMs', used: Math.max(0, Date.now() - mission.createdAt), limit: mission.budget.maxDurationMs },
-    ]
-    let changed = false
-    for (const item of dimensions) {
-      if (!(item.limit > 0)) continue
-      const crossed = thresholds.filter(threshold => item.used / item.limit >= threshold).at(-1)
-      if (crossed === undefined || crossed <= (mission.budgetWarned?.[item.dimension] ?? 0)) continue
-      mission.budgetWarned = { ...(mission.budgetWarned ?? {}), [item.dimension]: crossed }
-      changed = true
-      // F11: the division can land one ulp above an exact ceiling (700 / 0.7 is
-      // 1000.0000000000001), so Math.ceil alone suggests 1001. Round the ratio to
-      // six decimals first; the suggestion stays the smallest integer limit that
-      // holds the dimension at or below the crossed threshold.
-      const suggestedLimit = Math.ceil(Number((item.used / crossed).toFixed(6)))
-      this.store.event(mission.id, 'mission/budget-warning', 'runtime', { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
-        remaining: Math.max(0, item.limit - item.used), suggestedLimit })
-    }
-    if (changed) this.commit(mission.id, () => this.store.put('missions', mission))
-  }
-  private blockBudget(mission: Mission): void {
-    if (terminal(mission) || mission.status === 'blocked') return
-    const dimensions = this.exhaustedDimensions(mission)
-    mission.status = 'blocked'
-    mission.reason = dimensions.length ? `Aggregate mission budget exhausted: ${dimensions.join(', ')}` : 'Aggregate mission budget exhausted'
-    mission.budgetPause = { id: id('budget-pause'), quiesced: false }
-    this.commit(mission.id, () => {
-      this.store.put('missions', mission)
-      for (const task of this.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt) {
-        task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id, epoch: task.epoch }
-        this.store.put('tasks', task)
-      }
-      for (const member of this.store.list('members', mission.id)) { delete member.activity; this.store.put('members', member) }
-      this.upsertBudgetRefusals(mission, mission.reason!)
-      this.store.event(mission.id, 'mission/budget-exhausted', 'runtime', { tokens: mission.usedTokens, steps: mission.usedSteps, dimensions })
-      this.notify(mission.id, mission.reason!)
-    })
-    this.beginBudgetStop(mission.id, mission.budgetPause.id)
-  }
-  /** Stop outside the mission queue, which a cancelled in-flight tool may own. */
-  private beginBudgetStop(missionId: string, pauseId: string): void {
-    if (this.shuttingDown || this.budgetStops.has(pauseId)) return
-    this.budgetStops.add(pauseId)
-    this.defer(async () => {
-      try {
-        await Promise.all(this.store.list('members', missionId).map(member => this.workers.stop(member.id)))
-        if (this.closed) return
-        const mission = this.mission(missionId)
-        if (mission.budgetPause?.id !== pauseId) return
-        mission.budgetPause.quiesced = true
-        this.commit(missionId, () => {
-          this.store.put('missions', mission)
-          this.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
-        })
-        this.kick(missionId)
-        await this.flushOutbox(missionId)
-      } finally { this.budgetStops.delete(pauseId) }
-    })
-  }
-  /** A fresh durable delivery wakes preserved attempts as soon as stop completes. */
-  private resumeBudgetTasks(mission: Mission): void {
-    const pause = mission.budgetPause
-    if (mission.status !== 'active' || !pause?.quiesced) return
-    this.commit(mission.id, () => {
-      for (const task of this.store.list('tasks', mission.id)) {
-        const resume = task.budgetResume
-        if (!resume || resume.pauseId !== pause.id) continue
-        delete task.budgetResume
-        if (task.status !== 'running' || !task.attempt || task.attempt.id !== resume.attemptId || task.epoch !== resume.epoch) {
-          // The pause marker outlived its attempt (challenge, handoff or restart):
-          // re-pend the work without charging a recovery attempt.
-          if (task.status === 'running') { task.status = 'pending'; this.dropAttempt(task) }
-          this.store.put('tasks', task)
-          this.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
-          continue
-        }
-        task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs)
-        this.store.put('tasks', task)
-        const member = this.store.get('members', task.attempt.ownerId)
-        if (member && member.status !== 'stopped') { member.status = 'working'; this.store.put('members', member) }
-        for (const delivery of this.store.list('deliveries', mission.id)) {
-          if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
-            delivery.deliveredAt = Date.now(); this.store.put('deliveries', delivery)
-          }
-        }
-        this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt.ownerId, kind: 'assignment',
-          taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now(),
-          content: JSON.stringify({ missionId: mission.id, task, instructions: 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.' }) })
-        this.store.event(mission.id, 'task/budget-resumed', 'runtime', { taskId: task.id, attemptId: task.attempt.id, pauseId: pause.id })
-      }
-      delete mission.budgetPause
-      this.store.put('missions', mission)
-    })
-  }
+  
+  
+  
+  
+  
+  
+  
+  
   private onActivity(memberId: string, activity?: WorkerActivity): void {
     if (this.closed || this.shuttingDown) return
     const member = this.store.get('members', memberId)
@@ -3674,92 +2500,9 @@ export class SwarmRuntime {
       }
     })
   }
-  /** Renew only a still-owned native operation, bounded by the owner's actual mission deadline. */
-  private renewActiveOperation(task: Task, mission: Mission): void {
-    // S1 (P0): fence the renewal itself. The caller may hold a row read before
-    // an earlier iteration's await; re-read and never extend a lease, clear a
-    // warning or write a whole record over a row that moved epoch, status or
-    // attempt (cancel, handoff, challenge, beforeStep, recordToolRun).
-    const current = this.store.get('tasks', task.id)
-    if (current === undefined || current.missionId !== mission.id || current.epoch !== task.epoch
-      || current.status !== 'running' || current.attempt?.id !== task.attempt?.id) return
-    task = current
-    if (!task.attempt || task.attempt.leaseUntil >= Date.now() + this.config.leaseMs / 2) return
-    const member = this.store.get('members', task.attempt.ownerId)
-    const activity = member?.activity
-    const observed = this.workers.currentActivity?.(task.attempt.ownerId)
-    // A live operation is liveness for its full duration: match by member and
-    // activity id, never by the attempt the operation happens to be stored under.
-    // Adapters that report current activity must confirm the operation is live.
-    const live = activity !== undefined && (this.workers.currentActivity === undefined || (observed !== undefined && observed.id === activity.id))
-    if (!live) {
-      if (task.leaseWarned !== task.attempt.leaseUntil) {
-        task.leaseWarned = task.attempt.leaseUntil
-        this.commit(mission.id, () => {
-          this.store.put('tasks', task)
-          this.store.event(mission.id, 'task/lease-expiring', 'runtime', { taskId: task.id, ownerId: task.attempt!.ownerId, leaseUntil: task.attempt!.leaseUntil })
-        })
-      }
-      return
-    }
-    const modelAllowance = activity.kind === 'model' ? (member?.maxOutputTokens ?? 0) : 0
-    task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.config.leaseMs + Math.ceil(modelAllowance * LEASE_MS_PER_OUTPUT_TOKEN))
-    delete task.leaseWarned
-    // A lease extension is liveness bookkeeping, not a new progress timestamp or milestone.
-    this.commit(mission.id, () => this.store.put('tasks', task))
-  }
-  /**
-   * A worker-side git write that the sandbox refused (index.lock EPERM). Only a
-   * shell-executing tool runs a command line, so only its executed command is
-   * inspected; a quoted span that merely names a git-write phrase (a search
-   * pattern, an edit body, a message) is data, never a denial and never a latch,
-   * and a successful command is never a denial. R6-01: the result text is not
-   * inspected either, because a failed command that merely prints the refusal
-   * phrase is not a sandbox refusal; a denial is a failed run of an executed
-   * metadata-write command. R6-02: the subcommand must sit at command position
-   * in one shell segment, so a write word mentioned in a pattern or path is data
-   * even when the command fails. A command hidden inside a nested shell string
-   * is not seen: the sandbox still blocks it and the worker sees the raw refusal.
-   */
-  private deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined {
-    const command = executedShellCommand(input.tool, input.arguments)
-    if (command === undefined || !input.isError || gitWriteSubcommand(unquotedShellText(command)) === undefined) return undefined
-    return command.length > 200 ? `${command.slice(0, 200)}…` : command
-  }
+  
 
-  /**
-   * R11-15: detect one member naming a shared temp path another member already
-   * named inside the window. Bookkeeping is bounded and in-memory; the durable
-   * `isolation/temp-rendezvous` event (and the owner notice) is the audit row,
-   * and it appears in the bounded observe event window.
-   */
-  private tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined {
-    const paths = sharedTempPaths(input)
-    if (!paths.length) return undefined
-    const now = Date.now()
-    let report: { path: string; first: TempMention; second: TempMention } | undefined
-    for (const path of paths) {
-      const fresh = (this.tempMentions.get(path) ?? []).filter(mention => now - mention.at <= TEMP_RENDEZVOUS_WINDOW_MS)
-      const other = tempRendezvousDecision(fresh, memberId, now)
-      if (other !== undefined) {
-        const key = [path, ...[other.memberId, memberId].sort()].join('|')
-        const reportedAt = this.tempRendezvousReported.get(key)
-        if (reportedAt === undefined || now - reportedAt > TEMP_RENDEZVOUS_WINDOW_MS) {
-          this.tempRendezvousReported.set(key, now)
-          report ??= { path, first: other, second: { memberId, taskId, at: now } }
-        }
-      }
-      fresh.push({ memberId, taskId, at: now })
-      this.tempMentions.set(path, fresh.slice(-TEMP_RENDEZVOUS_MAX_MENTIONS))
-    }
-    while (this.tempMentions.size > TEMP_RENDEZVOUS_MAX_PATHS) {
-      const oldest = this.tempMentions.keys().next().value
-      if (oldest === undefined) break
-      this.tempMentions.delete(oldest)
-    }
-    for (const [key, at] of this.tempRendezvousReported) if (now - at > TEMP_RENDEZVOUS_WINDOW_MS) this.tempRendezvousReported.delete(key)
-    return report
-  }
+  
   private async recordToolRun(memberId: string, input: Omit<ToolRun, 'id' | 'seq' | 'missionId' | 'memberId' | 'taskId' | 'attemptId' | 'createdAt'>): Promise<string | undefined> {
     if (this.closed || input.tool.startsWith('swarm_')) return undefined
     const member = this.store.get('members', memberId)
@@ -3796,103 +2539,6 @@ export class SwarmRuntime {
     })
     return run.id
   }
-  private onIdle(memberId: string): void {
-    if (this.closed || this.shuttingDown) return
-    const member = this.store.get('members', memberId)
-    if (!member || member.status === 'stopped') return
-    // W6: remember that this member ended a turn while still owning an attempt,
-    // so scheduling can nudge it and, when the bounded retry is exhausted,
-    // checkpoint the workspace before any reassignment.
-    const open = this.store.list('tasks', member.missionId).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
-    if (open?.attempt) {
-      this.idleSignals.set(memberId, { attemptId: open.attempt.id, at: Date.now() })
-      // S5: the signal is durable on the task row the scheduling pass re-reads;
-      // the map above is only a cache for a row write still in flight.
-      open.idleSignal = { attemptId: open.attempt.id, at: Date.now() }
-      this.store.put('tasks', open)
-    } else this.idleSignals.delete(memberId)
-    member.status = 'idle'
-    delete member.activity
-    this.commit(member.missionId, () => {
-      this.store.put('members', member)
-      if (open?.attempt) this.store.put('tasks', open)
-    })
-    this.kick(member.missionId)
-  }
-  /**
-   * W6: an idle worker still owns a running attempt. First re-wake it with a
-   * bounded, durable nudge; when the bound is exhausted, capture the member
-   * workspace as an immutable checkpoint, fence the attempt and re-pend the
-   * task with the same member preferred so recovery resumes partial work.
-   */
-  private async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> {
-    const bound = this.config.maxIdleCloseouts ?? DEFAULT_IDLE_CLOSEOUTS
-    const nudges = task.closeout?.nudges ?? 0
-    if (nudges < bound) {
-      const nudge = nudges + 1
-      const remaining = bound - nudge
-      const attemptId = task.attempt!.id
-      task.closeout = { nudges: nudge, at: Date.now() }
-      this.commit(mission.id, () => {
-        this.store.put('tasks', task)
-        this.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: member.id, kind: 'control', createdAt: Date.now(),
-          content: `Your attempt on "${task.title}" (${task.id}) is still open but your turn ended without a terminal call. Continue this exact attemptId ${attemptId} and finish it: submit with swarm_submit, release it with swarm_handoff, or park with swarm_wait. ${remaining === 0 ? 'The next idle close-out checkpoints your workspace and re-pends the task for recovery.' : `After ${remaining} more idle close-out${remaining === 1 ? '' : 's'} the runtime checkpoints your workspace and re-pends the task for recovery.`}` })
-        this.store.event(mission.id, 'task/closeout-nudged', 'runtime', { taskId: task.id, attemptId, ownerId: member.id, nudges: nudge })
-      })
-      return
-    }
-    let checkpoint: Artifact
-    try { checkpoint = await this.workers.captureArtifact(member, task) }
-    catch (error) {
-      const failed = this.task(mission.id, task.id)
-      if (failed.status !== 'running' || failed.attempt?.id !== task.attempt?.id) return
-      failed.status = 'blocked'; failed.epoch++; this.dropAttempt(failed); delete failed.closeout; delete failed.idleSignal
-      failed.output = `Worker ended its turn without submitting (${task.id}) and its workspace could not be checkpointed: ${error instanceof Error ? error.message : String(error)}. Inspect the member workspace before proposing a replacement.`
-      this.commit(mission.id, () => {
-        this.store.put('tasks', failed)
-        this.store.event(mission.id, 'task/closeout-failed', 'runtime', { taskId: failed.id, ownerId: member.id, reason: failed.output })
-        this.notify(mission.id, failed.output!)
-      })
-      return
-    }
-    const current = this.task(mission.id, task.id)
-    // The attempt may have finished while the checkpoint committed; never mutate terminal work.
-    if (current.status !== 'running' || current.attempt?.id !== task.attempt?.id) return
-    current.checkpoint = { commit: checkpoint.commit, at: Date.now() }
-    current.status = 'blocked'; current.epoch++
-    current.recoveryCount = (current.recoveryCount ?? 0) + 1
-    this.dropAttempt(current); delete current.closeout; delete current.idleSignal
-    // Prefer the same member: its next attempt resumes the checkpointed workspace
-    // instead of a different member starting from the mission baseline.
-    current.assigneeId = member.id
-    current.plannedAssigneeId ??= member.id
-    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout' }
-    const epoch = current.epoch
-    this.commit(mission.id, () => {
-      this.store.put('tasks', current)
-      this.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount })
-    })
-    this.idleSignals.delete(member.id)
-    this.defer(async () => {
-      await this.workers.stop(member.id)
-      await this.exclusive(mission.id, async () => {
-        const fresh = this.task(mission.id, task.id)
-        if (fresh.epoch !== epoch || fresh.status !== 'blocked') return
-        const released = this.store.get('members', member.id)
-        if (released !== undefined && released.status !== 'stopped') { released.status = 'idle'; this.store.put('members', released) }
-        const exhausted = (fresh.recoveryCount ?? 0) >= (fresh.maxRecoveryAttempts ?? this.config.maxTasksPerMember)
-        if (!exhausted) {
-          fresh.status = 'pending'; delete fresh.resumeAfterStop
-          if (released === undefined || released.status === 'stopped') delete fresh.assigneeId
-        } else delete fresh.resumeAfterStop
-        this.commit(mission.id, () => {
-          this.store.put('tasks', fresh)
-          this.store.event(mission.id, exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready', 'runtime', { taskId: fresh.id, memberId: member.id })
-        })
-      })
-      this.kick(mission.id)
-    })
-  }
   /**
    * R11-01: record one classified provider outage inside the caller's
    * transaction. The durable row is bounded to one per member and class per
@@ -3918,7 +2564,7 @@ export class SwarmRuntime {
     return outage !== undefined && Date.now() - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
   }
   /** R11-01: a successful start or operation proves the route recovered. */
-  private clearProviderOutage(missionId: string, memberId: string): void {
+  clearProviderOutage(missionId: string, memberId: string): void {
     const member = this.store.get('members', memberId)
     if (member === undefined || member.providerOutage === undefined) return
     delete member.providerOutage
@@ -3956,7 +2602,7 @@ export class SwarmRuntime {
    * to another capable live member with a durable `task/reassigned` event. A
    * successful start clears the member's consecutive failure counter.
    */
-  private onStartFailure(mission: Mission, member: Member, error: unknown): void {
+  onStartFailure(mission: Mission, member: Member, error: unknown): void {
     if (this.closed || this.shuttingDown) return
     const missionId = mission.id
     const current = this.store.get('missions', missionId)
@@ -4016,59 +2662,20 @@ export class SwarmRuntime {
         : `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its work was re-pended with one recovery credit.`)
     })
   }
-  private defer(fn: () => Promise<void>): void {
+  defer(fn: () => Promise<void>): void {
     if (this.shuttingDown) return
     const operation = new Promise<void>(resolve => setImmediate(resolve)).then(fn)
     this.operations.add(operation)
     void operation.catch(error => { if (!this.closed) process.stderr.write(`[agent-swarm] ${String(error)}\n`) }).finally(() => this.operations.delete(operation))
   }
-  /**
-   * S2: the outbox pump lives outside every mission queue. It is driven by the
-   * tick timer and by state-changing calls, reads only durable rows (missions,
-   * deliveries, tasks, members) and never takes `exclusive`; a pass wedged in an
-   * adapter call, or a mission lock held for any other reason, therefore cannot
-   * stop a durable owner notice from being delivered. `beginBudgetStop` already
-   * used exactly this shape (defer + a queue-external flush); this generalizes
-   * it instead of adding a second mechanism.
-   *
-   * The pump is not a global lock: each delivery attempt is claimed
-   * individually, bounded by `stallPassTimeoutMs`, and abandoned (then retried
-   * on a later pump) if the adapter call does not settle. One hung `deliver`
-   * therefore cannot starve another notice — not even another notice of the same
-   * mission — and the abandonment is recorded durably on the mission row.
-   */
-  private pumpOutbox(): void {
-    if (this.shuttingDown || this.closed) return
-    // Bounded coalescing: concurrent requests join a pump that is inside its
-    // declared bound, but a pump whose deliveries hang past the bound never
-    // suppresses the next one — the flag ages out instead of starving the
-    // outbox (the reviewer's D2).
-    const now = Date.now()
-    if (this.pumpingSince !== undefined && now - this.pumpingSince < this.stallPassTimeoutMs) return
-    this.pumpingSince = now
-    this.defer(async () => {
-      try {
-        for (const mission of this.store.list('missions')) {
-          if (this.closed || this.shuttingDown) return
-          try { await this.flushOutbox(mission.id) }
-          catch { /* Durable outbox retries; one mission must not stop the pump. */ }
-        }
-      } finally { this.pumpingSince = undefined }
-    })
-  }
-  /** Start time of the running pump; ages out at the declared bound. */
-  private pumpingSince?: number
-  /**
-   * Deliveries a pump is currently attempting (cache-only claim keyed per
-   * delivery, so two pumps cannot duplicate one attempt and one hung call
-   * cannot claim the whole outbox).
-   */
-  private readonly delivering = new Map<string, number>()
+  
+  
+  
   /**
    * S1: the declared no-progress window, as an integer number of passes
    * (default 3, i.e. 3 × `tickMs`). Configuration, never a constant.
    */
-  private get stallPasses(): number {
+  get stallPasses(): number {
     const value = Math.trunc(this.config.stallPasses ?? DEFAULT_STALL_PASSES)
     return Number.isSafeInteger(value) && value >= 1 ? value : DEFAULT_STALL_PASSES
   }
@@ -4077,129 +2684,28 @@ export class SwarmRuntime {
    * pass still running past this bound has produced no durable change for the
    * whole window; the watchdog escalates it and releases the guard.
    */
-  private get stallPassTimeoutMs(): number {
+  get stallPassTimeoutMs(): number {
     const value = Math.trunc(this.config.stallPassTimeoutMs ?? this.config.tickMs * DEFAULT_STALL_PASS_TIMEOUT_TICKS)
     return Number.isSafeInteger(value) && value >= this.config.tickMs ? value : this.config.tickMs
   }
-  /** One durable pass row per mission; the row is the guard, never an in-memory Set. */
-  private passKey(missionId: string): string { return `pass_${missionId}` }
-  /**
-   * Identity of this runtime process in the pass row. A row written by a
-   * different instance is a crashed process's leftover: it never gates this
-   * runtime (the next open pass overwrites it), so a restart does not wait out
-   * a dead pass's bound.
-   */
-  private readonly instanceId = id('runtime')
-  /**
-   * The pass that may still hold the guard. Re-read from the store on every
-   * call: a `running` row older than the declared bound is NOT a guard, so a
-   * pass that never returns cannot swallow the tick timer's liveness action.
-   * While the mission has live work (a renewed lease, an in-flight quiescence)
-   * the row keeps gating past the bound: the pass may legitimately be inside a
-   * long adapter await for that live attempt.
-   */
-  private livePass(missionId: string): SchedulingPass | undefined {
-    const row = this.store.get('passes', this.passKey(missionId))
-    if (row === undefined || row.missionId !== missionId) return undefined
-    if (row.instanceId !== this.instanceId) return undefined
-    if (row.status !== 'running') return undefined
-    if (Date.now() - row.startedAt < this.stallPassTimeoutMs) return row
-    // Past the bound the row is a guard only while the mission has live work to
-    // progress. With no live work it is not a guard at all, so the tick timer's
-    // kick is never swallowed; the watchdog releases and escalates it.
-    return this.hasLiveWork(missionId) ? row : undefined
-  }
-  /**
-   * True while `pass` still owns the mission's guard (used to fence an abandoned
-   * pass body). Only an explicit release after the declared bound stops a body:
-   * a long pass that is still making progress (a live lease, an in-flight
-   * quiescence) keeps running, while an abandoned one must never dispatch into
-   * the newer pass's turn. Cache-only (S5): losing it can at worst let an
-   * abandoned body repeat idempotent work, and the durable re-read checks in the
-   * dispatch path still fence every task transition.
-   */
-  private passReleased(pass: SchedulingPass | undefined): boolean {
-    return pass !== undefined && this.releasedPasses.has(pass.runId)
-  }
-  /**
-   * A live lease renewed by recorded operations, or a stop whose acknowledgement
-   * is in flight, is progress: the runtime must not report a stall while one
-   * exists (a false stall notice is a defect of the same severity as a missing
-   * one). A lease is only live while `leaseUntil` is in the future, so a pass
-   * that wedged long enough for every lease to lapse is still detected.
-   */
-  private hasLiveWork(missionId: string): boolean {
-    const now = Date.now()
-    return this.store.list('tasks', missionId).some(task =>
-      this.quiescencePending(task)
-      || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
-  }
-  /**
-   * S7: the isolation invariant, decided from durable state only.
-   *  - live workers ≤ provisioned isolated worktrees: every non-stopped member
-   *    owns a provisioned workspace and no two live members share one, so the
-   *    number of worker handles the runtime may hold can never exceed the number
-   *    of distinct isolated worktrees;
-   *  - two concurrently running tasks that share one isolated worktree must
-   *    declare disjoint scope: the dispatch path admits at most one running task
-   *    per worktree and refuses a second whose scope overlaps.
-   * This asserts the isolation the runtime already has; it never weakens
-   * per-member worktrees, it refuses a dispatch that would lose them.
-   */
-  isolationViolations(missionId: string): string[] {
-    const violations: string[] = []
-    const members = this.store.list('members', missionId).filter(member => member.status !== 'stopped')
-    const byWorkspace = new Map<string, Member[]>()
-    for (const member of members) {
-      if (!member.workspace) { violations.push(`member ${member.id} (${member.name}) has no provisioned isolated worktree`); continue }
-      byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
-    }
-    for (const [workspace, group] of byWorkspace) {
-      if (group.length > 1) violations.push(`live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees`)
-    }
-    const running = this.store.list('tasks', missionId).filter(task => task.status === 'running' && task.attempt !== undefined)
-    const byTaskWorkspace = new Map<string, Task[]>()
-    for (const task of running) {
-      const owner = this.store.get('members', task.attempt!.ownerId)
-      if (owner === undefined || owner.status === 'stopped') { violations.push(`running task ${task.id} has no live owner (${task.attempt!.ownerId})`); continue }
-      byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
-    }
-    for (const [workspace, group] of byTaskWorkspace) {
-      if (group.length > 1) violations.push(`concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}`)
-      for (let left = 0; left < group.length; left++) {
-        for (let right = left + 1; right < group.length; right++) {
-          if (this.scopesOverlap(group[left]!.scope, group[right]!.scope)) {
-            violations.push(`concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}`)
-          }
-        }
-      }
-    }
-    return violations
-  }
+  
+  
+  
+  
+  
+  
   /** Two declared scopes overlap when either is `**`, equal, or one contains the other. */
-  private scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
+  scopesOverlap(left: readonly string[], right: readonly string[]): boolean {
     return left.some(a => right.some(b => scopeKeysOverlap(a, b)))
   }
-  /** The isolation precondition for one dispatch: refuse the member and record why when it fails. */
-  private isolationAllows(missionId: string, member: Member): boolean {
-    const violation = this.isolationViolations(missionId).find(entry => entry.includes(member.id))
-    if (violation !== undefined) { this.refuseIsolation(missionId, member, violation); return false }
-    // Change-and-return: a repaired board forgets the refusal key, so the same
-    // violation recurring later wakes the owner again instead of staying silent.
-    const mission = this.store.get('missions', missionId)
-    if (mission?.isolationRefusal !== undefined) {
-      delete mission.isolationRefusal
-      this.commit(missionId, () => this.store.put('missions', mission))
-    }
-    return true
-  }
+  
   /**
    * A durable refusal, not a silent skip: the invariant is named, the offending
    * member and worktree are recorded, and the owner is told the executable exit
    * (each live member needs its own isolated worktree). Dedup is per distinct
    * violation so a corrupted board does not wake the owner every tick.
    */
-  private refuseIsolation(missionId: string, member: Member, violation: string): void {
+  refuseIsolation(missionId: string, member: Member, violation: string): void {
     const mission = this.store.get('missions', missionId)
     if (mission === undefined || terminal(mission)) return
     const key = `${member.id}:${violation}`
@@ -4214,156 +2720,12 @@ export class SwarmRuntime {
       this.notify(missionId, `Isolation invariant refused a dispatch to ${member.name} (${member.id}): ${violation}. No worker was started and no task was assigned into a shared or unprovisioned worktree; repair the member workspaces so each live member has its own isolated worktree, then the task stays pending for the next pass.`)
     })
   }
-  /** Open a pass and record it durably before any scheduling work starts. */
-  private openPass(missionId: string): SchedulingPass | undefined {
-    if (this.closed || this.shuttingDown) return undefined
-    if (this.store.get('missions', missionId) === undefined) return undefined
-    if (this.livePass(missionId) !== undefined) return undefined
-    const prior = this.store.get('passes', this.passKey(missionId))
-    const pass: SchedulingPass = {
-      // One row per mission, overwritten each pass: `get(passKey)` is the gate.
-      id: this.passKey(missionId), runId: id('run'), instanceId: this.instanceId, missionId, status: 'running', startedAt: Date.now(),
-      revisionBefore: this.store.revision(), fingerprintBefore: this.fingerprint(missionId),
-      noProgressPasses: prior?.status === 'finished' ? prior.noProgressPasses : 0,
-    }
-    this.commit(missionId, () => this.store.put('passes', pass))
-    return pass
-  }
-  /**
-   * Close a pass: record `(fingerprint-before, fingerprint-after)` and
-   * `(revision-before, revision-after)`, count consecutive passes that advanced
-   * nothing and terminated nothing, and escalate once the declared window of
-   * such passes has been reached. Never throws: pass bookkeeping must not break
-   * scheduling.
-   */
-  private closePass(missionId: string, pass: SchedulingPass): void {
-    try {
-      // A graceful shutdown must still release the guard: skipping this write
-      // leaves a `running` row behind that the next runtime would treat as live.
-      if (this.closed) return
-      const row = this.store.get('passes', this.passKey(missionId))
-      // Compare the per-run identity, never the stable row key: another pass may
-      // have overwritten the row while this body was in flight.
-      if (row?.runId !== pass.runId) return
-      const revisionAfter = this.store.revision()
-      const fingerprintAfter = this.fingerprint(missionId)
-      const progressed = fingerprintAfter !== pass.fingerprintBefore
-      const noProgressPasses = progressed ? 0 : pass.noProgressPasses + 1
-      const closed: SchedulingPass = { ...pass, status: 'finished', finishedAt: Date.now(), revisionAfter, fingerprintAfter, noProgressPasses }
-      this.commit(missionId, () => this.store.put('passes', closed))
-      // Change-and-return: the board left the no-progress class, so a later
-      // return to it re-notifies instead of staying silent behind a stale key.
-      const mission = this.store.get('missions', missionId)
-      if (progressed && mission?.schedulingStallNotice !== undefined) {
-        delete mission.schedulingStallNotice
-        this.commit(missionId, () => this.store.put('missions', mission))
-      }
-      if (!progressed && noProgressPasses >= this.stallPasses && this.boardCannotProgress(missionId)) {
-        this.escalateSchedulingStall(missionId, { pass: closed, reason: 'no-progress', boundMs: this.config.tickMs * this.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
-      }
-    } catch { /* A closed store or a concurrent owner transition must not break scheduling. */ }
-  }
-  /**
-   * The no-progress escalation is a backstop for a pass that completed without
-   * advancing or terminating, so it may only fire for a board the runtime
-   * already classifies as unable to progress: `stalled` is the same predicate
-   * the board-level witness uses, and it returns false while any task runs under
-   * a live lease, while a stop acknowledgement is in flight, and while a
-   * submitted artifact is still inside the documented review grace. In
-   * particular a member the adapter reports busy is working, not stalled — a
-   * false stall notice is a defect of the same severity as a missing one.
-   */
-  private boardCannotProgress(missionId: string): boolean {
-    const mission = this.store.get('missions', missionId)
-    if (mission === undefined || mission.status !== 'active') return false
-    return this.stalled(mission, this.store.list('tasks', missionId), this.store.list('members', missionId))
-  }
-  /**
-   * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
-   * queue and outside the pass it watches. A pass still `running` past the
-   * declared bound is declared stalled: the durable stall event is committed,
-   * the owner notice is delivered by an unqueued flush, and the guard is
-   * released (both the durable row and the in-memory serialization chain) so the
-   * next tick is not swallowed.
-   */
-  private checkSchedulingPasses(): void {
-    if (this.closed || this.shuttingDown) return
-    const now = Date.now()
-    for (const mission of this.store.list('missions')) {
-      if (terminal(mission)) continue
-      const pass = this.store.get('passes', this.passKey(mission.id))
-      if (pass === undefined || pass.instanceId !== this.instanceId || pass.status !== 'running') continue
-      if (now - pass.startedAt < this.stallPassTimeoutMs) continue
-      if (this.store.get('passes', this.passKey(mission.id))?.runId !== pass.runId) continue
-      // A live lease or an in-flight quiescence is progress: a long pass that is
-      // still working must not be abandoned. It is re-evaluated on later ticks
-      // and released once that work has lapsed, so the window is still bounded.
-      if (this.hasLiveWork(mission.id)) continue
-      const unschedulable = this.unschedulable(mission, this.store.list('tasks', mission.id), this.store.list('members', mission.id)).map(task => `${task.id} (${task.status})`)
-      const fingerprintNow = this.fingerprint(mission.id)
-      const closed: SchedulingPass = {
-        ...pass, status: 'finished', finishedAt: now, revisionAfter: this.store.revision(), fingerprintAfter: fingerprintNow,
-        stalled: { reason: 'pass-timeout', at: now, boundMs: this.stallPassTimeoutMs, unschedulable },
-      }
-      // Release both halves of the guard: the durable row stops gating and the
-      // in-memory chain no longer queues later ticks behind a promise that never
-      // settles. A newer pass that has already registered its own chain entry is
-      // never clobbered (its `exclusive` finally compares identity). The released
-      // pass id fences the abandoned body.
-      this.releasedPasses.add(pass.runId)
-      this.queues.delete(mission.id)
-      this.commit(mission.id, () => this.store.put('passes', closed))
-      this.escalateSchedulingStall(mission.id, { pass: closed, reason: 'pass-timeout', boundMs: this.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow })
-    }
-  }
-  /**
-   * Commit the durable stall event and, when the state is otherwise silent,
-   * deliver the owner notice. Dedup is the existing fingerprint semantics: the
-   * same unchanged board never escalates twice (the durable
-   * `schedulingStallNotice` key), and a board that changes and returns does. A
-   * fresh witness another path already emitted for this exact fingerprint
-   * (`mission.witness`, the board-level stall notice or the coverage notice)
-   * suppresses the escalation entirely: that state is already escalated, so a
-   * second durable event for it would be duplicate evidence, not new evidence.
-   */
-  private escalateSchedulingStall(missionId: string, info: { pass: SchedulingPass; reason: 'pass-timeout' | 'no-progress'; boundMs: number; revisionNow: number; fingerprintNow: string }): void {
-    const mission = this.store.get('missions', missionId)
-    if (mission === undefined || terminal(mission) || mission.status !== 'active') return
-    const fingerprint = info.fingerprintNow
-    if (mission.schedulingStallNotice === fingerprint) return
-    const witnessed = mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
-    if (witnessed) return
-    const unschedulable = info.pass.stalled?.unschedulable ?? this.unschedulable(mission, this.store.list('tasks', missionId), this.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
-    const passes = info.pass.noProgressPasses
-    const stateUnchanged = info.pass.fingerprintBefore === fingerprint
-    mission.schedulingStallNotice = fingerprint
-    mission.updatedAt = Date.now()
-    mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
-    this.commit(missionId, () => {
-      this.store.put('missions', mission)
-      // Reuse the registered board-stall event rather than inventing a new type:
-      // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
-      // distinguishable in the durable log and in every existing read path.
-      this.store.event(missionId, 'mission/stalled', 'runtime', {
-        cause: 'scheduling-pass',
-        passId: info.pass.id, runId: info.pass.runId,
-        reason: info.reason === 'pass-timeout'
-          ? `scheduling pass did not return within its ${info.boundMs}ms bound and advanced no durable state`
-          : `no durable state change for ${passes} consecutive scheduling passes`,
-        wedged: info.reason === 'pass-timeout',
-        passStartedAt: info.pass.startedAt, passes, boundMs: info.boundMs,
-        revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
-        missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
-      })
-      this.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.`
-        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`)
-    })
-    // The notice path must not share the fate of the pass that could not report
-    // it: the queue-external pump delivers it, never the wedged mission queue.
-    this.pumpOutbox()
-  }
-  private kick(missionId: string): void {
+  
+  
+  
+  
+  
+  kick(missionId: string): void {
     if (this.shuttingDown || this.closed) return
     const pass = this.openPass(missionId)
     if (pass === undefined) return
@@ -4402,172 +2764,14 @@ export class SwarmRuntime {
     // F2: a submitted code deliverable no live review can accept is repaired
     // before dispatch, so the auto-admitted review can be scheduled this tick.
     this.admitMissingReviews(this.mission(missionId))
-    // S1 (P0): iterate ids and re-read each row inside the loop. The loop awaits
-    // external work (captureArtifact, stop), and cancel/challenge/handoff/
-    // publish/beforeStep/recordToolRun commit directly during those awaits; a
-    // pre-await snapshot must never be written back over a newer record.
-    for (const listed of this.store.list('tasks', missionId)) {
-      if (this.shuttingDown) return
-      let task = this.store.get('tasks', listed.id)
-      if (task === undefined || task.missionId !== missionId || task.status !== 'running' || !task.attempt) continue
-      const oldOwner = task.attempt.ownerId
-      const attemptId = task.attempt.id
-      // R10-15: a parked member holding a live attempt is a stall signal, not a
-      // silent board. Record it durably and wake the owner once per attempt.
-      const ownerMember = this.store.get('members', oldOwner)
-      const parked = ownerMember?.status === 'waiting'
-      if (parked) this.notifyParkedHolder(mission, task)
-      this.renewActiveOperation(task, mission)
-      // S1r: the renewal commits a re-read row, so the caller's snapshot can
-      // still look expired after a successful renewal. Re-read again and use the
-      // current row for every later comparison, or a live operation is renewed
-      // and then expired in the same pass (the documented "a live operation is
-      // liveness for its full duration" invariant).
-      const renewed = this.store.get('tasks', task.id)
-      if (renewed === undefined || renewed.missionId !== missionId || renewed.epoch !== task.epoch
-        || renewed.status !== 'running' || renewed.attempt?.id !== attemptId) continue
-      task = renewed
-      if (task.attempt === undefined || task.attempt.leaseUntil >= Date.now()) continue
-      // W6: capture a durable checkpoint before any reassignment when the old
-      // owner is quiescent, so the next attempt resumes committed work instead
-      // of falling back to the mission baseline.
-      if (this.workers.isIdle(oldOwner)) {
-        const owner = this.store.get('members', oldOwner)
-        if (owner !== undefined && owner.status !== 'stopped') {
-          try {
-            const checkpoint = await this.workers.captureArtifact(owner, task)
-            const current = this.task(missionId, task.id)
-            if (current.epoch === task.epoch && current.status === 'running' && current.attempt?.id === attemptId) {
-              // S1 (P0): commit the row re-read after the await, never the
-              // pre-await object, so a concurrent transition is not reverted.
-              current.checkpoint = { commit: checkpoint.commit, at: Date.now() }
-              this.commit(missionId, () => { this.store.put('tasks', current); this.store.event(missionId, 'task/checkpointed', 'runtime', { taskId: current.id, commit: checkpoint.commit, reason: 'lease-expired' }) })
-            }
-          } catch (error) {
-            // Auditable and non-fatal: the workspace stays untouched and
-            // prepareTask refuses a dirty workspace rather than losing it.
-            const current = this.task(missionId, task.id)
-            if (current.epoch === task.epoch && current.status === 'running' && current.attempt?.id === attemptId) {
-              const reason = `Lease-expiry checkpoint failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}. The member workspace is preserved; recovery will refuse a dirty workspace instead of losing it.`
-              this.commit(missionId, () => {
-                this.store.event(missionId, 'task/checkpoint-failed', 'runtime', { taskId: task.id, ownerId: oldOwner, reason })
-                this.notify(missionId, reason)
-              })
-            }
-          }
-        }
-      }
-      // The checkpoint awaited external work. An owner cancel (or any other
-      // fencing transition) committed during it must win over lease recovery:
-      // re-read and only transition the record that still owns this attempt.
-      const expiring = this.task(missionId, task.id)
-      if (expiring.epoch !== task.epoch || expiring.status !== 'running' || expiring.attempt?.id !== attemptId) continue
-      // A lease that expired while the task was budget-paused is host policy, not
-      // a recovery failure, and the plan's intended owner must survive it. A
-      // lease that expired while its owner was parked is the same class of
-      // host-induced stop (R10-15): the park, not the worker, caused the stall,
-      // so it must not spend a recovery credit.
-      const pauseInduced = expiring.budgetResume !== undefined || parked
-      expiring.status = 'blocked'; expiring.epoch++
-      if (!pauseInduced) expiring.recoveryCount = (expiring.recoveryCount ?? 0) + 1
-      this.dropAttempt(expiring)
-      const planned = expiring.plannedAssigneeId === undefined ? undefined : this.store.get('members', expiring.plannedAssigneeId)
-      if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
-      else delete expiring.assigneeId
-      expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired' }
-      this.commit(missionId, () => { this.store.put('tasks', expiring); this.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner }) })
-      await this.workers.stop(oldOwner)
-      const reopened = this.task(missionId, task.id)
-      if (reopened.epoch !== expiring.epoch || reopened.status !== 'blocked') continue
-      reopened.status = (reopened.recoveryCount ?? 0) >= (reopened.maxRecoveryAttempts ?? this.config.maxTasksPerMember) ? 'blocked' : 'pending'; delete reopened.resumeAfterStop
-      this.commit(missionId, () => { this.store.put('tasks', reopened) })
-    }
-    for (const member of this.store.list('members', missionId)) {
-      if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-      if (member.status === 'stopped') continue
-      // S1: an abandoned pass body (its guard was released after the declared
-      // bound) must never dispatch into the newer pass's turn.
-      if (this.passReleased(pass)) return
-      if (!this.isolationAllows(missionId, member)) continue
-      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
-      catch (error) {
-        // Disposing the adapter cancels in-flight starts. This is recoverable host
-        // shutdown, not a permanent worker failure to persist across restart.
-        if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-        this.onStartFailure(mission, member, error)
-        continue
-      }
-      this.startFailures.delete(member.id)
-      this.clearProviderOutage(missionId, member.id)
-      if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-      if (this.passReleased(pass)) return
-      // R10-09/S3: a parked member is dispatchable. The adapter's idle
-      // precondition can be false for a parked agent (a pending inbox item or a
-      // non-idle handle); an assignment is exactly the fresh input that unparks
-      // it, so the runtime must not let that precondition leave the board silent.
-      const parkedMember = member.status === 'waiting'
-      if (!parkedMember && !this.workers.isIdle(member.id)) continue
-      const open = this.store.list('tasks', missionId).find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
-      if (open !== undefined) {
-        // W6: the worker ended its turn with an open attempt. Nudge within a
-        // bounded retry, then checkpoint the workspace and re-pend the task
-        // instead of leaving it a zombie until lease expiry. A parked owner is
-        // not an abandoned turn: the lease path re-pends it without a credit.
-        // S5: the signal is re-read from the durable task row; the in-memory map
-        // is only a cache for an attempt whose row write is still in flight.
-        const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
-        const cachedIdle = this.idleSignals.get(member.id)?.attemptId === open.attempt?.id
-        if (!parkedMember && (durableIdle || cachedIdle)) await this.closeOutIdleAttempt(mission, member, open)
-        continue
-      }
-      const all = this.store.list('tasks', missionId)
-      const tasks = all.filter(t => this.ready(t, member, all)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
-      const task = tasks[0]
-      if (!task) continue
-      try {
-        // Revocation fencing: a mission whose human authorization was withdrawn
-        // is blocked here, before any adapter prepares a workspace or checkout.
-        await this.assertWorkspaceAuthorized(this.mission(missionId))
-        await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
-        if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-        if (this.passReleased(pass)) return
-        const fresh = this.task(missionId, task.id)
-        if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
-        // S7: re-read the isolation invariant after the external preparation
-        // await. A state change during it (a member added into this worktree, a
-        // second running task admitted) is refused here, never dispatched.
-        if (!this.isolationAllows(missionId, member)) continue
-        this.assign(fresh, member)
-      } catch (error) {
-        // Admission control already wrote the durable refusal; the task stays
-        // pending and a later tick re-evaluates it when a slot frees up.
-        if (error instanceof AdmissionRefusedError) continue
-        if (this.shuttingDown || this.mission(missionId).status !== 'active') return
-        // A withdrawn authorization is terminal for this host process, not a
-        // transient preparation failure: fence the mission now, never retry.
-        if (error instanceof WorkspaceRevokedError) { this.fenceWorkspace(missionId, error.diagnostic); return }
-        const fresh = this.task(missionId, task.id)
-        if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
-        // W18: a workspace or worker preparation failure is recoverable, not
-        // terminal. Mirror the attempt-failure, close-out and lease-expiry
-        // policy: spend exactly one recovery credit per failure, re-pend while
-        // the limit is not exhausted, and block only once it is.
-        const reason = `Workspace or worker preparation failed: ${String(error)}`
-        fresh.recoveryCount = (fresh.recoveryCount ?? 0) + 1
-        fresh.output = reason
-        fresh.epoch++
-        const limit = fresh.maxRecoveryAttempts ?? this.config.maxTasksPerMember
-        const exhausted = fresh.recoveryCount >= limit
-        fresh.status = exhausted ? 'blocked' : 'pending'
-        this.commit(missionId, () => {
-          this.store.put('tasks', fresh)
-          this.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, recoveryCount: fresh.recoveryCount, maxRecoveryAttempts: limit, status: fresh.status })
-          if (!exhausted) return
-          this.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason })
-          this.notify(missionId, reason)
-        })
-      }
-    }
+    // S1 (P0): the lease-expiry sweep is src/attempts.ts#recoverExpired, in the
+    // same order as before; it iterates ids and re-reads each row inside the loop,
+    // so a row committed during its awaits is never written back over.
+    if (!await this.attempts.recoverExpired(mission, missionId)) return
+    // M1a seam 7/7: the dispatch sweep is src/scheduling.ts#dispatch, in the same
+    // order as before; a false result abandons the pass where the loop's early
+    // returns did.
+    if (!await this.scheduling.dispatch(mission, missionId, pass)) return
     // Backstop: a full pass that dispatched nothing must still witness the state.
     this.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the
@@ -4575,62 +2779,8 @@ export class SwarmRuntime {
     // while this pass is wedged or the mission lock is held.
     await this.flushOutbox(missionId)
   }
-  /**
-   * S2: record durably that one delivery attempt was abandoned at its bound, so
-   * the starvation is visible even though the hung adapter call never returns.
-   */
-  private recordOutboxStarvation(missionId: string, delivery: Delivery): void {
-    try {
-      const mission = this.store.get('missions', missionId)
-      if (mission === undefined) return
-      const attempts = (mission.outboxStarved?.deliveryId === delivery.id ? mission.outboxStarved.attempts : 0) + 1
-      mission.outboxStarved = { deliveryId: delivery.id, attempts, at: Date.now() }
-      this.commit(missionId, () => this.store.put('missions', mission))
-    } catch { /* Recording a starvation must never break the pump. */ }
-  }
-  private async flushOutbox(missionId: string): Promise<void> {
-    if (this.shuttingDown) return
-    const mission = this.mission(missionId)
-    for (const delivery of this.store.list('deliveries', missionId)) {
-      if (this.shuttingDown) return
-      if (delivery.deliveredAt) continue
-      if (delivery.kind === 'assignment' && delivery.taskId) {
-        const task = this.task(missionId, delivery.taskId)
-        if (task.attempt?.id !== delivery.attemptId || task.status !== 'running') {
-          delivery.deliveredAt = Date.now(); this.commit(missionId, () => this.store.put('deliveries', delivery)); continue
-        }
-      }
-      if (delivery.to !== 'owner' && (mission.status !== 'active' || mission.budgetPause)) continue
-      const member = delivery.to === 'owner'
-        ? { id: 'owner', missionId, name: 'owner', role: 'owner', sessionId: mission.ownerSessionId, workspace: mission.workspace, status: 'idle' as const, subscriptions: [] }
-        : this.store.get('members', delivery.to)
-      if (!member || member.status === 'stopped') continue
-      // S2: one never-settling adapter `deliver` must not stop every other
-      // notice. Each attempt is claimed per delivery and bounded; an attempt
-      // that does not settle is abandoned, recorded durably on the mission row,
-      // and retried by a later pump (adapter acceptance is idempotent).
-      if (this.delivering.has(delivery.id)) continue
-      this.delivering.set(delivery.id, Date.now())
-      let bound: ReturnType<typeof setTimeout> | undefined
-      try {
-        const settled = await Promise.race([
-          this.workers.deliver(member, delivery).then(() => true),
-          new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.stallPassTimeoutMs) }),
-        ])
-        if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
-        delivery.deliveredAt = Date.now()
-        // The ledger's `claimed` timestamp is the adapter delivery that put the
-        // notice in front of the owner session; a queued notice stays queued.
-        if (delivery.notice !== undefined) delivery.notice.claimedAt = delivery.deliveredAt
-        this.commit(missionId, () => {
-          this.store.put('deliveries', delivery)
-          // A delivered notice clears the starvation record it followed.
-          if (mission.outboxStarved !== undefined) { delete mission.outboxStarved; this.store.put('missions', mission) }
-        })
-      } catch { /* Durable outbox retries absent sessions; acceptance is idempotent in the adapter. */ }
-      finally { if (bound !== undefined) clearTimeout(bound); this.delivering.delete(delivery.id) }
-    }
-  }
+  
+  
   /** Drain all runtime operations and worker handles before releasing database ownership. */
   async dispose(): Promise<void> {
     if (this.shuttingDown) return

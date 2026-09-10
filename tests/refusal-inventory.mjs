@@ -417,9 +417,9 @@ export const CALLER_COMPOSED_MESSAGES = [
   {
     file: 'src/admission.ts',
     code: 'review_path_missing',
-    authoredIn: 'src/runtime.ts',
+    authoredIn: 'src/notices.ts',
     probe: 'reviewPathExit',
-    note: 'Runtime.notifyReviewBlocked renders formatDiagnostic(missingReviewDiagnostic(...)) and appends the swarm_propose/reviewOf exit; tests/review-path-admission.test.mjs pins the diagnostic render itself.',
+    note: 'Notices.notifyReviewBlocked (src/notices.ts since the M1a split) renders formatDiagnostic(missingReviewDiagnostic(...)) and appends the swarm_propose/reviewOf exit; tests/review-path-admission.test.mjs pins the diagnostic render itself.',
   },
 ]
 

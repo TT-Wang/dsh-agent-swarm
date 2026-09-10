@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { assertScopeSelectors, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks } from './admission.ts'
+import { assertScopeSelectors, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks } from './admission.ts'
 import type { PlanInput, PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
@@ -95,6 +95,15 @@ export function validatePlan(value: unknown): PlanInput {
       const taskAcceptance = Array.isArray(task.acceptance) ? task.acceptance as string[] : []
       for (const diagnostic of reconcileObjectiveScope(task.objective, taskScope, `${at}.objective`)) admissionIssues.push(formatDiagnostic(diagnostic))
       for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), task.objective, taskAcceptance, at)) admissionIssues.push(formatDiagnostic(diagnostic))
+      // R12-F9 at plan admission: a task with no content-carrying edge whose own
+      // text assumes prior work would be prepared from the bare baseline and
+      // surprise its member at submit. Same guard as propose(), same exits.
+      for (const diagnostic of dependencyAssumptions({
+        objective: task.objective,
+        acceptance: taskAcceptance,
+        dependencies: [...(Array.isArray(task.dependencies) ? task.dependencies as string[] : []), ...(typeof task.reviewOf === 'string' ? [task.reviewOf] : [])],
+        replaces: Array.isArray(task.replaces) ? task.replaces as string[] : [],
+      }, `${at}.objective`)) admissionIssues.push(formatDiagnostic(diagnostic))
     }
     inspectAdmission(() => { if (task.assigneeKey !== undefined && (typeof task.assigneeKey !== 'string' || !members.has(task.assigneeKey))) throw new Error(`${at}.assigneeKey must name an existing member key`) })
     inspectAdmission(() => { if (task.priority !== undefined && (!Number.isInteger(task.priority) || Number(task.priority) < 0 || Number(task.priority) > 100)) throw new Error(`${at}.priority must be 0–100`) })
