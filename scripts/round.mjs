@@ -80,8 +80,12 @@ if (command === 'record') {
   rounds.push({ ...record, status: 'closed' })
   writeRounds(rounds.sort((a, b) => a.round - b.round))
   if (!existsSync(ledgerPath)) writeFileSync(ledgerPath, '# Improvement rounds\n\nEach round: audit -> implement -> independent verification -> integration -> gate -> mount on the lab host. Promote only when the gate is green.\n\n| Round | Revision | Gate | Findings | Fixed | Scope / notes |\n|---|---|---|---|---|---|\n')
-  appendFileSync(ledgerPath, `| ${record.round} | \`${record.revision.slice(0, 12)}\` | ${record.gate} | ${record.findings} | ${record.fixed} | ${record.notes.replaceAll('|', '\\|')} |\n`)
-  process.stdout.write(JSON.stringify(record, null, 2) + '\n')
+  // One ledger row per round. Closing a round whose row was already appended by
+  // hand (round 11) must update rounds.json without duplicating the human ledger.
+  const ledger = readFileSync(ledgerPath, 'utf8')
+  const already = ledger.split('\n').some(line => line.startsWith(`| ${record.round} |`))
+  if (!already) appendFileSync(ledgerPath, `| ${record.round} | \`${record.revision.slice(0, 12)}\` | ${record.gate} | ${record.findings} | ${record.fixed} | ${record.notes.replaceAll('|', '\\|')} |\n`)
+  process.stdout.write(JSON.stringify({ ...record, ledgerRow: already ? 'kept' : 'appended' }, null, 2) + '\n')
   process.exit(0)
 }
 
