@@ -8,12 +8,13 @@
  */
 import { randomUUID } from 'node:crypto'
 import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { WorkspaceRevokedError } from './workspace-admission.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Member, Mission, SchedulingPass, Task } from './types.ts'
+import type { Actor, Attempt, Member, Mission, SchedulingPass, SwarmEvent, Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -50,9 +51,130 @@ export interface DispatchQuestion {
  * the integration task records the schema addition. `releasedRunId` is the runId
  * of the most recent pass the watchdog released, carried forward by `openPass`
  * (and preserved by `closePass`) because the row is overwritten once per pass.
+ *
+ * R16-D: the same row also accumulates what the release bound could not keep:
+ * `releases` counts every released wedge and `worstRelease` keeps the widest
+ * release-to-bound gap seen (with the bound it was measured against). The row is
+ * the single durable carrier of these facts for the same reason as
+ * `releasedRunId`: the once-per-pass overwrite would otherwise erase the only
+ * record of a bounded release, and the silence projection (below) must not
+ * depend on the retained event window.
  */
-interface ReleasedPassFields { releasedRunId?: string; releasedAt?: number }
+interface ReleaseRecord {
+  runId: string
+  startedAt: number
+  releasedAt: number
+  /** `releasedAt - startedAt`: the whole time the wedged pass held the guard. */
+  gapMs: number
+  /** The declared bound this release was measured against. */
+  boundMs: number
+  /** True when live work (a live lease, an in-flight stop acknowledgement) held the release to its second bound. */
+  heldByLiveWork: boolean
+  /** The subjects whose live work held it, preserved by the release. */
+  liveSubjects: string[]
+}
+interface ReleasedPassFields {
+  releasedRunId?: string
+  releasedAt?: number
+  releases?: number
+  worstRelease?: ReleaseRecord
+}
 const releasedPassFields = (row: SchedulingPass): SchedulingPass & ReleasedPassFields => row as SchedulingPass & ReleasedPassFields
+
+/** Keep the wider of two release records; ties keep the earlier one. */
+const widerRelease = (previous: ReleaseRecord | undefined, next: ReleaseRecord): ReleaseRecord =>
+  previous === undefined || next.gapMs > previous.gapMs ? next : previous
+
+/** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
+export const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
+
+/** R16-D: one live attempt whose durable progress is past its declared bound. */
+export interface SilentAttempt {
+  taskId: string
+  epoch: number
+  /** The notice subject (`taskId@epoch`). */
+  subject: string
+  attemptId: string
+  ownerId: string
+  /** Newest durable row attributable to the attempt; 0 when only the dispatch exists. */
+  lastDurableAt: number
+  /** `now - lastDurableAt`. */
+  silentMs: number
+  boundMs: number
+}
+
+/** R16-D: one subject whose silence was measured against the bound that applied to it. */
+export interface SubjectSilence {
+  subject: string
+  kind: 'scheduling-pass' | 'attempt'
+  gapMs: number
+  /** The declared bound it was measured against. */
+  boundMs: number
+  /** When the measurement was taken (release instant or escalation instant). */
+  at: number
+}
+
+/** R16-D: the durable per-attempt reporting record, for one attempt of the retained window. */
+export interface AttemptReport {
+  attemptId: string
+  taskId: string
+  epoch: number
+  memberId: string
+  claimedAt: number
+  /** When the attempt stopped being current; undefined while the task row still carries it. */
+  endedAt?: number
+  lastDurableAt: number
+  /** Longest interval between consecutive durable elements (or to `endedAt` / now). */
+  worstReportingGapMs: number
+  /** The current silence: `(endedAt ?? now) - lastDurableAt`. */
+  silentMs: number
+  /** Owner escalations naming this attempt, by dedup key. */
+  escalations: string[]
+  /** The attempt ended with nothing durable after its own dispatch (no report, no escalation). */
+  endedUnreported: boolean
+}
+
+/**
+ * R16-D: the round's silence projection, read from the durable store alone.
+ * Read-only: it changes no task, member, pass or delivery state.
+ */
+export interface SilenceReport {
+  missionId: string
+  bounds: { passMs: number; passReleaseMs: number; attemptMs: number }
+  /** Every subject whose silence was measured, with the bound it was measured against. */
+  subjects: SubjectSilence[]
+  worstSubjectSilence: SubjectSilence | undefined
+  attempts: AttemptReport[]
+  worstAttemptReportingGap: { attemptId: string; taskId: string; gapMs: number } | undefined
+  attemptsEnded: number
+  /** Attempts that ended with no durable report or escalation after their own dispatch. */
+  attemptsEndedUnreported: number
+  attemptSilenceEscalations: number
+  /** The durable pass-row release record: how many wedges were released and the widest one. */
+  passReleases: { count: number; worst: ReleaseRecord | undefined }
+  note: string
+}
+
+/** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
+function formatSpan(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
+/**
+ * R16-D: the durable events after which a task no longer holds its attempt.
+ * This mirrors the private `ATTEMPT_CLOSERS` set in src/trace.ts (out of this
+ * task's write scope) — the replay truncation check is the cross-check: a log
+ * whose attempt closers diverge from this list is refused there. Kept local
+ * because importing it is impossible (not exported) and widening that module's
+ * surface is outside this task's scope; the integration task records the
+ * duplication as a hand-off. A frozen array, not a Set: it is a lookup
+ * vocabulary, and the S5 in-memory census classifies every collection in src/.
+ */
+const ATTEMPT_CLOSER_TYPES: readonly string[] = ['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected']
+const isAttemptCloser = (type: string): boolean => ATTEMPT_CLOSER_TYPES.includes(type)
 
 export class Scheduling {
   /**
@@ -524,20 +646,48 @@ export class Scheduling {
    * The pass that may still hold the guard. Re-read from the store on every
    * call: a `running` row older than the declared bound is NOT a guard, so a
    * pass that never returns cannot swallow the tick timer's liveness action.
+   *
    * While the mission has live work (a renewed lease, an in-flight quiescence)
-   * the row keeps gating past the bound: the pass may legitimately be inside a
-   * long adapter await for that live attempt.
+   * the row keeps gating inside the second, bounded window (`stallPassReleaseBoundMs`
+   * = `stallPassTimeoutMs` + `stallPassLiveGraceMs`): the pass may legitimately
+   * be inside a long adapter await for that live attempt. R16-D closes the half
+   * round 15 left open: past that window the row is not a guard at all, so a
+   * `kick` is never swallowed indefinitely by a healthy sibling's lease. The
+   * watchdog records and names the release; `openPass` records it durably too
+   * when a fresh pass supersedes a still-running wedged row, so the fence
+   * (`passReleased`) is closed on both paths.
    */
   livePass(missionId: string): SchedulingPass | undefined {
     const row = this.rt.store.get('passes', this.passKey(missionId))
     if (row === undefined || row.missionId !== missionId) return undefined
     if (row.instanceId !== this.instanceId) return undefined
     if (row.status !== 'running') return undefined
-    if (Date.now() - row.startedAt < this.rt.stallPassTimeoutMs) return row
-    // Past the bound the row is a guard only while the mission has live work to
-    // progress. With no live work it is not a guard at all, so the tick timer's
-    // kick is never swallowed; the watchdog releases and escalates it.
-    return this.hasLiveWork(missionId) ? row : undefined
+    const age = Date.now() - row.startedAt
+    if (age < this.rt.stallPassTimeoutMs) return row
+    // Past the declared pass bound the row is a guard only while the mission has
+    // live work to progress AND the bounded live-work hold has not elapsed. With
+    // no live work it is not a guard at all, so the tick timer's kick is never
+    // swallowed; the watchdog releases and escalates it.
+    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return row
+    return undefined
+  }
+
+  /**
+   * The subjects whose live work keeps `hasLiveWork` true: a running attempt
+   * under a live lease, or a task in its durable stop transition. The release
+   * names them so the owner can see what held the guard and that the release
+   * preserved it (it cancels no task, drops no attempt and changes no lease).
+   */
+  liveWorkHolders(missionId: string): Array<{ subject: string; memberId?: string }> {
+    const now = Date.now()
+    const holders: Array<{ subject: string; memberId?: string }> = []
+    for (const task of this.rt.store.list('tasks', missionId)) {
+      const live = this.quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
+      if (!live) continue
+      const memberId = task.attempt?.ownerId ?? task.assigneeId
+      holders.push({ subject: taskSubject(task), ...(memberId === undefined ? {} : { memberId }) })
+    }
+    return holders
   }
 
   /**
@@ -549,9 +699,13 @@ export class Scheduling {
    * queue-external decision sweep reads this predicate and names the subjects the
    * wedged pass cannot finish, even while a healthy sibling holds its lease.
    *
-   * Co-firing guards: `livePass` (still the scheduling gate), the wedge watchdog
-   * (`checkSchedulingPasses`, which releases only with no live work), the
-   * off-pass decision sweep (the only caller) and `hasLiveWork`.
+   * Co-firing guards: `livePass` (still the scheduling gate inside the bounded
+   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which
+   * releases inside the declared bound or the bounded live-work window), the
+   * off-pass decision sweep (the only caller) and `hasLiveWork`. R16-D: the
+   * bounded release does not weaken this predicate — it is still true for every
+   * `running` row past the first bound, so the off-pass sweep keeps naming the
+   * subjects the wedged pass cannot finish.
    */
   passWedged(missionId: string): boolean {
     const row = this.rt.store.get('passes', this.passKey(missionId))
@@ -566,20 +720,77 @@ export class Scheduling {
     if (this.rt.store.get('missions', missionId) === undefined) return undefined
     if (this.livePass(missionId) !== undefined) return undefined
     const prior = this.rt.store.get('passes', this.passKey(missionId))
+    // R16-D: a still-running predecessor is past every bound (else `livePass`
+    // above would have returned it), so opening this pass SUPERSEDES and
+    // RELEASES it. The slow path (the tick watchdog) normally gets there first;
+    // when it does not — a `kick` from a control path between ticks — the
+    // release must still be durable, fenced and named instead of being silently
+    // overwritten by the row write below.
+    if (prior !== undefined && prior.status === 'running' && prior.instanceId === this.instanceId) {
+      const held = this.hasLiveWork(missionId)
+      this.recordRelease(missionId, prior, releasedPassFields(prior), held, held ? this.liveWorkHolders(missionId) : [])
+    }
+    // Re-read: a supersede released the row above, and the durable release facts
+    // must travel onto this row (the once-per-pass overwrite erases them
+    // otherwise).
+    const carried = this.rt.store.get('passes', this.passKey(missionId))
+    const release = carried === undefined ? undefined : releasedPassFields(carried)
     const pass: SchedulingPass & ReleasedPassFields = {
       // One row per mission, overwritten each pass: `get(passKey)` is the gate.
       id: this.passKey(missionId), runId: id('run'), instanceId: this.instanceId, missionId, status: 'running', startedAt: Date.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
-      noProgressPasses: prior?.status === 'finished' ? prior.noProgressPasses : 0,
+      noProgressPasses: carried?.status === 'finished' ? carried.noProgressPasses : 0,
     }
     // S5c: the durable release record survives the once-per-pass overwrite.
-    const priorRelease = prior === undefined ? undefined : releasedPassFields(prior)
-    if (priorRelease?.releasedRunId !== undefined) {
-      pass.releasedRunId = priorRelease.releasedRunId
-      pass.releasedAt = priorRelease.releasedAt
+    if (release?.releasedRunId !== undefined) {
+      pass.releasedRunId = release.releasedRunId
+      pass.releasedAt = release.releasedAt
     }
+    if (release?.releases !== undefined) pass.releases = release.releases
+    if (release?.worstRelease !== undefined) pass.worstRelease = release.worstRelease
     this.rt.commit(missionId, () => this.rt.store.put('passes', pass))
     return pass
+  }
+
+  /**
+   * R16-D: release a wedged pass durably and name it. One path for both
+   * generators — the tick watchdog and a superseding `openPass` — so a release
+   * can never happen without the durable `releasedRunId` fence, the accumulated
+   * `releases`/`worstRelease` record and the owner escalation that names the
+   * wedged pass and the live work the release preserved.
+   *
+   * The in-memory chain entry is dropped as well: the abandoned body is fenced
+   * by `passReleased`, and a later `kick` must not queue behind a promise that
+   * never settles.
+   */
+  private recordRelease(missionId: string, pass: SchedulingPass, previous: ReleasedPassFields, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
+    const now = Date.now()
+    const boundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : this.rt.stallPassTimeoutMs
+    const unschedulable = this.unschedulable(this.rt.mission(missionId), this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
+    const fingerprintNow = this.rt.fingerprint(missionId)
+    const release: ReleaseRecord = { runId: pass.runId, startedAt: pass.startedAt, releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), boundMs, heldByLiveWork, liveSubjects: holders.map(holder => holder.subject) }
+    const closed: SchedulingPass & ReleasedPassFields = {
+      ...pass, status: 'finished', finishedAt: now, revisionAfter: this.rt.store.revision(), fingerprintAfter: fingerprintNow,
+      stalled: { reason: 'pass-timeout', at: now, boundMs: this.rt.stallPassTimeoutMs, unschedulable },
+    }
+    // S5c: the release is recorded DURABLY on the row before anything else, so
+    // `passReleased` reads it and the fence survives a cleared Set, a restart,
+    // or the once-per-pass overwrite (openPass carries it forward).
+    closed.releasedRunId = pass.runId
+    closed.releasedAt = now
+    closed.releases = (previous.releases ?? 0) + 1
+    closed.worstRelease = widerRelease(previous.worstRelease, release)
+    // Release both halves of the guard: the durable row stops gating and the
+    // in-memory chain no longer queues later ticks behind a promise that never
+    // settles. A newer pass that has already registered its own chain entry is
+    // never clobbered (its `exclusive` finally compares identity).
+    this.releasedPasses.add(pass.runId)
+    this.rt.queues.delete(missionId)
+    this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
+    this.escalateSchedulingStall(missionId, {
+      pass: closed, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow,
+      releaseBoundMs: boundMs, heldByLiveWork, release, liveHolders: holders,
+    })
   }
 
   /**
@@ -609,6 +820,11 @@ export class Scheduling {
         closed.releasedRunId = rowRelease.releasedRunId
         closed.releasedAt = rowRelease.releasedAt
       }
+      // R16-D: the accumulated release facts are the only durable record of a
+      // bounded release (the row is overwritten per pass), so a body that closes
+      // after its release must carry them, never drop them.
+      if (rowRelease.releases !== undefined && closed.releases === undefined) closed.releases = rowRelease.releases
+      if (rowRelease.worstRelease !== undefined && closed.worstRelease === undefined) closed.worstRelease = rowRelease.worstRelease
       this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
@@ -650,6 +866,18 @@ export class Scheduling {
    * the owner notice is delivered by an unqueued flush, and the guard is
    * released (both the durable row and the in-memory serialization chain) so the
    * next tick is not swallowed.
+   *
+   * R16-D: the release is bounded even when the mission still has live work. A
+   * live lease or an in-flight quiescence may be progress, so the pass is not
+   * abandoned at the first bound; but a healthy sibling's lease must not own the
+   * whole board's clock forever, so past `stallPassReleaseBoundMs` the pass is
+   * released anyway, with the live work it was held by named on the escalation
+   * and preserved untouched. Co-firing guards, named: `livePass` (mirrors the
+   * same bound, so no `kick` is swallowed after the release), the fence
+   * (`passReleased`, durable before the next pass opens), the off-pass decision
+   * sweep (which runs while the row is wedged and names the subjects no live
+   * path advances), the notice dedup (one escalation per unchanged board) and
+   * the lease-renewal path (a released pass changes no task, attempt or lease).
    */
   checkSchedulingPasses(): void {
     if (this.rt.closed || this.rt.shuttingDown) return
@@ -658,31 +886,16 @@ export class Scheduling {
       if (this.rt.isMissionTerminal(mission)) continue
       const pass = this.rt.store.get('passes', this.passKey(mission.id))
       if (pass === undefined || pass.instanceId !== this.instanceId || pass.status !== 'running') continue
-      if (now - pass.startedAt < this.rt.stallPassTimeoutMs) continue
+      const age = now - pass.startedAt
+      if (age < this.rt.stallPassTimeoutMs) continue
       if (this.rt.store.get('passes', this.passKey(mission.id))?.runId !== pass.runId) continue
-      // A live lease or an in-flight quiescence is progress: a long pass that is
-      // still working must not be abandoned. It is re-evaluated on later ticks
-      // and released once that work has lapsed, so the window is still bounded.
-      if (this.hasLiveWork(mission.id)) continue
-      const unschedulable = this.unschedulable(mission, this.rt.store.list('tasks', mission.id), this.rt.store.list('members', mission.id)).map(task => `${task.id} (${task.status})`)
-      const fingerprintNow = this.rt.fingerprint(mission.id)
-      const closed: SchedulingPass & ReleasedPassFields = {
-        ...pass, status: 'finished', finishedAt: now, revisionAfter: this.rt.store.revision(), fingerprintAfter: fingerprintNow,
-        stalled: { reason: 'pass-timeout', at: now, boundMs: this.rt.stallPassTimeoutMs, unschedulable },
-      }
-      // S5c: the release is recorded DURABLY on the row before anything else, so
-      // `passReleased` reads it and the fence survives a cleared Set, a restart,
-      // or the once-per-pass overwrite (openPass carries it forward).
-      closed.releasedRunId = pass.runId
-      closed.releasedAt = now
-      // Release both halves of the guard: the durable row stops gating and the
-      // in-memory chain no longer queues later ticks behind a promise that never
-      // settles. A newer pass that has already registered its own chain entry is
-      // never clobbered (its `exclusive` finally compares identity).
-      this.releasedPasses.add(pass.runId)
-      this.rt.queues.delete(mission.id)
-      this.rt.commit(mission.id, () => this.rt.store.put('passes', closed))
-      this.escalateSchedulingStall(mission.id, { pass: closed, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow })
+      const held = this.hasLiveWork(mission.id)
+      // Inside the second bound live work keeps the guard: a pass that may
+      // legitimately be inside a long adapter await for that work must not be
+      // abandoned. Past it the window is over, and the release below names the
+      // subject that held it instead of leaving the guard unreleased.
+      if (held && age < this.rt.stallPassReleaseBoundMs) continue
+      this.recordRelease(mission.id, pass, releasedPassFields(pass), held, held ? this.liveWorkHolders(mission.id) : [])
     }
   }
 
@@ -696,7 +909,21 @@ export class Scheduling {
    * suppresses the escalation entirely: that state is already escalated, so a
    * second durable event for it would be duplicate evidence, not new evidence.
    */
-  escalateSchedulingStall(missionId: string, info: { pass: SchedulingPass; reason: 'pass-timeout' | 'no-progress'; boundMs: number; revisionNow: number; fingerprintNow: string }): void {
+  escalateSchedulingStall(missionId: string, info: {
+    pass: SchedulingPass
+    reason: 'pass-timeout' | 'no-progress'
+    boundMs: number
+    revisionNow: number
+    fingerprintNow: string
+    /** R16-D: the bound the release was measured against (the live-work window when one applied). */
+    releaseBoundMs?: number
+    /** R16-D: true when live work held the release to its second bound. */
+    heldByLiveWork?: boolean
+    /** R16-D: the release record written to the pass row, named in the event. */
+    release?: ReleaseRecord
+    /** R16-D: the live work the release preserved, as subjects and members. */
+    liveHolders?: Array<{ subject: string; memberId?: string }>
+  }): void {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return
     const fingerprint = info.fingerprintNow
@@ -720,7 +947,19 @@ export class Scheduling {
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
     const unreached = this.rt.store.list('tasks', missionId).filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-    const subjects = subjectsOfTasks(unreached, mission)
+    // R16-D: a release held to its second bound names the live work that held it
+    // as a subject too. The claim is still "this pass cannot finish", but the
+    // owner must be able to see which subjects made the wait unavoidable, and
+    // that the release preserved them (it cancels no task, drops no attempt and
+    // changes no lease). Guard pair: this naming x the off-pass sweep — the sweep
+    // names what no live path advances, this names what the wedged pass never
+    // reached and what held it; both carry task@epoch and neither consumes the
+    // other's dedup key.
+    const holders = info.liveHolders ?? []
+    const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]
+    const heldText = info.heldByLiveWork === true && holders.length
+      ? ` The release was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
+      : ''
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
@@ -742,9 +981,21 @@ export class Scheduling {
         passStartedAt: info.pass.startedAt, passes, boundMs: info.boundMs,
         revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
         missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
+        // R16-D: what the release was measured against, whether live work held it,
+        // and the subjects whose work the release preserved. `boundMs` keeps its
+        // original meaning (the pass's own stall bound) so every existing reader
+        // is unchanged; the release facts are additive and only present on a
+        // release, never on the no-progress variant.
+        ...(info.release === undefined ? {} : {
+          releasedAt: info.release.releasedAt,
+          releaseBoundMs: info.releaseBoundMs ?? info.boundMs,
+          releaseGapMs: info.release.gapMs,
+          releasedWhileLive: info.heldByLiveWork === true,
+          liveSubjects: info.release.liveSubjects,
+        }),
       })
       this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}. Work the pass never reached: ${unreachedText}. Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        ? `Scheduling pass ${info.pass.id} (run ${info.pass.runId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}. Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
         : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects)
     })
     // The notice path must not share the fate of the pass that could not report
@@ -780,6 +1031,289 @@ export class Scheduling {
     return this.rt.store.list('tasks', missionId).some(task =>
       this.quiescencePending(task)
       || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
+  }
+
+  /* ----------------------------------------------------------------------- *
+   * R16-D: the attempt reporting bound.
+   *
+   * A live lease is liveness bookkeeping, not progress. The runtime already
+   * bounds one in-flight operation (F1, `operation-silent:`), but an attempt
+   * whose member row records no operation at all had no clock: while the pass
+   * runs, the lease eventually lapses and the existing recovery re-pends it;
+   * while the pass is wedged, nothing evaluated it and nothing named it. This
+   * guard gives the attempt itself a declared bound on durable progress and
+   * escalates it by name from the queue-external tick.
+   *
+   * Durable progress is any durable row a reader can attribute to the attempt:
+   * its own `task/claimed` event, a recorded tool run, a durable event naming
+   * the task or the attempt, or a delivery naming them. A renewed lease is
+   * deliberately NOT progress (the renewal path says so itself: "liveness
+   * bookkeeping, not a new progress timestamp"), so a lease that stays alive
+   * while nothing is recorded cannot mask the silence.
+   *
+   * Co-firing guards, named:
+   *  - F1 operation silence (`operation-silent:`): while any operation is
+   *    recorded on the member, that guard owns the attempt's clock; this one
+   *    stays quiet rather than double-reporting the same attempt. (It is also
+   *    the conservative half of the F1v D1/D2 pair: this guard never judges a
+   *    live declared check or retry, where a wall-clock bound false-positived.)
+   *  - the W6 idle close-out: an attempt whose turn ended (`idleSignal`,
+   *    `closeout.nudges`) is already being nudged and then checkpointed with a
+   *    coded terminal, so this guard stays quiet for exactly that attempt.
+   *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
+   *    the park is the owner's intent, not silence.
+   *  - the budget pause: a deliberate host pause is not a stalled worker.
+   *  - the wedge release (`recordRelease`): the tick this guard runs on is the
+   *    same queue-external tick that releases a wedged pass, so a pass that
+   *    cannot run its own recovery sweep cannot hide the attempt.
+   *  - the notice dedup: the key is `attempt-silent:<attemptId>:<lastDurableAt>`,
+   *    so one silence escalates once and a recording re-arms the clock.
+   * ----------------------------------------------------------------------- */
+
+  /**
+   * R16-D: one live attempt whose durable progress is past its declared bound.
+   * `subject` is the attempt's task@epoch, the identity the escalation carries.
+   */
+  silentAttempt(task: Task, mission: Mission, now = Date.now()): SilentAttempt | undefined {
+    const attempt = task.attempt
+    if (attempt === undefined || task.status !== 'running') return undefined
+    const boundMs = this.rt.attemptSilenceBoundMs
+    if (boundMs <= 0) return undefined
+    if (!Number.isSafeInteger(attempt.leaseUntil)) return undefined
+    // The W6 idle close-out owns an attempt whose turn ended: it nudges, then
+    // checkpoints and re-pends with a coded terminal. Naming it here would
+    // double-report one attempt (the pair is pinned by R16-D5).
+    if (task.idleSignal?.attemptId === attempt.id) return undefined
+    if ((task.closeout?.nudges ?? 0) > 0) return undefined
+    const member = this.rt.store.get('members', attempt.ownerId)
+    if (member === undefined || member.status === 'stopped' || member.status === 'waiting') return undefined
+    // F1's subject: any recorded in-flight operation means that guard owns this
+    // attempt's clock. The durable member row is the record; this is the
+    // conservative direction (it can only suppress, never invent, an escalation).
+    if (member.activity !== undefined) return undefined
+    const lastDurableAt = this.lastDurableAt(mission.id, task, attempt)
+    const silentMs = now - lastDurableAt
+    if (silentMs < boundMs) return undefined
+    return { taskId: task.id, epoch: task.epoch, subject: taskSubject(task), attemptId: attempt.id, ownerId: attempt.ownerId, lastDurableAt, silentMs, boundMs }
+  }
+
+  /**
+   * R16-D: the bounded sweep over one mission's live attempts. Runs from the
+   * queue-external tick (`Runtime.sweepDecisions`) on every tick, before the
+   * pass guard is consulted, so a wedged pass cannot hide an attempt that has
+   * stopped reporting. Returns the number of escalations this call emitted.
+   */
+  sweepSilentAttempts(missionId: string): number {
+    if (this.rt.closed || this.rt.shuttingDown) return 0
+    const mission = this.rt.store.get('missions', missionId)
+    if (mission === undefined || mission.status !== 'active' || this.rt.isMissionTerminal(mission)) return 0
+    // A deliberate budget pause is host policy, not a stalled worker: the pause
+    // owns the board until the owner resumes it.
+    if (mission.budgetPause !== undefined) return 0
+    let fired = 0
+    for (const task of this.rt.store.list('tasks', missionId)) {
+      const silent = this.silentAttempt(task, mission)
+      if (silent === undefined) continue
+      if (this.escalateSilentAttempt(mission, task, silent)) fired += 1
+    }
+    return fired
+  }
+
+  /** One durable owner escalation per silence; returns false when it was already named. */
+  private escalateSilentAttempt(mission: Mission, task: Task, silent: SilentAttempt): boolean {
+    const dedupKey = `${ATTEMPT_SILENCE_PREFIX}${silent.attemptId}:${silent.lastDurableAt}`
+    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'stall', dedupKey, from: 'runtime' })) return false
+    const member = this.rt.store.get('members', silent.ownerId)
+    const name = member === undefined ? silent.ownerId : `${member.name} (${member.id})`
+    const since = silent.lastDurableAt === 0 ? 'it was dispatched' : `durable row at ${silent.lastDurableAt}`
+    // The pass state is part of the honesty of the claim: the same guard fires
+    // whether or not the pass is running, and the reader must know which path
+    // would otherwise have named the attempt.
+    const pass = this.rt.store.get('passes', this.passKey(mission.id))
+    const passState = pass !== undefined && pass.status === 'running' && this.passWedged(mission.id)
+      ? ` The mission's scheduling pass ${pass.runId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
+      : ''
+    const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
+    this.rt.commit(mission.id, () => { this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey }) })
+    return true
+  }
+
+  /**
+   * R16-D: the newest durable row a reader can attribute to one attempt. The
+   * attempt's own `task/claimed` event is the floor, so a dispatch that recorded
+   * nothing else measures its silence from the dispatch itself.
+   */
+  private lastDurableAt(missionId: string, task: Task, attempt: Attempt): number {
+    let latest = 0
+    for (const event of this.rt.store.events(missionId, this.rt.config.maxEvents)) {
+      if (latest >= event.createdAt) continue
+      if (event.type === 'task/claimed') {
+        if (this.identityIn(event.data, task.id, attempt.id)) latest = event.createdAt
+        continue
+      }
+      if (this.identityIn(event.data, task.id, attempt.id)) latest = Math.max(latest, event.createdAt)
+    }
+    for (const run of this.rt.store.toolRuns(missionId, { attemptId: attempt.id })) latest = Math.max(latest, run.createdAt)
+    for (const delivery of this.rt.store.list('deliveries', missionId)) {
+      if (delivery.attemptId === attempt.id || delivery.taskId === task.id) latest = Math.max(latest, delivery.createdAt)
+    }
+    return latest
+  }
+
+  /** Whether a durable payload names this task or this attempt anywhere in its (bounded) object tree. */
+  private identityIn(data: unknown, taskId: string, attemptId: string, depth = 0): boolean {
+    if (depth > 3) return false
+    if (typeof data === 'string') return data === taskId || data === attemptId
+    if (Array.isArray(data)) return data.some(item => this.identityIn(item, taskId, attemptId, depth + 1))
+    if (data !== null && typeof data === 'object') return Object.values(data as Record<string, unknown>).some(item => this.identityIn(item, taskId, attemptId, depth + 1))
+    return false
+  }
+
+  /**
+   * R16-D: the round's silence projection. Read from the durable store alone —
+   * the retained event window, the tool-run rows, the delivery rows, the current
+   * task rows and the one durable pass row — and it changes nothing.
+   *
+   * The two numbers the round quotes:
+   *  - the worst per-subject silent gap, each subject carrying the declared bound
+   *    it was measured against (a released scheduling pass against the pass
+   *    release bound; an escalated attempt against the attempt reporting bound);
+   *  - the worst per-attempt reporting gap, plus how many attempts ended with no
+   *    durable report or escalation at all.
+   *
+   * Definitions, stated so a reader can falsify them:
+   *  - an attempt's durable elements are its `task/claimed` dispatch (and the
+   *    assignment delivery written with it), every durable event naming its task
+   *    or attempt while it was current, every delivery naming them, and every
+   *    recorded tool run of the attempt;
+   *  - its reporting gap is the longest interval between consecutive elements,
+   *    closed at its end (or at read time while it is live);
+   *  - it ended unreported when it is no longer the task's current attempt and no
+   *    durable event or delivery after its dispatch ever named it — the dispatch
+   *    itself is not a report about the attempt.   *
+   * LIMITS, named rather than hidden: the attempt intervals come from the
+   * retained event window (`maxEvents`), so an attempt whose dispatch has aged
+   * out is not reconstructed; an attempt that ended with no closing event is
+   * dated at its last durable element; the attempt bound quoted is the bound in
+   * force at read time, not necessarily the one in force when an old escalation
+   * fired (the escalation's own `[witness: …]` token carries that one).
+   */
+  silenceReport(missionId: string): SilenceReport {
+    const now = Date.now()
+    const bounds = { passMs: this.rt.stallPassTimeoutMs, passReleaseMs: this.rt.stallPassReleaseBoundMs, attemptMs: this.rt.attemptSilenceBoundMs }
+    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
+    const deliveries = this.rt.store.list('deliveries', missionId)
+    const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))
+    type ElementKind = 'claim' | 'event' | 'delivery' | 'run'
+    interface Element { at: number; kind: ElementKind; isClaim: boolean }
+    interface Interval { attemptId: string; taskId: string; epoch: number; memberId: string; claimedAt: number; endedAt?: number; elements: Element[] }
+    const byAttempt = new Map<string, Interval>()
+    const open = new Map<string, Interval>()
+    const claimStart = (event: SwarmEvent): void => {
+      const data = event.data as { taskId?: unknown; attempt?: { id?: unknown; ownerId?: unknown; epoch?: unknown } } | undefined
+      const taskId = typeof data?.taskId === 'string' ? data.taskId : undefined
+      const attemptId = typeof data?.attempt?.id === 'string' ? data.attempt.id : undefined
+      const ownerId = typeof data?.attempt?.ownerId === 'string' ? data.attempt.ownerId : undefined
+      if (taskId === undefined || attemptId === undefined || ownerId === undefined) return
+      const prior = open.get(taskId)
+      // A re-dispatch is the durable close of the attempt it replaces.
+      if (prior !== undefined) prior.endedAt = Math.min(prior.endedAt ?? event.createdAt, event.createdAt)
+      const interval: Interval = { attemptId, taskId, epoch: typeof data?.attempt?.epoch === 'number' ? data.attempt.epoch : 0, memberId: ownerId, claimedAt: event.createdAt, elements: [{ at: event.createdAt, kind: 'claim', isClaim: true }] }
+      byAttempt.set(attemptId, interval)
+      open.set(taskId, interval)
+    }
+    const attribute = (taskId: string, element: Element): void => {
+      const interval = open.get(taskId)
+      if (interval !== undefined) interval.elements.push(element)
+    }
+    for (const event of events) {
+      if (event.type === 'task/claimed') { claimStart(event); continue }
+      // The event is attributed to the open attempt of each task it names; a
+      // closer ends that attempt at this instant and takes it out of the open
+      // set, so a later event about the same task is never attributed to a
+      // closed attempt (a later delivery or run that names the attempt id is
+      // still attributed, because that identity is exact).
+      let closedTask: string | undefined
+      for (const [taskId, interval] of open) {
+        if (!this.identityIn(event.data, taskId, interval.attemptId)) continue
+        interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
+        if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
+      }
+      if (closedTask !== undefined) open.delete(closedTask)
+    }
+    for (const run of this.rt.store.toolRuns(missionId)) {
+      const interval = byAttempt.get(run.attemptId)
+      if (interval === undefined) continue
+      interval.elements.push({ at: run.createdAt, kind: 'run', isClaim: false })
+    }
+    for (const delivery of deliveries) {
+      const interval = delivery.attemptId === undefined ? open.get(delivery.taskId ?? '') : byAttempt.get(delivery.attemptId)
+      if (interval === undefined) continue
+      // The assignment delivery is written in the same transaction as the
+      // dispatch: it is the claim, not a report about the attempt.
+      interval.elements.push({ at: delivery.createdAt, kind: 'delivery', isClaim: delivery.kind === 'assignment' })
+    }
+    const escalations = new Map<string, string[]>()
+    for (const delivery of deliveries) {
+      const key = delivery.notice?.dedupKey
+      if (typeof key !== 'string') continue
+      const attemptId = /^(?:attempt-silent|operation-silent):([^:]+):/.exec(key)?.[1]
+      if (attemptId === undefined) continue
+      const list = escalations.get(attemptId) ?? []
+      list.push(key)
+      escalations.set(attemptId, list)
+    }
+    const reports: AttemptReport[] = []
+    const subjects: SubjectSilence[] = []
+    for (const interval of byAttempt.values()) {
+      const task = current.get(interval.taskId)
+      const stillCurrent = task?.status === 'running' && task.attempt?.id === interval.attemptId
+      const lastDurableAt = interval.elements.reduce((latest, element) => Math.max(latest, element.at), interval.claimedAt)
+      // No closer was recorded but the task no longer carries the attempt: the
+      // attempt ended at its last durable element, without a report.
+      const endedAt = interval.endedAt ?? (stillCurrent ? undefined : lastDurableAt)
+      const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)
+      const end = endedAt === undefined ? now : Math.max(endedAt, instants.at(-1) ?? endedAt)
+      let worstReportingGapMs = 0
+      let previousInstant = interval.claimedAt
+      for (const instant of instants) { worstReportingGapMs = Math.max(worstReportingGapMs, instant - previousInstant); previousInstant = instant }
+      worstReportingGapMs = Math.max(worstReportingGapMs, end - previousInstant)
+      const endedUnreported = endedAt !== undefined && !interval.elements.some(element => !element.isClaim && element.kind !== 'run')
+      const attemptEscalations = escalations.get(interval.attemptId) ?? []
+      reports.push({
+        attemptId: interval.attemptId, taskId: interval.taskId, epoch: interval.epoch, memberId: interval.memberId,
+        claimedAt: interval.claimedAt, ...(endedAt === undefined ? {} : { endedAt }), lastDurableAt,
+        worstReportingGapMs, silentMs: Math.max(0, end - lastDurableAt), escalations: attemptEscalations, endedUnreported,
+      })
+      for (const key of attemptEscalations) {
+        const delivery = deliveries.find(candidate => candidate.notice?.dedupKey === key)
+        const silentSince = Number(key.slice(key.lastIndexOf(':') + 1))
+        if (delivery === undefined || !Number.isSafeInteger(silentSince)) continue
+        subjects.push({ subject: delivery.subjects?.[0] ?? `${interval.taskId}@${interval.epoch}`, kind: 'attempt', gapMs: Math.max(0, delivery.createdAt - silentSince), boundMs: bounds.attemptMs, at: delivery.createdAt })
+      }
+    }
+    // The released scheduling passes: the durable pass row is the carrier (the
+    // once-per-pass overwrite erases per-run detail, so it accumulates the worst).
+    const passRow = this.rt.store.get('passes', this.passKey(missionId))
+    const passRelease = passRow === undefined ? undefined : releasedPassFields(passRow)
+    const worstRelease = passRelease?.worstRelease
+    if (worstRelease !== undefined) {
+      subjects.push({ subject: `pass:${worstRelease.runId}`, kind: 'scheduling-pass', gapMs: worstRelease.gapMs, boundMs: worstRelease.boundMs, at: worstRelease.releasedAt })
+    }
+    const worstSubjectSilence = subjects.reduce<SubjectSilence | undefined>((worst, item) =>
+      worst === undefined || item.gapMs > worst.gapMs || (item.gapMs === worst.gapMs && item.gapMs - item.boundMs > worst.gapMs - worst.boundMs) ? item : worst, undefined)
+    const worstAttempt = reports.reduce<{ attemptId: string; taskId: string; gapMs: number } | undefined>((worst, report) =>
+      worst === undefined || report.worstReportingGapMs > worst.gapMs ? { attemptId: report.attemptId, taskId: report.taskId, gapMs: report.worstReportingGapMs } : worst, undefined)
+    return {
+      missionId, bounds, subjects, worstSubjectSilence,
+      attempts: reports,
+      worstAttemptReportingGap: worstAttempt,
+      attemptsEnded: reports.filter(report => report.endedAt !== undefined).length,
+      attemptsEndedUnreported: reports.filter(report => report.endedUnreported).length,
+      attemptSilenceEscalations: subjects.filter(item => item.kind === 'attempt').length,
+      passReleases: { count: passRelease?.releases ?? 0, worst: worstRelease },
+      note: 'Read-only projection over the durable rows at read time. A subject silence is measured against the declared bound carried next to it: a released scheduling pass against the pass release bound it was released under, an escalated attempt against the attempt reporting bound in force at read time. The worst subject silence is the widest gap (ties: the widest overrun). The worst per-attempt reporting gap is the longest interval between durable elements attributable to one attempt, closed at its end or at read time. `attemptsEndedUnreported` counts attempts no longer current whose only durable element is their own dispatch. Limits: attempt intervals come from the retained event window, an attempt that ended with no closing event is dated at its last durable element, and a second release of an unchanged board is deduped into the first escalation (the pass row still counts it in `releases`).',
+    }
   }
 
   /**

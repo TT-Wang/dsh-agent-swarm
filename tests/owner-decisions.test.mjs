@@ -190,8 +190,12 @@ test('R15-A1: every notify() call site in src/ passes a subject argument (enumer
     }
   }
   // The count is part of the claim: a NEW call site must be visited and given a
-  // subject, and this number is what makes the enumeration complete.
-  assert.equal(sites, 23, `every .notify() site enumerated (found ${sites})`)
+  // subject, and this number is what makes the enumeration complete. R16-D adds
+  // exactly one site — `Scheduling.escalateSilentAttempt` (src/scheduling.ts),
+  // the attempt reporting-bound escalation, whose third argument is
+  // `[taskSubject(task)]`. The count moves 23 -> 24; nothing else in this test
+  // changed, and the new site is visited and checked like every other.
+  assert.equal(sites, 24, `every .notify() site enumerated (found ${sites})`)
   assert.deepEqual(offenders, [], `every notify() site passes subjects as its third argument: ${offenders.join(' | ')}`)
 })
 

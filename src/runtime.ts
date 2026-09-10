@@ -62,6 +62,27 @@ const PROVIDER_OUTAGE_EVENT_WINDOW_MS = 30_000
 const DEFAULT_STALL_PASSES = 3
 const DEFAULT_STALL_PASS_TIMEOUT_TICKS = 30
 /**
+ * R16-D: the declared bound on how long a live attempt may record no durable
+ * progress before the runtime escalates it by name (`attempt-silent:`). The
+ * default matches the longest wait this host itself treats as bounded (F1's
+ * `operationBoundMs` / the harness's 600 s `maxWaitTimeoutMs`): an attempt that
+ * has recorded nothing at all for that long is past the point where a live lease
+ * can still be read as progress. Configuration, never a constant the runtime is
+ * trapped behind: `attemptSilenceBoundMs` on the runtime config, `0` disables
+ * the guard, an invalid value keeps this default.
+ */
+const DEFAULT_ATTEMPT_SILENCE_BOUND_MS = 10 * 60_000
+/**
+ * R16-D: the additional declared window a wedged scheduling pass may keep the
+ * mission's guard while the mission still has live work. The default is the pass
+ * bound itself (so a wedge may hold the guard for at most 2 × `stallPassTimeoutMs`
+ * before the release), and it is configuration: `stallPassLiveGraceMs` on the
+ * runtime config, `0` meaning "release at the first bound". Without it the
+ * release was unbounded — a wedged pass waited for every unrelated lease to
+ * lapse, exactly the silent blocking round 16 removes.
+ */
+const DEFAULT_STALL_PASS_LIVE_GRACE_TICKS = 1
+/**
  * R5-02: consecutive `workers.start` failures for one member before its work is
  * re-routed to another capable live member. A transient start failure self-heals
  * on the next tick; only a route that keeps failing is retired.
@@ -979,6 +1000,14 @@ export class SwarmRuntime {
         // parked-member hatch (never rewritten) and the start-recovery loop (which
         // writes `idle` before any dispatch).
         this.reconcileMemberStatus(mission.id)
+        // R16-D: the attempt reporting bound runs BEFORE the pass guard below, so
+        // an attempt that has stopped reporting is named whether the pass is
+        // running, wedged or absent. Co-firing guards: F1's operation silence
+        // (skipped while an operation is recorded — that guard owns the clock),
+        // the W6 idle close-out (skipped for the attempt it is already nudging),
+        // the parked member, the budget pause, the wedged-pass release in
+        // `checkSchedulingPasses` (same tick, earlier) and the notice dedup key.
+        this.scheduling.sweepSilentAttempts(mission.id)
         // R15-D1/D2: the sweep runs when the pass is WEDGED past its declared
         // bound even though `livePass` still gates scheduling because the mission
         // has live work (a healthy sibling's lease, or a stop acknowledgement in
@@ -3496,6 +3525,52 @@ export class SwarmRuntime {
     const value = Math.trunc(this.config.stallPassTimeoutMs ?? this.config.tickMs * DEFAULT_STALL_PASS_TIMEOUT_TICKS)
     return Number.isSafeInteger(value) && value >= this.config.tickMs ? value : this.config.tickMs
   }
+  /**
+   * R16-D: the declared window a wedged pass may still hold the mission guard
+   * while the mission has live work (default: the pass bound itself, read as
+   * `stallPassTimeoutMs`; `stallPassLiveGraceMs: 0` releases at the first bound).
+   * Structural read: `RuntimeConfig` (src/types.ts) and the plugin `Config`
+   * schema (src/index.ts) are outside this task's write scope, so the two schema
+   * lines are a recorded hand-off — a runtime handed `stallPassLiveGraceMs` uses
+   * it, one without it uses the default.
+   */
+  get stallPassLiveGraceMs(): number {
+    const raw = (this.config as { stallPassLiveGraceMs?: unknown }).stallPassLiveGraceMs
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return Math.floor(raw)
+    return this.stallPassTimeoutMs * DEFAULT_STALL_PASS_LIVE_GRACE_TICKS
+  }
+  /**
+   * R16-D: the total bound a wedged pass is measured against once it has live
+   * work to progress. Past it the pass is released even though the live work
+   * remains — the work is preserved and named, the guard is not held hostage.
+   */
+  get stallPassReleaseBoundMs(): number { return this.stallPassTimeoutMs + this.stallPassLiveGraceMs }
+  /**
+   * R16-D: the declared bound on an attempt's durable progress (see
+   * `DEFAULT_ATTEMPT_SILENCE_BOUND_MS`). Structural read with the same hand-off
+   * as `stallPassLiveGraceMs`.
+   */
+  get attemptSilenceBoundMs(): number {
+    const raw = (this.config as { attemptSilenceBoundMs?: unknown }).attemptSilenceBoundMs
+    if (raw === 0) return 0
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_ATTEMPT_SILENCE_BOUND_MS
+  }
+  /**
+   * R16-D: the round's silence projection, read from the durable store alone
+   * (src/scheduling.ts#silenceReport). Read-only and ungated: it is the
+   * instrument the round's outcome report quotes, not an owner decision channel.
+   */
+  silenceReport(missionId: string): ReturnType<Scheduling['silenceReport']> { return this.scheduling.silenceReport(missionId) }
+  /**
+   * R16-D: the durable reporting bound verdict for the live attempt on one task
+   * (`taskId@epoch` + member), or undefined when the attempt is inside its bound
+   * or another guard owns it (F1's operation, the W6 idle close-out, a parked
+   * member, a budget pause). Exposed for the pair tests and the owner read path;
+   * the sweep that acts on it is `sweepDecisions`.
+   */
+  silentAttempt(task: Task, mission: Mission): ReturnType<Scheduling['silentAttempt']> { return this.scheduling.silentAttempt(task, mission) }
+  /** R16-D: the bounded sweep behind the escalation; returns how many attempts it named. */
+  sweepSilentAttempts(missionId: string): number { return this.scheduling.sweepSilentAttempts(missionId) }
   
   
   
