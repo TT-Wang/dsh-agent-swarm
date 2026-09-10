@@ -6,6 +6,13 @@
  * emitter without registering its type fails this suite. Types built from a
  * template literal at the emit site cannot be derived statically and are
  * enumerated explicitly.
+ *
+ * S5c: a type emitted through a shared exported constant
+ * (`this.event(missionId, STALE_TASK_REFUSAL_EVENT, …)`) used to be invisible
+ * here, so the durable `task/stale-revision-refused` row reached the mission log
+ * with no vocabulary entry and `eventVocabularyReport` reported it as
+ * unrecognized. The scan resolves `export const NAME = '...'` declarations in
+ * every source file, so a constant emission is enforced exactly like a literal.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -21,11 +28,19 @@ const DYNAMIC = [
 ]
 
 function emittedFromSource() {
+  const sources = readdirSync(SRC).filter(file => file.endsWith('.ts'))
+    .map(file => readFileSync(new URL(file, SRC), 'utf8'))
+  // Shared type-argument constants, e.g. `export const STALE_TASK_REFUSAL_EVENT = 'task/stale-revision-refused'`.
+  const constants = new Map()
+  for (const text of sources) for (const match of text.matchAll(/export const ([A-Za-z0-9_]+)\s*=\s*'([^']+)'/g)) constants.set(match[1], match[2])
   const emitted = new Set()
-  for (const file of readdirSync(SRC)) {
-    if (!file.endsWith('.ts')) continue
-    const text = readFileSync(new URL(file, SRC), 'utf8')
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*'([^']+)'/g)) emitted.add(match[1])
+  for (const text of sources) {
+    // Any second argument: a literal, or an identifier resolved to its constant.
+    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*([^,]+?)\s*,/g)) {
+      const argument = match[1].trim()
+      if (argument.startsWith("'") && argument.endsWith("'")) { emitted.add(argument.slice(1, -1)); continue }
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(argument) && constants.has(argument)) emitted.add(constants.get(argument))
+    }
     for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*[^,?]+\?\s*'([^']+)'\s*:\s*'([^']+)'/g)) {
       emitted.add(match[1]); emitted.add(match[2])
     }

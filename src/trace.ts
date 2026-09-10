@@ -360,6 +360,10 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'task/invalidated': 'Dependent work invalidated by a challenged prerequisite',
   'task/git-write-denied': 'Sandbox refused a worker git write; the supported exit is named',
   'task/budget-resume-skipped': 'Budget-resume marker was stale and skipped',
+  // S5c: emitted by `SwarmStore.putTask` through the exported constant
+  // `STALE_TASK_REFUSAL_EVENT` (src/store.ts). The vocabulary check resolves
+  // shared constants now, so this row is required, not optional.
+  'task/stale-revision-refused': 'A task write presented a revision another accepted write had moved past; the durable revision was named and the write refused',
   'task/quiescence-recovered': 'Parked task recovered after host restart',
   'evidence/published': 'Unverified claim published with host-recorded run ids',
   'evidence/challenged': 'Claim challenged with counterevidence',
