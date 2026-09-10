@@ -66,21 +66,49 @@ test('S1/S5: the scheduling guard is a durable pass row re-read from the store, 
   } finally { await f.cleanup() }
 })
 
-test('S1: a long pass with a live lease is progress and is never abandoned or reported as a stall', async () => {
+test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never abandoned; past that bound it is released with its live work preserved', async () => {
+  // R16-D changed the contract this test used to pin: "a pass with live work
+  // keeps its guard" was true for as long as ANY unrelated lease lived, which is
+  // exactly the unbounded release round 16 removes. The claim is now two-sided
+  // and both halves are asserted here: inside `stallPassReleaseBoundMs`
+  // (= stallPassTimeoutMs + stallPassLiveGraceMs, both declared) a live lease is
+  // progress and the guard is not abandoned and no stall is reported; past it
+  // the pass is released, named once, and the live work it was held by is
+  // preserved untouched. Nothing was deleted from the old assertions: the
+  // in-bound half is the same claim on the same fixture.
   const f = await setup({ config: { tickMs: 20, stallPassTimeoutMs: 100, stallPasses: 2 } })
   try {
     const task = f.propose()
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     assert.equal(taskOf(f.runtime, task.id).status, 'running')
-    // Simulate a pass that has been inside an adapter await for far longer than
-    // the bound while a worker holds a live lease (recorded renewals = progress).
-    const long = writePass(f, { runId: 'test-live', startedAt: Date.now() - 10_000 })
-    await sleep(300)
-    const row = f.runtime.store.get('passes', keyOf(f.mission.id))
-    assert.equal(row.runId, long.runId, 'a pass with live work keeps its guard')
-    assert.equal(row.status, 'running', 'the live pass is not marked stalled')
+    const attemptId = taskOf(f.runtime, task.id).attempt.id
+    // Simulate a pass that has been inside an adapter await for longer than the
+    // first bound while a worker holds a live lease (recorded renewals = progress).
+    // The row is inside the live-work hold (age 150 of a declared 200), so it
+    // still gates: this is the retained S1 claim.
+    const long = writePass(f, { runId: 'test-live', startedAt: Date.now() - 150 })
+    await sleep(40)
+    const guarded = f.runtime.store.get('passes', keyOf(f.mission.id))
+    assert.equal(guarded.runId, long.runId, 'a pass inside its declared live-work bound keeps its guard')
+    assert.equal(guarded.status, 'running', 'the live pass is not marked stalled')
     assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled'), [],
-      'a live attempt is progress: no false stall notice may be emitted')
+      'a live attempt is progress: no false stall notice may be emitted inside the bound')
+    // Past the declared live-work bound the release is bounded, named and
+    // preserves the work: the half round 15 left open.
+    const row = await eventually(() => {
+      const current = f.runtime.store.get('passes', keyOf(f.mission.id))
+      return current !== undefined && current.releasedRunId === long.runId ? current : undefined
+    }, 'the wedged pass must be released inside its declared live-work bound', 4_000)
+    assert.notEqual(row.runId, long.runId, 'the released guard no longer blocks later ticks')
+    assert.equal(row.worstRelease.heldByLiveWork, true, 'the release names the live work that held it')
+    assert.equal(row.worstRelease.boundMs, 200, 'and the declared bound it was measured against')
+    const released = events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.wedged === true && item.data.runId === long.runId)
+    assert.equal(released.length, 1, 'the released run is named exactly once')
+    assert.equal(released[0].data.releasedWhileLive, true)
+    const held = taskOf(f.runtime, task.id)
+    assert.equal(held.status, 'running', 'the live lease survives its own release')
+    assert.equal(held.attempt.id, attemptId, 'and the attempt is not stopped, dropped or reassigned by it')
+    assert.ok(held.attempt.leaseUntil > Date.now(), 'with a lease still in the future')
   } finally { await f.cleanup() }
 })
 
