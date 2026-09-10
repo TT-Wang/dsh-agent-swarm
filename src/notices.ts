@@ -57,12 +57,12 @@ export class Notices {
    * (class, fingerprint, sender); decision notices pass through so the liveness
    * engine's witness dedup stays in charge of them.
    */
-  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string, subjects?: string[]): void {
+  notify(missionId: string, content: string, from = 'runtime', noticeClass: NoticeClass = 'decision', dedupe = noticeClass === 'budget', dedupKey?: string, subjects?: string[], stampWitness = true): void {
     const mission = this.rt.store.get('missions', missionId)
     // No-silent-state witness W2: every owner-decision notice is durable under
     // the fingerprint of the board it was emitted for, so the owner can verify
     // that no non-terminal state was silent. A terminal mission needs no witness.
-    if (mission !== undefined && !this.rt.isMissionTerminal(mission)) {
+    if (stampWitness && mission !== undefined && !this.rt.isMissionTerminal(mission)) {
       mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
       this.rt.store.put('missions', mission)
     }
@@ -144,7 +144,7 @@ export class Notices {
     // R14-F2(b): stall roots are classified BEFORE the F(S) dedup. A root is an
     // owner decision no other notice can advance, so an unrelated notice that
     // consumed the board fingerprint must not silence it.
-    this.notifyStallRoots(mission, tasks)
+    const stallRootNotices = this.notifyStallRoots(mission, tasks)
     const fingerprint = this.rt.fingerprint(missionId)
     if (mission.witness?.fingerprint === fingerprint) return
     // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
@@ -199,9 +199,22 @@ export class Notices {
     // names only what no other witness speaks for.
     const roots = new Set(this.stallRoots(tasks).map(task => task.id))
     const unrecognised = nonTerminal.filter(task => !roots.has(task.id) && !this.waitsLegitimately(task, tasks))
-    if (!unrecognised.length) return
+    if (!unrecognised.length) {
+      // The stall-root notices above were emitted WITHOUT claiming the board witness,
+      // so the W3 stall path (fault F19 row 7) still owns the board when it applies.
+      // If the classifier recognises every task and no stall fires, those decision
+      // notices are this board's evidence: stamp the W2 witness here instead (row 7b).
+      if (stallRootNotices > 0) {
+        const board = this.rt.store.get('missions', missionId)
+        if (board !== undefined && !this.rt.isMissionTerminal(board)) {
+          board.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
+          this.rt.store.put('missions', board)
+        }
+      }
+      return
+    }
     const subjects = unrecognised.map(taskSubject)
-    this.notify(missionId, `Mission ${mission.title} has unfinished work that no live path will advance: ${unrecognised.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`, 'runtime', 'decision', true,
+    this.notify(missionId, `Mission ${mission.title} made no progress this tick and has unfinished work that no live path will advance: ${unrecognised.map(task => `${task.id} (${task.kind}, ${task.status}, epoch ${task.epoch}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')}. Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`, 'runtime', 'decision', true,
       `fallthrough:${missionId}:${subjects.slice().sort().join(',')}`, subjects)
   }
 
@@ -214,7 +227,8 @@ export class Notices {
    * no longer bounded. The dedup key is the root's own identity, not the board
    * fingerprint, so an unrelated notice can never consume it.
    */
-  notifyStallRoots(mission: Mission, tasks: Task[]): void {
+  notifyStallRoots(mission: Mission, tasks: Task[]): number {
+    let emitted = 0
     for (const root of this.stallRoots(tasks)) {
       const subject = taskSubject(root)
       const key = `stall-root:${mission.id}:${subject}`
@@ -236,9 +250,11 @@ export class Notices {
           // tasks that depend on it is the honest value.
           unschedulable: [root.id, ...dependents.map(task => task.id)],
         })
-        this.notify(mission.id, `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and ${cause}${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.map(task => task.id).join(', ')})` : ''}${root.output === undefined ? '' : `. Recorded reason: ${root.output}`}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`, 'runtime', 'decision', true, key, [subject, ...dependents.map(taskSubject)])
+        emitted += 1
+        this.notify(mission.id, `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and ${cause}${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.map(task => task.id).join(', ')})` : ''}${root.output === undefined ? '' : `. Recorded reason: ${root.output}`}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`, 'runtime', 'decision', true, key, [subject, ...dependents.map(taskSubject)], false)
       })
     }
+    return emitted
   }
 
   /**
