@@ -140,9 +140,13 @@ test('a create-path stall notice names the parked work, and admitting the follow
   const running = await eventually(() => f.current(repair.id).status === 'running' ? f.current(repair.id) : undefined,
     'the follow-up task must be assigned to the parked member')
   assert.equal(running.attempt.ownerId, f.author.id)
-  assert.equal(f.runtime.store.get('members', f.author.id).status, 'working')
+  // R17-G7: the park is durable intent, so it still stands until the assignment
+  // supplies fresh input; the live `working` status follows the attempt as soon
+  // as that input lifts the park (the derivation, not a status write).
+  assert.equal(f.runtime.store.get('members', f.author.id).status, 'waiting', 'the park stands until fresh input arrives')
   const assignment = f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id)
   assert.ok(assignment, 'the wake is a durable assignment delivery')
   assert.equal(assignment.member.id, f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'fresh input lets the woken member take its next step')
+  assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'with fresh input the park lifts and the derived status follows the live attempt')
 })

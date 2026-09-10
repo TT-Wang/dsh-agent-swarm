@@ -3,13 +3,18 @@
  * complete propose -> claim -> publish -> submit -> review -> verdict flow that
  * also retires a sibling review. `isIdle()` is false so the scheduler never
  * auto-dispatches and every claim is an explicit `swarm_claim` step.
+ *
+ * R17-G10: the fixture root comes from `tests/temp-root.mjs` (the checkout-safe
+ * ladder), because the trace tests are declared checks now and every file in a
+ * declared check's transitive closure must survive a runner whose ambient temp
+ * root is outside the sandbox. The assertions are unchanged.
  */
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
 import { TracePayloadStore } from '../../lib/trace.js'
+import { tempDirectory } from '../temp-root.mjs'
 
 export const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 
@@ -34,7 +39,7 @@ export class TraceWorkers {
  * options get the original passing-accept flow unchanged.
  */
 export async function traceFixture(t, options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-trace-'))
+  const root = await tempDirectory('swarm-trace-')
   const workspace = await realpath(await mkdtemp(join(root, 'ws-')))
   const statePath = join(root, 'db.sqlite')
   const workers = new TraceWorkers()

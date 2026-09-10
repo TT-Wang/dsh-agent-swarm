@@ -189,16 +189,19 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   // same call through the tool awaits a trace write, which lets setImmediate run.
   assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger task 3' })), /per-member proposal allowance/)
 
-  // Synchronous read: the notice is recorded and queued, not yet claimed.
+  // Synchronous read: the notice is recorded and queued, not yet delivered.
   const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)
   const queued = queuedView.ledger.find(entry => entry.class === 'budget')
   assert.ok(queued, 'the ledger exposes the notice')
   assert.equal(queued.state, 'queued')
-  assert.equal(queued.claimedAt, undefined)
+  assert.equal(queued.deliveredAt, undefined)
+  assert.equal(queued.consumedAt, undefined, 'transport is never relabelled as consumption')
   assert.ok(Number.isSafeInteger(queued.sentAt) && Number.isSafeInteger(queued.queuedAt))
   assert.equal(queued.sentAt, queued.queuedAt, 'sent and queued are recorded at enqueue')
-  assert.equal(queued.dedupKey, noticeFingerprint(records(f)), 'the dedup key is the mission-state fingerprint')
-  assert.match(queued.dedupKey, /^[a-f0-9]{64}$/)
+  // R17-G3: the identity is the fact — family, subject@epoch and the recorded
+  // reason — not a digest of the whole board, so an unrelated change cannot
+  // re-arm this notice.
+  assert.match(queued.dedupKey, /^budget:mission_[0-9a-f-]+:mission:mission_[0-9a-f-]+:(?:none|[0-9a-f]{16})$/, `the dedup key is the fact key: ${queued.dedupKey}`)
   assert.equal(queued.deliveryId, queued.id)
   // Read-only: two reads of the same state are identical and mutate nothing.
   const revision = f.runtime.store.revision()
@@ -207,14 +210,22 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   assert.equal(f.runtime.store.revision(), revision, 'reading the ledger and instruments commits no state change')
   assert.equal(f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.deliveredAt === undefined).length, 1, 'only the notice itself is pending')
 
-  // The outbox drains on the scheduler pass and the row becomes claimed.
-  const claimed = await eventually(() => {
+  // The outbox drains on the scheduler pass: the transport fact is `delivered`.
+  const deliveredEntry = await eventually(() => {
     const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.class === 'budget')
     return entry?.state === 'claimed' ? entry : undefined
-  }, 'the owner notice was never claimed')
-  assert.ok(claimed.claimedAt >= claimed.sentAt)
-  const delivered = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.id === claimed.deliveryId)
-  assert.equal(delivered.notice.claimedAt, delivered.deliveredAt, 'claimed is the adapter delivery timestamp')
+  }, 'the owner notice was never delivered')
+  assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
+  const delivered = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.id === deliveredEntry.deliveryId)
+  assert.equal(delivered.deliveredAt, deliveredEntry.deliveredAt, 'the transport fact is the adapter delivery timestamp')
+
+  // R17-G8: consumption is a separate fact, recorded once from the host's
+  // claimed signal (the adapter maps the delivery id), with a compare-and-swap.
+  assert.equal(f.runtime.recordConsumption(deliveredEntry.deliveryId), true, 'the host claimed signal records consumption')
+  assert.equal(f.runtime.recordConsumption(deliveredEntry.deliveryId), false, 'a second signal cannot move the timestamp')
+  const consumed = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.deliveryId === deliveredEntry.deliveryId)
+  assert.ok(consumed.consumedAt >= consumed.deliveredAt, 'consumption is recorded after delivery, as its own fact')
+  assert.equal(consumed.state, 'claimed', 'the transport state stays transport: consumption never rewrites it')
 
   // The ledger is owner-only; workers must not read control-plane notices.
   assert.throws(() => f.runtime.noticeLedger(f.aliceActor, f.mission.id), /Only the mission owner/)

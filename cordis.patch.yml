@@ -1,3 +1,15 @@
+# The plugin package's own bundle patch — the DIRECT mount layer.
+#
+# Installing this package as a profile dependency (`dsh plugin --profile web
+# add "link:$PWD"`) appends it to `dsh.profile.bundles`; this layer inserts the
+# plugin row with an empty config, so the plugin's own documented defaults
+# apply (~/.dsh/agent-swarm, or a caller overlay's absolute roots). The preview
+# deployment uses this path until the attended deployment swaps the mount.
+#
+# The DECLARED mount is the bundle package in `profile/`: it inserts the same
+# row id with explicit portable roots, declares its prerequisites and this
+# layer as a conflict, and composes the Web client UI with the same row. Mount
+# one or the other, never both.
 - insert:
     - id: dsh-external-agent-swarm
       name: '@dsh-external/dsh-agent-swarm'

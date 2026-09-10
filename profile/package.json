@@ -1,0 +1,49 @@
+{
+  "name": "@dsh-external/dsh-agent-swarm-profile",
+  "version": "0.7.0",
+  "description": "Declarative mount profile for the Agent Swarm platform: composes the plugin and its Web client UI over dsh-base + dsh-web-app",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TT-Wang/dsh-agent-swarm.git",
+    "directory": "profile"
+  },
+  "homepage": "https://github.com/TT-Wang/dsh-agent-swarm#readme",
+  "bugs": {
+    "url": "https://github.com/TT-Wang/dsh-agent-swarm/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "requires": {
+        "harness": [
+          "0.1.2-rc.1",
+          "0.1.3-alpha.2"
+        ],
+        "bundles": [
+          "@deepseek-ai/dsh-base",
+          "@deepseek-ai/dsh-web-app"
+        ]
+      },
+      "conflicts": {
+        "bundles": [
+          "@dsh-external/dsh-agent-swarm"
+        ]
+      }
+    }
+  },
+  "dependencies": {
+    "@dsh-external/dsh-agent-swarm": "file:.."
+  },
+  "files": [
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh-bundle",
+    "dsh-profile",
+    "deepseek-harness",
+    "agent-swarm"
+  ]
+}

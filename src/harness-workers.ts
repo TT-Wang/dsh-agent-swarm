@@ -19,6 +19,8 @@ import { Workspaces, writePrivateJson } from './workspaces.js'
 import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
+import { recordAppendRefusal } from './invariant.ts'
+import { noticeFamily } from './notices.ts'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
@@ -801,7 +803,19 @@ export class HarnessWorkers implements WorkerAdapter {
       const message = this.deliveryMessage(delivery)
       const seen = owner.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
         || (event.type === 'agent/inbox/spliced' && event.data.inserted.some(item => item.id === message.id)))
-      if (!seen) owner.send(message, 'next-step', true)
+      if (!seen) {
+        try {
+          owner.send(message, 'next-step', true)
+        } catch (error) {
+          // R17-G9: the host pre-append invariant refused this owner-facing
+          // decision. Record the refusal (a measurement) and ACKNOWLEDGE the
+          // delivery by returning, so the durable outbox does not retry forever a
+          // decision the invariant will refuse again; any other failure still
+          // propagates to the outbox's retry path.
+          if (recordAppendRefusal(error, { id: delivery.id, missionId: delivery.missionId, family: noticeFamily(delivery), subjects: delivery.subjects ?? [] })) return
+          throw error
+        }
+      }
       await this.ctx.sessions.flush(owner.session)
       return
     }

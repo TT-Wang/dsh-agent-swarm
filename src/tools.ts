@@ -331,9 +331,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       budget: object(a.budget) as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
       workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
     } satisfies CreateMissionInput))
-  register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree.',
-    { ...mission, name: string, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'name', 'role'],
-    (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: text(a, 'name'), role: text(a, 'role'), model: optionalText(a, 'model'),
+  register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id.',
+    { ...mission, name: { ...string, description: 'Optional human name. Omit it to take the next unused name from the fixed pool.' }, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'role'],
+    (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: optionalText(a, 'name'), role: text(a, 'role'), model: optionalText(a, 'model'),
       provider: optionalText(a, 'provider'), reasoningEffort: optionalText(a, 'reasoningEffort'), maxOutputTokens: optionalInteger(a, 'maxOutputTokens'),
       subscriptions: a.subscriptions === undefined ? undefined : array(a, 'subscriptions') }))
   register('swarm_workstream', 'Create a durable workstream in this mission; any member can propose work under it.',

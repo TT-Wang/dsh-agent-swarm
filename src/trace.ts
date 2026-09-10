@@ -14,9 +14,19 @@
  *   orchestrator's externally visible command sequence with no provider call.
  *   It fails with a named error on a corrupted or truncated log and on a
  *   command sequence that diverges from the recorded/golden sequence.
+ * - R17-G10 (host-contract adoption): recorded spans are handed to the host
+ *   telemetry sink (`ctx.sessionTelemetry`, the `session-telemetry` contract)
+ *   when the deployment mounts a backend, and the payload spill beside the state
+ *   file is bounded and swept (`sweepTraceSpill`, the `spill-local` sweep
+ *   semantics plus the size bound that sweep does not have). The declared bound
+ *   is a ceiling on the put path — a payload that would take the root above
+ *   `maxFiles`/`maxBytes` reserves room with a sweep before it is written. The
+ *   durable `trace/span` row stays because replay, the trace tests and the
+ *   reader census read it and the sink has no read-back; the retained bespoke
+ *   pieces and the reason that decided each are named at their definitions below.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import type { SwarmEvent } from './types.ts'
@@ -120,19 +130,295 @@ export interface TraceSpan {
   output: TracePayloadRef
 }
 
-/** Content-addressed payload store beside the state file; digests, not payloads, enter the log. */
+/** Milliseconds in one day; retention is configured in days like the host spill's `cleanupPeriodDays`. */
+const MS_PER_DAY = 24 * 60 * 60 * 1000
+/**
+ * R17-G10: the declared bound on the content-addressed payload spill.
+ *
+ * The durable log keeps only digests, so the payload bytes beside the state file
+ * are a cache and are bounded like one. `retentionMs` mirrors the host spill's
+ * `cleanupPeriodDays` semantics (a regular file strictly older than the cutoff is
+ * reclaimable); `maxFiles`/`maxBytes` are hard bounds the host sweep has no
+ * equivalent for, applied oldest-first so the newest review window survives.
+ *
+ * The bound is a ceiling, not a cadence. `TracePayloadStore.put` reserves room
+ * with a sweep before it writes, and the check-and-write is serialized per
+ * store, so after every `put` resolves the root holds at most `maxFiles` regular
+ * files and at most `maxBytes` payload bytes and no concurrent put can overtake
+ * that check. Between two of this store's writes the root only shrinks (every
+ * other operation is a read or a deletion), so the residue between two writes is
+ * itself bounded by the two ceilings. The one exception is a payload that cannot
+ * fit under `maxBytes` by itself: it is omitted (`stored: false`) rather than
+ * written above the bound. A second process writing into the same root is
+ * outside this invariant, and every host start re-applies it
+ * (`TraceRecorder.startupSweep`).
+ *
+ * Measured basis: the leaked directory held 4 683 files / 22.9 MB of payload
+ * bytes (33 MB on disk) on 2026-09-11 after three days of six-member rounds
+ * (~5 KB per payload), so 2 048 files / 16 MiB holds a full live round's span
+ * payloads while capping growth. A payload evicted under the bound is reported
+ * as `missing` by `traceMetrics`, never silently.
+ */
+export interface TraceSpillLimits {
+  /** Ceiling on the payload bytes the root holds after any `put` resolves; oldest files are evicted first. */
+  maxBytes: number
+  /** Ceiling on the regular files the root holds after any `put` resolves; oldest files are evicted first. */
+  maxFiles: number
+  /** Age after which a regular file may be reclaimed; `0` disables age retention (the bound still applies). */
+  retentionMs: number
+}
+/** Days of payload retention that produced {@link DEFAULT_TRACE_SPILL_LIMITS.retentionMs}. */
+export const TRACE_SPILL_RETENTION_DAYS = 7
+export const DEFAULT_TRACE_SPILL_LIMITS: TraceSpillLimits = {
+  maxBytes: 16 * 1024 * 1024, maxFiles: 2048, retentionMs: TRACE_SPILL_RETENTION_DAYS * MS_PER_DAY,
+}
+/** What one {@link sweepTraceSpill} call found, reclaimed (or would reclaim under `dryRun`), and left. */
+export interface TraceSpillReport {
+  root: string
+  dryRun: boolean
+  now: number
+  limits: TraceSpillLimits
+  /** Directory entries inspected. */
+  scanned: number
+  /** Regular files found before the sweep. */
+  files: number
+  /** Bytes held by those regular files before the sweep. */
+  bytes: number
+  /** Files reclaimed because their `mtime` was strictly older than the retention cutoff. */
+  expired: number
+  /** Files reclaimed because the `maxFiles`/`maxBytes` bound still did not hold. */
+  evicted: number
+  /** Files reclaimed in total (`expired + evicted`). */
+  deleted: number
+  bytesDeleted: number
+  /** Entries left untouched because they are not regular files (symlinks, directories, sockets). */
+  skipped: number
+  filesAfter: number
+  bytesAfter: number
+  /** Contained failures, in the order they happened; the sweep still never rejects. */
+  errors: string[]
+}
+
+/**
+ * R17-G10: one bounded sweep of a payload spill root — the thin adapter the
+ * acceptance allows where the host exposes no equivalent for a capability we
+ * genuinely use. Evidence that decided it:
+ * - `@deepseek-ai/dsh-spill-local` v0.1.3-alpha.2 (`src/cleanup.ts`,
+ *   `sweepSpillRoots`, harness commit 82a5fd61) does export its sweep as a
+ *   module function, but this package does not declare that dependency
+ *   (package.json is outside this branch's scope) and it is not resolvable from
+ *   the deployed plugin's 26-package `node_modules`, so the export cannot be
+ *   called from this file's runtime;
+ * - the host exposes no sweep as a service: `ctx.spillStore` is the `SpillStore`
+ *   seam with `saveText` only;
+ * - the host sweep descends only into its own `session-<12 hex>` directories
+ *   with age retention and no size or file bound, while this spill is
+ *   content-addressed flat files and the acceptance requires a bound.
+ *
+ * The adapter therefore mirrors the host sweep's semantics — regular files only,
+ * a strict `mtime` cutoff, symlinks never followed or deleted, idempotent unlink
+ * on ENOENT, every filesystem failure contained through a warn sink — and adds
+ * the oldest-first `maxFiles`/`maxBytes` eviction. `dryRun` returns the same
+ * counts without touching a file, so an operator can measure what a live sweep
+ * would reclaim. `reserveFiles`/`reserveBytes` are the room a caller needs
+ * *after* the sweep (the put path reserves one file and its payload size), so
+ * eviction runs until `limit - reserve` holds and the caller can write without
+ * the directory ever exceeding the declared bound. Never rejects: failures land
+ * in `errors` and in `warn`.
+ */
+export async function sweepTraceSpill(options: {
+  root: string
+  limits?: Partial<TraceSpillLimits>
+  now?: number
+  dryRun?: boolean
+  warn?: (message: string) => void
+  /** Files the caller must be able to add after the sweep; eviction targets `maxFiles - reserveFiles`. */
+  reserveFiles?: number
+  /** Bytes the caller must be able to add after the sweep; eviction targets `maxBytes - reserveBytes`. */
+  reserveBytes?: number
+}): Promise<TraceSpillReport> {
+  const limits: TraceSpillLimits = { ...DEFAULT_TRACE_SPILL_LIMITS, ...options.limits }
+  const now = options.now ?? Date.now()
+  const dryRun = options.dryRun === true
+  // The room the caller asked to keep is subtracted from the eviction target, so
+  // one sweep both re-bounds the directory and makes space for the next write.
+  const targetFiles = limits.maxFiles - Math.max(0, options.reserveFiles ?? 0)
+  const targetBytes = limits.maxBytes - Math.max(0, options.reserveBytes ?? 0)
+  const errors: string[] = []
+  const warn = (message: string): void => {
+    errors.push(message)
+    // The warn sink is observational: cleanup stays best-effort even when it throws.
+    try { options.warn?.(message) } catch { /* contained by contract */ }
+  }
+  const report = (fields: Partial<TraceSpillReport>): TraceSpillReport => ({
+    root: options.root, dryRun, now, limits, scanned: 0, files: 0, bytes: 0, expired: 0, evicted: 0,
+    deleted: 0, bytesDeleted: 0, skipped: 0, filesAfter: 0, bytesAfter: 0, errors, ...fields,
+  })
+  let names: string[]
+  try {
+    names = await readdir(options.root)
+  } catch (error) {
+    // A root no spill ever wrote into is the common case, not an error.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') warn(`spill sweep: failed to read ${options.root}: ${String(error)}`)
+    return report({})
+  }
+  const files: Array<{ path: string; name: string; mtimeMs: number; bytes: number }> = []
+  let skipped = 0
+  let bytes = 0
+  for (const name of names) {
+    const path = join(options.root, name)
+    let stats
+    try {
+      stats = await lstat(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') warn(`spill sweep: failed to stat ${path}: ${String(error)}`)
+      continue
+    }
+    // Only regular files expire. A symlink or a directory is counted and left
+    // untouched — `lstat` never follows a link, so a planted link can neither be
+    // deleted nor redirect the sweep (co-fires with the age and bound guards).
+    if (!stats.isFile()) { skipped++; continue }
+    files.push({ path, name, mtimeMs: stats.mtimeMs, bytes: stats.size })
+    bytes += stats.size
+  }
+  files.sort((left, right) => left.mtimeMs - right.mtimeMs || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+  const cutoff = now - limits.retentionMs
+  const reclaimed = new Set<string>()
+  let kept = files
+  // Age guard first, then the bound. A file already reclaimed for age is never
+  // charged twice when the bound eviction guard co-fires on the same file.
+  if (limits.retentionMs > 0) {
+    for (const file of files) if (file.mtimeMs < cutoff) reclaimed.add(file.path)
+    kept = files.filter(file => !reclaimed.has(file.path))
+  }
+  let keptBytes = kept.reduce((total, file) => total + file.bytes, 0)
+  let evicted = 0
+  for (const file of kept) {
+    // Stop at the reserved target, not at the declared bound: the caller is
+    // about to add its own file and bytes, and that addition is what must land
+    // inside the bound (co-fires with the age guard above and the put-path
+    // headroom guard in `TracePayloadStore`).
+    if (kept.length <= targetFiles && keptBytes <= targetBytes) break
+    reclaimed.add(file.path)
+    kept = kept.filter(candidate => candidate.path !== file.path)
+    keptBytes -= file.bytes
+    evicted++
+  }
+  const expired = reclaimed.size - evicted
+  let deleted = 0
+  let bytesDeleted = 0
+  for (const file of files) {
+    if (!reclaimed.has(file.path)) continue
+    if (dryRun) { deleted++; bytesDeleted += file.bytes; continue }
+    try {
+      await unlink(file.path)
+      deleted++
+      bytesDeleted += file.bytes
+    } catch (error) {
+      // A parallel sweep or the store itself may have removed it first: the goal
+      // (file gone) already holds, so ENOENT is success, everything else is named.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { deleted++; bytesDeleted += file.bytes; continue }
+      warn(`spill sweep: failed to delete ${file.path}: ${String(error)}`)
+    }
+  }
+  return report({
+    scanned: names.length, files: files.length, bytes, expired, evicted, deleted, bytesDeleted,
+    skipped, filesAfter: files.length - deleted, bytesAfter: bytes - bytesDeleted,
+  })
+}
+
+/** Per-store spill policy: limit overrides merged over {@link DEFAULT_TRACE_SPILL_LIMITS} and a failure sink. */
+export interface TraceSpillOptions {
+  limits?: Partial<TraceSpillLimits>
+  warn?: (message: string) => void
+}
+/** Payload writes between two opportunistic sweeps; the startup sweep is separate. */
+const PAYLOAD_SWEEP_INTERVAL = 256
+
+/**
+ * Content-addressed payload store beside the state file; digests, not payloads, enter the log.
+ *
+ * R17-G10 adoption note — why the host spill *store* is not used here:
+ * `ctx.spillStore` (`@deepseek-ai/dsh-spill`'s `SpillStore.saveText`) is
+ * session-scoped, writes one fresh unpredictably-named file per call and returns
+ * an opaque path locator, so it can express neither "same bytes, same digest"
+ * dedup nor the `{digest, bytes, stored}` reference that the persisted span
+ * contract and the replay/metrics readers validate. Replacing the reference
+ * would rename a persisted payload field with no named reader for the change,
+ * which the acceptance forbids without a consumer-pair regression. The host
+ * *sweep* semantics, which this store does adopt, are in {@link sweepTraceSpill},
+ * and {@link TraceRecorder.startupSweep} re-applies the bound on every host start.
+ *
+ * Ceiling (R17-G10 repair): the declared `maxFiles`/`maxBytes` bound holds after
+ * every `put` resolves, not only at a sweep cadence. Puts and sweeps are
+ * serialized per store, and a put reserves its own room (`reserveFiles: 1`,
+ * `reserveBytes: bytes`) with a sweep whenever the last observed directory state
+ * has no room, so the check cannot be overtaken by an interleaved write or an
+ * unrelated in-flight sweep. `tracked` is this store's last observation (a sweep
+ * report or the count after a write); it may lag a background sweep by being too
+ * high, which only costs one extra sweep and never hides an overshoot.
+ */
 export class TracePayloadStore {
-  constructor(readonly directory: string, readonly maxBytes = 262144) {}
+  private puts = 0
+  /** Serializes put's check-and-write: two concurrent puts cannot pass one headroom check. */
+  private writes: Promise<unknown> = Promise.resolve()
+  /** Serializes sweeps so a reservation sweep is never satisfied by an unrelated in-flight one. */
+  private sweeps: Promise<unknown> = Promise.resolve()
+  /** Regular files and payload bytes this store last observed in its root. */
+  private tracked?: { files: number; bytes: number }
+  private last?: TraceSpillReport
+  constructor(readonly directory: string, readonly maxBytes = 262144, readonly spill: TraceSpillOptions = {}) {}
   pathFor(digest: string): string { return join(this.directory, `${digest.slice('sha256:'.length)}.json`) }
+  /** The declared bound this store enforces, with the caller's overrides merged in. */
+  get limits(): TraceSpillLimits { return { ...DEFAULT_TRACE_SPILL_LIMITS, ...this.spill.limits } }
   async put(value: unknown): Promise<TracePayloadRef> {
+    // The queue keeps the check-and-write atomic with respect to other puts: the
+    // headroom guard, the write and the counter update cannot interleave, so the
+    // ceiling holds for concurrent callers too. A rejected write rejects its own
+    // caller and leaves the queue running.
+    const write = this.writes.then(() => this.putQueued(value), () => this.putQueued(value))
+    this.writes = write.then(() => undefined, () => undefined)
+    return write
+  }
+  private async putQueued(value: unknown): Promise<TracePayloadRef> {
     const text = canonicalJson(value)
     const digest = digestText(text)
     const bytes = Buffer.byteLength(text, 'utf8')
+    // Co-fires with `verify`: an omitted payload has no file, so `verify` returns
+    // true without reading — the pair that keeps a big payload out of the spill.
     if (bytes > this.maxBytes) return { digest, bytes, stored: false }
+    // A payload that cannot fit under the whole spill bound by itself can never be
+    // held under it: omit it instead of writing a file the ceiling forbids.
+    if (bytes > this.limits.maxBytes) return { digest, bytes, stored: false }
+    if (!await this.reserveRoom(bytes)) return { digest, bytes, stored: false }
     await mkdir(this.directory, { recursive: true, mode: 0o700 })
-    try { await writeFile(this.pathFor(digest), text, { flag: 'wx', mode: 0o600 }) }
+    let created = false
+    try { await writeFile(this.pathFor(digest), text, { flag: 'wx', mode: 0o600 }); created = true }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    if (created) {
+      const state = this.tracked ?? { files: 0, bytes: 0 }
+      this.tracked = { files: state.files + 1, bytes: state.bytes + bytes }
+    }
+    // Retention backstop for a long-lived process that never reaches the bound;
+    // the bound itself is already enforced above, and the startup sweep
+    // (`TraceRecorder.startupSweep`) re-applies it at every host restart.
+    this.puts++
+    if (this.puts >= PAYLOAD_SWEEP_INTERVAL) { this.puts = 0; void this.sweep() }
     return { digest, bytes, stored: true }
+  }
+  /**
+   * Room for one payload of `bytes`: true when the write may proceed. The first
+   * call observes the root with a sweep; when the observation has no room, one
+   * reservation sweep runs and the caller either has room or (only possible when
+   * `bytes` exceeds the whole bound or the bound allows no file) must omit.
+   */
+  private async reserveRoom(bytes: number): Promise<boolean> {
+    const limits = this.limits
+    const hasRoom = (files: number, held: number): boolean => files + 1 <= limits.maxFiles && held + bytes <= limits.maxBytes
+    if (this.tracked !== undefined && hasRoom(this.tracked.files, this.tracked.bytes)) return true
+    const report = await this.sweep({ reserveFiles: 1, reserveBytes: bytes })
+    this.tracked = { files: report.filesAfter, bytes: report.bytesAfter }
+    return hasRoom(report.filesAfter, report.bytesAfter)
   }
   async read(digest: string): Promise<string | undefined> {
     if (!DIGEST.test(digest)) return undefined
@@ -144,6 +430,54 @@ export class TracePayloadStore {
     const text = await this.read(ref.digest)
     return text !== undefined && digestText(text) === ref.digest
   }
+  /** The last completed real sweep of this store: at a host start, a reservation, a cadence or a caller. */
+  get lastSweep(): TraceSpillReport | undefined { return this.last }
+  /**
+   * One bounded sweep of this store's directory, queued behind any sweep already
+   * running so two sweeps cannot race and a reservation is honoured by the sweep
+   * that sees it. A dry run measures without replacing {@link lastSweep}, which
+   * records what the last real sweep reclaimed.
+   */
+  sweep(options: { dryRun?: boolean; now?: number; reserveFiles?: number; reserveBytes?: number } = {}): Promise<TraceSpillReport> {
+    const run = (): Promise<TraceSpillReport> => sweepTraceSpill({
+      root: this.directory, limits: this.spill.limits,
+      ...(this.spill.warn === undefined ? {} : { warn: this.spill.warn }), ...options,
+    }).then(report => {
+      if (!report.dryRun || this.last === undefined) this.last = report
+      return report
+    })
+    const queued = this.sweeps.then(run, run)
+    this.sweeps = queued.then(() => undefined, () => undefined)
+    return queued
+  }
+  /**
+   * The live instrument (`traceMetrics().payloads.spill`): what the directory
+   * holds now and what a sweep would reclaim, measured by a dry run so reading
+   * the metric never changes the store.
+   */
+  async spillState(): Promise<TraceSpillState> {
+    const report = await this.sweep({ dryRun: true })
+    return {
+      files: report.files, bytes: report.bytes, cleanable: report.files - report.filesAfter,
+      cleanableBytes: report.bytes - report.bytesAfter, maxFiles: report.limits.maxFiles,
+      maxBytes: report.limits.maxBytes, retentionMs: report.limits.retentionMs,
+      ...(this.last === undefined ? {} : { lastSweep: this.last }),
+    }
+  }
+}
+/** Bound, cleanable headroom and the last sweep, as reported by `traceMetrics`. */
+export interface TraceSpillState {
+  /** Regular files currently in the spill root. */
+  files: number
+  /** Bytes currently held. */
+  bytes: number
+  /** Regular files a sweep would reclaim right now. */
+  cleanable: number
+  cleanableBytes: number
+  maxFiles: number
+  maxBytes: number
+  retentionMs: number
+  lastSweep?: TraceSpillReport
 }
 
 /** Structural slice of `SwarmStore` the trace layer needs; keeps store.ts untouched. */
@@ -151,6 +485,130 @@ export interface TraceStore {
   events(missionId: string, limit: number, after?: number): SwarmEvent[]
   event(missionId: string, type: string, actor: string, data: unknown): void
   transaction<T>(operation: () => T): T
+}
+
+/**
+ * R17-G10: the host telemetry sink (`session-telemetry`), declared structurally.
+ *
+ * The host package `@deepseek-ai/dsh-session-telemetry` v0.1.3-alpha.2
+ * (harness commit 82a5fd61) defines `SessionTelemetryRecord` and
+ * `SessionTelemetrySink` and registers the sink as the `sessionTelemetry`
+ * service; the record shape below is that contract verbatim
+ * (`channel`/`time`/`severity`/`attributes`/`body`, with `emit` a non-blocking
+ * enqueue). It is declared here instead of imported so this package keeps no
+ * runtime or build dependency on a host package it does not declare
+ * (package.json is outside this branch's scope, and the deployed plugin
+ * installs only its declared peers); the binding is made through the cordis
+ * service registry in `src/index.ts`, which is how the host expects an optional
+ * integration to be discovered.
+ *
+ * What the host contract does NOT cover, and why the durable row stays: the
+ * sink is fire-and-forget with no read-back, so it cannot be the durable home of
+ * a span. `scripts/replay/replay.mjs` re-derives the decision sequence from the
+ * persisted `trace/span` rows, `tests/trace-*.test.mjs` assert their contract,
+ * and `tests/reader-census.test.mjs` records `trace/span` as a kept kind read by
+ * `src/tools.ts`. Dropping the row would delete an observable contract, which
+ * the acceptance forbids; the sink is therefore the reporting transport and the
+ * log row remains the record. The host's own capture coordinator also cannot
+ * help here: it mirrors host session events, and a swarm span is a plugin event
+ * in the swarm store.
+ */
+export interface HostTelemetryRecord {
+  channel: 'ledger' | 'ops'
+  time: number
+  severity: 'info' | 'warn' | 'error'
+  attributes: Record<string, string | number>
+  body: unknown
+}
+/** The minimum the host sink contract requires of a reporting backend. */
+export interface HostTelemetrySink {
+  emit(record: HostTelemetryRecord): void
+  flush?(): void
+  shutdown?(): Promise<void>
+}
+/**
+ * Map one durable span onto the host sink's ops record. `channel: 'ops'` is the
+ * host's channel for a signal with no session-log home (a swarm span is not a
+ * host session event, so it can never be a `ledger` row); the body is the
+ * complete span row, so nothing observable is lost in transport.
+ */
+export function hostTelemetryRecord(span: TraceSpan): HostTelemetryRecord {
+  return {
+    channel: 'ops',
+    time: span.endedAt,
+    severity: span.status === 'error' ? 'error' : 'info',
+    attributes: {
+      'telemetry.op': 'swarm.span',
+      'mission.id': span.missionId,
+      'trace.id': span.traceId,
+      'span.id': span.spanId,
+      ...(span.parentSpanId === undefined ? {} : { 'parent.span.id': span.parentSpanId }),
+      ...(span.taskId === undefined ? {} : { 'task.id': span.taskId }),
+      ...(span.attemptId === undefined ? {} : { 'attempt.id': span.attemptId }),
+      step: span.step, operation: span.operation, status: span.status,
+      ...(span.errorType === undefined ? {} : { 'error.type': span.errorType }),
+    },
+    body: span,
+  }
+}
+/**
+ * One runtime's binding to the host sink. The service may be mounted before or
+ * after this plugin (`ctx.inject` fires whenever it appears), so recorded spans
+ * read a mutable link instead of a value captured at construction. Emission is
+ * contained exactly as the host contains a backend failure: a throwing sink is
+ * counted and never allowed to cost the durable row.
+ */
+export class HostTelemetryLink {
+  private sink?: HostTelemetrySink
+  private emitted = 0
+  private failed = 0
+  attach(sink: HostTelemetrySink | undefined): void { this.sink = sink }
+  detach(): void { this.sink = undefined }
+  bound(): boolean { return this.sink !== undefined }
+  /** Hand one span to the host sink; returns whether a record was enqueued. */
+  emit(span: TraceSpan): boolean {
+    if (this.sink === undefined) return false
+    try { this.sink.emit(hostTelemetryRecord(span)); this.emitted++; return true }
+    catch { this.failed++; return false }
+  }
+  /** Records enqueued and sink failures contained, for the round's instrument. */
+  counts(): { emitted: number; failed: number } { return { emitted: this.emitted, failed: this.failed } }
+}
+const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()
+/**
+ * The telemetry link belongs to the runtime object, not to the recorder: the
+ * recorder is built by `src/tools.ts` (outside this change's scope) while the
+ * cordis context that owns the sink is only available in `src/index.ts`, so the
+ * two meet on the runtime identity they already share. Binding first or
+ * attaching later both yield one shared link.
+ */
+export function bindHostTelemetry(runtime: object): HostTelemetryLink {
+  const existing = hostTelemetryLinks.get(runtime)
+  if (existing !== undefined) return existing
+  const link = new HostTelemetryLink()
+  hostTelemetryLinks.set(runtime, link)
+  return link
+}
+const hostTelemetryFor = (runtime: unknown): HostTelemetryLink | undefined =>
+  runtime !== null && typeof runtime === 'object' ? hostTelemetryLinks.get(runtime) : undefined
+
+/**
+ * R17-G10: the declared spill limits a runtime config asks for, with the
+ * defaults applied for an omitted or invalid value. `src/tools.ts` builds the
+ * recorder from the runtime (out of this branch's scope), so the bound travels
+ * on the runtime's own config, whose schema defaults live in `src/index.ts`.
+ */
+export function traceSpillLimits(config: unknown): TraceSpillLimits {
+  const row = (config ?? {}) as Record<string, unknown>
+  const positive = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  const days = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+  return {
+    maxBytes: positive(row.traceSpillMaxBytes) ?? DEFAULT_TRACE_SPILL_LIMITS.maxBytes,
+    maxFiles: positive(row.traceSpillMaxFiles) ?? DEFAULT_TRACE_SPILL_LIMITS.maxFiles,
+    retentionMs: (days(row.traceSpillRetentionDays) ?? TRACE_SPILL_RETENTION_DAYS) * MS_PER_DAY,
+  }
 }
 
 const SEED_LIMIT = 20000
@@ -172,15 +630,25 @@ interface SpanIndex {
 export class TraceRecorder {
   private readonly indexes = new Map<string, SpanIndex>()
   private readonly unscoped = new Map<string, number>()
-  constructor(readonly store: TraceStore, readonly payloads: TracePayloadStore) {}
+  /**
+   * R17-G10: one bounded sweep per recorder — and a recorder is built once per
+   * plugin start, so the spill is re-bounded on every host restart without
+   * anyone having to remember to run a sweeper. Never rejects; the report is
+   * recorded as `payloads.spill.lastSweep` on the metrics path.
+   */
+  readonly startupSweep: Promise<TraceSpillReport>
+  constructor(readonly store: TraceStore, readonly payloads: TracePayloadStore, readonly telemetry?: HostTelemetryLink) {
+    this.startupSweep = payloads.sweep()
+  }
   /** A recorder exists only when the runtime owns a durable store and state path. */
   static forRuntime(runtime: unknown): TraceRecorder | undefined {
-    const candidate = runtime as { config?: { statePath?: unknown }; store?: Partial<TraceStore> } | undefined
+    const candidate = runtime as { config?: { statePath?: unknown } & Record<string, unknown>; store?: Partial<TraceStore> } | undefined
     const statePath = candidate?.config?.statePath
     const store = candidate?.store
     if (typeof statePath !== 'string' || !statePath) return undefined
     if (!store || typeof store.event !== 'function' || typeof store.transaction !== 'function' || typeof store.events !== 'function') return undefined
-    return new TraceRecorder(store as TraceStore, new TracePayloadStore(join(dirname(statePath), 'trace-payloads')))
+    const spill: TraceSpillOptions = { limits: traceSpillLimits(candidate?.config) }
+    return new TraceRecorder(store as TraceStore, new TracePayloadStore(join(dirname(statePath), 'trace-payloads'), 262144, spill), hostTelemetryFor(runtime))
   }
   private index(missionId: string): SpanIndex {
     const existing = this.indexes.get(missionId)
@@ -255,6 +723,10 @@ export class TraceRecorder {
     if (reason) throw new TraceContractError(`Refusing to record a span that violates the D6 contract: ${reason}`, undefined, context.step)
     this.store.transaction(() => this.store.event(context.missionId, 'trace/span', context.actor, span))
     this.remember(this.index(context.missionId), span)
+    // R17-G10: the durable row is written first, then the host sink is fed. The
+    // sink is a reporting transport (contained, counted, never rethrowing), so a
+    // backend failure can never cost the record or the mission.
+    this.telemetry?.emit(span)
     return span
   }
 }
@@ -293,13 +765,13 @@ export interface TraceMetrics {
   violations: TraceViolation[]
   firstViolatingStep?: TraceViolation
   operations: Record<string, number>
-  payloads: { referenced: number; stored: number; omitted: number; verified: number; missing: number; mismatched: number }
+  payloads: { referenced: number; stored: number; omitted: number; verified: number; missing: number; mismatched: number; spill?: TraceSpillState }
 }
 /** Contract compliance, causal closure and first-violating-step over a span window (F-44). */
 export async function traceMetrics(spans: readonly TraceSpan[], options: { payloads?: TracePayloadStore; seqOf?: (span: TraceSpan, index: number) => number | undefined } = {}): Promise<TraceMetrics> {
   const violations: TraceViolation[] = []
   const operations: Record<string, number> = {}
-  const payloads = { referenced: 0, stored: 0, omitted: 0, verified: 0, missing: 0, mismatched: 0 }
+  const payloads: TraceMetrics['payloads'] = { referenced: 0, stored: 0, omitted: 0, verified: 0, missing: 0, mismatched: 0 }
   const known = new Set(spans.map(span => span?.spanId))
   let roots = 0, orphans = 0
   const refs: TracePayloadRef[] = []
@@ -318,7 +790,12 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
       if (ref.stored) { payloads.stored++; refs.push(ref) } else payloads.omitted++
     }
   })
-  if (options.payloads) for (const ref of refs) { if (await options.payloads.verify(ref)) payloads.verified++; else { payloads.missing++; payloads.mismatched++ } }
+  if (options.payloads) {
+    for (const ref of refs) { if (await options.payloads.verify(ref)) payloads.verified++; else { payloads.missing++; payloads.mismatched++ } }
+    // R17-G10: the live instrument for the declared spill bound — files/bytes
+    // held, what a sweep would reclaim, and the last sweep's report.
+    payloads.spill = await options.payloads.spillState()
+  }
   const total = spans.length
   const first = violations.find(violation => violation.seq !== undefined) ?? violations[0]
   return {

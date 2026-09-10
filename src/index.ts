@@ -1,5 +1,5 @@
 /** DeepSeek Harness plugin: a durable swarm runtime over existing agent/session APIs. */
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
@@ -12,6 +12,9 @@ import { registerTools, SWARM_PROMPT } from './tools.ts'
 import { RoleScoper } from './roles.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
+import { liveLineageSubject, noticeFamily } from './notices.ts'
+import { installSwarmInvariant } from './invariant.ts'
+import { bindHostTelemetry, DEFAULT_TRACE_SPILL_LIMITS, TRACE_SPILL_RETENTION_DAYS, type HostTelemetrySink } from './trace.ts'
 import type { Budget } from './types.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
@@ -60,6 +63,16 @@ export interface Config {
    */
   authorizedWorkspaces: WorkspaceGrant[]
   defaultBudget: Budget
+  /**
+   * R17-G10: hard bound, in bytes, on the content-addressed span-payload spill
+   * beside the state file. Oldest payloads are evicted first, and an evicted
+   * payload is reported as `missing` by `traceMetrics`, never silently.
+   */
+  traceSpillMaxBytes: number
+  /** R17-G10: hard bound on the number of payload files held by the spill. */
+  traceSpillMaxFiles: number
+  /** R17-G10: days a payload file is retained; `0` disables age retention and keeps the size bound only. */
+  traceSpillRetentionDays: number
 }
 export const Config: z<Config> = z.object({
   statePath: z.string().default(join(homedir(), '.dsh/agent-swarm/swarm.sqlite')),
@@ -99,7 +112,36 @@ export const Config: z<Config> = z.object({
     maxTasks: z.natural().min(1).default(40),
     maxExperiments: z.natural().min(0).default(8),
   }),
+  // The spill bound defaults come from the trace module's declared limits, so
+  // the schema and the sweep cannot disagree about what the bound is.
+  traceSpillMaxBytes: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxBytes),
+  traceSpillMaxFiles: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxFiles),
+  traceSpillRetentionDays: z.natural().min(0).default(TRACE_SPILL_RETENTION_DAYS),
 })
+
+/**
+ * R17-G10: adopt the host telemetry sink for this runtime.
+ *
+ * The sink is a cordis service (`ctx.sessionTelemetry` from
+ * `@deepseek-ai/dsh-session-telemetry`), so the plugin discovers it through the
+ * registry instead of importing the host package: `ctx.inject` fires whether the
+ * backend is mounted before or after this plugin, and a composition with no
+ * backend mounted records exactly as before (durable span rows, no sink) — the
+ * host's own "no backend" behaviour, not this plugin's silence. The link is
+ * created before `registerTools` builds the recorder and shared through the
+ * runtime identity, because the recorder's construction site (`src/tools.ts`) is
+ * outside this change's scope while the context is only available here. The
+ * disposer detaches the sink with the plugin fiber, so no backend keeps a
+ * reporter after unload; the fiber is returned so a caller (and the pair test)
+ * can reach it.
+ */
+export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
+  const link = bindHostTelemetry(runtime as object)
+  return ctx.inject(['sessionTelemetry'], scoped => {
+    link.attach(scoped.get('sessionTelemetry') as HostTelemetrySink | undefined)
+    return () => link.detach()
+  })
+}
 
 /** Register the host service and all consumers under one disposable plugin fiber. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
@@ -119,6 +161,27 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
   ctx.provide('swarm', runtime)
+  // R17-G9: the pre-append invariant pilot. The companion registers through the
+  // host's `ctx.invariants` facility (the same one twelve host packages use), so
+  // an owner-facing decision naming a subject whose lineage still has a live path
+  // is refused BEFORE its host session event is published. The judge maps one
+  // relayed swarm message to the shared lineage predicate (`liveLineageSubject`,
+  // the emission-time counterpart of the wake-precision classifier); a deployment
+  // that mounts no invariant registry keeps working and reports the pilot as not
+  // landed through `swarmInvariantStatus`.
+  installSwarmInvariant(ctx, message => {
+    const source = message.source
+    if (source?.kind !== 'swarm' || typeof source.deliveryId !== 'string') return undefined
+    const delivery = runtime.store.get('deliveries', source.deliveryId)
+    if (delivery === undefined || delivery.to !== 'owner') return undefined
+    const family = noticeFamily(delivery)
+    const reason = liveLineageSubject(runtime, { missionId: delivery.missionId, family, subjects: delivery.subjects ?? [] })
+    if (reason === undefined) return undefined
+    return { missionId: delivery.missionId, family, subjects: [...(delivery.subjects ?? [])], reason, deliveryId: delivery.id }
+  })
+  // R17-G10: the host sink link exists before the recorder does; `registerTools`
+  // builds the recorder from the runtime identity this binding is keyed on.
+  installHostTelemetry(ctx, runtime)
   registerTools(ctx, runtime, config.defaultBudget, grants)
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })

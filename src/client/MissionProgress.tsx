@@ -1,9 +1,24 @@
 import type { Snapshot } from '../types.ts'
 import { useEffect, useState } from 'react'
+import { avatarCells } from './avatar.ts'
 import { acceptanceSummary, activityDuration, currentProgress, recentProgress, sidebarState, type ConnectionState } from './progress.ts'
 import { useCopy } from './locale.tsx'
 
 function timestamp(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }
+/**
+ * R17-G12: the worker's sprite, drawn inline as `<rect>`s with `crispEdges`.
+ * It is decoration derived from the name, so it is `aria-hidden` — identity
+ * stays with the name text — and it adds no image asset, no request, no
+ * dependency and no model turn.
+ */
+export function WorkerAvatar({ name }: { name: string }) {
+  const sprite = avatarCells(name), size = sprite.grid * sprite.cell
+  return <svg className="sw-worker-avatar" aria-hidden="true" focusable="false" role="presentation"
+    width={size} height={size} viewBox={`0 0 ${size} ${size}`} shapeRendering="crispEdges">
+    {sprite.cells.map(cell => <rect key={`${cell.x}:${cell.y}`} x={cell.x * sprite.cell} y={cell.y * sprite.cell}
+      width={sprite.cell} height={sprite.cell} fill={cell.color} />)}
+  </svg>
+}
 export function MissionProgress({ snapshot, connection = 'connected', live = false }: { snapshot: Snapshot; connection?: ConnectionState; live?: boolean }) {
   const t = useCopy(), current = currentProgress(snapshot, connection)
   const [clock, setClock] = useState(() => live && connection === 'connected' ? Date.now() : current.activity?.updatedAt ?? snapshot.mission.updatedAt)
@@ -23,7 +38,11 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     <strong>{t(current.label)}</strong>
     {current.task && <p>{current.task.title}</p>}
     {current.note && <p className="sw-focus-note">{t(current.note)}</p>}
-    {current.member && <p className="sw-focus-note">{current.member.name}{current.activity?.tool ? ` · ${current.activity.tool}` : ''}</p>}
+    {current.member && <p className="sw-focus-note sw-person" data-swarm-member={current.member.id}
+      data-swarm-worker-name={current.member.name} data-swarm-worker-role={current.member.role}>
+      <WorkerAvatar name={current.member.name} />
+      {`${current.member.name} · ${current.member.role}`}{current.activity?.tool ? ` · ${current.activity.tool}` : ''}
+    </p>}
     {current.activity && <p className="sw-focus-note"><span data-swarm-elapsed={current.activity.startedAt}>{t('Elapsed')} {duration!.minutes > 0 ? `${duration!.minutes}${t('min')} ` : ''}{duration!.seconds}{t('sec')}</span>
       {' · '}{t('Activity started')} {timestamp(current.activity.startedAt)}
       {current.activity.kind === 'retry' && current.activity.retryAt && <> · {t('Retry scheduled for')} {timestamp(current.activity.retryAt)}</>}

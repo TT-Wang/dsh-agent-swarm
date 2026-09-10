@@ -358,13 +358,18 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     assert.equal(baseline.totals[RECOVERABLE], 0)
     assert.equal(baseline.totals[DEAD_END], 0)
 
-    // ONE unrelated member goes to `working`. Nothing about the reviews changes.
-    f.runtime.store.transaction(() => {
-      const reviewer = f.runtime.store.get('members', f.reviewer.id)
-      reviewer.status = 'working'
-      f.runtime.store.put('members', reviewer)
-    })
-    const after = census(f.runtime.scheduling.guardBoard(f.mission.id))  // re-read after the flip
+    // ONE unrelated member goes to `working`, driven through the production path:
+    // the member claims a fifth task of its own, so the runtime's derived member
+    // board (the registered projection when published, the one derivation
+    // otherwise) reports it as working. Both the board and the classification are
+    // production values; only the task list is projected back to the four
+    // reviews, so the same four subjects are classified before and after.
+    const unrelated = f.propose({ title: 'Unrelated work', assigneeId: f.reviewer.id })
+    await f.runtime.claim(f.actor(f.reviewer), f.mission.id, unrelated.id)
+    const driven = f.runtime.scheduling.guardBoard(f.mission.id)
+    assert.equal(driven.members.find(member => member.id === f.reviewer.id).status, 'working', 'the driven board really reports a working member')
+    const workingBoard = { ...driven, tasks: driven.tasks.filter(task => reviews.includes(task.id)) }
+    const after = census(workingBoard)
     assert.equal(after.totals[OWNER_GATED], 4, 'an unrelated working member must not change the owner-gated count')
     assert.equal(after.totals[RECOVERABLE], 0, 'and must not invent recovery for a blocked review')
     assert.equal(after.totals[DEAD_END], 0, 'and must not invent a dead end either')
@@ -388,7 +393,6 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     }
     const mutantBaseline = preFixCensus(idleBoard)
     assert.equal(mutantBaseline.totals[OWNER_GATED], 4, 'with every member idle the pre-D1 census agrees, so the flip is caused by the working member alone')
-    const workingBoard = f.runtime.scheduling.guardBoard(f.mission.id)
     const mutantAfter = preFixCensus(workingBoard)
     assert.equal(mutantAfter.totals[OWNER_GATED], 0, 'without the task-scoped projection the unrelated working member flips every review')
     assert.equal(mutantAfter.totals[RECOVERABLE], 4, 'and reports them as recoverable on a member that is not working on them')

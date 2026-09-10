@@ -142,16 +142,21 @@ const CENSUS = [
   ["src/harness-workers.ts",7,"Set","const claimedIds = new Set(messages.map(message => message.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/notices.ts",3,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
-  ["src/notices.ts",4,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",5,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",6,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
-  ["src/notices.ts",7,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",8,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",9,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",10,"Set","const roots = new Set(this.stallRoots(tasks).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",11,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/notices.ts",3,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call (the shared lineage helper `replacementCoverage`), so it cannot gate a later call"],
+  ["src/notices.ts",4,"Set","const roots = new Set(stallRootsFor(rt, tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside the one synchronous call of the R17-G9 refusal predicate, which re-reads the durable task rows on every call, so it cannot gate a later call"],
+  ["src/notices.ts",5,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
+  ["src/notices.ts",6,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
+  ["src/notices.ts",7,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
+  ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
+  ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
+  ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
+  ["src/notices.ts",11,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",12,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",13,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",14,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",15,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",1,"Map","const result = new Map<string, Record<string, unknown>>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",2,"Set","const names = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",3,"Map","const byKey = new Map(tasks.map(task => [task.key, task])), visiting = new Set<string>(), done = new Set<string>(), result: PlanTask[] = []","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -178,7 +183,7 @@ const CENSUS = [
   ["src/runtime.ts",19,"Map","const byId = new Map(tasks.map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",20,"Map","const chains = new Map<string, string[]>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",21,"Set","const candidate = visit(task.id, new Set())","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",22,"Set","const member: Member = { id: memberId, missionId, name: input.name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, status: 'idle', subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",22,"Set","const member: Member = { id: memberId, missionId, name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, phase: 'active', status: deriveMemberStatus('active', false), subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",23,"Set","knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",24,"Set","const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",25,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -188,12 +193,12 @@ const CENSUS = [
   ["src/runtime.ts",29,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",30,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",31,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",32,"Set","const live = new Set(this.store.list('members', missionId).filter(member => member.status !== 'stopped').map(member => member.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",32,"Set","const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",33,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",34,"Set","member.subscriptions = [...new Set(topics)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",35,"Map","const byKey = new Map(plan.tasks.map(task => [task.key, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",36,"Set","const pending = [...(byKey.get(key)?.dependencies ?? [])], visited = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",37,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",37,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",38,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",39,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",1,"Set","readonly releasedPasses = new Set<string>()","gate","derivable","S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
@@ -211,14 +216,23 @@ const CENSUS = [
   ["src/scheduling.ts",9,"Set","const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
-  ["src/trace.ts",1,"Map","private readonly indexes = new Map<string, SpanIndex>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",2,"Map","private readonly unscoped = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",3,"Map","const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",4,"Set","const known = new Set(spans.map(span => span?.spanId))","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",5,"Map","const counts = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",6,"Map","const tasks = new Map<string, string>(), members = new Map<string, string>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",7,"Set","const ATTEMPT_CLOSERS = new Set(['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/trace.ts",8,"Map","const open = new Map<string, { taskId: string; memberId: string }>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
+  ["src/store.ts",4,"Set","return new Set(rows.map(row => String(row.owner_id)))","local","","R17-G7 function-local: the owner ids of the running attempts in one mission, read from the durable tasks table and discarded inside the same synchronous hydration, so it cannot gate a later call"],
+  ["src/trace.ts",1,"Set","const reclaimed = new Set<string>()","local","","function-local: created and discarded inside one sweep call, so it cannot gate a later call; the selection it drives is re-derived from the files' mtimes and the declared bound on every later sweep"],
+  ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: the runtime-to-host-sink link registry for the telemetry transport; a missing link can drop one reporting record, never a durable row or a mission decision (the span row is appended before the sink is consulted)"],
+  ["src/trace.ts",3,"Map","private readonly indexes = new Map<string, SpanIndex>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",4,"Map","private readonly unscoped = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",5,"Map","const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",6,"Set","const known = new Set(spans.map(span => span?.spanId))","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",7,"Map","const counts = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",8,"Map","const tasks = new Map<string, string>(), members = new Map<string, string>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS = new Set(['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/trace.ts",10,"Map","const open = new Map<string, { taskId: string; memberId: string }>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
+  // R17-G12: the roster lookup inside `nextWorkerName`. It is rebuilt from the
+  // mission's durable member rows at every admission and discarded with the
+  // call, so it cannot gate a later one: the pool order and the durable rows are
+  // the state, and losing the Set merely recomputes the same next name.
+  ["src/types.ts",1,"Set","const taken = new Set(used)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/web-api.ts",1,"Set","const providers = new Set(ctx.llm.listProviders().map(provider => provider.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/web-api.ts",2,"Set","const visibleScopes = () => new Set([sessionId, ...runtime.visibleMissions(actor).map(mission => mission.id)])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/web-api.ts",3,"Set","const changed = new Set(changes.flatMap(change => change.scopes).filter(scope => allowed.has(scope)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -618,7 +632,7 @@ const GATE_TESTS = {
       assert.ok(closed)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:3': async t => {
+  'src/notices.ts:5': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
       const task = f.propose({ title: 'Parked holder' })
@@ -627,13 +641,41 @@ const GATE_TESTS = {
       // Phantom presence: the set claims the notice for this attempt was sent,
       // but the durable delivery ledger has no such notice.
       f.runtime.parkedNotices.add(`parked:${f.mission.id}:${task.id}:${epoch}`)
-      f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', f.author.id); member.status = 'waiting'; f.runtime.store.put('members', member) })
+      // R17-G7: the park is durable state (`phase`); the live `status` is derived from it.
+      f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', f.author.id); member.phase = 'parked'; f.runtime.store.put('members', member) })
       const notice = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.to === 'owner' && /parked member/.test(delivery.content)),
         'the parked-holder notice is emitted from the durable state despite the phantom cache entry')
       assert.equal(notice.notice.dedupKey, `parked:${f.mission.id}:${task.id}:${epoch}`, 'the durable ledger is the gate')
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:4': async t => {
+  'src/notices.ts:9': async t => {
+    const f = await setup({ config: { tickMs: 10 } })
+    try {
+      f.runtime.notices.pendingTransitions.add('probe-mission')   // the loss must be exercised on a non-empty collection
+      assert.ok(f.runtime.notices.pendingTransitions.size > 0)
+      f.runtime.notices.pendingTransitions.clear()   // the loss
+      // The commit itself is the gate: a durable notice still lands after the
+      // publication queue was lost, because the write and its fact are committed.
+      f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'probe after a lost queue', [`mission:${f.mission.id}`], { trigger: 'probe/lost-queue', reason: 'probe' }))
+      const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('probe/lost-queue:'))
+      assert.equal(queued.length, 1, 'the durable outbox is unaffected by the lost publication queue')
+    } finally { await f.cleanup() }
+  },
+  'src/notices.ts:10': async t => {
+    const f = await setup({ config: { tickMs: 10 } })
+    try {
+      f.runtime.notices.wedgedReleases.add(f.mission.id)   // the loss must be exercised on a non-empty collection
+      assert.ok(f.runtime.notices.wedgedReleases.size > 0)
+      f.runtime.notices.wedgedReleases.clear()   // the loss
+      const task = f.propose({ title: 'Wedged marker lost' })
+      assert.ok(task?.id, 'the durable write is unaffected by the lost wedge marker')
+      // The release itself is durable; the next transition still publishes.
+      const state = f.runtime.passState(f.mission.id)
+      assert.equal(typeof state.passLive, 'boolean')
+      assert.equal(typeof state.wedged, 'boolean')
+    } finally { await f.cleanup() }
+  },
+  'src/notices.ts:6': async t => {
     const f = await setup()
     try {
       f.runtime.integrationGapWarned.add(`integration-gap:${f.mission.id}:2`)   // phantom presence
@@ -644,7 +686,7 @@ const GATE_TESTS = {
       assert.ok(notice)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:5': async t => {
+  'src/notices.ts:7': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
       const task = f.propose({ title: 'Blocked review path' })
@@ -662,7 +704,7 @@ const GATE_TESTS = {
       assert.ok(delivery)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:6': async t => {
+  'src/notices.ts:8': async t => {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100 } })
     try {
       const first = f.propose({ title: 'Notice' })

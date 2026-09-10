@@ -35,6 +35,14 @@ const PRE_BRANCH_UNCODED = 235
  * same total site set (235) rather than the shrinking subset that stayed put.
  */
 const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts']
+/**
+ * R17-G12 added exactly one site to this set: `[worker_name_pool_exhausted]` in
+ * `src/runtime.ts` (`addMember` refuses a name-less admission once every pool
+ * name is taken, with the explicit-`name` exit named). It is coded and
+ * compliant, so it does not move the uncoded count below; the total is raised by
+ * one so the "every site is still exposed" property keeps covering the union.
+ */
+const ADDED_SITES = 1
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {
@@ -70,7 +78,7 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
       if (assessRefusal(site, { ...index, diagnosticProducers: producers }).length) uncoded++
     }
   }
-  assert.equal(total, 235, 'the split control-path files still expose every refusal site (186 + 49)')
+  assert.equal(total, 235 + ADDED_SITES, 'the split control-path files still expose every refusal site (186 + 49, plus this round\'s coded site)')
   assert.ok(uncoded < PRE_BRANCH_UNCODED,
     `this branch must shrink the uncoded inventory (pre-branch ${PRE_BRANCH_UNCODED}, now ${uncoded})`)
   assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length,

@@ -2,7 +2,23 @@
 export type MissionStatus = 'staged' | 'active' | 'paused' | 'blocked' | 'completed' | 'stopped'
 export type TaskKind = 'research' | 'implementation' | 'verification' | 'integration'
 export type TaskStatus = 'pending' | 'running' | 'submitted' | 'accepted' | 'blocked' | 'cancelled'
+/**
+ * R17-G7: the live member status. It is DERIVED, never durable: `SwarmStore`
+ * strips it from every member write and re-derives it on every member read from
+ * the durable `MemberPhase` plus the tasks that name the member as the owner of
+ * a running attempt (`src/projection.ts`, `deriveMemberStatus`). No stored field
+ * can therefore mirror a live fact, which is what makes the R15-F2 seam — a
+ * durable row saying `idle` while a live attempt exists — impossible by
+ * construction instead of repaired by reconciliation.
+ */
 export type MemberStatus = 'idle' | 'working' | 'waiting' | 'stopped'
+/**
+ * R17-G7: the durable member lifecycle phase — the only member lifecycle state
+ * the store persists. `active` is the default (and what every row written
+ * before the phase existed means); `parked` is the member's own `swarm_wait`
+ * intent, which survives a restart; `stopped` is terminal.
+ */
+export type MemberPhase = 'active' | 'parked' | 'stopped'
 export type EvidenceStatus = 'unverified' | 'verified' | 'challenged' | 'refuted'
 /** Per-task effort dimensions that block the task itself instead of draining the mission budget. */
 export type TaskCeilingDimension = 'maxSteps' | 'maxFindings'
@@ -195,6 +211,20 @@ export interface Member {
   role: string
   sessionId: string
   workspace: string
+  /**
+   * R17-G7: durable lifecycle phase. Absent means `active` (rows written before
+   * the phase existed), which keeps old state files readable without a
+   * migration. Every writer that used to set a live `status` now sets this.
+   */
+  phase?: MemberPhase
+  /**
+   * R17-G7: the derived live status (see {@link MemberStatus}). It is present on
+   * every member record — a store read re-derives it and an in-memory record
+   * carries the value its builder computed — but it is never written to the
+   * store: `SwarmStore.put('members')` drops it, so a caller that assigns it
+   * changes nothing durable. The one derivation lives in `src/projection.ts` and
+   * is what the scheduler, the owner views and the guard board read.
+   */
   status: MemberStatus
   activity?: WorkerActivity
   subscriptions: string[]
@@ -214,6 +244,30 @@ export interface Member {
    * a successful start or a successful operation.
    */
   providerOutage?: MemberProviderOutage
+}
+/**
+ * R17-G12 (mission acceptance 12): the fixed pool a worker name is drawn from,
+ * in assignment order. Human English given names only — no vendor or product
+ * name (Claude was removed from the pool at the user's direction) — and more
+ * than any mission's worker budget, so a name-less admission never exhausts the
+ * pool before the budget does. The name is a display identity: `role` keeps the
+ * responsibility text unchanged and every protocol address stays the member id.
+ */
+export const WORKER_NAME_POOL = [
+  'Ada', 'Alan', 'Anita', 'Barbara', 'Beatrice', 'Ben', 'Carol', 'Dennis', 'Dora', 'Ed',
+  'Edsger', 'Elena', 'Emmy', 'Erik', 'Frances', 'Grace', 'Hedy', 'Ivan', 'Jean', 'Ken',
+  'Linus', 'Margaret', 'Maria', 'Nadia', 'Niels', 'Olga', 'Omar', 'Peter', 'Radia', 'Raj',
+  'Rich', 'Rita', 'Rosa', 'Ruth', 'Sophie', 'Tim', 'Vera', 'Vint', 'Wanda', 'Yukihiro',
+] as const
+/**
+ * The next unused name in assignment order, or undefined when every name is
+ * taken. `used` is every name the mission's members already carry — including a
+ * stopped member — because a name is never reused while the mission is active,
+ * and the runtime passes the mission's whole durable roster.
+ */
+export function nextWorkerName(used: Iterable<string>): string | undefined {
+  const taken = new Set(used)
+  return WORKER_NAME_POOL.find(name => !taken.has(name))
 }
 export interface Workstream {
   id: string
@@ -481,6 +535,35 @@ export interface SwarmEvent {
   actor: string
   data: unknown
   createdAt: number
+}
+/**
+ * R17-G9: one owner-facing decision candidate, judged before it is written. The
+ * candidate is what the emission site knows: the mission, the notice family (from
+ * the explicit option or the dedup key) and the subjects the decision names as
+ * `taskId@epoch` (or the mission root).
+ */
+export interface DecisionCandidate {
+  missionId: string
+  /** The notice family; only the families whose claim is "no live path will advance this subject" are judged. */
+  family?: string
+  /** The named subjects, at their current epoch. */
+  subjects: readonly string[]
+}
+/**
+ * R17-G9: one refused decision, recorded as a measurement. A refusal is never a
+ * silent no-op: the emission-time refusal records `emission` (nothing durable was
+ * written), the host pre-append invariant records `append` (the host session
+ * append was refused before publication).
+ */
+export interface DecisionRefusal {
+  at: number
+  missionId: string
+  family: string
+  subjects: string[]
+  reason: string
+  stage: 'emission' | 'append'
+  /** The durable delivery the append-stage refusal named, when one exists. */
+  deliveryId?: string
 }
 /**
  * S6: critical-path accounting for one mission, projected next to its total

@@ -501,7 +501,8 @@ test('watch removes mission data when a worker loses read membership', async t =
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
   const initial = (await f.rpc('state', { sessionId: member.sessionId })).result.value
   assert.equal(initial.snapshots.length, 1)
-  f.runtime.store.transaction(() => f.runtime.store.put('members', { ...member, status: 'stopped' }))
+  // R17-G7: the durable phase is what stops a member; the live status is derived.
+  f.runtime.store.transaction(() => f.runtime.store.put('members', { ...member, phase: 'stopped' }))
   const removed = (await f.rpc('watch', { sessionId: member.sessionId, afterRevision: initial.revision, waitMs: 0 })).result.value
   assert.equal(removed.kind, 'delta')
   assert.deepEqual(removed.missionIds, [])

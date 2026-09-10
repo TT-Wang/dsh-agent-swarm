@@ -99,7 +99,8 @@ test('R11-16: reviewability is derived from the captured artifact, not the decla
   t.after(f.cleanup)
   f.runtime.store.transaction(() => {
     const reviewer = f.runtime.store.get('members', f.reviewer.id)
-    reviewer.status = 'stopped'
+    // R17-G7: the durable phase is what stops a member; the live status is derived.
+    reviewer.phase = 'stopped'
     f.runtime.store.put('members', reviewer)
   })
   const source = proposeResearch(f)

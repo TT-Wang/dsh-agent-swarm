@@ -117,7 +117,7 @@ await runScenario({
       try {
         f.runtime.store.transaction(() => {
           const reviewer = f.runtime.store.get('members', f.reviewer.id)
-          reviewer.status = 'stopped'
+          reviewer.phase = 'stopped'
           f.runtime.store.put('members', reviewer)
         })
         const task = f.propose()
@@ -144,7 +144,7 @@ await runScenario({
       try {
         f.runtime.store.transaction(() => {
           const reviewer = f.runtime.store.get('members', f.reviewer.id)
-          reviewer.status = 'stopped'
+          reviewer.phase = 'stopped'
           f.runtime.store.put('members', reviewer)
         })
         const source = f.propose({ title: `${kind} source`, ...(kind === 'research' ? { kind: 'research', checks: undefined } : {}) })
@@ -208,7 +208,7 @@ await runScenario({
         // The adapter-side park state a pre-fix swarm_wait could create.
         f.runtime.store.transaction(() => {
           const parked = f.runtime.store.get('members', f.author.id)
-          parked.status = 'waiting'
+          parked.phase = 'parked'
           f.runtime.store.put('members', parked)
         })
         const notice = await eventually(() => ownerNotices(f).find(delivery => /parked member/.test(delivery.content)),

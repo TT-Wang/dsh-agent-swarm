@@ -171,7 +171,8 @@ test('S5: the durable notice ledger dedups decision notices when the in-memory s
   try {
     f.runtime.store.transaction(() => {
       const reviewer = f.runtime.store.get('members', f.reviewer.id)
-      reviewer.status = 'stopped'
+      // R17-G7: the durable phase is what stops a member; the live status is derived.
+      reviewer.phase = 'stopped'
       f.runtime.store.put('members', reviewer)
     })
     const task = f.propose()

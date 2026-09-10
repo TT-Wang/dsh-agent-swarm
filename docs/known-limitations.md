@@ -101,7 +101,7 @@ Round 2 deferred four defects and accepted two advisories without ranking them. 
 
 **Single-host, single-writer.** Admission, lease and budget accounting is durable but scoped to one host and one writer process at a time: every mutation serializes through a single SQLite writer connection. A competing writer is classified as `writer_busy` and retried with bounded backoff; progress is not guaranteed under sustained contention. Two writers against one store file, or one store shared across hosts, are unsupported. Multi-host horizontal scaling requires external coordination and is out of scope for this release.
 
-**The full verification suite requires the repository checkout, not the installed tarball.** The published tarball ships built `lib/`, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`. `npm run test:packed` verifies that shipped layout. `test`, `test:harness`, `test:faults`, `test:pack`, `test:profile`, `test:web`, `test:command-web` and the host-only `test:isolation` need `src/`, `tsconfig*.json`, `scripts/` and `tests/` from the repository; fault tier B additionally needs a built Harness checkout.
+**The full verification suite requires the repository checkout, not the installed tarball.** The published tarball ships built `lib/`, the manifest, `cordis.patch.yml`, the `profile/` mount bundle, four documents and `scripts/packed-smoke.mjs`. `npm run test:packed` verifies that shipped layout. `test`, `test:harness`, `test:faults`, `test:pack`, `test:profile`, `test:bundle`, `test:web`, `test:command-web` and the host-only `test:isolation` need `src/`, `tsconfig*.json`, `scripts/` and `tests/` from the repository; fault tier B additionally needs a built Harness checkout.
 
 ## Round 15 Pass 2 — the reader census and what it deleted
 
@@ -178,9 +178,159 @@ so **"handled" is UNTESTABLE with the missing instrument**; resolutions remain t
 recorded design hazard for wiring consumption: `flushOutbox` writes the whole delivery row after `deliver()`
 returns, so a stale whole-row put can clobber a concurrently recorded `consumedAt`.
 
+**Member phase vs. derived status (R17-G7).** The durable member `phase` (`active`/`parked`/`stopped`) is the only
+member lifecycle state the store persists; the live `status` (`idle`/`working`/`waiting`/`stopped`) is derived on
+every read from the phase plus the tasks that name the member as the owner of a running attempt, and the store
+drops any presented status on write. Rows written before the phase existed are mapped by the one rule in
+`src/projection.ts#memberPhaseOf` (used by both the read hydration and the write funnel): a recorded `stopped` stays
+stopped and a recorded `waiting` stays parked, while a recorded `idle` or `working` maps to `active`, because those
+two were live facts rather than durable intent. **One intent is therefore not recoverable from the row itself:** a
+legacy `working` row that owns no running attempt now reads `idle` — the R17-G7 rule that no stored field mirrors a
+live fact, applied to the fact that is gone. Phase-less rows keep their old `status` field in the file until their
+next write, which normalizes the row to a phase; no migration runs at open and no durable migration event is
+recorded. The live store at the time of the round was exactly this shape (142 member rows, 0 with a phase, 114 of
+them `stopped`), and `tests/r17-projection.test.mjs` seeds that shape and pins that none of the 114 becomes
+dispatchable.
+
+**Wake generation (R17-B2/B2r): what the budget, the replay check and the absence net do not cover.** The per-owner
+wake budget is a default of 6 individual owner notices per 5-second window per mission; facts beyond it are carried
+by one degraded summary delivery that lists every fact (nothing is dropped), and the summary is updated in place
+while it is still undelivered — a burst that spans several windows therefore produces one summary per window rather
+than a single merged report, and the bound is a burst bound, not a lifetime quota. The fact replay check covers ALL SEVEN
+families in `NOTICE_TEMPLATES` (stall-root, fall-through, stall, parked, review-blocked, integration-gap,
+coverage-complete) and rebuilds each expected body in the test from the durable rows the notice cites — never by
+calling the production template and never with a hardcoded cause — so a template mutation that adds a claim no row
+supports reddens the declared check. The remaining `notify(` sites are enumerated PER SITE with the fact each one
+reads instead of the shared interpretation in `tests/r17-notices.test.mjs` (the guard-terminal, dispatch-question
+and budget/ceiling refusals compose their body from the refusal registry; the pass and attempt escalations read
+their own rows; the rendezvous reads two tool runs; the guard nudge reads the adapter handle); they are not
+replayable from a single template. Fact identity is keyed on the event TYPE (a second distinct same-type transition
+at the same subject@epoch and recorded reason is the same fact and is suppressed) and an explicit family replaces the
+trigger in the key; both rules are stated at `factKey` in `src/notices.ts`, where the key is defined.
+Cause-bearing generation is TRANSITION-DRIVEN: the runtime's commit funnel
+coalesces the commits of one operation and publishes the decision facts against the settled state, with the pass
+state selecting the one pass-end branch (a wedged or released pass asks its dispatch question, a live pass does
+not). **The sampled tick (`sweepDecisions`) emits exactly two absence instruments and no cause:** the absence net —
+the absence of a durable transition and the elapsed clock (default bound 600,000 ms, `Notices.absenceBoundMs`) —
+and the retained attempt-silence escalation (`Scheduling.sweepSilentAttempts`, one bounded `stall`-class notice per
+silent attempt, declared bound `attemptSilenceBoundMs`, default 600,000 ms), which states the silence and the
+elapsed clock rather than a cause. No cause-bearing classifier runs from a sampled tick.
+`Delivery`'s declared `claimedAt` field in `src/types.ts` is dead: no code writes or reads it (the field remains
+declared for compatibility with rows written by the deployed build). The ledger's transport `state` label `claimed` is retained for the gate/reader surfaces and
+is derived from `deliveredAt` only — it is never a consumption assertion; consumption is the separate `consumedAt`
+fact recorded from `agent/inbox/claimed` with a compare-and-swap.
+
 **Open hand-offs.** The attempt-closer vocabulary in the scheduling branch duplicates the private attempt-closer
 set in `src/trace.ts` (the replay truncation check is the cross-check; the duplication is recorded here rather
 than silently shared). The six host-only suites (`test:harness`, `test:pack`, `test:profile`, `test:isolation`,
 `test:web`, `test:command-web`) are blocked by the nested-sandbox environment — measured `SandboxUnavailableError`
 (`sandbox-exec: sandbox_apply: Operation not permitted`) and, for isolation, an `EPERM` `mkdtemp` under `$HOME` —
-so the accept-host-only-or-change-policy decision is owed to the owner rather than silently declared.
+so the accept-host-only-or-change-policy decision is owed to the owner rather than silently declared. The residual
+member-status writers outside this branch's scope (`src/attempts.ts`, `src/gates.ts`) are inert because the store
+drops the derived field; they are tracked by the round's own follow-up task rather than silently left unnamed.
+
+## Round-17 declarative mount (bundle profile, R17-G11)
+
+**What ships.** `profile/` is the bundle package `@dsh-external/dsh-agent-swarm-profile`: its runtime content is its
+patch document plus its dependency on the plugin. It inserts the `dsh-external-agent-swarm` row with both roots stated
+explicitly and portably (`$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm`, which is `~/.dsh/agent-swarm` by
+default), and it names its prerequisites (`@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app`), the supported Harness
+releases and its conflicting bundle layer (the plugin package itself) in its own `dsh.bundle` metadata. The Web client
+UI mounts with the same row, through the package's `dsh.client` declaration; no second row exists.
+`tests/r17-profile.test.mjs` proves the metadata, the portable roots, the host profile loader composing the bundle
+into exactly one row, the conflict being a real duplicate-row composition, and a real `dsh --profile web` boot at the
+default, overlay-supplied and environment-supplied roots.
+
+**What remains hand-run.**
+
+- The payload dependency is `file:..` because the platform is distributed as a source checkout and is not published to
+  a registry; a registry publication of the same release would carry the version range instead, and the mount command
+  would be `dsh plugin --profile web add @dsh-external/dsh-agent-swarm-profile`. Until then a `file:` mount packs the
+  payload, so the mount command must be re-run (or `dsh plugin --profile web install` run) after rebuilding the plugin;
+  the verified source command is in [README](../README.md#mount-by-declaration-bundle-profile).
+- **The preview deployment still uses the direct mount**: the plugin package as the profile's bundle layer, with
+  `preview.patch.yml` supplying absolute roots through the bespoke `scripts/update-preview.mjs`. Swapping it to the
+  declared mount is the campaign's attended deployment step, and it requires removing the direct plugin dependency
+  from the profile before adding the bundle, because both layers insert the `dsh-external-agent-swarm` row — the
+  conflict the bundle declares in its metadata. Until that swap, the hand-written overlay and the update script remain
+  the deployment's real mount path, and this round does not change them.
+- The composition states the two roots it owns explicitly; every other plugin setting keeps the plugin's documented
+  default in [`src/index.ts`](../src/index.ts), so the composition is a mount declaration, not a full configuration
+  mirror.
+- `tests/r17-profile.test.mjs` mounts the profile the way the CLI install leaves it (the bundle in the profile's
+  `node_modules` with its payload resolvable beside it) without invoking a package manager, so the declared check needs
+  no pnpm binary; the `file:` install command itself is exercised by the attended deployment and by the round's
+  recorded mounting evidence, not by that check.
+
+## Round-17 integration (seven accepted artifacts, base `f265919`)
+
+**What the assembled tree carries.** Seven accepted artifacts composed by hand onto the round-16 head `f265919`:
+B1r2 `6cdd426d` (registered mission projection, durable `phase` plus derived status, no stored status mirror), B2r4
+`00cfe0c3` (one shared interpretation, replayable notices, fact-keyed repetition, one per-owner wake budget, the
+absence net, real consumption from the host claimed signal), Cr `0e7d12f8` (host telemetry sink, and the spill bound
+as a real ceiling), D `46a69294` (pre-append invariant), E2 `5ab322cd` (declarative bundle profile), Fr3 `cabae21f`
+(human worker names and pixel avatars, tool boundary included) and F19r2 `969c40a4` (the no-silent-state report
+restored). B2r4 was composed on B1r2, and D and F19r2 on B2r4, so the composition order follows that lineage: B1r2,
+B2r4, D, F19r2, then the independent Cr, Fr3 and E2. The tool surface is unchanged at 24 `SWARM_TOOLS`; the suite
+grew from 109 to 116 test files, and two new source modules carry the projection and the invariant.
+
+**Containment (measured, not assumed).** The assembled changed-path set is exactly the union of the seven deltas — 43
+paths, 0 extra, 0 missing — and the 34 paths an artifact touched exclusively are byte-identical to that artifact's
+tree. Every added line of every branch survives on the shared paths except six lines resolved by intent in three
+pairs (below); 21 lines that a composed successor rewrote are superseded by that successor's accepted tree, not lost.
+
+**The conflicts, resolved by intent.**
+- `src/runtime.ts` (B1r2 x Fr3, on member admission): the merged admission keeps B1r2's durable-phase predicate and
+  Fr3's resolved pool name — `memberPhaseOf(prior) === 'stopped'` with Fr3's optional-name guard, the worker budget
+  counted over non-stopped phases, and the member literal carrying the resolved `name` plus `phase` and
+  `status: deriveMemberStatus(...)` with the phase-only durable record.
+- `tests/in-memory-gates.test.mjs` (B1r2/B2r4/D x Cr x Fr3): the census keeps every side — B1r2's store entries, D's
+  renumbered notices entries, Cr's trace entries and Fr3's `src/types.ts` entry — and its `src/runtime.ts:22` line was
+  rewritten to pin the merged member literal exactly.
+- `docs/known-limitations.md` (B1r2/B2r4 x F19r2 x E2): F19r2's artifact replaced the two sibling paragraphs with the
+  base text and trimmed the residual-writer sentence. The assembly keeps both paragraphs, the trimmed sentence and
+  E2's mount section, because those paragraphs are the durable record of B1r2's and B2r4's fixes and F19r2's delta
+  adds no documentation text of its own.
+
+**Retained checks.** On a committed checkout of the assembled tree in the host dependency layout at 3-8 load average:
+typecheck, build, the declared check, the full unit suite (823/823), the fault suite (24/24 — F19 5,136 ms, F4
+3,047-3,128 ms), replay (26/26 payloads, contract compliance 1.000, causal closure 1.000) and the packed-artifact
+smoke all pass. The untouched base at the same load gives the same declared check (34/34) and fault suite (24/24), so
+no failure needed attributing. Three suites are **blocked by the nested sandbox and claimed by none**:
+`test:harness` fails with `SandboxUnavailableError` (`sandbox-exec: sandbox_apply: Operation not permitted`), and
+`test:pack` and `test:profile` are refused by `assertSandboxPrerequisite` with the same errno; `test:isolation`,
+`test:web` and `test:command-web` were not attempted and are named here for the same reason. The retained suite runs
+in the **ambient environment**, and no claim is made that the whole unit suite passes through the deployed check
+runner, which predates R16-B's scoped temp root (owner decision, board seq 170; row R17-G18).
+
+**Outcome against the frozen baseline (R0r2; R0's own numbers corrected by the author's R0r correction).** Every count
+below states its tree, because the host still runs the deployed round-15-line build. *Baseline families* (owner
+notices, deployed build): R15 49 = decision 23, fall-through 17, stall-root 4, unknown 2, escalation 2, guard-terminal
+1; R16 43 = decision 18, fall-through 14, stall-root 4, integration-gap 3, dispatch-question 2, guard-terminal 2; R17
+live 7 = integration-gap 5, dispatch-question 1, fall-through 1 in its first 100 s. *False wakes*: the shipped
+read-time predicate reports 0 on all 24 missions, but only 14/72 (R15) and 14/37 (R16) named no-live-path subjects
+remain judgeable at their epoch, so 0 is not evidence about the historical decisions. *Repetition* (strictly recorded
+subjects): R15 47 rows / 21 with subjects / 38 facts / 14 repeated / 34 extra / max 6; R16 43 / 43 / 107 / 8 / 14 /
+max 5; R17 live 7 / 7 / 18 / 4 / 4 / max 2; store-wide 464 / 71 / 163 / 26 / 52 / max 6, with 393 rows recording no
+subject at all, so per-fact repetition is unmeasurable for them. *Consumption*: 726/726 owner deliveries known
+through the durable `user/message` twin instrument while the ledger reports 464/464 unknown and `claimedAt ==
+deliveredAt` for all 464; the assembled tree records consumption from `agent/inbox/claimed` with a compare-and-swap,
+so delivered, consumed and resolved stay three facts. *Silence*: the deployed build writes neither attempt-silence
+escalations nor pass releases and its bound in force was 30,000/60,000 ms, so the baseline's worst per-subject silent
+gap is NONE MEASURED; its worst per-attempt gap is R16 1,575,049 ms (2.63x the 600,000 ms bound) against R15 221,235
+ms and R17's 85,441 ms at the read instant. On the assembled tree the bound is the absence net's declared 600,000 ms
+plus the retained attempt-silence escalation, both with pair tests. The round's live ledger (deployed build) keeps
+showing the families being fixed, exactly as the mission's measurement caveat predicts.
+
+**Open hand-offs.** The corrected baseline numbers replace R0's withdrawn repetition figures and snapshot instant
+(R0r/R0r2, accepted); F19r2's documentation deletion is resolved in this assembly as described above. Open rows:
+R17-G13 (no checkpoint for a ceiling-blocked attempt; measured twice this round), R17-G14 (a cancellation names
+already-resolved dependents as stranded; seven instances in two rounds), R17-G15 (a shared temp path and a path inside
+another member's attempt scope are reported identically; four rendezvous notices this round), R17-G16 (a task's
+declared check is not preflighted against its composed base — B1x and B1xr2 both proved it), R17-G17 (a declared check
+is not preflighted in the execution sandbox — Fr2's EPERM verdict), R17-G18 (which check path the scoped temp covers;
+to be answered on the deployed build). The leaked payload spill was swept by the owner outside the worker sandbox
+(4,737 files / 23,178,654 B to 2,048 files / 11,173,294 B, exactly the declared bound) and the sweep re-applies at
+host start; growth resumes on the deployed build until deployment. The census documentation defects stayed fixed, and
+the sandbox-suite classification stands as the owner's decision to scope the claim rather than sweep 76 test files.
+

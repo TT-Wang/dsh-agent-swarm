@@ -11,6 +11,9 @@ import { WorkspaceAdmission, WorkspaceRevokedError, executedShellCommand, gitWri
 import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions, type WakePrecision } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
+// R17-G6/G7: the one derivation of mission derived state and its host projection.
+import { MissionProjection, deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
+import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, missionFingerprint, BOARD_BODY_EXCERPT, BOARD_DELTA_POSTS, DEFAULT_BUDGET_WARN_AT, postView, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
@@ -20,7 +23,8 @@ import { AdmissionRefusedError, admissionRowId, classifyProviderOutage, decideAd
 import { validScope } from './scope.ts'
 import { absoluteCheckPaths, assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, missingReviewDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, shellSegments, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { nextWorkerName } from './types.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
 // on the Node worktree module at runtime.
@@ -640,6 +644,14 @@ export class SwarmRuntime {
 
   /** M1a seam 6/7: workspace and admission surface. */
   private readonly workspaceAdmission = new WorkspaceAdmission(this)
+  /**
+   * R17-G6: the mission derived state as a registered host projection. The
+   * runtime publishes each mission's derived board into its owner session on a
+   * transition and reads the published board back for consumers; a composition
+   * without the host registry (or without an attached owner session) keeps the
+   * same derivation applied to durable rows, so there is one truth either way.
+   */
+  private readonly projection: MissionProjection = new MissionProjection(this)
   /** The mission is terminal: no further scheduling or fencing applies. */
   isMissionTerminal(mission: Mission): boolean { return terminal(mission) }
   // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
@@ -670,6 +682,13 @@ export class SwarmRuntime {
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
   private readonly notices = new Notices(this)
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): void { return this.notices.notify(missionId, content, subjects, options) }
+  /**
+   * R17-G8: record real consumption for one owner delivery from the host's
+   * claimed signal (the adapter maps `agent/inbox/claimed` to the delivery id).
+   * Compare-and-swap inside the mission transaction; delivered, consumed and
+   * resolved stay three facts.
+   */
+  recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean { return this.notices.recordConsumption(deliveryId, options) }
   /**
    * R15-A1: the subjects of a notice that is scoped to a task, a member or the
    * mission itself. A task-scoped notice names that task at its epoch; a
@@ -705,7 +724,18 @@ export class SwarmRuntime {
   wakePrecision(actor: Actor, missionId: string): WakePrecision { return this.notices.wakePrecision(actor, missionId) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void { return this.notices.ensureWitness(missionId, options) }
-  notifyStall(mission: Mission, tasks: Task[], members: Member[], reason: string): void { return this.notices.notifyStall(mission, tasks, members, reason) }
+  notifyStall(mission: Mission, reason: string): void { return this.notices.notifyStall(this.interpretation(mission.id), reason) }
+  /**
+   * R17-G1: the shared interpretation of one mission's durable state, forwarded
+   * so the dispatcher and every generator read the same derived view.
+   */
+  interpretation(missionId: string): MissionInterpretation { return this.notices.interpretation(missionId) }
+  /** R17-G5: the released pass owed its dispatch question; publish with the wedged branch. */
+  expectWedgedRelease(missionId: string): void { this.notices.expectWedgedRelease(missionId) }
+  /** R17-G5: the scheduling pass state at a committed transition (for publication). */
+  passState(missionId: string): { passLive: boolean; wedged: boolean } {
+    return { passLive: this.scheduling.livePass(missionId) !== undefined, wedged: this.scheduling.passWedged(missionId) }
+  }
   notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
   notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
@@ -801,6 +831,12 @@ export class SwarmRuntime {
    * exactly what the host was authorized to do in this process.
    */
   async start(grants?: WorkspaceGrantSnapshot): Promise<void> {
+    // R17-G6: register the mission projection with the host before any mission
+    // is recovered or published, so recovery transitions are projected too.
+    this.projection.attach(this.workers)
+    // R17-G8: subscribe to the host's claimed signal so real consumption is
+    // recorded from it (one CAS write per delivery), never inferred.
+    this.notices.attach(this.workers)
     if (grants !== undefined) {
       this.store.transaction(() => {
         for (const grant of grants.grants) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: grant.path, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
@@ -833,9 +869,10 @@ export class SwarmRuntime {
     for (const mission of this.store.list('missions')) {
       if (terminal(mission)) {
         // A cold host has no surviving native worker handles for terminal work.
+        // R17-G7: the durable phase is what changes; the live status is derived.
         this.commit(mission.id, () => {
           for (const member of this.store.list('members', mission.id)) {
-            if (member.status !== 'stopped') { member.status = 'stopped'; this.store.put('members', member) }
+            if (memberPhaseOf(member) !== 'stopped') { member.phase = 'stopped'; this.store.put('members', member) }
           }
         })
         continue
@@ -874,8 +911,14 @@ export class SwarmRuntime {
             })
           }
         }
+        // R17-G7: recovery used to rewrite every non-stopped member row to
+        // `idle`, which is exactly how a member could read `idle` while the
+        // attempt it owns was still live (R15-F2). There is nothing to write:
+        // the attempt rows above are re-pended or dropped in this same
+        // transaction, and the live status is derived from them, while a parked
+        // member keeps the owner's durable park intent across the restart.
         for (const member of this.store.list('members', mission.id)) {
-          if (member.status !== 'stopped') { member.status = 'idle'; this.store.put('members', member) }
+          if (member.phase === undefined) { member.phase = 'active'; this.store.put('members', member) }
         }
         this.store.event(mission.id, 'mission/recovered', 'runtime', {})
       })
@@ -926,47 +969,19 @@ export class SwarmRuntime {
     this.timer.unref()
   }
   /**
-   * R15-F2: derive each member's durable status from the live attempt on the
-   * board, so a stale `idle` row cannot hide a member that currently owns running
-   * work. The reported seam: after a mission pause and a host restart the durable
-   * member row said `idle` while that member held a live attempt (and the adapter
-   * published continuous activity), so a status-only reader showed no active
-   * worker. `claim`/`assign` write the pair atomically, but the recovery paths
-   * (`Attempts.onIdle`, the start-recovery loop, close-out) can leave the member
-   * row behind the attempt; this reconciliation closes that window in one tick.
-   *
-   * The reconciliation only ever UPGRADES: a member that is neither `stopped` nor
-   * `waiting` and owns a running task (an attempt row still names it) becomes
-   * `working`. It never writes `idle`, for two reasons: the paths that end an
-   * attempt already write `idle` (`Attempts.onIdle`, cancel/handoff release,
-   * close-out), and the member row participates in the board fingerprint, so a
-   * spurious downgrade would change F(S) and let the coverage-complete or stall
-   * notice announce one unchanged state twice (fault F19 row 8 measured exactly
-   * that when this wrote both directions). `waiting` is never rewritten: the park
-   * is the owner's intent and the parked-member hatch keeps the member dispatchable
-   * regardless of the row.
-   *
-   * Co-firing guards, named: the W6 idle close-out (the attempt stays live until
-   * close-out fences it, so this agrees with it rather than racing it), the
-   * parked-member hatch (excluded above), the start-recovery loop (which writes
-   * `idle` for every non-stopped member before any dispatch) and the coverage /
-   * stall notices, whose F(S) key this write must not churn (hence upgrade-only).
+   * R15-F2, deleted by R17-G7: `reconcileMemberStatus` used to upgrade a stale
+   * `idle` member row to `working` whenever the row fell behind the live attempt,
+   * and its upgrade-only rule existed because the member row was part of the
+   * board fingerprint (a spurious downgrade re-armed the coverage/stall notices).
+   * The status is now derived on every read from the durable phase and the live
+   * attempts (`src/projection.ts`), so there is no mirror to reconcile and no
+   * write that could churn F(S): the seam is impossible by construction. The
+   * guards it used to co-fire with are now the readers of the same derivation:
+   * the W6 idle close-out (which owns the attempt until it fences it), the
+   * parked-member hatch (`memberPhaseOf === 'parked'`, which wins over work in
+   * flight) and the coverage / stall notices (whose F(S) key no status write can
+   * move any more).
    */
-  private reconcileMemberStatus(missionId: string): void {
-    const tasks = this.store.list('tasks', missionId)
-    for (const member of this.store.list('members', missionId)) {
-      if (member.status === 'stopped' || member.status === 'waiting') continue
-      let ownsLiveAttempt = false
-      for (const task of tasks) {
-        if (task.status !== 'running' || task.attempt === undefined || task.attempt.ownerId !== member.id) continue
-        ownsLiveAttempt = true
-        break
-      }
-      if (!ownsLiveAttempt || member.status === 'working') continue
-      member.status = 'working'
-      this.commit(missionId, () => this.store.put('members', member))
-    }
-  }
 
   /**
    * R15-A2: decision generation that does not depend on a scheduling pass
@@ -994,12 +1009,13 @@ export class SwarmRuntime {
       if (this.closed || this.shuttingDown) return
       if (terminal(mission) || mission.status !== 'active') continue
       try {
-        // R15-F2: the member rows are reconciled against the live attempts on every
-        // tick, before the decision sweep describes the board. Co-firing guards: the
-        // W6 idle close-out (which owns an attempt whose turn ended), the
-        // parked-member hatch (never rewritten) and the start-recovery loop (which
-        // writes `idle` before any dispatch).
-        this.reconcileMemberStatus(mission.id)
+        // R17-G7: no member-status reconciliation runs here any more. Every
+        // reader derives the status from the durable phase and the live attempts
+        // (`src/projection.ts`), so the sweep describes the same board the
+        // dispatch path acts on without a write in between. Co-firing guards the
+        // deleted write used to name are now readers of that one derivation: the
+        // W6 idle close-out, the parked-member hatch and the coverage/stall
+        // notices, whose F(S) key no status write can move.
         // R16-D: the attempt reporting bound runs BEFORE the pass guard below, so
         // an attempt that has stopped reporting is named whether the pass is
         // running, wedged or absent. Co-firing guards: F1's operation silence
@@ -1015,9 +1031,14 @@ export class SwarmRuntime {
         // classifier below names only what no live path advances. When the pass is
         // merely inside its bound the sweep stays out of its way, and when no pass
         // exists at all the next kick opens one in this same tick.
-        const wedged = this.scheduling.passWedged(mission.id)
-        if (!wedged && (this.scheduling.livePass(mission.id) !== undefined || this.queues.has(mission.id))) continue
-        this.ensureWitness(mission.id, wedged ? { offPass: true, wedged: true } : { offPass: true })
+        // R17-G5: the sampled tick path emits exactly two absence instruments and
+        // no cause — the attempt-silence escalation above (`sweepSilentAttempts`,
+        // bounded by `attemptSilenceBoundMs`) and the absence net here (the
+        // absence of a durable transition and the elapsed clock, bounded by
+        // `Notices.absenceBoundMs`). Cause-bearing generation is
+        // transition-driven (see `commit`), so no sampled tick can invent a cause
+        // from a state it only sampled.
+        this.notices.absenceNet(mission.id)
       } catch (error) {
         // A sweep must never break the tick that carries the outbox pump and the
         // wedge detector; the next tick re-derives the same state.
@@ -1060,10 +1081,46 @@ export class SwarmRuntime {
     let result: T
     try { result = this.store.transaction(fn) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
+    // R17-G6: a committed transition publishes its derived board (the projection
+    // appends nothing when the board is unchanged). This runs after the
+    // transaction and never throws into the caller.
+    this.projection.publish(missionId)
+    // R17-G5: and it publishes its decision facts in the same transition — the
+    // classifier runs here (never from the tick sample), against the state this
+    // commit produced. The pass state selects the one pass-end branch; a wedged
+    // pass keeps its own subject. Reentrant commits are ignored by the guard.
+    this.notices.transition(missionId)
     return result
   }
   /** Subscribe to committed state changes. */
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
+  /**
+   * R17-G6: the derived member board — the read face the guard model and the
+   * owner/UI views consume. The value is the registered projection's current
+   * state when the host unit is attached and the owner session is available
+   * (`ctx.sessionProjections.stateOf` through `MissionProjection.boardOf`), and
+   * otherwise the same single derivation applied to the durable rows. Unlike
+   * `missionBoard` it needs no mission row, so the guard model can project a
+   * board whose mission is not (or no longer) in the store.
+   */
+  memberBoard(missionId: string): MissionBoardMember[] {
+    const projected = this.projection.boardOf(missionId)?.members
+    if (projected !== undefined) return projected
+    return deriveMemberBoard(this.store.list('members', missionId), this.store.list('tasks', missionId))
+  }
+  /**
+   * R17-G6: the durable member rows with the board's derived status merged in —
+   * the one place `snapshot()` and `observe()` take member statuses from, so the
+   * owner/UI read face is an instance of the projection being read rather than a
+   * second derivation. The rows themselves stay the durable records (name, role,
+   * subscriptions, activity); only the derived status comes from the board.
+   */
+  private projectedMembers(missionId: string): Member[] {
+    const board = this.memberBoard(missionId)
+    const status: Record<string, MemberStatus> = {}
+    for (const member of board) status[member.id] = member.status
+    return this.store.list('members', missionId).map(member => ({ ...member, status: status[member.id] ?? member.status }))
+  }
   mission(missionId: string): Mission {
     const mission = this.store.get('missions', missionId)
     if (!mission) throw new Error('Unknown mission')
@@ -1072,7 +1129,7 @@ export class SwarmRuntime {
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
     const mission = this.mission(missionId)
     if (mission.ownerSessionId === actor.sessionId) return { mission, key: 'owner', owner: true }
-    const member = this.store.list('members', missionId).find(m => m.sessionId === actor.sessionId && m.status !== 'stopped')
+    const member = this.store.list('members', missionId).find(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped')
     if (!member) throw new Error('Session is not a participant in this mission')
     return { mission, member, key: member.id, owner: false }
   }
@@ -1285,12 +1342,21 @@ export class SwarmRuntime {
     })
     return mission
   }
-  /** Owner-only membership admission keeps authority and aggregate capacity bounded. */
-  async addMember(actor: Actor, missionId: string, input: { name: string; role: string; model?: string; provider?: string; reasoningEffort?: string; maxOutputTokens?: number; subscriptions?: string[] }, admittedId?: string): Promise<Member> {
+  /**
+   * Owner-only membership admission keeps authority and aggregate capacity bounded.
+   *
+   * R17-G12: `name` is optional. When the caller supplies none the runtime
+   * assigns the next unused name from the fixed `WORKER_NAME_POOL` in assignment
+   * order, considering every member row of the mission — a stopped member's name
+   * is never reused while the mission is active. `role` keeps the responsibility
+   * text unchanged and the member id stays the only address, so nothing in the
+   * protocol depends on a display name.
+   */
+  async addMember(actor: Actor, missionId: string, input: { name?: string; role: string; model?: string; provider?: string; reasoningEffort?: string; maxOutputTokens?: number; subscriptions?: string[] }, admittedId?: string): Promise<Member> {
     return this.exclusive(missionId, async () => {
       const { mission, owner } = this.active(actor, missionId, admittedId !== undefined)
       if (!owner) throw new Error('Only the mission owner can add workers; send a bounded collaborator request')
-      requireText(input.name, 'name'); requireText(input.role, 'role')
+      if (input.name !== undefined) requireText(input.name, 'name'); requireText(input.role, 'role')
       for (const field of ['provider', 'model', 'reasoningEffort'] as const) if (input[field] !== undefined) requireText(input[field]!, field)
       if (input.provider && !input.model) throw new Error('A selected provider requires a selected model')
       if (input.maxOutputTokens !== undefined && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1)) throw new Error('maxOutputTokens must be a positive safe integer')
@@ -1301,13 +1367,18 @@ export class SwarmRuntime {
       if (this.store.list('starts', missionId).length && input.maxOutputTokens === undefined) throw new Error('Automatic workers require maxOutputTokens chosen by the primary agent')
       const prior = admittedId ? this.store.get('members', admittedId) : undefined
       if (prior) {
-        if (prior.missionId !== missionId || prior.name !== input.name || prior.status === 'stopped') throw new Error('Member admission identity conflict')
+        if (prior.missionId !== missionId || (input.name !== undefined && prior.name !== input.name) || memberPhaseOf(prior) === 'stopped') throw new Error('Member admission identity conflict')
         await this.workers.start({ mission, member: prior, ownerSessionId: mission.ownerSessionId })
         return prior
       }
       const members = this.store.list('members', missionId)
-      if (members.filter(m => m.status !== 'stopped').length >= mission.budget.maxWorkers) throw new Error('Mission worker budget exhausted')
-      if (members.some(m => m.name === input.name)) throw new Error('Worker name already exists')
+      if (members.filter(m => memberPhaseOf(m) !== 'stopped').length >= mission.budget.maxWorkers) throw new Error('Mission worker budget exhausted')
+      // R17-G12: a name-less admission takes the next unused pool name in
+      // assignment order; the pool is the bound, and its exhaustion is a named
+      // refusal that names the caller's own exit rather than an anonymous failure.
+      const name = input.name ?? nextWorkerName(members.map(member => member.name))
+      if (name === undefined) throw new Error('[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
+      if (members.some(m => m.name === name)) throw new Error('Worker name already exists')
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
       await this.assertWorkspaceAuthorized(mission)
@@ -1319,8 +1390,14 @@ export class SwarmRuntime {
       }
       const workspace = await this.workers.prepareWorkspace(mission, memberId)
       this.active(actor, missionId, admittedId !== undefined)
-      const member: Member = { id: memberId, missionId, name: input.name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, status: 'idle', subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }
-      this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/added', 'owner', member) })
+      // R17-G7: the durable row carries the phase; the in-memory record carries the
+      // derivation's own output (a fresh active member owns no attempt), and the
+      // store strips that status on write, so admission leaves no live fact behind.
+      const member: Member = { id: memberId, missionId, name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, phase: 'active', status: deriveMemberStatus('active', false), subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }
+      // The durable record and the historical event carry the phase only: the
+      // derived status is never persisted, not even as an event snapshot.
+      const { status: _derivedStatus, ...memberRecord } = member
+      this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/added', 'owner', memberRecord) })
       try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
       catch (error) {
         if (this.shuttingDown || this.mission(missionId).status !== 'active') throw error
@@ -1345,16 +1422,16 @@ export class SwarmRuntime {
           } catch (retryError) {
             if (this.shuttingDown || this.mission(missionId).status !== 'active') throw retryError
             const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
-            member.status = 'stopped'
+            member.phase = 'stopped'
             this.commit(missionId, () => {
               this.store.put('members', member)
               this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
               this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
             })
-            throw new Error(`Member ${input.name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
+            throw new Error(`Member ${name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
           }
         }
-        member.status = 'stopped'
+        member.phase = 'stopped'
         this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }) })
         throw error
       }
@@ -1368,7 +1445,7 @@ export class SwarmRuntime {
     const prior = admittedId ? this.store.get('workstreams', admittedId) : undefined
     if (prior) { if (prior.missionId !== missionId) throw new Error('Workstream identity conflict'); return prior }
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
-    if (input.coordinatorId && !this.store.list('members', missionId).some(m => m.id === input.coordinatorId && m.status !== 'stopped')) throw new Error('Unknown coordinator')
+    if (input.coordinatorId && !this.store.list('members', missionId).some(m => m.id === input.coordinatorId && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown coordinator')
     const stream: Workstream = { ...input, id: admittedId ?? id('stream'), missionId }
     if (this.store.list('workstreams', missionId).length >= this.mission(missionId).budget.maxTasks) throw new Error('Workstream admission budget exhausted')
     this.commit(missionId, () => { this.store.put('workstreams', stream); this.store.event(missionId, 'workstream/created', key, stream) })
@@ -1464,7 +1541,7 @@ export class SwarmRuntime {
       const effective = this.effectiveDependency(missionId, dependency, tasks)
       if (effective.status === 'cancelled' || effective.status === 'blocked') throw new Error(`Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
-    if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && m.status !== 'stopped')) throw new Error('Unknown assignee')
+    if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown assignee')
     if (input.kind === 'verification') {
       if (!input.reviewOf) throw new Error('Verification requires reviewOf')
       const source = this.task(missionId, input.reviewOf)
@@ -1638,7 +1715,9 @@ export class SwarmRuntime {
     }
     task.epoch++
     task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Date.now() + this.config.leaseMs }
-    task.status = 'running'; task.assigneeId = member.id; member.status = 'working'
+    // R17-G7: assigning the attempt is what makes the derived status `working`;
+    // there is no member status to write and none to fall behind the attempt.
+    task.status = 'running'; task.assigneeId = member.id
     // Close-out and git-denial markers belong to one attempt; a new attempt starts clean.
     delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
@@ -1892,14 +1971,14 @@ export class SwarmRuntime {
           ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
-          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, [taskSubject(source)], { from: member.id })
+          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, this.interpretation(missionId).subjectsOf([source]), { from: member.id })
           // R11-18: the rejection reason and the repair path must reach the
           // source author, not only the owner. The author's re-claim is refused
           // (the task is blocked), so without this delivery the only exit is
           // inferred from the owner's notice.
           const authorId = source.attempt?.ownerId ?? source.assigneeId
           const author = authorId === undefined ? undefined : this.store.get('members', authorId)
-          if (author !== undefined && author.status !== 'stopped') this.store.put('deliveries', { id: id('msg'), missionId, from: member.id, to: author.id, kind: 'control', createdAt: Date.now(),
+          if (author !== undefined && memberPhaseOf(author) !== 'stopped') this.store.put('deliveries', { id: id('msg'), missionId, from: member.id, to: author.id, kind: 'control', createdAt: Date.now(),
             content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"], keeping its acceptance verbatim and its kind (${source.kind}). Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
         }
       })
@@ -1934,7 +2013,7 @@ export class SwarmRuntime {
   message(actor: Actor, missionId: string, input: { to: string; kind: 'question' | 'finding'; content: string; topic?: string }): { queued: boolean } {
     const { key } = this.active(actor, missionId)
     this.bounded(input.content)
-    if (input.to !== 'owner' && input.to !== 'subscribers' && !this.store.list('members', missionId).some(m => m.id === input.to && m.status !== 'stopped')) throw new Error('Recipient is not a live mission member')
+    if (input.to !== 'owner' && input.to !== 'subscribers' && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Recipient is not a live mission member')
     if (input.to === 'subscribers' && !input.topic) throw new Error('Broadcast requires a topic')
     this.commit(missionId, () => {
       if (input.to === 'subscribers') this.topicDelivery(missionId, key, input.topic!, input.content)
@@ -2163,7 +2242,7 @@ export class SwarmRuntime {
       this.store.event(missionId, 'evidence/challenged', key, input)
       // The challenged claim's own task is the subject; the dependents it
       // invalidated are named by the `task/invalidated` events, not merged into it.
-      this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, [taskSubject(source)], { from: key })
+      this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.interpretation(missionId).subjectsOf([source]), { from: key })
     })
     if (interrupted.size) this.defer(async () => { await Promise.all([...interrupted].map(memberId => this.workers.stop(memberId))) })
     this.kick(missionId)
@@ -2173,7 +2252,7 @@ export class SwarmRuntime {
   handoff(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; to?: string; summary: string }): { handoff: string } {
     const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
     this.bounded(input.summary)
-    if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && m.status !== 'stopped')) throw new Error('Unknown new owner')
+    if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown new owner')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', at: Date.now() }
@@ -2184,7 +2263,7 @@ export class SwarmRuntime {
         const fresh = this.task(missionId, task.id)
         if (fresh.epoch !== task.epoch || fresh.status !== 'blocked') return
         const m = this.store.get('members', member.id)!
-        m.status = 'idle'; fresh.status = 'pending'; delete fresh.resumeAfterStop
+        m.phase = 'active'; fresh.status = 'pending'; delete fresh.resumeAfterStop
         this.commit(missionId, () => { this.store.put('tasks', fresh); this.store.put('members', m); this.store.event(missionId, 'task/handoff-ready', 'runtime', { taskId: fresh.id }) })
       })
       this.kick(missionId)
@@ -2211,8 +2290,8 @@ export class SwarmRuntime {
       const attempt = review.attempt
       if (attempt !== undefined) {
         const owner = this.store.get('members', attempt.ownerId)
-        if (owner !== undefined && owner.status !== 'stopped') {
-          owner.status = 'idle'; delete owner.activity
+        if (owner !== undefined && memberPhaseOf(owner) !== 'stopped') {
+          owner.phase = 'active'; delete owner.activity
           this.store.put('members', owner); released.add(owner.id)
         }
       }
@@ -2234,7 +2313,7 @@ export class SwarmRuntime {
   private liveReview(missionId: string, source: Task): Task | undefined {
     const author = source.attempt?.ownerId ?? source.assigneeId
     const authors = this.authorIds(source)
-    const live = new Set(this.store.list('members', missionId).filter(member => member.status !== 'stopped').map(member => member.id))
+    const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
     return liveReviewFor(this.store.list('tasks', missionId), source.id, author, live,
       review => (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
         && (review.assigneeId === undefined || !authors.has(review.assigneeId)))
@@ -2348,7 +2427,7 @@ export class SwarmRuntime {
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
     const authors = this.authorIds(source)
     const author = source.attempt?.ownerId ?? source.assigneeId
-    if (!members.some(member => member.status !== 'stopped' && !authors.has(member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && !authors.has(member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable. */
@@ -2402,8 +2481,8 @@ export class SwarmRuntime {
     const released = new Set<string>()
     const releaseMember = (memberId: string): Member | undefined => {
       const member = this.store.get('members', memberId)
-      if (member === undefined || member.status === 'stopped') return undefined
-      member.status = 'idle'; delete member.activity
+      if (member === undefined || memberPhaseOf(member) === 'stopped') return undefined
+      member.phase = 'active'; delete member.activity
       return member
     }
     task.status = 'cancelled'; task.epoch++
@@ -2433,9 +2512,10 @@ export class SwarmRuntime {
         ...(strandedDependents.length ? { strandedDependents } : {}) })
       if (strandedDependents.length) {
         // The withdrawn task and every stranded dependent are the subjects: the
-        // decision names exactly the obligations the owner must replace.
-        const strandedSubjects = this.store.list('tasks', missionId).filter(candidate => strandedDependents.includes(candidate.id)).map(taskSubject)
-        this.notify(missionId, `Cancelling ${task.id} stranded admitted dependents ${strandedDependents.join(', ')}. Propose a replacement for ${task.id} with replaces; dependents resolve to the live repair automatically.`, [taskSubject(task), ...strandedSubjects], { from: key })
+        // decision names exactly the obligations the owner must replace. The
+        // subject list comes from the shared interpretation, not a second read.
+        const view = this.interpretation(missionId)
+        this.notify(missionId, `Cancelling ${task.id} stranded admitted dependents ${strandedDependents.join(', ')}. Propose a replacement for ${task.id} with replaces; dependents resolve to the live repair automatically.`, view.subjectsOf([task, ...view.tasks.filter(candidate => strandedDependents.includes(candidate.id))]), { from: key })
       }
     })
     if (released.size) this.defer(async () => { await Promise.all([...released].map(memberId => this.workers.stop(memberId))) })
@@ -2459,7 +2539,7 @@ export class SwarmRuntime {
     // Refuse with the supported exits; an unowned member may still park.
     const open = this.store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
     if (open?.attempt) throw new Error(`You still hold running attempt ${open.attempt.id} on task ${open.id} (${open.title}). swarm_wait cannot park a member that owns a running attempt: submit it with swarm_submit/swarm_verify, release it with swarm_handoff, or keep working. Parking it would leave the attempt running until lease expiry.`)
-    member.status = 'waiting'
+    member.phase = 'parked'
     this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/waiting', member.id, {}) })
     return { waiting: true }
   }
@@ -2665,7 +2745,7 @@ export class SwarmRuntime {
   }
   /** Native browser callers select an existing Harness session; membership still bounds reads. */
   visibleMissions(actor: Actor): Mission[] {
-    const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))
+    const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))
     return this.store.list('missions').filter(m => m.ownerSessionId === actor.sessionId || memberMissions.has(m.id))
   }
   visibleSnapshots(actor: Actor): Snapshot[] { return this.visibleMissions(actor).map(m => this.snapshot(actor, m.id)) }
@@ -2830,7 +2910,9 @@ export class SwarmRuntime {
       if (target.artifact) deliveryTarget = { taskId: target.id, commit: target.artifact.commit }
     } catch { deliveryTarget = undefined }
     const completionReason = this.completionError(mission, { cancelUnschedulable: true })
-    return { mission, members: this.store.list('members', missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length,
+    // R17-G6: the client's read face takes member statuses from the derived board
+    // (the registered projection when published), not from a second derivation.
+    return { mission, members: this.projectedMembers(missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length,
       ...(deliveryTarget === undefined ? {} : { deliveryTarget }),
       completion: { eligible: completionReason === undefined, ...(completionReason === undefined ? {} : { reason: completionReason }) },
       criticalPath: this.criticalPath(missionId),
@@ -2858,7 +2940,7 @@ export class SwarmRuntime {
     // Worker guidance alone did not prevent detail=full, so the runtime refuses
     // it for worker sessions while the owner path keeps the complete view.
     if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
-    const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
+    const tasks = this.store.list('tasks', missionId), members = this.projectedMembers(missionId)
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
@@ -2974,7 +3056,7 @@ export class SwarmRuntime {
   private inFlightEstimate(members: Member[]): number {
     let total = 0
     for (const member of members) {
-      if (member.status === 'stopped') continue
+      if (memberPhaseOf(member) === 'stopped') continue
       const activity = this.workers.currentActivity ? this.workers.currentActivity(member.id) : member.activity
       if (activity?.kind !== 'model') continue
       const requests = member.usage?.requests ?? 0
@@ -3069,7 +3151,7 @@ export class SwarmRuntime {
     const relaxed = isStalled ? this.completionError(mission, { cancelUnschedulable: true }) : strict
     if (strict !== undefined && !(isStalled && relaxed === undefined)) {
       // The owner needs the gap that would remain after cancelling dead leftovers, not the leftovers themselves.
-      if (isStalled) this.notifyStall(mission, tasks, members, relaxed ?? strict)
+      if (isStalled) this.notifyStall(mission, relaxed ?? strict)
       return false
     }
     // R10-14: coverage complete, no stall, mission still active. An owner-assembled
@@ -3083,7 +3165,7 @@ export class SwarmRuntime {
       this.store.event(missionId, 'automatic/completed', 'runtime', {})
       // R15-A1: the completion notice names every accepted deliverable (the
       // mission's lineage roots), so the final decision is attributable too.
-      this.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, subjectsOfTasks(this.store.list('tasks', missionId).filter(task => task.status === 'accepted'), mission))
+      this.notify(missionId, `Completed ${mission.title}: all required deliverables were independently accepted. Review the evidence and final artifact in Agent Swarm.`, this.interpretation(missionId).subjectsOf(this.interpretation(missionId).tasks.filter(task => task.status === 'accepted')))
     })
     return true
   }
@@ -3130,7 +3212,7 @@ export class SwarmRuntime {
     if (terminal(mission)) throw new Error('Mission is terminal; create a new mission to continue')
     if (mission.status === 'staged' && action !== 'stop') throw new Error('Use the saved plan launch action to activate staged work')
     if (action === 'coordinator') {
-      if (!coordinatorId || !this.store.list('members', missionId).some(m => m.id === coordinatorId && m.status !== 'stopped')) throw new Error('Unknown coordinator')
+      if (!coordinatorId || !this.store.list('members', missionId).some(m => m.id === coordinatorId && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown coordinator')
       mission.coordinatorId = coordinatorId
     } else if (action === 'complete') {
       // The owner decides; verified coverage and the deliverable are still required.
@@ -3175,8 +3257,8 @@ export class SwarmRuntime {
         await this.workers.stop(member.id)
         if (this.closed || !terminal(this.mission(missionId))) return
         const current = this.store.get('members', member.id)
-        if (!current || current.status === 'stopped') return
-        current.status = 'stopped'
+        if (!current || memberPhaseOf(current) === 'stopped') return
+        current.phase = 'stopped'
         this.commit(missionId, () => {
           this.store.put('members', current)
           this.store.event(missionId, 'member/stopped', 'runtime', { memberId: current.id })
@@ -3189,7 +3271,7 @@ export class SwarmRuntime {
   private guard(memberId: string, tool: string): string | undefined {
     if (this.shuttingDown) return 'Swarm runtime is shutting down'
     const member = this.store.get('members', memberId)
-    if (!member || member.status === 'stopped') return 'Worker membership is inactive'
+    if (!member || memberPhaseOf(member) === 'stopped') return 'Worker membership is inactive'
     const mission = this.mission(member.missionId)
     if (mission.status !== 'active' || Date.now() >= mission.deadline || mission.usedSteps > mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens) return 'Mission is inactive or out of budget'
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
@@ -3211,7 +3293,7 @@ export class SwarmRuntime {
     const mission = this.mission(member.missionId)
     if (mission.status !== 'active') throw new Error(`Mission is ${mission.status}`)
     if (mission.budgetPause) return false
-    if (member.status === 'waiting' && !hasFreshInput) return false
+    if (memberPhaseOf(member) === 'parked' && !hasFreshInput) return false
     // D1: a task that exhausted its own step/finding ceiling blocks itself before
     // the next step is charged, so the mission budget is never drained by it.
     const activeTask = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
@@ -3225,7 +3307,8 @@ export class SwarmRuntime {
     }
     mission.usedSteps++; mission.updatedAt = Date.now()
     this.commit(mission.id, () => {
-      if (member.status === 'waiting') { member.status = 'working'; this.store.put('members', member) }
+      // R17-G7: fresh input unparks the member; the derived status follows the attempt.
+      if (memberPhaseOf(member) === 'parked') { member.phase = 'active'; this.store.put('members', member) }
       this.store.put('missions', mission)
       for (const task of this.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt?.ownerId === memberId) {
         task.usedSteps = (task.usedSteps ?? 0) + 1
@@ -3248,7 +3331,7 @@ export class SwarmRuntime {
     task.epoch++
     this.dropAttempt(task); delete task.resumeAfterStop; delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
-    if (member !== undefined && member.status !== 'stopped') { member.status = 'waiting'; delete member.activity }
+    if (member !== undefined && memberPhaseOf(member) !== 'stopped') { member.phase = 'parked'; delete member.activity }
     this.commit(mission.id, () => {
       this.store.put('tasks', task)
       if (member !== undefined) this.store.put('members', member)
@@ -3272,7 +3355,7 @@ export class SwarmRuntime {
     const member = this.store.get('members', memberId)
     if (!member) return
     const mission = this.mission(member.missionId)
-    if (mission.status !== 'active' || member.status === 'stopped' || mission.budgetPause || Date.now() >= mission.deadline) activity = undefined
+    if (mission.status !== 'active' || memberPhaseOf(member) === 'stopped' || mission.budgetPause || Date.now() >= mission.deadline) activity = undefined
     const previous = member.activity
     if (activity !== undefined) {
       const task = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
@@ -3356,19 +3439,18 @@ export class SwarmRuntime {
     member.providerOutage = { ...outage, at: Date.now() }
     this.store.put('members', member)
     if (duplicate) return
-    const openTasks = this.store.list('tasks', member.missionId).filter(task => task.status === 'running' && task.attempt?.ownerId === member.id).map(task => task.id)
-    this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: openTasks })
+    // R17-G1: the member's open work comes from the shared interpretation.
+    const view = this.interpretation(member.missionId)
+    const open = view.tasks.filter(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+    this.store.event(member.missionId, 'provider/outage', 'runtime', { memberId: member.id, class: outage.class, status: outage.status, message: outage.message, taskIds: open.map(task => task.id) })
     // One owner notice per class transition, never one per retry.
     if (previous?.class !== outage.class) {
       // R15-A1/A4: a member-scoped notice names that member's open work: the
       // subject is the task whose clock the outage holds, never the whole board.
       // The mission root is the fallback only when the member owns no open task.
-      const subjects = openTasks.length
-        ? openTasks.map((taskId: string) => { const task = this.store.get('tasks', taskId); return task === undefined ? `mission:${member.missionId}` : taskSubject(task) })
-        : [missionSubject(this.mission(member.missionId))]
       this.notify(member.missionId,
         `${member.name} provider ${outage.class} outage${outage.status === undefined ? '' : ` (HTTP ${outage.status})`}: ${outage.message}. Its attempt is preserved and no recovery credit is spent while the route is quiescent.`,
-        subjects, { from: member.id })
+        open.length ? view.subjectsOf(open) : [missionSubject(view.mission)], { from: member.id })
     }
   }
   /** R11-01: the member's route is quiescent only inside the outage window. */
@@ -3455,7 +3537,7 @@ export class SwarmRuntime {
     // Below the limit the member stays live so the next tick retries the same
     // route; at the limit it is retired exactly like a dead session. A quiescent
     // route is always kept live: the provider may recover on the next tick.
-    member.status = reroute ? 'stopped' : 'idle'
+    member.phase = reroute ? 'stopped' : 'active'
     this.commit(missionId, () => {
       if (outage === undefined) this.store.put('members', member)
       else this.recordProviderOutage(member, outage)
@@ -3487,7 +3569,7 @@ export class SwarmRuntime {
         }
         if (!exhausted) continue
         this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
-        this.notify(missionId, `${reason} (${task.id} exhausted its recovery limit of ${limit})`, [taskSubject(task)])
+        this.notify(missionId, `${reason} (${task.id} exhausted its recovery limit of ${limit})`, this.interpretation(missionId).subjectsOf([task]))
       }
       this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error), consecutiveFailures, rerouted: reroute, ...(outage === undefined ? {} : { outage: outage.class }) })
       // The outage notice is emitted by `recordProviderOutage`; do not claim a
@@ -3627,7 +3709,7 @@ export class SwarmRuntime {
   private async ensureWorkers(mission: Mission): Promise<void> {
     for (const member of this.store.list('members', mission.id)) {
       if (this.shuttingDown) return
-      if (member.status === 'stopped') continue
+      if (memberPhaseOf(member) === 'stopped') continue
       // R5-02: a failed resume is recovered by the same policy as the scheduler
       // start path; a successful start clears the consecutive failure counter.
       try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }); this.startFailures.delete(member.id); this.clearProviderOutage(mission.id, member.id) }
@@ -3687,7 +3769,14 @@ export class SwarmRuntime {
         await Promise.race([drain, new Promise<void>(resolve => { bound = setTimeout(resolve, this.stallPassTimeoutMs) })])
       } finally { if (bound !== undefined) clearTimeout(bound) }
     }
-    finally { this.closed = true; this.listeners.clear(); this.store.close() }
+    finally {
+      // R17-G6: unload unregisters the mission projection, so the host's
+      // snapshots stop serving a key whose owner is gone.
+      this.projection.dispose()
+      // R17-G8: and the claimed-signal subscription goes with it.
+      this.notices.dispose()
+      this.closed = true; this.listeners.clear(); this.store.close()
+    }
     if (workerError !== undefined) throw workerError
   }
 }

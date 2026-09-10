@@ -106,7 +106,19 @@ const meaningfulEvents: Record<string, string> = {
   'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, 200) : undefined }
+/**
+ * R17-Fr3: the bounded excerpt for one owner-facing field. The bound must still
+ * contain the actionable exit a reason ends with. A checkout-local workspace
+ * path is ~150 characters and the revocation reason that names it carries its
+ * cause and `[workspace_not_authorized]` exit *after* the path, so the previous
+ * 200-character cap cut the exit out of the panel for exactly the missions that
+ * were fenced — and the panel's own projection test asserts the reason is the
+ * owner-facing detail. 400 covers the longest reason the runtime writes (path,
+ * cause and exit) while staying a bounded excerpt; nothing else about the
+ * compact view changed.
+ */
+const DETAIL_EXCERPT = 400
+function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, DETAIL_EXCERPT) : undefined }
 function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
 const reasonFirst = new Set(['task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
@@ -176,7 +188,7 @@ export function recentProgress(snapshot: Snapshot, limit = 3): ProgressEvent[] {
     // names the cause and how much recovery credit it spent. The R11-08
     // families name their own payload instead of falling back to the title.
     const detail = eventDetail(type, data, task, evidence, reason)
-    return [{ seq: event.seq, createdAt: event.createdAt, label, ...(detail ? { detail: detail.slice(0, 200) } : {}) }]
+    return [{ seq: event.seq, createdAt: event.createdAt, label, ...(detail ? { detail: detail.slice(0, DETAIL_EXCERPT) } : {}) }]
   }).slice(0, Math.max(0, limit))
 }
 

@@ -165,7 +165,15 @@ export interface NoticeLedgerEntry {
   content: string
   sentAt: number
   queuedAt: number
-  claimedAt?: number
+  /**
+   * R17-G8: the transport fact (the adapter delivered it) and the consumption
+   * fact (the host's claimed signal). They are separate: `state` is transport
+   * only (`claimed` means "the adapter put it in front of the owner session"),
+   * a delivery is never relabelled as consumed, and consumption is never
+   * inferred from transport.
+   */
+  deliveredAt?: number
+  consumedAt?: number
   state: 'queued' | 'claimed'
   deliveryId: string
   escalation?: Escalation
@@ -178,8 +186,9 @@ export function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
     id: delivery.id, missionId: delivery.missionId, class: delivery.notice.class, dedupKey: delivery.notice.dedupKey,
     from: delivery.from, content: delivery.content,
     sentAt: delivery.notice.sentAt, queuedAt: delivery.notice.queuedAt,
-    ...(delivery.notice.claimedAt === undefined ? {} : { claimedAt: delivery.notice.claimedAt }),
-    state: delivery.notice.claimedAt === undefined ? 'queued' : 'claimed',
+    ...(delivery.deliveredAt === undefined ? {} : { deliveredAt: delivery.deliveredAt }),
+    ...((delivery.notice as { consumedAt?: number }).consumedAt === undefined ? {} : { consumedAt: (delivery.notice as { consumedAt?: number }).consumedAt }),
+    state: delivery.deliveredAt === undefined ? 'queued' : 'claimed',
     deliveryId: delivery.id,
     ...(delivery.escalation === undefined ? {} : { escalation: delivery.escalation }),
   }

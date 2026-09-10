@@ -74,6 +74,38 @@ Keep the linked plugin directory in place. After rebuilding it, restart the prof
 
 These instructions install a local source build; they do not require a published npm package.
 
+### Mount by declaration (bundle profile)
+
+That `add "link:$PWD"` call is the **direct mount**: the plugin package itself is
+the profile's bundle layer. The repository also ships a bundle package,
+[`profile/`](profile/README.md) (`@dsh-external/dsh-agent-swarm-profile`), whose
+runtime content is its patch document plus its dependency on this plugin. It is
+the **declared mount**: one layer composes the platform and its Web client UI,
+with portable roots, explicit defaults, and its prerequisites and conflicts
+named in the package's own metadata.
+
+```sh
+node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
+```
+
+The CLI installs the bundle and this plugin as its payload, and appends the
+bundle to `dsh.profile.bundles` after the `@deepseek-ai/dsh-base` and
+`@deepseek-ai/dsh-web-app` layers it declares as prerequisites. Its roots are
+portable and explicit — `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm`
+(which is `~/.dsh/agent-swarm` by default) — and a caller supplies another root,
+as the attended preview does, with that variable or with a `--patch` overlay
+that addresses the `dsh-external-agent-swarm` row by id. The payload dependency
+is the sibling package (`file:..`), so the mount needs no registry access, and a
+`file:` install packs the plugin: re-run the command after rebuilding it.
+
+Mount this bundle **or** the plugin package as a layer, never both. Both patch
+layers insert the same row id, and the profile bundle declares that conflict in
+its metadata. `tests/r17-profile.test.mjs` proves the composition and a real
+`dsh --profile web` boot at the default and caller-supplied roots. The preview
+deployment still uses the direct mount; swapping it is the campaign's attended
+deployment step, and what remains hand-run is recorded in
+[known limitations](docs/known-limitations.md).
+
 ## Use it
 
 Open a conversation in a **Git workspace**, choose your model, then describe the task:
@@ -131,6 +163,8 @@ Without it, a resizable dock sits beside the conversation — collapse and reope
 
 The default view leads with the goal, current work, accepted-task count and recent progress. **Team** reveals worker conversations. **Task details and resources** reveals budgets, the usage breakdown, the work board, the dependency graph, evidence and event history.
 
+**Worker identity.** Every worker carries a human given name from a fixed pool of 40 names — no vendor or product name — together with the responsibility text it was admitted with. `swarm_add_member` assigns the next unused name in assignment order when the caller supplies none; a name is unique within its mission and never reused while the mission is active, and an explicit name is still honoured. The name is a display identity only: `role` keeps the responsibility text unchanged and every delivery, assignment and tool argument addresses the **member id**, so nothing in the protocol depends on a display name. The current worker's line in the panel shows `name · role` beside a deterministic minimal pixel avatar derived from the name: an FNV-1a hash grows an 8×8 sprite mirrored about its vertical axis, using 3–4 colours from a fixed four-colour palette and drawn as inline SVG `<rect>`s with `shape-rendering: crispEdges`. The sprite is `aria-hidden` — a screen reader hears the name once — and it adds no image asset, no network request, no dependency and no model turn. `tests/r17-worker-names.test.mjs` proves the pool and assignment rules, 40 names → 40 distinct sprites, and the bounded rect count.
+
 Activity labels come from real model requests, tool executions, verification runs and provider retries. Elapsed time counts from the operation's observed start. These describe what the host has seen — an active request is not a promise of useful progress. On a connection failure the panel shows **Reconnecting** and marks retained activity as last-observed.
 
 Updates arrive through a cancellable native RPC watch with keepalives; hiding a pane stops its requests and reopening fetches current state. **Open conversation** navigates to a live worker's native chat, or opens a read-only paginated transcript after that worker is gone — without activating an agent or spending a model request.
@@ -161,6 +195,40 @@ Peer messages never grant authority to widen scope or budgets, change ownership,
 - **Host restart.** A host-caused stop re-pends the task without spending recovery credit and records a per-task `task/restart-repended` event, so a `maxRecoveryAttempts: 1` task survives one restart.
 - **Isolation.** Verification checkouts copy ignored dependency directories by default. The shared temp roots are a cross-member channel, so the runtime records a bounded `isolation/temp-rendezvous` event when two members name the same shared-temp path inside the window.
 
+## The platform contract
+
+This plugin is DSH's **mission scheduling, dispatch and execution platform**.
+DSH owns the agent layer — the loop, sessions, inbox, tools, sandbox, approvals,
+durable session log, projections, invariants and telemetry — and this plugin
+never re-implements it. The plugin owns the mission layer that nobody else
+provides: admission, isolation, execution control, verification, evidence and
+the owner decision loop. Stated as what a caller may rely on:
+
+- **One specification in, one artifact plus evidence out.** A mission
+  specification (objective, scope, acceptance, dependency graph, budgets,
+  workspace) produces a committed artifact, an independent non-author verdict,
+  host-recorded check runs and a durable record — reproducibly on every
+  supported composition.
+- **One owner decision loop.** The owner is told when a decision is needed — a
+  submitted result to review, a blocked or unreviewable task, a challenged
+  finding, a budget ceiling, a board that cannot advance — and not on every
+  tick. Missions are not an unattended black box.
+- **Failures are facts with exits.** Every refusal carries a stable bracket code
+  and an executable next step — for example `[workspace_not_authorized]`,
+  `[workspace_uncommitted]`, `[verification_requires_verify]` — and every
+  non-terminal state has a recorded successor or a bounded escalation.
+- **Resources are accounted and bounded.** Tokens, steps, wall time, tasks,
+  experiments and check concurrency are owner-set, never silently exceeded and
+  never reset by a resume.
+- **Mountable by declaration.** The platform ships as a composition — the
+  plugin, its Web client UI, and a bundle profile package — and a host mounts
+  it by naming the bundle in a profile's `dsh.profile.bundles`; see
+  [mount by declaration](#mount-by-declaration-bundle-profile).
+
+What is guaranteed, what is measured and what remains a named limit are listed
+under [current limitations](#current-limitations) and in the detailed
+[known limitations](docs/known-limitations.md).
+
 ## Storage and configuration
 
 The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [src/index.ts](src/index.ts):
@@ -187,7 +255,7 @@ capture, commit) are not the declared check and use their own bounded floor, `HO
 
 A mission workspace is accepted only when it equals the calling session's working directory or resolves (realpath, symlink-resolved) inside one of the roots in `authorizedWorkspaces`. The roots are read once from plugin configuration at start; **no model-callable tool can create, widen or revoke a root**, and changing the set requires a human editing the profile/`cordis.patch.yml` and restarting the host. `swarm_create` and `swarm_stage` overwrite the model-supplied workspace with the resolved path and record the matched root durably as `mission.workspaceGrantRoot` plus a `mission/workspace-bound` audit event; `workspace/grant-loaded` records each configured root at start. An unauthorized path is refused with a field-level `[workspace_not_authorized]` diagnostic naming the requirement and how a human grants it. Removing a root and restarting refuses new missions and fences a running one (durable blocked reason plus an owner notice) at its next workspace preparation or verification checkout. Worker sessions never create missions or use a grant. See [known limitations](docs/known-limitations.md) for the residual risks (model write access to the configuration file, TOCTOU on a replaced root, authorization is not confidentiality).
 
-Only one live runtime may own a database. To run independent Harness processes, give each an absolute `statePath` and `workspacesRoot` through its profile overlay. **Changing `DSH_HOME` alone does not isolate this plugin's storage.**
+Only one live runtime may own a database. To run independent Harness processes, give each an absolute `statePath` and `workspacesRoot` through its profile overlay. **Changing `DSH_HOME` alone does not isolate this plugin's storage.** The [bundle profile](profile/README.md) states both roots explicitly and portably — `DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm` — and a caller points them elsewhere with that variable or a `--patch` overlay.
 
 Infrastructure settings never replace the primary agent's decisions: an automatic plan must still supply its own complete resource budgets and task policies.
 
@@ -211,6 +279,7 @@ That runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 | `npm run test:harness` | Real Harness Loader composition, end to end. |
 | `npm run test:pack` / `test:packed` | The packaged artifact loads and runs what it declares. |
 | `npm run test:profile` | Real CLI profile install and lifecycle. |
+| `npm run test:bundle` | The declarative bundle profile: metadata, portable roots, host composition, and a real `dsh --profile web` boot. |
 | `npm run test:web` / `test:command-web` | The sidebar and `/agent-swarm` browser workflows. |
 
 Suites use temporary profiles and Git workspaces, with the model boundary scripted. `test:deepseek` and `test:command-deepseek` make real provider requests, can incur charges, and are excluded from `verify`.

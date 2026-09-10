@@ -169,6 +169,9 @@ test('R15-A1: every notify() call site in src/ passes a subject argument (enumer
   const offenders = []
   const isSubjectArgument = value => value.startsWith('[')
     || /^(subjects|subjectList|[a-zA-Z.]*Subjects)$/.test(value)
+    // R17-B2r: the shared interpretation's own subject helper
+    // (`view.subjectsOf`, `this.interpretation(id).subjectsOf`, a ternary over it).
+    || /subjectsOf\(/.test(value)
     || /^[a-zA-Z.]*SubjectsFor\(/.test(value)
     || /^[a-zA-Z.]*subjectsOfTasks\(/.test(value)
     || /^[a-zA-Z.]*(Subjects|subjects)\(/.test(value)
@@ -190,12 +193,13 @@ test('R15-A1: every notify() call site in src/ passes a subject argument (enumer
     }
   }
   // The count is part of the claim: a NEW call site must be visited and given a
-  // subject, and this number is what makes the enumeration complete. R16-D adds
-  // exactly one site — `Scheduling.escalateSilentAttempt` (src/scheduling.ts),
-  // the attempt reporting-bound escalation, whose third argument is
-  // `[taskSubject(task)]`. The count moves 23 -> 24; nothing else in this test
-  // changed, and the new site is visited and checked like every other.
-  assert.equal(sites, 24, `every .notify() site enumerated (found ${sites})`)
+  // subject, and this number is what makes the enumeration complete. R16-D added
+  // `Scheduling.escalateSilentAttempt` (src/scheduling.ts, `[taskSubject(task)]`),
+  // moving 23 -> 24. R17-B2 adds exactly one more — `Notices.absenceNet`
+  // (src/notices.ts), the absence net, whose third argument is `[subject]` built
+  // from `missionSubject(mission)`. The count moves 24 -> 25; nothing else in
+  // this test changed, and the new site is visited and checked like every other.
+  assert.equal(sites, 25, `every .notify() site enumerated (found ${sites})`)
   assert.deepEqual(offenders, [], `every notify() site passes subjects as its third argument: ${offenders.join(' | ')}`)
 })
 
@@ -443,48 +447,53 @@ test('R15-F1: a pending verification waits on its live source and is named only 
   assert.ok(namesReview().length > 0, 'a review whose source is terminal has no live path and is named')
 })
 
-test('R15-F2: a stale idle member row is reconciled with the live attempt, and the projection still shows the work', async t => {
+test('R15-F2/R17-G7: a member owning a live attempt can never read idle — impossible by construction, not reconciled', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const task = f.propose('Live attempt', { assigneeId: builder.id })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, task.id)
-  // The reported pause/restart seam: the durable member row says idle while the
-  // attempt is live on a running task.
+  // The reported pause/restart seam: a writer puts `idle` onto the member row
+  // while the attempt is live on a running task. R17-G7 makes that write
+  // non-durable (`SwarmStore.put('members')` drops the derived status) and the
+  // read derived, so the seam cannot be constructed at all.
   const stale = f.runtime.store.get('members', builder.id)
   stale.status = 'idle'
   f.runtime.store.put('members', stale)
   // The projection derives the phase from the durable task rows, not from the row.
-  assert.equal(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection shows the live attempt even while the stored status is ambiguous')
+  assert.equal(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection shows the live attempt even while a stale status write is presented')
   // The guard board derives the same fact for the model-facing progress action.
   const board = f.runtime.scheduling.guardBoard(f.mission.id)
   assert.equal(board.members.find(member => member.id === builder.id).status, 'working', 'the guard board derives a working member from the live attempt')
-  // And the tick reconciles the durable row itself.
+  // Every read on every tick derives the same value; nothing writes the row.
   await sleep(250)
-  assert.equal(f.runtime.store.get('members', builder.id).status, 'working', 'the durable member row is reconciled with the live attempt')
-  // Pair 1: a parked member is never rewritten by the reconciliation.
+  assert.equal(f.runtime.store.get('members', builder.id).status, 'working', 'the derived read follows the live attempt with no reconcile write')
+  assert.equal(f.runtime.store.get('members', builder.id).phase, 'active', 'the durable row carries the phase, not the live status')
+  // Pair 1: a parked member keeps the owner's durable park intent, which wins
+  // over work in flight (the parked-member hatch is the only reader that acts).
   const parked = await f.addMember('Parked')
   const parkedRow = f.runtime.store.get('members', parked.id)
-  parkedRow.status = 'waiting'
+  parkedRow.phase = 'parked'
   f.runtime.store.put('members', parkedRow)
   await sleep(200)
-  assert.equal(f.runtime.store.get('members', parked.id).status, 'waiting', 'a parked member is never rewritten')
+  assert.equal(f.runtime.store.get('members', parked.id).status, 'waiting', 'the durable park is never rewritten')
   assert.equal(f.runtime.store.get('members', builder.id).status, 'working', 'the working member stays working')
-  // Pair 2: once the attempt is gone the derived views stop claiming work, and
-  // the tick leaves the durable row alone: the reconciliation only ever upgrades,
-  // so it cannot churn the F(S) key that the coverage and stall notices use. The
-  // paths that END an attempt write `idle` (Attempts.onIdle, cancel/handoff).
+  // Pair 2: once the attempt is gone the derived views stop claiming work with no
+  // status write. There is no upgrade-only rule to preserve, because there is no
+  // stored mirror to preserve it in, and no write can churn the F(S) key the
+  // coverage and stall notices use.
   const done = f.runtime.store.get('tasks', task.id)
   done.status = 'submitted'; delete done.attempt
   f.runtime.store.put('tasks', done)
   await sleep(250)
   assert.notEqual(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection stops reporting work once the attempt is gone')
   const after = f.runtime.scheduling.guardBoard(f.mission.id)
-  assert.equal(after.members.find(member => member.id === builder.id).status, 'working', 'the guard board preserves the stored row (upgrade-only, the retained DEADr D1 contract)')
-  assert.equal(f.runtime.store.get('members', builder.id).status, 'working', 'the upgrade-only reconciliation does not downgrade the row')
-  // The path that ends a turn writes the downgrade itself.
+  assert.equal(after.members.find(member => member.id === builder.id).status, 'idle', 'with no live attempt the same derivation is idle')
+  assert.equal(f.runtime.store.get('members', builder.id).status, 'idle', 'the derived read stops claiming work once the attempt is gone')
+  // The idle callback removes the attempt through the close-out path; the status
+  // follows it and no writer states the downgrade.
   f.runtime.workers.callbacks?.idle?.(builder.id)
   await sleep(150)
-  assert.equal(f.runtime.store.get('members', builder.id).status, 'idle', 'the idle callback writes the downgrade')
+  assert.equal(f.runtime.store.get('members', builder.id).status, 'idle', 'the idle callback leaves the derivation idle')
 })
 
 test('R15-D1: a hung workers.start is named while a healthy sibling holds a live lease', async t => {

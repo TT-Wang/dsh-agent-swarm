@@ -10,11 +10,23 @@
  *      restart with the human root removed;
  *   3. the sanctioned board stays model-tool-only in the client and the
  *      declared gap is documented and held by this test.
+ *
+ * R17-Fr3: the fixture routes its temp root through `tests/temp-root.mjs`, the
+ * R15-F3/F5 rule for every file a declared check runs. `os.tmpdir()` stays
+ * whatever the caller's environment says — in the host check sandbox that is a
+ * path outside the disposable checkout, so `mkdtemp` there dies with EPERM
+ * before the first assertion; `tempDirectory` keeps the ambient root as its
+ * first choice and falls back to `<cwd>/.swarm/test-tmp` when it is denied. That
+ * fallback path is long (205 characters in this checkout, measured), which is
+ * why the owner-facing excerpt in `src/client/progress.ts` now covers a real
+ * checkout path plus the reason it introduces (see `DETAIL_EXCERPT` there): at
+ * the previous 200-character cap both this file's bound-workspace detail and the
+ * revocation reason it asserts were cut mid-path. Not one assertion, test name
+ * or count in this file changed.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -25,6 +37,7 @@ import { RecentProgress } from '../lib/types/client/MissionProgress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { eventSummary } from '../lib/types/client/projection.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
+import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 const renderChinese = (component, props) => renderToStaticMarkup(
@@ -45,7 +58,7 @@ class TickingWorkers extends Workers {
   async verifyArtifact() { return [] }
 }
 async function fixture(t) {
-  const temp = await realpath(await mkdtemp(join(tmpdir(), 'swarm-client-projection-')))
+  const temp = await realpath(await tempDirectory('swarm-client-projection-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   const session = join(temp, 'session'), granted = join(temp, 'granted')
   await mkdir(session); await mkdir(granted)

@@ -14,6 +14,8 @@ import { dirname, join, basename, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SchedulingPass, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
+// R17-G7: one derivation for the derived member status; the store never persists it.
+import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
 interface Tables {
   missions: Mission
@@ -338,7 +340,10 @@ export class SwarmStore {
   /** Read a detached record. Durable parsers reject malformed identity fields. */
   get<T extends Table>(table: T, id: string): Tables[T] | undefined {
     const row = this.db.prepare(`SELECT value FROM ${table} WHERE id=?`).get(id)
-    return row ? this.parse<T>(String(row.value), id) : undefined
+    if (row === undefined) return undefined
+    const parsed = this.parse<T>(String(row.value), id)
+    if (table === 'members') return this.hydrateMembers([parsed as unknown as Member])[0] as unknown as Tables[T]
+    return parsed
   }
   private parse<T extends Table>(json: string, id?: string): Tables[T] {
     const result: unknown = JSON.parse(json)
@@ -349,7 +354,39 @@ export class SwarmStore {
   list<T extends Table>(table: T, missionId?: string): Tables[T][] {
     const rows = missionId === undefined ? this.db.prepare(`SELECT value FROM ${table} ORDER BY rowid`).all()
       : this.db.prepare(`SELECT value FROM ${table} WHERE mission_id=? ORDER BY rowid`).all(missionId)
-    return rows.map(row => this.parse<T>(String(row.value)))
+    const parsed = rows.map(row => this.parse<T>(String(row.value)))
+    // R17-G7: member rows are hydrated with the derived live status at the one
+    // read face, so no reader sees a durable status (there is none).
+    if (table === 'members') return this.hydrateMembers(parsed as unknown as Member[]) as unknown as Tables[T][]
+    return parsed
+  }
+  /**
+   * R17-G7: the derived member view. The durable row carries a phase; the live
+   * status is computed here from that phase and the tasks that name the member
+   * as the owner of a running attempt (`deriveMemberStatus`). The member is
+   * never given a stored status to mirror, so the R15-F2 seam (a row reading
+   * `idle` while a live attempt exists) cannot be constructed.
+   */
+  private hydrateMembers(members: readonly Member[]): Member[] {
+    const views: Member[] = []
+    let cachedMission = ''
+    let liveOwners = new Set<string>()
+    for (const member of members) {
+      if (member.missionId !== cachedMission) {
+        cachedMission = member.missionId
+        liveOwners = this.liveAttemptOwners(cachedMission)
+      }
+      // R17-G7: the ONE phase rule, including the legacy mapping, so a
+      // phase-less row that records `stopped`/`waiting` keeps its intent.
+      const phase = memberPhaseOf(member)
+      views.push({ ...member, phase, status: deriveMemberStatus(phase, liveOwners.has(member.id)) })
+    }
+    return views
+  }
+  /** Members that own a running attempt in one mission, read from the durable task rows. */
+  private liveAttemptOwners(missionId: string): Set<string> {
+    const rows = this.db.prepare(`SELECT json_extract(value,'$.attempt.ownerId') AS owner_id FROM tasks WHERE mission_id=? AND json_extract(value,'$.status')='running' AND json_extract(value,'$.attempt.ownerId') IS NOT NULL`).all(missionId)
+    return new Set(rows.map(row => String(row.owner_id)))
   }
   /** Write a detached record inside its caller's transaction. */
   put<T extends Table>(table: T, value: Tables[T]): void {
@@ -359,6 +396,16 @@ export class SwarmStore {
     // path can bypass the guard by holding a record it read before another
     // accepted write.
     if (table === 'tasks') { this.putTask(value as Task); return }
+    // R17-G7: the member funnel drops the derived live status and normalizes the
+    // durable phase. A caller that assigns `member.status` (there are legacy
+    // sites outside this round's write scope) changes nothing durable: the next
+    // read re-derives the status from the phase and the live attempts.
+    if (table === 'members') {
+      const member = value as Member
+      const { status: _derivedStatus, ...durable } = member
+      this.upsert(table, { ...durable, phase: memberPhaseOf(member) } as Tables[T])
+      return
+    }
     this.upsert(table, value)
   }
   /**

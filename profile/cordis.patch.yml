@@ -1,0 +1,40 @@
+# The declarative mount for the Agent Swarm platform (R17-G11).
+#
+# A profile mounts the platform by declaration: list this bundle after
+# `@deepseek-ai/dsh-base` and `@deepseek-ai/dsh-web-app` in
+# `dsh.profile.bundles` (the prerequisites declared in this package's
+# `dsh.bundle.requires.bundles`) and install the package with
+# `dsh plugin --profile <name> add <this package>`. The loader composes this
+# layer with the host bundles; nothing here is a hand-written absolute path.
+#
+# This layer inserts the plugin row and states the two roots it owns
+# explicitly instead of relying on an implicit default:
+#
+#   root = $DSH_AGENT_SWARM_ROOT
+#          ?? ($DSH_HOME ?? $HOME/.dsh) + '/agent-swarm'
+#   statePath      = root + '/swarm.sqlite'
+#   workspacesRoot = root + '/workspaces'
+#
+# The expression is portable: it names no user, machine or checkout path, and
+# with no variable set it resolves to the plugin's own documented default
+# (`~/.dsh/agent-swarm/...`). A caller that needs another root — the attended
+# preview uses its own — sets `DSH_AGENT_SWARM_ROOT`, or overrides this row's
+# `config` in a later patch layer (a `--patch <file>` overlay or the profile's
+# own `cordis.patch.yml`), which is the layer order the launcher defines.
+#
+# The client UI mounts with this row: the client module system scans mounted
+# rows for a package declaring `dsh.client` for the web platform, and the
+# inserted package declares exactly that (`./client` plus its inject list), so
+# the browser half needs no second row.
+#
+# Conflict (declared in package.json `dsh.bundle.conflicts.bundles`): the
+# plugin package itself also ships a bundle patch
+# (`@dsh-external/dsh-agent-swarm/cordis.patch.yml`) that inserts the same row
+# id `dsh-external-agent-swarm`. Mount this bundle or the plugin package as a
+# profile layer, never both: a second insert would duplicate the row.
+- insert:
+    - id: dsh-external-agent-swarm
+      name: '@dsh-external/dsh-agent-swarm'
+      config:
+        statePath: !!js "((process.env.DSH_AGENT_SWARM_ROOT ?? ((process.env.DSH_HOME ?? ((process.env.HOME ?? '') + '/.dsh')) + '/agent-swarm')) + '/swarm.sqlite')"
+        workspacesRoot: !!js "((process.env.DSH_AGENT_SWARM_ROOT ?? ((process.env.DSH_HOME ?? ((process.env.HOME ?? '') + '/.dsh')) + '/agent-swarm')) + '/workspaces')"

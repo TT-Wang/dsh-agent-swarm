@@ -13,6 +13,8 @@ import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { WorkspaceRevokedError } from './workspace-admission.ts'
+// R17-G6/G7: the one derivation of the derived member status.
+import { memberPhaseOf } from './projection.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Attempt, Member, Mission, SchedulingPass, SwarmEvent, Task } from './types.ts'
 
@@ -202,9 +204,14 @@ export class Scheduling {
    * active during an adapter await, or when the pass guard was released.
    */
   async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
-        for (const member of this.rt.store.list('members', missionId)) {
+        // R17-G1: the dispatcher reads the SAME shared interpretation every
+        // owner-facing generator consumes (`ready`, `dispatchable`, the task and
+        // member rows), so no notice can describe a board the dispatcher would
+        // act on differently. The view is rebuilt after each await, so it is
+        // never staler than the per-step store reads it replaces.
+        for (const member of this.rt.interpretation(missionId).members) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (member.status === 'stopped') continue
+          if (memberPhaseOf(member) === 'stopped') continue
           // S1: an abandoned pass body (its guard was released after the declared
           // bound) must never dispatch into the newer pass's turn.
           if (this.passReleased(pass)) return false
@@ -234,13 +241,14 @@ export class Scheduling {
           // precondition can be false for a parked agent (a pending inbox item or a
           // non-idle handle); an assignment is exactly the fresh input that unparks
           // it, so the runtime must not let that precondition leave the board silent.
-          const parkedMember = member.status === 'waiting'
+          const parkedMember = memberPhaseOf(member) === 'parked'
           // R15-A4/A5: the sweep and the owner-facing explanation ask the same
           // question (`startBlocker`), so a member the sweep skipped is never
           // described to the owner with a cause the sweep did not test. The
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (this.startBlocker(member) !== undefined) continue
-          const open = this.rt.store.list('tasks', missionId).find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
+          const view = this.rt.interpretation(missionId)
+          const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
             // bounded retry, then checkpoint the workspace and re-pend the task
@@ -253,8 +261,8 @@ export class Scheduling {
             if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open)
             continue
           }
-          const all = this.rt.store.list('tasks', missionId)
-          const ready = all.filter(t => this.ready(t, member, all)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          const all = view.tasks
+          const ready = all.filter(t => view.ready(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
           // R12-F9, dispatch-time half: a task whose own text assumes prior work
           // is already in the worktree while no content-carrying edge provides it
           // would be prepared from the bare mission baseline and surprise the
@@ -356,9 +364,9 @@ export class Scheduling {
    * answer with the same predicate.
    *
    * Guards it can co-fire with:
-   * - the parked-member hatch (`member.status === 'waiting'`, R10-09/S3): a parked
-   *   member is startable even when the adapter reports a pending inbox item, so
-   *   the hatch wins here exactly as it does in `dispatch`;
+   * - the parked-member hatch (`memberPhaseOf(member) === 'parked'`, R10-09/S3): a
+   *   parked member is startable even when the adapter reports a pending inbox item,
+   *   so the hatch wins here exactly as it does in `dispatch`;
    * - the adapter's `isIdle` precondition (`HarnessWorkers.isIdle`), which now
    *   drains a stranded `nextStep` item instead of stranding the member (R15-A5);
    * - the W6 open-attempt close-out, which owns a member that already has a
@@ -366,7 +374,7 @@ export class Scheduling {
    *   `dispatchQuestion` refuses to answer for a task with an open attempt.
    */
   startBlocker(member: Member): 'handle-busy' | undefined {
-    if (member.status === 'waiting') return undefined
+    if (memberPhaseOf(member) === 'parked') return undefined
     return this.rt.workers.isIdle(member.id) ? undefined : 'handle-busy'
   }
 
@@ -395,7 +403,7 @@ export class Scheduling {
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it, and a second owner wake would be noise.
       if (task.attempt !== undefined) continue
-      const eligible = members.filter(member => member.status !== 'stopped' && this.ready(task, member, tasks))
+      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && this.ready(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
@@ -477,23 +485,21 @@ export class Scheduling {
             ? { assumedContent: true } : {}),
         }
       }),
-      // R15-F2: the guard board derives a member's status from the live attempt as
-      // well as from the stored row, so a stale `idle` row cannot make the model's
-      // progress action hide a member that currently owns running work. Co-firing
-      // guards: this derivation x the W6 idle close-out (same attempt) and x the
-      // parked-member hatch (`waiting` is preserved: a parked owner still holds
-      // its work).
-      // Upgrade-only, exactly like the runtime's reconciliation: a stale `idle` row
-      // must not hide a member that owns a live attempt (the reported seam), while a
-      // stored `working` row is preserved — the retained DEADr D1 pair depends on
-      // the stored status reaching the guard model, and the paths that END an
-      // attempt write `idle` themselves.
-      members: members.map(member => {
-        if (member.status === 'waiting' || member.status === 'stopped') return { id: member.id, status: member.status }
-        const ownsLiveAttempt = tasks.some(task => task.status === 'running' && task.attempt !== undefined
-          && task.attempt.leaseUntil >= now && task.attempt.ownerId === member.id)
-        return { id: member.id, status: ownsLiveAttempt ? 'working' : member.status }
-      }),
+      // R17-G6/G7: the member half of the guard board is READ from the runtime's
+      // derived member board — the registered host projection's current state
+      // when this process published one, otherwise the same single derivation —
+      // so the model-facing guard model is an instance of the projection being
+      // read, not a second interpretation of the rows. The stored mirror and its
+      // upgrade-only rule are gone: there is no row to fall behind the attempt,
+      // and no write here can churn F(S). Co-firing guards, named: the W6 idle
+      // close-out (which owns the attempt until it fences it), the parked-member
+      // hatch (`parked` wins over work in flight and keeps the member
+      // dispatchable), the dispatch decision (which asks `startBlocker` about the
+      // handle, never this status) and the coverage/stall notices, whose F(S) key
+      // no status write can move any more. A dead lease stays the guard model's
+      // own classification (`guardTerminalChain` reads the task rows and returns
+      // `attempt_lease`), so this status never has to encode lease liveness.
+      members: this.rt.memberBoard(missionId).map(member => ({ id: member.id, status: member.status })),
     }
   }
 
@@ -526,7 +532,7 @@ export class Scheduling {
    * once every acceptance criterion is independently covered.
    */
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
-    const live = members.filter(member => member.status !== 'stopped')
+    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     // W15: a blocked task with a matching stop marker is alive, not dead. Handoff,
     // worker close-out and lease expiry hold the task at `blocked` +
     // `resumeAfterStop` only until `workers.stop()` resolves; treating it as
@@ -593,7 +599,7 @@ export class Scheduling {
     if (unreviewed.length) {
       if (!this.unreviewedStall(mission.id, unreviewed)) return false
     }
-    const live = members.filter(member => member.status !== 'stopped')
+    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
 
@@ -961,6 +967,18 @@ export class Scheduling {
       ? ` The release was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
       : ''
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
+    // R15-D2: when a subject of this escalation is a blocked task whose stop is
+    // past its declared bound (or carries no recorded start), the escalation
+    // states that row-supported fact — the pass's release is exactly what makes
+    // the stop unbounded.
+    const stopFacts = unreached.filter(task => task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch)
+      .map(task => {
+        const stop = task.resumeAfterStop
+        return stop?.at === undefined
+          ? `${task.id} is blocked and its stop carries no recorded start, so the declared bound (${info.boundMs}ms) cannot be shown to hold`
+          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, Date.now() - stop.at)}ms, past its declared bound`
+      })
+    const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
     const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
     mission.schedulingStallNotice = fingerprint
@@ -994,9 +1012,18 @@ export class Scheduling {
           liveSubjects: info.release.liveSubjects,
         }),
       })
+      // R17-G5: the release is a transition that still owes the dead pass's own
+      // dispatch question, so the next fact publication runs with the wedged
+      // branch even though the pass row is released by the time it runs.
+      this.rt.expectWedgedRelease(missionId)
       this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} (run ${info.pass.runId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}. Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
-        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects)
+        ? `Scheduling pass ${info.pass.id} (run ${info.pass.runId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
+        // R17-G5: the pass release is its own fact, not the board's witness. A
+        // wedged-pass escalation must not consume the board's W2 witness for a
+        // fingerprint whose decision the transition-driven classifier still owes
+        // (the dispatch question the dead pass never reached).
+        { stampWitness: false })
     })
     // The notice path must not share the fate of the pass that could not report
     // it: the queue-external pump delivers it, never the wedged mission queue.
@@ -1086,7 +1113,7 @@ export class Scheduling {
     if (task.idleSignal?.attemptId === attempt.id) return undefined
     if ((task.closeout?.nudges ?? 0) > 0) return undefined
     const member = this.rt.store.get('members', attempt.ownerId)
-    if (member === undefined || member.status === 'stopped' || member.status === 'waiting') return undefined
+    if (member === undefined || memberPhaseOf(member) === 'stopped' || memberPhaseOf(member) === 'parked') return undefined
     // F1's subject: any recorded in-flight operation means that guard owns this
     // attempt's clock. The durable member row is the record; this is the
     // conservative direction (it can only suppress, never invent, an escalation).
@@ -1323,14 +1350,14 @@ export class Scheduling {
    */
   reviewPathStalled(tasks: Task[], members: Member[]): boolean {
     if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const live = members.filter(member => member.status !== 'stopped')
+    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
 
   /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
   rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
     const candidates = this.rt.store.list('members', missionId)
-      .filter(member => member.id !== failedId && member.status !== 'stopped' && this.capable(task, member))
+      .filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped' && this.capable(task, member))
     const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
     return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }

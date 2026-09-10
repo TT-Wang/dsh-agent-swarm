@@ -161,7 +161,7 @@ const TOOL_CENSUS = [
   ["swarm_launch", "keep", "worker-decision", "tests/automatic.test.mjs", "Launch the complete plan for a native /agent-swarm request identified by requestId; no user confirmation is ne"],
   ["swarm_budget", "keep", "worker-decision", "tests/automatic.test.mjs", "Owner only: set all six resource ceilings from observed progress, with a reason"],
   ["swarm_create", "keep", "worker-decision", "tests/authorized-workspace.test.mjs", "Create a durable mission in the user-authorized workspace and scope with every budget field chosen for this ta"],
-  ["swarm_add_member", "keep", "worker-decision", "tests/harness-composition.mjs", "Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree."],
+  ["swarm_add_member", "keep", "worker-decision", "tests/harness-composition.mjs", "Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id."],
   ["swarm_workstream", "keep", "worker-decision", "tests/harness-composition.mjs", "Create a durable workstream in this mission; any member can propose work under it."],
   ["swarm_propose", "keep", "worker-decision", "tests/arena-protocols.test.mjs", "Propose and admit a task within mission scope and budget"],
   ["swarm_claim", "keep", "worker-decision", "tests/durability-w9-recovery.test.mjs", "Claim ready work as yourself; ownership is atomic and expires"],
