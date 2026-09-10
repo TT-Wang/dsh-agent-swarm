@@ -329,10 +329,136 @@ export function reconcileDeliverableIgnores(workspace: string, objective: string
 }
 
 /** Every admission reconciliation that needs only the task text, scope and workspace. */
-export function reconcileTaskAdmission(task: { objective: string; scope: readonly string[]; acceptance?: readonly string[] }, workspace: string, location: string): AdmissionDiagnostic[] {
+export function reconcileTaskAdmission(task: TaskAdmissionInput, workspace: string, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
   const diagnostics = reconcileObjectiveScope(task.objective, task.scope, location)
   diagnostics.push(...reconcileDeliverableIgnores(workspace, task.objective, task.acceptance ?? [], location))
+  // R12-F9, admission-time half: the terminal element of the admission chain.
+  // It fires only when the caller supplies the task's dependency set, so a call
+  // site that does not know the edges can never refuse a legitimate task.
+  diagnostics.push(...dependencyAssumptions(task, location, context))
   return diagnostics
+}
+
+/* ------------------------------------------------------------------------- *
+ * R12-F9: the admission guard for a task that assumes prior work.
+ *
+ * Reproduced twice on 2026-09-10. `T3b` was admitted with no dependencies while
+ * its objective said "resume from your own artifact `09883f3`" and was prepared
+ * from the bare mission baseline; it was refused at submission ("Artifact
+ * changes path outside task scope"). `INT2` said the assembly was already in its
+ * worktree, was caught by the member itself, and was repaired by hand with
+ * `git archive` plus a 225-path hash check at the cost of an owner cancellation
+ * pair. Both are the same chain: preparation merges the mission baseline plus
+ * the declared dependencies, so a task whose own text assumes content that no
+ * dependency carries is refused at admission — with a coded diagnostic and an
+ * executable exit — instead of surprising its member at submission.
+ *
+ * The guard deliberately requires the dependency *set*, not just the text: a
+ * task that really does depend on the content is legitimate, and a repair may
+ * not depend on the task it replaces (src/runtime.ts refuses that edge), so a
+ * bare `replaces` id is not by itself evidence of missing content. `knownContents`
+ * lets the caller distinguish "add the dependency that carries it" from "state
+ * how you will obtain it"; when the caller does not know, the diagnostic names
+ * both exits.
+ * ------------------------------------------------------------------------- */
+
+/** The stable code of the R12-F9 admission refusal. */
+export const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
+
+export interface DependencyAssumptionInput {
+  objective: string
+  acceptance?: readonly string[]
+  dependencies?: readonly string[]
+  replaces?: readonly string[]
+}
+
+export interface TaskAdmissionInput extends DependencyAssumptionInput {
+  scope: readonly string[]
+}
+
+export interface DependencyAssumptionContext {
+  /** The declared dependency set. Absent means unknown, never "empty". */
+  dependencies?: readonly string[]
+  replaces?: readonly string[]
+  /** Durable task ids, artifact commits and evidence ids this mission already holds. */
+  knownContents?: ReadonlySet<string>
+}
+
+/** A clause that claims prior work is already available in the worktree. */
+const WORKTREE_PRESENCE = /\b(?:already\s+in|already\s+present\s+in|is\s+already\s+in|are\s+already\s+in|was\s+already\s+in|were\s+already\s+in|already\s+has)\s+(?:your|its|the|this)\s+(?:worktree|checkout|baseline)\b/i
+/** A clause that resumes or starts from named prior work. */
+const RESUME_PRESENCE = /\b(?:resum(?:e|es|ing)\s+from|continu(?:e|es|ing)\s+from|prepared?\s+from|start(?:s|ing)?\s+from)\b/i
+/** A weaker claim, kept only for a *named* artifact identity. */
+const AVAILABILITY_PRESENCE = /\balready\s+(?:present|available|committed|merged|checked\s+out)\b/i
+const CONTENT_WORD = /\b(?:artifact|assembly|checkpoint|commit|evidence|snapshot|previous\s+attempt|prior\s+work|replaced\s+task)\b/i
+
+/** Named artifact/evidence/task identities and commit-like tokens appearing in a clause. */
+export function namedContentTokens(text: string): string[] {
+  const found: string[] = []
+  for (const match of text.matchAll(/\b(?:artifact|evidence|task|attempt|mission|stream|checkpoint)_[A-Za-z0-9-]{4,}\b/g)) found.push(match[0])
+  // A bare short hex token is only a commit reference when it carries a digit:
+  // ordinary words such as "defaced" are all [a-f] and must not be read as one.
+  for (const match of text.matchAll(/\b[0-9a-f]{7,40}\b/g)) if (/\d/.test(match[0])) found.push(match[0])
+  return found
+}
+
+/**
+ * The coded diagnostic for one clause that assumes content no dependency
+ * carries. `known` is the caller's answer to "does this mission already hold
+ * that content"; undefined names both executable exits.
+ */
+export function dependencyAssumptionDiagnostic(named: string, field: string, clause: string, location: string, known?: boolean): AdmissionDiagnostic {
+  const provenance = known === true
+    ? 'That content exists in this mission, so a dependency edge is what carries it into a prepared worktree.'
+    : known === false
+      ? 'That content is not in the mission baseline, so the worktree will not contain it.'
+      : 'No declared dependency carries that content into the prepared worktree.'
+  return {
+    code: 'dependency_assumption_missing',
+    location,
+    path: named,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\` while keeping its acceptance criteria verbatim.`,
+  }
+}
+
+/**
+ * The R12-F9 admission guard: diagnostics for every clause of the objective and
+ * acceptance that assumes prior work while the declared dependency set is empty.
+ * A call site that does not supply the dependency set gets an empty list — the
+ * guard never guesses, because guessing would refuse a legitimate task.
+ */
+export function dependencyAssumptions(task: DependencyAssumptionInput, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
+  const dependencies = context.dependencies ?? task.dependencies
+  if (dependencies === undefined || dependencies.length > 0) return []
+  const replaces = new Set(context.replaces ?? task.replaces ?? [])
+  const fields: Array<[string, string]> = [['objective', task.objective], ...(task.acceptance ?? []).map((item, index) => [`acceptance[${index}]`, item] as [string, string])]
+  const found: AdmissionDiagnostic[] = []
+  const seen = new Set<string>()
+  for (const [field, text] of fields) {
+    for (const clause of text.split(CLAUSE_SPLIT)) {
+      const worktreeClaim = WORKTREE_PRESENCE.test(clause)
+      const resumeClaim = RESUME_PRESENCE.test(clause)
+      const availabilityClaim = AVAILABILITY_PRESENCE.test(clause)
+      if (!worktreeClaim && !resumeClaim && !availabilityClaim) continue
+      const tokens = namedContentTokens(clause)
+      const contentWord = CONTENT_WORD.test(clause)
+      const replaced = [...replaces].filter(id => clause.includes(id))
+      // A bare `replaces` id in an ordinary repair sentence is not evidence of a
+      // missing dependency; it only counts when the same clause also claims
+      // prior content is available, or carries a named artifact identity.
+      const claimsContent = tokens.length > 0 || contentWord || (replaced.length > 0 && (worktreeClaim || resumeClaim || availabilityClaim))
+      if (!claimsContent) continue
+      // The weak "already present/available/committed/merged" wording only fires
+      // for a named identity or an explicit content noun, so a factual sentence
+      // about the baseline repository cannot trip the guard.
+      if (availabilityClaim && !worktreeClaim && !resumeClaim && tokens.length === 0 && !CONTENT_WORD.test(clause)) continue
+      const named = tokens[0] ?? replaced[0] ?? (/(?:artifact|assembly|checkpoint|commit|evidence|snapshot)/i.exec(clause)?.[0] ?? 'the assumed prior work')
+      if (seen.has(named)) continue
+      seen.add(named)
+      found.push(dependencyAssumptionDiagnostic(named, field, clause.trim(), location, context.knownContents === undefined ? undefined : context.knownContents.has(named)))
+    }
+  }
+  return found
 }
 
 export interface CheckClassification {

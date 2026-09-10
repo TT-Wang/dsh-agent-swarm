@@ -86,13 +86,18 @@ test('S7: a shared worktree is refused durably, never dispatched into, and clear
     const task = f.propose({ assigneeId: f.reviewer.id })
     const refused = await eventually(() => {
       const notice = f.runtime.store.list('deliveries', f.mission.id)
-        .find(delivery => delivery.to === 'owner' && /Isolation invariant refused/.test(delivery.content))
+        .find(delivery => delivery.to === 'owner' && /\[workspace_terminal\]/.test(delivery.content))
       const key = f.runtime.store.get('missions', f.mission.id).isolationRefusal
       return notice !== undefined && key !== undefined ? { notice, key } : undefined
     }, 'a shared worktree must produce a durable refusal', 6_000)
     assert.match(refused.key, new RegExp(f.reviewer.id), 'the durable refusal names the member that was not started')
     assert.match(refused.key, /share one provisioned worktree/, 'the durable refusal names the violation')
-    assert.match(refused.notice.content, /repair the member workspaces/, 'the refusal wakes the owner with the executable exit')
+    // S4b: the isolation notice is the shared coded workspace terminal now. The
+    // assertion is the coded contract (stable code, the violation as the detail,
+    // and the executable exits) instead of the removed prose-only wording.
+    assert.match(refused.notice.content, /\[workspace_terminal\]/, 'the refusal carries the stable diagnostic code')
+    assert.match(refused.notice.content, /share one provisioned worktree/, 'the detail names the violation')
+    assert.match(refused.notice.content, /swarm_cancel/, 'the refusal wakes the owner with an executable exit')
     assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'no task is assigned into a shared worktree')
     const starts = f.workers.started.filter(id => id === f.reviewer.id).length
     await sleep(120)

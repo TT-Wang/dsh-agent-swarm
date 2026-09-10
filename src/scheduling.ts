@@ -7,7 +7,8 @@
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { hasNotice } from './arena.ts'
+import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { WorkspaceRevokedError } from './workspace-admission.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -68,6 +69,15 @@ export class Scheduling {
           // S1: an abandoned pass body (its guard was released after the declared
           // bound) must never dispatch into the newer pass's turn.
           if (this.passReleased(pass)) return false
+          // Round 14: one member's guard chain must never abort the whole sweep.
+          // Before this, a guard that threw here (the field evidence: "Member has
+          // uncommitted commits" while an owner tried to preserve a cut-off
+          // attempt) propagated out of `dispatch`, the scheduler only wrote it to
+          // stderr, and every later tick re-entered the same throw: a dead end
+          // with no durable record and no exit. The throw is now the terminal
+          // element's input: escalate with a coded decision request, then keep
+          // dispatching the other members.
+          try {
           if (!this.rt.isolationAllows(missionId, member)) continue
           try { await this.rt.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
           catch (error) {
@@ -101,8 +111,34 @@ export class Scheduling {
             continue
           }
           const all = this.rt.store.list('tasks', missionId)
-          const tasks = all.filter(t => this.ready(t, member, all)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
-          const task = tasks[0]
+          const ready = all.filter(t => this.ready(t, member, all)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
+          // R12-F9, dispatch-time half: a task whose own text assumes prior work
+          // is already in the worktree while no content-carrying edge provides it
+          // would be prepared from the bare mission baseline and surprise the
+          // member at submit (T3b lost a cycle to "Artifact changes path outside
+          // task scope"; INT2 was repaired by hand). The admission-time call site
+          // refuses it at propose()/plan validation; this is the last guard before
+          // preparation.
+          //
+          // S4r-D1: the ineligible task is removed from THIS member's candidate
+          // set before the first candidate is chosen. Skipping the member's whole
+          // iteration here used to starve every later ready task on that member
+          // forever — the admission guard and the dispatch sweep co-firing into a
+          // trap, exactly the pair class this round is about. One escalation per
+          // ineligible task, and the sweep still dispatches the next ready task.
+          // A review's source is prepared into the worktree like a dependency
+          // (`prepareTask` receives it as the review source), so it is a
+          // content-carrying edge too.
+          const ineligible: Array<{ task: Task; detail: string }> = []
+          const candidates = ready.filter(candidate => {
+            const carryingEdges = [...candidate.dependencies, ...(candidate.reviewOf === undefined ? [] : [candidate.reviewOf])]
+            const assumptions = dependencyAssumptions({ objective: candidate.objective, acceptance: candidate.acceptance, dependencies: carryingEdges, replaces: candidate.replaces }, `task ${JSON.stringify(candidate.id)}`)
+            if (!assumptions.length) return true
+            ineligible.push({ task: candidate, detail: assumptions.map(item => `${item.location}: ${item.message}`).join(' ') })
+            return false
+          })
+          for (const refused of ineligible) this.escalateGuardTerminal(missionId, 'admission', { taskId: refused.task.id, detail: refused.detail })
+          const task = candidates[0]
           if (!task) continue
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
@@ -125,7 +161,15 @@ export class Scheduling {
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             // A withdrawn authorization is terminal for this host process, not a
             // transient preparation failure: fence the mission now, never retry.
-            if (error instanceof WorkspaceRevokedError) { this.rt.fenceWorkspace(missionId, error.diagnostic); return false }
+            if (error instanceof WorkspaceRevokedError) {
+              this.rt.fenceWorkspace(missionId, error.diagnostic)
+              // Round 14: the workspace chain's terminal element. `fenceWorkspace`
+              // blocks the work and records the raw diagnostic; this adds the coded
+              // decision request naming the executable exits, so a fenced mission
+              // never ends with a record that has no way forward in it.
+              this.escalateGuardTerminal(missionId, 'workspace', { taskId: task.id, detail: error.diagnostic })
+              return false
+            }
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
             // W18: a workspace or worker preparation failure is recoverable, not
@@ -144,11 +188,93 @@ export class Scheduling {
               this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, recoveryCount: fresh.recoveryCount, maxRecoveryAttempts: limit, status: fresh.status })
               if (!exhausted) return false
               this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason })
-              this.rt.notify(missionId, reason)
             })
+            // Round 14: this is the terminal element of the dispatch-precondition
+            // chain. The task cannot be prepared again (its recovery limit is
+            // spent), so no earlier element of the chain can yield an action; the
+            // escalation is unconditional and names the executable exits instead
+            // of leaving the owner a bare reason string.
+            if (exhausted) this.escalateGuardTerminal(missionId, 'dispatch_preconditions', {
+              taskId: fresh.id, detail: `its recovery limit of ${limit} is exhausted after preparation failures: ${reason}`,
+            })
+          }
+          } catch (error) {
+            if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
+            this.escalateGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail: String(error) })
+            continue
           }
         }
     return true
+  }
+
+  /**
+   * Round 14: the terminal element of a guard chain, made unconditional.
+   *
+   * A chain's earlier elements may each answer "no" for a good reason; when
+   * every one of them has, this method is what runs. It has no condition of its
+   * own: it always produces a `GuardTerminal` and always records a durable
+   * decision request unless the *same* request for the *same* board fingerprint
+   * is already durable. Dedup therefore means "this exact decision is already on
+   * the record", never "stay silent and hope a later pass speaks".
+   *
+   * The notice is recorded through `notify`, which stamps the mission's W2
+   * witness for this fingerprint: the board-level witness path cannot then emit
+   * a second, differently-worded decision for the same state, so two individually
+   * correct rules cannot multiply into a trap.
+   */
+  escalateGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal | undefined {
+    return emitGuardTerminal(this.rt, missionId, chain, context)
+  }
+
+  /**
+   * The durable board as the guard-chain model sees it: the production view the
+   * terminal classification and the property test share. Every field is derived
+   * from a durable row (or a durable event), never from an in-memory gate.
+   */
+  guardBoard(missionId: string, mission?: Mission): GuardBoard {
+    const row = mission ?? this.rt.store.get('missions', missionId)
+    const tasks = this.rt.store.list('tasks', missionId)
+    const members = this.rt.store.list('members', missionId)
+    const now = Date.now()
+    const revoked = this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')
+    return {
+      mission: {
+        status: row?.status ?? 'active',
+        workspace: revoked ? 'revoked' : 'authorized',
+        ...(row?.budgetPause === undefined ? {} : { budgetPaused: true }),
+      },
+      tasks: tasks.map(task => {
+        const exhaustion = taskCeilingExhaustion(task)
+        const source = task.reviewOf === undefined ? undefined : this.rt.task(missionId, task.reviewOf)
+        const reviewSourceLive = task.reviewOf === undefined
+          ? (task.status === 'submitted' ? this.reviewable(task, tasks) : undefined)
+          // A review whose named source is missing can never be dispatched: the
+          // scheduler's `capable` reads the source row, so a dangling review is
+          // reported as no live source rather than omitted.
+          : source !== undefined && source.status === 'submitted'
+        return {
+          id: task.id, status: task.status,
+          ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
+          ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
+          dependenciesSatisfied: task.dependencies.every(dependency => this.rt.dependencySatisfied(missionId, dependency, tasks)),
+          dependenciesDead: task.dependencies.some(dependency => this.rt.effectiveDependency(missionId, dependency, tasks).status === 'cancelled'),
+          ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
+          // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses,
+          // for every task the model reports progress on. A review task is live
+          // exactly while its source is submitted (`capable`); a submitted source
+          // is live exactly while `reviewable` finds a live independent review.
+          // Reporting a source as progress without consulting that predicate made
+          // the review_admission terminal unable to classify its canonical case.
+          ...(reviewSourceLive === undefined ? {} : { reviewSourceLive }),
+          ...(source === undefined ? {} : { authorMemberIds: [...this.rt.authorIds(source)] }),
+          preparationExhausted: task.status === 'blocked' && typeof task.output === 'string' && task.output.startsWith('Workspace or worker preparation failed'),
+          ...(task.dependencies.length === 0 && task.reviewOf === undefined
+            && dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: task.dependencies, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`).length > 0
+            ? { assumedContent: true } : {}),
+        }
+      }),
+      members: members.map(member => ({ id: member.id, status: member.status })),
+    }
   }
 
   ready(task: Task, member: Member, tasks?: Task[]): boolean {
@@ -538,4 +664,203 @@ export class Scheduling {
     const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
     return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }
+}
+
+/* ------------------------------------------------------------------------- *
+ * Round 14: the guard-chain board model.
+ *
+ * The kernel obligation is structural: every guard chain ends in an escalation
+ * that has no conditions of its own, so a dead end is impossible. This model is
+ * the shared vocabulary for that claim. `guardDispatchActions` and
+ * `guardProgressActions` describe every action an earlier element of a chain can
+ * still produce; `guardTerminalChain` names the chain whose earlier elements
+ * have all answered "no"; `terminalEscalation` turns that into the coded,
+ * actionable decision request `Scheduling.escalateGuardTerminal` emits.
+ *
+ * The model is pure: no store, no clock, no cache. `tests/guard-terminals.test.mjs`
+ * enumerates generated board states (task status x attempt presence x workspace
+ * state x member status x budget pause), walks the reachable subset through a
+ * transition relation and asserts the property over every reachable non-terminal
+ * state, so the guarantee is checked against the same functions the dispatch
+ * path uses. The states the generator does not reach are named in that test.
+ * ------------------------------------------------------------------------- */
+
+/** One generated board: the five dimensions the property test enumerates. */
+export interface GuardTask {
+  id: string
+  status: Task['status']
+  /** An attempt is attached to a running task; `leaseLive` is its lease state. */
+  attempt?: { leaseLive: boolean }
+  /** The task already spent its own step/finding ceiling (`taskCeilingExhaustion`). */
+  ceilingExhausted?: boolean
+  /** An ordinary dependency edge waits for acceptance; a dead edge never resolves. */
+  dependenciesSatisfied?: boolean
+  dependenciesDead?: boolean
+  /** This task reviews the named source; the source may have no live review left. */
+  reviewOf?: string
+  reviewSourceLive?: boolean
+  /** Members who authored the reviewed source and can never review it. */
+  authorMemberIds?: string[]
+  /** Preparation failures exhausted the task's recovery limit. */
+  preparationExhausted?: boolean
+  /**
+   * The task's own text assumes prior content that no dependency carries
+   * (R12-F9): the admission guard's terminal input.
+   */
+  assumedContent?: boolean
+}
+
+export interface GuardMember {
+  id: string
+  status: Member['status']
+  /** False only for a member the isolation invariant refuses. */
+  isolated?: boolean
+}
+
+export interface GuardBoard {
+  mission: {
+    status: Mission['status']
+    workspace: 'authorized' | 'revoked' | 'dirty' | 'unprovisioned'
+    budgetPaused?: boolean
+    budgetBlocked?: string
+  }
+  tasks: GuardTask[]
+  members: GuardMember[]
+}
+
+export interface GuardDispatchAction {
+  kind: 'dispatch'
+  chain: 'dispatch_preconditions'
+  taskId: string
+  memberId: string
+}
+
+/** Work already in flight: an action an earlier chain element is executing. */
+export interface GuardProgressAction {
+  kind: 'progress'
+  chain: GuardChainId
+  detail: string
+  taskId?: string
+  memberId?: string
+}
+
+export interface GuardEscalationAction {
+  kind: 'escalate'
+  chain: GuardChainId
+  code: string
+  message: string
+  exits: DecisionExit[]
+  coFires: GuardChainId[]
+  taskId?: string
+}
+
+export type GuardAction = GuardDispatchAction | GuardProgressAction | GuardEscalationAction
+
+const isLiveMember = (member: GuardMember): boolean => member.status === 'idle' || member.status === 'waiting'
+
+/**
+ * Every (task, member) pair an earlier element of the dispatch-precondition
+ * chain can still act on. A task is dispatchable only when the whole chain
+ * before the terminal answered "yes": the mission is active, the budget is not
+ * paused or exhausted, the workspace is authorized, the task is pending, it has
+ * not spent its own ceiling or its preparation recovery, its dependency lineage
+ * is alive and satisfied, its review source is live when it is a review, and a
+ * live member who did not author that source can take it.
+ */
+export function guardDispatchActions(board: GuardBoard): GuardDispatchAction[] {
+  const mission = board.mission
+  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
+  const actions: GuardDispatchAction[] = []
+  for (const task of board.tasks) {
+    if (task.status !== 'pending' || task.ceilingExhausted === true || task.preparationExhausted === true || task.assumedContent === true) continue
+    if (task.dependenciesSatisfied === false || task.dependenciesDead === true) continue
+    if (task.reviewOf !== undefined && task.reviewSourceLive === false) continue
+    const member = board.members.find(candidate => isLiveMember(candidate) && candidate.isolated !== false
+      && !(task.authorMemberIds ?? []).includes(candidate.id))
+    if (member !== undefined) actions.push({ kind: 'dispatch', chain: 'dispatch_preconditions', taskId: task.id, memberId: member.id })
+  }
+  return actions
+}
+
+/**
+ * Work already in flight. A live lease, a working member or a submitted source
+ * whose review is still live is progress, so the board is not a dead end and no
+ * terminal escalation is owed. This is deliberately derived from the board, not
+ * from the terminal function, so the property test cannot be circular.
+ *
+ * "In flight" is only progress while the chains that gate it can still let it
+ * land: an attempt whose workspace cannot produce an artifact, or whose mission
+ * is paused or out of budget, is executing but can never reach its terminal
+ * step — that is exactly the 2026-09-10 trap, and it must count as a dead end
+ * rather than as liveness.
+ */
+export function guardProgressActions(board: GuardBoard): GuardProgressAction[] {
+  const mission = board.mission
+  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
+  const actions: GuardProgressAction[] = []
+  for (const task of board.tasks) {
+    if (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseLive) {
+      actions.push({ kind: 'progress', chain: 'attempt_lease', taskId: task.id, detail: 'a running attempt holds a live lease' })
+    }
+    if (task.status === 'submitted' && task.reviewOf === undefined && task.reviewSourceLive !== false) {
+      actions.push({ kind: 'progress', chain: 'review_admission', taskId: task.id, detail: 'a submitted source has a live review path' })
+    }
+  }
+  for (const member of board.members) {
+    if (member.status === 'working') actions.push({ kind: 'progress', chain: 'dispatch_preconditions', memberId: member.id, detail: 'the member is working' })
+  }
+  return actions
+}
+
+/**
+ * The chain whose earlier elements have all answered "no". Ordered so the
+ * classification names the *first* chain that cannot progress: a board with an
+ * exhausted budget and a revoked workspace is a budget decision first, because
+ * no lease can be admitted until the ceiling moves.
+ */
+export function guardTerminalChain(board: GuardBoard): GuardChainId {
+  const live = board.tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
+  if (board.mission.budgetBlocked !== undefined || board.mission.budgetPaused === true) return 'budget'
+  if (live.length > 0 && board.mission.workspace !== 'authorized') return 'workspace'
+  if (board.tasks.some(task => task.status === 'running' && task.attempt !== undefined && !task.attempt.leaseLive)) return 'attempt_lease'
+  if (board.tasks.some(task => task.ceilingExhausted === true && task.status !== 'accepted' && task.status !== 'cancelled')) return 'task_ceiling'
+  if (board.tasks.some(task => task.assumedContent === true && task.status === 'pending')) return 'admission'
+  if (board.tasks.some(task => task.status === 'submitted' && task.reviewSourceLive === false)) return 'review_admission'
+  return 'dispatch_preconditions'
+}
+
+/**
+ * The unconditional terminal element: total by construction. It takes a board
+ * and always returns an escalation — the only branch that carries no earlier
+ * failure is the generic "no executable action remains" one — so no caller can
+ * reach a state where the chain has ended and nothing is emitted.
+ */
+export function terminalEscalation(board: GuardBoard): GuardEscalationAction {
+  const chain = guardTerminalChain(board)
+  const task = board.tasks.find(candidate => candidate.status !== 'accepted' && candidate.status !== 'cancelled')
+  const member = board.members.find(candidate => candidate.status === 'working') ?? board.members[0]
+  const terminal = guardTerminal(chain, { ...(task === undefined ? {} : { taskId: task.id }), ...(member === undefined ? {} : { memberId: member.id }) })
+  return { kind: 'escalate', ...terminal, ...(task === undefined ? {} : { taskId: task.id }) }
+}
+
+/** Every action the model can see: dispatch, progress, or the unconditional terminal. */
+/**
+ * True only for the mission statuses no actor can bring back: `completed` and
+ * `stopped`. Everything else — including `blocked` (a budget stop) and `paused` —
+ * still owes the owner an executable action, which is the whole point of the
+ * terminal element (`emitGuardTerminal` bails only on a terminal mission).
+ */
+export function guardMissionTerminal(board: GuardBoard): boolean {
+  return board.mission.status === 'completed' || board.mission.status === 'stopped'
+}
+
+export function guardActions(board: GuardBoard): GuardAction[] {
+  const dispatch = guardDispatchActions(board)
+  const progress = guardProgressActions(board)
+  // S4r-D5: the terminal is appended for every non-terminal mission status, not
+  // only for `active`. A budget-blocked mission (`status: 'blocked'`,
+  // `budgetPause` set) is exactly when the owner needs the coded exit, and the
+  // old predicate returned an empty action list for it.
+  if (dispatch.length > 0 || progress.length > 0 || guardMissionTerminal(board)) return [...dispatch, ...progress]
+  return [...dispatch, ...progress, terminalEscalation(board)]
 }

@@ -11,6 +11,7 @@ import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
 import type { Member, Mission, Task } from './types.ts'
@@ -457,7 +458,12 @@ export class WorkspaceAdmission {
       }
       this.rt.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
     })
-    this.rt.notify(missionId, reason)
+    // S4b: every caller of `fenceWorkspace` (the dispatch catch, the authorization
+    // re-checks in src/runtime.ts) now reaches the shared coded workspace
+    // terminal, not only the dispatch path. The emission is deduplicated per
+    // (chain, code, board fingerprint), so a caller that emits after this one is
+    // absorbed.
+    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason })
   }
 
   /**
