@@ -112,6 +112,37 @@ export function isSqliteBusy(error: unknown): boolean {
   return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i.test(message)
 }
 /**
+ * S5: a task write that disagrees with the task's durable per-task revision.
+ * The record was read before another write was accepted, so applying this one
+ * would be a lost update — the exact shape of the Row-13 P0, where an
+ * in-memory flag papered over a task row decided from stale memory. The refusal
+ * names the durable revision, not the caller's stale one, so the caller can
+ * re-read and decide again; `code` is stable so callers branch on it, never on
+ * message text.
+ */
+export class StaleTaskRevisionError extends Error {
+  readonly code = 'stale_task_revision' as const
+  /** The imperative next step, separate from the prose so a caller can render it. */
+  readonly nextStep: string
+  constructor(readonly taskId: string, readonly expected: number, readonly current: number, readonly missionId: string) {
+    const nextStep = `Read task ${taskId} again (swarm_observe with taskId=${taskId}, or SwarmStore.get), then retry the write once with revision ${current}`
+    super(`Task ${taskId} write refused: it presents revision ${expected} but the durable task is at revision ${current}; another write was accepted after this writer read the task. ${nextStep}; a second refusal means another writer won again, so re-read and decide on the current record instead of overwriting it.`)
+    this.name = 'StaleTaskRevisionError'
+    this.nextStep = nextStep
+  }
+}
+/** One refused stale task write, recorded durably when the refused write rolled back. */
+export interface StaleTaskRefusal {
+  missionId: string
+  taskId: string
+  expected: number
+  current: number
+  at: number
+}
+/** The durable event type every refused stale task write is recorded under. */
+export const STALE_TASK_REFUSAL_EVENT = 'task/stale-revision-refused'
+
+/**
  * R11-02: a state file that is not a database, or is structurally corrupt.
  * Distinct from contention (`isSqliteBusy`) and from an unsupported schema, so
  * the open path can fail closed and name the snapshot recovery path instead of
@@ -164,6 +195,13 @@ export class SwarmStore {
   private closed = false
   private transactionScopes?: Set<string>
   private readonly listeners = new Set<() => void>()
+  /**
+   * S5: stale task refusals produced inside a transaction. The refused write
+   * makes the caller's transaction roll back (a compare-and-swap has no partial
+   * outcome), so the refusal record is committed by `transaction()` immediately
+   * after the rollback instead of being erased by it.
+   */
+  private pendingStaleRefusals: StaleTaskRefusal[] = []
   constructor(path: string, options: StoreOptions = {}) {
     this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
     this.writerAttempts = Math.max(1, Math.trunc(options.writerAttempts ?? DEFAULT_WRITER_ATTEMPTS))
@@ -266,6 +304,9 @@ export class SwarmStore {
       withWriterRetry(() => this.db.exec('COMMIT'), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     } catch (error) {
       try { this.db.exec('ROLLBACK') } catch { /* A failed commit may already have ended the transaction. */ }
+      // S5: the rollback erased the refused write, not the evidence of it. The
+      // refusal record is committed on its own before the error leaves this call.
+      this.flushStaleRefusals()
       if (error instanceof WriterBusyError || !isSqliteBusy(error)) throw error
       throw new WriterBusyError(`SQLite writer conflicted during a swarm transaction: ${error instanceof Error ? error.message : String(error)}`, this.writerAttempts, error)
     } finally { this.transactionScopes = undefined }
@@ -312,12 +353,77 @@ export class SwarmStore {
   }
   /** Write a detached record inside its caller's transaction. */
   put<T extends Table>(table: T, value: Tables[T]): void {
+    // S5: every task write is a compare-and-swap on the task's own revision.
+    // The funnel is deliberate: all call sites (runtime, attempts, scheduling,
+    // workspace-admission, gates) write tasks through this one method, so no
+    // path can bypass the guard by holding a record it read before another
+    // accepted write.
+    if (table === 'tasks') { this.putTask(value as Task); return }
+    this.upsert(table, value)
+  }
+  /**
+   * S5: the durable revision of one task. `0` means "no versioned row yet"
+   * (a new id, or a row written before per-task revisions existed), which is
+   * also the value an unversioned writer presents.
+   */
+  taskRevision(taskId: string): number {
+    return this.get('tasks', taskId)?.revision ?? 0
+  }
+  /**
+   * S5 compare-and-swap for one task row. The presented revision must equal the
+   * durable one; the accepted write stamps `current + 1` onto the caller's
+   * object, so a caller that re-writes the same record inside the same
+   * transaction stays consistent, while a caller that presents a revision
+   * another writer already moved past is refused with `StaleTaskRevisionError`
+   * and leaves no partial write behind. Returns the revision that was written.
+   */
+  putTask(value: Task): number {
+    if (value.revision !== undefined && !Number.isSafeInteger(value.revision)) throw new Error('Invalid task revision')
+    const current = this.get('tasks', value.id)
+    const expected = value.revision ?? 0
+    const currentRevision = current?.revision ?? 0
+    if (current !== undefined && expected !== currentRevision) throw this.refuseStaleTask(value, expected, currentRevision)
+    value.revision = currentRevision + 1
+    this.upsert('tasks', value)
+    return value.revision
+  }
+  private upsert<T extends Table>(table: T, value: Tables[T]): void {
     const missionId = 'missionId' in value && value.missionId !== undefined ? value.missionId : value.id
     const statement = this.db.prepare(`INSERT INTO ${table}(id,mission_id,value) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET mission_id=excluded.mission_id,value=excluded.value`)
     withWriterRetry(() => statement.run(value.id, missionId, JSON.stringify(value)), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
     if ('ownerSessionId' in value) this.transactionScopes?.add(value.ownerSessionId)
     if ('sessionId' in value) this.transactionScopes?.add(value.sessionId)
+  }
+  /** Record the refusal durably and hand the caller the diagnostic to throw. */
+  private refuseStaleTask(value: Task, expected: number, current: number): StaleTaskRevisionError {
+    const refusal: StaleTaskRefusal = { missionId: value.missionId, taskId: value.id, expected, current, at: Date.now() }
+    // Inside a caller transaction the record is flushed after its rollback;
+    // outside one there is nothing to roll back, so it is committed now.
+    if (this.transactionScopes === undefined) this.recordStaleRefusals([refusal])
+    else this.pendingStaleRefusals.push(refusal)
+    return new StaleTaskRevisionError(value.id, expected, current, value.missionId)
+  }
+  private flushStaleRefusals(): void {
+    const pending = this.pendingStaleRefusals
+    this.pendingStaleRefusals = []
+    this.recordStaleRefusals(pending)
+  }
+  /**
+   * One durable `task/stale-revision-refused` event per refused write, so the
+   * lost update is visible in the mission record even though the write itself
+   * was rolled back. Never throws: a refusal record must not mask the refusal.
+   */
+  private recordStaleRefusals(refusals: readonly StaleTaskRefusal[]): void {
+    if (this.closed || !refusals.length) return
+    try {
+      // The transaction that produced these may have rolled back already; clear
+      // the scope so the record's own transaction can open.
+      this.transactionScopes = undefined
+      this.transaction(() => {
+        for (const refusal of refusals) this.event(refusal.missionId, STALE_TASK_REFUSAL_EVENT, 'runtime', { taskId: refusal.taskId, expected: refusal.expected, current: refusal.current })
+      })
+    } catch { /* The write was still refused; the record is best-effort bookkeeping. */ }
   }
   /** Append an immutable coordination event inside the same state transaction. */
   event(missionId: string, type: string, actor: string, data: unknown): void {

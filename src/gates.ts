@@ -329,7 +329,11 @@ export class RuntimeGates {
       this.rt.store.put('missions', mission)
       for (const task of this.rt.store.list('tasks', mission.id)) if (task.status === 'running' && task.attempt) {
         task.budgetResume = { pauseId: mission.budgetPause!.id, attemptId: task.attempt.id, epoch: task.epoch }
-        this.rt.store.put('tasks', task)
+        // S5: every task write is a compare-and-swap on the task's own revision.
+        // These records were read inside this transaction, so the presented
+        // revision is the durable one and the write is accepted; a record that
+        // another accepted write moved past is refused instead of overwritten.
+        this.rt.store.putTask(task)
       }
       for (const member of this.rt.store.list('members', mission.id)) { delete member.activity; this.rt.store.put('members', member) }
       this.rt.upsertBudgetRefusals(mission, mission.reason!)
@@ -339,19 +343,43 @@ export class RuntimeGates {
     this.beginBudgetStop(mission.id, mission.budgetPause.id)
   }
 
-  /** Stop outside the mission queue, which a cancelled in-flight tool may own. */
+  /**
+   * Stop outside the mission queue, which a cancelled in-flight tool may own.
+   *
+   * S5r: the gate is the DURABLE pause row, never the in-memory `budgetStops`
+   * Set. The claim (`budgetPause.stopping`) is written before any await, so two
+   * concurrent callers — or the same caller after the Set was lost — cannot run
+   * the stop twice and write a duplicate `mission/budget-quiesced` event. The
+   * claim is bounded exactly like the pass guard: a foreign instance's claim, or
+   * one older than `stallPassTimeoutMs`, is a crashed stop and does not gate.
+   * `budgetStops` stays only as the public mirror `SwarmRuntime.budgetStops`
+   * names for the gate census; it is never read to decide anything.
+   */
   beginBudgetStop(missionId: string, pauseId: string): void {
-    if (this.rt.shuttingDown || this.budgetStops.has(pauseId)) return
+    if (this.rt.shuttingDown) return
+    const mission = this.rt.store.get('missions', missionId)
+    if (mission === undefined) return
+    const pause = mission.budgetPause
+    if (pause === undefined || pause.id !== pauseId || pause.quiesced) return
+    const claim = pause.stopping
+    if (claim !== undefined && claim.instanceId === this.rt.instanceId && Date.now() - claim.at < this.rt.stallPassTimeoutMs) return
+    // The durable claim lands BEFORE the first await, so it is the gate for any
+    // later caller, whether or not this process still holds the mirror entry.
+    pause.stopping = { instanceId: this.rt.instanceId, at: Date.now() }
+    this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
     this.budgetStops.add(pauseId)
     this.rt.defer(async () => {
       try {
         await Promise.all(this.rt.store.list('members', missionId).map(member => this.rt.workers.stop(member.id)))
         if (this.rt.closed) return
-        const mission = this.rt.mission(missionId)
-        if (mission.budgetPause?.id !== pauseId) return
-        mission.budgetPause.quiesced = true
+        const current = this.rt.mission(missionId)
+        // Re-read after the await: the pause may have been resumed or already
+        // quiesced by a concurrent stop; either way this claim writes nothing.
+        if (current.budgetPause?.id !== pauseId || current.budgetPause.quiesced) return
+        current.budgetPause.quiesced = true
+        delete current.budgetPause.stopping
         this.rt.commit(missionId, () => {
-          this.rt.store.put('missions', mission)
+          this.rt.store.put('missions', current)
           this.rt.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
         })
         this.rt.kick(missionId)
@@ -373,12 +401,13 @@ export class RuntimeGates {
           // The pause marker outlived its attempt (challenge, handoff or restart):
           // re-pend the work without charging a recovery attempt.
           if (task.status === 'running') { task.status = 'pending'; this.rt.dropAttempt(task) }
-          this.rt.store.put('tasks', task)
+          // S5: compare-and-swap on the task's own revision (see blockBudget).
+          this.rt.store.putTask(task)
           this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
           continue
         }
         task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.rt.config.leaseMs)
-        this.rt.store.put('tasks', task)
+        this.rt.store.putTask(task)
         const member = this.rt.store.get('members', task.attempt.ownerId)
         if (member && member.status !== 'stopped') { member.status = 'working'; this.rt.store.put('members', member) }
         for (const delivery of this.rt.store.list('deliveries', mission.id)) {
