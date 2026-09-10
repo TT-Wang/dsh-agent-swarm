@@ -9,6 +9,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { hasNotice } from './arena.ts'
+import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 
 /**
@@ -213,7 +214,11 @@ export class Attempts {
       // `task/operation-silent` event type would need its `EVENT_VOCABULARY`
       // row in src/trace.ts, outside this task's write scope; that exact change
       // is named as a hand-off in the submission.
-      this.rt.notify(mission.id, message, 'runtime', 'stall', true, dedupKey)
+      // R15-A1: the silent operation names its own task. Guard pair: F1 operation
+      // silence x lease expiry x the board-level stall — the subject is this task's
+      // identity, so a healthy sibling's notices never consume the clock of this
+      // one (they carry different subjects and different dedup keys).
+      this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey })
     })
   }
   /**
