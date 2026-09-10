@@ -388,7 +388,12 @@ export class RuntimeGates {
         }
         this.rt.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt.ownerId, kind: 'assignment',
           taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now(),
-          content: JSON.stringify({ missionId: mission.id, task, instructions: 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.' }) })
+          content: JSON.stringify({ missionId: mission.id, task, instructions: 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.',
+            // ENV-R2: the resumed attempt is the same attempt, so its assignment
+            // must carry the same declared-check envelope a first assignment
+            // does; otherwise the resumed member is the one assignee that is
+            // never told which environment the host check will run in.
+            ...this.rt.assignmentCheckEnvironment() }) })
         this.rt.store.event(mission.id, 'task/budget-resumed', 'runtime', { taskId: task.id, attemptId: task.attempt.id, pauseId: pause.id })
       }
       delete mission.budgetPause

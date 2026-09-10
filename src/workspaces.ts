@@ -1,6 +1,8 @@
 /** Owned Git worktrees and immutable artifacts. The source checkout is read-only. */
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { statSync } from 'node:fs'
+import { StringDecoder } from 'node:string_decoder'
 import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
@@ -9,7 +11,11 @@ import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 export type { CheckEnvelope }
 
-export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean }
+export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
+  /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
+  attribution?: CheckAttribution
+  /** ENV: the environment this check actually ran under. */
+  environment?: CheckEnvironment }
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
 /**
@@ -88,6 +94,14 @@ export interface WorkspaceOptions {
   checkConcurrency?: number
   /** R11-19: called once per declared check with its measured wait and run time. */
   onCheckEnvelope?(info: CheckEnvelopeSample): void
+  /**
+   * ENV: the confinement policy the host applies to a declared check. Defaults
+   * to the contract every caller must satisfy: `workspace-write` rooted at the
+   * clean verification checkout, and the check runs only when the host reports
+   * full enforcement (F-29), so a check that ran proves the effective policy.
+   * A host with a different confinement states it here.
+   */
+  sandboxPolicy?: { mode?: string; enforcement?: string }
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
 }
@@ -105,6 +119,147 @@ export interface CheckEnvelopeSample {
   limit: number
 }
 const DEFAULT_CHECK_CONCURRENCY = 2
+/** The stand-in checkout path a declared envelope names before a check has a real one. */
+export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
+/**
+ * ENV: the environment a declared check runs under, stated as facts instead of
+ * folklore, so the assignee knows which environment the host check will use and
+ * a verification can tell when its self-run cannot reproduce it.
+ *
+ * `home`, the two user cache roots, the sandbox policy and the dependency links
+ * are what a self-run must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
+ * scoped roots the envelope itself provides inside the disposable checkout: they
+ * differ by design on every run and are excluded from the reproduction
+ * comparison. Existence flags are recorded and reported but never refuse an
+ * acceptance: a check must not depend on the ambient cache staying warm.
+ *
+ * Structural mirror: `src/runtime.ts` reads the same shape through a type-only
+ * import, and `WorkerAdapter.checkEnvelope` keeps declaring the measured type.
+ */
+export interface CheckEnvironment {
+  /** HOME the check process receives; null when it inherits none. */
+  home: string | null
+  /** User-level cache directory the check's HOME resolves (`<home>/.cache`); null without a HOME. */
+  userCacheDir: string | null
+  /** `<userCacheDir>/huggingface`, where a user-level model cache lives; null without a HOME. */
+  huggingfaceCacheDir: string | null
+  /** Whether the two user cache roots existed when these facts were recorded. */
+  userCacheDirExists: boolean
+  huggingfaceCacheDirExists: boolean
+  /** XDG_CACHE_HOME in force for this environment (the scoped root for a check). */
+  xdgCacheHome: string | null
+  /** The confinement the host applies: workspace-write rooted at the checkout, full enforcement. */
+  sandboxPolicy: { mode: string; enforcement: string; workspaceRoot: string | null }
+  /** Ignored dependency directories materialised into the checkout, and how. */
+  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[] }
+  /** Scoped cache root the envelope provides inside the checkout; null for a self-run. */
+  checkCacheRoot: string | null
+  /** Package-manager cache roots the check sets below `checkCacheRoot`. */
+  checkCacheRoots: Record<string, string>
+}
+/** ENV: one check's failure attribution, captured before the output bound can cut it off. */
+export interface CheckAttribution {
+  /** 1-based position of the failing check in the declared sequence. */
+  index: number
+  command: string
+  /** The last stage banner (`> script`, `$ command`, `# stage: name`) before the first failure. */
+  stage: string | null
+  /** The last `# Subtest:` heading before the first failure (the suite that failed). */
+  subtest: string | null
+  /** TAP `not ok` names seen in the stream, bounded; the count is every name seen. */
+  failingTests: string[]
+  failingTestCount: number
+  /** TAP summary lines (`1..N`, `# tests/# pass/# fail/...`), latest value per key. */
+  tapSummary: string[]
+  /** True when the stored output was cut at the host's output bound. */
+  outputTruncated: boolean
+}
+/** ENV: the measured facts of the most recent completed check, carried by the envelope record. */
+export interface ObservedCheck {
+  memberId: string
+  taskId: string
+  at: number
+  environment: CheckEnvironment
+  attribution?: CheckAttribution
+  /** Bounded head of the free-form output; the attribution above it is what must survive a cut. */
+  output: string
+}
+/**
+ * ENV: the measured envelope plus the declared-check environment and the last
+ * observation. `environment` is the declared envelope the runtime delivers to
+ * the assignee and compares with the verification attempt's self-run facts:
+ * blocking divergences (HOME, the user cache roots, the sandbox policy, the
+ * dependency links) are the ones a self-run cannot reproduce, the existence
+ * flags are advisory, because a cold cache is not a wrong environment.
+ */
+export interface DeclaredCheckEnvelope extends CheckEnvelope {
+  environment: CheckEnvironment
+  selfRunEnvironment: CheckEnvironment
+  observed?: ObservedCheck
+}
+/** Bounded attribution capture: names kept, and the longest name kept. */
+const MAX_ATTRIBUTED_FAILURES = 50
+const MAX_ATTRIBUTED_NAME = 200
+/** Scan carry: a line longer than this is not a TAP or stage line this attribution needs. */
+const MAX_ATTRIBUTION_CARRY = 4096
+/**
+ * ENV: read the failing test names, the TAP summary and the failing stage out of
+ * the process stream as it is produced. The stored output is bounded and the
+ * interesting lines are exactly the ones a bound cuts off (TAP writes the
+ * failing test after every passing one and the summary last), so attribution is
+ * captured from every chunk — including chunks dropped at the bound.
+ */
+class CheckOutputScanner {
+  private readonly decoder = new StringDecoder('utf8')
+  private carry = ''
+  private stage: string | null = null
+  private subtest: string | null = null
+  private failingStage: string | null = null
+  private failingSubtest: string | null = null
+  private readonly failingTests: string[] = []
+  private failingTestCount = 0
+  private failed = false
+  private readonly summary = new Map<string, string>()
+  private plan: string | null = null
+  push(chunk: Buffer): void {
+    // A chunk can split a multi-byte character; decode through the stream decoder
+    // so a TAP name is never corrupted at a chunk boundary.
+    this.carry += this.decoder.write(chunk)
+    let end = this.carry.indexOf('\n')
+    while (end !== -1) {
+      this.line(this.carry.slice(0, end).replace(/\r$/, ''))
+      this.carry = this.carry.slice(end + 1)
+      end = this.carry.indexOf('\n')
+    }
+    if (this.carry.length > MAX_ATTRIBUTION_CARRY) this.carry = this.carry.slice(-MAX_ATTRIBUTION_CARRY)
+  }
+  private line(text: string): void {
+    const failure = /^\s*not ok\s+\d+\s*-\s+(.*\S)\s*$/.exec(text)
+    if (failure !== null) {
+      if (!this.failed) { this.failed = true; this.failingStage = this.stage; this.failingSubtest = this.subtest }
+      this.failingTestCount++
+      if (this.failingTests.length < MAX_ATTRIBUTED_FAILURES) this.failingTests.push(failure[1]!.slice(0, MAX_ATTRIBUTED_NAME))
+      return
+    }
+    if (!this.failed) {
+      const stage = /^>\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^\$\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^#\s*stage:\s*(\S.*\S|\S)\s*$/i.exec(text)
+      if (stage !== null) this.stage = stage[1]!.slice(0, MAX_ATTRIBUTED_NAME)
+      const subtest = /^#\s*Subtest:\s*(\S.*\S|\S)\s*$/.exec(text)
+      if (subtest !== null) this.subtest = subtest[1]!.slice(0, MAX_ATTRIBUTED_NAME)
+    }
+    const summary = /^#\s*(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b\s*(.*)$/.exec(text)
+    if (summary !== null) { this.summary.set(summary[1]!, text.trim()); return }
+    const plan = /^1\.\.(\d+)\s*$/.exec(text)
+    if (plan !== null) this.plan = text.trim()
+  }
+  result(outputTruncated: boolean): CheckAttributionShot {
+    return { stage: this.failingStage ?? this.stage, subtest: this.failingSubtest ?? this.subtest,
+      failingTests: [...this.failingTests], failingTestCount: this.failingTestCount,
+      tapSummary: [...(this.plan === null ? [] : [this.plan]), ...this.summary.values()], outputTruncated }
+  }
+}
+/** ENV: what the scanner extracts from a stream before the call site labels it. */
+export interface CheckAttributionShot { stage: string | null; subtest: string | null; failingTests: string[]; failingTestCount: number; tapSummary: string[]; outputTruncated: boolean }
 /**
  * R11-19: a per-host FIFO semaphore over declared-check executions. A queued
  * verification is not lost and not run unconfined; its wait is measured so the
@@ -230,7 +385,7 @@ interface MissionWorkspace { version: 1; missionId: string; source: string; base
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; recovery?: TaskRecovery }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
-interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string> }
+interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean }
 /**
  * Worktree metadata mutation queues keyed by canonical git common dir. Git
  * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
@@ -243,7 +398,7 @@ const worktreeQueues = new Map<string, Promise<void>>()
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
 
 /** Execute an argv with bounded output and a cancellation-owned process group. */
-export async function runProcess(argv: readonly string[], options: ProcessOptions): Promise<{ exitCode: number; output: string; truncated: boolean }> {
+export async function runProcess(argv: readonly string[], options: ProcessOptions): Promise<{ exitCode: number; output: string; truncated: boolean; attribution?: CheckAttributionShot }> {
   if (argv.length === 0 || !argv[0]) throw new Error('An executable is required')
   options.signal?.throwIfAborted()
   if (process.platform === 'win32') throw new Error('Swarm worktree execution currently requires POSIX process groups')
@@ -255,6 +410,10 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
     let bytes = 0
     let truncated = false
     const chunks: Buffer[] = []
+    // ENV: attribution is read from every chunk, including the chunks the
+    // output bound drops, because the failing test and the TAP summary arrive
+    // after it.
+    const scanner = options.captureAttribution === true ? new CheckOutputScanner() : undefined
     let failure: Error | undefined
     let killTimer: ReturnType<typeof setTimeout> | undefined
     const killGroup = (signal: NodeJS.Signals): void => {
@@ -277,6 +436,7 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
     const timer = setTimeout(() => { cancel(new Error(`Execution timed out after ${options.timeoutMs}ms`)) }, options.timeoutMs)
     options.signal?.addEventListener('abort', onAbort, { once: true })
     const append = (chunk: Buffer): void => {
+      scanner?.push(chunk)
       const available = Math.max(0, options.maxBytes - bytes)
       if (chunk.length > available) truncated = true
       if (available > 0) { const kept = chunk.subarray(0, available); chunks.push(kept); bytes += kept.length }
@@ -298,7 +458,7 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
         while (Buffer.byteLength(output + marker) > options.maxBytes) output = output.slice(0, -1)
         output += marker
       }
-      resolve({ exitCode: code ?? 1, output, truncated })
+      resolve({ exitCode: code ?? 1, output, truncated, ...(scanner === undefined ? {} : { attribution: scanner.result(truncated) }) })
     })
     if (options.signal?.aborted) onAbort()
   })
@@ -324,6 +484,21 @@ export async function writePrivateJson(file: string, value: unknown): Promise<vo
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
 function commitId(value: unknown): value is string { return typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value) }
 
+/** ENV: how much of one check's free-form output the envelope record carries below its attribution. */
+const CHECK_ENVELOPE_OUTPUT_CHARS = 4000
+/** ENV: the bounded output excerpt the envelope carries after the attribution. */
+function boundedOutput(output: string): string {
+  return output.length <= CHECK_ENVELOPE_OUTPUT_CHARS ? output : `${output.slice(0, CHECK_ENVELOPE_OUTPUT_CHARS)}\n[envelope output excerpt truncated]`
+}
+/** ENV: the host process environment as a record; the fallback check env and the self-run baseline. */
+function ambientEnvironment(): Record<string, string> {
+  return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+}
+/** Whether a path names an existing directory; an absent cache root is recorded, never invented. */
+function isDirectory(target: string | null): boolean {
+  if (target === null) return false
+  try { return statSync(target).isDirectory() } catch { return false }
+}
 /** Owns worktrees beneath one configured directory and never resets the source checkout. */
 export class Workspaces {
   readonly root: string
@@ -338,6 +513,8 @@ export class Workspaces {
   /** R11-19: one per-host semaphore over declared-check executions. */
   private readonly checks: CheckSemaphore
   private readonly checkSamples: CheckEnvelopeSample[] = []
+  /** ENV: the most recent completed check's own environment and failure attribution. */
+  private lastCheck: ObservedCheck | undefined
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
@@ -348,7 +525,49 @@ export class Workspaces {
   }
 
   /** R11-19: the host's measured check envelope (limit, active, queued, wait and run times). */
-  checkEnvelope(): CheckEnvelope { return this.checks.state() }
+  checkEnvelope(): DeclaredCheckEnvelope {
+    return { ...this.checks.state(), environment: this.declaredCheckEnvironment(), selfRunEnvironment: this.selfRunEnvironment(),
+      ...(this.lastCheck === undefined ? {} : { observed: this.lastCheck }) }
+  }
+  /**
+   * ENV: the environment the host's declared checks run under, computed without
+   * running one. `checkCacheRoot`/`checkCacheRoots` name the placeholder
+   * checkout a check will be given; the rest are the facts a self-run must
+   * reproduce.
+   */
+  declaredCheckEnvironment(): CheckEnvironment { return this.checkEnvironment(this.checkProcessEnv(CHECKOUT_PLACEHOLDER), CHECKOUT_PLACEHOLDER, true) }
+  /**
+   * ENV: what a member's own self-run inherits in this host process. A self-run
+   * has none of the envelope's scoped check caches, which is why those fields
+   * are excluded from the reproduction comparison.
+   */
+  selfRunEnvironment(): CheckEnvironment { return this.checkEnvironment(ambientEnvironment(), CHECKOUT_PLACEHOLDER, false) }
+  /** The environment one declared check receives, including the scoped cache roots. */
+  private checkProcessEnv(checkout: string): Record<string, string> {
+    const cache = this.checkCacheEnvironment(checkout)
+    if (this.options.checkEnv !== undefined) return { ...cache, ...this.options.checkEnv }
+    return { ...ambientEnvironment(), ...cache }
+  }
+  /** ENV: turn a process environment into the facts the envelope records. */
+  private checkEnvironment(env: Record<string, string>, checkout: string, scoped: boolean): CheckEnvironment {
+    const home = env.HOME === undefined || env.HOME === '' ? null : env.HOME
+    const userCacheDir = home === null ? null : path.join(home, '.cache')
+    const huggingfaceCacheDir = userCacheDir === null ? null : path.join(userCacheDir, 'huggingface')
+    const roots = scoped ? this.checkCacheEnvironment(checkout) : {}
+    return {
+      home,
+      userCacheDir,
+      huggingfaceCacheDir,
+      userCacheDirExists: isDirectory(userCacheDir),
+      huggingfaceCacheDirExists: isDirectory(huggingfaceCacheDir),
+      xdgCacheHome: env.XDG_CACHE_HOME === undefined || env.XDG_CACHE_HOME === '' ? null : env.XDG_CACHE_HOME,
+      sandboxPolicy: { mode: this.options.sandboxPolicy?.mode ?? 'workspace-write', enforcement: this.options.sandboxPolicy?.enforcement ?? 'full',
+        workspaceRoot: scoped ? checkout : null },
+      dependencyLinks: { mode: this.dependencyMode(), dirs: [...(this.options.verificationDependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)] },
+      checkCacheRoot: scoped ? path.join(checkout, '.swarm-check-cache') : null,
+      checkCacheRoots: roots,
+    }
+  }
   /** R11-19: the most recent measured checks, oldest first (bounded). */
   checkEnvelopeSamples(): readonly CheckEnvelopeSample[] { return [...this.checkSamples] }
   private recordCheckEnvelope(member: Member, task: Task, command: string, waitMs: number, runMs: number): void {
@@ -1006,22 +1225,32 @@ export class Workspaces {
         await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
         await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
-        const cache = this.checkCacheEnvironment(checkout)
         await mkdir(path.join(checkout, '.swarm-check-cache'), { recursive: true, mode: 0o700 }).catch(() => undefined)
-        const parentEnv = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
-        const env = this.options.checkEnv === undefined ? { ...parentEnv, ...cache } : { ...cache, ...this.options.checkEnv }
+        const env = this.checkProcessEnv(checkout)
+        // ENV: the facts this check runs under, recorded with it so a reader can
+        // compare them with the envelope delivered to the assignee.
+        const environment = this.checkEnvironment(env, checkout, true)
+        environment.dependencyLinks = { ...environment.dependencyLinks, dirs: linked.length ? linked : environment.dependencyLinks.dirs }
         const results: CheckResult[] = []
         let first = true
         for (const command of task.checks) {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
           const commandStarted = Date.now()
-          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env })
+          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true })
           // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
           const output = result.exitCode === 127
             ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
             : result.output
-          results.push({ command, exitCode: result.exitCode, output, truncated: result.truncated })
+          // ENV: attribution and environment are written BEFORE the free-form
+          // output, so a bound on the record removes detail rather than the
+          // failing test names, the TAP summary and the stage that failed.
+          const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
+            : { index: results.length + 1, command, ...result.attribution }
+          results.push({ command, exitCode: result.exitCode, ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
+          // ENV: the most recent completed check, whatever its verdict, so the
+          // measured envelope never carries a stale attribution from an earlier run.
+          this.lastCheck = { memberId: member.id, taskId: task.id, at: Date.now(), environment, ...(attribution === undefined ? {} : { attribution }), output: boundedOutput(output) }
           // The queue wait belongs to the first check of this verification; the
           // run time is the check's own execution.
           this.recordCheckEnvelope(member, task, command, first ? waitMs : 0, Date.now() - commandStarted)

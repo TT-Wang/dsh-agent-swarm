@@ -1,5 +1,6 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
 import { createHash, randomUUID } from 'node:crypto'
+import { statSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
@@ -19,7 +20,11 @@ import { AdmissionRefusedError, admissionRowId, classifyProviderOutage, decideAd
 import { validScope } from './scope.ts'
 import { absoluteCheckPaths, assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, missingReviewDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, shellSegments, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+// ENV: the declared-check environment is authored by the host's workspace layer
+// and read here through a type-only import, so the policy module never depends
+// on the Node worktree module at runtime.
+import type { CheckAttribution, CheckEnvironment, ObservedCheck } from './workspaces.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
@@ -114,6 +119,413 @@ export class ObserveDetailRefusedError extends Error {
     this.name = 'ObserveDetailRefusedError'
   }
 }
+/** ENV: one field of the declared-check envelope a self-run does not reproduce. */
+export interface CheckEnvironmentMismatch { field: string; envelope: string; selfRun: string }
+/**
+ * ENV: the envelope reproduction comparison. `blocking` divergences mean the
+ * verification attempt's self-run cannot reproduce the environment the host
+ * check runs under, so the mismatch is reported instead of accepting the
+ * artifact. `advisory` divergences (whether a cache root happened to exist) are
+ * recorded but never refuse an acceptance: a check must not depend on the
+ * ambient cache staying warm.
+ */
+export interface CheckEnvironmentComparison { blocking: CheckEnvironmentMismatch[]; advisory: CheckEnvironmentMismatch[] }
+const checkEnvironmentField = (value: string | boolean | null): string => value === null ? 'absent' : String(value)
+/** ENV: the cache roots as one comparable field; `none` when the environment sets none. */
+const checkCacheRootsField = (roots: Record<string, string>): string =>
+  Object.keys(roots).sort().map(name => `${name}=${roots[name]}`).join(', ') || 'none'
+/**
+ * ENV: compare the declared envelope the runtime delivered with the environment
+ * a verification attempt's self-run reports. HOME, the user cache roots, the
+ * sandbox policy and the dependency links must agree; the scoped check cache
+ * roots the envelope itself provides (`checkCacheRoot`, `checkCacheRoots`,
+ * `xdgCacheHome`) and the existence flags are compared and REPORTED but stay
+ * advisory: they differ by construction on every run, and a check must not
+ * depend on the ambient cache staying warm — refusing on them would block every
+ * production acceptance.
+ */
+export function compareCheckEnvironments(envelope: CheckEnvironment, selfRun: CheckEnvironment): CheckEnvironmentComparison {
+  const blocking: CheckEnvironmentMismatch[] = []
+  const advisory: CheckEnvironmentMismatch[] = []
+  const compare = (field: string, before: string | boolean | null, after: string | boolean | null, into: CheckEnvironmentMismatch[]): void => {
+    const left = checkEnvironmentField(before), right = checkEnvironmentField(after)
+    if (left !== right) into.push({ field, envelope: left, selfRun: right })
+  }
+  compare('home', envelope.home, selfRun.home, blocking)
+  compare('userCacheDir', envelope.userCacheDir, selfRun.userCacheDir, blocking)
+  compare('huggingfaceCacheDir', envelope.huggingfaceCacheDir, selfRun.huggingfaceCacheDir, blocking)
+  compare('sandboxPolicy.mode', envelope.sandboxPolicy?.mode ?? null, selfRun.sandboxPolicy?.mode ?? null, blocking)
+  compare('sandboxPolicy.enforcement', envelope.sandboxPolicy?.enforcement ?? null, selfRun.sandboxPolicy?.enforcement ?? null, blocking)
+  compare('dependencyLinks.mode', envelope.dependencyLinks?.mode ?? null, selfRun.dependencyLinks?.mode ?? null, blocking)
+  compare('dependencyLinks.dirs', envelope.dependencyLinks?.dirs.join(', ') || 'none', selfRun.dependencyLinks?.dirs.join(', ') || 'none', blocking)
+  compare('userCacheDirExists', envelope.userCacheDirExists, selfRun.userCacheDirExists, advisory)
+  compare('huggingfaceCacheDirExists', envelope.huggingfaceCacheDirExists, selfRun.huggingfaceCacheDirExists, advisory)
+  // ENV-R: the scoped roots the envelope provides are divergences a self-run
+  // cannot reproduce, and a self-run that sets its own cache roots diverges from
+  // the envelope's. Both are named with both values so the record shows the
+  // difference, never an empty comparison that hides it.
+  compare('xdgCacheHome', envelope.xdgCacheHome, selfRun.xdgCacheHome, advisory)
+  compare('checkCacheRoot', envelope.checkCacheRoot, selfRun.checkCacheRoot, advisory)
+  compare('checkCacheRoots', checkCacheRootsField(envelope.checkCacheRoots), checkCacheRootsField(selfRun.checkCacheRoots), advisory)
+  return { blocking, advisory }
+}
+/**
+ * ENV: a verification whose self-run environment cannot reproduce the
+ * declared-check envelope. The verdict is refused rather than accepting an
+ * artifact that was only ever validated under a different environment.
+ */
+export class CheckEnvironmentMismatchError extends Error {
+  readonly code = 'check_environment_mismatch'
+  constructor(message: string) {
+    super(message)
+    this.name = 'CheckEnvironmentMismatchError'
+  }
+}
+/** ENV-R: the environment names the declared-check envelope records. */
+const SELF_RUN_FACTS = new Set(['HOME', 'XDG_CACHE_HOME', 'npm_config_cache', 'YARN_CACHE_FOLDER', 'PIP_CACHE_DIR', 'GOCACHE'])
+/** ENV-R: the commands whose arguments declare environment facts for the command they run. */
+const SELF_RUN_ENV_COMMANDS = new Set(['env', 'export', 'unset'])
+/** ENV-R: the shells whose `-c` body is itself a command that may declare facts. */
+const SELF_RUN_SHELLS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh'])
+/** ENV-R: how deep a nested `sh -c` body is followed before the text is treated as opaque. */
+const SELF_RUN_MAX_DEPTH = 4
+/**
+ * ENV-R: the semantics this extractor does NOT model, stated so a reader does
+ * not over-trust it. It reads the command TEXT, which is what the runtime
+ * durably records; it is not a shell. Every entry below is pinned by a test in
+ * `tests/check-envelope.test.mjs` that asserts the direction it claims.
+ *
+ * - A non-literal value is recorded as the literal text the command contains
+ *   (`HOME=$X` records `$X`), never resolved: an environment the extractor
+ *   cannot resolve is REPORTED as a divergence rather than assumed equal, which
+ *   is the guard's purpose — an artifact validated under an environment the
+ *   host cannot confirm must not be accepted.
+ * - `set -a`, `source`/`.` and a function body are not followed: an override
+ *   they apply is recorded as ABSENT (permissive — the guard is no more
+ *   refusing than before this repair). A heredoc BODY is stripped from the
+ *   command before it is read, so it is never read as code at all.
+ * - `env -S` is not split, and `export -n NAME[=VALUE]`/`export -f`/`export -p`
+ *   are not modelled: an override in those forms is recorded as ABSENT
+ *   (permissive). `export -n HOME=/x` leaves the child without HOME, and the
+ *   extractor records no override rather than an assignment the child never
+ *   sees.
+ *
+ * Two forms that used to be wrong are now modelled explicitly: `unset -f`/
+ * `unset -n` (and any unset option other than `-v`/`--`) record NOTHING, because
+ * they act on functions and namerefs rather than on the variable, and a quoted
+ * `NAME=VALUE` word after `env`/`export` records an assignment, because those
+ * builtins parse their arguments after quote removal.
+ */
+export const SELF_RUN_EXTRACTOR_LIMITATIONS: readonly string[] = Object.freeze([
+  'a non-literal value is recorded as its literal text (`HOME=$X` records `$X`): reported as a divergence, never resolved',
+  '`set -a`, `source`/`.` and function bodies are not followed: their override is recorded as absent (permissive); a heredoc body is stripped before the command is read, so it is never read as code',
+  '`env -S` is not split, and `export -n NAME[=VALUE]`, `export -f` and `export -p` are not modelled: their override is recorded as absent (permissive)',
+])
+/**
+ * ENV-R: the `unset` options that act on a VARIABLE. Any other option (`-f`,
+ * `-n`, combined forms) makes the command act on functions or namerefs, so the
+ * words after it are not removals of the names the envelope records.
+ */
+const UNSET_VARIABLE_OPTIONS = new Set(['-v', '--'])
+/** ENV-R: the `env` options whose argument the extractor must consume rather than read as a fact. */
+const ENV_CHDIR_OPTIONS = new Set(['-C', '--chdir'])
+/** ENV-R: one environment operation a self-run command declares for itself. */
+export interface SelfRunEnvironmentOperation { name: string; value: string | null }
+/** ENV-R: the environment a self-run command gives itself, read from its command text. */
+export interface SelfRunEnvironmentSource {
+  /** Ordered operations; `value: null` means the command removes the name. */
+  operations: SelfRunEnvironmentOperation[]
+  /** True when the command starts from an empty environment (`env -i`/`--ignore-environment`/`-`). */
+  cleared: boolean
+}
+/** ENV-R: how the environment facts on a durable tool-run row were derived. */
+export interface SelfRunEnvironmentProvenance extends SelfRunEnvironmentSource {
+  /** The facts were read from the recorded command's own text; absent means the ambient host facts. */
+  from: 'command'
+}
+/**
+ * ENV-R4 D3: remove heredoc bodies from a command before it is read. A body is
+ * DATA, not shell code: under any preceding segment (an `export` included) its
+ * lines must never be read as environment assignments. Each `<<`/`<<-`
+ * redirection outside quotes contributes a delimiter; the following lines are
+ * dropped up to and including each terminator line, in order, so several
+ * heredocs in one command are consumed correctly. `<<<` (a here-string) is not
+ * a heredoc and is left alone.
+ */
+function stripHeredocBodies(command: string): string {
+  const kept: string[] = []
+  const pending: Array<{ delimiter: string; tabs: boolean }> = []
+  for (const line of command.split('\n')) {
+    if (pending.length > 0) {
+      const head = pending[0]!
+      const candidate = head.tabs ? line.replace(/^\t+/, '') : line
+      if (candidate === head.delimiter) pending.shift()
+      continue
+    }
+    kept.push(line)
+    pending.push(...heredocDelimiters(line))
+  }
+  return kept.join('\n')
+}
+/** ENV-R4 D3: the heredoc delimiters one line opens, outside quotes and never for `<<<`. */
+function heredocDelimiters(line: string): Array<{ delimiter: string; tabs: boolean }> {
+  const found: Array<{ delimiter: string; tabs: boolean }> = []
+  let index = 0, quote: string | null = null
+  while (index < line.length) {
+    const char = line[index]!
+    if (quote !== null) { if (char === quote) quote = null; index += 1; continue }
+    if (char === "'" || char === '"') { quote = char; index += 1; continue }
+    if (char === '\\') { index += 2; continue }
+    if (char === '<' && line[index + 1] === '<' && line[index + 2] !== '<') {
+      const tabs = line[index + 2] === '-'
+      index += tabs ? 3 : 2
+      while (index < line.length && /\s/.test(line[index]!)) index += 1
+      let word = '', inner: string | null = null
+      while (index < line.length) {
+        const current = line[index]!
+        if (inner !== null) { if (current === inner) inner = null; else word += current; index += 1; continue }
+        if (current === "'" || current === '"') { inner = current; index += 1; continue }
+        if (/\s/.test(current)) break
+        word += current
+        index += 1
+      }
+      if (word.length > 0) found.push({ delimiter: word, tabs })
+      continue
+    }
+    index += 1
+  }
+  return found
+}
+interface ShellWord {
+  text: string
+  operator: boolean
+  /** An assignment whose `NAME=` prefix was unquoted: valid at segment start and after `env`/`export`. */
+  assignment?: { name: string; value: string }
+  /** An assignment read from the quote-removed word: valid only where a builtin parses it (`env`, `export`). */
+  valueAssignment?: { name: string; value: string }
+}
+/**
+ * ENV-R: split one command line into shell words, operators and the unquoted
+ * assignment words. Quotes are removed from `text`; an assignment is recognized
+ * only when its `NAME=` prefix is itself unquoted and the name is a valid
+ * identifier, so a quoted mention (`grep "HOME=/x" f`) stays an argument.
+ */
+function shellWords(command: string): ShellWord[] {
+  const words: ShellWord[] = []
+  let index = 0
+  while (index < command.length) {
+    const char = command[index]!
+    // ENV-R4 D3: a newline ends the simple command exactly like `;`. Without
+    // this, an `export` segment leaked across the newline and a heredoc body's
+    // `HOME=/x` was read as an export operand — a false blocking divergence for
+    // a command that really runs with the ambient HOME.
+    if (char === '\n') { words.push({ text: '\n', operator: true }); index += 1; continue }
+    if (/\s/.test(char)) { index += 1; continue }
+    if (command.startsWith('&&', index) || command.startsWith('||', index)) { words.push({ text: command.slice(index, index + 2), operator: true }); index += 2; continue }
+    if (char === ';' || char === '|' || char === '&' || char === '(' || char === ')') { words.push({ text: char, operator: true }); index += 1; continue }
+    let text = '', name = '', quotedName = false, closed = false, nameValid = true
+    while (index < command.length) {
+      const current = command[index]!
+      // Command substitution is part of the word, not a subshell operator: a
+      // value like `$(pwd)` is recorded as the text the command contains (the
+      // documented non-literal direction).
+      if (current === '$' && command[index + 1] === '(') {
+        let depth = 0
+        while (index < command.length) {
+          const inner = command[index]!
+          text += inner
+          index += 1
+          if (inner === '(') depth += 1
+          else if (inner === ')') { depth -= 1; if (depth === 0) break }
+        }
+        continue
+      }
+      if (/\s/.test(current) || current === ';' || current === '|' || current === '&' || current === '(' || current === ')') break
+      if (current === "'") {
+        index += 1
+        if (!closed) quotedName = true
+        while (index < command.length && command[index] !== "'") { text += command[index]; index += 1 }
+        index += 1
+        continue
+      }
+      if (current === '"') {
+        index += 1
+        if (!closed) quotedName = true
+        while (index < command.length && command[index] !== '"') {
+          if (command[index] === '\\' && index + 1 < command.length && '"\\$`'.includes(command[index + 1]!)) index += 1
+          text += command[index]; index += 1
+        }
+        index += 1
+        continue
+      }
+      if (current === '\\') { index += 1; if (index < command.length) { text += command[index]; index += 1 }; continue }
+      if (current === '`') {
+        text += current
+        index += 1
+        while (index < command.length && command[index] !== '`') { text += command[index]; index += 1 }
+        if (index < command.length) { text += command[index]; index += 1 }
+        continue
+      }
+      if (!closed) {
+        if (current === '=') closed = true
+        else if (name.length === 0 ? /[A-Za-z_]/.test(current) : /[A-Za-z0-9_]/.test(current)) name += current
+        else nameValid = false
+      }
+      text += current
+      index += 1
+    }
+    const assignment = closed && !quotedName && nameValid && name.length > 0 ? { name, value: text.slice(name.length + 1) } : undefined
+    const equals = text.indexOf('=')
+    const assignedName = equals > 0 ? text.slice(0, equals) : ''
+    const valueAssignment = assignedName.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(assignedName)
+      ? { name: assignedName, value: text.slice(equals + 1) } : undefined
+    words.push({ text, operator: false, ...(assignment === undefined ? {} : { assignment }), ...(valueAssignment === undefined ? {} : { valueAssignment }) })
+  }
+  return words
+}
+/**
+ * ENV-R: the environment one recorded command declares for itself, read from
+ * the durable command text. Segment-initial unquoted `NAME=VALUE` words (also
+ * after `&&`, `||`, `;`, `|`, `(`, at the start of a shell `-c` body and after
+ * `env`), `export NAME=VALUE`, `env [-i|--ignore-environment|-]`, `env -u NAME`
+ * and `unset NAME` are the forms recognized; only the names the envelope
+ * records are kept. See {@link SELF_RUN_EXTRACTOR_LIMITATIONS}.
+ */
+export function selfRunEnvironmentSource(command: unknown): SelfRunEnvironmentSource {
+  const operations: SelfRunEnvironmentOperation[] = []
+  const source: SelfRunEnvironmentSource = { operations, cleared: false }
+  if (typeof command !== 'string' || command.length === 0) return source
+  const record = (name: string, value: string | null): void => { if (SELF_RUN_FACTS.has(name)) operations.push({ name, value }) }
+  const walk = (words: ShellWord[], depth: number): void => {
+    let segmentStart = true, commandWord = '', mode: 'plain' | 'env' | 'export' | 'unset' = 'plain'
+    let pendingUnset = false, pendingShellBody = false, pendingEnvArgument = false, exportUnmodelled = false
+    for (const word of words) {
+      if (word.operator) { segmentStart = true; commandWord = ''; mode = 'plain'; pendingUnset = false; pendingShellBody = false; pendingEnvArgument = false; exportUnmodelled = false; continue }
+      const base = word.text.split('/').pop() ?? word.text
+      if (segmentStart) {
+        if (word.assignment !== undefined) { record(word.assignment.name, word.assignment.value); continue }
+        commandWord = base
+        segmentStart = false
+        mode = base === 'env' ? 'env' : base === 'export' ? 'export' : base === 'unset' ? 'unset' : 'plain'
+        continue
+      }
+      if (pendingShellBody) {
+        pendingShellBody = false
+        // ENV-R5: a nested shell body is read exactly like a top-level command,
+        // so the heredoc strip must be re-applied here. The top-level scanner
+        // cannot see a `<<DELIM` that sits inside an unterminated quote on the
+        // `sh -c '...` line, so without this the body's `HOME=/x` was read as
+        // code and the durable row recorded an override the child never had.
+        if (depth < SELF_RUN_MAX_DEPTH) walk(shellWords(stripHeredocBodies(word.text)), depth + 1)
+        continue
+      }
+      if (mode === 'env') {
+        if (word.text === '-i' || word.text === '--ignore-environment' || word.text === '-') { source.cleared = true; continue }
+        if (word.text === '-u' || word.text === '--unset') { pendingUnset = true; continue }
+        if (word.text.startsWith('--unset=')) { record(word.text.slice('--unset='.length), null); continue }
+        if (pendingUnset) { pendingUnset = false; record(word.text, null); continue }
+        // `env -C dir` changes directory; its argument is not an environment fact.
+        if (ENV_CHDIR_OPTIONS.has(word.text)) { pendingEnvArgument = true; continue }
+        if (pendingEnvArgument) { pendingEnvArgument = false; continue }
+        // ENV-R3 D1: `env` parses its OWN arguments after quote removal, so a
+        // word whose value is `NAME=VALUE` is an assignment even when it was
+        // quoted. At segment start a quoted word stays a command name; here it
+        // is an `env` operand.
+        const envAssignment = word.assignment ?? word.valueAssignment
+        if (envAssignment !== undefined) { record(envAssignment.name, envAssignment.value); continue }
+        // `env … <command>`: the command env runs is where later facts come from.
+        commandWord = base
+        mode = 'plain'
+      }
+      if (mode === 'export') {
+        // ENV-R4 D4: `export -n NAME[=VALUE]` leaves the variable UNEXPORTED
+        // (the executed child does not see it), `export -f NAME` exports a
+        // function and `export -p` prints; none of them declares an environment
+        // fact, so nothing is recorded (permissive). The value form used to be
+        // read as an assignment the child never sees.
+        if (exportUnmodelled) continue
+        if (word.text.startsWith('-') && word.text !== '--') { exportUnmodelled = true; continue }
+        // `export "NAME=VALUE"` assigns: the builtin sees the word after quote
+        // removal, exactly as `env` does.
+        const exported = word.assignment ?? word.valueAssignment
+        if (exported !== undefined) record(exported.name, exported.value)
+        continue
+      }
+      if (mode === 'unset') {
+        // ENV-R3 D2: `unset -f NAME`/`unset -n NAME` (and any option other than
+        // the variable forms) act on functions and namerefs. Recording the
+        // following word as a variable removal made `unset -f HOME; echo
+        // HOME=$HOME` — a command that really runs with HOME untouched — look
+        // like an override and refused an otherwise clean acceptance.
+        if (word.text.startsWith('-') && !UNSET_VARIABLE_OPTIONS.has(word.text)) { mode = 'plain'; continue }
+        if (!word.text.startsWith('-')) record(word.text, null)
+        continue
+      }
+      if (SELF_RUN_SHELLS.has(commandWord) && word.text === '-c') { pendingShellBody = true; continue }
+    }
+  }
+  walk(shellWords(stripHeredocBodies(command)), 0)
+  return source
+}
+/** Whether a path names an existing directory; an absent root is recorded as absent, never invented. */
+function isDirectory(target: string | null): boolean {
+  if (target === null) return false
+  try { return statSync(target).isDirectory() } catch { return false }
+}
+/**
+ * ENV-R: apply one command's declared environment to the ambient facts a
+ * self-run would otherwise inherit, re-deriving the user cache roots and their
+ * existence flags for an overridden HOME and carrying the command's own
+ * package-manager cache roots. The result is what the durable tool-run row
+ * records as the environment that execution really used.
+ */
+export function selfRunEnvironmentFacts(ambient: CheckEnvironment, source: SelfRunEnvironmentSource): CheckEnvironment {
+  const env: Record<string, string> = {}
+  if (!source.cleared) {
+    if (ambient.home !== null) env.HOME = ambient.home
+    if (ambient.xdgCacheHome !== null) env.XDG_CACHE_HOME = ambient.xdgCacheHome
+    for (const [name, value] of Object.entries(ambient.checkCacheRoots)) env[name] = value
+  }
+  for (const operation of source.operations) {
+    if (operation.value === null) delete env[operation.name]
+    else env[operation.name] = operation.value
+  }
+  const home = env.HOME === undefined || env.HOME === '' ? null : env.HOME
+  const userCacheDir = home === null ? null : join(home, '.cache')
+  const huggingfaceCacheDir = userCacheDir === null ? null : join(userCacheDir, 'huggingface')
+  const checkCacheRoots: Record<string, string> = { ...ambient.checkCacheRoots }
+  for (const name of ['npm_config_cache', 'YARN_CACHE_FOLDER', 'PIP_CACHE_DIR', 'GOCACHE']) {
+    const value = env[name]
+    if (value === undefined) delete checkCacheRoots[name]
+    else checkCacheRoots[name] = value
+  }
+  return {
+    ...ambient,
+    home,
+    userCacheDir,
+    huggingfaceCacheDir,
+    userCacheDirExists: isDirectory(userCacheDir),
+    huggingfaceCacheDirExists: isDirectory(huggingfaceCacheDir),
+    xdgCacheHome: env.XDG_CACHE_HOME === undefined || env.XDG_CACHE_HOME === '' ? null : env.XDG_CACHE_HOME,
+    checkCacheRoots,
+  }
+}
+/** ENV-R: the command text of a tool run, when the tool's arguments carry one. */
+function recordedCommand(argumentsValue: unknown): string | undefined {
+  if (typeof argumentsValue !== 'object' || argumentsValue === null) return undefined
+  const command = (argumentsValue as { command?: unknown }).command
+  return typeof command === 'string' && command.length > 0 ? command : undefined
+}
+/** ENV: the measured envelope plus the environment facts and observation the adapter attaches. */
+type DeclaredCheckEnvelope = CheckEnvelope & {
+  environment?: CheckEnvironment
+  selfRunEnvironment?: CheckEnvironment
+  observed?: ObservedCheck
+}
+/** ENV: the environment facts a tool run was recorded under, carried on the durable row. */
+type ToolRunWithEnvironment = ToolRun & { checkEnvironment?: CheckEnvironment; checkEnvironmentSource?: SelfRunEnvironmentProvenance }
+const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =>
+  typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
 /** The model-visible position already delivered to one member; the next default read starts after it. */
 interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
@@ -866,6 +1278,75 @@ export class SwarmRuntime {
     if (task.assigneeId !== undefined) ids.add(task.assigneeId)
     return ids
   }
+
+  /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
+  private declaredCheckEnvelope(): DeclaredCheckEnvelope | undefined {
+    try { return this.workers.checkEnvelope?.() as DeclaredCheckEnvelope | undefined }
+    catch { return undefined } // reporting the environment must never break a delivery or a verdict
+  }
+  /**
+   * ENV: the environment facts one attempt's self-run was recorded under. The
+   * attempt's own host-recorded tool runs are the evidence; when it ran nothing,
+   * the ambient facts a self-run would inherit here are the fallback. ENV-R: the
+   * facts on a row are the environment the recorded command gives itself (its
+   * assignments, `env -i`, `unset`), so a reviewer that really ran with
+   * `HOME=<temp>` is compared with that HOME and not with the ambient one.
+   */
+  private selfRunEnvironmentEvidence(missionId: string, memberId: string, taskId: string, attemptId: string): { environment: CheckEnvironment; source: 'tool-run' | 'host-ambient'; at: number } | undefined {
+    const runs = this.store.list('tool_runs', missionId).filter(run => run.memberId === memberId && run.taskId === taskId && run.attemptId === attemptId)
+    for (const run of [...runs].reverse()) {
+      const facts = (run as ToolRunWithEnvironment).checkEnvironment
+      if (facts !== undefined) return { environment: facts, source: 'tool-run', at: run.createdAt }
+    }
+    const ambient = this.declaredCheckEnvelope()?.selfRunEnvironment
+    return ambient === undefined ? undefined : { environment: ambient, source: 'host-ambient', at: Date.now() }
+  }
+  /** ENV: the declared envelope delivered with one attempt's assignment, from the durable delivery. */
+  private deliveredCheckEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
+    for (const delivery of this.store.list('deliveries', missionId)) {
+      if (delivery.kind !== 'assignment' || delivery.taskId !== taskId || delivery.attemptId !== attemptId) continue
+      try {
+        const content = JSON.parse(delivery.content) as { checkEnvironment?: { environment?: unknown } }
+        const environment = content.checkEnvironment?.environment
+        if (isDeclaredCheckEnvironment(environment)) return environment
+      } catch { /* a delivery without the envelope simply has none */ }
+    }
+    return undefined
+  }
+  /**
+   * ENV: compare the envelope delivered to one verification attempt with the
+   * environment that attempt's self-run reports. An attempt with no delivered
+   * envelope and no self-run evidence has nothing to compare, and the verdict
+   * proceeds as before.
+   */
+  private checkEnvironmentReproduction(missionId: string, memberId: string, taskId: string, attemptId: string):
+    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'tool-run' | 'host-ambient'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+    const envelope = this.deliveredCheckEnvironment(missionId, taskId, attemptId) ?? this.declaredCheckEnvelope()?.environment
+    if (envelope === undefined) return undefined
+    const evidence = this.selfRunEnvironmentEvidence(missionId, memberId, taskId, attemptId)
+    if (evidence === undefined) return undefined
+    return { envelope, selfRun: evidence.environment, source: evidence.source, at: evidence.at, comparison: compareCheckEnvironments(envelope, evidence.environment) }
+  }
+  /**
+   * ENV: the check environment facts an assignment delivery carries. Public so
+   * every module that writes an assignment delivery (the claim path here and the
+   * budget-resume path in src/gates.ts) delivers the same envelope: one
+   * assignee that is not told the environment is the defect this closes.
+   */
+  assignmentCheckEnvironment(): { checkEnvironment?: { note: string; environment: CheckEnvironment; selfRun?: CheckEnvironment } } {
+    const envelope = this.declaredCheckEnvelope()
+    if (envelope?.environment === undefined) return {}
+    return { checkEnvironment: {
+      note: 'These are the facts the host runs this task\'s declared checks under. A self-run must reproduce them: the runtime reports the mismatch instead of accepting an artifact when it cannot. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits. A command that sets HOME or a cache root for itself (`HOME=… cmd`, `export …`, `env -i`, `unset …`) is recorded as the environment that self-run really used, and the comparison names the divergent field with both values.',
+      environment: envelope.environment,
+      ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
+    } }
+  }
+  /** ENV: render a blocking mismatch as the refusal the member must act on. */
+  private checkEnvironmentMismatchMessage(comparison: CheckEnvironmentComparison, source: string): string {
+    const fields = comparison.blocking.map(item => `${item.field}: envelope ${item.envelope}, self-run ${item.selfRun}`).join('; ')
+    return `[check_environment_mismatch] This verification's self-run environment (${source}) cannot reproduce the declared-check envelope: ${fields}. Rerun the declared check in the envelope environment, then call \`swarm_verify\` with its \`verdict\` and \`reason\` again; the artifact is not accepted under a different environment.`
+  }
   
   
   
@@ -902,7 +1383,7 @@ export class SwarmRuntime {
         this.store.put('tasks', task); this.store.put('members', member)
         this.store.recordAdmission(admitted)
         this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-          content: JSON.stringify({ missionId: task.missionId, task, instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
+          content: JSON.stringify({ missionId: task.missionId, task, ...this.assignmentCheckEnvironment(), instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
       })
     } catch (error) {
@@ -1051,6 +1532,35 @@ export class SwarmRuntime {
       const independentRuns = this.store.list('tool_runs', missionId).filter(run => run.memberId === member.id && run.taskId === task.id && run.attemptId === input.attemptId && !run.isError)
       if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
       const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
+      // ENV: the host check attaches the environment it ran under and, on
+      // failure, the attribution captured before the output bound. The adapter
+      // interface still declares the narrow result, so widen it here.
+      const outcomes = checks as Array<{ command: string; exitCode: number; output: string; truncated?: boolean; attribution?: CheckAttribution; environment?: CheckEnvironment }>
+      const attributionOf = (check: { command: string; exitCode: number }): { attribution?: CheckAttribution } => {
+        const found = outcomes.find(item => item.command === check.command && item.exitCode === check.exitCode)
+        return found?.attribution === undefined ? {} : { attribution: found.attribution }
+      }
+      const failureAttribution = outcomes.find(check => check.attribution !== undefined)?.attribution
+      // ENV: the envelope delivered to this attempt must be reproducible by the
+      // attempt's own self-run. A blocking divergence is durable before it is
+      // reported, so a later reader sees the environments, not only the refusal.
+      const reproduction = this.checkEnvironmentReproduction(missionId, member.id, task.id, input.attemptId)
+      if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
+        this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
+          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
+          envelope: reproduction.envelope, selfRun: reproduction.selfRun, selfRunSource: reproduction.source, selfRunAt: reproduction.at,
+          blocking: reproduction.comparison.blocking, advisory: reproduction.comparison.advisory,
+          ...(failureAttribution === undefined ? {} : { attribution: failureAttribution }),
+        }))
+      }
+      // A failed check still blocks the source with its real failure (the
+      // mismatch is recorded above). An acceptance, though, is refused rather
+      // than validating an artifact under an environment the host check cannot
+      // reproduce.
+      if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
+        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(reproduction.comparison,
+          reproduction.source === 'tool-run' ? "recorded on this attempt's host-recorded tool runs" : 'the ambient host environment'))
+      }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
@@ -1115,7 +1625,7 @@ export class SwarmRuntime {
           }
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: rejection, checks: runIds,
-          ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, output: excerpt(check.output, 400) })) }) })
+          ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
           this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, member.id)
@@ -2500,7 +3010,19 @@ export class SwarmRuntime {
     if (!member) return undefined
     const task = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     if (!task?.attempt) return undefined
-    const run: ToolRun = { ...input, id: id('run'), missionId: member.missionId, memberId, taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now() }
+    const run: ToolRunWithEnvironment = { ...input, id: id('run'), missionId: member.missionId, memberId, taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now() }
+    // ENV-R: the environment this execution ran under. The command text is the
+    // durable evidence of what the command gives itself (`HOME=… cmd`,
+    // `export …`, `env -i`, `unset …`), so the row records THAT environment, not
+    // the host-ambient sample a command that overrode HOME never ran with.
+    const ambient = this.declaredCheckEnvelope()?.selfRunEnvironment
+    if (ambient !== undefined) {
+      const source = selfRunEnvironmentSource(recordedCommand(input.arguments))
+      run.checkEnvironment = selfRunEnvironmentFacts(ambient, source)
+      // Provenance: a reader can tell a command-derived environment from the
+      // ambient fallback without re-parsing the command text.
+      if (source.cleared || source.operations.length > 0) run.checkEnvironmentSource = { from: 'command', ...source }
+    }
     // F8: a recorded run may extend the attempt lease, but a stored lease must
     // never outlive the mission deadline (the same clamp every other renewal uses).
     task.attempt.leaseUntil = Math.min(this.mission(member.missionId).deadline, Date.now() + this.config.leaseMs)
