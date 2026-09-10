@@ -22,7 +22,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { refusalSites } from './refusal-inventory.mjs'
 
-const SOURCES = ['src/runtime.ts', 'src/workspaces.ts']
+// M1a split the control path: the same inventory now spans the modules that
+// received its refusal sites, so the RPC-actionable count stays complete.
+const SOURCES = ['src/runtime.ts', 'src/workspaces.ts', 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts']
 /** The RPC-actionable inventory measured on the merge baseline 34e8a20. */
 const BASELINE_CLASSIFIED = 103
 

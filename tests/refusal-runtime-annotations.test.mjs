@@ -29,6 +29,12 @@ const ANNOTATED = {
 }
 /** Uncoded refusal sites on these two files before this branch (measured on the merge baseline 34e8a20). */
 const PRE_BRANCH_UNCODED = 235
+/**
+ * M1a split the two serialized control-path files into modules. The inventory is
+ * the union, so the "every site is still exposed" property is asserted over the
+ * same total site set (235) rather than the shrinking subset that stayed put.
+ */
+const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts']
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {
@@ -55,7 +61,7 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
   let uncoded = 0
   let total = 0
   const sitesByFile = {}
-  for (const file of Object.keys(ANNOTATED)) {
+  for (const file of INVENTORY_SOURCES) {
     const sites = refusalSites(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), file)
     const producers = diagnosticProducers([sites])
     sitesByFile[file] = sites
@@ -64,12 +70,12 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
       if (assessRefusal(site, { ...index, diagnosticProducers: producers }).length) uncoded++
     }
   }
-  assert.equal(total, 235, 'the two serialized files still expose every refusal site (186 + 49)')
+  assert.equal(total, 235, 'the split control-path files still expose every refusal site (186 + 49)')
   assert.ok(uncoded < PRE_BRANCH_UNCODED,
     `this branch must shrink the uncoded inventory (pre-branch ${PRE_BRANCH_UNCODED}, now ${uncoded})`)
   assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length,
     'the shrink equals the number of codes this branch added')
-  const applied = applyAllowlist([...sitesByFile['src/runtime.ts'], ...sitesByFile['src/workspaces.ts']], ALLOWLIST,
+  const applied = applyAllowlist(INVENTORY_SOURCES.flatMap(file => sitesByFile[file]), ALLOWLIST,
     site => assessRefusal(site, { ...index, diagnosticProducers: diagnosticProducers([sitesByFile[site.file] ?? []]) }))
   assert.deepEqual(applied.stale, [], 'the allowlist handed over by T2 is empty and stays empty')
 })
