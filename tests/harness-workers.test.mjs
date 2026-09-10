@@ -138,8 +138,8 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
 
 const message = (member, id = 'delivery-one') => ({ id, missionId: member.missionId, from: 'coordinator-test', to: member.id, kind: 'assignment', content: 'Complete the assigned task.', createdAt: 1 })
 
-async function eventually(read, what) {
-  const deadline = Date.now() + 10000
+async function eventually(read, what, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
   assert.fail(`Timed out waiting for ${what}`)
 }
@@ -513,14 +513,23 @@ test('a silent generation keeps its attempt lease renewed through the runtime wi
   const gate = new Promise(resolve => { release = resolve })
   const f = await fixture(t, undefined, {
     workerOptions: { activityHeartbeatMs: 20 },
-    // Hold the provider silent on its first request; abort must still release the gate.
-    beforeChunks: (_action, options, count) => count !== 1 ? undefined : Promise.race([gate, new Promise(resolve => {
+    // Hold every provider request silent; abort must still release the gate. The
+    // former "first request only" gate let the member's turn end before its silent
+    // generation under load, which left a live operation unobservable and turned a
+    // lease-liveness property into a harness-start race.
+    beforeChunks: (_action, options) => Promise.race([gate, new Promise(resolve => {
       if (options.signal.aborted) resolve()
       else options.signal.addEventListener('abort', resolve, { once: true })
     })]),
   })
   const adapter = new HarnessWorkers(f.ctx, { ...f.options, workspacesRoot: path.join(f.options.workspacesRoot, 'lease-runtime') })
-  const runtime = new SwarmRuntime({ statePath: path.join(f.options.workspacesRoot, 'lease.sqlite'), leaseMs: 150, tickMs: 10,
+  // The lease is generous relative to the observation window: the property is
+  // "a live operation keeps its attempt alive", and a short lease made the model
+  // start itself a race under load (the attempt was recovered before the harness
+  // could publish its first activity). The decision the property is about is
+  // pinned below by driving the durable lease to its expiry boundary, not by
+  // waiting for wall-clock time to pass.
+  const runtime = new SwarmRuntime({ statePath: path.join(f.options.workspacesRoot, 'lease.sqlite'), leaseMs: 60_000, tickMs: 10,
     maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, adapter)
   try {
     const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 }
@@ -532,20 +541,53 @@ test('a silent generation keeps its attempt lease renewed through the runtime wi
     const task = runtime.propose(actor, mission.id, { workstreamId: stream.id, title: 'Long generation', objective: 'Generate without tools', kind: 'implementation', scope: ['**'], acceptance: ['survives'], checks: ['check'] })
     // start() must precede the claim: it treats an already-running task as host-restart recovery.
     await runtime.start()
-    await runtime.claim(actor, mission.id, task.id)
-    const running = await eventually(() => { const current = runtime.store.get('tasks', task.id); return current?.status === 'running' ? current : undefined }, 'the task to be running')
-    const published = await eventually(() => runtime.store.get('members', member.id)?.activity, 'the published activity')
+    // The runtime's own dispatcher can win the race with this explicit claim: its
+    // refusal names exactly that outcome ("Task changed while preparing its
+    // workspace"). The property under test starts on the next line — the task running
+    // under this member with a live operation renewed at its lease boundary — and a
+    // claim refused because the dispatcher already moved the row is not a failure of
+    // that property. Any other error, or a task that left the runnable states (the
+    // dispatcher may be mid-preparation, so pending and running both count), still
+    // fails the test unchanged.
+    try { await runtime.claim(actor, mission.id, task.id) }
+    catch (error) {
+      const current = runtime.store.get('tasks', task.id)
+      const runnable = current !== undefined && (current.status === 'running' || current.status === 'pending')
+      if (!runnable || !/Task changed while preparing its workspace/.test(String(error?.message ?? ''))) throw error
+    }
+    const running = await eventually(() => { const current = runtime.store.get('tasks', task.id); return current?.status === 'running' ? current : undefined }, 'the task to be running', 30_000)
+    const published = await eventually(() => runtime.store.get('members', member.id)?.activity, 'the published activity', 30_000)
     assert.equal(published.attemptId, running.attempt.id, 'the runtime binds the live operation to its attempt')
     // Simulate the runtime dropping the persisted activity (the budget-pause clear in
     // blockBudget): only the adapter's ongoing liveness can restore it before expiry.
     runtime.store.transaction(() => { const stored = runtime.store.get('members', member.id); delete stored.activity; runtime.store.put('members', stored) })
-    await new Promise(resolve => setTimeout(resolve, 600))
-    const after = runtime.store.get('tasks', task.id)
-    assert.equal(after.status, 'running', 'a silent generation is lease liveness for its full duration')
-    assert.equal(after.attempt.id, running.attempt.id, 'the original attempt keeps ownership')
-    assert.equal(after.recoveryCount ?? 0, 0, 'no recovery is spent while the operation is live')
-    assert.equal(runtime.store.events(mission.id, 500).some(event => event.type === 'task/lease-expired'), false, 'no lease expiry while the operation is live')
-    assert.equal(runtime.store.get('members', member.id).activity.attemptId, running.attempt.id, 'the adapter restored the persisted activity')
+    const restored = await eventually(() => runtime.store.get('members', member.id)?.activity, 'the adapter to restore the persisted activity', 30_000)
+    assert.equal(restored.attemptId, running.attempt.id, 'the adapter restored the persisted activity')
+    // Drive the durable lease to its expiry boundary (the same nudge the W9 test
+    // uses) so the renewal decision is exercised deterministically: with a live
+    // activity the runtime must renew, and it may never expire the attempt. The
+    // margin is 2 s, not a bare millisecond: the renewal rule fires whenever the
+    // lease is inside half of `leaseMs`, and the margin only has to survive heartbeat
+    // jitter (20 ms) plus one scheduled tick — a tighter margin made the fixture's own
+    // nudge the thing that expired the attempt under load.
+    const leaseBefore = Date.now() + 2000
+    runtime.store.transaction(() => { const row = runtime.store.get('tasks', task.id); row.attempt.leaseUntil = leaseBefore; runtime.store.put('tasks', row) })
+    let observed
+    await eventually(() => {
+      const after = runtime.store.get('tasks', task.id)
+      if (after.attempt === undefined || after.attempt.leaseUntil <= leaseBefore) return undefined
+      observed = {
+        after,
+        activity: runtime.store.get('members', member.id)?.activity,
+        expired: runtime.store.events(mission.id, 500).some(event => event.type === 'task/lease-expired'),
+      }
+      return observed
+    }, 'the live operation renews its attempt lease', 30_000)
+    assert.equal(observed.after.status, 'running', 'a silent generation is lease liveness for its full duration')
+    assert.equal(observed.after.attempt.id, running.attempt.id, 'the original attempt keeps ownership')
+    assert.equal(observed.after.recoveryCount ?? 0, 0, 'no recovery is spent while the operation is live')
+    assert.equal(observed.expired, false, 'no lease expiry while the operation is live')
+    assert.equal(observed.activity.attemptId, running.attempt.id, 'the live operation stays bound to its attempt')
   } finally { release(); await runtime.dispose() }
 })
 
