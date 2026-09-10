@@ -1,5 +1,5 @@
 /**
- * R15-F3: a checkout-safe temp root for the fixtures the declared check runs.
+ * R15-F3 / R15-F5: the checkout-safe temp root the fixtures and production share.
  *
  * The host check runner executes each check inside a workspace-write sandbox
  * rooted at the disposable checkout, but TMPDIR/TMP/TEMP stay inherited from the
@@ -10,26 +10,13 @@
  * denies it, under `<cwd>/.swarm/test-tmp` (`.swarm/` is git-ignored, so a
  * self-run leaves no untracked path behind).
  *
+ * R15-F5: this module no longer carries its own copy of that ladder. The one
+ * implementation is the exported `tempDirectory` in `src/delivery.ts`, which
+ * production delivery also uses for its scratch root; re-exporting it here means
+ * a fixture and the production path cannot disagree about which roots are tried,
+ * or about which errno values fall through.
+ *
  * Every assertion, count, timeout and cleanup in the suites is unchanged; only
  * the root of the fixture directory differs.
  */
-import { mkdtemp, mkdir } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-
-/** Checkout-local fallback root; git-ignored, so it cannot trip [workspace_uncommitted]. */
-const fallbackRoot = join(process.cwd(), '.swarm', 'test-tmp')
-
-/** One fixture directory: the ambient temp root, or the checkout-local fallback when denied. */
-export async function tempDirectory(prefix) {
-  try {
-    return await mkdtemp(join(tmpdir(), prefix))
-  } catch {
-    // The ambient temp root is unusable in this environment (EPERM/EACCES under
-    // the check sandbox, ENOENT for a missing TMPDIR, ENOTDIR for a file path).
-    // The checkout-local root is the sandbox-safe answer; a prefix we control
-    // cannot fail here for any other reason.
-    await mkdir(fallbackRoot, { recursive: true })
-    return await mkdtemp(join(fallbackRoot, prefix))
-  }
-}
+export { tempDirectory } from '../lib/delivery.js'

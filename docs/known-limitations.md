@@ -122,15 +122,23 @@ event still returns with its payload (only the description is reported missing),
 the old names has to say so explicitly.
 
 **Kept with a compatibility reason.** `src/client/progress.ts` still labels `attempt/started`, which no writer in
-this repository emits (the live kind is `task/claimed`). It is kept because a historical card can still hold
-such rows and `tests/ui-progress.test.mjs` renders exactly that fixture; the census records it as a named
-compatibility label rather than an undocumented exception, and the label-coverage check fails if a new label
-appears with neither a vocabulary kind nor such an entry.
+this repository emits (the live kind is `task/claimed`). It is kept because a historical card can still hold such
+rows, and the readers that keep it live in that same file: the label map (`meaningfulEvents`, where it renders as
+"Task started") and `recoveryEventTypes`, which treats such a row as a recovery step. The census records it as a
+named compatibility label rather than an undocumented exception; the label-coverage check fails if a new label
+appears with neither a vocabulary kind nor such an entry, and the compatibility-reader check fails if the row's
+recorded reason cites a file that does not itself mention the label (the R16-G7 defect: the row claimed
+`tests/ui-progress.test.mjs` rendered it, and that string occurs nowhere in that file or in `tests/fixtures/`).
 
 **Kept because a reader exists.** All 24 tools keep their decision and their named reader (the worker or owner
-decision that uses them, proven by a test that exercises the tool). Event kinds whose only reader is the durable
-log itself are recorded as `audit` rows and are accepted only because the same kind has a writer — a vocabulary
-description alone is not treated as proof of value, and a test-only reference is rejected by the census rule.
+decision that uses them). 22 of the 24 rows are proven by a test that exercises the tool's handler; the two
+exceptions are `swarm_challenge` and `swarm_subscribe`, whose proof is their registration in `src/tools.ts` plus
+the model-visible golden fixture `tests/fixtures/model-visible.expected.json` — both appear in its
+`workerSwarmTools` set, which `tests/harness-composition.mjs` and `tests/roles.test.mjs` read — so the census now
+states the split mechanically instead of a blanket claim that was false for those two rows (R16-G7). Event kinds
+whose only reader is the durable log itself are recorded as `audit` rows and are accepted only because the same
+kind has a writer — a vocabulary description alone is not treated as proof of value, and a test-only reference is
+rejected by the census rule.
 
 **Boundary of the payload examination.** The payload census is deliberately bounded to the four densest durable
 payloads (the three `mission/stalled` shapes, `task/check-envelope`, `tool/recorded` and
