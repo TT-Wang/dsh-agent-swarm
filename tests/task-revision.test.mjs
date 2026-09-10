@@ -36,6 +36,7 @@ import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore, StaleTaskRevisionError, STALE_TASK_REFUSAL_EVENT, WriterBusyError, isSqliteBusy } from '../lib/store.js'
 import { missionFingerprint } from '../lib/gates.js'
+import { EVENT_VOCABULARY, eventVocabularyReport } from '../lib/trace.js'
 
 /** The external execution boundary only: nothing in these tests dispatches work. */
 class QuietWorkers {
@@ -239,4 +240,21 @@ test('S5: a new task record is accepted without a revision and a legacy row is m
   store.transaction(() => store.put('tasks', legacy))
   assert.equal(store.get('tasks', 'task_legacy').revision, 1, 'the legacy row is versioned by its first accepted write')
   assert.equal(store.taskRevision('task_legacy'), 1)
+})
+
+test('S5c: the durable stale-revision refusal type is registered and recognized by the vocabulary report', async t => {
+  const f = await fixture(t)
+  const [winner, loser] = f.twoReaders()
+  f.write(winner)
+  assert.throws(() => f.write(loser), StaleTaskRevisionError)
+  const log = f.store.events(f.mission.id, 500)
+  const recorded = log.filter(event => event.type === STALE_TASK_REFUSAL_EVENT)
+  assert.equal(recorded.length, 1, 'the refusal is in the real mission log')
+  // The type is emitted through an exported constant, which the vocabulary
+  // scanner now resolves (tests/event-vocabulary.test.mjs); this test pins the
+  // end-to-end consequence on a real mission log.
+  assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string', 'the vocabulary names the emitted type')
+  const report = eventVocabularyReport(log)
+  assert.deepEqual(report.unrecognized, [], 'no event in the real mission log is unrecognized')
+  assert.ok(report.recognized.includes(STALE_TASK_REFUSAL_EVENT), 'the report recognizes the refusal type')
 })

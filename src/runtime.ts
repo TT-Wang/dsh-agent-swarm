@@ -116,6 +116,15 @@ export class ObserveDetailRefusedError extends Error {
 }
 /** The model-visible position already delivered to one member; the next default read starts after it. */
 interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
+/**
+ * S5c: consecutive `workers.start` failures, carried on the member row so the
+ * count survives a lost map or a restart instead of handing a failing route a
+ * fresh budget. `Member` (src/types.ts) is outside this task's write scope, so
+ * the field is declared here and travels as a plain JSON property on the same
+ * durable row; the integration task records the one-line schema addition.
+ */
+interface MemberStartFailureFields { startFailures?: number }
+const startFailureFields = (member: Member): Member & MemberStartFailureFields => member as Member & MemberStartFailureFields
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 export class SwarmRuntime {
   /**
@@ -428,11 +437,34 @@ export class SwarmRuntime {
     }, this.config.tickMs)
     this.timer.unref()
   }
+  /**
+   * S5c: one serialized presentation of a mission's operations. The chain is an
+   * in-process ordering cache, not the mission's gate. A predecessor that has
+   * not settled inside the declared bound is treated as wedged — it is usually
+   * inside an adapter call (`workers.start`, `captureArtifact`, `verifyArtifact`)
+   * — and the next operation starts instead of being swallowed by a promise that
+   * may never settle (the Row-13 shape, which the pass watchdog only releases
+   * for a wedged *pass* with no live work). Two bodies that overlap after the
+   * bound cannot lose an update: every commit is a synchronous single-writer
+   * transaction and every task write is a compare-and-swap on the task's own
+   * revision (`SwarmStore.putTask`), so the worst case is a refused stale write.
+   */
   async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(missionId) ?? Promise.resolve()
-    const current = previous.catch(() => {}).then(fn)
+    const previous = this.queues.get(missionId)
+    if (previous !== undefined) await this.boundedQueueWait(previous)
+    const current = Promise.resolve().then(fn)
     this.queues.set(missionId, current)
     try { return await current } finally { if (this.queues.get(missionId) === current) this.queues.delete(missionId) }
+  }
+  /** Wait for the mission-queue predecessor, but never past the declared bound. */
+  private async boundedQueueWait(previous: Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        previous.catch(() => {}),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, this.stallPassTimeoutMs); timer.unref() }),
+      ])
+    } finally { if (timer !== undefined) clearTimeout(timer) }
   }
   commit<T>(missionId: string, fn: () => T): T {
     if (this.closed) throw new Error('Swarm runtime is closed')
@@ -2007,7 +2039,20 @@ export class SwarmRuntime {
           reviewOf: task.reviewOf ? `task_${draft.id}_${task.reviewOf}` : undefined,
         }, `task_${draft.id}_${task.key}`)
         mission = this.active(actor, missionId, true).mission
-        if (mission.status !== 'staged') throw new Error('Plan assembly was interrupted')
+        // S5c: the launch's cancellation decision is durable, not the in-memory
+        // abort handle. `failStart` records the failed request durably (the
+        // mission is still staged here, so it takes the failing branch); re-read
+        // it before activation so a launch cancelled while it was assembling
+        // cannot bring a mission active just because `startControllers` was lost
+        // or raced. A retry calls `startPlan` again, which sets the request back
+        // to `launching`, so only a change that happened after THIS launch began
+        // is honoured. The refusal reuses this site's existing message: the
+        // control-path refusal inventory on the serialized files must not grow,
+        // and the durable `automatic/failed` event `failStart` wrote already
+        // carries the cancellation reason.
+        const inFlight = automatic === undefined ? undefined : this.store.get('starts', automatic.id)
+        const cancelled = inFlight !== undefined && (inFlight.status === 'failed' || inFlight.status === 'stopped')
+        if (cancelled || mission.status !== 'staged') throw new Error('Plan assembly was interrupted')
         mission.status = 'active'; mission.updatedAt = Date.now(); mission.deadline = Date.now() + mission.budget.maxDurationMs
         draft.status = 'launched'; draft.updatedAt = Date.now()
         this.commit(missionId, () => {
@@ -2557,9 +2602,20 @@ export class SwarmRuntime {
   /** R11-01: a successful start or operation proves the route recovered. */
   clearProviderOutage(missionId: string, memberId: string): void {
     const member = this.store.get('members', memberId)
-    if (member === undefined || member.providerOutage === undefined) return
+    if (member === undefined) return
+    // S5c: a successful start also clears the durable consecutive-failure count
+    // (the same event that proves the route recovered proves the failures
+    // stopped). `startFailures` stays as the in-process mirror only.
+    const fields = startFailureFields(member)
+    const outage = member.providerOutage
+    const failures = fields.startFailures
+    if (outage === undefined && failures === undefined) return
     delete member.providerOutage
-    this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'provider/recovered', 'runtime', { memberId }) })
+    delete fields.startFailures
+    this.commit(missionId, () => {
+      this.store.put('members', member)
+      if (outage !== undefined) this.store.event(missionId, 'provider/recovered', 'runtime', { memberId })
+    })
   }
   private onProviderOutage(memberId: string, outage: ProviderOutage): void {
     if (this.closed || this.shuttingDown) return
@@ -2604,8 +2660,15 @@ export class SwarmRuntime {
     // and the work moves to another capable live member when one exists.
     const outage = classifyProviderOutage(error) ?? this.providerQuiescent(member)
     const reason = outage !== undefined ? `Provider ${outage.class} outage: ${outage.message}` : `Worker could not start: ${String(error)}`
-    const consecutiveFailures = (this.startFailures.get(member.id) ?? 0) + 1
-    if (outage === undefined) this.startFailures.set(member.id, consecutiveFailures)
+    // S5c: the count is read from the durable member row (the map is the mirror),
+    // so losing the map — or restarting the runtime — continues the count instead
+    // of resetting the route's budget.
+    const durable = this.store.get('members', member.id) ?? member
+    const consecutiveFailures = (startFailureFields(durable).startFailures ?? this.startFailures.get(member.id) ?? 0) + 1
+    if (outage === undefined) {
+      startFailureFields(member).startFailures = consecutiveFailures
+      this.startFailures.set(member.id, consecutiveFailures)
+    }
     const reroute = outage === undefined && consecutiveFailures >= START_FAILURE_REROUTE_LIMIT
     // Below the limit the member stays live so the next tick retries the same
     // route; at the limit it is retired exactly like a dead session. A quiescent

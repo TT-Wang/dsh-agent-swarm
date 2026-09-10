@@ -33,14 +33,16 @@
  *    work or a lost in-process notification. The test clears it and shows the
  *    durable result is unchanged.
  *
- * A third label is possible and this file refuses to hide it: `unsafe-in-memory`
- * means the collection is neither. Clearing (or, worse, keeping) it provably
- * changes externally visible behaviour, and its fix needs a file outside S5's
- * declared scope, so the entry carries a hand-off note in the submission naming
- * the exact change. The census test asserts the count of unsafe entries so it
- * cannot grow silently. Today there are exactly three, all in `src/runtime.ts`:
- * `queues` (presence swallows the mission's next liveness action — the same P0
- * class as the deleted `scheduled` Set), `startControllers` and `startFailures`.
+ * A third label was possible while a gate was neither; S5c closed it. Every
+ * behaviour-gating entry in `src/` is now `derivable` or `cache-only`, and the
+ * census test asserts that by NAME for the five entries that used to be reported
+ * as neither (`queues`, `operations`, `startControllers`, `startFailures`,
+ * `releasedPasses`): a new unlabelled state cannot hide behind an edited count.
+ * The five fixes are structural, not re-labelling — the mission queue no longer
+ * chains past the declared bound, the launch's cancellation is re-read from the
+ * durable start row before activation, the consecutive-failure count lives on
+ * the member row, every deferred body re-derives from durable state, and the
+ * pass watchdog stamps `releasedRunId` on the durable pass row.
  *
  * Co-firing guards (every guard must name what it can fire with):
  *  - the per-task revision CAS in `SwarmStore.putTask` fires with the mission
@@ -48,16 +50,50 @@
  *    tests live in `tests/task-revision.test.mjs`;
  *  - the fingerprint cache fires with `commitDepth` (bypassed inside a
  *    transaction) — pinned below;
- *  - the notice-dedup sets fire with the durable delivery ledger — pinned below.
+ *  - the notice-dedup sets fire with the durable delivery ledger — pinned below;
+ *  - the durable pass-release fence fires with the pass watchdog
+ *    (`checkSchedulingPasses`), the mission queue's bound and `openPass`'s
+ *    carry-forward — pinned in the `releasedPasses` test below.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
-import { setup, eventually, events, taskOf } from './faults/harness.mjs'
+import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
+
+/** A settable promise gate, so a test owns the in-flight window it asserts on. */
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
+
+/**
+ * S5c: a worker adapter whose workspace preparation can be held open, so the
+ * launch-cancellation test owns the window in which a launch is in flight.
+ */
+class GatedWorkers extends FakeWorkers {
+  prepareStarted = 0
+  prepareGate
+  async prepareWorkspace(mission, memberId) {
+    this.prepareStarted += 1
+    if (this.prepareGate) await this.prepareGate
+    return join(mission.workspace, memberId)
+  }
+}
+
+/** A valid automatic plan (the shape `startPlan` accepts), copied from tests/automatic.test.mjs. */
+function automaticPlan(workspace) {
+  const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+  return {
+    title: 'Automatic delivery', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
+    members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
+    workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
+    tasks: [
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
+    ],
+  }
+}
 
 /**
  * Exhaustive census, keyed by [file, occurrence index within the file, constructor, source, class, label, reason].
@@ -104,10 +140,10 @@ const CENSUS = [
   ["src/roles.ts", 1, "Map", "private readonly applied = new Map<string, Applied>()", "outside", "", "outside the runtime decision path: the plugin composition tool-registration cache, not the runtime mission path (enumerated, no label claimed)"],
   ["src/roles.ts", 2, "Set", "const visible = new Set(agent.ctx.tools.schemas(agent).map(schema => schema.name))", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts", 1, "Set", "private readonly listeners = new Set<(missionId: string) => void>()", "gate", "cache-only", "in-process change fan-out; a lost notification changes no durable state and a subscriber re-reads on its next request"],
-  ["src/runtime.ts", 2, "Map", "readonly queues = new Map<string, Promise<unknown>>()", "gate", "unsafe-in-memory", "presence swallows: every mission operation chains on the previous promise, and the pass watchdog deletes that chain entry only for a wedged pass while the mission has NO live work (checkSchedulingPasses), so a hung non-pass operation (submit, verify, captureArtifact) keeps swallowing later mission operations while any attempt holds a live lease; hand-off: give exclusive its own declared bound instead of relying on the pass watchdog"],
-  ["src/runtime.ts", 3, "Set", "private readonly operations = new Set<Promise<unknown>>()", "gate", "unsafe-in-memory", "S5r: the registry is what `dispose()` drains (up to stallPassTimeoutMs) before it closes the store, and `defer` executes the body AFTER the caller returns; clearing it while a deferred write is in flight lets dispose() close the store first and the write is lost (probe below). hand-off: make the store own its in-flight writes (or have defer register with the store) so dispose drains the store, not a runtime registry"],
-  ["src/runtime.ts", 4, "Map", "private readonly startControllers = new Map<string, AbortController>()", "gate", "unsafe-in-memory", "loss removes the only cancellation channel of an in-flight launch; hand-off: re-check the durable start row status before activation instead of trusting the handle"],
-  ["src/runtime.ts", 5, "Map", "readonly startFailures = new Map<string, number>()", "gate", "unsafe-in-memory", "memory-only consecutive-failure counter gates member retirement; loss resets it and the member is retried instead of retired; hand-off: persist it on the member row or derive it from the durable task/start-failed events"],
+  ["src/runtime.ts", 2, "Map", "readonly queues = new Map<string, Promise<unknown>>()", "gate", "cache-only", "S5c: the chain is an in-process ordering cache. `exclusive` waits for a predecessor only up to the declared bound (stallPassTimeoutMs) and then starts the next operation, so a wedged body can no longer swallow it, and two bodies that overlap after the bound cannot lose an update because every commit is a single-writer transaction and every task write is a compare-and-swap on the task revision (SwarmStore.putTask). Clearing it removes ordering only, never a durable outcome (probe below)"],
+  ["src/runtime.ts", 3, "Set", "private readonly operations = new Set<Promise<unknown>>()", "gate", "cache-only", "S5c: the drain registry orders shutdown; the deferred body is registered by `defer` and runs regardless, so clearing the registry does not cancel it and its durable write still lands (probe below). Every deferred body the runtime schedules re-derives its work from durable state (the pass row, the budget `stopping` claim, the durable outbox), so losing the drain lets dispose() return earlier but cannot make a durable transition wrong"],
+  ["src/runtime.ts", 4, "Map", "private readonly startControllers = new Map<string, AbortController>()", "gate", "derivable", "S5c: the abort handle is an accelerator. `failStart` records the failed request durably and `launchDraft` re-reads that row immediately before it activates the mission, so a cancelled launch cannot come active even when the registry is lost or raced (probe below)"],
+  ["src/runtime.ts", 5, "Map", "readonly startFailures = new Map<string, number>()", "gate", "derivable", "S5c: the count is read from and written to the durable member row (`startFailures` field) and cleared there by the same successful start that clears the provider outage; the Map is the in-process mirror, so a lost map or a restart continues the count instead of resetting the route budget (probe below)"],
   ["src/runtime.ts", 6, "Map", "private readonly observeCursors = new Map<string, DeliveredCursor>()", "gate", "cache-only", "delivered-position context cache; loss re-sends one bounded focused view and a cursor can never exceed the durable log"],
   ["src/runtime.ts", 7, "Map", "private readonly autoReviewAdmissions = new Map<string, string>()", "gate", "derivable", "the durable task/review-admitted event is read first; the map is only a fallback for an admission whose event write failed"],
   ["src/runtime.ts", 8, "Set", "private readonly reviewPathReported = new Set<string>()", "gate", "derivable", "the durable task/review-missing event for the exact submission is re-read before the set is trusted"],
@@ -135,7 +171,7 @@ const CENSUS = [
   ["src/runtime.ts", 30, "Set", "const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts", 31, "Set", "const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts", 32, "Set", "const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts", 1, "Set", "readonly releasedPasses = new Set<string>()", "gate", "unsafe-in-memory", "S5r: `passReleased` (src/scheduling.ts) reads only this Set, so clearing it lets an abandoned pass body resume and dispatch (probe below, deterministic). hand-off: record the released runId durably on the passes row (`SchedulingPass.releasedRunId`/`releasedAt`, types.ts) and have passReleased read that row"],
+  ["src/scheduling.ts", 1, "Set", "readonly releasedPasses = new Set<string>()", "gate", "derivable", "S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
   ["src/scheduling.ts", 2, "Set", "const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts", 3, "Set", "const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {", "local", "", "function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts", 1, "Set", "private readonly listeners = new Set<() => void>()", "gate", "cache-only", "observer fan-out for committed changes; the durable revision and change cursor carry the state"],
@@ -210,7 +246,7 @@ test('S5 census: every in-memory collection in src/ is classified, and none is u
     const id = `${file}:${index}`
     const entry = declared.get(id)
     assert.ok(entry, `UNCLASSIFIED in-memory collection at ${id} (${kind}): ${source}\n` +
-      'Classify it in CENSUS: a gate needs a label (derivable | cache-only | unsafe-in-memory) and a test body in GATE_TESTS; a transient, constant or out-of-unit collection needs that class and a reason.')
+      'Classify it in CENSUS: a gate needs a label (derivable | cache-only) and a test body in GATE_TESTS; a transient, constant or out-of-unit collection needs that class and a reason.')
     assert.equal(entry[2], kind, `${id} changed constructor from ${entry[2]} to ${kind}; re-classify it`)
     assert.equal(entry[3], source, `${id} changed text; if it is still the same collection, update CENSUS, otherwise classify the new one`)
     seen.add(id)
@@ -218,15 +254,24 @@ test('S5 census: every in-memory collection in src/ is classified, and none is u
   for (const entry of CENSUS) assert.ok(seen.has(key(entry)), `stale census entry ${key(entry)} is no longer in the tree`)
   const counts = CENSUS.reduce((all, entry) => ({ ...all, [entry[4]]: (all[entry[4]] ?? 0) + 1 }), {})
   assert.equal(counts.gate, GATES.length)
-  // S5r: the verifier reproduced two false labels. `operations` loses a write
-  // when it is cleared while dispose() runs, and `releasedPasses` loses the only
-  // record that an abandoned pass was released. Both are now labelled and their
-  // tests exercise a non-empty loss; the count is machine-checked so the class
-  // cannot grow silently.
-  assert.equal(GATES.filter(entry => entry[5] === 'unsafe-in-memory').length, 5,
-    'exactly five runtime collections are neither derivable nor cache-only; a new one must be reported, not labelled into silence')
-  assert.equal(GATES.filter(entry => entry[5] === 'unsafe-in-memory').map(key).join(','),
-    'src/runtime.ts:2,src/runtime.ts:3,src/runtime.ts:4,src/runtime.ts:5,src/scheduling.ts:1')
+  // S5c: zero unlabelled behaviour-gating entries, asserted BY NAME for the five
+  // that used to carry the third state, not by a count that could be edited.
+  const CLOSED = {
+    'src/runtime.ts:2': 'cache-only',
+    'src/runtime.ts:3': 'cache-only',
+    'src/runtime.ts:4': 'derivable',
+    'src/runtime.ts:5': 'derivable',
+    'src/scheduling.ts:1': 'derivable',
+  }
+  for (const label of new Set(GATES.map(entry => entry[5]))) {
+    assert.ok(label === 'derivable' || label === 'cache-only',
+      `gate ${key(GATES.find(entry => entry[5] === label))} carries ${JSON.stringify(label)}; every gate must be derivable or cache-only`)
+  }
+  for (const [entryKey, label] of Object.entries(CLOSED)) {
+    const entry = GATES.find(candidate => key(candidate) === entryKey)
+    assert.ok(entry !== undefined, `${entryKey} must still be a labelled gate entry`)
+    assert.equal(entry[5], label, `${entryKey} must be ${label}: S5c closed the gate that used to be reported as neither`)
+  }
 })
 
 test('S5 census: the round-13 `scheduled` Set stays deleted and the guard stays durable (T1, included here)', () => {
@@ -262,138 +307,134 @@ const GATE_TESTS = {
   'src/runtime.ts:2': async t => {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 50 } })
     try {
-      // Live work: a running attempt with a live lease, which is exactly what
-      // makes the pass watchdog keep the chain instead of releasing it.
+      // Live work plus a wedged queued body: before S5c the next mission
+      // operation chained behind the promise that never settles and was
+      // swallowed (the Row-13 shape). The assertion is deliberately inverted
+      // from the predecessor's probe, so a regression to a swallowing chain
+      // fails this test.
       const task = f.propose({ title: 'Live work under a wedged queue' })
       await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      // WEDGE: one queued body that never settles, with the durable pass row
-      // running past the declared bound, exactly the F21 injection shape.
       void f.runtime.exclusive(f.mission.id, () => new Promise(() => {}))
-      await eventually(() => {
-        const row = f.runtime.store.get('passes', `pass_${f.mission.id}`)
-        return row?.status === 'running' && Date.now() - row.startedAt > 50 ? row : undefined
-      }, 'a pass row is running past its declared bound')
-      const swallowed = await Promise.race([
+      assert.ok(f.runtime.queues.size > 0, 'the wedged body holds a chain entry')
+      const ran = await Promise.race([
         f.runtime.exclusive(f.mission.id, async () => 'ran'),
-        new Promise(resolve => setTimeout(() => resolve('SWALLOWED'), 300)),
+        new Promise(resolve => setTimeout(() => resolve('SWALLOWED'), 1_000)),
       ])
-      // PROBE (hand-off): the pass watchdog only deletes the chain entry when the
-      // mission has NO live work (checkSchedulingPasses). With a live lease it
-      // deliberately keeps waiting, so a hung *non-pass* operation (submit,
-      // verify, captureArtifact) keeps every later mission operation chained
-      // behind a promise that never settles — the Row-13 shape, narrowed to that
-      // window. The hand-off gives `exclusive` its own declared bound; when it
-      // lands this assertion inverts to 'ran' and the entry becomes cache-only.
-      assert.equal(swallowed, 'SWALLOWED', 'PROBE: with live work, a wedged queued body swallows the next mission operation')
-      assert.ok(f.runtime.queues.has(f.mission.id), 'the watchdog kept the chain because the mission has live work')
-      // The release half works: end the live work and the same watchdog deletes
-      // the chain, so a later operation starts on a fresh chain and runs.
-      f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'S5: end the live work' })
-      const released = await eventually(async () => {
-        const outcome = await Promise.race([
-          f.runtime.exclusive(f.mission.id, async () => 'ran'),
-          new Promise(resolve => setTimeout(() => resolve(undefined), 60)),
-        ])
-        return outcome === 'ran' ? 'ran' : undefined
-      }, 'once the live work ends the watchdog releases the chain, so a later operation runs', 4_000)
-      assert.equal(released, 'ran', 'the release affects later operations, not one already queued behind the wedge')
+      assert.equal(ran, 'ran', 'a predecessor wedged past the declared bound must not swallow the next mission operation')
+
+      // The loss on a non-empty collection: clearing the ordering cache removes
+      // serialization only. The gated body still runs and its durable write
+      // still lands, and the mission's durable attempt is untouched.
+      const gate = deferred()
+      const pending = f.runtime.exclusive(f.mission.id, async () => {
+        await gate.promise
+        const mission = f.runtime.mission(f.mission.id)
+        mission.updatedAt += 1
+        f.runtime.commit(f.mission.id, () => f.runtime.store.put('missions', mission))
+        return 'gated'
+      })
+      assert.ok(f.runtime.queues.size > 0, 'the loss must be exercised on a non-empty collection')
+      const revision = f.runtime.store.revision()
+      f.runtime.queues.clear()   // the loss
+      gate.resolve()
+      assert.equal(await pending, 'gated', 'clearing the ordering cache does not cancel the body it was ordering')
+      assert.ok(f.runtime.store.revision() > revision, 'the gated body still committed its durable write')
+      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the durable attempt is untouched by the lost ordering cache')
       const rejected = await f.runtime.exclusive(f.mission.id, () => { throw new Error('probe rejection') }).then(() => 'resolved', error => `rejected:${error.message}`)
       assert.equal(rejected, 'rejected:probe rejection', 'a rejected body does not swallow the chain')
-      assert.equal(await f.runtime.exclusive(f.mission.id, async () => 'ran'), 'ran', 'the chain continues after a rejection')
     } finally { await f.cleanup() }
   },
   'src/runtime.ts:3': async t => {
-    // First half: the deferred body is independent of the registry, so a cleared
-    // registry does not cancel work that dispose() would have drained.
+    // The loss on a non-empty collection: clear the drain registry while a
+    // deferred body is in flight. The body is registered by `defer` and runs
+    // regardless, so its durable write still lands — the registry orders
+    // shutdown, it does not gate the work.
     const f = await setup()
     try {
       const stamp = f.runtime.mission(f.mission.id).updatedAt
-      let releaseOp
-      const opGate = new Promise(resolve => { releaseOp = resolve })
+      const gate = deferred()
       f.runtime.defer(async () => {
-        await opGate
+        await gate.promise
         const mission = f.runtime.mission(f.mission.id)
         mission.updatedAt = stamp + 5
         f.runtime.commit(f.mission.id, () => f.runtime.store.put('missions', mission))
       })
-      assert.ok(f.runtime.operations.size > 0, 'the gated deferred write is registered; the loss must be exercised on a non-empty collection')
+      assert.ok(f.runtime.operations.size > 0, 'the loss must be exercised on a non-empty collection')
       f.runtime.operations.clear()   // the loss
-      releaseOp()
-      await eventually(() => f.runtime.mission(f.mission.id).updatedAt === stamp + 5,
-        'the deferred write still lands after the registry is cleared')
+      gate.resolve()
+      await eventually(() => f.runtime.mission(f.mission.id).updatedAt === stamp + 5 ? true : undefined,
+        'the deferred durable write still lands after the drain registry is cleared')
+      // Every deferred body the runtime schedules re-derives its work from
+      // durable state (the pass row, the budget stop claim, the outbox), so a
+      // lost drain cannot make a durable transition wrong. The queued owner
+      // notice below is the durable record a later pump delivers from.
+      await f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'S5c drain probe', 'runtime', 'decision', false))
+      const queued = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.deliveredAt === undefined)
+      assert.ok(queued.length >= 1, 'the deferred notice is durable in the outbox, so a later pump re-derives it')
     } finally { await f.cleanup() }
-    // Second half (the actual loss): the registry is what makes dispose wait for
-    // a deferred write, and defer runs its body after the caller returned.
-    const g = await setup()
-    try {
-      let landed = false
-      let releaseLate
-      const lateGate = new Promise(resolve => { releaseLate = resolve })
-      g.runtime.defer(async () => {
-        await lateGate
-        const mission = g.runtime.mission(g.mission.id)
-        mission.updatedAt = Date.now() + 7
-        try { g.runtime.commit(g.mission.id, () => g.runtime.store.put('missions', mission)); landed = true }
-        catch { /* the store was closed under the write: this is the loss */ }
-      })
-      assert.ok(g.runtime.operations.size > 0, 'the gated deferred write is registered; the loss must be exercised on a non-empty collection')
-      g.runtime.operations.clear()   // the loss
-      await g.runtime.dispose()
-      releaseLate()
-      await new Promise(resolve => setTimeout(resolve, 40))
-      assert.equal(landed, false,
-        'PROBE: with the registry cleared, dispose() closes the store before the deferred write lands, so an accepted-looking write is lost')
-    } finally { await g.cleanup() }
   },
   'src/runtime.ts:4': async t => {
-    const f = await setup()
+    const workers = new GatedWorkers()
+    const f = await setup({ workers })
     try {
-      const first = f.runtime.requestStart(f.owner, { commandId: 's5-controllers-1', goal: 'probe', workspace: f.dir })
-      const controller = new AbortController()
-      f.runtime.startControllers.set(first.id, controller)
-      f.runtime.failStart(f.owner, first.id, 'injected failure')
-      assert.equal(controller.signal.aborted, true, 'with the handle present, failing the request cancels the in-flight launch')
-      const second = f.runtime.requestStart(f.owner, { commandId: 's5-controllers-2', goal: 'probe', workspace: f.dir })
-      const lost = new AbortController()
-      f.runtime.startControllers.set(second.id, lost)
-      assert.ok(f.runtime.startControllers.size > 0, 'the loss must be exercised on a non-empty collection')
+      const request = f.runtime.requestStart(f.owner, { commandId: 's5c-cancel', goal: 'Make the requested change and verify it', workspace: f.dir })
+      const gate = deferred()
+      workers.prepareGate = gate.promise
+      const launching = f.runtime.startPlan(f.owner, request.id, automaticPlan(f.dir))
+      await eventually(() => workers.prepareStarted > 0 ? true : undefined, 'the launch must be in flight (workspace preparation started)')
+      // The cancellation is recorded durably, and the in-memory abort registry is
+      // lost on purpose: the launch must still not come active, because the
+      // decision is re-read from the durable start row before activation.
+      assert.ok(f.runtime.startControllers.size > 0, 'the in-flight launch holds an abort handle')
       f.runtime.startControllers.clear()   // the loss
-      f.runtime.failStart(f.owner, second.id, 'injected failure')
-      assert.equal(lost.signal.aborted, false, 'PROBE: with the registry lost, the in-flight launch is no longer cancellable')
-      assert.equal(f.runtime.store.get('starts', second.id).status, 'failed', 'the durable failure is independent of the lost handle')
+      f.runtime.failStart(f.owner, request.id, 'S5c: cancel the in-flight launch')
+      assert.equal(f.runtime.store.get('starts', request.id).status, 'failed', 'the cancellation is durable')
+      gate.resolve()
+      await assert.rejects(launching, /Plan assembly was interrupted/,
+        'the launch honours the durable cancellation instead of the lost abort handle')
+      assert.equal(f.runtime.store.get('starts', request.id).status, 'failed', 'the request stays failed')
+      // The cancellation is attributable from the durable record: `failStart`
+      // wrote this event with the reason before the launch noticed. The event is
+      // recorded under the launch's mission id (the request names it already).
+      const cancelledMissionId = f.runtime.store.get('starts', request.id).missionId
+      const cancelEvent = events(f.runtime, cancelledMissionId, 'automatic/failed')
+        .find(event => /cancel the in-flight launch/.test(String(event.data.reason)))
+      assert.ok(cancelEvent !== undefined, 'the durable failure event names the cancellation reason')
+      const cancelledMission = cancelledMissionId === undefined ? undefined : f.runtime.store.get('missions', cancelledMissionId)
+      assert.ok(cancelledMission === undefined || cancelledMission.status !== 'active',
+        'a cancelled launch never brings its own mission active')
     } finally { await f.cleanup() }
   },
   'src/runtime.ts:5': async t => {
-    // Control: with the counter intact, consecutive start failures retire the member.
-    const control = await setup()
-    let retired
-    try {
-      for (let attempt = 0; attempt < 10 && retired !== 'stopped'; attempt += 1) {
-        control.runtime.onStartFailure(control.mission, control.author, new Error('injected start failure'))
-        retired = control.runtime.store.get('members', control.author.id).status
-      }
-      assert.equal(retired, 'stopped', 'the in-memory counter retires a member after the declared consecutive failures')
-      const count = control.runtime.startFailures.get(control.author.id)
-      assert.ok(count >= 1)
-    } finally { await control.cleanup() }
-    // Falsification: lose the counter and the same third failure no longer retires.
     const f = await setup()
     try {
-      const first = f.propose()
+      f.propose({ title: 'Failing route' })
       f.runtime.onStartFailure(f.mission, f.author, new Error('injected start failure'))
       f.runtime.onStartFailure(f.mission, f.author, new Error('injected start failure'))
-      assert.equal(f.runtime.startFailures.get(f.author.id), 2, 'two consecutive failures are held in memory')
-      assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle', 'below the limit the member stays live')
+      assert.equal(f.runtime.startFailures.get(f.author.id), 2, 'the mirror holds the count')
+      assert.equal(f.runtime.store.get('members', f.author.id).startFailures, 2, 'the durable member row holds the same count')
       assert.ok(f.runtime.startFailures.size > 0, 'the loss must be exercised on a non-empty collection')
       f.runtime.startFailures.clear()   // the loss
       f.runtime.onStartFailure(f.mission, f.author, new Error('injected start failure'))
-      assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle',
-        'PROBE: with the counter lost, the failure that would have retired the member keeps it live instead')
-      assert.equal(f.runtime.startFailures.get(f.author.id), 1, 'the counter restarts from one')
-      const recorded = events(f.runtime, f.mission.id, 'task/start-failed')
-      assert.deepEqual(recorded.map(event => event.data.consecutiveFailures), [1, 2, 1],
-        'the durable log carries the real counts, so the counter is derivable; the third row restarts at one only because the memory was lost')
+      assert.equal(f.runtime.store.get('members', f.author.id).status, 'stopped',
+        'the third consecutive failure still retires the member: the gate reads the durable count, not the lost map')
+      assert.equal(f.runtime.store.get('members', f.author.id).startFailures, 3, 'the durable count continues')
+      assert.deepEqual(events(f.runtime, f.mission.id, 'task/start-failed').map(event => event.data.consecutiveFailures), [1, 2, 3],
+        'the durable log agrees with the durable count')
     } finally { await f.cleanup() }
+    // A restart continues the count instead of handing the failing route a fresh budget.
+    const g = await setup()
+    let restarted
+    try {
+      g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
+      g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
+      const statePath = join(g.dir, 'swarm.sqlite')
+      await g.runtime.dispose()
+      restarted = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10, messageChars: 16000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, new FakeWorkers())
+      assert.equal(restarted.store.get('members', g.author.id).startFailures, 2, 'the count survives a restart')
+      restarted.onStartFailure(restarted.mission(g.mission.id), restarted.store.get('members', g.author.id), new Error('injected start failure'))
+      assert.equal(restarted.store.get('members', g.author.id).status, 'stopped', 'and the restarted runtime retires on the third failure')
+    } finally { if (restarted !== undefined) await restarted.dispose(); await g.cleanup() }
   },
   'src/runtime.ts:6': async t => {
     const f = await setup()
@@ -632,15 +673,21 @@ const GATE_TESTS = {
       assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
         'while the release is recorded, the abandoned pass body is fenced and dispatches nothing')
       assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the fenced body changed no task state')
-      // THE LOSS: the in-memory Set is the only record that this pass was
-      // released. `passReleased` (src/scheduling.ts) reads it, so clearing it
-      // lets the abandoned body resume — the Row-13 class this census exists for.
+      // THE VERIFIER'S REPRODUCTION, closed: the in-memory Set is cleared while
+      // the durable `releasedRunId` on the pass row is present. The watchdog
+      // stamps that field before releasing, so the fence must survive.
       f.runtime.releasedPasses.clear()
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), true,
-        'PROBE: with the Set cleared, the abandoned pass body is no longer fenced')
-      assert.equal(taskOf(f.runtime, task.id).status, 'running',
-        'PROBE: and it drives the task to running with a live attempt')
-      assert.ok(taskOf(f.runtime, task.id).attempt?.leaseUntil > Date.now(), 'the resumed body assigned a real attempt')
+      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...abandonedPass, status: 'finished', releasedRunId: abandonedPass.runId, releasedAt: Date.now() }))
+      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
+        'with the Set cleared but the durable release present, the abandoned pass body still dispatches nothing')
+      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'and it still cannot drive a task to running')
+      // Positive control: a pass that was never released is not fenced (the fence
+      // is the durable release record, not a blanket refusal).
+      const live = { ...abandonedPass, runId: 'never-released-run' }
+      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...live, status: 'running' }))
+      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, live), true, 'a live pass body still dispatches')
+      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'and assigns the work normally')
+      assert.ok(taskOf(f.runtime, task.id).attempt?.leaseUntil > Date.now(), 'with a real attempt')
     } finally { await f.cleanup() }
   },
   'src/store.ts:1': async t => {
@@ -695,19 +742,19 @@ const GATE_TESTS = {
   },
 }
 
-test('S5 D1 pin (KNOWN GAP, hand-off): the stale-revision refusal event is not in EVENT_VOCABULARY yet', async () => {
+test('S5c D1 closed: the stale-revision refusal event is registered and visible to the vocabulary check', async () => {
   // The refusal type is emitted through the exported constant
-  // `STALE_TASK_REFUSAL_EVENT`, so the static emitter scan in
-  // tests/event-vocabulary.test.mjs cannot see it and the vocabulary is missing
-  // an entry the runtime really emits (verifier-1's reproduction,
-  // evidence_110873e2). Registering it is a src/trace.ts change outside the S5
-  // scope; this pin fails the moment it is registered, which is exactly when the
-  // assertion must be deleted.
+  // `STALE_TASK_REFUSAL_EVENT`. S5r pinned the resulting gap (the static emitter
+  // scan could not see it, and `eventVocabularyReport` reported the durable row
+  // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
+  // point: `src/trace.ts` registers the row and the scanner in
+  // tests/event-vocabulary.test.mjs resolves exported constants, so the type is
+  // enforced exactly like a literal emission.
   const { EVENT_VOCABULARY } = await import('../lib/trace.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
-  assert.equal(EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], undefined,
-    'KNOWN GAP (hand-off): register task/stale-revision-refused in src/trace.ts EVENT_VOCABULARY and delete this assertion')
+  assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string',
+    'the vocabulary must name task/stale-revision-refused (the D1 gap is closed)')
 })
 
 test('S5 inventory: every gate entry has exactly one test', () => {

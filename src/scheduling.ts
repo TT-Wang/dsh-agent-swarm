@@ -25,12 +25,24 @@ export const STALL_GRACE_MAX_MS = 1000
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
+/**
+ * S5c: the durable release record on the pass row. `SchedulingPass`
+ * (src/types.ts) is outside this task's write scope, so the two fields are
+ * declared here and travel as plain JSON properties on the same durable row;
+ * the integration task records the schema addition. `releasedRunId` is the runId
+ * of the most recent pass the watchdog released, carried forward by `openPass`
+ * (and preserved by `closePass`) because the row is overwritten once per pass.
+ */
+interface ReleasedPassFields { releasedRunId?: string; releasedAt?: number }
+const releasedPassFields = (row: SchedulingPass): SchedulingPass & ReleasedPassFields => row as SchedulingPass & ReleasedPassFields
+
 export class Scheduling {
   /**
-   * S1: pass ids the watchdog released after the declared bound. Fences an
-   * abandoned pass body so it cannot dispatch into the newer pass's turn.
-   * Cache-only (S5): a lost entry lets the abandoned body repeat idempotent
-   * work, no durable transition becomes wrong.
+   * S1: pass ids the watchdog released after the declared bound, so an
+   * abandoned pass body cannot dispatch into the newer pass's turn. S5c: this
+   * Set is the in-process mirror of the durable `releasedRunId` on the pass row
+   * (`passReleased` reads the row first), so losing it cannot let a released
+   * body resume — it is a fast path for the same durable fact.
    */
   readonly releasedPasses = new Set<string>()
   /**
@@ -310,11 +322,17 @@ export class Scheduling {
     if (this.rt.store.get('missions', missionId) === undefined) return undefined
     if (this.livePass(missionId) !== undefined) return undefined
     const prior = this.rt.store.get('passes', this.passKey(missionId))
-    const pass: SchedulingPass = {
+    const pass: SchedulingPass & ReleasedPassFields = {
       // One row per mission, overwritten each pass: `get(passKey)` is the gate.
       id: this.passKey(missionId), runId: id('run'), instanceId: this.instanceId, missionId, status: 'running', startedAt: Date.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
       noProgressPasses: prior?.status === 'finished' ? prior.noProgressPasses : 0,
+    }
+    // S5c: the durable release record survives the once-per-pass overwrite.
+    const priorRelease = prior === undefined ? undefined : releasedPassFields(prior)
+    if (priorRelease?.releasedRunId !== undefined) {
+      pass.releasedRunId = priorRelease.releasedRunId
+      pass.releasedAt = priorRelease.releasedAt
     }
     this.rt.commit(missionId, () => this.rt.store.put('passes', pass))
     return pass
@@ -340,7 +358,13 @@ export class Scheduling {
       const fingerprintAfter = this.rt.fingerprint(missionId)
       const progressed = fingerprintAfter !== pass.fingerprintBefore
       const noProgressPasses = progressed ? 0 : pass.noProgressPasses + 1
-      const closed: SchedulingPass = { ...pass, status: 'finished', finishedAt: Date.now(), revisionAfter, fingerprintAfter, noProgressPasses }
+      const closed: SchedulingPass & ReleasedPassFields = { ...pass, status: 'finished', finishedAt: Date.now(), revisionAfter, fingerprintAfter, noProgressPasses }
+      // S5c: never erase a release record the watchdog wrote for this same row.
+      const rowRelease = releasedPassFields(row)
+      if (rowRelease.releasedRunId !== undefined && closed.releasedRunId === undefined) {
+        closed.releasedRunId = rowRelease.releasedRunId
+        closed.releasedAt = rowRelease.releasedAt
+      }
       this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
@@ -360,12 +384,19 @@ export class Scheduling {
    * pass body). Only an explicit release after the declared bound stops a body:
    * a long pass that is still making progress (a live lease, an in-flight
    * quiescence) keeps running, while an abandoned one must never dispatch into
-   * the newer pass's turn. Cache-only (S5): losing it can at worst let an
-   * abandoned body repeat idempotent work, and the durable re-read checks in the
-   * dispatch path still fence every task transition.
+   * the newer pass's turn.
+   *
+   * S5c: the DURABLE `releasedRunId` on the pass row is the authority — the
+   * watchdog writes it when it releases, and `openPass` carries it forward
+   * across the once-per-pass overwrite — so clearing the in-memory Set cannot
+   * let a released body resume (the verifier's reproduction). The Set is only
+   * the fast path for the same durable fact.
    */
   passReleased(pass: SchedulingPass | undefined): boolean {
-    return pass !== undefined && this.releasedPasses.has(pass.runId)
+    if (pass === undefined) return false
+    const row = this.rt.store.get('passes', this.passKey(pass.missionId))
+    if (row !== undefined && releasedPassFields(row).releasedRunId === pass.runId) return true
+    return this.releasedPasses.has(pass.runId)
   }
 
   /**
@@ -391,15 +422,19 @@ export class Scheduling {
       if (this.hasLiveWork(mission.id)) continue
       const unschedulable = this.unschedulable(mission, this.rt.store.list('tasks', mission.id), this.rt.store.list('members', mission.id)).map(task => `${task.id} (${task.status})`)
       const fingerprintNow = this.rt.fingerprint(mission.id)
-      const closed: SchedulingPass = {
+      const closed: SchedulingPass & ReleasedPassFields = {
         ...pass, status: 'finished', finishedAt: now, revisionAfter: this.rt.store.revision(), fingerprintAfter: fingerprintNow,
         stalled: { reason: 'pass-timeout', at: now, boundMs: this.rt.stallPassTimeoutMs, unschedulable },
       }
+      // S5c: the release is recorded DURABLY on the row before anything else, so
+      // `passReleased` reads it and the fence survives a cleared Set, a restart,
+      // or the once-per-pass overwrite (openPass carries it forward).
+      closed.releasedRunId = pass.runId
+      closed.releasedAt = now
       // Release both halves of the guard: the durable row stops gating and the
       // in-memory chain no longer queues later ticks behind a promise that never
       // settles. A newer pass that has already registered its own chain entry is
-      // never clobbered (its `exclusive` finally compares identity). The released
-      // pass id fences the abandoned body.
+      // never clobbered (its `exclusive` finally compares identity).
       this.releasedPasses.add(pass.runId)
       this.rt.queues.delete(mission.id)
       this.rt.commit(mission.id, () => this.rt.store.put('passes', closed))
