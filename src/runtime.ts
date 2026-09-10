@@ -8,7 +8,7 @@ import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot 
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts } from './attempts.ts'
 import { WorkspaceAdmission, WorkspaceRevokedError, executedShellCommand, gitWriteDeniedMessage, gitWriteSubcommand, sharedTempPaths, tempRendezvousDecision, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions, type WakePrecision } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
@@ -680,6 +680,8 @@ export class SwarmRuntime {
   noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
   private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
+  /** R16-A: the owner-only wake-precision projection (decisions, false wakes, missed obligations). */
+  wakePrecision(actor: Actor, missionId: string): WakePrecision { return this.notices.wakePrecision(actor, missionId) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void { return this.notices.ensureWitness(missionId, options) }
   notifyStall(mission: Mission, tasks: Task[], members: Member[], reason: string): void { return this.notices.notifyStall(mission, tasks, members, reason) }
@@ -1095,6 +1097,47 @@ export class SwarmRuntime {
   }
   effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
   dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
+  /**
+   * R16-A: whether a dependency reference still has a live path. `dependencySatisfied`
+   * answers the dispatcher's question ("may the dependent start?"); this answers the
+   * notice classifier's ("can the obligation still advance?"). Both read the same
+   * `lineage`, so an owner decision and the dispatcher cannot disagree about a
+   * dependency whose original row is cancelled or blocked but whose repair is live.
+   *
+   * A dependency is unfinished exactly when its EFFECTIVE carrier is neither
+   * accepted (done) nor cancelled without a live repair (dead). A missing row is
+   * not a live path: the classifier must escalate a dangling reference, never throw.
+   *
+   * Co-fires with: `dependencySatisfied` (a satisfied dependency is never waiting),
+   * the stall-root classifier (a blocked effective dependency is the ROOT's subject,
+   * and `dependentsOf` enumerates this dependent beside it) and
+   * `unfinishedDependencies` below (one repair carrying several originals is
+   * counted once).
+   */
+  dependencyUnfinished(missionId: string, dependencyId: string, tasks?: Task[]): boolean {
+    const rows = tasks ?? this.store.list('tasks', missionId)
+    if (!rows.some(task => task.id === dependencyId)) return false
+    const effective = this.effectiveDependency(missionId, dependencyId, rows)
+    return effective.status !== 'accepted' && effective.status !== 'cancelled'
+  }
+  /**
+   * R16-A: the EFFECTIVE unfinished prerequisites of one task, deduplicated in
+   * reference order. This is the one seam the waking classifier reads, so a notice
+   * and the scheduler resolve a replaced dependency through the same lineage.
+   */
+  unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[] {
+    const rows = tasks ?? this.store.list('tasks', missionId)
+    const seen = new Set<string>()
+    const unfinished: Task[] = []
+    for (const dependency of task.dependencies) {
+      if (!this.dependencyUnfinished(missionId, dependency, rows)) continue
+      const effective = this.effectiveDependency(missionId, dependency, rows)
+      if (seen.has(effective.id)) continue
+      seen.add(effective.id)
+      unfinished.push(effective)
+    }
+    return unfinished
+  }
   /** Every identity a dependency reference stands for, including the current effective repair. */
   dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }
   // M1a: lease/attempt accounting lives in src/attempts.ts; these forwarders keep

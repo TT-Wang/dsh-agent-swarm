@@ -140,13 +140,17 @@ const CENSUS = [
   ["src/harness-workers.ts",6,"Set","const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/harness-workers.ts",7,"Set","const claimedIds = new Set(messages.map(message => message.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/notices.ts",2,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
-  ["src/notices.ts",3,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",4,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",5,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
-  ["src/notices.ts",6,"Set","const roots = new Set(this.stallRoots(tasks).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",7,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",8,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/notices.ts",3,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
+  ["src/notices.ts",4,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
+  ["src/notices.ts",5,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
+  ["src/notices.ts",6,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
+  ["src/notices.ts",7,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",8,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",9,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",10,"Set","const roots = new Set(this.stallRoots(tasks).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",11,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",1,"Map","const result = new Map<string, Record<string, unknown>>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",2,"Set","const names = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",3,"Map","const byKey = new Map(tasks.map(task => [task.key, task])), visiting = new Set<string>(), done = new Set<string>(), result: PlanTask[] = []","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -167,29 +171,30 @@ const CENSUS = [
   ["src/runtime.ts",13,"Set","private readonly reviewPathReported = new Set<string>()","gate","derivable","the durable task/review-missing event for the exact submission is re-read before the set is trusted"],
   ["src/runtime.ts",14,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",15,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",16,"Set","dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",17,"Set","const seen = new Set<string>([task.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",18,"Map","const byId = new Map(tasks.map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",19,"Map","const chains = new Map<string, string[]>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",20,"Set","const candidate = visit(task.id, new Set())","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",21,"Set","const member: Member = { id: memberId, missionId, name: input.name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, status: 'idle', subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",22,"Set","knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",23,"Set","const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",24,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",25,"Set","const ids = new Set(task.priorOwnerIds ?? [])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",26,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",27,"Set","if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",28,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",29,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",30,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",31,"Set","const live = new Set(this.store.list('members', missionId).filter(member => member.status !== 'stopped').map(member => member.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",32,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",33,"Set","member.subscriptions = [...new Set(topics)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",34,"Map","const byKey = new Map(plan.tasks.map(task => [task.key, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",35,"Set","const pending = [...(byKey.get(key)?.dependencies ?? [])], visited = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",36,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",37,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",38,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",16,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",17,"Set","dependencyIdentities(missionId: string, dependencyId: string, tasks?: Task[]): Set<string> { return new Set(this.lineage(missionId, dependencyId, tasks).map(task => task.id)) }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",18,"Set","const seen = new Set<string>([task.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",19,"Map","const byId = new Map(tasks.map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",20,"Map","const chains = new Map<string, string[]>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",21,"Set","const candidate = visit(task.id, new Set())","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",22,"Set","const member: Member = { id: memberId, missionId, name: input.name, role: input.role, model: input.model, provider: input.provider, reasoningEffort: input.reasoningEffort, maxOutputTokens: input.maxOutputTokens, sessionId: id('swarm-session'), workspace, status: 'idle', subscriptions: input.subscriptions === undefined ? [] : [...new Set(input.subscriptions)] }","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",23,"Set","knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",24,"Set","const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",25,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",26,"Set","const ids = new Set(task.priorOwnerIds ?? [])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",27,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",28,"Set","if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",29,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",30,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",31,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",32,"Set","const live = new Set(this.store.list('members', missionId).filter(member => member.status !== 'stopped').map(member => member.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",33,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",34,"Set","member.subscriptions = [...new Set(topics)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",35,"Map","const byKey = new Map(plan.tasks.map(task => [task.key, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",36,"Set","const pending = [...(byKey.get(key)?.dependencies ?? [])], visited = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",37,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && m.status !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",38,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",39,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",1,"Set","readonly releasedPasses = new Set<string>()","gate","derivable","S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
   ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -602,7 +607,7 @@ const GATE_TESTS = {
       assert.ok(closed)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:2': async t => {
+  'src/notices.ts:3': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
       const task = f.propose({ title: 'Parked holder' })
@@ -617,7 +622,7 @@ const GATE_TESTS = {
       assert.equal(notice.notice.dedupKey, `parked:${f.mission.id}:${task.id}:${epoch}`, 'the durable ledger is the gate')
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:3': async t => {
+  'src/notices.ts:4': async t => {
     const f = await setup()
     try {
       f.runtime.integrationGapWarned.add(`integration-gap:${f.mission.id}:2`)   // phantom presence
@@ -628,7 +633,7 @@ const GATE_TESTS = {
       assert.ok(notice)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:4': async t => {
+  'src/notices.ts:5': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
       const task = f.propose({ title: 'Blocked review path' })
@@ -646,7 +651,7 @@ const GATE_TESTS = {
       assert.ok(delivery)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:5': async t => {
+  'src/notices.ts:6': async t => {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100 } })
     try {
       const first = f.propose({ title: 'Notice' })
