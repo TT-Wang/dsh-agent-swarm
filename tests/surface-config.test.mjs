@@ -37,3 +37,14 @@ test('config exposes the round-11 check semaphore and dependency-link opt-in', (
   assert.equal(overridden.allowDependencyLinkReads, true)
   assert.throws(() => Config({ ...base, checkConcurrency: 0 }))
 })
+
+test('the declared-check budget default fits a real check, and a declared value still wins', () => {
+  // Round 14 measured this project's own declared checks (`npm run typecheck &&
+  // npm run build && node --test <file>`) at 67-111 s. The former 60 s default
+  // cancelled them mid-run, and host git operations shared the same knob, so the
+  // verification checkout died with the check and three reviewers could not record
+  // a verdict for artifacts that were fine.
+  const config = Config(base)
+  assert.ok(config.checkTimeoutMs >= 300000, `the default check budget must exceed a real check's runtime, saw ${config.checkTimeoutMs}`)
+  assert.equal(Config({ ...base, checkTimeoutMs: 900000 }).checkTimeoutMs, 900000, 'a declared budget still wins over the default')
+})

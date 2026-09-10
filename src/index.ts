@@ -69,7 +69,14 @@ export const Config: z<Config> = z.object({
   maxMessageChars: z.natural().min(1000).default(16000),
   maxEvents: z.natural().min(1).default(100),
   maxAttempts: z.natural().min(1).default(3),
-  checkTimeoutMs: z.natural().min(100).default(60000),
+  // The budget one declared check runs under. This project's own checks
+  // (`npm run typecheck && npm run build && node --test <file>`) measure 67-111 s
+  // on an idle host and longer under load, so the former 60 s fallback cancelled
+  // legitimate checks mid-run and three reviewers could not record a verdict for
+  // the resulting failures. Ten minutes fits a real check while still bounding a
+  // hang; a task may declare its own value (900000 and 1800000 are used in this
+  // campaign) and that value wins.
+  checkTimeoutMs: z.natural().min(100).default(600000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
   verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),

@@ -120,6 +120,14 @@ export interface CheckEnvelopeSample {
 }
 const DEFAULT_CHECK_CONCURRENCY = 2
 /** The stand-in checkout path a declared envelope names before a check has a real one. */
+/**
+ * Bounded budget for one host git operation (worktree add, capture, commit).
+ * It is deliberately not the declared-check budget: round 14 lost three
+ * verification verdicts because a checkout under load exceeded the 60 s check
+ * budget and `git worktree add` was cancelled while the artifact was fine.
+ */
+export const HOST_GIT_TIMEOUT_MS = 5 * 60_000
+
 export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
 /**
  * ENV: the environment a declared check runs under, stated as facts instead of
@@ -691,9 +699,19 @@ export class Workspaces {
     const authorization = await reauthorizeWorkspace(workspace, recordedRoot ?? workspace, grants, source)
     if (!authorization.ok) throw new Error(authorization.diagnostic)
   }
+  /**
+   * Host git operations (worktree add, capture, commit) are not the declared
+   * check and must not inherit its budget. Round 14 lost three verdicts because
+   * they did: a verification checkout under load exceeded the 60 s check budget
+   * and `git worktree add` was cancelled, so `swarm_verify` never recorded a
+   * result while the reviewed artifact was fine. The floor is bounded, and the
+   * attempt lease plus the operation bound still escalate a genuinely hung git.
+   */
+  private gitTimeout(): number { return Math.max(this.options.checkTimeoutMs, HOST_GIT_TIMEOUT_MS) }
+
   private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
-    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.options.checkTimeoutMs, maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
+    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.gitTimeout(), maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed (${result.exitCode}): ${result.output.trim()}`)
     if (result.truncated) throw new Error(`git ${args[0]} output exceeded the configured limit; refusing incomplete artifact inspection`)
     return raw || args.includes('-z') ? result.output : result.output.trim()

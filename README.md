@@ -176,7 +176,10 @@ The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [
 | `cacheReadWeight` | `0.1` | Budget weight for cached input. Raw buckets are unaffected. |
 | `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned per dimension. |
 | `authorizedWorkspaces` | `[]` | Human-authorized roots (`{ path, note?, expiresAt? }`) a mission may target outside the session cwd. Loaded once at start; no tool can change it. |
-| `checkTimeoutMs` | `60000` | Fallback per-command timeout when a task does not choose one. |
+| `checkTimeoutMs` | `600000` | Fallback timeout for one declared check when a task does not choose one. It must fit the
+check it runs: this project's own checks (`npm run typecheck && npm run build && node --test <file>`) measure
+67-111 s, and the former 60 s default cancelled them mid-run in round 14. Host git operations (worktree add,
+capture, commit) are not the declared check and use their own bounded floor, `HOST_GIT_TIMEOUT_MS` (300 s). |
 | `leaseMs` | `120000` | Attempt lease, renewed only while a real operation is observed. |
 | `tickMs` | `1000` | Scheduler tick. |
 

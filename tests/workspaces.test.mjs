@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { HOST_GIT_TIMEOUT_MS, Workspaces, runProcess } from '../lib/workspaces.js'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -484,4 +484,17 @@ test('capture path inventory tolerates far more than the small check-output limi
   const artifact = await workspaces.captureArtifact(member, task)
   assert.equal(artifact.changedPaths.length, names.length)
   assert.equal(await readFile(path.join(member.workspace, names[0]), 'utf8'), 'bulk\n')
+})
+
+test('host git operations keep their own bounded budget instead of the declared-check budget', async t => {
+  // Round 14: under load a verification checkout exceeded the declared-check budget and
+  // `git worktree add` was cancelled, so `swarm_verify` never recorded a result while the
+  // reviewed artifact was fine. A 1 ms check budget must not starve the host git work the
+  // fixture does here (worktree add, commit): pre-fix this test fails, post-fix it passes.
+  const { workspaces, member, task, head } = await fixture(t, { checkTimeoutMs: 1 })
+  await workspaces.prepareTask(member, task, [])
+  await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
+  const artifact = await workspaces.captureArtifact(member, task)
+  assert.equal(artifact.baseCommit, head, 'capture ran to completion under a 1 ms check budget')
+  assert.ok(HOST_GIT_TIMEOUT_MS >= 300000, 'the host git floor is bounded but generous')
 })
