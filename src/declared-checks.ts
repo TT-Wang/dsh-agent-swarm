@@ -26,18 +26,55 @@ export function excerpt(value: unknown, limit: number): string {
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
 
+/** One declared check's outcome, as the host recorded it. */
+export type CheckResult = { command: string; exitCode: number; output: string; truncated?: boolean }
+
 export class DeclaredChecks {
+  /**
+   * S15: the attempts of the verification in flight. The key is
+   * `memberId:commit:sourceTaskId`, not `memberId:commit`: `run()` executes
+   * outside the mission lock and `recordRuns()` inside a later exclusive section,
+   * so two concurrent verifications by one member on one artifact could otherwise
+   * swap their held passes. The reviewed source is available on both sides —
+   * `run()` gets the source, and `recordRuns()` reads the verification task's
+   * `reviewOf` from the store — so the pairing is exact without a new parameter.
+   */
+  private readonly checkRuns = new Map<string, CheckResult[][]>()
+
   constructor(private readonly rt: SwarmRuntime) {}
 
-  /** The verification window one source's declared checks may occupy. */
-  windowFor(source: Task): number {
-    const checkTimeoutMs = source.checkTimeoutMs ?? this.rt.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
-    return checkTimeoutMs * Math.max(1, source.checks.length) + this.rt.config.leaseMs
+  /** The reviewed source a verification task belongs to. */
+  private sourceOf(verificationTaskId: string): string {
+    return this.rt.store.get('tasks', verificationTaskId)?.reviewOf ?? verificationTaskId
   }
 
-  /** Run the declared checks through the adapter; the host owns the sandbox. */
-  async run(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal) {
-    return this.rt.workers.verifyArtifact(member, source, artifact, signal)
+  /**
+   * The verification window one source's declared checks may occupy. It covers
+   * the worst case of the retry rule below: a failing first pass plus its retry.
+   */
+  windowFor(source: Task): number {
+    const checkTimeoutMs = source.checkTimeoutMs ?? this.rt.config.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS
+    return checkTimeoutMs * Math.max(1, source.checks.length) * 2 + this.rt.config.leaseMs
+  }
+
+  /**
+   * Run the declared checks through the adapter; the host owns the sandbox.
+   *
+   * S15 (recorded 2026-09-09, reproduced on 2026-09-10): a declared check can be a
+   * wall-clock deadline that assumed an unloaded machine, and the single-strike
+   * rule turned one timing accident into a preserve-and-replace cycle — round 13
+   * paid two of those and the owner paid one more while gating it. So a failing
+   * pass is re-run once on the same artifact and the retry decides: a real
+   * failure fails twice, a flake does not. The first pass is kept for the durable
+   * record (see `recordRuns`), never discarded.
+   */
+  async run(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
+    const key = `${member.id}:${artifact.commit}:${source.id}`
+    const first = await this.rt.workers.verifyArtifact(member, source, artifact, signal)
+    if (first.every(check => check.exitCode === 0)) { this.checkRuns.delete(key); return first }
+    const retry = await this.rt.workers.verifyArtifact(member, source, artifact, signal)
+    this.checkRuns.set(key, [first, retry])
+    return retry
   }
 
   /**
@@ -58,16 +95,29 @@ export class DeclaredChecks {
   }
 
   /**
-   * One durable tool-run row per declared check, in order, in the same
-   * transaction as the verdict. Returns the row ids the acceptance event names.
+   * One durable tool-run row per declared check per attempt, in order, in the
+   * same transaction as the verdict. When the retry rule fired, both the failed
+   * first pass and the deciding retry are written, each row naming its attempt,
+   * command, exit code and output, so the durable record shows the flake instead
+   * of hiding it. The returned ids are the deciding attempt's rows, which is what
+   * the acceptance/rejection event names.
    */
   recordRuns(missionId: string, where: { memberId: string; taskId: string; attemptId: string; commit: string },
-    checks: ReadonlyArray<{ command: string; exitCode: number; output: string; truncated?: boolean }>): string[] {
+    checks: ReadonlyArray<CheckResult>): string[] {
+    const key = `${where.memberId}:${where.commit}:${this.sourceOf(where.taskId)}`
+    const held = this.checkRuns.get(key)
+    this.checkRuns.delete(key)
+    const recorded: Array<{ attempt: number; checks: ReadonlyArray<CheckResult> }> = held === undefined
+      ? [{ attempt: 1, checks }]
+      : [{ attempt: 1, checks: held[0]! }, { attempt: 2, checks: held[1]! }]
     const ids: string[] = []
     let seq = this.rt.store.countToolRuns(missionId)
-    for (const check of checks) {
-      const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
-      this.rt.store.put('tool_runs', run); ids.push(run.id)
+    for (const [index, entry] of recorded.entries()) {
+      const deciding = index === recorded.length - 1
+      for (const check of entry.checks) {
+        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
+        this.rt.store.put('tool_runs', run); if (deciding) ids.push(run.id)
+      }
     }
     return ids
   }

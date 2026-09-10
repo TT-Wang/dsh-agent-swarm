@@ -162,7 +162,14 @@ test('workers see only member tools and the member protocol, and each tool resul
   assert.deepEqual(swarmNames(workerRequest.tools), SWARM_TOOLS.filter(name => !MANAGEMENT_TOOLS.includes(name)).sort())
   assert.match(workerRequest.system, /Swarm member protocol/); assert.doesNotMatch(workerRequest.system, /owner protocol/)
   assert.match(workerRequest.system, new RegExp(`Your memberId: ${builder.id}`))
-  const stored = f.runtime.store.get('members', builder.id)
+  // The member's usage snapshot is written by the adapter's usage callback, which is
+  // asynchronous to the run and the idle signal observed above: under load it can land
+  // after them. Wait for it (bounded) instead of assuming it beat the earlier
+  // predicate — the assertion below is unchanged, it just reads a settled record.
+  const stored = await eventually(() => {
+    const member = f.runtime.store.get('members', builder.id)
+    return member?.usage === undefined ? undefined : member
+  }, 'the member usage snapshot')
   assert.equal(stored.usage.requests >= 1, true); assert.equal(stored.usage.reasoningTokens, stored.usage.requests)
   assert.deepEqual(f.runtime.store.get('missions', missionId).workerUsage.requests, stored.usage.requests + f.runtime.store.list('members', missionId).filter(m => m.id !== builder.id).reduce((sum, m) => sum + (m.usage?.requests ?? 0), 0))
 })

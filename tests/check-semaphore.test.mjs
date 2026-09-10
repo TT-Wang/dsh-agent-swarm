@@ -47,7 +47,12 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
   return { temp, source, workspaces, prepared, checkStarts }
 }
 
-const eventually = async (read, message, timeoutMs = 4000) => {
+/**
+ * Deadline on hanging, not on speed: the predicates below wait for real check work
+ * (git checkout, process spawn, the FIFO slot). The former 4 s default assumed an
+ * unloaded host; the assertions are unchanged.
+ */
+const eventually = async (read, message, timeoutMs = 30000) => {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
   assert.fail(message)
@@ -80,11 +85,26 @@ test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', 
   const samples = f.workspaces.checkEnvelopeSamples()
   assert.equal(samples.length, 3)
   assert.ok(samples.some(sample => sample.active > 1), 'at least two declared checks executed concurrently')
-  assert.equal(samples.filter(sample => sample.waitMs > 0).length, 0, 'no check waited below the limit')
+  // `CheckSemaphore.acquire` reports `waitMs` as the elapsed time of its whole
+  // prologue, not only a real queue wait, so a busy event loop can report 1 ms for a
+  // check that never queued: the exact-zero form of this assertion was an unstated
+  // "the clock never advances during a synchronous call". The property is that no
+  // check queued behind another below the limit, which is stated in the units of the
+  // hold itself: the default check sleeps 0.15 s, so a genuinely queued check waits
+  // at least that long, while the measurement artefact is a millisecond.
+  assert.ok(envelope.maxWaitMs < 100, `no check queued below the limit, saw maxWaitMs=${envelope.maxWaitMs}`)
+  assert.equal(samples.filter(sample => sample.waitMs >= 100).length, 0, 'no check waited for a slot below the limit')
 })
 
 test('R11-19: an aborted queued verification leaves the queue instead of running', async t => {
-  const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 2, 'sleep 0.6')
+  // The first check holds the only slot while the second verification does its
+  // pre-queue work (store reads, artifact validation, authorization) and then waits.
+  // A 0.6 s hold assumed that pre-queue work finishes in under 0.6 s on an unloaded
+  // host; when it did not, the first check ended before the second reached the queue,
+  // `queued` stayed 0 and the second acquired the slot instead of waiting — a
+  // scheduling artefact, not a contract change. The hold is now long enough that the
+  // queue observation is about the semaphore, not about how fast the host is.
+  const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 2, 'sleep 5')
   const [first, second] = f.prepared
   const running = f.workspaces.verifyArtifact(first.member, first.task, first.artifact)
   await eventually(() => f.checkStarts.length === 1, 'the first check never started')

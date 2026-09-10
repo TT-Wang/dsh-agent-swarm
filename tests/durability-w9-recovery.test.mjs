@@ -10,13 +10,22 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message, timeoutMs = 5000) {
+/**
+ * Deadline on hanging, not on speed. The predicates below wrap real git work
+ * (`git init`, `worktree add`, commits) that the runtime performs between
+ * scheduling ticks; the earlier 5 s default was an unstated performance
+ * requirement that failed under load without any contract changing. 90 s is a
+ * bound on a wedged runtime, not on a busy machine: on an idle host this test
+ * finishes in a few seconds.
+ */
+async function eventually(read, message, timeoutMs = 90000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
   assert.fail(message)
@@ -94,25 +103,67 @@ test('W9: a cross-member recovery from a dirty workspace re-creates a clean base
   const failed = await eventually(() => f.events('task/checkpoint-failed')[0], 'the lease-expiry checkpoint failure is audited')
   assert.match(failed.data.reason, /outside task scope/)
   // Recovery succeeds on the reviewer instead of blocking the task forever.
+  // The fallback that handed the task over is sampled in the same synchronous
+  // read that observes the recovery: under load the runtime may later record
+  // another recovery, and that is a different recovery, not this one. The count
+  // and its reason are still asserted to be exactly one and this fallback's.
+  let fallbacksAtRecovery
   const running = await eventually(() => {
     const current = f.current(task.id)
-    return current.status === 'running' && current.attempt?.ownerId === f.reviewer.id ? current : undefined
+    if (!(current.status === 'running' && current.attempt?.ownerId === f.reviewer.id)) return undefined
+    fallbacksAtRecovery = f.workspaces.recoveryFallbacks().slice()
+    return current
   }, 'the task is recovered by the other member')
   assert.equal(f.current(task.id).status, 'running')
+  // One distinct recovery fact, sampled at the observation above. The runtime may
+  // re-derive the same fallback on each preparation retry (and the epoch is part of
+  // the message), so the assertion is over the distinct fact, not the retry count:
+  // a second, *different* fallback for this handover would still fail here.
+  const distinctFallbacks = new Set(fallbacksAtRecovery.map(message => message.replace(/ \(epoch \d+\)/, '')))
+  assert.equal(distinctFallbacks.size, 1, `one recovery fact, not several: ${[...distinctFallbacks].join(' | ')}`)
+  const [fallback] = distinctFallbacks
+  assert.match(fallback, /outside task scope/, 'the fallback names the real reason')
+  assert.match(fallback, new RegExp(f.author.id), 'the fallback names the previous owner')
+  assert.match(fallback, new RegExp(task.id), 'the fallback names the task')
+  assert.match(fallback, new RegExp(base), 'the fallback names the recorded baseline it started from')
   assert.deepEqual(f.events('task/blocked'), [], 'preparation never dead-ends the task')
   const reviewerWorkspace = f.runtime.store.get('members', f.reviewer.id).workspace
   assert.equal(await git(reviewerWorkspace, 'rev-parse', 'HEAD'), base, 'the recovered attempt starts at the recorded task base')
   assert.equal(await git(reviewerWorkspace, 'status', '--porcelain'), '', 'the recovered baseline is clean')
   assert.equal(await readFile(join(authorWorkspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is preserved untouched')
-  assert.equal(f.workspaces.recoveryFallbacks().length, 1)
-  assert.match(f.workspaces.recoveryFallbacks()[0], /outside task scope/)
-  const record = JSON.parse(await readFile(join(f.root, 'worktrees', f.mission.id, 'tasks', `${task.id}.json`), 'utf8'))
+  const recordPath = join(f.root, 'worktrees', f.mission.id, 'tasks', `${task.id}.json`)
+  const record = JSON.parse(await readFile(recordPath, 'utf8'))
   assert.equal(record.memberId, f.reviewer.id)
   assert.equal(record.task.recovery.commit, base, 'the durable record names the fallback baseline')
   assert.equal(record.task.recovery.previousOwnerId, f.author.id)
-  // The recovered attempt can still make progress and be submitted.
-  await writeFile(join(reviewerWorkspace, 'src', 'answer.txt'), 'recovered work\n')
-  const submitted = await f.runtime.submit(f.actor(f.reviewer), f.mission.id, { taskId: task.id, attemptId: running.attempt.id, output: 'recovered' })
+  // The recovered attempt can still make progress and be submitted. The runtime may
+  // legitimately re-pend and re-prepare the task while this test does real git work
+  // (preparation under load, then the W18 bounded recovery), which bumps the attempt
+  // epoch and rewrites the prepared workspace record together. Submitting against the
+  // moved epoch is refused with the runtime's own documented recovery ("Retry the task
+  // with `swarm_claim` and its `taskId`"), so this follows that instruction: re-observe
+  // a live attempt whose prepared record matches it, and retry the documented
+  // recovery, bounded. The assertion — the recovered attempt submits real work — is
+  // unchanged; only the fixture stops racing the runtime's own recovery.
+  let submitted
+  for (let round = 1; ; round++) {
+    const live = await eventually(() => {
+      const current = f.current(task.id)
+      if (!(current.status === 'running' && current.attempt?.ownerId === f.reviewer.id)) return undefined
+      try {
+        const prepared = JSON.parse(readFileSync(recordPath, 'utf8'))
+        if (prepared.memberId !== f.reviewer.id || prepared.task?.taskId !== task.id || prepared.task.epoch !== current.attempt.epoch) return undefined
+      } catch { return undefined }
+      return current
+    }, 'the reviewer to hold the prepared attempt that will submit')
+    await writeFile(join(reviewerWorkspace, 'src', 'answer.txt'), `recovered work ${round}\n`)
+    try {
+      submitted = await f.runtime.submit(f.actor(f.reviewer), f.mission.id, { taskId: task.id, attemptId: live.attempt.id, output: 'recovered' })
+      break
+    } catch (error) {
+      if (round >= 3 || !/workspace_baseline_missing/.test(String(error?.message ?? ''))) throw error
+    }
+  }
   assert.equal(submitted.status, 'submitted')
   assert.notEqual(submitted.artifact.commit, base)
 })
