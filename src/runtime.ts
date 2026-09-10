@@ -756,7 +756,16 @@ export class SwarmRuntime {
     // D1: reconcile the objective's write directives with the task scope and the
     // named deliverables with the effective ignore rules at the production
     // admission point, so a plan error is rejected here instead of at submit.
-    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task')
+    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task', {
+      // R12-F9: the guard needs the content-carrying edges (the declared
+      // dependencies plus a review source, which `prepareTask` merges into the
+      // worktree like a dependency) and the durable identities this mission
+      // already holds, so the diagnostic can say whether the named content exists
+      // here (add the dependency that carries it) or must be obtained (state how).
+      dependencies: [...(input.dependencies ?? []), ...(input.reviewOf === undefined ? [] : [input.reviewOf])],
+      replaces: input.replaces,
+      knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
+    })
     if (reconciliation.length) throw new Error(reconciliation.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')
