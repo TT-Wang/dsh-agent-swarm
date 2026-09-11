@@ -24,10 +24,14 @@ const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connect
 export function CompletionControls({ snapshot, disabled, onComplete }: { snapshot: Snapshot; disabled: boolean; onComplete: () => void }) {
   const t = useCopy()
   const reason = completionBlocker(snapshot)
-  return <>
+  // OWNER PASS 2026-09-11 #2: the blocker sentence used to sit inline between
+  // Complete and Stop, so one long reason pushed Stop out of the visible row. It
+  // is the button's own caption now — bounded, ellipsised, full text in `title` —
+  // and the buttons stay side by side.
+  return <div className="sw-complete-control">
     <button data-action="complete" disabled={disabled || reason !== undefined} onClick={onComplete}>{t('Complete')}</button>
-    {reason !== undefined && <span className="sw-small" data-swarm-completion="blocked">{t('Cannot complete')}: {reason}</span>}
-  </>
+    {reason !== undefined && <span className="sw-small" data-swarm-completion="blocked" title={`${t('Cannot complete')}: ${reason}`}>{t('Cannot complete')}: {reason}</span>}
+  </div>
 }
 export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
   sessions: Context['sessions']; modelDirectories: Context['modelDirectories']; monitor: SwarmMonitor;
@@ -103,6 +107,10 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   }
   const disabled = Boolean(busy) || connection !== 'connected'
   const status = snapshot?.mission.status
+  // OWNER PASS 2026-09-11 #2: Pause/Resume and Stop/Complete used to be two
+  // sibling rows, so the primary controls always stacked. They share one
+  // horizontal row now (`data-swarm-actions`, no wrap, scrolls sideways when the
+  // panel is narrower than the buttons) and keep their own data attributes.
   const controls = snapshot && <div className="sw-mission-controls" data-swarm-mission={snapshot.mission.id}>
     <span data-swarm-status={status} className="sw-sr-only">{t(status!)}</span>
     {data?.writable && status === 'active' && <button data-action="pause" disabled={disabled} onClick={() => { void control('pause') }}>{t('Pause')}</button>}
@@ -163,7 +171,8 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
           onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
           onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
       </details>}
-      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={<>{controls}{advancedControls}</>}
+      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={
+        controls || advancedControls ? <div className="sw-actions" data-swarm-actions="">{controls}{advancedControls}</div> : undefined}
         onCancelTask={data?.writable ? task => { void cancelTask(task) } : undefined}
         technicalDetails={snapshot.mission.baseline ? <BaselineNotice baseline={snapshot.mission.baseline} /> : undefined}
         delivery={owner && data?.writable && snapshot.mission.status === 'completed' && snapshot.mission.baseline && deliverableCommit(snapshot) !== undefined ?

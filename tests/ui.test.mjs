@@ -15,6 +15,7 @@ import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityP
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
 import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
+import { WorkerAvatar } from '../lib/types/client/MissionProgress.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -482,4 +483,21 @@ test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly 
   assert.match(index, /disposals\.add\(new SwarmMonitor\(request\)\), \[request\]/, 'the monitor registers with the pane registry and re-creates with its request')
   assert.match(index, /disposals\.release\(monitor\)/, 'unmount releases the monitor through the registry')
   assert.match(index, /ctx\.effect\(\(\) => \(\) => disposals\.dispose\(\), 'agent-swarm: pane resources'\)/, 'plugin unload drains the registry')
+})
+
+test('OWNER PASS 2026-09-11 #2: the avatar scales in half steps and the controls row never wraps', async () => {
+  const render = props => renderToStaticMarkup(React.createElement(WorkerAvatar, props))
+  assert.match(render({ name: 'Nova' }), /width="32" height="32" viewBox="0 0 32 32"/, 'the default renders the sprite grid exactly')
+  assert.match(render({ name: 'Nova', size: 48 }), /width="48" height="48" viewBox="0 0 32 32"/, '48px is 1.5x the grid, so the cells stay integer')
+  assert.match(render({ name: 'Nova', size: 28 }), /width="32" height="32"/, 'a smaller request never shrinks below the grid; the stylesheet sizes the header')
+  assert.equal(render({ name: 'Nova' }), render({ name: 'Nova', size: 32 }))
+  const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
+  assert.match(styles, /\.sw-actions\{display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;overflow-x:auto/,
+    'the mission control row is one horizontal row that scrolls instead of wrapping')
+  assert.match(styles, /\.sw-actions>\.sw-mission-controls\{padding:0;flex:0 0 auto;flex-wrap:nowrap;align-items:flex-start\}/)
+  assert.match(styles, /\.sw-member-head\{display:grid;grid-template-columns:auto minmax\(0,1fr\);gap:12px/, 'the member head is avatar + identity')
+  assert.match(styles, /\.sw-complete-control\{display:flex;flex-direction:column/, 'the completion blocker is the button caption, not an inline sentence that displaces Stop')
+  assert.match(styles, /\.sw-complete-control>\[data-swarm-completion\]\{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, 'and it is bounded with an ellipsis')
+  assert.match(styles, /\.sw-member \.sw-worker-avatar\{width:48px;height:48px;border-radius:11px/, 'the member avatar is 48px')
+  assert.match(styles, /\.sw-team \.sw-workers\{margin-top:10px;grid-template-columns:repeat\(auto-fit,minmax\(240px,1fr\)\)\}/, 'the roster widens for the larger card')
 })

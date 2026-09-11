@@ -39,8 +39,17 @@ body[data-ds-dark-theme] [data-swarm-dock]{background:#101b22}
 [data-swarm-panel] button{white-space:nowrap;font-size:11px}[data-swarm-panel] button:hover{border-color:var(--sw-accent)}[data-swarm-panel] button:disabled{opacity:.45;cursor:not-allowed}[data-swarm-panel] input:focus-visible,[data-swarm-panel] select:focus-visible,[data-swarm-panel] textarea:focus-visible{outline:2px solid var(--sw-accent);outline-offset:1px}
 [data-swarm] .sw-link{background:transparent;border:0;padding:5px 0;color:var(--sw-accent);font-size:11px;cursor:pointer;margin-top:8px}[data-swarm-panel] .sw-primary{background:#2c6b56;color:#e9fff6;border-color:#4a9777}
 [data-swarm] .sw-mission-controls{display:flex;align-items:center;gap:8px;padding:10px 4px 0;flex-wrap:wrap}
+/* OWNER PASS 2026-09-11 #2: one horizontal row for the mission controls —
+   Pause/Resume beside Stop/Complete — instead of two stacked clusters. The row
+   never wraps; when the panel is narrower than the buttons it scrolls sideways. */
+[data-swarm] .sw-actions{display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;overflow-x:auto;padding:2px 0;scrollbar-width:thin}
+[data-swarm] .sw-actions>.sw-mission-controls{padding:0;flex:0 0 auto;flex-wrap:nowrap;align-items:flex-start}
+[data-swarm] .sw-actions>.sw-mission-controls>button{flex:0 0 auto}
+[data-swarm] .sw-complete-control{display:flex;flex-direction:column;align-items:flex-start;gap:3px;flex:0 0 auto;min-width:0}
+[data-swarm] .sw-complete-control>[data-swarm-completion]{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4}
+@container(max-width:400px){[data-swarm] .sw-actions{gap:6px}[data-swarm] .sw-actions button{padding:6px 8px}[data-swarm] .sw-complete-control>[data-swarm-completion]{max-width:150px}}
 [data-swarm] .sw-delivery{border:1px solid var(--sw-border);border-radius:8px;margin:12px 0;padding:12px;font-size:12px;overflow-wrap:anywhere}
-[data-swarm] .sw-delivery .sw-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+[data-swarm] .sw-delivery .sw-controls{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;overflow-x:auto}
 [data-swarm] .sw-delivery-diff{max-height:360px;overflow:auto;font-size:11px;white-space:pre;tab-size:2}
 [data-swarm] .sw-error{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;background:#482c30;border:1px solid #8f5c60;color:#ffd7d6;border-radius:7px;padding:10px 12px;margin:10px 0}
 [data-swarm] .sw-editor{padding:16px 6px 6px}[data-swarm] .sw-editor h2{font-size:18px}[data-swarm] fieldset{margin:0;padding:0;border:0;min-width:0}[data-swarm] .sw-editor label{display:flex;flex-direction:column;gap:5px;font-size:11px;color:var(--sw-muted);margin-top:12px;min-width:0}[data-swarm] .sw-editor label input,[data-swarm] .sw-editor label textarea,[data-swarm] .sw-editor label select{display:block;width:100%;font-size:12px}[data-swarm] .sw-editor textarea{resize:vertical;min-height:65px;line-height:1.5}[data-swarm] .sw-editor input[readonly]{opacity:.6}
@@ -80,10 +89,20 @@ body:not([data-ds-dark-theme]) [data-swarm] .sw-challenge,body:not([data-ds-dark
 /* OWNER PASS 2026-09-11: the team strip, the per-member progress bar, the seven
    lanes and the cancellation cause chips. */
 [data-swarm] .sw-team{margin:0 0 16px}[data-swarm] .sw-team h3{margin:0;font-size:12px;font-weight:550}
-[data-swarm] .sw-team .sw-workers{margin-top:10px}
-[data-swarm] .sw-member{display:flex;flex-direction:column;gap:6px}
-[data-swarm] .sw-member-task{font-size:11px;color:var(--sw-text);overflow-wrap:anywhere}
-[data-swarm] .sw-member-meta{display:flex;gap:8px;flex-wrap:wrap;font-size:10px;color:var(--sw-muted)}
+[data-swarm] .sw-team .sw-workers{margin-top:10px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+/* OWNER PASS 2026-09-11 #2: the member card is a two-column head (avatar +
+   identity), a full-width task line, the progress bar and the metadata/link rows,
+   so the sprite reads as the card's anchor instead of a thumbnail in the name line. */
+[data-swarm] .sw-member{display:block}
+[data-swarm] .sw-member-head{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:center}
+[data-swarm] .sw-member-ident{min-width:0}
+[data-swarm] .sw-member-name{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+[data-swarm] .sw-member-name .sw-worker-name{font-size:14px;font-weight:600;overflow-wrap:anywhere}
+[data-swarm] .sw-member-role{margin-top:3px}
+[data-swarm] .sw-member-task{font-size:12px;color:var(--sw-text);overflow-wrap:anywhere;margin-top:10px}
+[data-swarm] .sw-member .sw-bar{margin-top:10px}
+[data-swarm] .sw-member .sw-link{margin-top:12px}
+[data-swarm] .sw-member-meta{display:flex;gap:10px;flex-wrap:wrap;font-size:10px;color:var(--sw-muted);margin-top:9px}
 [data-swarm] .sw-member-meta>span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 [data-swarm] .sw-bar{height:4px;border-radius:4px;background:#2a3e47;overflow:hidden;position:relative}
 [data-swarm] .sw-bar>span{display:block;height:100%;background:var(--sw-accent);transition:width .6s ease}
@@ -94,7 +113,7 @@ body:not([data-ds-dark-theme]) [data-swarm] .sw-challenge,body:not([data-ds-dark
 [data-swarm] .sw-bar[data-state=idle]>span{animation:none;width:0}
 @keyframes sw-slide{0%{transform:translateX(-100%)}100%{transform:translateX(320%)}}
 @media(prefers-reduced-motion:reduce){[data-swarm] .sw-bar[data-indeterminate]>span{animation:none;width:100%;opacity:.35}[data-swarm] .sw-bar>span{transition:none}}
-[data-swarm] .sw-member .sw-worker-avatar{width:28px;height:28px;border-radius:8px;background:#0d1a20;padding:2px}
+[data-swarm] .sw-member .sw-worker-avatar{width:48px;height:48px;border-radius:11px;background:#0d1a20;padding:3px;flex:none}
 body:not([data-ds-dark-theme]) [data-swarm] .sw-member .sw-worker-avatar{background:#eef4f1}
 [data-swarm] .sw-cancel-note{color:#d9b48c;margin-top:5px}
 body:not([data-ds-dark-theme]) [data-swarm] .sw-cancel-note{color:#8a6a3d}
@@ -125,7 +144,7 @@ body:not([data-ds-dark-theme]) [data-swarm] .sw-lane-count{background:#eef3f0}
 [data-swarm] .sw-activity-head{margin-bottom:4px}
 [data-swarm] .sw-activity-head .sw-person{gap:8px;align-items:center;min-width:0}
 [data-swarm] .sw-activity-head strong{font-size:12px;font-weight:600;overflow-wrap:anywhere}
-[data-swarm] .sw-activity-head .sw-worker-avatar{width:22px;height:22px;border-radius:6px;background:#0d1a20;padding:2px;flex:none}
+[data-swarm] .sw-activity-head .sw-worker-avatar{width:28px;height:28px;border-radius:7px;background:#0d1a20;padding:2px;flex:none}
 body:not([data-ds-dark-theme]) [data-swarm] .sw-activity-head .sw-worker-avatar{background:#eef4f1}
 [data-swarm] .sw-actor-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4d7d92;flex:none}
 [data-swarm] .sw-activity-group .sw-event:last-child{border-bottom:0}

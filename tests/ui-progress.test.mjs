@@ -330,3 +330,41 @@ test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what it
   assert.match(chinese, /依据: /, 'and the derivation line')
   assert.doesNotMatch(chinese, /Why this state|Derived from|Waiting for your decision|consumption unknown/, 'the focus line leaks no English copy')
 })
+
+test('OWNER PASS 2026-09-11 #2: Pause and Stop share one horizontal control row', () => {
+  const snapshot = uiSnapshot()
+  const writable = { ownerSessionId: 'owner', loading: false, connection: 'connected',
+    data: { snapshots: [snapshot], drafts: [], starts: [], writable: true, workspace: '/workspace/demo' } }
+  const html = render(ActivityPanel, panelProps(writable))
+  const at = html.indexOf('data-swarm-actions=""')
+  assert.ok(at > 0, 'the mission controls live in one container')
+  assert.equal((html.match(/data-swarm-actions=""/g) ?? []).length, 1, 'exactly one control row')
+  const row = html.slice(at)
+  // The two clusters used to be sibling rows, so Pause and Stop always stacked.
+  assert.ok(row.indexOf('data-action="pause"') > 0, 'Pause is in the row')
+  assert.ok(row.indexOf('data-action="complete"') > 0, 'Complete is in the row')
+  assert.ok(row.indexOf('data-action="stop"') > 0, 'Stop is in the row')
+  assert.ok(row.indexOf('data-action="pause"') < row.indexOf('data-action="stop"'), 'Pause precedes Stop in the same row')
+  assert.ok(row.indexOf('data-action="complete"') < row.indexOf('data-action="stop"'))
+  // The technical disclosure still holds neither control (F-15 stays closed).
+  assert.doesNotMatch(html, /data-swarm-details="technical" open/)
+})
+
+test('OWNER PASS 2026-09-11 #2: the member card leads with a large avatar and a restacked identity', () => {
+  const markup = render(SwarmBoard, { snapshot: uiSnapshot(), onOpenWorker() {} })
+  const start = markup.indexOf('data-swarm-member="b"')
+  const card = markup.slice(start, markup.indexOf('</article>', start))
+  const head = card.slice(card.indexOf('sw-member-head'), card.indexOf('sw-member-task'))
+  assert.match(head, /class="sw-worker-avatar"[^>]*width="48" height="48"/, 'the sprite is 48px, not a thumbnail')
+  assert.ok(head.indexOf('sw-worker-avatar') < head.indexOf('sw-worker-name'), 'the avatar anchors the head')
+  assert.match(head, /class="sw-worker-name">Nova</)
+  assert.match(head, /class="sw-chip" data-tone="live">working</, 'the status chip sits with the name')
+  assert.match(head, /sw-member-role">Runtime implementation</, 'the role is its own line under the name')
+  assert.doesNotMatch(card, /class="sw-person"/, 'the identity no longer rides the generic person row')
+  assert.doesNotMatch(card, /initials/, 'and no initials block returns')
+  // Order inside the card: head, task, bar, meta, link.
+  const order = ['sw-member-head', 'sw-member-task', 'class="sw-bar"', 'sw-member-meta', 'data-worker-session']
+  for (let index = 1; index < order.length; index++) {
+    assert.ok(card.indexOf(order[index - 1]) < card.indexOf(order[index]), `${order[index - 1]} precedes ${order[index]}`)
+  }
+})

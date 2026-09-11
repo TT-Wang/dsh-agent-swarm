@@ -11,10 +11,16 @@ function timestamp(value: number): string { return new Date(value).toLocaleTimeS
  * stays with the name text — and it adds no image asset, no request, no
  * dependency and no model turn.
  */
-export function WorkerAvatar({ name }: { name: string }) {
-  const sprite = avatarCells(name), size = sprite.grid * sprite.cell
+export function WorkerAvatar({ name, size: requested }: { name: string; size?: number }) {
+  const sprite = avatarCells(name), base = sprite.grid * sprite.cell
+  // OWNER PASS 2026-09-11 #2: the sprite is scaled by a whole or half step, so the
+  // pixel grid stays crisp at every size the layout asks for — 48px is 1.5x a 32px
+  // sprite (6px cells, integer at a 2x device pixel ratio), 28px is the compact
+  // activity header, and the default renders the grid exactly.
+  const scale = requested === undefined ? 1 : Math.max(1, Math.round((requested / base) * 2) / 2)
+  const size = base * scale
   return <svg className="sw-worker-avatar" aria-hidden="true" focusable="false" role="presentation"
-    width={size} height={size} viewBox={`0 0 ${size} ${size}`} shapeRendering="crispEdges">
+    width={size} height={size} viewBox={`0 0 ${base} ${base}`} shapeRendering="crispEdges">
     {sprite.cells.map(cell => <rect key={`${cell.x}:${cell.y}`} x={cell.x * sprite.cell} y={cell.y * sprite.cell}
       width={sprite.cell} height={sprite.cell} fill={cell.color} />)}
   </svg>

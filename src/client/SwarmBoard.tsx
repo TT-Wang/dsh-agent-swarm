@@ -119,10 +119,17 @@ function MemberRow({ member, running, now, live, onOpen }: {
     : view.state === 'waiting' ? t('Waiting for input or dependencies')
       : view.state === 'stopped' ? t('Stopped') : t('No active task')
   return <article className="sw-worker sw-member" data-swarm-member={member.id} data-state={view.state}>
-    <div className="sw-row"><div className="sw-person">
-      <WorkerAvatar name={member.name} />
-      <div><div className="sw-worker-name">{member.name}</div><div className="sw-small">{member.role}</div></div>
-    </div><Badge value={member.status} /></div>
+    {/* OWNER PASS 2026-09-11 #2: the avatar was a 28px thumbnail squeezed into the
+        name line. It is now the card's anchor at 48px with the identity, status and
+        current task stacked beside it, the progress bar full width underneath, and
+        the metadata/link rows aligned to the card instead of the name text. */}
+    <div className="sw-member-head">
+      <WorkerAvatar name={member.name} size={48} />
+      <div className="sw-member-ident">
+        <div className="sw-member-name"><span className="sw-worker-name">{member.name}</span><Badge value={member.status} /></div>
+        <div className="sw-small sw-member-role">{member.role}</div>
+      </div>
+    </div>
     <p className="sw-small sw-member-task">{view.state === 'working' && view.task ? view.task.title : stateLabel}</p>
     <div className="sw-bar" data-basis={view.basis ?? 'live'} data-state={view.state}
       {...(view.percent === undefined ? { 'data-indeterminate': '' } : { role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(view.percent), 'aria-label': `${member.name}: ${stateLabel}` })}>
@@ -316,7 +323,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
           {/* Item 1: one group per durable actor, so "what has Atlas been doing"
               is answered by looking at Atlas' block instead of by reading every row. */}
           <header className="sw-row sw-activity-head">
-            <span className="sw-person">{group.member ? <WorkerAvatar name={group.member.name} /> : <span className="sw-actor-dot" aria-hidden="true" />}
+            <span className="sw-person">{group.member ? <WorkerAvatar name={group.member.name} size={28} /> : <span className="sw-actor-dot" aria-hidden="true" />}
               <strong>{t(group.name)}</strong></span>
             <span className="sw-small">{group.events.length} {t(group.events.length === 1 ? 'event' : 'events')}</span>
           </header>
