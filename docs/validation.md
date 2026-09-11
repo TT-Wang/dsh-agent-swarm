@@ -8,7 +8,7 @@ Version **0.6.0** was checked on 2026-09-08. The full regression baseline and th
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
-## 0.1.5-rc.1 baseline (2026-09-11) — current
+## 0.1.5-rc.1 baseline (2026-09-11)
 
 The owner pass of 2026-09-11 adapted the plugin to the npm `latest` line and measured it on a checkout
 built from the release tag `dsh-v0.1.5-rc.1` (`183f08e9c6`): `pnpm install --frozen-lockfile` (25 s) then
@@ -48,6 +48,55 @@ the single derivation over `swarm.sqlite`, and `tests/r17-projection.test.mjs` p
 module appends a session event.
 
 Both targets use isolated SDK links. The rc.1 copy runs the same emitted JavaScript against rc.1 dependencies and its actual CLI; it is not an alpha.2-linked plugin with only a different CLI environment variable. Host and client TypeScript are also checked against the selected SDK without re-emitting that copy.
+
+## Second UI pass (2026-09-11, client only) — current
+
+The owner asked for the remaining items of the 2026-09-11 UI review and then for the attended
+preview restart. The pass changes `src/client/` only (feed grouping, lane counts and empty-lane
+collapse, the clamped card reason, the sidebar's stated derivation, the `DisposalRegistry`, and the
+dock's inline-style layout shift), so the runtime, store, adapter and admission paths are untouched
+and the replay digest is unchanged. Measured on the committed artifact `1f62695`, with the SDK farm
+repointed per row (the tracked linker still enforces `compatibility.json`).
+
+| Check | Result |
+| --- | --- |
+| `npm run typecheck` | exit 0 on both farms (`0.1.3-alpha.2`, `0.1.5-rc.1`) |
+| Emitted JavaScript (`lib/**/*.js`) | 59 files, SHA-256 `2a654ad5c839eb96db5b24b802bce9283d7e521f3fb43b5f3f581771c0505ee3` |
+| Complete behavioral suite (`node --test tests/*.test.mjs`) | **849 tests: 847 passed, 2 failed** on this host; the two failing files pass alone (see the load note) |
+| `npm run test:faults` | **24/24** on both farms |
+| `npm run test:replay` | `REPLAY OK`, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` (unchanged by this pass) |
+| `npm run test:harness` (real Loader composition) | passed on `0.1.3-alpha.2` and `0.1.5-rc.1` |
+| `npm run test:profile` (installed bundle through the real CLI) | passed on both |
+| `npm run test:pack` (clean checkout of the committed artifact) | passed on both; 190 published files |
+| `npm run test:bundle` | 7/7 on `0.1.3-alpha.2`, passed on `0.1.5-rc.1` |
+
+The pass adds six tests (843 → 849): the actor-grouping derivation and its rendered order, the lane
+counts and the collapsed empty lane, the reason clamp (full reason one disclosure away, short reason
+inline), the owner-state disclosure (including the new `count` field and the Chinese strings), the
+`DisposalRegistry` contract, and the dock geometry plus the two source guards that keep `#root` and
+`!important` out of the stylesheet. The clean-checkout pack tier is also the gate that caught the new
+`src/client/lifecycle.ts` while it was still untracked: the tier builds only tracked files, so the
+module had to be committed before the packed artifact could compose.
+
+Layout facts were measured in headless Chromium against the rendered board and panel, not inferred
+from markup: the lane-count strip sits above the board (strip y 924, board y 959) with all seven chips
+(`ready 1 · queued 1 · active 1 · review 1 · blocked 0 · cancelled 0 · done 1`); an empty lane is
+**20 px** tall (header only, 1 px rule, no placeholder box) where a filled lane is 240 px; the
+lane-title colour rules that no code had ever triggered now apply (`queued` `rgb(157,182,212)`,
+`cancelled` `rgb(154,160,173)`); the Activity tab renders three actor groups (runtime, Nova, Atlas —
+20 retained events each, member groups drawing 54 and 50 sprite rects and the runtime group none); the
+clamped reason is one 17 px line whose full 294-character text is one disclosure away; the tab bar
+reports `Work board 10 · Dependency graph 10 · Evidence 2 · Activity 5`; and the state-provenance
+disclosure reports phase `waiting-for-owner` with the durable evidence
+`task t4 status=submitted without a live review`.
+
+**Load note (this host, not a product claim).** The host running the suite also runs the live preview
+host and the owner's browser; load average was 12–33 during the measurements. Five wall-clock-bound
+cases failed in a run that shared the machine with a browser and a second suite, and two different
+wall-clock-bound cases failed in the serial run published above (`durability-w9-recovery`,
+`lease-liveness`; the first took 175 s where it takes 7 s alone). Every failing file passes when run
+by itself, and no assertion was changed to make that happen. This is recorded in
+`docs/known-limitations.md` with the same evidence.
 
 ## Historical revision baseline (2026-09-09, superseded)
 
