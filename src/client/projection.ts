@@ -1,4 +1,4 @@
-import type { Member, Snapshot, Task, Evidence } from '../types.ts'
+import type { Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
 
 export type BoardLane = 'ready' | 'queued' | 'active' | 'review' | 'blocked' | 'cancelled' | 'done'
 /**
@@ -395,6 +395,37 @@ export function retiredReviewsBySource(snapshot: Snapshot): Map<string, RetiredR
 /** Verification tasks of one source that the owner or runtime withdrew (F-12 sibling surface). */
 export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): RetiredReview[] {
   return retiredReviewsBySource(snapshot).get(sourceTaskId) ?? []
+}
+
+/**
+ * OWNER PASS 2026-09-11: the Activity tab used to be one flat newest-first list
+ * in which the runtime, the owner and every worker were interleaved, so the
+ * answer to "what has Atlas been doing?" required reading every row. Events are
+ * grouped by their durable actor instead — newest group first, newest event
+ * first inside a group — in one pass over the retained window (F-34). An actor
+ * that is a member carries the member row so the group header can draw the same
+ * sprite as the roster; the non-member writers get a stable role label instead of
+ * a raw key.
+ */
+const ACTOR_LABELS: Record<string, string> = {
+  owner: 'Owner conversation', runtime: 'Runtime', config: 'Configuration', host: 'Harness',
+}
+export interface ActivityGroup { actor: string; name: string; member?: Member; events: SwarmEvent[] }
+export function activityGroups(snapshot: Snapshot): ActivityGroup[] {
+  const members = new Map(snapshot.members.map(member => [member.id, member]))
+  const groups = new Map<string, ActivityGroup>()
+  for (const event of snapshot.events) {
+    let group = groups.get(event.actor)
+    if (group === undefined) {
+      const member = members.get(event.actor)
+      group = { actor: event.actor, name: member?.name ?? ACTOR_LABELS[event.actor] ?? shortId(event.actor),
+        ...(member === undefined ? {} : { member }), events: [] }
+      groups.set(event.actor, group)
+    }
+    group.events.push(event)
+  }
+  for (const group of groups.values()) group.events.sort((a, b) => b.seq - a.seq)
+  return [...groups.values()].sort((a, b) => b.events[0]!.seq - a.events[0]!.seq)
 }
 
 /**

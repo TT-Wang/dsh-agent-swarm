@@ -14,7 +14,8 @@ import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityPanel.js'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
-import { fitSidebar } from '../lib/types/client/SidebarDock.js'
+import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
+import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 import { validatePlan } from '../lib/plans.js'
@@ -423,4 +424,62 @@ test('snapshot reader validates every budget key and the runtime-projected deliv
   assert.deepEqual(readSnapshot(projected), projected)
   assert.equal(deliverableCommit(projected), 'a'.repeat(40))
   assert.equal(completionBlocker(projected), 'still blocked')
+})
+
+test('OWNER PASS 2026-09-11 (C3): the dock shifts a discovered host root by inline style, not by an id rule', async () => {
+  // The reservation must follow the dock, so it is computed for the same four
+  // geometries the dock itself uses.
+  assert.deepEqual(dockShift(true, 480, 1440), { width: 'calc(100% - 480px)' })
+  assert.deepEqual(dockShift(false, 480, 1440), { width: 'calc(100% - 28px)' }, 'the collapsed launcher keeps its 28px strip')
+  assert.deepEqual(dockShift(true, 480, 600), { width: '100%', height: '55dvh' }, 'a narrow viewport stacks the dock under the app')
+  assert.deepEqual(dockShift(false, 480, 600), { width: '100%', height: 'calc(100dvh - 40px)' }, 'a collapsed narrow dock is only its 40px bar')
+  // The target is discovered structurally: the child of the body above the dock.
+  const body = { style: {}, parentElement: null }
+  const root = { style: {}, parentElement: body }
+  const shell = { style: {}, parentElement: root }
+  const dock = { style: {}, parentElement: shell }
+  assert.equal(hostShiftTarget(dock, node => node === body), root, 'the app root is whatever sits directly under the body')
+  assert.equal(hostShiftTarget({ style: {}, parentElement: body }, node => node === body), undefined,
+    'a dock that is itself a body child has no host root to move')
+  assert.equal(hostShiftTarget({ style: {}, parentElement: null }, node => node === body), undefined, 'a detached dock moves nothing')
+  assert.equal(hostShiftTarget(undefined, node => node === body), undefined)
+  // C3 is only closed if the sheet no longer names the host's id or forces the
+  // layout with !important; the dock's own geometry stays in CSS.
+  const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
+  assert.doesNotMatch(styles, /#root/, 'the dock no longer depends on the host root id')
+  assert.doesNotMatch(styles, /\[data-swarm-docked\][^{}]*\{[^}]*!important/, 'and no dock rule has to outrank the host with !important')
+  for (const rule of ['.sw-lane-count', '.sw-lane[data-empty]', '.sw-activity-group', '.sw-why']) {
+    assert.ok(styles.includes(rule), `the second-pass styles ship ${rule}`)
+  }
+  assert.match(styles, /\.sw-lane\[data-empty\]\{opacity:\.55;align-self:start\}/,
+    'an empty lane stops stretching to its row height, so it is one header tall instead of a full-height empty column')
+  const dockSource = await readFile(new URL('../src/client/SidebarDock.tsx', import.meta.url), 'utf8')
+  assert.match(dockSource, /style\.width = previous\.width/, 'the host inline style is restored on unload')
+})
+
+test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly once, even after the drain', async () => {
+  const calls = []
+  const registry = new DisposalRegistry()
+  const first = { dispose: () => calls.push('first') }, second = { dispose: () => calls.push('second') }
+  assert.equal(registry.add(first), first, 'add returns the resource so a render can use it inline')
+  assert.equal(registry.size, 1)
+  registry.release(first)
+  registry.release(first)
+  assert.deepEqual(calls, ['first'], 'releasing twice disposes once, so the unmount effect is idempotent')
+  assert.equal(registry.size, 0)
+  registry.add(second)
+  registry.dispose()
+  registry.dispose()
+  assert.deepEqual(calls, ['first', 'second'], 'the plugin drain disposes what unmount did not, and is idempotent')
+  assert.equal(registry.drained, true)
+  // The point of the registry: a pane that mounts during unload cannot leak.
+  const late = { dispose: () => calls.push('late') }
+  registry.add(late)
+  assert.deepEqual(calls, ['first', 'second', 'late'], 'a resource registered after the drain is disposed at once')
+  assert.equal(registry.size, 0)
+  // The plugin scope really wires the registry: the effect that drains it must exist.
+  const index = await readFile(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
+  assert.match(index, /disposals\.add\(new SwarmMonitor\(request\)\), \[request\]/, 'the monitor registers with the pane registry and re-creates with its request')
+  assert.match(index, /disposals\.release\(monitor\)/, 'unmount releases the monitor through the registry')
+  assert.match(index, /ctx\.effect\(\(\) => \(\) => disposals\.dispose\(\), 'agent-swarm: pane resources'\)/, 'plugin unload drains the registry')
 })

@@ -166,6 +166,31 @@ export const zh: Record<string, string> = {
   'superseded by a repair': '已被修复任务替代', 'review retired by its verdict': '因源任务判决而撤回的复核',
   'still queued when the mission completed': '任务完成时仍在排队', 'withdrawn by the owner': '由 owner 撤销', 'cause not recorded in this snapshot': '此快照未记录原因',
   'lease expired': '租约已到期', 'tokens': 'token', 'Stopped': '已停止',
+  // OWNER PASS 2026-09-11 (second pass): the owner-state projection now renders
+  // its label/note/count/evidence, the card reason unfolds, the activity feed is
+  // grouped and the board prints lane counts — every one of those strings is a
+  // stable key, including the ones the focus line had been leaking in English.
+  'Why this state': '状态依据', 'Derived from': '依据', 'consumption unknown': '是否已处理未知',
+  'start time unknown': '开始时间未知', 'Reason': '原因', 'Task distribution': '任务分布',
+  'Runtime': '运行时', 'Configuration': '配置', 'Harness': '宿主',
+  'event': '条事件', 'events': '条事件', 'writer': '个写入方', 'writers': '个写入方',
+  'No details recorded': '未记录详情',
+  'Connection unavailable': '连接不可用',
+  'The view is stale: it shows the last durable state, and no execution is confirmed until updates resume.': '当前视图已过期，显示的是最后一次持久状态；恢复更新前无法确认执行情况。',
+  'Waiting for you': '等待你处理', 'Waiting for your decision': '等待你决定',
+  'The plan is staged and has not been launched.': '计划已暂存，尚未启动。',
+  'Launch the staged plan or edit it.': '启动暂存的计划，或继续编辑。',
+  'Cannot make progress without a repair.': '没有修复就无法继续。',
+  'Repair the task or withdraw it.': '修复该子任务，或将其撤销。',
+  'A submitted artifact has no live independent review path.': '已提交的产物没有可用的独立审查路径。',
+  'Admit an independent review or cancel the submission.': '准入一次独立审查，或取消该提交。',
+  'A recovery attempt is running for this task.': '该子任务正在进行一次恢复尝试。',
+  'Recovering': '正在恢复',
+  'The worker handle is acknowledging its stop before the task can be re-pended; no recovery credit is spent.': '成员正在确认停止，之后子任务才能重新排队；此过程不消耗恢复次数。',
+  'Tasks in progress': '进行中的任务', 'Scheduling the next task': '正在安排下一个子任务',
+  'Ready to dispatch.': '可以派发。', 'No work has been admitted yet.': '尚未准入任何工作。',
+  'Admit work with swarm_propose or inspect the plan.': '用 swarm_propose 准入工作，或检查现有计划。',
+  'No task can make further progress': '没有子任务还能继续推进',
 }
 export const en = Object.fromEntries(Object.keys(zh).map(key => [key, key]))
 export const CopyContext = createContext<(text: string) => string>(text => text)

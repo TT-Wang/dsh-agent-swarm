@@ -19,7 +19,8 @@ export const SWARM_CSS = `
 [data-swarm-panel] .sw-panel-title{display:flex;align-items:center;justify-content:space-between;background:var(--sw-card);padding:12px 16px;flex:none;user-select:none;border-bottom:1px solid var(--sw-border)}
 [data-swarm-panel] .sw-panel-title>div:first-child{min-width:0;overflow:hidden}[data-swarm-panel] .sw-panel-title strong{font-size:13px;letter-spacing:.01em}[data-swarm-panel] .sw-panel-title small{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--sw-muted);max-width:48ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}
 .sw-live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#65cfb0;flex:none}.sw-live-dot[data-error=true]{background:#d9ad69}
-body[data-swarm-docked] #root{width:calc(100% - var(--swarm-dock-width))!important;min-width:0}
+/* C3: the host root is resized inline by SidebarDock.dockShift, so this sheet
+   names no host id and needs no !important; the dock's own geometry stays here. */
 [data-swarm-dock]{position:fixed;inset:0 0 0 auto;width:var(--swarm-dock-width);height:100dvh;pointer-events:auto;border-left:1px solid #90a79c55;background:#f6faf8;z-index:40}
 body[data-ds-dark-theme] [data-swarm-dock]{background:#101b22}
 .sw-dock-body{height:100%;min-height:0}.sw-dock-body[hidden],.sw-launcher[hidden]{display:none}
@@ -27,7 +28,7 @@ body[data-ds-dark-theme] [data-swarm-dock]{background:#101b22}
 .sw-launcher:focus-visible{outline:2px solid #559b7c;outline-offset:-3px}
 .sw-sidebar-resize{position:absolute;inset:0 auto 0 -3px;width:7px;cursor:col-resize;touch-action:none;z-index:2}
 .sw-sidebar-resize:hover,.sw-sidebar-resize:focus-visible{background:#68bca66b;outline:none}
-@media(max-width:700px){body[data-swarm-docked] #root{width:100%!important;height:55dvh!important;min-height:0}body[data-swarm-docked=closed] #root{height:calc(100dvh - 40px)!important}
+@media(max-width:700px){
 [data-swarm-dock]{inset:auto 0 0;width:100%;height:45dvh;border-left:0;border-top:1px solid #90a79c55}[data-swarm-dock][data-expanded=false]{height:40px}.sw-launcher{writing-mode:horizontal-tb;justify-content:center;padding:8px}.sw-sidebar-resize{display:none}}
 
 .sw-open-monitor{border:1px solid #507c70;border-radius:7px;background:transparent;color:inherit;font:12px ui-sans-serif,system-ui,sans-serif;padding:6px 10px;cursor:pointer}
@@ -107,4 +108,33 @@ body:not([data-ds-dark-theme]) [data-swarm] .sw-cancel-note{color:#8a6a3d}
 [data-swarm] .sw-mission-facts>summary{display:flex;gap:9px;flex-wrap:wrap;align-items:baseline}
 [data-swarm] .sw-fact-title{font-size:12px;color:var(--sw-text)}
 [data-swarm] .sw-fact-counts{color:var(--sw-muted)}
+
+/* OWNER PASS 2026-09-11 (second pass): lane counts, collapsed empty lanes, the
+   member-grouped activity feed, the clamped card reason and the state
+   provenance line. */
+[data-swarm] .sw-lane-counts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+[data-swarm] .sw-lane-count{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--sw-border);border-radius:100px;padding:2px 8px;font-size:10px;color:var(--sw-muted);background:#1b2b33}
+[data-swarm] .sw-lane-count b{font-weight:600;color:var(--sw-text)}
+[data-swarm] .sw-lane-count[data-empty=true]{opacity:.5}
+body:not([data-ds-dark-theme]) [data-swarm] .sw-lane-count{background:#eef3f0}
+[data-swarm] .sw-lane[data-empty]{opacity:.55;align-self:start}
+[data-swarm] .sw-lane[data-empty] .sw-lane-title{margin-bottom:0;min-height:0;padding-bottom:0}
+[data-swarm] .sw-lane-void{border-top:1px dashed #2c414a;margin-top:2px}
+[data-swarm] .sw-activity-group{border-top:1px solid var(--sw-border);padding-top:10px;margin-top:10px}
+[data-swarm] .sw-activity-group:first-of-type{border-top:0;padding-top:0;margin-top:0}
+[data-swarm] .sw-activity-head{margin-bottom:4px}
+[data-swarm] .sw-activity-head .sw-person{gap:8px;align-items:center;min-width:0}
+[data-swarm] .sw-activity-head strong{font-size:12px;font-weight:600;overflow-wrap:anywhere}
+[data-swarm] .sw-activity-head .sw-worker-avatar{width:22px;height:22px;border-radius:6px;background:#0d1a20;padding:2px;flex:none}
+body:not([data-ds-dark-theme]) [data-swarm] .sw-activity-head .sw-worker-avatar{background:#eef4f1}
+[data-swarm] .sw-actor-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#4d7d92;flex:none}
+[data-swarm] .sw-activity-group .sw-event:last-child{border-bottom:0}
+[data-swarm] .sw-reason{font-size:10px;color:var(--sw-muted)}
+[data-swarm] .sw-reason>summary{color:#d9b48c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+body:not([data-ds-dark-theme]) [data-swarm] .sw-reason>summary{color:#8a6a3d}
+[data-swarm] .sw-reason>p{margin-top:6px;overflow-wrap:anywhere}
+[data-swarm] .sw-why{margin-top:9px}
+[data-swarm] .sw-why>summary{font-size:11px;color:var(--sw-muted)}
+[data-swarm] .sw-why .sw-focus-note{margin-top:5px}
+[data-swarm] .sw-decision-content{display:block;margin-top:3px}
 `

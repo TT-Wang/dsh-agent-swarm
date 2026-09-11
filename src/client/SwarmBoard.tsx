@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
-import { LANES, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
+import { LANES, activityGroups, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useNow } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
@@ -8,6 +8,15 @@ import { MissionProgress, RecentProgress, ResultSummary, WorkerAvatar } from './
 import { activityLabels, memberActivity, memberProgress, runningByOwner, taskReasons, type ConnectionState } from './progress.ts'
 
 type View = 'board' | 'evidence' | 'activity' | 'graph'
+/**
+ * A durable reason is one line on the card, its full text behind the disclosure
+ * (2026-09-11 review, second pass). A preparation failure or a workspace-audit
+ * refusal can run to a paragraph; printed whole it pushed every following card
+ * off screen, and printed truncated with no way to open it, it hid the one
+ * sentence the owner needs.
+ */
+const REASON_INLINE = 96
+function clipped(reason: string): boolean { return reason.length > REASON_INLINE }
 function time(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
 function tone(status: string): string {
   return ['accepted', 'completed', 'verified', 'idle'].includes(status) ? 'good'
@@ -67,10 +76,13 @@ function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, 
       {task.artifact && <span className="sw-code" title={task.artifact.commit}>{t('Artifact')} {shortId(task.artifact.commit)}</span>}
     </div>
     {/* W9/W15: the durable reason is visible on the card, not only in the collapsed disclosure. */}
-    {reason && <p className="sw-small sw-focus-note" data-swarm-task-reason="">{reason}</p>}
+    {reason && (clipped(reason)
+      ? <details className="sw-reason" data-swarm-reason="full"><summary data-swarm-task-reason="">{t('Reason')}: {reason.slice(0, REASON_INLINE)}…</summary>
+        <p>{reason}</p></details>
+      : <p className="sw-small sw-focus-note" data-swarm-task-reason="">{reason}</p>)}
     {/* Item 4 of the 2026-09-11 UI pass: a cancelled card names which of the four
         causes it is, instead of sharing one "blocked / cancelled" label. */}
-    {cancellation && <p className="sw-small sw-cancel-note" data-swarm-cancel-kind={cancellation.kind}>{t(cancellationLabels[cancellation.kind])}{cancellation.detail ? ` · ${cancellation.detail}` : ''}</p>}
+    {cancellation && <p className="sw-small sw-cancel-note" data-swarm-cancel-kind={cancellation.kind}>{t(cancellationLabels[cancellation.kind])}{cancellation.detail ? ` · ${cancellation.detail.slice(0, REASON_INLINE)}${clipped(cancellation.detail) ? '…' : ''}` : ''}</p>}
     {(task.dependencies.length > 0 || task.output || task.scope?.length > 0) && <details><summary>{t('Task details')}</summary>
       {task.objective && <p className="sw-small">{task.objective}</p>}
       {task.dependencies.length > 0 && <p className="sw-refs">{t('Prerequisites')}: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}
@@ -205,6 +217,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
   const cancellations = useMemo(() => cancellationNotes(snapshot), [snapshot])
   const memberById = useMemo(() => new Map(snapshot.members.map(member => [member.id, member])), [snapshot.members])
   const running = useMemo(() => runningByOwner(snapshot.tasks), [snapshot.tasks])
+  const groups = useMemo(() => activityGroups(snapshot), [snapshot])
   const verdicts = useMemo(() => durableVerdicts(snapshot), [snapshot])
   const retiredBySource = useMemo(() => retiredReviewsBySource(snapshot), [snapshot])
   const tasks = snapshot.tasks.filter(task => stream === 'all' || task.workstreamId === stream)
@@ -213,6 +226,11 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
   const accepted = snapshot.tasks.filter(task => task.status === 'accepted').length
   const activeWorkers = snapshot.members.filter(member => member.status === 'working').length
   const blocked = snapshot.tasks.filter(task => lanes.get(task.id) === 'blocked').length
+  // One bucketing pass feeds the lane counts, the seven columns and the empty-lane
+  // collapse; the board used to rescan the task array once per lane (F-34).
+  const byLane = new Map<BoardLane, Task[]>()
+  for (const lane of LANES) byLane.set(lane.id, [])
+  for (const task of tasks) byLane.get(lanes.get(task.id) ?? 'ready')!.push(task)
   return <section data-swarm="" aria-label={`Agent Swarm mission: ${mission.title}`}>
     <header className="sw-head"><div className="sw-row"><span className="sw-eyebrow">{t(live ? 'Current mission' : 'Mission snapshot')}</span><Badge value={mission.status} /></div>
       <h2>{mission.title}</h2>
@@ -251,8 +269,8 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
     <UsageBreakdown worker={mission.workerUsage} owner={mission.ownerUsage} steps={mission.usedSteps} />
     </details>
     <div className="sw-tabs" role="tablist" aria-label="Mission views">
-      <button className="sw-tab" role="tab" aria-selected={view === 'board'} onClick={() => setView('board')}>{t('Work board')}</button>
-      <button className="sw-tab" role="tab" aria-selected={view === 'graph'} onClick={() => setView('graph')}>{t('Dependency graph')}</button>
+      <button className="sw-tab" role="tab" aria-selected={view === 'board'} onClick={() => setView('board')}>{t('Work board')} <span className="sw-count">{tasks.length}</span></button>
+      <button className="sw-tab" role="tab" aria-selected={view === 'graph'} onClick={() => setView('graph')}>{t('Dependency graph')} <span className="sw-count">{snapshot.tasks.length}</span></button>
       <button className="sw-tab" role="tab" aria-selected={view === 'evidence'} onClick={() => setView('evidence')}>{t('Evidence')} <span className="sw-count">{counts.total}</span></button>
       <button className="sw-tab" role="tab" aria-selected={view === 'activity'} onClick={() => setView('activity')}>{t('Activity')} <span className="sw-count">{snapshot.events.length}</span></button>
     </div>
@@ -263,10 +281,20 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
         {snapshot.workstreams.map(item => <button className="sw-stream" aria-pressed={stream === item.id} key={item.id}
           title={item.objective} onClick={() => setStream(item.id)}>{item.title}</button>)}
       </div>}
-      {view === 'board' && <><div className="sw-board">{LANES.map(lane => {
-        const items = tasks.filter(task => lanes.get(task.id) === lane.id)
-        return <section className="sw-lane" key={lane.id} aria-label={t(lane.label)}><div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
-          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live}
+      {view === 'board' && <>
+        {/* Item 2: the whole distribution in one line, so a narrow sidebar does not
+            have to be scrolled sideways to learn where the work is. */}
+        <div className="sw-lane-counts" data-swarm-lane-counts="" aria-label={t('Task distribution')}>
+          {LANES.map(lane => <span className="sw-lane-count" key={lane.id} data-lane-count={lane.id} data-empty={byLane.get(lane.id)!.length === 0}>
+            {t(lane.label)} <b>{byLane.get(lane.id)!.length}</b></span>)}
+        </div>
+        <div className="sw-board">{LANES.map(lane => {
+        const items = byLane.get(lane.id)!
+        return <section className="sw-lane" key={lane.id} data-lane={lane.id} data-empty={items.length === 0 ? '' : undefined} aria-label={t(lane.label)}>
+          <div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
+          {/* Item 3: an empty lane collapses to its header instead of drawing a
+              dashed placeholder box in every one of the seven columns. */}
+          {items.length === 0 ? <div className="sw-lane-void" aria-hidden="true" /> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live}
             now={task.attempt === undefined ? stableNow : now} index={index} memberById={memberById}
             lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} cancellation={cancellations.get(task.id)} onCancel={onCancelTask} />)}
         </section>
@@ -283,11 +311,20 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
         {evidence.length === 0 ? <div className="sw-empty">{t('No evidence in this workstream yet. Claims will show their host tool records and artifact commits here.')}</div>
           : evidence.map(item => <EvidenceCard key={item.id} evidence={item} index={index} memberById={memberById} verdicts={verdicts} retiredBySource={retiredBySource} />)}
       </>}
-      {view === 'activity' && <><div className="sw-row"><h3>{t('Recent events')}</h3><span className="sw-small">{snapshot.pendingDeliveries} {t('pending deliveries')}</span></div>
-        {snapshot.events.length === 0 ? <div className="sw-empty">{t('No activity recorded yet.')}</div> : [...snapshot.events].reverse().map(event => <div className="sw-event" key={event.seq}>
-          <span className="sw-small">{time(event.createdAt)}</span><div><div className="sw-event-type">{event.type.replaceAll('.', '/').replaceAll('_', ' ').split('/').map(token => t(token.trim())).join(' / ')}</div>
-            <div className="sw-event-data">{event.actor} · {eventSummary(event.data)}</div></div>
-        </div>)}
+      {view === 'activity' && <><div className="sw-row"><h3>{t('Recent events')}</h3><span className="sw-small">{snapshot.pendingDeliveries} {t('pending deliveries')} · {groups.length} {t(groups.length === 1 ? 'writer' : 'writers')}</span></div>
+        {snapshot.events.length === 0 ? <div className="sw-empty">{t('No activity recorded yet.')}</div> : groups.map(group => <section className="sw-activity-group" key={group.actor} data-swarm-activity-group={group.actor}>
+          {/* Item 1: one group per durable actor, so "what has Atlas been doing"
+              is answered by looking at Atlas' block instead of by reading every row. */}
+          <header className="sw-row sw-activity-head">
+            <span className="sw-person">{group.member ? <WorkerAvatar name={group.member.name} /> : <span className="sw-actor-dot" aria-hidden="true" />}
+              <strong>{t(group.name)}</strong></span>
+            <span className="sw-small">{group.events.length} {t(group.events.length === 1 ? 'event' : 'events')}</span>
+          </header>
+          {group.events.map(event => <div className="sw-event" key={event.seq}>
+            <span className="sw-small">{time(event.createdAt)}</span><div><div className="sw-event-type">{event.type.replaceAll('.', '/').replaceAll('_', ' ').split('/').map(token => t(token.trim())).join(' / ')}</div>
+              <div className="sw-event-data">{eventSummary(event.data) || t('No details recorded')}</div></div>
+          </div>)}
+        </section>)}
         {snapshot.events.length > 0 && <p className="sw-small" style={{ marginTop: 12 }}>{t('Showing the latest')} {snapshot.events.length} {t('events retained in this snapshot.')}</p>}
       </>}
     </div>

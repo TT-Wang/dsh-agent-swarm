@@ -18,6 +18,7 @@ import { ActivityPanel, OPEN_MONITOR } from './ActivityPanel.tsx'
 import { SidebarDock } from './SidebarDock.tsx'
 import { createSidebarAdapter } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
+import { DisposalRegistry } from './lifecycle.ts'
 import { CopyContext, en, zh } from './locale.tsx'
 import { openWorker } from './navigation.ts'
 import { WorkerHistory, type HistoryPage } from './history.ts'
@@ -54,17 +55,23 @@ export function apply(ctx: Context): void {
     subscribe: (listener: () => void) => { historyListeners.add(listener); return () => { historyListeners.delete(listener) } },
     getSnapshot: () => historyRequest,
   }
+  // C2: React can build a pane and throw it away before it commits (StrictMode's
+  // double render), so unmount alone cannot dispose what a render created. Every
+  // pane resource is registered here, released when the pane unmounts, and the
+  // plugin scope drains the rest on unload.
+  const disposals = new DisposalRegistry()
+  ctx.effect(() => () => disposals.dispose(), 'agent-swarm: pane resources')
   function Pane({ sessionId, active = true, onClose }: { sessionId?: string; active?: boolean; onClose?: () => void }) {
-    const monitor = useMemo(() => new SwarmMonitor(request), [])
-    const history = useMemo(() => new WorkerHistory(async (workerSessionId, beforeSeq) => {
+    const monitor = useMemo(() => disposals.add(new SwarmMonitor(request)), [request])
+    const history = useMemo(() => disposals.add(new WorkerHistory(async (workerSessionId, beforeSeq) => {
       const owner = sessionId ?? ctx.sessions.list.getSnapshot().current
       if (!owner) throw new Error('Select a conversation to read its worker history.')
       return request<HistoryPage>('worker-history', { sessionId: owner, workerSessionId, maxMessages: 30, ...(beforeSeq === undefined ? {} : { beforeSeq }) })
-    }), [sessionId])
+    })), [sessionId])
     const current = useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot, ctx.sessions.list.getSnapshot).current
     const pending = useSyncExternalStore(historyRequests.subscribe, historyRequests.getSnapshot, historyRequests.getSnapshot)
-    useEffect(() => () => monitor.dispose(), [monitor])
-    useEffect(() => () => history.dispose(), [history])
+    useEffect(() => () => disposals.release(monitor), [monitor])
+    useEffect(() => () => disposals.release(history), [history])
     useEffect(() => {
       if (active && pending && pending.owner === (sessionId ?? current)) {
         history.open(pending.member.sessionId, pending.member.name)

@@ -316,8 +316,20 @@ export interface OwnerRecoveryView {
 
 export interface SidebarStateView {
   phase: OwnerPhase
+  /**
+   * OWNER PASS 2026-09-11: `label`, `note`, `count`, `decision.content` and
+   * `evidence` are the projection's own answer to "why does the sidebar say
+   * that?", and they are rendered by the mission focus line (`data-swarm-owner-
+   * state` in `MissionProgress`). They used to be derived and then dropped on the
+   * floor, so the panel showed a phase with no stated derivation. Every one of
+   * them is either a stable translation key or a durable fact; a number that a
+   * label or note quantifies travels in `count` instead of being folded into a
+   * sentence that no catalogue can translate.
+   */
   label: string
   note?: string
+  /** The number `label` or `note` quantifies (a task count, an attempt number), when it has one. */
+  count?: number
   /** The transport state, not the work state: a stale view, never a stalled one. */
   stale: boolean
   recovery?: OwnerRecoveryView
@@ -410,15 +422,15 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
   }
   if (blocked !== undefined) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
-      note: blocked.output ?? `Task ${blocked.id} cannot make progress without a repair.`,
-      decision: { subject: taskSubject(blocked), content: blocked.output ?? `Repair or withdraw ${blocked.id}.`, queuedAt: lastEventAt(snapshot, blocked.id, recoveryEventTypes) ?? mission.updatedAt, consumption: 'unknown' },
+      note: blocked.output ?? 'Cannot make progress without a repair.',
+      decision: { subject: taskSubject(blocked), content: blocked.output ?? 'Repair the task or withdraw it.', queuedAt: lastEventAt(snapshot, blocked.id, recoveryEventTypes) ?? mission.updatedAt, consumption: 'unknown' },
       evidence: `task ${blocked.id} status=blocked epoch ${blocked.epoch}` }
   }
   if (unreviewed !== undefined) {
     const queuedAt = lastEventAt(snapshot, unreviewed.id, submissionEventTypes) ?? mission.updatedAt
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for your decision',
       note: 'A submitted artifact has no live independent review path.',
-      decision: { subject: taskSubject(unreviewed), content: `Admit a verification task for ${unreviewed.id} or cancel it.`, queuedAt, consumption: 'unknown' },
+      decision: { subject: taskSubject(unreviewed), content: 'Admit an independent review or cancel the submission.', queuedAt, consumption: 'unknown' },
       evidence: `task ${unreviewed.id} status=submitted without a live review` }
   }
   if (recovering !== undefined) {
@@ -426,18 +438,20 @@ export function sidebarState(snapshot: Snapshot, connection: ConnectionState = '
     const limit = recovering.maxRecoveryAttempts
     const attemptNumber = (recovering.recoveryCount ?? 0) + 1
     return { ...base, phase: 'recovering', label: 'Recovering',
-      note: `Attempt ${attemptNumber}${limit === undefined ? '' : ` of ${limit}`} for ${recovering.title}.`,
+      note: 'A recovery attempt is running for this task.',
+      count: attemptNumber,
       recovery: { action: `Attempt ${attemptNumber}${limit === undefined ? '' : ` of ${limit}`}`, subject: taskSubject(recovering), since, ageMs: recoveryAge(since, now) },
-      evidence: `task ${recovering.id} recoveryCount=${recovering.recoveryCount ?? 0}` }
+      evidence: `task ${recovering.id} attempt=${attemptNumber}${limit === undefined ? '' : `/${limit}`} recoveryCount=${recovering.recoveryCount ?? 0}` }
   }
   if (firstRunning !== undefined) {
-    return { ...base, phase: 'working', label: runningCount > 1 ? `${runningCount} tasks in progress` : 'Task in progress',
+    return { ...base, phase: 'working', label: runningCount > 1 ? 'Tasks in progress' : 'Task in progress',
+      ...(runningCount > 1 ? { count: runningCount } : {}),
       note: firstRunning.title, evidence: `task ${firstRunning.id} status=running` }
   }
   if (pendingCount > 0) {
     // Pending work with a live member is the runtime's own dispatch turn: the
     // projection does not wake the owner for a state the runtime handles.
-    return { ...base, phase: 'working', label: 'Scheduling the next task', note: `${pendingCount} task(s) ready to dispatch.`, evidence: `${pendingCount} task(s) status=pending` }
+    return { ...base, phase: 'working', label: 'Scheduling the next task', note: 'Ready to dispatch.', count: pendingCount, evidence: `${pendingCount} task(s) status=pending` }
   }
   if (!tasks.length) {
     return { ...base, phase: 'waiting-for-owner', label: 'Waiting for you', note: 'No work has been admitted yet.',

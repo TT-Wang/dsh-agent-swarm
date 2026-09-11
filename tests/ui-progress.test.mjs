@@ -6,6 +6,7 @@ import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import { currentProgress, recentProgress, acceptanceSummary, activityDuration } from '../lib/types/client/progress.js'
 import { MissionProgress } from '../lib/types/client/MissionProgress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
+import { activityGroups } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DeliveryPanel } from '../lib/types/client/DeliveryPanel.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -228,4 +229,104 @@ test('a persisted delivery receipt keeps the completed result marked applied aft
   assert.match(markup, /data-action="apply-delivery"[^>]*disabled=""[^>]*>Applied</)
   assert.match(markup, /View changes/)
   assert.match(markup, /Result applied to working files/)
+})
+
+test('OWNER PASS 2026-09-11 (second pass, item 1): the activity feed is grouped by durable actor', () => {
+  // Fixture order: seq 1 owner, seq 2 member a, seq 3 and 4 member b.
+  const snapshot = uiSnapshot()
+  const groups = activityGroups(snapshot)
+  assert.deepEqual(groups.map(group => group.actor), ['b', 'a', 'owner'], 'the group with the newest event leads')
+  assert.deepEqual(groups.map(group => group.events.map(event => event.seq)), [[4, 3], [2], [1]], 'each group is newest-first inside')
+  assert.equal(groups[0].name, 'Nova', 'a member actor is named by its member row')
+  assert.equal(groups[0].member.id, 'b')
+  assert.equal(groups.at(-1).name, 'Owner conversation', 'a non-member writer gets a role label, not a raw key')
+  assert.equal(groups.at(-1).member, undefined, 'and no invented member row')
+  const unknown = { ...snapshot, members: [], events: [{ seq: 1, missionId: snapshot.mission.id, type: 'task/accepted', actor: 'member_9f3ac1', data: {}, createdAt: 1 }] }
+  assert.equal(activityGroups(unknown)[0].name, 'member_9', 'an unknown actor is shortened, never invented')
+  const markup = render(SwarmBoard, { snapshot, initialView: 'activity' })
+  assert.deepEqual([...markup.matchAll(/data-swarm-activity-group="([^"]+)"/g)].map(match => match[1]), ['b', 'a', 'owner'],
+    'the rendered groups keep the derived order')
+  assert.match(markup, /data-swarm-activity-group="b"[\s\S]*?class="sw-worker-avatar"/, 'a member group header draws that member’s sprite')
+  assert.match(markup, /data-swarm-activity-group="b"[\s\S]*?2 events/, 'and its own event count')
+  assert.doesNotMatch(markup, /data-swarm-activity-group="owner"[\s\S]*?sw-worker-avatar/, 'the owner group draws no worker sprite')
+  assert.equal((markup.match(/class="sw-event"/g) ?? []).length, snapshot.events.length, 'grouping keeps every event row')
+  assert.doesNotMatch(markup, /class="sw-event-data">a · |class="sw-event-data">b · /, 'a row no longer repeats the actor its header already names')
+})
+
+test('OWNER PASS 2026-09-11 (second pass, item 2): lane counts lead the board and empty lanes collapse', () => {
+  const snapshot = uiSnapshot()
+  const markup = render(SwarmBoard, { snapshot, initialView: 'board' })
+  assert.match(markup, /data-swarm-lane-counts=""/, 'the distribution strip exists')
+  const chips = [...markup.matchAll(/data-lane-count="([^"]+)" data-empty="(true|false)">[^<]*<b>(\d+)<\/b>/g)]
+    .map(match => ({ lane: match[1], empty: match[2] === 'true', count: Number(match[3]) }))
+  assert.equal(chips.length, 7, 'all seven lanes are counted')
+  const cards = new Map()
+  for (const card of markup.matchAll(/class="sw-task" data-lane="([^"]+)"/g)) cards.set(card[1], (cards.get(card[1]) ?? 0) + 1)
+  for (const chip of chips) {
+    assert.equal(chip.count, cards.get(chip.lane) ?? 0, `the ${chip.lane} count matches its column`)
+    assert.equal(chip.empty, chip.count === 0, `the ${chip.lane} chip agrees with its own emptiness`)
+  }
+  assert.ok(chips.some(chip => chip.count > 0) && chips.some(chip => chip.count === 0), 'the fixture exercises an occupied and an empty lane')
+  const empty = chips.find(chip => chip.empty)
+  const at = markup.indexOf(`class="sw-lane" data-lane="${empty.lane}" data-empty=""`)
+  assert.ok(at > 0, `the empty ${empty.lane} lane is marked collapsed`)
+  const lane = markup.slice(at, markup.indexOf('</section>', at))
+  assert.match(lane, /sw-lane-void/, 'an empty lane draws one thin rule instead of a dashed placeholder box')
+  assert.doesNotMatch(lane, /class="sw-task"|class="sw-empty"/, 'and holds neither a card nor a placeholder')
+  const occupied = chips.find(chip => chip.count > 0)
+  assert.match(markup, new RegExp(`class="sw-lane" data-lane="${occupied.lane}"(?! data-empty)`), 'an occupied lane stays a normal column')
+  assert.match(markup, /Work board <span class="sw-count">5<\/span>/, 'the board tab counts the tasks it holds')
+  assert.match(markup, /Dependency graph <span class="sw-count">5<\/span>/, 'and so does the graph tab')
+})
+
+test('OWNER PASS 2026-09-11 (second pass, item 3): a long durable reason is one clipped line that unfolds', () => {
+  const long = `Workspace preparation failed: ${'uncommitted work under a deeply nested path '.repeat(6)}`
+  const blocked = uiSnapshot()
+  blocked.events.push({ seq: 30, missionId: blocked.mission.id, type: 'task/blocked', actor: 'runtime', data: { taskId: 't5', reason: long }, createdAt: blocked.mission.updatedAt })
+  const markup = render(SwarmBoard, { snapshot: blocked, initialView: 'board' })
+  assert.match(markup, /data-swarm-reason="full"/, 'a paragraph-sized reason becomes a disclosure')
+  const summary = (markup.match(/<summary data-swarm-task-reason="">([\s\S]*?)<\/summary>/) ?? [])[1]
+  assert.ok(summary && summary.length < 130, `the collapsed line stays on one line, saw ${summary?.length}`)
+  assert.ok(summary.endsWith('…'), 'the clip is visible, never silent')
+  assert.ok(markup.includes(long), 'and the full reason is one disclosure away')
+  const short = uiSnapshot()
+  short.events.push({ seq: 31, missionId: short.mission.id, type: 'task/blocked', actor: 'runtime', data: { taskId: 't5', reason: 'Workspace preparation failed' }, createdAt: short.mission.updatedAt })
+  const inline = render(SwarmBoard, { snapshot: short, initialView: 'board' })
+  assert.match(inline, /data-swarm-task-reason="">Workspace preparation failed<\/p>/, 'a short reason stays on the card, inline')
+  assert.doesNotMatch(inline, /data-swarm-reason="full"/, 'with no second disclosure to open')
+})
+
+test('OWNER PASS 2026-09-11 (second pass, item 5): the focus line states what its phase was derived from', () => {
+  // The fixture has a submitted artifact with no live review, so the projection
+  // waits for the owner and the disclosure shows exactly that fact.
+  const markup = render(SwarmBoard, { snapshot: uiSnapshot() })
+  assert.match(markup, /data-swarm-owner-state="waiting-for-owner"/, 'the disclosure carries the projected phase')
+  assert.match(markup, /data-swarm-owner-label="">Waiting for your decision<\/p>/, 'and the projection’s own label')
+  assert.match(markup, /data-swarm-owner-note="">A submitted artifact has no live independent review path\.<\/p>/)
+  assert.match(markup, /data-swarm-owner-evidence="">task t4 status=submitted without a live review<\/span>/, 'the durable fact behind the phase is printed')
+  assert.match(markup, /data-swarm-decision-content="">Admit an independent review or cancel the submission\./, 'and the decision says what to do about it')
+  // A running task is the working phase, with the same derivation available.
+  const running = uiSnapshot()
+  running.tasks[3] = { ...running.tasks[3], status: 'accepted' }
+  const runningMarkup = render(SwarmBoard, { snapshot: running })
+  assert.match(runningMarkup, /data-swarm-owner-state="working"/)
+  assert.match(runningMarkup, /data-swarm-owner-label="">Task in progress<\/p>/)
+  assert.match(runningMarkup, /data-swarm-owner-evidence="">task t2 status=running<\/span>/)
+  // A count travels beside the label instead of inside a sentence no catalogue can translate.
+  const many = { ...running, tasks: running.tasks.map(task => task.id === 't5' ? { ...task, status: 'running' } : task) }
+  assert.match(render(SwarmBoard, { snapshot: many }), /data-swarm-owner-label="">Tasks in progress 2<\/p>/)
+  // A blocked task states the decision it waits for, including its content.
+  const blocked = uiSnapshot()
+  blocked.tasks[2] = { ...blocked.tasks[2], status: 'blocked' }
+  const blockedMarkup = render(SwarmBoard, { snapshot: blocked })
+  assert.match(blockedMarkup, /data-swarm-owner-state="waiting-for-owner"/)
+  assert.match(blockedMarkup, /data-swarm-owner-label="">Waiting for your decision<\/p>/)
+  assert.match(blockedMarkup, /data-swarm-owner-note="">Cannot make progress without a repair\.<\/p>/)
+  assert.match(blockedMarkup, /data-swarm-decision-content="">Repair the task or withdraw it\./)
+  assert.match(blockedMarkup, /data-swarm-owner-evidence="">task t3 status=blocked epoch 1<\/span>/)
+  const chinese = render(SwarmBoard, { snapshot: blocked }, true)
+  assert.match(chinese, /状态依据/, 'the provenance summary is translated')
+  assert.match(chinese, /等待你决定/, 'so is the phase label that used to be English-only')
+  assert.match(chinese, /依据: /, 'and the derivation line')
+  assert.doesNotMatch(chinese, /Why this state|Derived from|Waiting for your decision|consumption unknown/, 'the focus line leaks no English copy')
 })

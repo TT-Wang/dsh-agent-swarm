@@ -53,7 +53,18 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     </p>}
     {owner.recovery && <p className="sw-focus-note" data-swarm-recovery={owner.recovery.subject}>{t(owner.recovery.action)}
       {owner.recovery.ageMs === undefined ? '' : ` · ${Math.round(owner.recovery.ageMs / 1000)}${t('sec')}`}{owner.recovery.since === undefined ? ` · ${t('start time unknown')}` : ''}</p>}
-    {owner.decision && <p className="sw-focus-note" data-swarm-decision={owner.decision.subject}>{t('Waiting for you')}: {owner.decision.subject} · {t('consumption unknown')}</p>}
+    {owner.decision && <p className="sw-focus-note" data-swarm-decision={owner.decision.subject}>{t('Waiting for you')}: {owner.decision.subject} · {t('consumption unknown')}
+      <span className="sw-decision-content" data-swarm-decision-content="">{t(owner.decision.content)}</span></p>}
+    {/* OWNER PASS 2026-09-11 (second pass): the projection's label, note, count
+        and durable evidence used to be derived and then dropped; they are the
+        answer to "why does this line say that", so they are shown here — behind
+        one disclosure, so the summary never repeats the headline above it. */}
+    <details className="sw-why" data-swarm-owner-state={owner.phase}>
+      <summary>{t('Why this state')}</summary>
+      <p className="sw-focus-note" data-swarm-owner-label="">{t(owner.label)}{owner.count === undefined ? '' : ` ${owner.count}`}</p>
+      {owner.note && <p className="sw-focus-note" data-swarm-owner-note="">{t(owner.note)}</p>}
+      <p className="sw-refs">{t('Derived from')}: <span className="sw-code" data-swarm-owner-evidence="">{owner.evidence}</span></p>
+    </details>
     {live && (current.stale || owner.stale) && <p className="sw-focus-note">{t('Current execution is unconfirmed until updates resume.')}</p>}
   </div>
 }
