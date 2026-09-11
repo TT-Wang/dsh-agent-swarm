@@ -105,7 +105,6 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(canonical(value)) ?? 'null'
 }
 export const digestText = (text: string): string => `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`
-export const digestPayload = (value: unknown): string => digestText(canonicalJson(value))
 /** W3C trace context id: deterministic from the mission, so worker hops join one trace. */
 export const traceIdFor = (missionId: string): string => createHash('sha256').update(missionId, 'utf8').digest('hex').slice(0, 32)
 export const traceparentFor = (traceId: string, spanId: string): string => `00-${traceId}-${spanId}-01`
@@ -1009,15 +1008,6 @@ export interface ReplayCommand {
   sourceTaskId?: string
   verdict?: 'accepted' | 'rejected'
   commit?: string
-}
-/** Stable comparison key; only fields both the durable log and the adapter can know. */
-export function commandKey(command: ReplayCommand): string {
-  switch (command.kind) {
-    case 'dispatch': return `dispatch:${command.taskId}:${command.memberId}`
-    case 'verify': return `verify:${command.sourceTaskId}`
-    case 'stop': return `stop:${command.memberId}`
-    case 'checkpoint': return `checkpoint:${command.taskId}:${command.commit}`
-  }
 }
 export const replayDigest = (keys: readonly string[]): string => digestText(keys.join('\n'))
 

@@ -132,12 +132,6 @@ export async function authorizeWorkspace(requested: string, sessionCwd: string |
   return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded) }
 }
 
-/** Narrow an authorization to the resolved workspace or fail with its diagnostic. */
-export function boundWorkspace(authorization: WorkspaceAuthorization): string {
-  if (!authorization.ok) throw new Error(authorization.diagnostic)
-  return authorization.workspace
-}
-
 /**
  * Re-validate a workspace already recorded on a mission, using the mission's
  * own durable `workspaceGrantRoot` as the recorded anchor:

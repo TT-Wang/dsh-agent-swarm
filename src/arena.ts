@@ -200,15 +200,6 @@ export function noticeLedger(deliveries: readonly Delivery[], limit = 20): Notic
   return deliveries.map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
 }
 
-/** The most recent notice of one class, used for witness dedup and reporting. */
-export function lastNoticeOfClass(deliveries: readonly Delivery[], noticeClass: NoticeClass): NoticeLedgerEntry | undefined {
-  for (let index = deliveries.length - 1; index >= 0; index--) {
-    const entry = noticeEntry(deliveries[index]!)
-    if (entry !== undefined && entry.class === noticeClass) return entry
-  }
-  return undefined
-}
-
 /**
  * Whether the same class already announced the same state fingerprint from the
  * same sender. `content` narrows the match to an identical message. A different
