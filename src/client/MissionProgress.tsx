@@ -38,9 +38,12 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     <strong>{t(current.label)}</strong>
     {current.task && <p>{current.task.title}</p>}
     {current.note && <p className="sw-focus-note">{t(current.note)}</p>}
+    {/* OWNER PASS 2026-09-11: the member sprite lives in the member's own row
+        (`TeamActivity`), not floating in the mission focus line, and the row is
+        also where the member's progress bar is. This line keeps the name for
+        screen readers and the focus contract without drawing a second avatar. */}
     {current.member && <p className="sw-focus-note sw-person" data-swarm-member={current.member.id}
       data-swarm-worker-name={current.member.name} data-swarm-worker-role={current.member.role}>
-      <WorkerAvatar name={current.member.name} />
       {`${current.member.name} · ${current.member.role}`}{current.activity?.tool ? ` · ${current.activity.tool}` : ''}
     </p>}
     {current.activity && <p className="sw-focus-note"><span data-swarm-elapsed={current.activity.startedAt}>{t('Elapsed')} {duration!.minutes > 0 ? `${duration!.minutes}${t('min')} ` : ''}{duration!.seconds}{t('sec')}</span>

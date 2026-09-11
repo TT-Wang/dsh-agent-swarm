@@ -11,7 +11,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { boardIndex, dependencyMet, durableVerdict, eventSummary, readSnapshot, retiredReviews, snapshotFromResult, taskLane } from '../lib/types/client/projection.js'
+import  {  boardIndex, dependencyMet, durableVerdict, eventSummary, readSnapshot, retiredReviews, snapshotFromResult, taskLane , cancellationNotes }  from '../lib/types/client/projection.js'
 import { recentProgress, taskReasons } from '../lib/types/client/progress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { RecentProgress } from '../lib/types/client/MissionProgress.js'
@@ -474,4 +474,31 @@ test('F-12/F-13 client surface: durable verdict naming, retired siblings, retain
   assert.equal((activity.match(/class="sw-event"/g) ?? []).length, 60)
   assert.match(activity, /events retained in this snapshot\./)
   assert.doesNotMatch(activity, /Showing the latest 40/)
+})
+
+test('OWNER PASS 2026-09-11: the cancelled lane names why each task was withdrawn', () => {
+  const snapshot = uiSnapshot()
+  const base = snapshot.tasks[4]
+  snapshot.mission.status = 'active'
+  const repair = { ...base, id: 't6', status: 'pending', replaces: [base.id] }
+  const retired = { ...base, id: 't7', kind: 'verification', reviewOf: 't2', status: 'cancelled' }
+  const withdrawn = { ...base, id: 't8', status: 'cancelled' }
+  const endOfMission = { ...base, id: 't9', status: 'cancelled' }
+  const orphan = { ...base, id: 't10', status: 'cancelled' }
+  const cancelled = { ...base, id: 't11', status: 'cancelled' }
+  const completed = { ...snapshot, mission: { ...snapshot.mission, status: 'completed' }, tasks: [...snapshot.tasks, repair, retired, withdrawn, endOfMission, orphan, cancelled],
+    events: [...snapshot.events, { seq: 90, missionId: snapshot.mission.id, type: 'task/cancelled', actor: 'owner', data: { taskId: withdrawn.id, reason: 'owner withdrew a duplicate' }, createdAt: snapshot.mission.updatedAt }] }
+  // The end-of-mission case must be judged before the completed snapshot exists.
+  const active = { ...completed, mission: { ...snapshot.mission, status: 'active' }, tasks: [...snapshot.tasks, repair, retired, withdrawn, orphan, cancelled] }
+  const notes = cancellationNotes(active)
+  assert.deepEqual(notes.get(retired.id), { kind: 'retired-review', detail: 'Implement lease renewal and fencing' })
+  assert.deepEqual(notes.get(withdrawn.id), { kind: 'withdrawn', detail: 'owner withdrew a duplicate' })
+  assert.equal(notes.get(orphan.id).kind, 'unrecorded')
+  assert.equal(notes.get(cancelled.id).kind, 'unrecorded', 'the repair target is not itself classified as superseded without a naming repair')
+  // A repair that names the task supersedes it, and a completed mission explains the rest.
+  const withRepair = cancellationNotes({ ...active, tasks: [...snapshot.tasks, { ...repair, replaces: [cancelled.id] }, retired, withdrawn, orphan, cancelled] })
+  assert.deepEqual(withRepair.get(cancelled.id), { kind: 'superseded', detail: repair.title })
+  assert.equal(cancellationNotes(completed).get(orphan.id).kind, 'at-completion')
+  // The board places them in the cancelled lane, never in blocked.
+  assert.equal(taskLane(cancelled, active.tasks), 'cancelled')
 })

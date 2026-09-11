@@ -53,6 +53,51 @@ export function currentProgress(snapshot: Snapshot, connection: ConnectionState 
 }
 
 /** Elapsed wall time describes an observed operation; it is never a completion estimate. */
+/**
+ * OWNER PASS 2026-09-11: one member's live row — the state, the task it holds and
+ * the bar under it. The bar is determinate only when the snapshot carries a real
+ * bound; otherwise it is an indeterminate live bar rather than an invented
+ * percentage:
+ *  - `steps`: the task's own step ceiling (`usedSteps`/`maxSteps`, both durable);
+ *  - `lease`: the attempt's lease countdown (a countdown, not a ratio — the
+ *    attempt record has no start instant, so a fraction would be a guess);
+ *  - no bound: `percent` is undefined and the CSS animation carries "working".
+ */
+export type MemberRowState = 'working' | 'waiting' | 'idle' | 'stopped'
+export interface MemberProgressView {
+  state: MemberRowState
+  task?: Task
+  activity?: WorkerActivity
+  /** 0..100 when a durable bound exists; undefined means an indeterminate live bar. */
+  percent?: number
+  basis?: 'steps' | 'lease'
+  /** `used/limit` for a step ceiling; rendered with the caller's locale. */
+  basisCount?: string
+  /** Whole seconds left on the attempt lease; 0 means it already expired. */
+  leaseRemaining?: number
+}
+export function memberProgress(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>, now: number): MemberProgressView {
+  const task = memberTask(member, tasks)
+  const activity = member.activity ?? memberActivity(member, tasks)
+  const state: MemberRowState = member.phase === 'stopped' || member.status === 'stopped' ? 'stopped'
+    : member.status === 'working' || (task !== undefined && member.status !== 'waiting') ? 'working'
+      : member.status === 'waiting' ? 'waiting' : 'idle'
+  if (task?.usedSteps !== undefined && task.maxSteps !== undefined && task.maxSteps > 0) {
+    const percent = Math.max(0, Math.min(100, (task.usedSteps / task.maxSteps) * 100))
+    return { state, task, ...(activity === undefined ? {} : { activity }), percent, basis: 'steps', basisCount: `${task.usedSteps}/${task.maxSteps}` }
+  }
+  if (task?.attempt !== undefined) {
+    return { state, task, ...(activity === undefined ? {} : { activity }), basis: 'lease',
+      leaseRemaining: Math.max(0, Math.round((task.attempt.leaseUntil - now) / 1000)) }
+  }
+  return { state, task, ...(activity === undefined ? {} : { activity }) }
+}
+/** The running task one member owns, or undefined when it holds none. */
+function memberTask(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>): Task | undefined {
+  if (!Array.isArray(tasks)) return (tasks as ReadonlyMap<string, Task>).get(member.id)
+  return (tasks as readonly Task[]).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+}
+
 export function activityDuration(startedAt: number, now: number): { minutes: number; seconds: number } {
   const elapsed = Number.isFinite(startedAt) && Number.isFinite(now) ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0
   return { minutes: Math.floor(elapsed / 60), seconds: elapsed % 60 }

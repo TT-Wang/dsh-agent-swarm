@@ -41,15 +41,24 @@ async function nativeClient(packageName) {
   } finally { styleLoader.deregister() }
 }
 
-test('board distinguishes dependency-blocked work from dispatchable work and clamps budget', () => {
+test('board separates queued, blocked and cancelled work and clamps budget', () => {
+  // OWNER PASS 2026-09-11: waiting on live work is "queued"; only a dead
+  // prerequisite, a stopped assignee or a vanished review source is "blocked";
+  // withdrawals get their own lane instead of sharing it with blocked work.
   const { tasks } = uiSnapshot()
-  assert.equal(taskLane(tasks[2], tasks), 'blocked')
+  assert.equal(taskLane(tasks[2], tasks), 'queued', 'a review whose source is still running is queued, not blocked')
   assert.equal(taskLane(tasks[4], tasks), 'ready')
   assert.equal(taskLane(tasks[0], tasks), 'done')
   const review = { ...tasks[2], dependencies: [], reviewOf: tasks[1].id }
-  assert.equal(taskLane(review, tasks), 'blocked', 'review waits for source submission')
+  assert.equal(taskLane(review, tasks), 'queued', 'review waits for source submission')
   assert.equal(taskLane({ ...review, reviewOf: 'missing-source' }, tasks), 'blocked', 'missing review source is never ready')
   assert.equal(taskLane(review, tasks.map(task => task.id === review.reviewOf ? { ...task, status: 'submitted' } : task)), 'ready')
+  const cancelled = { ...tasks[4], status: 'cancelled' }
+  assert.equal(taskLane(cancelled, tasks), 'cancelled', 'a withdrawal has its own lane')
+  const blockedByDead = { ...tasks[4], dependencies: [cancelled.id] }
+  assert.equal(taskLane(blockedByDead, [...tasks, cancelled]), 'blocked', 'a dead prerequisite blocks instead of queueing')
+  const queuedBehindLive = { ...tasks[4], dependencies: [tasks[1].id] }
+  assert.equal(taskLane(queuedBehindLive, tasks), 'queued', 'a live prerequisite queues instead of blocking')
   assert.equal(remainingPercent(140, 100), 0)
   assert.equal(remainingPercent(0, 0), 0)
 })

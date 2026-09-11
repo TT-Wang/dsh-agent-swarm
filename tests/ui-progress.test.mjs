@@ -109,18 +109,79 @@ test('default historical card is compact and technical views are opt-in', () => 
   const snapshot = withActivity()
   const markup = render(SwarmBoard, { snapshot, onOpenWorker() {} })
   assert.match(markup, /Recorded state/)
-  assert.match(markup, /data-swarm-details="team"/)
+  // OWNER PASS 2026-09-11: members moved out of their disclosure into the top
+  // dynamic area, each with an avatar and its own progress bar; the technical
+  // pane stays opt-in and now opens on a title with unfoldable facts.
+  assert.match(markup, /data-swarm-team=""/)
+  assert.match(markup, /class="sw-bar"/)
   assert.match(markup, /data-swarm-details="technical"/)
+  assert.doesNotMatch(markup, /data-swarm-details="team"/)
   assert.match(markup, /data-swarm-accepted="">1 \/ 5 tasks accepted/)
   assert.doesNotMatch(markup, /role="tab"|class="sw-metrics"|class="sw-board"/)
   assert.equal((markup.match(/data-swarm-progress-event=/g) ?? []).length, 3)
   const expanded = render(SwarmBoard, { snapshot, initialView: 'graph' })
   assert.match(expanded, /data-swarm-details="technical" open=""/)
+  assert.match(expanded, /data-swarm-details="mission"/, 'the detailed facts unfold inside the technical pane')
+  assert.match(expanded, /class="sw-fact-title"/, 'that pane opens on a title')
   assert.match(expanded, /role="tabpanel" aria-label="Dependency graph"/)
   const chinese = render(SwarmBoard, { snapshot }, true)
   assert.match(chinese, /智能体正在思考/)
   assert.match(chinese, /任务与资源详情/)
   assert.match(chinese, /项已验收/)
+})
+
+
+test('OWNER PASS 2026-09-11: members sit in the dynamic area with an avatar and their own live bar', () => {
+  const snapshot = uiSnapshot()
+  const markup = render(SwarmBoard, { snapshot, onOpenWorker() {} })
+  // Item 5: the roster is part of the default overview, above the opt-in
+  // technical pane, and it is no longer a disclosure.
+  const team = markup.indexOf('data-swarm-team')
+  const technical = markup.indexOf('data-swarm-details="technical"')
+  assert.ok(team > 0 && technical > team, 'the team strip precedes the technical pane')
+  assert.doesNotMatch(markup, /data-swarm-details="team"/)
+  // Item 1: the mission focus line draws no avatar; the sprite lives in the rows.
+  const focus = markup.slice(markup.indexOf('class="sw-focus"'), markup.indexOf('data-swarm-team'))
+  assert.doesNotMatch(focus, /<svg/, 'the focus line carries no avatar')
+  assert.equal((markup.match(/class="sw-worker-avatar"/g) ?? []).length, snapshot.members.length, 'one sprite per member row')
+  assert.doesNotMatch(markup, /class="sw-avatar"/, 'the initials block is gone')
+  // Item 2/5: every member row carries a bar; a step ceiling is determinate and a
+  // bare attempt is a lease countdown (never an invented percentage).
+  assert.equal((markup.match(/class="sw-bar"/g) ?? []).length, snapshot.members.length, 'one bar per member')
+  assert.match(markup, /data-swarm-member-basis="lease"/, 'the running attempt shows its lease')
+  assert.match(markup, /data-basis="lease"/, 'and the bar is the lease one')
+  const ceiling = uiSnapshot()
+  ceiling.tasks[1].usedSteps = 3
+  ceiling.tasks[1].maxSteps = 12
+  const bounded = render(SwarmBoard, { snapshot: ceiling, onOpenWorker() {} })
+  assert.match(bounded, /data-swarm-member-basis="steps">steps 3\/12</, 'a declared step ceiling shows the ratio')
+  assert.match(bounded, /data-basis="steps"/, 'the bounded bar is the step one')
+  assert.match(bounded, /role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="25"/, 'a bounded bar is a meter, not an animation')
+  assert.match(bounded, /<span style="width:25%">/, 'and its width is the durable ratio')
+})
+
+test('OWNER PASS 2026-09-11: the technical pane opens on a title, and the facts unfold below it', () => {
+  const markup = render(SwarmBoard, { snapshot: uiSnapshot(), initialView: 'board' })
+  const facts = markup.indexOf('data-swarm-details="mission"')
+  assert.ok(facts > 0, 'the facts disclosure exists inside the technical pane')
+  assert.ok(markup.indexOf('class="sw-fact-title"') > facts, 'it opens on the mission title')
+  assert.ok(markup.indexOf('class="sw-metrics"') > facts, 'the metrics grid is inside the unfoldable facts')
+  assert.ok(!markup.includes('data-swarm-details="mission" open='), 'and it is collapsed by default')
+})
+
+
+test('OWNER PASS 2026-09-11: the new team labels are translated, not English leaks', () => {
+  const snapshot = uiSnapshot()
+  const chinese = render(SwarmBoard, { snapshot, onOpenWorker() {} }, true)
+  assert.match(chinese, /团队动态/, 'the team strip title is translated')
+  assert.match(chinese, /名成员/, 'the member count is translated')
+  assert.match(chinese, /工作中/, 'a working member reads in Chinese')
+  assert.doesNotMatch(chinese, />Team activity</, 'no English team label leaks')
+  const cancelled = uiSnapshot()
+  cancelled.tasks[4] = { ...cancelled.tasks[4], status: 'cancelled' }
+  const lanes = render(SwarmBoard, { snapshot: cancelled, initialView: 'board' }, true)
+  assert.match(lanes, /已取消/, 'the cancelled lane is translated')
+  assert.doesNotMatch(lanes, />Cancelled</, 'and it is not left in English')
 })
 
 test('completed summary presents accepted output and actual review counts, never an unaccepted claim', () => {

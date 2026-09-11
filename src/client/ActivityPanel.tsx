@@ -70,10 +70,19 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const showMissionPicker = drafts.length + snapshots.length > 1 || (selected === 'new' && drafts.length + snapshots.length > 0)
   const draft = drafts.find(item => `draft:${item.id}` === selected)
   const snapshot = snapshots.find(item => `mission:${item.mission.id}` === selected)
+  // OWNER PASS 2026-09-11 (review C1): the generation fence is advanced in an
+  // effect, never during render. Mutating the ref while rendering also ran for a
+  // render React discarded, which advanced the fence past the committed one and
+  // made every in-flight pause/stop/apply result look stale — the user action
+  // then vanished with no error.
   const selectedContext = useRef({ key: '', generation: 0 })
+  const [generation, setGeneration] = useState(0)
   const context = `${owner ?? ''}:${selected}`
-  if (selectedContext.current.key !== context) selectedContext.current = { key: context, generation: selectedContext.current.generation + 1 }
-  const generation = selectedContext.current.generation
+  useEffect(() => {
+    if (selectedContext.current.key === context) return
+    selectedContext.current = { key: context, generation: selectedContext.current.generation + 1 }
+    setGeneration(selectedContext.current.generation)
+  }, [context])
   const stillSelected = () => selectedContext.current.key === context && selectedContext.current.generation === generation
   const selectedStart = snapshot ? starts.find(item => item.missionId === snapshot.mission.id) : selected === 'new' || draft ? undefined : latestStart
   const start = selectedStart && ['planning', 'launching', 'failed'].includes(selectedStart.status) ? selectedStart : undefined

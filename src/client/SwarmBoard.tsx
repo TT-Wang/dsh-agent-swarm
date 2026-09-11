@@ -1,11 +1,11 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import { memo, useMemo, useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
-import { LANES, boardIndex, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type DurableVerdict, type RetiredReview } from './projection.ts'
+import { LANES, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useNow } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
-import { MissionProgress, RecentProgress, ResultSummary } from './MissionProgress.tsx'
-import { activityLabels, memberActivity, runningByOwner, taskReasons, type ConnectionState } from './progress.ts'
+import { MissionProgress, RecentProgress, ResultSummary, WorkerAvatar } from './MissionProgress.tsx'
+import { activityLabels, memberActivity, memberProgress, runningByOwner, taskReasons, type ConnectionState } from './progress.ts'
 
 type View = 'board' | 'evidence' | 'activity' | 'graph'
 function time(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
@@ -37,9 +37,15 @@ function UsageBreakdown({ worker, owner, steps }: { worker?: UsageBuckets; owner
     <p className="sw-small">{t('Worker requests are physical model calls; steps count logical worker turns')} · {steps} {t('steps')}. {t('Owner usage is attributed by time window and is not charged to the worker budget.')}</p>
   </details>
 }
-function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, onCancel }: {
+/** How the cancelled lane explains itself; the board never guesses a cause it was not given. */
+const cancellationLabels: Record<CancellationKind, string> = {
+  superseded: 'superseded by a repair', 'retired-review': 'review retired by its verdict',
+  'at-completion': 'still queued when the mission completed', withdrawn: 'withdrawn by the owner',
+  unrecorded: 'cause not recorded in this snapshot',
+}
+function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, cancellation, onCancel }: {
   task: Task; snapshot: Snapshot; live: boolean; now: number; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
-  reason?: string; onCancel?: (task: Task) => void;
+  reason?: string; cancellation?: CancellationNote; onCancel?: (task: Task) => void;
 }) {
   const t = useCopy()
   const [arming, setArming] = useState(false)
@@ -62,6 +68,9 @@ function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, 
     </div>
     {/* W9/W15: the durable reason is visible on the card, not only in the collapsed disclosure. */}
     {reason && <p className="sw-small sw-focus-note" data-swarm-task-reason="">{reason}</p>}
+    {/* Item 4 of the 2026-09-11 UI pass: a cancelled card names which of the four
+        causes it is, instead of sharing one "blocked / cancelled" label. */}
+    {cancellation && <p className="sw-small sw-cancel-note" data-swarm-cancel-kind={cancellation.kind}>{t(cancellationLabels[cancellation.kind])}{cancellation.detail ? ` · ${cancellation.detail}` : ''}</p>}
     {(task.dependencies.length > 0 || task.output || task.scope?.length > 0) && <details><summary>{t('Task details')}</summary>
       {task.objective && <p className="sw-small">{task.objective}</p>}
       {task.dependencies.length > 0 && <p className="sw-refs">{t('Prerequisites')}: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}
@@ -77,19 +86,60 @@ function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, 
     </div>}
   </article>
 }
-function Worker({ member, running, onOpen }: { member: Member; running: ReadonlyMap<string, Task>; onOpen?: (member: Member) => void }) {
+/**
+ * One member's live row. OWNER PASS 2026-09-11:
+ *  - the deterministic pixel sprite replaces the initials block, so the avatar
+ *    sits with the member (it used to be drawn only in the mission focus line
+ *    while this row showed initials);
+ *  - the bar under the name is the member's own dynamic progress: a durable step
+ *    ratio when the task declares a ceiling, a lease countdown when it holds an
+ *    attempt, and otherwise an indeterminate live bar that animates while the
+ *    member works;
+ *  - the row is the same component wherever members are shown, so the roster
+ *    cannot drift between the top strip and any other view.
+ */
+function MemberRow({ member, running, now, live, onOpen }: {
+  member: Member; running: ReadonlyMap<string, Task>; now: number; live: boolean; onOpen?: (member: Member) => void;
+}) {
   const t = useCopy()
-  const current = running.get(member.id)
-  const activity = memberActivity(member, running)
-  return <article className="sw-worker"><div className="sw-row"><div className="sw-person">
-    <span className="sw-avatar" aria-hidden="true">{member.name.slice(0, 2).toUpperCase()}</span>
-    <div><div className="sw-worker-name">{member.name}</div><div className="sw-small">{member.role}</div></div>
-  </div><Badge value={member.status} /></div>
-    {member.model && <div className="sw-small" style={{ marginTop: 8 }}>{member.provider ? `${member.provider} / ` : ''}{member.model}{member.reasoningEffort ? ` · ${member.reasoningEffort}` : ''}</div>}
-    <p className="sw-small" style={{ marginTop: 7 }}>{current?.title ?? t(member.status === 'waiting' ? 'Waiting for input or dependencies' : 'No active task')}</p>
-    {activity && <p className="sw-small" data-swarm-worker-activity={activity.kind}>{t(activityLabels[activity.kind])}{activity.tool ? ` · ${activity.tool}` : ''}</p>}
+  const view = memberProgress(member, running, live ? now : Date.now())
+  const stateLabel = view.state === 'working' ? (view.task?.title ?? t('Working'))
+    : view.state === 'waiting' ? t('Waiting for input or dependencies')
+      : view.state === 'stopped' ? t('Stopped') : t('No active task')
+  return <article className="sw-worker sw-member" data-swarm-member={member.id} data-state={view.state}>
+    <div className="sw-row"><div className="sw-person">
+      <WorkerAvatar name={member.name} />
+      <div><div className="sw-worker-name">{member.name}</div><div className="sw-small">{member.role}</div></div>
+    </div><Badge value={member.status} /></div>
+    <p className="sw-small sw-member-task">{view.state === 'working' && view.task ? view.task.title : stateLabel}</p>
+    <div className="sw-bar" data-basis={view.basis ?? 'live'} data-state={view.state}
+      {...(view.percent === undefined ? { 'data-indeterminate': '' } : { role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(view.percent), 'aria-label': `${member.name}: ${stateLabel}` })}>
+      <span style={view.percent === undefined ? undefined : { width: `${view.percent}%` }} /></div>
+    <div className="sw-small sw-member-meta">
+      {view.basis === 'steps' && view.basisCount !== undefined && <span data-swarm-member-basis="steps">{t('steps')} {view.basisCount}</span>}
+      {view.basis === 'lease' && <span data-swarm-member-basis="lease">{view.leaseRemaining === 0 ? t('lease expired') : `${t('lease')} ${view.leaseRemaining}${t('sec')}`}</span>}
+      {view.activity && <span data-swarm-worker-activity={view.activity.kind}>{t(activityLabels[view.activity.kind])}{view.activity.tool ? ` · ${view.activity.tool}` : ''}</span>}
+      {member.model && <span>{member.provider ? `${member.provider} / ` : ''}{member.model}</span>}
+    </div>
     {onOpen && <button className="sw-link" data-worker-session={member.sessionId} onClick={() => onOpen(member)}>{t('Open conversation')} ↗</button>}
   </article>
+}
+/**
+ * The team strip at the top of the overview: every member with its own live
+ * progress, so the answer to "what is happening" includes who is doing it
+ * without opening a disclosure.
+ */
+function TeamActivity({ members, running, now, live, onOpen }: {
+  members: readonly Member[]; running: ReadonlyMap<string, Task>; now: number; live: boolean; onOpen?: (member: Member) => void;
+}) {
+  const t = useCopy()
+  const working = members.filter(member => member.status === 'working').length
+  return <section className="sw-team" data-swarm-team="" aria-label={t('Team activity')}>
+    <div className="sw-row"><h3>{t('Team activity')}</h3>
+      <span className="sw-small" data-swarm-team-counts="">{working} {t('working')} · {members.length} {t('members')}</span></div>
+    <div className="sw-workers">{members.length === 0 ? <p className="sw-muted">{t('Workers appear when the mission delegates work.')}</p>
+      : members.map(member => <MemberRow key={member.id} member={member} running={running} now={now} live={live} onOpen={onOpen} />)}</div>
+  </section>
 }
 function EvidenceCard({ evidence, index, memberById, verdicts, retiredBySource }: {
   evidence: Evidence; index: BoardIndex; memberById: ReadonlyMap<string, Member>;
@@ -136,7 +186,12 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
   const [view, setView] = useState<View>(initialView ?? 'board')
   const [detailsOpen, setDetailsOpen] = useState(initialView !== undefined)
   const [stream, setStream] = useState('all')
-  const now = useNow(live)
+  // The lease clock ticks only while a lease is on screen: every other card and
+  // the roster render from stable values, so a live mission no longer re-renders
+  // the whole board once per second (2026-09-11 review, M2/C-item).
+  const leaseVisible = live && snapshot.tasks.some(task => task.attempt !== undefined)
+  const now = useNow(leaseVisible)
+  const stableNow = snapshot.mission.updatedAt
   const { mission } = snapshot
   // One index and one lane pass per render; every card, edge and count reuses
   // them, so cost stays linear in tasks + edges (F-34).
@@ -147,6 +202,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
     return map
   }, [index, snapshot.tasks, snapshot.members])
   const reasons = useMemo(() => taskReasons(snapshot), [snapshot])
+  const cancellations = useMemo(() => cancellationNotes(snapshot), [snapshot])
   const memberById = useMemo(() => new Map(snapshot.members.map(member => [member.id, member])), [snapshot.members])
   const running = useMemo(() => runningByOwner(snapshot.tasks), [snapshot.tasks])
   const verdicts = useMemo(() => durableVerdicts(snapshot), [snapshot])
@@ -163,18 +219,22 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
     </header>
     <div className="sw-overview">
       <MissionProgress snapshot={snapshot} live={live} connection={connection} />
+      {actions}
+      {/* Item 5: the members moved out of their disclosure into the dynamic area,
+          each with its own avatar and live progress. */}
+      <TeamActivity members={snapshot.members} running={running} now={now} live={live} onOpen={onOpenWorker} />
       {mission.status === 'completed' && <ResultSummary snapshot={snapshot} />}
       {delivery}
-      {actions}
       <RecentProgress snapshot={snapshot} />
-      <details className="sw-disclosure" data-swarm-details="team"><summary>{t('Team')} <span className="sw-detail-count">{snapshot.members.length}</span></summary>
-        <div className="sw-workers">{snapshot.members.length === 0 ? <p className="sw-muted">{t('Workers appear when the mission delegates work.')}</p>
-          : snapshot.members.map(member => <Worker key={member.id} member={member} running={running} onOpen={onOpenWorker} />)}</div>
-      </details>
     </div>
     <details className="sw-disclosure sw-technical" data-swarm-details="technical" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
       <summary>{t('Task details and resources')}</summary>
       {detailsOpen && <>
+    {/* Item 3: the top of this pane opens on a title plus its headline numbers;
+        the objective, the metrics grid and the usage table unfold from there. */}
+    <details className="sw-section sw-mission-facts" data-swarm-details="mission">
+      <summary><span className="sw-fact-title">{mission.title}</span>
+        <span className="sw-small sw-fact-counts">{accepted} / {snapshot.tasks.length} {t('tasks accepted')} · {compactNumber(mission.usedTokens)} {t('tokens')} · {mission.usedSteps} {t('steps')}</span></summary>
     <p className="sw-objective sw-detail-objective">{mission.objective}</p>
     {technicalDetails}
     <div className="sw-metrics"><Metric label={t('ACCEPTED WORK')} value={`${accepted} / ${snapshot.tasks.length}`} detail={`${blocked} blocked · ${snapshot.workstreams.length} workstreams`} />
@@ -189,6 +249,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
       <Metric label={t('WORKERS')} value={`${activeWorkers} active`} detail={`${snapshot.members.length} workers · cap ${mission.budget.maxWorkers}`} />
     </div>
     <UsageBreakdown worker={mission.workerUsage} owner={mission.ownerUsage} steps={mission.usedSteps} />
+    </details>
     <div className="sw-tabs" role="tablist" aria-label="Mission views">
       <button className="sw-tab" role="tab" aria-selected={view === 'board'} onClick={() => setView('board')}>{t('Work board')}</button>
       <button className="sw-tab" role="tab" aria-selected={view === 'graph'} onClick={() => setView('graph')}>{t('Dependency graph')}</button>
@@ -205,8 +266,9 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
       {view === 'board' && <><div className="sw-board">{LANES.map(lane => {
         const items = tasks.filter(task => lanes.get(task.id) === lane.id)
         return <section className="sw-lane" key={lane.id} aria-label={t(lane.label)}><div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
-          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live} now={now} index={index} memberById={memberById}
-            lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} onCancel={onCancelTask} />)}
+          {items.length === 0 ? <div className="sw-empty">{t('No tasks')}</div> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live}
+            now={task.attempt === undefined ? stableNow : now} index={index} memberById={memberById}
+            lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} cancellation={cancellations.get(task.id)} onCancel={onCancelTask} />)}
         </section>
       })}</div>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">

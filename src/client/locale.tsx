@@ -162,6 +162,10 @@ export const zh: Record<string, string> = {
   'Showing the latest': '显示最近', 'events retained in this snapshot.': '条此快照保留的事件。',
   'Checks run inside the isolated worker sandbox; a command that needs a nested sandbox or host-only tool may fail before your code runs.': '检查命令在隔离的工作沙箱内运行；需要嵌套沙箱或仅限主机的命令可能在运行你的代码前失败。',
   'The provider must accept the selected model and reasoning effort.': '提供商必须支持所选模型和推理强度。',
+  'Team activity': '团队动态', 'members': '名成员', 'Queued': '排队中', 'Cancelled': '已取消', 'Blocked': '受阻',
+  'superseded by a repair': '已被修复任务替代', 'review retired by its verdict': '因源任务判决而撤回的复核',
+  'still queued when the mission completed': '任务完成时仍在排队', 'withdrawn by the owner': '由 owner 撤销', 'cause not recorded in this snapshot': '此快照未记录原因',
+  'lease expired': '租约已到期', 'tokens': 'token', 'Stopped': '已停止',
 }
 export const en = Object.fromEntries(Object.keys(zh).map(key => [key, key]))
 export const CopyContext = createContext<(text: string) => string>(text => text)

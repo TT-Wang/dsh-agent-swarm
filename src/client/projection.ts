@@ -1,10 +1,23 @@
 import type { Member, Snapshot, Task, Evidence } from '../types.ts'
 
-export type BoardLane = 'ready' | 'active' | 'review' | 'done' | 'blocked'
+export type BoardLane = 'ready' | 'queued' | 'active' | 'review' | 'blocked' | 'cancelled' | 'done'
+/**
+ * OWNER PASS 2026-09-11: blocked and cancelled were one lane and one label
+ * ("Blocked / cancelled"), which read every withdrawal as a defect and every
+ * dependency wait as a failure. They are four different facts and the board now
+ * says which one it is:
+ *  - `queued`: waiting on work that is still alive and will advance by itself;
+ *  - `blocked`: cannot advance without an owner decision (a dead dependency, a
+ *    stopped assignee, a review whose source is gone);
+ *  - `cancelled`: withdrawn, with the reason classified on the card by
+ *    {@link cancellationNotes} (superseded repair, retired review, end of
+ *    mission, owner withdrawal, or an unrecorded cause).
+ */
 export const LANES: readonly { id: BoardLane; label: string }[] = [
-  { id: 'ready', label: 'Ready' }, { id: 'active', label: 'In progress' },
-  { id: 'review', label: 'Awaiting acceptance' }, { id: 'done', label: 'Accepted' },
-  { id: 'blocked', label: 'Blocked / cancelled' },
+  { id: 'ready', label: 'Ready' }, { id: 'queued', label: 'Queued' },
+  { id: 'active', label: 'In progress' }, { id: 'review', label: 'Awaiting acceptance' },
+  { id: 'blocked', label: 'Blocked' }, { id: 'cancelled', label: 'Cancelled' },
+  { id: 'done', label: 'Accepted' },
 ]
 
 /** A dependency on a replaced task is met by its accepted repair, mirroring the runtime's lineage rule. */
@@ -66,16 +79,25 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
   }
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   const blockedDependencies = (task: Task): string[] => task.dependencies.filter(id => !dependencyMet(id))
+  // A task is still alive while it can reach an acceptance or a verdict on its
+  // own; only a dead one makes its dependents blocked rather than queued.
+  const alive = (status: string): boolean => status === 'pending' || status === 'running' || status === 'submitted'
   const lane = (task: Task, members?: readonly Member[]): BoardLane => {
     if (task.status === 'accepted') return 'done'
     if (task.status === 'running') return 'active'
     if (task.status === 'submitted') return 'review'
-    if (task.status === 'blocked' || task.status === 'cancelled') return 'blocked'
-    // A review whose source is not submitted can never be dispatched, and a
-    // pending task assigned to a stopped member has no live owner; the runtime
-    // classifies both as unschedulable, so the board must not advertise them.
-    if (task.reviewOf && byId.get(task.reviewOf)?.status !== 'submitted') return 'blocked'
-    if (blockedDependencies(task).length > 0) return 'blocked'
+    if (task.status === 'cancelled') return 'cancelled'
+    if (task.status === 'blocked') return 'blocked'
+    // A review waits while its source is still in flight and is blocked when the
+    // source can no longer become submitted (the runtime calls the latter
+    // unschedulable); a pending task assigned to a stopped member has no live
+    // owner either way.
+    if (task.reviewOf !== undefined) {
+      const source = effective(task.reviewOf)
+      if (source?.status !== 'submitted') return source !== undefined && alive(source.status) ? 'queued' : 'blocked'
+    }
+    const unmet = blockedDependencies(task)
+    if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
     if (members !== undefined && task.assigneeId !== undefined
       && !members.some(member => member.id === task.assigneeId && member.status !== 'stopped')) return 'blocked'
     return 'ready'
@@ -318,6 +340,46 @@ export function durableVerdict(snapshot: Snapshot, evidenceId: string): DurableV
 export interface RetiredReview { id: string; title: string }
 
 /** Withdrawn verification tasks per reviewed source, built in one pass over tasks (F-34). */
+/**
+ * Why a task is sitting in the cancelled lane. Four causes were collapsed into
+ * one label before this pass, and the board could not tell a healthy repair from
+ * a real withdrawal:
+ *  - `superseded`: another task names it in `replaces` (the repair lineage the
+ *    runtime resolves through);
+ *  - `retired-review`: a verification withdrawn because its source reached a
+ *    verdict (the runtime retires sibling reviews);
+ *  - `at-completion`: a mission completed with this task still queued;
+ *  - `withdrawn`: the durable `task/cancelled` event names the owner as actor,
+ *    with the recorded reason as the detail;
+ *  - `unrecorded`: the snapshot carries no cause, stated rather than guessed.
+ */
+export type CancellationKind = 'superseded' | 'retired-review' | 'at-completion' | 'withdrawn' | 'unrecorded'
+export interface CancellationNote { kind: CancellationKind; detail?: string }
+export function cancellationNotes(snapshot: Snapshot): Map<string, CancellationNote> {
+  const index = boardIndex(snapshot.tasks)
+  const replacement = new Map<string, Task>()
+  for (const task of snapshot.tasks) for (const target of task.replaces ?? []) if (!replacement.has(target)) replacement.set(target, task)
+  const withdrawn = new Map<string, string>()
+  for (const event of snapshot.events) {
+    if (event.type !== 'task/cancelled' || event.actor !== 'owner') continue
+    const data = event.data as { taskId?: unknown; reason?: unknown } | undefined
+    if (typeof data?.taskId === 'string' && !withdrawn.has(data.taskId)) withdrawn.set(data.taskId, typeof data.reason === 'string' ? data.reason : '')
+  }
+  const notes = new Map<string, CancellationNote>()
+  for (const task of snapshot.tasks) {
+    if (task.status !== 'cancelled') continue
+    const repair = replacement.get(task.id)
+    if (repair !== undefined) { notes.set(task.id, { kind: 'superseded', detail: repair.title }); continue }
+    if (task.kind === 'verification' && task.reviewOf !== undefined) {
+      notes.set(task.id, { kind: 'retired-review', detail: index.byId.get(task.reviewOf)?.title }); continue
+    }
+    if (snapshot.mission.status === 'completed') { notes.set(task.id, { kind: 'at-completion' }); continue }
+    if (withdrawn.has(task.id)) { notes.set(task.id, { kind: 'withdrawn', ...(withdrawn.get(task.id) ? { detail: withdrawn.get(task.id)! } : {}) }); continue }
+    notes.set(task.id, { kind: 'unrecorded', ...(task.output ? { detail: task.output.slice(0, 160) } : {}) })
+  }
+  return notes
+}
+
 export function retiredReviewsBySource(snapshot: Snapshot): Map<string, RetiredReview[]> {
   const retired = new Map<string, RetiredReview[]>()
   for (const task of snapshot.tasks) {

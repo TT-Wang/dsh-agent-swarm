@@ -51,6 +51,7 @@ import { registerTools } from '../lib/tools.js'
 import { WORKER_NAME_POOL, nextWorkerName } from '../lib/types.js'
 import { AVATAR_CELL, AVATAR_GRID, AVATAR_MAX_CELLS, AVATAR_PALETTE, avatarCells, fnv1a32 } from '../lib/types/client/avatar.js'
 import { MissionProgress } from '../lib/types/client/MissionProgress.js'
+import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { tempDirectory } from './temp-root.mjs'
 
 /** The pool as the specification fixes it, in assignment order. */
@@ -273,14 +274,22 @@ test('the sidebar renders name · role beside an aria-hidden crispEdges sprite a
   f.workers.callbacks.activity(member.id, { id: 'operation-1', kind: 'model', startedAt: Date.now() - 1000, updatedAt: Date.now() })
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.members.find(row => row.id === member.id).activity.kind, 'model')
-  const markup = renderToStaticMarkup(React.createElement(MissionProgress, { snapshot, live: true }))
-  assert.ok(markup.includes(`${member.name} · ${role}`), 'the sidebar shows the name with the role beside it')
-  assert.ok(markup.includes(`data-swarm-worker-name="${member.name}"`), 'the name is addressable in the projection')
-  assert.ok(markup.includes(`data-swarm-worker-role="${role}"`), 'the role is addressable in the projection')
-  assert.ok(markup.includes('shape-rendering="crispEdges"'), 'the sprite is rendered with crispEdges')
+  const focus = renderToStaticMarkup(React.createElement(MissionProgress, { snapshot, live: true }))
+  assert.ok(focus.includes(`${member.name} · ${role}`), 'the focus line names the member with the role beside it')
+  assert.ok(focus.includes(`data-swarm-worker-name="${member.name}"`), 'the name is addressable in the projection')
+  assert.ok(focus.includes(`data-swarm-worker-role="${role}"`), 'the role is addressable in the projection')
+  // OWNER PASS 2026-09-11: the sprite is drawn in the member's own row (the team
+  // strip), not floating in the mission focus line where it used to be; the focus
+  // line keeps the identity text and the row carries name · role beside the sprite.
+  assert.ok(!focus.includes('<svg'), 'the mission focus line draws no avatar')
+  const markup = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, onOpenWorker() {} }))
+  assert.ok(markup.includes('data-swarm-team'), 'the team strip is part of the default overview')
+  const row = markup.slice(markup.indexOf(`data-swarm-member="${member.id}"`), markup.indexOf('Open conversation'))
+  assert.ok(row.includes(`${member.name}`) && row.includes(`${role}`), 'the member row shows the name with the role beside it')
+  assert.ok(row.includes('shape-rendering="crispEdges"'), 'the sprite is rendered with crispEdges in the member row')
   assert.ok(markup.includes('aria-hidden="true"'), 'the sprite is decorative; the name text carries identity')
-  const rects = markup.match(/<rect /g) ?? []
-  assert.equal(rects.length, avatarCells(member.name).cells.length, 'exactly the sprite cells are drawn as inline rects')
+  const rects = (markup.match(/<rect /g) ?? []).length >= avatarCells(member.name).cells.length ? markup.match(/<rect /g) : []
+  assert.equal(rects.length, avatarCells(member.name).cells.length * snapshot.members.length, 'one sprite per member, each drawn as inline rects')
   assert.ok(rects.length <= AVATAR_MAX_CELLS && rects.length >= 24, `the drawn rect count is bounded (${rects.length})`)
   assert.ok(!/<image|xlink:href|url\(|https?:|data:/i.test(markup), 'the sprite is inline: no image asset and no network request')
   assert.ok(!markup.includes('<img'), 'no image element is introduced')
