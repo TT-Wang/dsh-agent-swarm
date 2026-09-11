@@ -30,6 +30,14 @@
  *                     restart only; no snapshot copy, no backup
  *   --dry-run         report what would change; write nothing
  *   --delay <ms>      wait before stopping the old host (default: 2000)
+ *   --launch-timeout-ms <ms>
+ *                     how long the detached worker waits for the new host to
+ *                     publish its launch URL before it rolls the snapshot back
+ *                     (default 300000). The first release's fixed 90s window
+ *                     mis-read a loaded machine's slow boot as a failure: it
+ *                     rolled a working snapshot back and left server.json
+ *                     "failed" while the host was still booting and later
+ *                     published its URL.
  */
 import { cpSync, copyFileSync, existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { execFileSync, spawn } from 'node:child_process'
@@ -169,7 +177,7 @@ const previousPid = server.pid
 if (!dryRun) {
   writeFileSync(serverPath, JSON.stringify({ status: 'restarting', pid: null, previousPid, url: `http://127.0.0.1:${port}`, home, plugin: pluginDir, model: server.model, port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 })
   const statePath = join(preview, `.update-preview-${stamp()}.json`)
-  writeFileSync(statePath, JSON.stringify({ preview, pluginDir, backup, entries, port, harnessRoot, cli, patch, home, workspace, previousPid, model: server.model, delayMs: Number(value('--delay', '2000')) }, null, 2) + '\n', { mode: 0o600 })
+  writeFileSync(statePath, JSON.stringify({ preview, pluginDir, backup, entries, port, harnessRoot, cli, patch, home, workspace, previousPid, model: server.model, delayMs: Number(value('--delay', '2000')), launchTimeoutMs: Number(value('--launch-timeout-ms', '300000')) }, null, 2) + '\n', { mode: 0o600 })
   const out = openSync(logPath, 'a', 0o600)
   const worker = spawn(process.execPath, [self, '--restart-worker', '--state', statePath], { detached: true, stdio: ['ignore', out, out] })
   worker.unref()
@@ -222,7 +230,12 @@ async function runWorker(statePath) {
     return { child, sinceOffset }
   }
   const awaitLaunchUrl = async (child, sinceOffset) => {
-    for (let attempt = 0; attempt < 450; attempt++) {
+    // A loaded host (this machine runs the preview AND the agent session that
+    // deploys it) can take minutes to print its launch URL. Waiting too little is
+    // worse than waiting long: the old 90s window declared a healthy boot a
+    // failure and rolled a working snapshot back.
+    const attempts = Math.max(1, Math.ceil(Number(state.launchTimeoutMs ?? 300000) / 200))
+    for (let attempt = 0; attempt < attempts; attempt++) {
       await sleep(200)
       try {
         const found = selectLaunchUrl(readFileSync(serverLogPath, 'utf8'), sinceOffset, state.port)
@@ -240,7 +253,7 @@ async function runWorker(statePath) {
     let { child, sinceOffset } = await start()
     let url = await awaitLaunchUrl(child, sinceOffset)
     if (!url) {
-      log('new host did not publish a launch url; rolling back the plugin snapshot')
+      log(`new host did not publish a launch url within ${Number(state.launchTimeoutMs ?? 300000)}ms; rolling back the plugin snapshot`)
       await stop(child.pid)
       if (state.backup && existsSync(state.backup)) {
         for (const relative of state.entries) {
