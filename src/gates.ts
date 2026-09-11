@@ -11,7 +11,7 @@ import { arenaView as projectArenaView } from './arena.ts'
 import { excerpt } from './declared-checks.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Budget, Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
+import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
 
 export const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 

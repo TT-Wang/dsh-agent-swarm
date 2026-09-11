@@ -147,7 +147,7 @@ export interface ProposalAllowance {
  * changes it is `maxTasks`, and `swarm_budget` is owner-only. A cancelled task
  * does not consume the allowance (it no longer occupies the board).
  */
-export function proposalAllowance(mission: Pick<Mission, 'budget'>, members: readonly Member[], tasks: readonly Task[], proposer: string): ProposalAllowance {
+export function proposalAllowance(mission: Pick<Mission, 'budget'>, _members: readonly Member[], tasks: readonly Task[], proposer: string): ProposalAllowance {
   const ceiling = Math.max(1, mission.budget.maxTasks)
   const plannedMembers = Math.max(1, mission.budget.maxWorkers)
   const limit = Math.max(1, Math.min(ceiling, Math.ceil(ceiling / plannedMembers)))

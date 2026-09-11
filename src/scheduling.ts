@@ -446,7 +446,6 @@ export class Scheduling {
   guardBoard(missionId: string, mission?: Mission): GuardBoard {
     const row = mission ?? this.rt.store.get('missions', missionId)
     const tasks = this.rt.store.list('tasks', missionId)
-    const members = this.rt.store.list('members', missionId)
     const now = Date.now()
     const revoked = this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')
     return {
@@ -1248,10 +1247,6 @@ export class Scheduling {
       const interval: Interval = { attemptId, taskId, epoch: typeof data?.attempt?.epoch === 'number' ? data.attempt.epoch : 0, memberId: ownerId, claimedAt: event.createdAt, elements: [{ at: event.createdAt, kind: 'claim', isClaim: true }] }
       byAttempt.set(attemptId, interval)
       open.set(taskId, interval)
-    }
-    const attribute = (taskId: string, element: Element): void => {
-      const interval = open.get(taskId)
-      if (interval !== undefined) interval.elements.push(element)
     }
     for (const event of events) {
       if (event.type === 'task/claimed') { claimStart(event); continue }

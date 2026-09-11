@@ -9,8 +9,7 @@
  */
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
-import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -345,13 +344,6 @@ export function gitWriteSubcommand(command: string): string | undefined {
  * denials and must never latch an attempt.
  */
 const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
-
-/**
- * The sandbox's own refusal text. R6-01: retained as the documented refusal
- * vocabulary of the accepted guard artifact, but the denial no longer scans the
- * result, so incidental output text can never claim it or latch an attempt.
- */
-const GIT_WRITE_REFUSAL = /index\.lock|Operation not permitted|EPERM/i
 
 /**
  * A mission's recorded workspace is no longer inside a human-authorized root.

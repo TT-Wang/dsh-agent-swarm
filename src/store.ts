@@ -744,7 +744,7 @@ export function stageRestore(statePath: string, snapshotPath: string, requestedB
   return request
 }
 /** Read one staged restore request, if present. A malformed request fails closed. */
-export function pendingRestore(statePath: string, snapshotDir = `${statePath}.snapshots`): PendingRestore | undefined {
+export function pendingRestore(statePath: string, _snapshotDir = `${statePath}.snapshots`): PendingRestore | undefined {
   try {
     const parsed = JSON.parse(readFileSync(`${statePath}${RESTORE_REQUEST_SUFFIX}`, 'utf8')) as Partial<PendingRestore>
     if (typeof parsed.snapshot !== 'string' || !parsed.snapshot.endsWith(SNAPSHOT_SUFFIX) || basename(parsed.snapshot) !== parsed.snapshot) {

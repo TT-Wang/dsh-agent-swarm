@@ -50,16 +50,24 @@ const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/no
  * are coded and compliant, so the uncoded count is unchanged and the branch's
  * shrink equation still holds.
  */
-const ADDED_SITES = 2
 /**
- * Adopting the host's managed-process seam deleted one *uncoded* refusal together
- * with the launcher it guarded: `runProcess` no longer refuses non-POSIX
- * platforms, because the provider behind `ctx.subprocess` owns process ranges on
- * every platform it supports. That is a real shrink beyond this branch's
- * recoding, so the shrink equation below carries it as its own term rather than
- * pretending a diagnostic code was added for a refusal that no longer exists.
+ * Two later owner passes moved the total again, and both are counted rather than
+ * absorbed into a number:
+ *  - the 2026-09-11 subprocess adoption added two coded refusals
+ *    (`[subprocess_service_required]`, `[subprocess_pipes_missing]`) and deleted
+ *    the POSIX-only launcher's uncoded platform refusal, because the provider
+ *    behind `ctx.subprocess` owns process ranges on every platform it supports;
+ *  - the 2026-09-11 orphan sweep deleted one more uncoded refusal with the dead
+ *    `Workspaces.assertRecordAuthorized` (`'Mission source workspace changed'` —
+ *    its protection lives on at `workspaces.ts:1358`).
+ *
+ * Net against the pre-branch 235: three coded sites added, two uncoded sites
+ * deleted. Every added site is coded and compliant, so the shrink equation below
+ * carries the deletions as their own term instead of pretending a diagnostic code
+ * was added for a refusal that no longer exists.
  */
-const REMOVED_UNCODED_SITES = 1
+const ADDED_SITES = 3
+const REMOVED_UNCODED_SITES = 2
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {
@@ -95,7 +103,7 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
       if (assessRefusal(site, { ...index, diagnosticProducers: producers }).length) uncoded++
     }
   }
-  assert.equal(total, 235 + ADDED_SITES, 'the split control-path files still expose every refusal site (186 + 49, plus this round\'s coded site)')
+  assert.equal(total, 235 + ADDED_SITES - REMOVED_UNCODED_SITES, 'the split control-path files still expose every refusal site (186 + 49, plus this round\'s coded site)')
   assert.ok(uncoded < PRE_BRANCH_UNCODED,
     `this branch must shrink the uncoded inventory (pre-branch ${PRE_BRANCH_UNCODED}, now ${uncoded})`)
   assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length - REMOVED_UNCODED_SITES,

@@ -1,29 +1,27 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
-import { realpath } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
-import { isContained, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts } from './attempts.ts'
-import { WorkspaceAdmission, WorkspaceRevokedError, executedShellCommand, gitWriteDeniedMessage, gitWriteSubcommand, sharedTempPaths, tempRendezvousDecision, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
+import type { WorkspaceGrantSnapshot } from './authorization.ts'
+import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions, type WakePrecision } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { MissionProjection, deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
-export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
-import { RuntimeGates, emptyUsage, addUsage, missionFingerprint, BOARD_BODY_EXCERPT, BOARD_DELTA_POSTS, DEFAULT_BUDGET_WARN_AT, postView, type MissionFingerprintBoard, type MissionFingerprintTask } from './gates.ts'
+export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
+import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
-import { arenaView as projectArenaView, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger, proposalAllowance as computeProposalAllowance } from './arena.ts'
-import { AdmissionRefusedError, admissionRowId, classifyProviderOutage, decideAdmission, defaultLimitRules, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type AdmissionUsage, type LimitLevel, type LimitRule } from './scheduler.ts'
+import { proposalAllowance as computeProposalAllowance } from './arena.ts'
+import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope } from './scope.ts'
-import { absoluteCheckPaths, assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, missingReviewDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, shellSegments, taskCeilingBlock } from './admission.ts'
+import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, Artifact, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import type { Actor, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
@@ -208,8 +206,6 @@ export class CheckEnvironmentMismatchError extends Error {
 }
 /** ENV-R: the environment names the declared-check envelope records. */
 const SELF_RUN_FACTS = new Set(['HOME', 'XDG_CACHE_HOME', 'npm_config_cache', 'YARN_CACHE_FOLDER', 'PIP_CACHE_DIR', 'GOCACHE'])
-/** ENV-R: the commands whose arguments declare environment facts for the command they run. */
-const SELF_RUN_ENV_COMMANDS = new Set(['env', 'export', 'unset'])
 /** ENV-R: the shells whose `-c` body is itself a command that may declare facts. */
 const SELF_RUN_SHELLS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh'])
 /** ENV-R: how deep a nested `sh -c` body is followed before the text is treated as opaque. */
@@ -666,13 +662,8 @@ export class SwarmRuntime {
   readonly attempts = new Attempts(this)
   /** M1a seam 4/7: the durable refusal registry and its writer-busy recovery. */
   private readonly refusals = new RefusalRegistry(this)
-  private admissionRulesFor(mission: Mission): LimitRule[] { return this.refusals.admissionRulesFor(mission) }
-  private admissionUsage(missionId: string, candidate: AdmissionCandidate, member: Member): AdmissionUsage { return this.refusals.admissionUsage(missionId, candidate, member) }
-  private budgetBlocked(mission: Mission): string | undefined { return this.refusals.budgetBlocked(mission) }
-  private admissionCandidate(missionId: string, task: Task, member: Member): AdmissionCandidate { return this.refusals.admissionCandidate(missionId, task, member) }
   private admissionDecision(mission: Mission, member: Member, task: Task): { candidate: AdmissionCandidate; decision: AdmissionDecision } { return this.refusals.admissionDecision(mission, member, task) }
   private admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord { return this.refusals.admissionRecord(candidate, decision, latencyMs) }
-  private shouldRecordRefusal(next: AdmissionRecord): boolean { return this.refusals.shouldRecordRefusal(next) }
   upsertAdmission(record: AdmissionRecord): void { return this.refusals.upsertAdmission(record) }
   private recordRefusal(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): void { return this.refusals.recordRefusal(candidate, decision, latencyMs) }
   upsertBudgetRefusals(mission: Mission, reason: string): void { return this.refusals.upsertBudgetRefusals(mission, reason) }
@@ -742,29 +733,20 @@ export class SwarmRuntime {
   private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
   async flushOutbox(missionId: string): Promise<void> { return this.notices.flushOutbox(missionId) }
-  private recordOutboxStarvation(missionId: string, delivery: Delivery): void { return this.notices.recordOutboxStarvation(missionId, delivery) }
   pumpOutbox(): void { return this.notices.pumpOutbox() }
 
   /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
   private readonly scheduling = new Scheduling(this)
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
-  private capable(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.capable(task, member, tasks) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
   reviewable(task: Task, tasks: Task[]): boolean { return this.scheduling.reviewable(task, tasks) }
-  private unreviewedStall(missionId: string, unreviewed: Task[]): boolean { return this.scheduling.unreviewedStall(missionId, unreviewed) }
   stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
   private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
   private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
-  private passKey(missionId: string): string { return this.scheduling.passKey(missionId) }
-  private livePass(missionId: string): SchedulingPass | undefined { return this.scheduling.livePass(missionId) }
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
-  private passReleased(pass: SchedulingPass | undefined): boolean { return this.scheduling.passReleased(pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
-  private escalateSchedulingStall(missionId: string, info: { pass: SchedulingPass; reason: 'pass-timeout' | 'no-progress'; boundMs: number; revisionNow: number; fingerprintNow: string }): void { return this.scheduling.escalateSchedulingStall(missionId, info) }
-  private boardCannotProgress(missionId: string): boolean { return this.scheduling.boardCannotProgress(missionId) }
-  private hasLiveWork(missionId: string): boolean { return this.scheduling.hasLiveWork(missionId) }
   private reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
   private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined { return this.scheduling.rerouteTarget(missionId, task, failedId) }
 
@@ -780,7 +762,6 @@ export class SwarmRuntime {
   private async usage(memberId: string, tokens: number): Promise<void> { return this.gates.usage(memberId, tokens) }
   private async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> { return this.gates.usageSnapshot(memberId, totalTokens, usage) }
   private recordOwnerUsage(sessionId: string, usage: UsageBuckets): void { return this.gates.recordOwnerUsage(sessionId, usage) }
-  private exhaustedDimensions(mission: Mission): string[] { return this.gates.exhaustedDimensions(mission) }
   private warnBudget(mission: Mission): void { return this.gates.warnBudget(mission) }
   private blockBudget(mission: Mission): void { return this.gates.blockBudget(mission) }
   private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
@@ -1231,7 +1212,6 @@ export class SwarmRuntime {
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } { return this.attempts.ownAttempt(actor, missionId, taskId, attemptId) }
   private fenceAttempt(mission: Mission, task: Task, windowMs: number): void { return this.attempts.fenceAttempt(mission, task, windowMs) }
   dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
-  private renewActiveOperation(task: Task, mission: Mission): void { return this.attempts.renewActiveOperation(task, mission) }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
   async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task) }
   /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */

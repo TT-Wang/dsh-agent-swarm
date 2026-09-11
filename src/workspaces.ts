@@ -974,18 +974,6 @@ export class Workspaces {
     finally { if (this.baselines.get(mission.id) === pending) this.baselines.delete(mission.id) }
   }
 
-  /**
-   * Re-validate one recorded mission before a verification checkout is created.
-   * A verification can be the first filesystem effect after a host restart, so
-   * the checkout path checks independently against the persisted manifest.
-   */
-  private async assertRecordAuthorized(missionId: string, source: string): Promise<void> {
-    if (this.options.grants === undefined) return
-    const record = await this.missionRecord(missionId)
-    if (record.source !== source) throw new Error('Mission source workspace changed')
-    await this.assertWorkspaceAuthorized(source, record.workspaceGrantRoot)
-  }
-
   private async memberRecord(member: Pick<Member, 'missionId' | 'id' | 'workspace'>): Promise<MemberWorkspace> {
     const value = await readJson(this.memberPath(member.missionId, member.id))
     const expected = path.join(this.missionDir(member.missionId), 'members', segment(member.id))

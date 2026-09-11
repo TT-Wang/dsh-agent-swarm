@@ -303,13 +303,6 @@ function recoveryAge(since: number | undefined, now: number): number | undefined
   return since === undefined || !Number.isFinite(since) ? undefined : Math.max(0, now - since)
 }
 
-/** A submitted task no live review can accept: only the owner can admit one. */
-function unreviewable(task: Task, tasks: readonly Task[]): boolean {
-  if (task.status !== 'submitted') return false
-  return !tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
-    && (review.status === 'pending' || review.status === 'running'))
-}
-
 /**
  * Derive the sidebar phase from durable facts. `now` is injectable so the age of
  * a recovery step is testable without sleeping.

@@ -57,13 +57,6 @@ export class DecisionRefusalLog {
   list(): readonly DecisionRefusal[] { return [...this.entries] }
   /** How many candidates were refused. */
   count(): number { return this.entries.length }
-  /** How many were refused at each stage. */
-  byStage(): { emission: number; append: number } {
-    return {
-      emission: this.entries.filter(entry => entry.stage === 'emission').length,
-      append: this.entries.filter(entry => entry.stage === 'append').length,
-    }
-  }
   /** Test seam: drop the recorded refusals. */
   clear(): void { this.entries.length = 0 }
 }

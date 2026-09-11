@@ -855,7 +855,6 @@ export class Notices {
     if (elapsed < bound) return
     const key = `absence:${missionId}:${lastAt}`
     if (hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    const subject = missionSubject(mission)
     this.rt.commit(missionId, () => {
       this.notify(missionId, `No durable transition recorded for ${elapsed}ms (declared bound ${bound}ms) on an active mission. The absence net reports the absence and the elapsed clock only; read the board for the state.`, [missionSubject(view.mission)], {
         dedupe: true, dedupKey: key, trigger: 'absence-net', reason: `no durable row for ${elapsed}ms`,
@@ -1032,7 +1031,6 @@ export class Notices {
         return submission === undefined || submission.age >= grace
       })
       if (ripe.length) {
-        const subjects = view.subjectsOf(ripe)
         this.rt.commit(missionId, () => {
           this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`, view.subjectsOf(ripe))
         })
@@ -1188,7 +1186,6 @@ export class Notices {
   /** Wake the owner once per distinct stalled state; idle workers cannot resolve it themselves. */
   notifyStall(view: MissionInterpretation, reason: string): void {
     const mission = view.mission
-    const tasks = view.tasks
     const leftover = view.unschedulable
     // The stall dedup key is the same owner-observable fingerprint as every
     // other witness, so a stall is fresh exactly when the board changed.
@@ -1206,7 +1203,6 @@ export class Notices {
       // stop the board-level notice, and this notice no longer depends on prose
       // to say which subject is stuck.
       const stuck = leftover.length ? leftover : view.nonTerminal
-      const stuckSubjects = view.subjectsOf(stuck)
       this.notify(mission.id, NOTICE_TEMPLATES.stall.build({ reason, detail, subjects: view.subjectsOf(stuck) }), view.subjectsOf(stuck),
         { trigger: NOTICE_TEMPLATES.stall.trigger, reason })
       // W3: the stall notice is the no-silent-state witness for this state.

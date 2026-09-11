@@ -6,9 +6,9 @@
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods so no call site changed.
  */
-import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
+import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
-import { hasNotice, proposalAllowance } from './arena.ts'
+import { hasNotice } from './arena.ts'
 import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Budget, Member, Mission, Task } from './types.ts'
