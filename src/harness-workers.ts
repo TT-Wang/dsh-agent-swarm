@@ -622,13 +622,20 @@ export class HarnessWorkers implements WorkerAdapter {
     const composition = await this.composition(spec, abort.signal)
     abort.signal.throwIfAborted()
     const persisted = await persistedSessionHeader(persistence, SessionId(spec.member.sessionId), abort.signal) !== undefined
-    const setup = async (agentCtx: Context): Promise<void> => {
+    // The setup hook's shape moved in the 0.1.5 line: through 0.1.3-alpha.2 the
+    // agent was reached through `agentCtx.agent` (removed at 0.1.5), and from
+    // 0.1.5 the callback receives it as its second parameter. An OPTIONAL second
+    // parameter satisfies both `AgentSetup` signatures, and the value is taken
+    // from whichever host supplies it, so one callback serves every supported
+    // release instead of forking the adapter by host version.
+    const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
       const presets = this.ctx.get('agentPresets')
       if (composition.preset !== undefined) {
         if (presets === undefined) throw new Error('Saved worker composition requires agent-presets')
         await presets.mount(agentCtx, composition.preset)
       } else if (presets !== undefined) throw new Error('A rosterless worker cannot silently resume under a new default preset')
-      const agent = agentCtx.agent as Agent
+      const agent = setupAgent ?? (agentCtx as Context & { agent?: Agent }).agent
+      if (agent === undefined) throw new Error('Worker setup received no agent from the Harness')
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
       this.removeRevokedPending(resident, agent)
@@ -943,7 +950,7 @@ export class HarnessWorkers implements WorkerAdapter {
     const agent = resident.handle.agent
     const decision = strandedInboxDecision({
       stopping: resident.stopping !== undefined, observations: resident.observations.size,
-      status: agent.status, hasPending: agent.inbox.hasPending,
+      status: agent.status, hasPending: agent.inbox.nextStep.length > 0 || agent.inbox.nextTurn.length > 0,
     })
     if (decision.drain) this.drainStrandedInbox(resident, agent)
     return decision.startable

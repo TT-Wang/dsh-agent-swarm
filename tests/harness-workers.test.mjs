@@ -24,6 +24,18 @@ import { registerTools } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
+/**
+ * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
+ * passed it as `options.system`; from the 0.1.5 line the agent-loop invariant
+ * requires `options.system === undefined` and carries the prompt inside
+ * `messages` as surface node 0 (a `system`-role message). Reading both keeps one
+ * assertion set valid on either host.
+ */
+const systemTextOf = request => request.system ?? (request.messages ?? [])
+  .filter(message => message.role === 'system')
+  .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
+  .join('\n')
+
 // Actual public storage APIs on each supported release. These helpers preserve
 // durability and release alpha.2's explicit handles, including after failures.
 async function readStoredSession(persistence, id) {
@@ -308,8 +320,8 @@ test('first peer input exposes mission and member identity in provider text afte
     const request = f.requests[0]
     // Inspect only provider-visible prompt/text, never host-only message source
     // metadata. The model has received no prior assignment or mission tool call.
-    assert.match(request.system, /Swarm missionId: mission-test/)
-    assert.match(request.system, /Your memberId: worker-test/)
+    assert.match(systemTextOf(request), /Swarm missionId: mission-test/)
+    assert.match(systemTextOf(request), /Your memberId: worker-test/)
     const text = request.messages.flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text)).join('\n')
     assert.match(text, /\[Swarm question; missionId mission-test;/)
     assert.match(text, /Please wait until there is a review assignment/)
@@ -720,7 +732,7 @@ test('worker persona shadows both legacy and prefix/suffix deployment personas',
   } })
   await f.adapter.deliver(f.member, message(f.member))
   await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
-  assert.doesNotMatch(f.requests[0].system, /DEPLOYMENT_SENTINEL/)
-  assert.match(f.requests[0].system, /Your role: implementer/)
-  assert.equal(f.requests[0].system.match(/Your role: implementer/g).length, 1)
+  assert.doesNotMatch(systemTextOf(f.requests[0]), /DEPLOYMENT_SENTINEL/)
+  assert.match(systemTextOf(f.requests[0]), /Your role: implementer/)
+  assert.equal(systemTextOf(f.requests[0]).match(/Your role: implementer/g).length, 1)
 })

@@ -29,10 +29,11 @@ The following exact Harness releases are supported:
 
 | Harness release | Release commit | Distribution |
 | --- | --- | --- |
-| [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` | npm `latest` / `next` |
-| [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` | npm `alpha`; newest GitHub release |
+| [0.1.5-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.1) | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` | npm `latest` (current) |
+| [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` | npm `alpha` at the time |
+| [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` | npm `latest` at the time |
 
-Both are prereleases. This plugin does not claim compatibility with the older `0.1.0-rc.5` SDK or with unreleased Harness commits. The development linker checks the release revision recorded in [compatibility.json](compatibility.json), not just a version string.
+All three are prereleases, and one adapter serves all three: the worker setup hook takes the agent from whichever host supplies it, so the plugin does not fork by host version. This plugin does not claim compatibility with the older `0.1.0-rc.5` SDK or with unreleased Harness commits. The development linker checks the release revision recorded in [compatibility.json](compatibility.json), not just a version string.
 
 Verification runs against packaged-artifact loading, native CLI profile installation and the real `/agent-swarm` browser workflow. Provider responses are scripted while Harness, tools, persistence, Git effects, authentication and browser interaction are real, so these checks establish integration behavior — not model planning success rates. See [validation](docs/validation.md).
 

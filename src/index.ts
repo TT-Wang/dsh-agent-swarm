@@ -188,5 +188,5 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   new RoleScoper(ctx, runtime)
   await runtime.start(grants)
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
-  ctx.inject(['connection'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
+  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
 }

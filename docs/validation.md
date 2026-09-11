@@ -4,8 +4,48 @@ Version **0.6.0** was checked on 2026-09-08. The full regression baseline and th
 
 | Harness release | Exact source commit |
 | --- | --- |
-| `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+| `0.1.5-rc.1` | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
+| `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+
+## 0.1.5-rc.1 baseline (2026-09-11) — current
+
+The owner pass of 2026-09-11 adapted the plugin to the npm `latest` line and measured it on a checkout
+built from the release tag `dsh-v0.1.5-rc.1` (`183f08e9c6`): `pnpm install --frozen-lockfile` (25 s) then
+`build:lib`, `build:native-system` and `build:web` in a fresh clone of that revision. The project's
+Harness symlink farm was repointed at that checkout for the run (the tracked linker still enforces
+`compatibility.json`), then restored.
+
+| Check | 0.1.5-rc.1 (`183f08e9c6`) | 0.1.3-alpha.2 (`82a5fd61a7`) |
+| --- | --- | --- |
+| `npm run build` | exit 0 | exit 0 |
+| `node --test tests/*.test.mjs` | **833/833** | **833/833** |
+| `npm run test:faults` | **24/24** | **24/24** |
+| `npm run test:replay` | `REPLAY OK`, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` | identical digest |
+| `npm run test:harness` (real Loader composition) | passed | passed |
+| `npm run test:profile` (installed bundle through the real CLI) | passed | passed |
+| `npm run test:pack` (packed artifact) | passed (187 published files) | passed |
+| `npm run test:bundle` | 7/7 | 7/7 |
+
+Three product changes make the newest line work, and each is written to satisfy every supported
+release rather than forked by version: the worker setup hook accepts the agent as an **optional**
+second parameter (0.1.5 passes it there; through 0.1.3 it is reached through `agentCtx.agent`, removed
+at 0.1.5), the inbox's pending work is read from `nextStep`/`nextTurn` (the `hasPending` getter was
+removed), and the RPC registration injects `webServer` alongside `connection` (0.1.5's connection
+plugin registers its route on the context the service was provided from and that context must inject
+it). Declaration metadata moved with them: `compatibility.json` gained the release and made it the
+default, `profile/package.json`'s `dsh.bundle.requires.harness` lists all three, and the 24 peer ranges
+accept it. Test-side adaptations: the provider-visible system prompt is read through one helper that
+accepts either carrier (0.1.5's agent loop forbids `options.system` and carries the prompt in
+`messages` as surface node 0), and the synthetic web host composes `Connection` inside a scope that
+injects `webServer`.
+
+The same pass fixed the reason the three real-host tiers could not run at all before it: the plugin
+published its derived mission board into the owner session as a plugin-owned `swarm/mission` event,
+which the host's closed session vocabulary refuses to read back (`SessionFormatUnsupportedError` on
+every supported host). The publication and the host projection registration are deleted; the board is
+the single derivation over `swarm.sqlite`, and `tests/r17-projection.test.mjs` pins that no `src/`
+module appends a session event.
 
 Both targets use isolated SDK links. The rc.1 copy runs the same emitted JavaScript against rc.1 dependencies and its actual CLI; it is not an alpha.2-linked plugin with only a different CLI environment variable. Host and client TypeScript are also checked against the selected SDK without re-emitting that copy.
 

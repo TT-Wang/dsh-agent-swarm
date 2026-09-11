@@ -3,20 +3,25 @@
  *
  * Two claims, each pinned by a test that fails on the pre-change tree:
  *
- * 1. **The mission projection is a registered host unit.** `SwarmRuntime` calls
- *    `ctx.sessionProjections.register` (the facility `src/model-selection.ts`
- *    already reads), publishes one whole derived board per mission into the
- *    owner session on a transition, serves it back through `stateOf`, and
- *    unregisters it on unload.
+ * 1. **The plugin writes nothing into the owner session log.** Round 17 also
+ *    registered a host projection unit and published each derived board as a
+ *    plugin-owned session event (`swarm/mission`). The host's session format
+ *    keeps a closed vocabulary with no plugin registration path and refuses to
+ *    decode a stored log containing an unknown type unless its envelope carries
+ *    `ignorable: true` — which `Session.append()` cannot set — so a written log
+ *    could not be read back by its own writer and the real-host tiers refused
+ *    with `SessionFormatUnsupportedError`. The publication and the registration
+ *    are deleted; this file pins that the log stays empty and that no source
+ *    appends a session event.
  * 2. **Member state is a durable phase plus a derived live status.** The durable
  *    row carries `phase` and never `status`; `SwarmStore` drops any status on
  *    write and re-derives it on read from the phase and the running attempts, so
  *    the R15-F2 seam (a row reading `idle` while a live attempt exists) cannot be
  *    constructed, and the reconcile path is gone from the source.
- * 3. **The projection is read in the product.** `SwarmRuntime.memberBoard` is
- *    the read face the guard board and the owner/UI views (`snapshot`, `observe`)
- *    consume; a test-provided host unit proves they report the unit's value
- *    rather than a second derivation.
+ * 3. **The one derivation is the read face.** `SwarmRuntime.memberBoard` is what
+ *    the guard board and the owner/UI views (`snapshot`, `observe`) consume, and
+ *    it is the single derivation applied to durable rows — a mounted projection
+ *    registry that serves a different board cannot change it.
  * 4. **A phase-less legacy row keeps its recorded intent.** The live store's
  *    shape (142 rows, no phase, 114 `stopped`) is seeded raw and every stopped
  *    row stays stopped and non-dispatchable; the rule is
@@ -37,7 +42,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
 import { Scheduling, guardActions, guardProgressActions } from '../lib/scheduling.js'
@@ -106,26 +111,30 @@ async function fixture(t, { workers: provided, registry } = {}) {
   return { dir, ctx, session, runtime, workers, owner, mission, stream, addMember, propose, claim, memberRow, taskRow, storedMember }
 }
 
-test('the mission board is a registered host projection: published on transition, disposed on unload', async t => {
+test('no session event: the plugin appends nothing to the owner log, and the derivation is the read face', async t => {
   assert.ok(projection, MISSING)
   const f = await fixture(t)
   const member = await f.addMember('Ada')
-  const board = f.ctx.sessionProjections.stateOf(f.session, 'swarmMission')
-  assert.ok(board, 'the registered key serves state through the host registry')
-  assert.equal(board.sessionId, OWNER, 'the fold is scoped to the session it was registered for')
-  assert.deepEqual(board.missions[f.mission.id]?.members, [{ id: member.id, phase: 'active', status: 'idle' }])
+  assert.deepEqual(f.session.snapshotEvents().map(event => event.type).filter(type => !KNOWN_SESSION_EVENT_TYPES.has(type)), [], 'no event outside the host vocabulary is written into the session log')
 
   const task = f.propose('Claim me')
   await f.claim(member, task)
   const working = await eventually(() => {
-    const current = f.ctx.sessionProjections.stateOf(f.session, 'swarmMission')?.missions[f.mission.id]?.members.find(row => row.id === member.id)
-    return current?.status === 'working' ? current : undefined
-  }, 'the live attempt publishes a working member board')
+    const row = f.runtime.memberBoard(f.mission.id).find(candidate => candidate.id === member.id)
+    return row?.status === 'working' ? row : undefined
+  }, 'the live attempt is visible through the derivation')
   assert.equal(working.phase, 'active')
-  assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'working', 'the runtime reads the same board')
+  assert.deepEqual(f.session.snapshotEvents().map(event => event.type).filter(type => !KNOWN_SESSION_EVENT_TYPES.has(type)), [], 'a live transition writes no plugin-owned type either')
 
-  await f.runtime.dispose()
-  assert.equal(f.ctx.sessionProjections.stateOf(f.session, 'swarmMission'), undefined, 'unload removes the key from the host registry')
+  // The class of failure this replaced: a stored log is refused when it carries
+  // an event type the host's closed vocabulary does not know and the envelope is
+  // not marked ignorable. The only durable answer is to append nothing, so the
+  // check is source-level and exhaustive over every writer in src/.
+  const { readdir } = await import('node:fs/promises')
+  const sources = await Promise.all((await readdir(join(ROOT, 'src'))).filter(name => name.endsWith('.ts'))
+    .map(async name => [name, await readFile(join(ROOT, 'src', name), 'utf8')]))
+  const appenders = sources.filter(([, source]) => /session\.append\(|\.append\(\s*['"]swarm\//.test(source)).map(([name]) => name)
+  assert.deepEqual(appenders, [], 'no src module appends a session event: the host format cannot carry a plugin-owned type')
 })
 
 test('the durable member row carries a phase and never a status; the read face derives it', async t => {
@@ -243,27 +252,27 @@ test('pair: the UI projection carries the derived status', async t => {
   assert.equal(observed.members.find(row => row.id === member.id).status, 'working', 'the compact board the client renders carries the derived status')
 })
 
-test('the projection is read by the product: the guard board and the owner views take their statuses from the registered unit', async t => {
+test('a mounted projection registry cannot change the read face: the derivation is the only source', async t => {
   assert.ok(projection, MISSING)
-  // The test's own host unit: whatever it serves is what the product must show.
-  const projected = { version: 1, sessionId: OWNER, missions: {} }
-  const registry = { register: () => () => {}, stateOf: () => projected }
+  // A hostile unit: it answers every read with a wrong board and counts
+  // registrations. Nothing in the product may consult it.
+  let registrations = 0
+  const wrong = { missions: {} }
+  const registry = {
+    register: () => { registrations += 1; return () => {} },
+    stateOf: () => ({ version: 1, sessionId: OWNER, missions: wrong.missions }),
+  }
   const f = await fixture(t, { registry })
   const member = await f.addMember('Ada')
-  assert.equal(f.memberRow(member).status, 'idle', 'the durable derivation says idle')
+  assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'idle', 'the derivation says idle')
 
-  // The registered unit says the member is parked. Every consumer of mission
-  // derived state must report the projection's value, not a second derivation.
-  projected.missions[f.mission.id] = { missionId: f.mission.id, status: 'active', updatedAt: 0, members: [{ id: member.id, phase: 'parked', status: 'waiting' }] }
-  assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'waiting', 'memberBoard reads the projection')
-  assert.equal(new Scheduling(f.runtime).guardBoard(f.mission.id).members.find(row => row.id === member.id).status, 'waiting', 'the guard board reads the projection')
-  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'waiting', 'the snapshot (client read face) reads the projection')
-  assert.equal(f.runtime.observe(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'waiting', 'the observe board reads the projection')
-
-  // With no published board the fallback is the same single derivation.
-  projected.missions = {}
-  assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'idle')
-  assert.equal(new Scheduling(f.runtime).guardBoard(f.mission.id).members.find(row => row.id === member.id).status, 'idle')
+  // The hostile unit claims the member is parked. No consumer may believe it.
+  wrong.missions[f.mission.id] = { missionId: f.mission.id, status: 'active', updatedAt: 0, members: [{ id: member.id, phase: 'parked', status: 'waiting' }] }
+  assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'idle', 'memberBoard ignores the registry')
+  assert.equal(new Scheduling(f.runtime).guardBoard(f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the guard board ignores the registry')
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the snapshot (client read face) ignores the registry')
+  assert.equal(f.runtime.observe(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the observe board ignores the registry')
+  assert.equal(registrations, 0, 'the plugin registers no projection unit')
 })
 
 test('a phase-less legacy member row keeps its recorded intent: the live-store shape stays stopped', async t => {
@@ -318,7 +327,7 @@ test('a phase-less legacy member row keeps its recorded intent: the live-store s
   assert.equal(projection.memberPhaseOf({ phase: 'parked', status: 'stopped' }), 'parked', 'an explicit phase always wins over the legacy field')
 })
 
-test('the scoped writers are gone and the projection owns the derivation', async t => {
+test('the scoped writers are gone and nothing writes a session event', async t => {
   assert.ok(projection, MISSING)
   const strip = text => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
   const runtimeSource = strip(await readFile(join(ROOT, 'src/runtime.ts'), 'utf8'))
@@ -330,7 +339,8 @@ test('the scoped writers are gone and the projection owns the derivation', async
     assert.equal(/\.status\s*=\s*'working'/.test(source), false, `${file} still writes a live working status`)
   }
   const projectionSource = await readFile(join(ROOT, 'src/projection.ts'), 'utf8')
-  assert.match(projectionSource, /ctx\.get\('sessionProjections'\)/, 'the projection is registered through the host registry')
-  assert.match(projectionSource, /registry\.register\(missionProjectionDefinition\)/)
+  assert.equal(/sessionProjections/.test(projectionSource), false, 'the deleted host unit is not referenced again')
+  assert.equal(/session\.append\(/.test(projectionSource), false, 'the projection appends no session event')
+  assert.equal(/MissionProjection\b/.test(strip(await readFile(join(ROOT, 'src/runtime.ts'), 'utf8'))), false, 'the runtime holds no projection owner')
   assert.match(strip(await readFile(join(ROOT, 'src/types.ts'), 'utf8')), /export type MemberPhase = /, 'the durable phase is declared')
 })

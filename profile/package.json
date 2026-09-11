@@ -19,7 +19,8 @@
       "requires": {
         "harness": [
           "0.1.2-rc.1",
-          "0.1.3-alpha.2"
+          "0.1.3-alpha.2",
+          "0.1.5-rc.1"
         ],
         "bundles": [
           "@deepseek-ai/dsh-base",

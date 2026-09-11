@@ -1,5 +1,5 @@
 {
-  "defaultHost": "0.1.2-rc.1",
+  "defaultHost": "0.1.5-rc.1",
   "supportedHosts": [
     {
       "version": "0.1.2-rc.1",
@@ -12,11 +12,17 @@
       "commit": "82a5fd61a7cf5c293cec4bdff68f455398d685e9",
       "channel": "alpha",
       "source": "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2"
+    },
+    {
+      "version": "0.1.5-rc.1",
+      "commit": "183f08e9c6dde7e36cd2318eaee70b0da08fb35e",
+      "channel": "latest",
+      "source": "https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.1"
     }
   ],
   "reference": {
     "commit": "1caff61f4c0909711b515ebc56187055556186cd",
     "source": "https://github.com/NanmiCoder/dsh-agent-teams"
   },
-  "note": "Targets the npm latest release and newest alpha release separately. See docs/validation.md for completed checks; historical rc.5 evidence does not establish compatibility with these targets."
+  "note": "Targets the npm latest release and the newest alpha release separately. See docs/validation.md for completed checks; historical rc.5 evidence does not establish compatibility with these targets. The owner pass of 2026-09-11 moved the default to the npm latest line (0.1.5-rc.1) and kept the two earlier releases supported; the session-vocabulary fix in the same pass is what makes the real-host tiers runnable at all."
 }

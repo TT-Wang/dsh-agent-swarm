@@ -10,7 +10,7 @@ import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSub
 import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
-import { MissionProjection, deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
+import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
@@ -640,14 +640,6 @@ export class SwarmRuntime {
 
   /** M1a seam 6/7: workspace and admission surface. */
   private readonly workspaceAdmission = new WorkspaceAdmission(this)
-  /**
-   * R17-G6: the mission derived state as a registered host projection. The
-   * runtime publishes each mission's derived board into its owner session on a
-   * transition and reads the published board back for consumers; a composition
-   * without the host registry (or without an attached owner session) keeps the
-   * same derivation applied to durable rows, so there is one truth either way.
-   */
-  private readonly projection: MissionProjection = new MissionProjection(this)
   /** The mission is terminal: no further scheduling or fencing applies. */
   isMissionTerminal(mission: Mission): boolean { return terminal(mission) }
   // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
@@ -812,9 +804,6 @@ export class SwarmRuntime {
    * exactly what the host was authorized to do in this process.
    */
   async start(grants?: WorkspaceGrantSnapshot): Promise<void> {
-    // R17-G6: register the mission projection with the host before any mission
-    // is recovered or published, so recovery transitions are projected too.
-    this.projection.attach(this.workers)
     // R17-G8: subscribe to the host's claimed signal so real consumption is
     // recorded from it (one CAS write per delivery), never inferred.
     this.notices.attach(this.workers)
@@ -1062,10 +1051,6 @@ export class SwarmRuntime {
     let result: T
     try { result = this.store.transaction(fn) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
-    // R17-G6: a committed transition publishes its derived board (the projection
-    // appends nothing when the board is unchanged). This runs after the
-    // transaction and never throws into the caller.
-    this.projection.publish(missionId)
     // R17-G5: and it publishes its decision facts in the same transition — the
     // classifier runs here (never from the tick sample), against the state this
     // commit produced. The pass state selects the one pass-end branch; a wedged
@@ -1075,18 +1060,18 @@ export class SwarmRuntime {
   }
   /** Subscribe to committed state changes. */
   subscribe(listener: (missionId: string) => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
-  /**
+/**
    * R17-G6: the derived member board — the read face the guard model and the
-   * owner/UI views consume. The value is the registered projection's current
-   * state when the host unit is attached and the owner session is available
-   * (`ctx.sessionProjections.stateOf` through `MissionProjection.boardOf`), and
-   * otherwise the same single derivation applied to the durable rows. Unlike
-   * `missionBoard` it needs no mission row, so the guard model can project a
-   * board whose mission is not (or no longer) in the store.
+   * owner/UI views consume, and the ONLY one: the single derivation
+   * (`src/projection.ts`) applied to the durable rows. It used to prefer a host
+   * projection unit's published state, but that unit published the board as a
+   * plugin-owned session event the host's format cannot read back (see the
+   * module header of `src/projection.ts`), so the unit is gone and the
+   * derivation is the read face on every composition. Unlike `missionBoard` it
+   * needs no mission row, so the guard model can project a board whose mission
+   * is not (or no longer) in the store.
    */
   memberBoard(missionId: string): MissionBoardMember[] {
-    const projected = this.projection.boardOf(missionId)?.members
-    if (projected !== undefined) return projected
     return deriveMemberBoard(this.store.list('members', missionId), this.store.list('tasks', missionId))
   }
   /**
@@ -3750,9 +3735,6 @@ export class SwarmRuntime {
       } finally { if (bound !== undefined) clearTimeout(bound) }
     }
     finally {
-      // R17-G6: unload unregisters the mission projection, so the host's
-      // snapshots stop serving a key whose owner is gone.
-      this.projection.dispose()
       // R17-G8: and the claimed-signal subscription goes with it.
       this.notices.dispose()
       this.closed = true; this.listeners.clear(); this.store.close()

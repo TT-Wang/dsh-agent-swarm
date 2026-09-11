@@ -23,6 +23,18 @@ import { registerTools, ENTRY_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT,
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
+/**
+ * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
+ * passed it as `options.system`; from the 0.1.5 line the agent-loop invariant
+ * requires `options.system === undefined` and carries the prompt inside
+ * `messages` as surface node 0 (a `system`-role message). Reading both keeps one
+ * assertion set valid on either host.
+ */
+const systemTextOf = request => request.system ?? (request.messages ?? [])
+  .filter(message => message.role === 'system')
+  .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
+  .join('\n')
+
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
 const swarmNames = tools => (tools ?? []).map(tool => tool.name).filter(name => name.startsWith('swarm_')).sort()
 
@@ -89,17 +101,17 @@ test('an ordinary session sees the entry set and prompt; owning a request promot
   owner.agent.followup({ id: 'm1', role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } })
   await owner.agent.whenIdle()
   assert.deepEqual(swarmNames(f.requests[0].tools), visible())
-  assert.match(f.requests[0].system, new RegExp(ENTRY_PROMPT.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
-  assert.doesNotMatch(f.requests[0].system, /owner protocol/)
+  assert.match(systemTextOf(f.requests[0]), new RegExp(ENTRY_PROMPT.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  assert.doesNotMatch(systemTextOf(f.requests[0]), /owner protocol/)
   // A durable automatic request promotes the session synchronously on commit.
   f.runtime.requestStart({ sessionId: 'owner-session' }, { commandId: 'c1', goal: 'Do it', workspace: f.source })
   assert.deepEqual(visible(), SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort())
   owner.agent.followup({ id: 'm2', role: 'user', content: [{ type: 'text', text: 'plan' }], source: { kind: 'user' } })
   await owner.agent.whenIdle()
   assert.deepEqual(swarmNames(f.requests[1].tools), visible())
-  assert.match(f.requests[1].system, /Agent Swarm owner protocol/)
-  assert.equal((f.requests[1].system.match(/scope contains only repository-relative paths/g) ?? []).length, 1, 'planning rules appear exactly once')
-  assert.doesNotMatch(f.requests[1].system, new RegExp(ENTRY_PROMPT.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the entry prompt is shadowed, not duplicated')
+  assert.match(systemTextOf(f.requests[1]), /Agent Swarm owner protocol/)
+  assert.equal((systemTextOf(f.requests[1]).match(/scope contains only repository-relative paths/g) ?? []).length, 1, 'planning rules appear exactly once')
+  assert.doesNotMatch(systemTextOf(f.requests[1]), new RegExp(ENTRY_PROMPT.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'the entry prompt is shadowed, not duplicated')
   // The old global prompt (3844 chars) plus the planning rules repeated in every planning message (1687) exceeded the owner prompt alone.
   assert(OWNER_PROMPT.length < 3844 + 1687 && ENTRY_PROMPT.length < 800 && WORKER_PROMPT.length < 1600, `role prompts stay compact: ${OWNER_PROMPT.length}/${ENTRY_PROMPT.length}/${WORKER_PROMPT.length}`)
   // Owner usage is attributed to the planning request without charging any worker pool.
@@ -161,8 +173,8 @@ test('workers see only member tools and the member protocol, and each tool resul
   assert.equal(seen, true, 'the model sees the recorded run id at the end of its tool result')
   assert.match(JSON.stringify(worker.session.snapshotEvents().filter(event => event.type === 'tool/result')), new RegExp(runs[0].id), 'the durable log carries the same id')
   assert.deepEqual(swarmNames(workerRequest.tools), SWARM_TOOLS.filter(name => !MANAGEMENT_TOOLS.includes(name)).sort())
-  assert.match(workerRequest.system, /Swarm member protocol/); assert.doesNotMatch(workerRequest.system, /owner protocol/)
-  assert.match(workerRequest.system, new RegExp(`Your memberId: ${builder.id}`))
+  assert.match(systemTextOf(workerRequest), /Swarm member protocol/); assert.doesNotMatch(systemTextOf(workerRequest), /owner protocol/)
+  assert.match(systemTextOf(workerRequest), new RegExp(`Your memberId: ${builder.id}`))
   // The member's usage snapshot is written by the adapter's usage callback, which is
   // asynchronous to the run and the idle signal observed above: under load it can land
   // after them. Wait for it (bounded) instead of assuming it beat the earlier
