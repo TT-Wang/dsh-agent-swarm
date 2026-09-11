@@ -7,7 +7,7 @@ import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { SwarmStore } from './store.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, verdictRows, type TraceStep } from './trace.ts'
-import type { Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, Evidence, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task } from './types.ts'
+import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, Evidence, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
@@ -27,7 +27,8 @@ export const SWARM_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swar
 /** The runtime rejects these for the owner session; hiding them saves schema tokens without changing authority. */
 export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_escalate'] as const
 /** The runtime guard rejects these for workers; hiding them is presentation, the guard remains the boundary. */
-export const MANAGEMENT_TOOLS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
+/** The owner-only surface, declared once in `src/types.ts` and read here and by the runtime guard. */
+export const MANAGEMENT_TOOLS: readonly string[] = OWNER_ONLY_TOOLS
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
 /** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */

@@ -214,9 +214,13 @@ the owner decision loop. Stated as what a caller may rely on:
   submitted result to review, a blocked or unreviewable task, a challenged
   finding, a budget ceiling, a board that cannot advance — and not on every
   tick. Missions are not an unattended black box.
-- **Failures are facts with exits.** Every refusal carries a stable bracket code
-  and an executable next step — for example `[workspace_not_authorized]`,
-  `[workspace_uncommitted]`, `[verification_requires_verify]` — and every
+- **Failures are facts with exits.** Every refusal on a model-facing path carries
+  a stable bracket code and an executable next step — for example
+  `[workspace_not_authorized]`, `[workspace_uncommitted]`,
+  `[verification_requires_verify]` — and `tests/refusal-inventory.mjs` enumerates
+  the whole control path so the uncoded remainder is a measured number rather than
+  a claim (measured 2026-09-11: 11/166 in `src/runtime.ts`, 9/49 in
+  `src/workspaces.ts`, 0/29 in `src/plans.ts`, 0/17 in `src/store.ts`). Every
   non-terminal state has a recorded successor or a bounded escalation.
 - **Resources are accounted and bounded.** Tokens, steps, wall time, tasks,
   experiments and check concurrency are owner-set, never silently exceeded and

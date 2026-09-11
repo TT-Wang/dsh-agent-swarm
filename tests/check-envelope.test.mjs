@@ -234,6 +234,25 @@ test('ENV: a completed check records the environment it ran under and its attrib
  * Attribution ahead of the output bound.
  * ------------------------------------------------------------------ */
 
+test('ENV: the spec reporter Node 24 emits by default is attributed too, not just TAP', async t => {
+  // Node 24's `node --test` writes the spec reporter even when piped (`✔`/`✖`/`ℹ`),
+  // so reading TAP alone produced exit codes with NO attribution on a runtime
+  // `engines` declares supported — the silent evidence loss the 2026-09-11 review
+  // measured. This check forces the same reporter deterministically on any Node.
+  const temp = await realpath(await tempDirectory('swarm-env-spec-'))
+  t.after(async () => rm(temp, { recursive: true, force: true }))
+  await mkdir(path.join(temp, 'tests'), { recursive: true })
+  await writeFile(path.join(temp, FIXTURE_TEST), FAILING_SUITE)
+  const command = `echo "▶ fixture-spec-suite" && node --test --test-reporter=spec ${FIXTURE_TEST}`
+  const result = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: temp, timeoutMs: 30000, maxBytes: 4096, captureAttribution: true, env: checkEnvFor(process.env.HOME) })
+  assert.equal(result.exitCode, 1, 'the run really fails')
+  assert.deepEqual(result.attribution.failingTests, ['the-real-failure'], 'the spec failure marker is attributed')
+  assert.equal(result.attribution.failingTestCount, 1)
+  assert.ok(result.attribution.tapSummary.some(line => /^ℹ fail 1$/.test(line)), `the spec summary survives: ${JSON.stringify(result.attribution.tapSummary)}`)
+  assert.ok(result.attribution.tapSummary.some(line => /^ℹ tests \d+$/.test(line)), 'the spec summary carries the test count')
+  assert.equal(result.attribution.stage, 'fixture-spec-suite', 'the ▶ suite marker names the failing stage')
+})
+
 test('ENV: truncating a real failing run at the bound keeps the failing test, the TAP summary and the stage', async t => {
   const temp = await realpath(await tempDirectory('swarm-env-tap-'))
   t.after(async () => rm(temp, { recursive: true, force: true }))

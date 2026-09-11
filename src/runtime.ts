@@ -21,7 +21,7 @@ import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysO
 import { validScope } from './scope.ts'
 import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import type { Actor, AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
@@ -1030,10 +1030,23 @@ export class SwarmRuntime {
    */
   async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(missionId)
-    if (previous !== undefined) await this.boundedQueueWait(previous)
-    const current = Promise.resolve().then(fn)
+    // The tail of THIS call is registered before the first await, so a later
+    // caller chains onto this call instead of onto the same predecessor. The
+    // read-await-write shape this replaced let two callers that both waited on
+    // one predecessor each become the tail and run their bodies CONCURRENTLY
+    // (the fork found in the 2026-09-11 review): dispatch and swarm_claim could
+    // interleave per-member workspace preparation, and mission/member/delivery
+    // rows have no compare-and-swap to lose an update safely.
+    let release!: () => void
+    const current = new Promise<void>(resolve => { release = resolve })
     this.queues.set(missionId, current)
-    try { return await current } finally { if (this.queues.get(missionId) === current) this.queues.delete(missionId) }
+    try {
+      if (previous !== undefined) await this.boundedQueueWait(previous)
+      return await fn()
+    } finally {
+      release()
+      if (this.queues.get(missionId) === current) this.queues.delete(missionId)
+    }
   }
   /** Wait for the mission-queue predecessor, but never past the declared bound. */
   private async boundedQueueWait(previous: Promise<unknown>): Promise<void> {
@@ -3240,7 +3253,7 @@ export class SwarmRuntime {
     const mission = this.mission(member.missionId)
     if (mission.status !== 'active' || Date.now() >= mission.deadline || mission.usedSteps > mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens) return 'Mission is inactive or out of budget'
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
-    if (/subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph/.test(tool) || ['send_message', 'interrupt_agent', 'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_control', 'swarm_cancel', 'swarm_restore'].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
+    if (/subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
     const active = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     // W7: a denied worker-side git write is surfaced once as a typed, actionable
     // error; the workspace is still publishable through swarm_submit.

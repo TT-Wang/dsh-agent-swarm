@@ -9,7 +9,8 @@
   },
   "names": {
     "pluginNames": [
-      "agent-swarm"
+      "agent-swarm",
+      "agent-swarm-client"
     ],
     "loaderIds": [
       "dsh-external-agent-swarm"
@@ -19,17 +20,23 @@
     ],
     "tools": [
       "swarm_add_member",
+      "swarm_board",
       "swarm_budget",
+      "swarm_cancel",
       "swarm_challenge",
       "swarm_claim",
       "swarm_control",
       "swarm_create",
+      "swarm_escalate",
       "swarm_handoff",
       "swarm_launch",
       "swarm_message",
       "swarm_observe",
+      "swarm_post",
       "swarm_propose",
       "swarm_publish",
+      "swarm_registry",
+      "swarm_restore",
       "swarm_stage",
       "swarm_submit",
       "swarm_subscribe",

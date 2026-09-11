@@ -8,6 +8,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, sep } from 'node:path'
@@ -123,6 +124,30 @@ test('R11-02: restore refuses while a live runtime owns the state file', async t
   })
   await f.runtime.dispose()
   assert.equal(SwarmStore.restore(f.statePath, snapshot.path).restoredFrom, snapshot.path, 'a stopped host restores cleanly')
+})
+
+test('R11-02: restore reclaims a lock a crashed host left behind, and still refuses a live owner', async t => {
+  const f = await fixture(t, { storeOptions: { snapshotIntervalMs: 0 } })
+  const snapshot = f.runtime.store.snapshot()
+  await f.runtime.dispose()
+  const lockPath = `${f.statePath}.lock`
+  // The shape a SIGKILL leaves: the lock file names a pid that no longer exists.
+  // Before the fix this refused with restore_blocked, so the staged-restore path
+  // could never run after the crash it exists for.
+  await writeFile(lockPath, JSON.stringify({ pid: 999_999, nonce: 'crashed-host' }))
+  const restored = SwarmStore.restore(f.statePath, snapshot.path)
+  assert.equal(restored.restoredFrom, snapshot.path, 'a dead-pid lock does not block the restore it caused')
+  assert.equal(existsSync(lockPath), false, 'the stale lock is reclaimed, exactly as acquireLock reclaims it')
+
+  // A live owner still refuses, and the refusal names the one manual exit.
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, nonce: 'live-owner' }))
+  assert.throws(() => SwarmStore.restore(f.statePath, snapshot.path), error => {
+    assert.ok(error instanceof StoreRecoveryError)
+    assert.equal(error.code, 'restore_blocked')
+    assert.match(error.message, new RegExp(lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    return true
+  })
+  await rm(lockPath, { force: true })
 })
 
 test('R11-02: snapshot retention keeps the newest snapshots and prunes the rest', async t => {

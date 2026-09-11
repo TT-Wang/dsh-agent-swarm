@@ -10,6 +10,7 @@ import {
   assertReplayParity, decodeDurableLog, orchestratorCommands, replayDigest, replayLabels, stableCommandKey, traceMetrics,
 } from '../lib/trace.js'
 import { runScenario } from '../scripts/replay/scenario.mjs'
+import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const GOLDEN = join(HERE, '..', 'scripts', 'replay', 'golden-commands.json')
@@ -33,6 +34,33 @@ test('replay derives the orchestrator command sequence with stable admission-ord
   // Two independent replays of the same durable log are byte-identical.
   assert.equal(orchestratorCommands(syntheticLog()).digest, replayed.digest)
   assert.deepEqual(orchestratorCommands(syntheticLog()).commands.map(command => command.kind), ['dispatch', 'verify'])
+})
+
+test('every attempt-fencing event closes the open attempt: restart re-pend and ceiling block included', () => {
+  // The two readers used to carry hand-mirrored closer lists and both had lost
+  // `task/restart-repended` (a host restart re-pends a running task) and
+  // `task/ceiling-exhausted` (a task blocks at its own ceiling), so a durable
+  // log the runtime itself wrote was refused as truncated by its own replay.
+  // Each payload is the shape its emission site writes (src/runtime.ts and
+  // src/attempts.ts): taskId is what closes the attempt, oldOwner is what the
+  // lease-expiry path additionally carries for the stop command.
+  const fence = (type, data) => orchestratorCommands([
+    ...syntheticLog().slice(0, 3),
+    { seq: 4, missionId: 'm', type, actor: 'runtime', data, createdAt: 4 },
+  ])
+  const fences = [
+    ['task/restart-repended', { taskId: 'task-1', epoch: 2, ownerId: 'member-1', reason: 'host-restart' }],
+    ['task/ceiling-exhausted', { taskId: 'task-1', dimension: 'steps', limit: 12, used: 12, code: 'task_ceiling_exhausted' }],
+    ['task/lease-expired', { taskId: 'task-1', oldOwner: 'member-1' }],
+  ]
+  for (const [type, data] of fences) {
+    const replayed = fence(type, data)
+    assert.deepEqual(replayed.unresolved, [], `${type} closes the attempt it fences`)
+    assert.ok(replayed.keys.includes('dispatch:task#1:member#1'), `${type} keeps the dispatch it fenced`)
+  }
+  // The declared vocabulary is the single source both readers consume.
+  assert.deepEqual(Object.keys(ATTEMPT_FENCING_EVENTS).length > 0, true)
+  assert.ok(ATTEMPT_FENCING_EVENTS.includes('task/restart-repended') && ATTEMPT_FENCING_EVENTS.includes('task/ceiling-exhausted'))
 })
 
 test('a truncated durable log fails with ReplayTruncationError, never a silent short sequence', () => {

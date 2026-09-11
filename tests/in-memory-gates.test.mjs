@@ -225,7 +225,7 @@ const CENSUS = [
   ["src/trace.ts",6,"Set","const known = new Set(spans.map(span => span?.spanId))","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",7,"Map","const counts = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",8,"Map","const tasks = new Map<string, string>(), members = new Map<string, string>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS = new Set(['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/trace.ts",10,"Map","const open = new Map<string, { taskId: string; memberId: string }>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   // R17-G12: the roster lookup inside `nextWorkerName`. It is rebuilt from the
   // mission's durable member rows at every admission and discarded with the
@@ -832,6 +832,26 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
   assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string',
     'the vocabulary must name task/stale-revision-refused (the D1 gap is closed)')
+})
+
+test('S5 gate src/runtime.ts:7 pair: the mission queue never forks two waiters onto one predecessor', async t => {
+  // The 2026-09-11 review found the read-await-write shape: two callers that
+  // both waited on one predecessor each registered themselves as the tail and
+  // ran their bodies concurrently. Mission-scoped work (dispatch, claim,
+  // prepareTask) must be serialized, so this pins the ordering, not the timing.
+  const f = await setup(t, { workers: new FakeWorkers() })
+  const events = []
+  const body = name => async () => {
+    events.push(`start:${name}`)
+    await new Promise(resolve => setTimeout(resolve, 25))
+    events.push(`end:${name}`)
+  }
+  const first = f.runtime.exclusive('mission-queue-probe', body('a'))
+  await new Promise(resolve => setTimeout(resolve, 5))
+  const second = f.runtime.exclusive('mission-queue-probe', body('b'))
+  const third = f.runtime.exclusive('mission-queue-probe', body('c'))
+  await Promise.all([first, second, third])
+  assert.deepEqual(events, ['start:a', 'end:a', 'start:b', 'end:b', 'start:c', 'end:c'], 'no body starts before its predecessor ended')
 })
 
 test('S5 inventory: every gate entry has exactly one test', () => {

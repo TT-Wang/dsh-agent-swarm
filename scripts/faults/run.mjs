@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Fault-injection suite F1-F20.
+ * Fault-injection suite F1-F21.
  *
  * Each scenario is a standalone module under tests/faults/ that injects one
  * fault, proves the injection fired, and then asserts the durable recovery
@@ -29,7 +29,7 @@ const value = name => { const index = args.indexOf(name); return index === -1 ? 
 const asJson = args.includes('--json')
 const only = (value('--only') ?? '').split(',').map(item => item.trim().toUpperCase()).filter(Boolean)
 const timeoutMs = Number(value('--timeout') ?? 300_000)
-const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F19', 'F20', 'F21']
+const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18', 'F19', 'F20', 'F21']
 
 const scenarioId = file => file.replace(/\.mjs$/, '').replace(/^f(\d+)([a-z]?)-.*$/, (_match, number, suffix) => `F${Number(number)}${suffix.toUpperCase()}`)
 
@@ -37,6 +37,16 @@ const files = (await readdir(FAULTS_DIR)).filter(name => /^f\d+[a-z]?-.*\.mjs$/.
 // F-36: a selective run must not hide a missing or misspelled module. Every
 // requested id has to exist in the expected set and in the discovered inventory.
 const inventory = new Set(files.map(scenarioId))
+// 2026-09-11 review (T1): the declared set had lost F15-F18, so deleting those
+// four scenario files left a fully green run. The declaration stays hand-kept on
+// purpose — it is what makes a DELETED scenario visible — and this equality
+// makes a drifted one visible in the other direction too.
+const missingFromDisk = EXPECTED.filter(id => !inventory.has(id))
+const missingFromExpectation = [...inventory].filter(id => !EXPECTED.includes(id))
+if (missingFromDisk.length || missingFromExpectation.length) {
+  process.stderr.write(`faults: scenario inventory mismatch; declared-but-absent: ${missingFromDisk.join(', ') || 'none'}; present-but-undeclared: ${missingFromExpectation.join(', ') || 'none'}\n`)
+  process.exit(1)
+}
 const unknown = only.filter(id => !EXPECTED.includes(id) || !inventory.has(id))
 if (unknown.length) {
   process.stderr.write(`faults: unknown scenario id(s): ${unknown.join(', ')}\n`)

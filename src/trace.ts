@@ -29,7 +29,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
-import type { SwarmEvent } from './types.ts'
+import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
 export const TRACE_OPERATIONS = ['agent', 'tool', 'llm', 'retrieval', 'review', 'merge'] as const
@@ -1049,7 +1049,8 @@ const required = (data: Record<string, unknown>, key: string, seq: number): stri
   return value
 }
 /** Events that close a dispatched attempt; anything else leaves the attempt unresolved. */
-const ATTEMPT_CLOSERS = new Set(['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected'])
+/** The one declared set (`src/types.ts`): every event that fences a running attempt. */
+const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)
 export interface ReplayResult {
   commands: ReplayCommand[]
   keys: string[]

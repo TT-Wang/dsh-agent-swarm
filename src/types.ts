@@ -528,6 +528,42 @@ export interface Delivery {
   /** Present when this delivery carries a typed owner escalation. */
   escalation?: Escalation
 }
+/**
+ * Every durable event that fences a running attempt, and therefore closes the
+ * attempt interval both readers reconstruct from the log:
+ *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
+ *    and refuses the whole log with `ReplayTruncationError` when one never
+ *    closes;
+ *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
+ *    with the same set.
+ *
+ * The two readers used to carry hand-mirrored copies. They drifted: neither had
+ * `task/restart-repended` (emitted when a host restart re-pends a running task,
+ * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
+ * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
+ * refuse its own mission as truncated. One list, both readers.
+ */
+/**
+ * The owner-only tool surface: management and runtime modification that a
+ * worker session must never reach. Declared ONCE, because two enforcement points
+ * read it and they had drifted: the role projection hides exactly this set from
+ * a worker's schemas (`src/tools.ts`), and the runtime's synchronous final guard
+ * refuses exactly this set on every dispatch surface (`src/runtime.ts`). The
+ * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
+ * tool the guard would have allowed.
+ */
+export const OWNER_ONLY_TOOLS: readonly string[] = [
+  'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member',
+  'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
+]
+
+export const ATTEMPT_FENCING_EVENTS: readonly string[] = [
+  'task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion',
+  'task/lease-expired', 'task/restart-repended', 'task/ceiling-exhausted',
+  'task/handoff-started', 'task/invalidated', 'task/review-retired',
+  'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected',
+]
+
 export interface SwarmEvent {
   seq: number
   missionId: string

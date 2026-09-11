@@ -16,7 +16,7 @@ import { WorkspaceRevokedError } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Attempt, Member, Mission, SchedulingPass, SwarmEvent, Task } from './types.ts'
+import { ATTEMPT_FENCING_EVENTS, type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type SwarmEvent, type Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -166,17 +166,15 @@ function formatSpan(ms: number): string {
 }
 
 /**
- * R16-D: the durable events after which a task no longer holds its attempt.
- * This mirrors the private `ATTEMPT_CLOSERS` set in src/trace.ts (out of this
- * task's write scope) — the replay truncation check is the cross-check: a log
- * whose attempt closers diverge from this list is refused there. Kept local
- * because importing it is impossible (not exported) and widening that module's
- * surface is outside this task's scope; the integration task records the
- * duplication as a hand-off. A frozen array, not a Set: it is a lookup
+ * R16-D: the durable events after which a task no longer holds its attempt. The
+ * vocabulary is declared ONCE in `src/types.ts` (`ATTEMPT_FENCING_EVENTS`) and
+ * read here and by the replay decoder, which is what stops the two readers from
+ * drifting: the hand-mirrored copy this function replaced had lost
+ * `task/restart-repended` and `task/ceiling-exhausted`, so the replay refused
+ * logs its own runtime wrote. A frozen array, not a Set: it is a lookup
  * vocabulary, and the S5 in-memory census classifies every collection in src/.
  */
-const ATTEMPT_CLOSER_TYPES: readonly string[] = ['task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/lease-expired', 'task/handoff-started', 'task/invalidated', 'task/review-retired', 'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected']
-const isAttemptCloser = (type: string): boolean => ATTEMPT_CLOSER_TYPES.includes(type)
+const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.includes(type)
 
 export class Scheduling {
   /**

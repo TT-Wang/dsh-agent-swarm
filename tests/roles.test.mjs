@@ -85,6 +85,24 @@ async function fixture(t, responder, workerOptions = {}) {
 }
 const prompt = text => ({ kind: 'text', text })
 
+test('the runtime guard refuses exactly the owner-only surface the role projection hides', async t => {
+  // The 2026-09-11 review found the two enforcement points drifted: the guard's
+  // hand-written list had lost `swarm_registry`, so the projection hid a tool
+  // the guard would have allowed on an alternate dispatch surface. One declared
+  // list (`OWNER_ONLY_TOOLS`) now feeds both; this pins that they agree.
+  const f = await fixture(t, () => prompt('done'))
+  await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const owner = { sessionId: 'owner-session' }
+  const mission = f.runtime.create(owner, { title: 'Guard', objective: 'Guard the owner surface', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const builder = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  const guard = (tool) => f.workers.callbacks.guard(builder.id, tool)
+  for (const tool of MANAGEMENT_TOOLS) {
+    assert.equal(typeof guard(tool), 'string', `${tool} is refused for a worker by the runtime guard`)
+  }
+  assert.equal(guard('swarm_submit'), undefined, 'a member tool stays allowed')
+  assert.equal(guard('swarm_registry'), 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority', 'the drifted tool is refused by name, not by luck')
+})
+
 test('T3d: the entry-visible surface equals the model-visible golden fixture', async () => {
   const fixture = JSON.parse(await readFile(new URL('./fixtures/model-visible.expected.json', import.meta.url), 'utf8'))
   const visible = SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name) && !OWNER_SESSION_TOOLS.includes(name)).sort()

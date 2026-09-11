@@ -663,8 +663,16 @@ export class SwarmStore {
       if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0) {
         try { process.kill(pid, 0); alive = true } catch (error) { alive = (error as NodeJS.ErrnoException).code === 'EPERM' }
       }
-      throw new StoreRecoveryError('restore_blocked',
-        `Swarm state ${statePath} is owned by a live runtime${alive && pid !== undefined ? ` (pid ${pid})` : ''}; stop the host before restoring a snapshot`, statePath)
+      if (alive || pid === undefined) {
+        throw new StoreRecoveryError('restore_blocked',
+          `Swarm state ${statePath} is owned by a live runtime${alive && pid !== undefined ? ` (pid ${pid})` : ''}; stop the host before restoring a snapshot. If no host is running, delete ${lockPath} and retry.`, statePath)
+      }
+      // OWNER PASS 2026-09-11: a crashed host leaves its lock behind, and the
+      // store's own acquire path already reclaims a dead pid — restore did not,
+      // so the recovery path was unavailable exactly when it was needed: a host
+      // killed while a restore request was staged could never apply it again.
+      // Reclaim the same way acquireLock does, then continue.
+      rmSync(lockPath, { force: true })
     }
     SwarmStore.validateSnapshot(statePath, snapshotPath)
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 })

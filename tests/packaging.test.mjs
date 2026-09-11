@@ -14,6 +14,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { SWARM_TOOLS } from '../lib/tools.js'
 
 const root = new URL('..', import.meta.url)
 
@@ -70,4 +71,16 @@ test('F-21: the packed-artifact smoke passes on the built tree', () => {
   assert.ok(existsSync(new URL('lib/index.js', root)), 'run the build before the suite (npm run build)')
   const output = execFileSync(process.execPath, ['scripts/packed-smoke.mjs'], { cwd: root, encoding: 'utf8' })
   assert.match(output, /packed-smoke: \d+ export target\(s\)/)
+})
+
+test('the naming manifest declares exactly the surface this package registers', () => {
+  // The 2026-09-11 reviews found the manifest at 18 of 24 tools with no test
+  // reading it, so the drift was silent. It is a published file, so it is pinned
+  // against the registry rather than hand-kept.
+  const naming = JSON.parse(readFileSync(new URL('../dsh-plugin.naming.json', import.meta.url), 'utf8'))
+  assert.deepEqual([...naming.names.tools].sort(), [...SWARM_TOOLS].sort(), 'every registered tool is declared, and nothing else')
+  assert.deepEqual([...naming.names.pluginNames].sort(), ['agent-swarm', 'agent-swarm-client'], 'both plugin halves are named')
+  assert.deepEqual(naming.names.services, ['swarm'], 'the service the plugin provides')
+  assert.deepEqual(naming.names.commands, ['agent-swarm'], 'the native command')
+  assert.deepEqual(naming.names.routes, [{ kind: 'prefix', path: '/agent-swarm' }], 'the RPC route prefix')
 })

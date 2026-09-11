@@ -249,23 +249,46 @@ class CheckOutputScanner {
     }
     if (this.carry.length > MAX_ATTRIBUTION_CARRY) this.carry = this.carry.slice(-MAX_ATTRIBUTION_CARRY)
   }
+  /**
+   * ENV (2026-09-11 review): `node --test` writes TAP only when its reporter
+   * picks TAP. Node 24's default reporter is `spec` even on a pipe (`✔ name`,
+   * `✖ name`, `ℹ fail 1`), so a Node 24 check produced exit codes with NO
+   * attribution at all while this scanner read TAP alone — a silent evidence
+   * loss on a runtime the package's own `engines` declares supported. Both
+   * formats are read here; a foreign format simply contributes nothing, which is
+   * the pre-existing behaviour.
+   */
   private line(text: string): void {
-    const failure = /^\s*not ok\s+\d+\s*-\s+(.*\S)\s*$/.exec(text)
-    if (failure !== null) {
+    const tap = /^\s*not ok\s+\d+\s*-\s+(.*\S)\s*$/.exec(text)
+    // `✖ failing test (12.3ms)` — the spec reporter's failure marker, optional
+    // leading indentation for nested subtests, optional trailing duration.
+    const spec = tap === null ? /^\s*✖\s+(.*?)(?:\s+\(\d+(?:\.\d+)?(?:ms|s)\))?\s*$/.exec(text) : null
+    // The spec reporter prints its own section header (`✖ failing tests:`) with
+    // the same marker; it names no test and must not become one.
+    const failure = tap ?? (spec !== null && /^(?:failing )?tests?:$/.test(spec[1]!.trim()) ? null : spec)
+    const name = failure === null ? null : (spec === null ? failure[1]! : failure[1]!.replace(/\s*\(\d+(?:\.\d+)?(?:ms|s)\)\s*$/, ''))
+    if (name !== null) {
+      // The spec reporter prints each failure twice: once in the live stream and
+      // again under its trailing `failing tests:` block. TAP prints it once, so
+      // only the spec path dedupes — a repeated name is the reporter's echo, not
+      // a second failing test, and counting it would double `failingTestCount`.
+      if (spec !== null && this.failingTests.includes(name)) return
       if (!this.failed) { this.failed = true; this.failingStage = this.stage; this.failingSubtest = this.subtest }
       this.failingTestCount++
-      if (this.failingTests.length < MAX_ATTRIBUTED_FAILURES) this.failingTests.push(failure[1]!.slice(0, MAX_ATTRIBUTED_NAME))
+      if (this.failingTests.length < MAX_ATTRIBUTED_FAILURES) this.failingTests.push(name.slice(0, MAX_ATTRIBUTED_NAME))
       return
     }
     if (!this.failed) {
-      const stage = /^>\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^\$\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^#\s*stage:\s*(\S.*\S|\S)\s*$/i.exec(text)
+      // `▶ suite name` is the spec reporter's suite marker; the TAP trio stays.
+      const stage = /^>\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^$\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^#\s*stage:\s*(\S.*\S|\S)\s*$/i.exec(text) ?? /^\s*▶\s+(\S.*\S|\S)\s*$/.exec(text)
       if (stage !== null) this.stage = stage[1]!.slice(0, MAX_ATTRIBUTED_NAME)
       const subtest = /^#\s*Subtest:\s*(\S.*\S|\S)\s*$/.exec(text)
       if (subtest !== null) this.subtest = subtest[1]!.slice(0, MAX_ATTRIBUTED_NAME)
     }
     const summary = /^#\s*(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b\s*(.*)$/.exec(text)
+      ?? /^\s*ℹ\s*(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b\s*(.*)$/.exec(text)
     if (summary !== null) { this.summary.set(summary[1]!, text.trim()); return }
-    const plan = /^1\.\.(\d+)\s*$/.exec(text)
+    const plan = /^1\.\.(\d+)\s*$/.exec(text) ?? /^\s*ℹ\s*tests\s+(\d+)\s*$/.exec(text)
     if (plan !== null) this.plan = text.trim()
   }
   result(outputTruncated: boolean): CheckAttributionShot {
