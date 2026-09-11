@@ -4,9 +4,10 @@ import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { HOST_GIT_TIMEOUT_MS, Workspaces, runProcess } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -21,7 +22,7 @@ async function fixture(t, options = {}) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const head = await git(source, 'rev-parse', 'HEAD')
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Implement answer', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -112,7 +113,7 @@ test('concurrent members and restarted workspace managers reuse the exact origin
   assert.equal(await git(first, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   assert.equal(await git(second, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   await writeFile(path.join(source, 'src', 'answer.txt'), 'later source edits\n')
-  const resumed = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const resumed = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
   try {
     assert.deepEqual(await resumed.prepareBaseline(mission), baseline)
     const third = await resumed.prepareWorkspace(mission, 'third')
@@ -184,7 +185,7 @@ test('unresolved Git conflicts are refused without modifying the user index or c
   await git(source, 'checkout', 'main')
   await writeFile(path.join(source, 'src', 'answer.txt'), 'main answer\n')
   await git(source, 'commit', '-am', 'main')
-  const merged = await runProcess(['git', 'merge', 'conflicting'], { cwd: source, timeoutMs: 30000, maxBytes: 10000 })
+  const merged = await runProcess(['git', 'merge', 'conflicting'], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 10000 })
   assert.equal(merged.exitCode, 1)
   const index = await readFile(path.join(source, '.git', 'index'))
   const content = await readFile(path.join(source, 'src', 'answer.txt'))
@@ -310,7 +311,7 @@ test('primary-selected check timeout overrides the host fallback and removes the
 
 test('bounded UTF-8 output counts the truncation marker in its byte budget', async t => {
   const { temp } = await fixture(t)
-  const result = await runProcess([process.execPath, '-e', 'process.stdout.write("界".repeat(500))'], { cwd: temp, timeoutMs: 30000, maxBytes: 65 })
+  const result = await runProcess([process.execPath, '-e', 'process.stdout.write("界".repeat(500))'], { subprocess: subprocessSeam, cwd: temp, timeoutMs: 30000, maxBytes: 65 })
   assert.equal(result.truncated, true)
   assert.ok(Buffer.byteLength(result.output) <= 65)
   assert.match(result.output, /output truncated/)

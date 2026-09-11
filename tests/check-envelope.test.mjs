@@ -28,13 +28,14 @@ import path from 'node:path'
 import { SwarmRuntime, compareCheckEnvironments, selfRunEnvironmentSource, selfRunEnvironmentFacts, SELF_RUN_EXTRACTOR_LIMITATIONS } from '../lib/runtime.js'
 import { Workspaces, checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
 const DEFAULT_DEPENDENCY_DIRS = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -115,7 +116,7 @@ async function workspaceFixture(t, options = {}) {
   await writeFile(path.join(source, TMP_PROBE), TMP_PROBE_SOURCE)
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'fixture baseline')
-  const workspaces = new Workspaces({
+  const workspaces = new Workspaces({ subprocess: subprocessSeam,
     workspacesRoot: path.join(temp, 'worktrees'),
     checkTimeoutMs: 30000,
     maxCheckOutputBytes: options.maxCheckOutputBytes ?? 4096,
@@ -238,7 +239,7 @@ test('ENV: truncating a real failing run at the bound keeps the failing test, th
   t.after(async () => rm(temp, { recursive: true, force: true }))
   await mkdir(path.join(temp, 'tests'), { recursive: true })
   await writeFile(path.join(temp, FIXTURE_TEST), FAILING_SUITE)
-  const result = await runProcess(['/bin/sh', '-c', FAILING_CHECK], { cwd: temp, timeoutMs: 30000, maxBytes: 4096, captureAttribution: true, env: checkEnvFor(process.env.HOME) })
+  const result = await runProcess(['/bin/sh', '-c', FAILING_CHECK], { subprocess: subprocessSeam, cwd: temp, timeoutMs: 30000, maxBytes: 4096, captureAttribution: true, env: checkEnvFor(process.env.HOME) })
   assert.equal(result.exitCode, 1, 'the run really fails')
   assert.equal(result.truncated, true, 'the stored output was cut at the bound')
   assert(!result.output.includes('the-real-failure'), 'the bound removed the failing test name from the stored output')
@@ -487,7 +488,7 @@ test('ENV-R: a recorded self-run command that overrides HOME refuses the accepta
   const command = `HOME=${other} node -e "process.stdout.write(process.env.HOME ?? '')"`
   // The command really executes under its own HOME; the row must record that
   // environment rather than the ambient host sample it never ran with.
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(executed.exitCode, 0, executed.output)
   assert.ok(executed.output.includes(other), `the self-run really ran with the HOME its command declares: ${executed.output.slice(0, 200)}`)
   const runId = await fixture.workers.callbacks.toolRun(reviewer.reviewer.id, { tool: 'bash', arguments: { command }, result: { output: executed.output.trim() }, isError: false })
@@ -525,7 +526,7 @@ test('ENV-R: a quoted mention of HOME is not an override and the acceptance proc
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
   const command = `grep -n "HOME=${other}" src/answer.txt ; true`
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(process.env.HOME) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(process.env.HOME) })
   assert.equal(executed.exitCode, 0, executed.output)
   const runId = await fixture.workers.callbacks.toolRun(reviewer.reviewer.id, { tool: 'bash', arguments: { command }, result: { output: executed.output }, isError: false })
   const row = fixture.runtime.store.get('tool_runs', runId)
@@ -723,7 +724,7 @@ test('ENV-R5: the reviewer\'s nested shape really runs with the ambient HOME and
   const command = `sh -c "echo \\"shell HOME=\\$HOME\\"; cat <<DOC
 x; export HOME=${other}
 DOC"`
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(executed.exitCode, 0, executed.output)
   assert.ok(executed.output.includes(`shell HOME=${home}`), `the shell really ran with the check HOME: ${executed.output}` )
   assert.ok(executed.output.includes(`x; export HOME=${other}`), `the heredoc body really was printed as data: ${executed.output}`)
@@ -744,7 +745,7 @@ test('ENV-R3: a command that leaves HOME untouched is not refused, and one that 
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
   const record = async command => {
-    const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+    const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
     assert.equal(executed.exitCode, 0, executed.output)
     const runId = await fixture.workers.callbacks.toolRun(reviewer.reviewer.id, { tool: 'bash', arguments: { command }, result: { output: executed.output }, isError: false })
     return { executed, row: fixture.runtime.store.get('tool_runs', runId) }
@@ -765,7 +766,7 @@ test('ENV-R3: a command that leaves HOME untouched is not refused, and one that 
   // (A separate fixture: the acceptance above closed this fixture's attempt.)
   const clearedFixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const clearedReviewer = clearedFixture.reviews[0]
-  const removal = await runProcess(['/bin/sh', '-c', 'unset -v HOME; echo "HOME=[$HOME]"'], { cwd: path.join(clearedFixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const removal = await runProcess(['/bin/sh', '-c', 'unset -v HOME; echo "HOME=[$HOME]"'], { subprocess: subprocessSeam, cwd: path.join(clearedFixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(removal.exitCode, 0, removal.output)
   assert.ok(removal.output.includes('HOME=[]'), `the variable really was removed: ${removal.output}`)
   const removalRun = await clearedFixture.workers.callbacks.toolRun(clearedReviewer.reviewer.id, { tool: 'bash', arguments: { command: 'unset -v HOME; echo "HOME=[$HOME]"' }, result: { output: removal.output }, isError: false })
@@ -782,7 +783,7 @@ test('ENV-R3: a command that leaves HOME untouched is not refused, and one that 
   const overrideFixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const overrideReviewer = overrideFixture.reviews[0]
   const command = `env "HOME=${other}" sh -c 'echo HOME=$HOME'`
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(overrideFixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(overrideFixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(executed.exitCode, 0, executed.output)
   assert.ok(executed.output.includes(other), `the command really ran with the overridden HOME: ${executed.output}`)
   const runId = await overrideFixture.workers.callbacks.toolRun(overrideReviewer.reviewer.id, { tool: 'bash', arguments: { command }, result: { output: executed.output }, isError: false })
@@ -832,7 +833,7 @@ test('ENV-R4: a command whose heredoc body mentions HOME really runs with the am
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
   const command = 'echo "shell HOME=$HOME"; cat <<DOC\nx; export HOME=/x\nDOC'
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(executed.exitCode, 0, executed.output)
   assert.ok(executed.output.includes(`shell HOME=${home}`), `the shell really ran with the check HOME: ${executed.output}`)
   assert.ok(executed.output.includes('export HOME=/x'), 'the body is printed as data, never executed')
@@ -851,7 +852,7 @@ test('ENV-R4: export -n HOME=/x really runs without HOME in the child and record
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
   const command = 'export -n HOME=/x; printenv HOME || echo "child HOME absent"'
-  const executed = await runProcess(['/bin/sh', '-c', command], { cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
+  const executed = await runProcess(['/bin/sh', '-c', command], { subprocess: subprocessSeam, cwd: path.join(fixture.temp, 'source'), timeoutMs: 30000, maxBytes: 4096, env: checkEnvFor(home) })
   assert.equal(executed.exitCode, 0, executed.output)
   assert.ok(executed.output.includes('child HOME absent'), `the executed child really has no HOME: ${executed.output}`)
   const runId = await fixture.workers.callbacks.toolRun(reviewer.reviewer.id, { tool: 'bash', arguments: { command }, result: { output: executed.output }, isError: false })

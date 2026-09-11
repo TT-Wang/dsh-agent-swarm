@@ -31,14 +31,15 @@ import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MANAGEMENT_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
 const gitFails = async (cwd, ...args) => {
-  const result = await runProcess(['git', ...args], { cwd, timeoutMs: 30000, maxBytes: 10000 })
+  const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 10000 })
   return result.exitCode !== 0
 }
 async function gitFixture(t) {
@@ -49,7 +50,7 @@ async function gitFixture(t) {
   await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   return { temp, source, workspaces, artifactsOf: missionId => path.join(temp, 'worktrees', missionId, 'artifacts.git') }
 }
@@ -120,7 +121,7 @@ test('T1c2: the per-mission artifact repository is self-contained, so a source g
   assert.equal(await lstat(path.join(repo, 'objects', 'info', 'alternates')).then(() => true, () => false), false, 'no alternate borrows the source object store')
 
   // Remove the member worktree and prune the source object store.
-  const removed = await runProcess(['git', '-C', source, 'worktree', 'remove', '--force', member.workspace], { cwd: source, timeoutMs: 30000, maxBytes: 100000 })
+  const removed = await runProcess(['git', '-C', source, 'worktree', 'remove', '--force', member.workspace], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(removed.exitCode, 0, removed.output)
   await git(source, 'worktree', 'prune')
   await git(source, 'gc', '--prune=now', '--quiet')

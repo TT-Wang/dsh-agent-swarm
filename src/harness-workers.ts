@@ -315,6 +315,10 @@ export class HarnessWorkers implements WorkerAdapter {
     this.workspaces = new Workspaces({
       ...options,
       checkEnv: this.checkEnvironment.map(),
+      // Every command this adapter runs — worktree Git, capture, and a declared
+      // check — goes through the host's managed-process seam, resolved at each
+      // start so the provider's mount order never decides whether a mission can run.
+      subprocess: () => ctx.get('subprocess'),
       ...(options.grants === undefined ? {} : { grants: options.grants }),
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')

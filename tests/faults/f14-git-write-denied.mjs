@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
 import { makeRepo, Workspaces, WorkspaceWorkers, setup, events, eventually, git, runScenario, taskOf } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F14', title: 'A denied worker git write returns a typed error and never blocks artifact publication', invariants: ['I14'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f14')
-    const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     const workers = new WorkspaceWorkers(workspaces)
     const f = await setup({ workspace: source, workers })
     const g = await setup()

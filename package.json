@@ -148,7 +148,8 @@
     "@deepseek-ai/dsh-session-projection": "0.1.2-rc.1",
     "@deepseek-ai/dsh-client-ui-chat": "0.1.2-rc.1",
     "@deepseek-ai/dsh-client-ui-renderer": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-session-query": "0.1.2-rc.1"
+    "@deepseek-ai/dsh-session-query": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.2-rc.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-client-connection": {

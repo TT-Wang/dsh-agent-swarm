@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { tempDirectory } from '../temp-root.mjs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 const execute = promisify(execFile)
 export const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
@@ -46,7 +47,7 @@ export const clone = value => structuredClone(value)
 export const json = value => JSON.parse(JSON.stringify(value))
 
 export async function git(cwd, ...args) {
-  const result = await runProcess(['git', '-c', 'user.name=Fault Suite', '-c', 'user.email=faults@example.invalid', ...args], { cwd, timeoutMs: 30_000, maxBytes: 200_000 })
+  const result = await runProcess(['git', '-c', 'user.name=Fault Suite', '-c', 'user.email=faults@example.invalid', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30_000, maxBytes: 200_000 })
   assert.equal(result.exitCode, 0, `git ${args.join(' ')} failed: ${result.output}`)
   return result.output.trim()
 }

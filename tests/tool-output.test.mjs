@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { registerTools } from '../lib/tools.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
 function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget); return definitions }
 test('model-visible renders stay compact: observe passes the focused view through and never repeats the board; launch and stage return identities', () => {
@@ -66,7 +67,10 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   const snapshot = { mission: { id: 'mission-one' } }
   const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) { launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot }, snapshot: () => snapshot }
   const definitions = new Map()
-  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  // The launch path probes every declared check's shell syntax through the host
+  // managed-process seam, so this stub host supplies the real provider — the
+  // assertion below is that the probe runs without executing the check.
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) }, get: name => name === 'subprocess' ? subprocessSeam() : undefined }, runtime, budget)
   const input = { requestId: 'request-one', title: 'Goal', objective: 'Deliver the goal', scope: ['result.txt'], acceptance: ['works'], budget: { ...budget, maxTokens: 12345 },
     members: [{ key: 'a', name: 'A', role: 'delivery', maxOutputTokens: 1024 }, { key: 'b', name: 'B', role: 'review', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'w', title: 'Work', objective: 'Deliver' }], tasks: [

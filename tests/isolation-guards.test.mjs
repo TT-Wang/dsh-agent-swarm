@@ -13,9 +13,10 @@ import path from 'node:path'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { applyDelivery } from '../lib/delivery.js'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', '-c', 'commit.gpgsign=false', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', '-c', 'commit.gpgsign=false', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -43,7 +44,7 @@ async function workspaceFixture(t, { links = {}, options = {} } = {}) {
     await git(source, 'add', '-A')
     await git(source, 'commit', '-m', 'baseline links')
   }
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
   const mission = { id: 'mission-isolation', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Isolation guard', kind: 'implementation', scope: ['**'], checks: [], status: 'running' }
@@ -150,7 +151,7 @@ test('F-C1: capture never records an escaping chain, even after an unrelated ret
   await symlink('../escape', path.join(member.workspace, 'src', 'chain'))
   await assert.rejects(workspaces.captureArtifact(member, task), /symlink escapes the mission workspace/)
   // The refusal is durable: the artifact ref is never published.
-  const ref = await runProcess(['git', 'rev-parse', '--verify', '--quiet', 'refs/swarm/mission-isolation/task-one/1'], { cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
+  const ref = await runProcess(['git', 'rev-parse', '--verify', '--quiet', 'refs/swarm/mission-isolation/task-one/1'], { subprocess: subprocessSeam, cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
   assert.notEqual(ref.exitCode, 0, 'no artifact ref exists after a refused capture')
   assert.equal(await readFile(path.join(member.workspace, 'src', 'answer.txt'), 'utf8'), 'base\n')
 })

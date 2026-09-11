@@ -30,6 +30,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, ScopedEnvironment, assertCompositionScratch } from '../lib/harness-workers.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -100,7 +101,7 @@ async function realCheckFixture(t, members = 2, checkCommand = 'sleep 0.6') {
   const source = join(root, 'source')
   await mkdir(join(source, 'src'), { recursive: true })
   const git = async (...args) => {
-    const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd: source, timeoutMs: 30000, maxBytes: 100000 })
+    const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 100000 })
     assert.equal(result.exitCode, 0, result.output)
     return result.output.trim()
   }
@@ -108,7 +109,7 @@ async function realCheckFixture(t, members = 2, checkCommand = 'sleep 0.6') {
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git('add', '.')
   await git('commit', '-m', 'fixture baseline')
-  const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
     checkConcurrency: 1, confineCheck: argv => argv })
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'mission-operation-bound-checks', workspace: source }

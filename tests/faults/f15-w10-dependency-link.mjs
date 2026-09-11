@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { makeRepo, Workspaces, git, readJson, runScenario } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F15', title: 'An untracked dependency symlink does not block the next task preparation', invariants: ['I9', 'I13'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f15', { '.gitignore': '/node_modules/\n', 'src/answer.txt': 'base\n' })
-    const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     try {
       const mission = { id: 'mission-f15', workspace: source }
       const member = { id: 'member-f15', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-f15') }

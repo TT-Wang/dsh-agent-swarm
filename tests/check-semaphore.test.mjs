@@ -14,9 +14,10 @@ import path from 'node:path'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { Config } from '../lib/index.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -30,7 +31,7 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'fixture baseline')
   const checkStarts = []
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
     confineCheck: (argv) => { checkStarts.push(Date.now()); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const prepared = []

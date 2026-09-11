@@ -22,6 +22,7 @@ import { HarnessWorkers } from '../lib/harness-workers.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
+import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
 // Actual public storage APIs on each supported release. These helpers preserve
 // durability and release alpha.2's explicit handles, including after failures.
@@ -64,7 +65,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   const source = path.join(root, 'source')
   await mkdir(source)
   for (const args of [['init', '-b', 'main'], ['-c', 'user.name=Swarm', '-c', 'user.email=swarm@localhost', 'commit', '--allow-empty', '-m', 'base']]) {
-    const result = await runProcess(['git', ...args], { cwd: source, timeoutMs: 30000, maxBytes: 10000 })
+    const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 10000 })
     assert.equal(result.exitCode, 0, result.output)
   }
   const ctx = new Context()
@@ -101,6 +102,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   await ctx.plugin(SystemPrompt, config.systemPromptConfig)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SubprocessLocal)
   await ctx.plugin(JsonlPersistence, { root: path.join(root, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
   await ctx.plugin(SandboxPolicy, { mode: 'read-only', workspaceRoot: source })
   await ctx.plugin(Approval, { policy: 'never' })

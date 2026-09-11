@@ -18,6 +18,7 @@ import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
+import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const gate = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -101,10 +102,10 @@ test('host recovery discards persisted running activity before publishing recove
 
 async function nativeFixture(t, responder, retry=false) {
   const root=await realpath(await mkdtemp(join(tmpdir(),'swarm-native-activity-'))), source=join(root,'source');await mkdir(source)
-  for(const args of [['init','--quiet'],['-c','user.name=Swarm','-c','user.email=swarm@localhost','commit','--allow-empty','--quiet','-m','base']]) assert.equal((await runProcess(['git',...args],{cwd:source,timeoutMs:30000,maxBytes:10000})).exitCode,0)
+  for(const args of [['init','--quiet'],['-c','user.name=Swarm','-c','user.email=swarm@localhost','commit','--allow-empty','--quiet','-m','base']]) assert.equal((await runProcess(['git',...args],{ subprocess: subprocessSeam,cwd:source,timeoutMs:30000,maxBytes:10000})).exitCode,0)
   const ctx=new Context();let adapter;const observed=[]
   t.after(async()=>{await adapter?.dispose();await ctx.fiber.dispose();await rm(root,{recursive:true,force:true})})
-  for(const plugin of [LlmRuntime,SessionStore,SessionProjection,SystemPrompt,ToolRuntime,AgentRegistry]) await ctx.plugin(plugin)
+  for(const plugin of [LlmRuntime,SessionStore,SessionProjection,SystemPrompt,ToolRuntime,AgentRegistry,SubprocessLocal]) await ctx.plugin(plugin)
   await ctx.plugin(JsonlPersistence,{root:join(root,'sessions'),compression:'none',writeBatchMaxDelayMs:1})
   await ctx.plugin(SandboxPolicy,{mode:'read-only',workspaceRoot:source});await ctx.plugin(Approval,{policy:'never'});await ctx.plugin(AgentLoop,{agents:[]})
   if(retry) await ctx.plugin(LlmRetry)

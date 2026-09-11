@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { readdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { makeRepo, Workspaces, git, runScenario } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F10', title: 'Concurrent worktree preparation in one repository is serialized and never corrupts git metadata', invariants: ['I9'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f10')
-    const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     try {
       const missionOne = { id: 'mission-one', workspace: source }
       const missionTwo = { id: 'mission-two', workspace: source }

@@ -3,13 +3,14 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { makeRepo, Workspaces, WorkspaceWorkers, setup, runNode, runScenario, MISSION_ACCEPTANCE } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F8', title: 'A SIGKILL after the delivery effect but before the receipt replays idempotently', invariants: ['I4'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f8', { 'value.cjs': 'module.exports = 1\n' })
     const workspacesRoot = join(root, 'worktrees')
-    const workspaces = new Workspaces({ workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     const workers = new WorkspaceWorkers(workspaces)
     const stateDir = join(root, 'state')
     await mkdir(stateDir, { recursive: true })

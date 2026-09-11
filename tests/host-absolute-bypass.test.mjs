@@ -16,6 +16,7 @@ import { absoluteCheckPaths, classifyCheck, isCheckPattern, isSystemCheckPath, n
 import { validatePlan } from '../lib/plans.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { runProcess } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
 
@@ -39,7 +40,7 @@ test('A2-01: the shell really resolves \\/ and // to the same host path the scan
   const target = join(directory, 'host-secret.txt')
   await writeFile(target, 'host state\n')
   for (const spelling of [target, `\\${target}`, `/${target}`, `//${target}`]) {
-    const result = await runProcess(['/bin/sh', '-c', `test -f ${spelling} && echo READ`], { cwd: directory, timeoutMs: 10000, maxBytes: 2000 })
+    const result = await runProcess(['/bin/sh', '-c', `test -f ${spelling} && echo READ`], { subprocess: subprocessSeam, cwd: directory, timeoutMs: 10000, maxBytes: 2000 })
     assert.equal(result.output.trim(), 'READ', `${JSON.stringify(spelling)} must resolve to the same host file`)
   }
 })

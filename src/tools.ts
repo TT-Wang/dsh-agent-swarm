@@ -315,7 +315,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     // Parse only: reject invalid shell syntax before worker creation, without executing a check.
     const syntaxIssues: string[] = []
     for (const [taskIndex, task] of plan.tasks.entries()) for (const [checkIndex, command] of (task.checks ?? []).entries()) {
-      const syntax = await runProcess(['/bin/sh', '-n', '-c', command], { cwd: request.workspace, signal: actor.signal, timeoutMs: 10000, maxBytes: 2000 })
+      const syntax = await runProcess(['/bin/sh', '-n', '-c', command], { cwd: request.workspace, signal: actor.signal, timeoutMs: 10000, maxBytes: 2000, subprocess: () => ctx.get('subprocess') })
       if (syntax.exitCode !== 0) syntaxIssues.push(`tasks[${taskIndex}].checks[${checkIndex}] has invalid shell syntax: ${syntax.output.trim()}`)
     }
     if (syntaxIssues.length) throw new Error(`[check_syntax_invalid] ${syntaxIssues.join('\n')}\nPrefer the existing repository check commands; repair every command in the \`checks\` array and retry the complete plan with the same \`requestId\`.`)

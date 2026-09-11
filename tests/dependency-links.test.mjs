@@ -4,9 +4,10 @@ import { lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } fro
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -26,7 +27,7 @@ async function fixture(t, options = {}) {
   await writeFile(path.join(source, 'vendor', 'dep', 'value.txt'), 'vendored\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
   const mission = { id: 'mission-deps', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Run checks', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -109,7 +110,7 @@ test('W11: an already-staged dependency link is unstaged before the artifact com
   const artifact = await workspaces.captureArtifact(member, task)
   assert.deepEqual(artifact.changedPaths, ['src/answer.txt'])
   assert.equal(await git(member.workspace, 'ls-files', '--', 'node_modules'), '', 'the staged link is unstaged')
-  const shown = await runProcess(['git', 'show', `${artifact.commit}:node_modules`], { cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
+  const shown = await runProcess(['git', 'show', `${artifact.commit}:node_modules`], { subprocess: subprocessSeam, cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
   assert.notEqual(shown.exitCode, 0, 'the commit contains no dependency link')
   assert.equal((await lstat(link)).isSymbolicLink(), true, 'the link stays in the workspace')
 })

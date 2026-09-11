@@ -24,12 +24,13 @@ import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { validatePlan } from '../lib/plans.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -58,7 +59,7 @@ async function pythonFixture(t, options = {}) {
   await writeFile(path.join(source, '.tox', 'py', 'bin', 'python'), '#!/bin/sh\necho "tox-python"\n')
   await chmod(path.join(source, '.tox', 'py', 'bin', 'python'), 0o755)
   const seen = []
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
     confineCheck: (argv, cwd) => { seen.push(cwd); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }

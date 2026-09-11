@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm } from 'node:fs/promises'
 import { makeRepo, readJson, writeJson, Workspaces, git, runScenario } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F6', title: 'A task whose recorded owner moved on recovers from its recorded base', invariants: ['I1', 'I3'],
   body: async () => {
     const { root, source, head } = await makeRepo('swarm-faults-f6')
-    const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     try {
       const mission = { id: 'mission-f6', workspace: source }
       const first = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }

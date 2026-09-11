@@ -1,10 +1,10 @@
 /** Owned Git worktrees and immutable artifacts. The source checkout is read-only. */
-import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
 import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { captureGitSnapshot } from './git-snapshot.js'
@@ -104,6 +104,14 @@ export interface WorkspaceOptions {
   sandboxPolicy?: { mode?: string; enforcement?: string }
   /** Required in production: wrap checks in the host's execution confinement. */
   confineCheck(argv: string[], cwd: string): Promise<string[]> | string[]
+  /**
+   * The host's managed-process seam every command in this instance runs through
+   * (`ctx.get('subprocess')` in the adapter). Read at each start rather than
+   * captured, so a workspace built before the provider mounts still executes
+   * once it does. Absent refuses the command with a named error instead of
+   * spawning an unmanaged process.
+   */
+  subprocess?: ProcessSeamSource
 }
 /** R11-19: one declared check's measured queue wait and execution time. */
 export interface CheckEnvelopeSample {
@@ -393,7 +401,23 @@ interface MissionWorkspace { version: 1; missionId: string; source: string; base
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; recovery?: TaskRecovery }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
-interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean }
+/**
+ * The narrow slice of the host's subprocess capability (`ctx.subprocess`) this
+ * plugin executes through. Every process this plugin starts — the Git plumbing
+ * on its own worktrees, a worker's shell-syntax probe, a declared check — is one
+ * `spawn` of a fully specified spec; range ownership, signalling and quiescence
+ * belong to the provider behind the seam (its TERM-before-KILL staging, its
+ * spill and drain bounds, its host-exit force-stop).
+ */
+export interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
+/**
+ * Resolve the seam at the moment a command starts. A resolver rather than a
+ * value because the provider's mount order is the host's business: a workspace
+ * built during plugin load must still execute commands once the service is
+ * active, and a host that mounts none refuses at the point of use.
+ */
+export type ProcessSeamSource = () => ProcessSeam | undefined
+interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean; subprocess?: ProcessSeamSource }
 /**
  * Worktree metadata mutation queues keyed by canonical git common dir. Git
  * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
@@ -405,71 +429,132 @@ interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number;
 const worktreeQueues = new Map<string, Promise<void>>()
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
 
-/** Execute an argv with bounded output and a cancellation-owned process group. */
+/**
+ * ENV: one bounded output window over a command's two streams. The retained
+ * text is the HEAD of the stream (its first `maxBytes`), because a check's first
+ * failing lines are the evidence a verifier reads; attribution is scanned over
+ * every chunk, including the chunks the bound drops, because the failing test
+ * and the TAP summary arrive after it. The window is the plugin's, not the
+ * provider's: the seam's own collector keeps the tail and is never enabled here.
+ */
+class ProcessOutput {
+  private bytes = 0
+  private truncated = false
+  private readonly chunks: Buffer[] = []
+  private readonly scanner: CheckOutputScanner | undefined
+  constructor(private readonly maxBytes: number, captureAttribution: boolean) {
+    this.scanner = captureAttribution ? new CheckOutputScanner() : undefined
+  }
+  push(chunk: Buffer): void {
+    this.scanner?.push(chunk)
+    const available = Math.max(0, this.maxBytes - this.bytes)
+    if (chunk.length > available) this.truncated = true
+    if (available > 0) { const kept = chunk.subarray(0, available); this.chunks.push(kept); this.bytes += kept.length }
+  }
+  result(): { output: string; truncated: boolean; attribution?: CheckAttributionShot } {
+    const truncated = this.truncated
+    let output = Buffer.concat(this.chunks).toString('utf8')
+    if (truncated) {
+      const marker = '\n[output truncated]'
+      output = Buffer.from(output).subarray(0, Math.max(0, this.maxBytes - Buffer.byteLength(marker))).toString('utf8')
+      while (Buffer.byteLength(output + marker) > this.maxBytes) output = output.slice(0, -1)
+      output += marker
+    }
+    return { output, truncated, ...(this.scanner === undefined ? {} : { attribution: this.scanner.result(truncated) }) }
+  }
+}
+
+/** Grace the host's termination procedure stages between SIGTERM and SIGKILL, and the bound it drains held pipes with. */
+const TERMINATION_GRACE_MS = 300
+
+/**
+ * ENV: the environment one command receives. An explicit map is the child's
+ * *whole* environment, exactly as the direct launcher treated it: every name the
+ * map does not carry is removed with the seam's tombstones, because the provider
+ * otherwise layers its credential-scrubbed ambient base underneath — and a check
+ * environment that deliberately cleared a variable (the overlay scrubs
+ * `NODE_TEST_CONTEXT`, a cleared `HOME` is recorded as a blocking divergence)
+ * must not have it reappear. With no map the child gets that scrubbed ambient
+ * base, which is what a bare probe wants and what the plugin's own `process.env`
+ * would have handed it before the scrub existed.
+ */
+function seamEnvironment(map: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  if (map === undefined) return { GIT_TERMINAL_PROMPT: '0' }
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of Object.keys(scrubbedParentEnv())) if (!Object.hasOwn(map, key)) env[key] = undefined
+  return { ...env, ...map, GIT_TERMINAL_PROMPT: '0' }
+}
+
+/**
+ * Execute one argv through the host's managed-process seam with bounded output
+ * and a caller-owned deadline.
+ *
+ * What stays here: the argv, the environment overlay, the head-keeping output
+ * window, and cause classification — a caller abort reports 'Execution
+ * cancelled', the deadline reports `Execution timed out after Nms`, and a real
+ * exit code is reported whatever cleanup did afterwards.
+ *
+ * What moved to the host with this pass: process creation, the owned process
+ * range, SIGTERM-before-SIGKILL escalation on the spec's abort signal, the drain
+ * bound for pipes a surviving descendant still holds, and force-termination of
+ * whatever is still running at host exit. The provider that owns those is also
+ * what makes a host-exit kill and a range quiescence claim inspectable, instead
+ * of the plugin's own best-effort group signalling.
+ */
 export async function runProcess(argv: readonly string[], options: ProcessOptions): Promise<{ exitCode: number; output: string; truncated: boolean; attribution?: CheckAttributionShot }> {
   if (argv.length === 0 || !argv[0]) throw new Error('An executable is required')
   options.signal?.throwIfAborted()
-  if (process.platform === 'win32') throw new Error('Swarm worktree execution currently requires POSIX process groups')
-  return await new Promise((resolve, reject) => {
-    const child = spawn(argv[0]!, argv.slice(1), {
-      cwd: options.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...(options.env ?? process.env), GIT_TERMINAL_PROMPT: '0' },
+  const seam = options.subprocess?.()
+  if (seam === undefined) throw new Error('[subprocess_service_required] Command execution requires the Harness subprocess service Inspect the host composition that mounts it, then retry; report the refusal with `missionId` and `swarm_observe`.')
+  // The seam takes one signal, so the caller's cancellation and this deadline are
+  // merged into one controller whose reason classifies the failure once.
+  const deadline = new AbortController()
+  let failure: Error | undefined
+  const cancel = (error: Error): void => { failure ??= error; deadline.abort(failure) }
+  const onAbort = (): void => { cancel(new Error('Execution cancelled', { cause: options.signal?.reason })) }
+  options.signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = setTimeout(() => { cancel(new Error(`Execution timed out after ${options.timeoutMs}ms`)) }, options.timeoutMs)
+  const release = (): void => {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', onAbort)
+  }
+  const output = new ProcessOutput(options.maxBytes, options.captureAttribution === true)
+  let handle: SubprocessHandle
+  try {
+    handle = seam.spawn({
+      argv,
+      cwd: options.cwd,
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      graceMs: TERMINATION_GRACE_MS,
+      signal: deadline.signal,
+      env: seamEnvironment(options.env),
     })
-    let bytes = 0
-    let truncated = false
-    const chunks: Buffer[] = []
-    // ENV: attribution is read from every chunk, including the chunks the
-    // output bound drops, because the failing test and the TAP summary arrive
-    // after it.
-    const scanner = options.captureAttribution === true ? new CheckOutputScanner() : undefined
-    let failure: Error | undefined
-    let killTimer: ReturnType<typeof setTimeout> | undefined
-    const killGroup = (signal: NodeJS.Signals): void => {
-      if (child.pid === undefined) return
-      try { process.kill(-child.pid, signal) } catch (error) {
-        // ESRCH and EPERM both mean the group is no longer ours to signal: the
-        // close-path reap must not replace the child's real exit code and
-        // output with a cleanup error. A timeout or abort already recorded its
-        // own failure in cancel() before any kill.
-        const code = error instanceof Error && 'code' in error ? error.code : undefined
-        if (code !== 'ESRCH' && code !== 'EPERM') failure ??= error instanceof Error ? error : new Error(String(error))
-      }
-    }
-    const cancel = (error: Error): void => {
-      failure ??= error
-      killGroup('SIGTERM')
-      killTimer ??= setTimeout(() => { killGroup('SIGKILL') }, 300)
-    }
-    const onAbort = (): void => { cancel(new Error('Execution cancelled', { cause: options.signal?.reason })) }
-    const timer = setTimeout(() => { cancel(new Error(`Execution timed out after ${options.timeoutMs}ms`)) }, options.timeoutMs)
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-    const append = (chunk: Buffer): void => {
-      scanner?.push(chunk)
-      const available = Math.max(0, options.maxBytes - bytes)
-      if (chunk.length > available) truncated = true
-      if (available > 0) { const kept = chunk.subarray(0, available); chunks.push(kept); bytes += kept.length }
-    }
-    child.stdout.on('data', append)
-    child.stderr.on('data', append)
-    child.on('error', error => { failure ??= error })
-    child.on('close', code => {
-      clearTimeout(timer)
-      if (killTimer !== undefined) clearTimeout(killTimer)
-      options.signal?.removeEventListener('abort', onAbort)
-      // A check may leave background descendants. Its owned process group ends here.
-      killGroup('SIGKILL')
-      if (failure !== undefined) { reject(failure); return }
-      let output = Buffer.concat(chunks).toString('utf8')
-      if (truncated) {
-        const marker = '\n[output truncated]'
-        output = Buffer.from(output).subarray(0, Math.max(0, options.maxBytes - Buffer.byteLength(marker))).toString('utf8')
-        while (Buffer.byteLength(output + marker) > options.maxBytes) output = output.slice(0, -1)
-        output += marker
-      }
-      resolve({ exitCode: code ?? 1, output, truncated, ...(scanner === undefined ? {} : { attribution: scanner.result(truncated) }) })
-    })
-    if (options.signal?.aborted) onAbort()
-  })
+  } catch (error) {
+    // A pre-aborted spec is refused synchronously by the provider; this plugin's
+    // own cause classification still owns the message the caller reads.
+    release()
+    throw failure ?? error
+  }
+  if (handle.stdout === undefined || handle.stderr === undefined) {
+    release()
+    handle.terminate()
+    throw new Error('[subprocess_pipes_missing] The Harness subprocess provider did not expose the requested stdout and stderr pipes Correct the provider composition, then retry; report the refusal with `missionId` and `swarm_observe`.')
+  }
+  handle.stdout.on('data', (chunk: Buffer) => { output.push(chunk) })
+  handle.stderr.on('data', (chunk: Buffer) => { output.push(chunk) })
+  // A signal that aborted before the listener existed dispatches to nobody.
+  if (options.signal?.aborted) onAbort()
+  try {
+    const outcome = await handle.done.catch((error: unknown) => { throw failure ?? error })
+    if (failure !== undefined) throw failure
+    return { exitCode: outcome.exitCode ?? 1, ...output.result() }
+  } finally {
+    release()
+    // The run is over; release the range. Termination is idempotent, so this
+    // also covers the deadline path the seam already began, and the provider
+    // keeps ownership of quiescence for whatever a check left behind.
+    handle.terminate()
+  }
 }
 
 function segment(value: string): string {
@@ -752,7 +837,7 @@ export class Workspaces {
 
   private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
-    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.gitTimeout(), maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, ...(signal === undefined ? {} : { signal }) })
+    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.gitTimeout(), maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, subprocess: this.options.subprocess, ...(signal === undefined ? {} : { signal }) })
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed (${result.exitCode}): ${result.output.trim()}`)
     if (result.truncated) throw new Error(`git ${args[0]} output exceeded the configured limit; refusing incomplete artifact inspection`)
     return raw || args.includes('-z') ? result.output : result.output.trim()
@@ -1302,7 +1387,7 @@ export class Workspaces {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
           const commandStarted = Date.now()
-          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true })
+          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
           // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
           const output = result.exitCode === 127
             ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`

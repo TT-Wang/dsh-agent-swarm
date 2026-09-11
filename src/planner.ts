@@ -48,7 +48,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     if (!cwd) throw new Error('请先打开目标项目的对话，然后输入 /agent-swarm 加任务描述。')
     const workspace = await realpath(cwd)
     const git = async (args: string[]) => {
-      const result = await runProcess(['git', ...args], { cwd: workspace, signal, timeoutMs: 10000, maxBytes: 16000 })
+      const result = await runProcess(['git', ...args], { cwd: workspace, signal, timeoutMs: 10000, maxBytes: 16000, subprocess: () => ctx.get('subprocess') })
       if (result.exitCode !== 0 || result.truncated) throw new Error('Agent Swarm 需要一个已有提交的 Git 项目，请在项目根目录的对话中重试。')
       return result.output.trim()
     }

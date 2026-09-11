@@ -41,8 +41,25 @@ const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/no
  * name is taken, with the explicit-`name` exit named). It is coded and
  * compliant, so it does not move the uncoded count below; the total is raised by
  * one so the "every site is still exposed" property keeps covering the union.
+ *
+ * The 2026-09-11 subprocess adoption nets one more, which is why the total now
+ * sits two above the pre-branch 235: `runProcess` gained two coded refusals
+ * (`[subprocess_service_required]`, `[subprocess_pipes_missing]`) and lost the
+ * POSIX-only launcher's platform refusal, because the provider behind
+ * `ctx.subprocess` owns process ranges on every platform (+2 −1). Both new sites
+ * are coded and compliant, so the uncoded count is unchanged and the branch's
+ * shrink equation still holds.
  */
-const ADDED_SITES = 1
+const ADDED_SITES = 2
+/**
+ * Adopting the host's managed-process seam deleted one *uncoded* refusal together
+ * with the launcher it guarded: `runProcess` no longer refuses non-POSIX
+ * platforms, because the provider behind `ctx.subprocess` owns process ranges on
+ * every platform it supports. That is a real shrink beyond this branch's
+ * recoding, so the shrink equation below carries it as its own term rather than
+ * pretending a diagnostic code was added for a refusal that no longer exists.
+ */
+const REMOVED_UNCODED_SITES = 1
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {
@@ -81,8 +98,8 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
   assert.equal(total, 235 + ADDED_SITES, 'the split control-path files still expose every refusal site (186 + 49, plus this round\'s coded site)')
   assert.ok(uncoded < PRE_BRANCH_UNCODED,
     `this branch must shrink the uncoded inventory (pre-branch ${PRE_BRANCH_UNCODED}, now ${uncoded})`)
-  assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length,
-    'the shrink equals the number of codes this branch added')
+  assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length - REMOVED_UNCODED_SITES,
+    'the shrink equals the codes this branch added plus the uncoded refusal the subprocess adoption deleted')
   const applied = applyAllowlist(INVENTORY_SOURCES.flatMap(file => sitesByFile[file]), ALLOWLIST,
     site => assessRefusal(site, { ...index, diagnosticProducers: diagnosticProducers([sitesByFile[site.file] ?? []]) }))
   assert.deepEqual(applied.stale, [], 'the allowlist handed over by T2 is empty and stays empty')

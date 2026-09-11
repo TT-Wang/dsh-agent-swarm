@@ -40,7 +40,7 @@ Verification runs against packaged-artifact loading, native CLI profile installa
 
 You need:
 
-- Node.js `^22.19.0 || >=24.0.0`, Git, and a POSIX system such as macOS or Linux. Windows execution is unsupported.
+- Node.js `^22.19.0 || >=24.0.0`, Git, and a POSIX system such as macOS or Linux: declared checks and syntax probes execute through `/bin/sh`, and delivery relies on POSIX link semantics. Windows execution is unsupported.
 - A checkout of one of the exact Harness releases above, with dependencies installed and its CLI and Web application built. Follow the [Harness development instructions](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.1.3-alpha.2/docs/development.md) for that release.
 - A working Harness model/provider configuration. Credentials are configured in Harness; the plugin uses the owner conversation's model by default.
 
@@ -286,7 +286,7 @@ Suites use temporary profiles and Git workspaces, with the model boundary script
 
 ## Current limitations
 
-- **Local, single-host.** Git workspaces and POSIX process groups are required. Distributed workers and non-Git workspaces are not implemented.
+- **Local, single-host.** Git workspaces and the host's subprocess service (`ctx.subprocess`) are required: every command, including each declared check, runs as a provider-managed process range. Distributed workers and non-Git workspaces are not implemented.
 - **Verification proves that your commands ran, not that they are sufficient.** The host executes exactly what a task declares, against the exact submitted commit. It cannot infer a complete test oracle from a natural-language goal.
 - **The verification checkout borrows your installed toolchain.** Dependency directories are copied into the disposable checkout by default (so `..` cannot resolve into your source checkout); a read-through `link` requires the explicit `allowDependencyLinkReads` opt-in. Either way they are not a fresh install and may differ from CI.
 - **Budget accounting is provider-reported.** In-flight requests are estimated, so an unusually large one can still cross a ceiling. Attempts that report no usage cannot be counted.

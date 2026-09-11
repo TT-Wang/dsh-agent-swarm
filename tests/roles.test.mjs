@@ -21,6 +21,7 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { RoleScoper } from '../lib/roles.js'
 import { registerTools, ENTRY_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
+import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
 const swarmNames = tools => (tools ?? []).map(tool => tool.name).filter(name => name.startsWith('swarm_')).sort()
@@ -30,7 +31,7 @@ async function fixture(t, responder, workerOptions = {}) {
   const source = path.join(root, 'source')
   await mkdir(source)
   for (const args of [['init', '-b', 'main'], ['-c', 'user.name=Swarm', '-c', 'user.email=swarm@localhost', 'commit', '--allow-empty', '-m', 'base']]) {
-    const result = await runProcess(['git', ...args], { cwd: source, timeoutMs: 30000, maxBytes: 10000 })
+    const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 10000 })
     assert.equal(result.exitCode, 0, result.output)
   }
   const ctx = new Context()
@@ -55,7 +56,7 @@ async function fixture(t, responder, workerOptions = {}) {
     }
   }
   await ctx.plugin(LlmRuntime); await ctx.plugin(SessionStore); await ctx.plugin(SessionProjection); await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime); await ctx.plugin(AgentRegistry)
+  await ctx.plugin(ToolRuntime); await ctx.plugin(AgentRegistry); await ctx.plugin(SubprocessLocal)
   await ctx.plugin(JsonlPersistence, { root: path.join(root, 'sessions'), compression: 'none', writeBatchMaxDelayMs: 1 })
   await ctx.plugin(SandboxPolicy, { mode: 'read-only', workspaceRoot: source }); await ctx.plugin(Approval, { policy: 'never' })
   await ctx.plugin(UserQuestionService); await ctx.plugin(AgentLoop, { agents: [] })

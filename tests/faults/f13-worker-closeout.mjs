@@ -3,12 +3,13 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
 import { makeRepo, Workspaces, WorkspaceWorkers, setup, events, eventually, git, runScenario, taskOf } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
   id: 'F13', title: 'An idle worker with uncommitted work is nudged, checkpointed and resumed from the real commit', invariants: ['I13'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f13')
-    const workspaces = new Workspaces({ workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
     const workers = new WorkspaceWorkers(workspaces)
     const f = await setup({ workspace: source, workers, config: { tickMs: 3_600_000, maxIdleCloseouts: 2, leaseMs: 600_000 } })
     try {

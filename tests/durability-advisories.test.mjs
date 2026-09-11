@@ -19,9 +19,10 @@ import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -35,7 +36,7 @@ async function fixture(t, options = {}) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const head = await git(source, 'rev-parse', 'HEAD')
-  const workspaces = new Workspaces({ workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
   const mission = { id: 'mission-advisory', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Prepare', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -97,7 +98,7 @@ test('A2: a real untracked dependency directory is excluded from preparation and
   const artifact = await workspaces.captureArtifact(member, next)
   assert.deepEqual(artifact.changedPaths, ['src/answer.txt'], 'dependency content is never an artifact change')
   assert.equal(await git(member.workspace, 'ls-files', '--', 'node_modules'), '', 'the dependency directory is never committed')
-  const shown = await runProcess(['git', 'show', `${artifact.commit}:node_modules/dep/value.txt`], { cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
+  const shown = await runProcess(['git', 'show', `${artifact.commit}:node_modules/dep/value.txt`], { subprocess: subprocessSeam, cwd: member.workspace, timeoutMs: 30000, maxBytes: 10000 })
   assert.notEqual(shown.exitCode, 0, 'the commit contains no dependency file')
   assert.equal(await readFile(path.join(member.workspace, 'node_modules', 'dep', 'value.txt'), 'utf8'), 'toolchain\n', 'the dependency directory stays in the workspace')
 })

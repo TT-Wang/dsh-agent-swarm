@@ -15,6 +15,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { SwarmRuntime, Workspaces, WorkspaceWorkers, PROJECT, events, eventually, setup, acceptThroughReview } from './harness.mjs'
+import { subprocessSeam } from '../subprocess-seam.mjs'
 
 const { applyDelivery: realApplyDelivery } = await import(pathToFileURL(join(PROJECT, 'lib/delivery.js')).href)
 
@@ -29,7 +30,7 @@ const taskId = value('--task')
 const marker = value('--marker')
 assert(phase && stateDir && workspacesRoot, 'driver requires a phase, --state and --worktrees')
 
-const workspaces = new Workspaces({ workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
 
 class DriverWorkers extends WorkspaceWorkers {
   async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }

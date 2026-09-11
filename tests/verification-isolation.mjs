@@ -35,6 +35,7 @@ import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
 import { resolveHarnessRoot, assertSupportedHarness } from '../scripts/harness-target.mjs'
 import { importHarness } from './fixtures/built-harness.mjs'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const harnessRoot = resolveHarnessRoot(undefined)
 assertSupportedHarness(harnessRoot)
@@ -49,7 +50,7 @@ const confineCheck = (argv, cwd) => confinedCheckArgv(sandbox, argv, cwd)
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 const exists = async file => await lstat(file).then(() => true, () => false)
 const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Isolation', '-c', 'user.email=isolation@localhost', '-c', 'commit.gpgsign=false', ...args], { cwd, timeoutMs: 30000, maxBytes: 100000 })
+  const result = await runProcess(['git', '-c', 'user.name=Swarm Isolation', '-c', 'user.email=isolation@localhost', '-c', 'commit.gpgsign=false', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
   assert.equal(result.exitCode, 0, result.output)
   return result.output.trim()
 }
@@ -68,7 +69,7 @@ async function fixture(t, options = {}) {
   // An installed, ignored toolchain the check reads through the dependency link.
   await mkdir(path.join(source, 'node_modules', 'dep'), { recursive: true })
   await writeFile(path.join(source, 'node_modules', 'dep', 'tool.txt'), 'toolchain\n')
-  const workspaces = new Workspaces({ workspacesRoot: path.join(scratch, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck, ...options })
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(scratch, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck, ...options })
   const mission = { id: 'mission-isolation', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Isolation proof', kind: 'implementation', scope: ['**'], checks: [], status: 'running' }
@@ -90,7 +91,7 @@ test('host prerequisite: the real provider fully enforces workspace-write', asyn
   // confinedCheckArgv is the production path: it throws unless the host
   // reports full enforcement, so reaching runProcess proves enforcement.
   const argv = confinedCheckArgv(sandbox, ['/bin/sh', '-c', 'true'], scratch)
-  const probe = await runProcess(argv, { cwd: scratch, timeoutMs: 30000, maxBytes: 32000 })
+  const probe = await runProcess(argv, { subprocess: subprocessSeam, cwd: scratch, timeoutMs: 30000, maxBytes: 32000 })
   assert.equal(probe.exitCode, 0, `the host cannot apply the real sandbox (nested-sandbox worker hosts are excluded by design): ${probe.output}`)
 })
 

@@ -11,6 +11,7 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { Workspaces } from '../lib/workspaces.js'
+import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 const budget = { maxTokens: 10000, maxSteps: 50, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 10, maxExperiments: 1 }
 async function fixture(t, options = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-planner-')))
@@ -18,8 +19,8 @@ async function fixture(t, options = {}) {
   const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
   git(['init', '-q']); git(['-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'initial'])
   const ctx = new Context()
-  await ctx.plugin(SessionStore); await ctx.plugin(CommandRuntime)
-  const workspaces = new Workspaces({ workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  await ctx.plugin(SessionStore); await ctx.plugin(CommandRuntime); await ctx.plugin(SubprocessLocal)
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
   const runtime = new SwarmRuntime({ statePath: join(root, '.git', 'swarm.sqlite'), tickMs: 60000, leaseMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, { bind() {}, prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() })
   await runtime.start()
   const session = await ctx.sessions.create(SessionId('planner-owner'), { meta: { cwd: root } })
