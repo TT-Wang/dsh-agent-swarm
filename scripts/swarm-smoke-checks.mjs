@@ -18,7 +18,7 @@ export async function assertSimplifiedSwarm(panel) {
 /** Observe the public wire contract independently of the product monitor. */
 export function observedSwarmState(current, endpoint, value) {
   if (endpoint === '/api/agent-swarm/state') return value
-  if (endpoint !== '/agent-swarm/watch') return undefined
+  if (endpoint !== '/api/agent-swarm/watch') return undefined
   if (value.kind === 'heartbeat') {
     if (current?.ownerSessionId !== value.ownerSessionId) return undefined
     const state = { ...current, revision: value.revision }

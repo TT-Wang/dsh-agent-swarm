@@ -124,7 +124,7 @@ try {
     page.on('pageerror', error => pageErrors.push(error.message))
     page.on('response', async response => {
       const endpoint = new URL(response.url()).pathname
-      if (!endpoint.startsWith('/agent-swarm/')) return
+      if (!endpoint.startsWith('/api/agent-swarm/')) return
       try {
         const body = await response.json()
         rpcResults.push({ endpoint, ...body.result })
@@ -133,7 +133,7 @@ try {
     })
     async function clickRpc(locator, endpoint) {
       const [response] = await Promise.all([
-        page.waitForResponse(response => new URL(response.url()).pathname === `/agent-swarm/${endpoint}` && response.request().method() === 'POST'),
+        page.waitForResponse(response => new URL(response.url()).pathname === `/api/agent-swarm/${endpoint}` && response.request().method() === 'POST'),
         locator.click(),
       ])
       assert.equal(response.status(), 200)
@@ -164,7 +164,7 @@ try {
         assert(events.filter(event => event.type === 'model/request').every(event => event.sessionId === ownerSessionId))
         const state = await page.evaluate(async sessionId => {
           const response = await fetch('/api/agent-swarm/state', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-            type: 'client-request', rpcId: 'web-smoke-read-only', method: 'state', payload: { sessionId },
+            type: 'client-request', rpcId: 'web-smoke-read-only', method: 'agent-swarm/state', payload: { sessionId },
           }) })
           return (await response.json()).result
         }, ownerSessionId)
@@ -248,8 +248,11 @@ try {
       assert.equal(resumed.snapshot.mission.status, 'active')
       checks.push('live mission Pause/Resume controls, cancellation and reassignment')
       await until(() => latestState?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.tasks.every(task => task.status === 'accepted'), 'live accepted task state without owner swarm_observe', 45_000)
-      // Live sessions can use the native conversation selector before mission disposal.
-      await openSwarmDetails(panel, 'team')
+      // The roster is part of the default overview (no disclosure to open), and a
+      // live member row carries the native conversation link.
+      const roster = panel.locator('[data-swarm-team]')
+      await roster.waitFor()
+      assert((await panel.locator('[data-swarm-member]').count()) > 0, 'the default overview shows the team roster')
       await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
       await until(() => latestState?.ownerSessionId === builder.sessionId && latestState.writable === false, 'native active worker conversation navigation and read-only swarm view')
       await panel.getByText('Mission controls are read-only in worker conversations. Open the owner conversation to manage this mission.', { exact: true }).waitFor()
@@ -273,12 +276,12 @@ try {
       await page.screenshot({ path: join(artifacts, 'completed.png'), fullPage: true })
       await writeFile(join(artifacts, 'completed.aria.txt'), await page.locator('body').ariaSnapshot())
       await openSwarmDetails(panel, 'technical')
-      await panel.getByRole('tab', { name: 'Dependency graph', exact: true }).click()
+      await panel.getByRole('tab', { name: /Dependency graph/ }).click()
       await panel.getByRole('tabpanel', { name: 'Dependency graph', exact: true }).waitFor()
       await page.screenshot({ path: join(artifacts, 'dependency-graph.png'), fullPage: true })
       await writeFile(join(artifacts, 'dependency-graph.aria.txt'), await panel.ariaSnapshot())
       checks.push('dependency graph tab exposes its correctly named accessible tabpanel')
-      await panel.getByRole('tab', { name: 'Work board', exact: true }).click()
+      await panel.getByRole('tab', { name: /Work board/ }).click()
       await panel.getByRole('tabpanel', { name: 'Work board', exact: true }).waitFor()
       await page.setViewportSize({ width: 390, height: 844 })
       const collapseNavigation = page.locator('button[aria-label="Collapse sidebar"]:not([data-swarm-dock] button)')
@@ -327,7 +330,7 @@ try {
       await panel.getByRole('combobox', { name: 'Missions', exact: true }).selectOption(`mission:${missionId}`)
       const beforeHistory = (await readFile(tracePath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
       const workerRequests = events => events.filter(event => event.type === 'model/request' && [builder.sessionId, reviewer.sessionId].includes(event.sessionId)).length
-      await openSwarmDetails(panel, 'team')
+      await panel.locator('[data-swarm-team]').waitFor()
       await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
       const transcript = panel.locator(`[data-swarm-transcript="${builder.sessionId}"]`)
       await transcript.waitFor()

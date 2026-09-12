@@ -146,18 +146,18 @@ try {
       if (['/api/agent-swarm/state', '/api/agent-swarm/watch'].includes(endpoint)) {
         latestObserverRequest = request
         stateRequests.push({ endpoint, at: Date.now() })
-        sampleEligible.set(request, endpoint === '/agent-swarm/watch' && continuousObserver)
+        sampleEligible.set(request, endpoint === '/api/agent-swarm/watch' && continuousObserver)
       }
     })
     page.on('requestfailed', request => { if (request === latestObserverRequest) continuousObserver = false })
     page.on('response', async response => {
       const endpoint = new URL(response.url()).pathname
-      if (!endpoint.startsWith('/agent-swarm/')) return
+      if (!endpoint.startsWith('/api/agent-swarm/')) return
       try {
         const body = await response.json()
         rpcResults.push({ endpoint, ...body.result })
         if (body.result?.ok) {
-          if (endpoint === '/agent-swarm/watch') {
+          if (endpoint === '/api/agent-swarm/watch') {
             watchResponses++
           }
           const state = observedSwarmState(latestState, endpoint, body.result.value)
@@ -312,7 +312,7 @@ try {
       if (!failedWatch) { failedWatch = true; await route.abort('failed') }
       else await route.continue()
     }
-    await page.route('**/agent-swarm/watch', transientFailure)
+    await page.route('**/api/agent-swarm/watch', transientFailure)
     await panel.getByRole('button', { name: 'Refresh', exact: true }).click()
     await until(() => failedWatch, 'a single native watch request is interrupted')
     await panel.locator('[data-swarm-connection="reconnecting"]').waitFor()
@@ -326,7 +326,7 @@ try {
     assert.equal(await panel.getAttribute('data-swarm-session'), completed.mission.ownerSessionId)
     checks.push('one failed native watch exposes reconnecting, then resumes without losing the completed mission or changing owner')
     await openSwarmDetails(panel, 'technical')
-    await panel.getByRole('tab', { name: 'Dependency graph', exact: true }).click()
+    await panel.getByRole('tab', { name: /Dependency graph/ }).click()
     await panel.getByRole('tabpanel', { name: 'Dependency graph', exact: true }).waitFor()
     await page.screenshot({ path: join(artifacts, 'dependency-graph.png'), fullPage: true })
     await writeFile(join(artifacts, 'completed.aria.txt'), await page.locator('body').ariaSnapshot())
@@ -378,7 +378,7 @@ try {
     assert(trace.filter(event => event.type === 'model/request' && event.sessionId !== ownerId).every(event => event.model === 'swarm-web-primary'), 'workers inherit the current conversation model without configuration')
     assert(trace.filter(event => event.type === 'model/request' && event.sessionId !== ownerId).every(event => event.maxTokens === 4096), 'real worker model requests carry the generated per-response allowance')
     assert(!trace.some(event => event.type === 'fixture/error'), 'the scripted provider must not conceal tool errors')
-    assert(!rpcResults.some(result => ['/agent-swarm/create-draft', '/agent-swarm/update-draft', '/agent-swarm/launch-draft', '/agent-swarm/control'].includes(result.endpoint)), 'the browser must not secretly submit a manual draft or control flow')
+    assert(!rpcResults.some(result => ['/api/agent-swarm/create-draft', '/api/agent-swarm/update-draft', '/api/agent-swarm/launch-draft', '/api/agent-swarm/control'].includes(result.endpoint)), 'the browser must not secretly submit a manual draft or control flow')
     assert(trace.some(event => event.type === 'user/message' && event.sessionId === ownerId && event.sourceKind === 'swarm-start'))
     assert(!trace.some(event => event.type === 'user/message' && event.sessionId === ownerId && event.sourceKind === 'user'), 'planning guidance is attributed plugin context, never a forged user bubble')
     checks.push(validationRepair

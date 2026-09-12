@@ -186,22 +186,27 @@ export function createNativeSidebarAdapter(ctx: Context, descriptor: () => Nativ
     if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return () => {}
     const panel = descriptor()
     panelId = panel.id
-    // The main entry is the panel itself; the rail entry is its button. Both ride
-    // the same id, and a host that declares only one of the two slots simply
-    // never runs the other inject.
-    const main = slots.inject('main', () => slots.register({ name: 'main', key: panel.id }, () => panel.component()))
-    const rail = slots.inject('sidebar.panellist', () => slots.register({
-      name: 'sidebar.panellist', id: panel.id, label: panel.label,
-      ...(panel.order === undefined ? {} : { order: panel.order }),
-    }, (props: { size: number; active: boolean }) => panel.icon(props)))
-    registered += 1
-    notify()
-    return () => {
-      registered -= 1
-      main()
-      rail()
+    // The rail is the surface, and it is the only slot that proves the host has a
+    // native sidebar: a host that declares just the layout's `main` slot has
+    // nowhere to click, so claiming a panel there would make it unreachable and
+    // hide the dock that used to carry it. Register the panel inside the rail
+    // declaration, so both appear and disappear together.
+    const rail = slots.inject('sidebar.panellist', () => {
+      const releaseRail = slots.register({
+        name: 'sidebar.panellist', id: panel.id, label: panel.label,
+        ...(panel.order === undefined ? {} : { order: panel.order }),
+      }, (props: { size: number; active: boolean }) => panel.icon(props))
+      const releaseMain = slots.inject('main', () => slots.register({ name: 'main', key: panel.id }, () => panel.component()))
+      registered += 1
       notify()
-    }
+      return () => {
+        registered -= 1
+        releaseMain()
+        releaseRail()
+        notify()
+      }
+    })
+    return () => { rail() }
   }, 'agent-swarm: native sidebar panel'))
   const dispose = () => {
     if (disposed) return
