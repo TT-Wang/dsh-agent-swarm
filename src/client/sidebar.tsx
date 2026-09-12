@@ -195,41 +195,42 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
   let disposed = false
   let registered = 0
   const notify = () => { for (const listener of [...listeners]) listener() }
-  const type = ctx.inject(['sidebarRightTabs'], ready => ready.effect(() => {
+  // Both services are required, and they are required together: the registry is
+  // the host fact that a right sidebar exists, and asking for it in the same
+  // injection is what keeps this adapter from claiming seats on a host whose
+  // slot tree has no right pane (0.1.2/0.1.3 declare neither service, and a
+  // registration into an undeclared slot would otherwise look like success and
+  // hide the dock the panel still needs).
+  const dependency = ctx.inject(['slots', 'sidebarRightTabs'], ready => ready.effect(() => {
     if (disposed) return () => {}
+    const slots = ready.get('slots') as unknown as SlotRegistrar | undefined
     const registry = ready.get('sidebarRightTabs') as unknown as RightTabRegistry | undefined
+    if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return () => {}
     if (registry === undefined || typeof registry.register !== 'function') return () => {}
     const tab = descriptor()
-    const release = registry.register({
+    const releaseType = registry.register({
       id: tab.id, kind: tab.kind, title: () => tab.label(),
       // The guide is the only route to a page type from the UI, so the panel
       // names itself there instead of staying a registration nobody can pick.
       guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
     })
-    return () => release()
-  }, 'agent-swarm: right sidebar tab type'))
-  const body = ctx.inject(['slots'], ready => ready.effect(() => {
-    if (disposed) return () => {}
-    const slots = ready.get('slots') as unknown as SlotRegistrar | undefined
-    if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return () => {}
-    const tab = descriptor()
     // The body and its chip title share the registry id as the seat key. The
     // title seat is optional (the chip falls back to the captured title), so the
     // panel registers its own name and stays independent of copy timing.
-    const release = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id }, () => tab.component()))
+    const releaseBody = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id }, () => tab.component()))
     registered += 1
     notify()
     return () => {
       registered -= 1
-      release()
+      releaseBody()
+      releaseType()
       notify()
     }
-  }, 'agent-swarm: right sidebar tab body'))
+  }, 'agent-swarm: right sidebar tab'))
   const dispose = () => {
     if (disposed) return
     disposed = true
-    void type.dispose()
-    void body.dispose()
+    void dependency.dispose()
     listeners.clear()
   }
   ctx.effect(() => dispose, 'agent-swarm: right sidebar adapter')

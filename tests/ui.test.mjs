@@ -514,9 +514,15 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
     register(options, component) { const entry = { slot: options.name, key: options.key, component }; seats.push(entry); return () => { const at = seats.indexOf(entry); if (at >= 0) seats.splice(at, 1) } },
   }
   const opened = []
+  // A faithful `inject`: the factory runs only when EVERY requested service is
+  // present, which is what keeps a host without a right sidebar from claiming
+  // seats in it.
   const ctx = {
     inject(names, factory) {
-      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => (name === 'slots' ? slots : name === 'sidebarRightTabs' ? registry : undefined) }
+      const available = { slots, sidebarRightTabs: registry }
+      const missing = names.filter(name => available[name] === undefined)
+      if (missing.length) return { dispose: async () => {} }
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
       const release = factory(scope)
       return { dispose: async () => { await release?.dispose?.() } }
     },
@@ -542,7 +548,22 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.deepEqual(seats, [])
   assert.equal(adapter.open(), false, 'a disposed adapter never reveals anything')
 
-  // Hosts without a right sidebar (0.1.2/0.1.3) must fall back, not throw.
+  // Hosts without a right sidebar (0.1.2/0.1.3) must fall back, not throw — and
+  // a host that has the slot service but no sidebar registry must not claim a
+  // seat in a pane that does not exist (that bug hid the dock on 0.1.3).
+  const slotOnly = {
+    inject(names, factory) {
+      if (names.includes('sidebarRightTabs')) return { dispose: async () => {} }
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: () => slots }
+      const release = factory(scope)
+      return { dispose: async () => { await release?.dispose?.() } }
+    },
+    get: () => undefined, effect: fn => { fn() },
+  }
+  const noRegistry = createRightSidebarAdapter(slotOnly, describe)
+  assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing and the dock renders')
+  assert.deepEqual(seats, [], 'and the body seat is never registered into an undeclared slot')
+  noRegistry.dispose()
   const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }
   const fallback = createRightSidebarAdapter(bare, describe)
   assert.equal(fallback.getSnapshot(), false)
@@ -554,5 +575,6 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar-right/, 'no static import of the right-sidebar package')
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
+  assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs'\]/, 'and only when both the slot service and the sidebar registry are present')
   assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
 })
