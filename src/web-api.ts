@@ -1,6 +1,7 @@
 /** Optional native browser RPC consumers of the durable swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
+import { RpcId } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcHandler, ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
 import { isAppendSurfaceEvent, SessionId, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
@@ -11,6 +12,7 @@ import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
+import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
 import type { Actor, Budget, Mission, PlanInput, PlanMember } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
@@ -396,5 +398,46 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  ctx.connection.rpc.handle('/agent-swarm', handler)
+  // Three host generations, one route shape. A plugin-owned channel
+  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5: the connection
+  // service resolves `webServer` on a context that injects `credentials` alone,
+  // and Cordis refuses that property access, so the route is never registered.
+  // The shared `/api` interceptor is not an option either — that channel admits
+  // exactly one interceptor and another plugin holds it. What is left is what the
+  // host itself documents for plugin endpoints: one exact route per endpoint on
+  // the shared channel, consulted before the interceptor, inheriting its Host,
+  // Origin and browser-authentication fence. The client posts the standard
+  // envelope to `/api/agent-swarm/<endpoint>`.
+  const releases: Array<() => Promise<void>> = []
+  ctx.effect(() => () => { for (const release of releases.splice(0)) void release() }, 'agent-swarm: web routes')
+  const reply = (rpcId: string, result: ConnectionRpcResult<unknown>): Response => new Response(
+    JSON.stringify({ type: 'server-response', rpcId: RpcId(rpcId), result } satisfies ServerResponse),
+    { status: 200, headers: { 'content-type': 'application/json' } })
+  for (const endpoint of SWARM_WEB_ENDPOINTS) {
+    const method = `${SWARM_RPC_PREFIX}${endpoint}`
+    releases.push(ctx.connection.fetch.register({
+      path: `${SWARM_RPC_CHANNEL}/${method}`,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async request => {
+        // The framing rules mirror the host's own channel handler, so a browser
+        // sees the same statuses whether an endpoint is served by a channel or by
+        // one of these routes: 415 for a non-JSON media type, 400 for a body that
+        // is not JSON, and a `gateway/bad-request` envelope for anything else.
+        const mediaType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+        if (mediaType !== 'application/json') return new Response('content type must be application/json', { status: 415 })
+        let body: unknown
+        try { body = await request.json() } catch { return new Response('body is not JSON', { status: 400 }) }
+        const envelope = body !== null && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined
+        const rpcId = typeof envelope?.rpcId === 'string' ? RpcId(envelope.rpcId) : RpcId('invalid-request')
+        if (envelope?.type !== 'client-request' || typeof envelope.method !== 'string') {
+          return reply(rpcId, { ok: false, error: { code: 'gateway/bad-request', message: 'invalid client-request message', details: { issues: [] } } })
+        }
+        if (envelope.method !== method) {
+          return reply(rpcId, { ok: false, error: { code: 'gateway/bad-request', message: `method ${JSON.stringify(envelope.method)} does not match endpoint ${JSON.stringify(method)}`, details: { issues: [] } } })
+        }
+        return reply(rpcId, await handler(endpoint, envelope.payload, request.signal))
+      },
+    }))
+  }
 }

@@ -22,6 +22,7 @@ import { DisposalRegistry } from './lifecycle.ts'
 import { CopyContext, en, zh } from './locale.tsx'
 import { openWorker } from './navigation.ts'
 import { WorkerHistory, type HistoryPage } from './history.ts'
+import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX } from '../types.ts'
 import type { Member } from '../types.ts'
 
 export const name = 'agent-swarm-client'
@@ -45,7 +46,8 @@ export function apply(ctx: Context): void {
     return <CopyContext.Provider value={text => copy(text)}>{children}</CopyContext.Provider>
   }
   const request: Request = async <T,>(endpoint: string, payload: unknown, signal?: AbortSignal): Promise<T> => {
-    const result = await (ctx.get('connection') as ConnectionHandle).rpc.call('/agent-swarm', endpoint, payload, signal)
+    // The client builds `<channel>/<endpoint>`; the host claims our prefix inside /api.
+    const result = await (ctx.get('connection') as ConnectionHandle).rpc.call(SWARM_RPC_CHANNEL, `${SWARM_RPC_PREFIX}${endpoint}`, payload, signal)
     if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`)
     return result.value as T
   }

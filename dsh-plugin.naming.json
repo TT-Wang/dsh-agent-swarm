@@ -53,8 +53,28 @@
     "settingsNamespaces": [],
     "routes": [
       {
-        "kind": "prefix",
-        "path": "/agent-swarm"
+        "kind": "fetch",
+        "channel": "/api",
+        "path": "/api/agent-swarm/<endpoint>",
+        "methods": [
+          "POST"
+        ],
+        "endpoints": [
+          "state",
+          "watch",
+          "models",
+          "control",
+          "cancel",
+          "delivery",
+          "apply-delivery",
+          "worker-history",
+          "create-draft",
+          "update-draft",
+          "discard-draft",
+          "launch-draft",
+          "add-member",
+          "propose"
+        ]
       }
     ]
   }

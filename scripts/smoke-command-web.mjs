@@ -143,7 +143,7 @@ try {
     page.on('pageerror', error => pageErrors.push(error.message))
     page.on('request', request => {
       const endpoint = new URL(request.url()).pathname
-      if (['/agent-swarm/state', '/agent-swarm/watch'].includes(endpoint)) {
+      if (['/api/agent-swarm/state', '/api/agent-swarm/watch'].includes(endpoint)) {
         latestObserverRequest = request
         stateRequests.push({ endpoint, at: Date.now() })
         sampleEligible.set(request, endpoint === '/agent-swarm/watch' && continuousObserver)

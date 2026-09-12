@@ -163,7 +163,7 @@ try {
         assert(!events.some(event => event.type === 'fixture/error'))
         assert(events.filter(event => event.type === 'model/request').every(event => event.sessionId === ownerSessionId))
         const state = await page.evaluate(async sessionId => {
-          const response = await fetch('/agent-swarm/state', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+          const response = await fetch('/api/agent-swarm/state', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
             type: 'client-request', rpcId: 'web-smoke-read-only', method: 'state', payload: { sessionId },
           }) })
           return (await response.json()).result

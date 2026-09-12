@@ -108,10 +108,10 @@ async function fixture(t) {
   assert.ok(cookie)
 
   async function rpc(endpoint, payload, options = {}) {
-    const body = options.raw ?? JSON.stringify({ type: 'client-request', rpcId: 'web-test', method: endpoint, payload })
+    const body = options.raw ?? JSON.stringify({ type: 'client-request', rpcId: 'web-test', method: `agent-swarm/${endpoint}`, payload })
     const headers = { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json', cookie, ...options.headers }
     return await new Promise((resolve, reject) => {
-      const req = httpRequest({ hostname: '127.0.0.1', port, path: `/agent-swarm/${endpoint}`, method: options.method ?? 'POST', headers }, res => {
+      const req = httpRequest({ hostname: '127.0.0.1', port, path: `/api/agent-swarm/${endpoint}`, method: options.method ?? 'POST', headers }, res => {
         const chunks = []
         res.on('data', chunk => chunks.push(chunk))
         res.on('end', () => {

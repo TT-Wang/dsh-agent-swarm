@@ -15,6 +15,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SWARM_TOOLS } from '../lib/tools.js'
+import { SWARM_WEB_ENDPOINTS } from '../lib/types.js'
 
 const root = new URL('..', import.meta.url)
 
@@ -82,5 +83,14 @@ test('the naming manifest declares exactly the surface this package registers', 
   assert.deepEqual([...naming.names.pluginNames].sort(), ['agent-swarm', 'agent-swarm-client'], 'both plugin halves are named')
   assert.deepEqual(naming.names.services, ['swarm'], 'the service the plugin provides')
   assert.deepEqual(naming.names.commands, ['agent-swarm'], 'the native command')
-  assert.deepEqual(naming.names.routes, [{ kind: 'prefix', path: '/agent-swarm' }], 'the RPC route prefix')
+  assert.deepEqual(naming.names.routes, [{
+    kind: 'fetch', channel: '/api', path: '/api/agent-swarm/<endpoint>', methods: ['POST'], endpoints: SWARM_WEB_ENDPOINTS,
+  }], 'the RPC surface is one exact route per endpoint on the host shared channel')
+  // The declared list and the handler's dispatch must not drift, and the client
+  // must address the same prefix the server registers.
+  const source = readFileSync(new URL('../src/web-api.ts', import.meta.url), 'utf8')
+  const dispatched = [...source.matchAll(/case '([a-z-]+)':/g)].map(match => match[1])
+  assert.deepEqual([...dispatched].sort(), [...SWARM_WEB_ENDPOINTS].sort(), 'every declared endpoint has a dispatch case')
+  const client = readFileSync(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
+  assert.match(client, /rpc\.call\(SWARM_RPC_CHANNEL, `\$\{SWARM_RPC_PREFIX\}\$\{endpoint\}`/, 'the client addresses the registered prefix')
 })

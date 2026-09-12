@@ -49,6 +49,39 @@ module appends a session event.
 
 Both targets use isolated SDK links. The rc.1 copy runs the same emitted JavaScript against rc.1 dependencies and its actual CLI; it is not an alpha.2-linked plugin with only a different CLI environment variable. Host and client TypeScript are also checked against the selected SDK without re-emitting that copy.
 
+### The RPC surface moved onto the host's shared channel (2026-09-12)
+
+Booting the native-sidebar host exposed a second adaptation gap, this one on the
+host side, and it is fixed in the same pass:
+
+- **A plugin-owned channel is unusable from 0.1.5.** `ctx.connection.rpc.handle('/agent-swarm', …)`
+  registers the route through the connection service, which reads `webServer` on a
+  context that injects `credentials` alone. Cordis refuses that access
+  (`cannot get property "webServer" without inject`), the route is never mounted,
+  and every panel call dies with `HTTP 405`.
+- **The shared channel admits exactly one interceptor.** `rpc.intercept('/api', …)`
+  answers `connection: shared RPC channel "/api" already has an interceptor` on a
+  composed host, so it is not available either.
+- **What works on all three releases** is the host's documented mechanism for
+  plugin endpoints: one exact Fetch route per endpoint on the shared `/api`
+  channel, consulted before the interceptor and behind its Host, Origin and
+  browser-authentication fence. The client already posts the standard envelope to
+  `<channel>/<endpoint>`, so the change is one address on each side plus the
+  endpoint list (`SWARM_WEB_ENDPOINTS`, pinned against the handler's dispatch and
+  the naming manifest). The route's framing mirrors the host's channel handler:
+  415 for a non-JSON media type, 400 for a body that is not JSON, and a
+  `gateway/bad-request` envelope for a malformed or mismatched request.
+
+Measured on the same isolated 0.1.5-rc.1 host: before the fix
+`POST /agent-swarm/state → 405` and (after the address change but before the route
+change) `POST /api/agent-swarm/state → 404`; now `POST /api/agent-swarm/state → 200`
+with the plugin's own envelope, and the panel in the native sidebar reports
+**Connected** with the start-guide body, no standalone dock and no page error
+(`~/.dsh/agent-swarm-native015/verify/native-sidebar-5196-wired.png`). The real-HTTP
+suites (`tests/web-api.test.mjs`, `tests/web-api-sanitize.test.mjs`, 23 cases)
+drive a composed connection plugin, web server, browser authentication and the
+routes end to end, and the full behavioral suite is re-run on the final code.
+
 ## Native sidebar adaptation (2026-09-12) — current
 
 Harness 0.1.5 introduced the host's own sidebar (`@deepseek-ai/dsh-client-ui-sidebar`).

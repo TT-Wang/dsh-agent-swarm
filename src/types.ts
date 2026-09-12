@@ -552,6 +552,33 @@ export interface Delivery {
  * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
  * tool the guard would have allowed.
  */
+/**
+ * The host's shared browser-transport channel and this plugin's endpoint prefix
+ * inside it.
+ *
+ * Every supported release mounts the connection plugin's `/api` route and offers
+ * `ctx.connection.rpc.intercept('/api', …)` for plugin endpoints. A plugin-owned
+ * channel (`rpc.handle('/agent-swarm', …)`) is only usable through 0.1.3: from
+ * 0.1.5 the connection service resolves `webServer` on its own context, which
+ * injects `credentials` alone, and Cordis refuses that property access
+ * (`cannot get property "webServer" without inject`), so the channel route is
+ * never registered. The client posts to `<channel>/<endpoint>`, so both halves
+ * agree on `SWARM_RPC_CHANNEL` plus `SWARM_RPC_PREFIX` in front of the endpoint.
+ */
+export const SWARM_RPC_CHANNEL = '/api'
+export const SWARM_RPC_PREFIX = 'agent-swarm/'
+
+/**
+ * Every endpoint the panel may call, and therefore every exact route the host is
+ * asked for. 0.1.5 admits one interceptor per shared channel, so the plugin
+ * registers one route per endpoint instead; the list, the handler's dispatch and
+ * the naming manifest are pinned together by tests.
+ */
+export const SWARM_WEB_ENDPOINTS: readonly string[] = [
+  'state', 'watch', 'models', 'control', 'cancel', 'delivery', 'apply-delivery', 'worker-history',
+  'create-draft', 'update-draft', 'discard-draft', 'launch-draft', 'add-member', 'propose',
+]
+
 export const OWNER_ONLY_TOOLS: readonly string[] = [
   'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member',
   'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
