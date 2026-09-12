@@ -82,6 +82,25 @@ suites (`tests/web-api.test.mjs`, `tests/web-api-sanitize.test.mjs`, 23 cases)
 drive a composed connection plugin, web server, browser authentication and the
 routes end to end, and the full behavioral suite is re-run on the final code.
 
+### The panel moved to the host's right sidebar (2026-09-12)
+
+The owner asked for the panel beside the conversation rather than in the main
+column. Harness 0.1.5 exposes the same mechanism the Files pane uses, and it is
+public: a tab TYPE in the `sidebarRightTabs` registry (`id`, `kind`, the chip
+title and the guide capsule), the panel BODY in the keyed `sidebar.right.pane.tab`
+seat under that id, and navigation through the `sidebarRight` controller
+(`openTab(kind, { revealIfOpened: true })`). The guide capsule matters: a page
+type that recognizes no resource address is otherwise unreachable from the UI,
+which the first attempt proved — the tab registered, and nothing could open it.
+
+Measured on the isolated 0.1.5-rc.1 host (port 5196, headless Chromium): the right
+sidebar's tab strip now reads **Agent Swarm** beside Files; the panel renders
+inside the pane at `x=792, y=38, 648×862` on a 1440×900 viewport; the state RPC is
+`200` and the panel reports **Connected**; the standalone dock is absent and no
+page error is logged (`~/.dsh/agent-swarm-native015/verify/right-sidebar-5196-open.png`).
+The left column's Global panels list is empty again — the plugin registers one
+surface, not two.
+
 ## Native sidebar adaptation (2026-09-12) — current
 
 Harness 0.1.5 introduced the host's own sidebar (`@deepseek-ai/dsh-client-ui-sidebar`).

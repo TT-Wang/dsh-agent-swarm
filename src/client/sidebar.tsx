@@ -129,111 +129,121 @@ export function createSidebarAdapter(ctx: Context, descriptor: () => SidebarTabD
 }
 
 /* ------------------------------------------------------------------------- *
- * The native DSH sidebar (the 0.1.5 line).
+ * The host's right sidebar (the 0.1.5 line).
  *
- * The shell renders one rail icon per registration in the root-scoped
- * `sidebar.panellist` list, and that icon's `id` addresses the component
- * registered in the layout's root-scoped `main` keyed slot; `ctx.layout`
- * selects it (`selectPanel`). Everything below is structural on purpose: the
- * sidebar shell ships from 0.1.5, so this module has to compile and load against
- * 0.1.2/0.1.3 as well — there the injects never fire, `getSnapshot()` stays
- * false, and the standalone dock remains the surface.
+ * The Files pane and this panel are the same mechanism: a tab TYPE registered
+ * with the `sidebarRightTabs` registry (id, kind, and the title its chip shows),
+ * the panel BODY in the keyed `sidebar.right.pane.tab` seat under that id, and
+ * navigation through the `sidebarRight` controller (`openTab(kind)`). Nothing
+ * here imports the sidebar package: the ids, keys and slot names are structural,
+ * so 0.1.2/0.1.3 — which have no right sidebar — simply never fire these injects
+ * and the standalone dock keeps carrying the surface.
  * ------------------------------------------------------------------------- */
 
-/**
- * The host's slot service, restricted to what this adapter uses. `inject` waits
- * for a slot declaration and returns its own disposer; the callback runs inside
- * that declaration's lifetime and must register through the service (the
- * callback's argument is a Cordis scope, not the registrar — registering on it
- * fails in a microtask, which is how a panel silently never appears).
- */
+/** The slot service, restricted to what this adapter uses. */
 interface SlotRegistrar {
   inject(name: string, factory: () => (() => void) | void): () => void
   register(options: Record<string, unknown>, component: unknown): () => void
 }
 
-/** The subset of the host's layout service this adapter uses. */
-interface NativeLayout {
-  selectPanel(id: string | null): void
+/**
+ * One capsule on the right sidebar's guide page — the Start tab's list of what a
+ * pane can open. Without it a registered type is invisible: the guide is how a
+ * user reaches a page type that recognizes no resource address.
+ */
+export interface RightSidebarGuideEntry {
+  order: number
+  title: () => string
+  description?: () => string
 }
 
-export interface NativePanelDescriptor {
-  /** Panel key: the `main` entry key and the `sidebar.panellist` list id. */
+/** The right-sidebar tab registry. */
+interface RightTabRegistry {
+  register(definition: {
+    id: string
+    kind: string
+    title: (address: string) => string
+    guide?: readonly RightSidebarGuideEntry[]
+  }): () => void
+}
+
+/** The right-sidebar navigation controller. */
+interface RightSidebarController {
+  openTab(kind: string, options?: Record<string, unknown>): void
+}
+
+export interface RightSidebarDescriptor {
+  /** Registry id: also the key both seats register under. */
   id: string
+  /** Tab kind `openTab` names. */
+  kind: string
   label: () => string
+  /** One line under the guide capsule's title. */
+  description?: () => string
+  /** Ascending order on the guide page. */
   order?: number
-  /** The rail icon, drawn at the size the sidebar asks for. */
-  icon: (props: { size: number; active: boolean }) => ReactNode
-  /** The panel body, rendered in the main column while the panel is selected. */
   component: () => ReactNode
 }
 
 /**
- * Contribute a native sidebar panel while the host provides the slots service.
- * The returned adapter reports integrated as soon as the `main` entry is
- * registered, so the caller does not render the standalone dock beside a native
- * panel; `open()` selects the panel through the layout service.
+ * Contribute one right-sidebar tab. Integrated as soon as the tab body is
+ * registered, so the caller does not also render the standalone dock; `open()`
+ * reveals the tab through the host's controller.
  */
-export function createNativeSidebarAdapter(ctx: Context, descriptor: () => NativePanelDescriptor): SidebarAdapter {
+export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightSidebarDescriptor): SidebarAdapter {
   const listeners = new Set<() => void>()
   let disposed = false
   let registered = 0
-  let panelId: string | undefined
   const notify = () => { for (const listener of [...listeners]) listener() }
-  const dependency = ctx.inject(['slots'], ready => ready.effect(() => {
+  const type = ctx.inject(['sidebarRightTabs'], ready => ready.effect(() => {
+    if (disposed) return () => {}
+    const registry = ready.get('sidebarRightTabs') as unknown as RightTabRegistry | undefined
+    if (registry === undefined || typeof registry.register !== 'function') return () => {}
+    const tab = descriptor()
+    const release = registry.register({
+      id: tab.id, kind: tab.kind, title: () => tab.label(),
+      // The guide is the only route to a page type from the UI, so the panel
+      // names itself there instead of staying a registration nobody can pick.
+      guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
+    })
+    return () => release()
+  }, 'agent-swarm: right sidebar tab type'))
+  const body = ctx.inject(['slots'], ready => ready.effect(() => {
     if (disposed) return () => {}
     const slots = ready.get('slots') as unknown as SlotRegistrar | undefined
     if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return () => {}
-    const panel = descriptor()
-    panelId = panel.id
-    // The rail is the surface, and it is the only slot that proves the host has a
-    // native sidebar: a host that declares just the layout's `main` slot has
-    // nowhere to click, so claiming a panel there would make it unreachable and
-    // hide the dock that used to carry it. Register the panel inside the rail
-    // declaration, so both appear and disappear together.
-    const rail = slots.inject('sidebar.panellist', () => {
-      const releaseRail = slots.register({
-        name: 'sidebar.panellist', id: panel.id, label: panel.label,
-        ...(panel.order === undefined ? {} : { order: panel.order }),
-      }, (props: { size: number; active: boolean }) => panel.icon(props))
-      const releaseMain = slots.inject('main', () => slots.register({ name: 'main', key: panel.id }, () => panel.component()))
-      registered += 1
+    const tab = descriptor()
+    // The body and its chip title share the registry id as the seat key. The
+    // title seat is optional (the chip falls back to the captured title), so the
+    // panel registers its own name and stays independent of copy timing.
+    const release = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id }, () => tab.component()))
+    registered += 1
+    notify()
+    return () => {
+      registered -= 1
+      release()
       notify()
-      return () => {
-        registered -= 1
-        releaseMain()
-        releaseRail()
-        notify()
-      }
-    })
-    return () => { rail() }
-  }, 'agent-swarm: native sidebar panel'))
+    }
+  }, 'agent-swarm: right sidebar tab body'))
   const dispose = () => {
     if (disposed) return
     disposed = true
-    void dependency.dispose()
+    void type.dispose()
+    void body.dispose()
     listeners.clear()
   }
-  ctx.effect(() => dispose, 'agent-swarm: native sidebar adapter')
+  ctx.effect(() => dispose, 'agent-swarm: right sidebar adapter')
   return {
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
     getSnapshot: () => registered > 0,
     open() {
-      if (registered === 0 || panelId === undefined) return false
-      const layout = ctx.get('layout') as unknown as NativeLayout | undefined
-      if (layout === undefined || typeof layout.selectPanel !== 'function') return false
-      layout.selectPanel(panelId)
+      if (registered === 0) return false
+      const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
+      // Revealing is best effort: the tab exists either way, and the host's own
+      // Tab control opens the pane when no controller is mounted.
+      if (controller !== undefined && typeof controller.openTab === 'function') controller.openTab(descriptor().kind, { revealIfOpened: true })
       return true
     },
     dispose,
   }
-}
-
-/** The rail glyph: three linked nodes, sized by the sidebar. */
-export function SwarmRailIcon({ size }: { size: number }) {
-  return <svg className="sw-rail-icon" width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false"
-    fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round">
-    <circle cx="12" cy="5.2" r="2.6" /><circle cx="5.6" cy="17.4" r="2.6" /><circle cx="18.4" cy="17.4" r="2.6" />
-    <path d="M10.7 7.4 6.9 14.9M13.3 7.4l3.8 7.5M8.2 17.4h7.6" />
-  </svg>
 }

@@ -15,7 +15,7 @@ import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityP
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
 import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
-import { createNativeSidebarAdapter } from '../lib/types/client/sidebar.js'
+import { createRightSidebarAdapter } from '../lib/types/client/sidebar.js'
 import { WorkerAvatar } from '../lib/types/client/MissionProgress.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
@@ -503,72 +503,56 @@ test('OWNER PASS 2026-09-11 #2: the avatar scales in half steps and the controls
   assert.match(styles, /\.sw-team \.sw-workers\{margin-top:10px;grid-template-columns:repeat\(auto-fit,minmax\(240px,1fr\)\)\}/, 'the roster widens for the larger card')
 })
 
-test('native sidebar adapter: the rail slot gates the panel, and both vanish together', async () => {
-  // A fake host modelled on the real slot service: `inject` waits for a slot
-  // declaration, returns its own disposer, and passes a scope (never the
-  // registrar) to the callback. `slots` is mutable so a host can be given the
-  // rail slot, only the layout slot, or neither.
-  const registered = []
+test('right sidebar adapter: one tab type, its body seat, and host navigation', async () => {
+  // A fake host modelled on the real right-sidebar kit: the registry takes the
+  // tab type, the slot service takes the body under the same id, and the
+  // controller opens the pane by kind.
+  const types = [], seats = []
+  const registry = { register(definition) { types.push(definition); return () => { types.splice(types.indexOf(definition), 1) } } }
   const slots = {
-    declared: new Set(['main']),
-    inject(name, factory) {
-      if (!slots.declared.has(name)) return () => { released.push(name) }
-      const release = factory()
-      return () => { released.push(name); release?.() }
-    },
-    register(options, component) {
-      const entry = { slot: options.name, options, component }
-      registered.push(entry)
-      return () => { const at = registered.indexOf(entry); if (at >= 0) registered.splice(at, 1) }
-    },
+    inject(name, factory) { const release = factory(); return () => release?.() },
+    register(options, component) { const entry = { slot: options.name, key: options.key, component }; seats.push(entry); return () => { const at = seats.indexOf(entry); if (at >= 0) seats.splice(at, 1) } },
   }
-  const released = []
-  const calls = []
+  const opened = []
   const ctx = {
     inject(names, factory) {
-      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => (name === 'slots' ? slots : undefined) }
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => (name === 'slots' ? slots : name === 'sidebarRightTabs' ? registry : undefined) }
       const release = factory(scope)
       return { dispose: async () => { await release?.dispose?.() } }
     },
-    get: name => (name === 'layout' ? { selectPanel: id => calls.push(id) } : undefined),
+    get: name => (name === 'sidebarRight' ? { openTab: (kind, options) => opened.push(`${kind}:${JSON.stringify(options)}`) } : undefined),
     effect: fn => { fn() },
   }
-  const describe = () => ({ id: 'agent-swarm', label: () => 'Agent Swarm', order: 80, icon: () => null, component: () => null })
-
-  // Layout slot only: the host has no rail, so the panel must not be claimed and
-  // the standalone dock has to keep carrying the surface.
-  const layoutOnly = createNativeSidebarAdapter(ctx, describe)
-  assert.equal(layoutOnly.getSnapshot(), false, 'without the rail slot the adapter is not integrated')
-  assert.equal(layoutOnly.open(), false)
-  assert.deepEqual(registered, [], 'and claims no panel the user could never open')
-  layoutOnly.dispose()
-
-  // Both slots: one rail entry and one main entry behind the same id.
-  slots.declared.add('sidebar.panellist')
-  const adapter = createNativeSidebarAdapter(ctx, describe)
-  assert.equal(adapter.getSnapshot(), true, 'a live rail entry reports integrated, so the dock stays hidden')
-  assert.deepEqual(registered.map(entry => [entry.slot, entry.options.key ?? entry.options.id, entry.options.order,
-    typeof entry.options.label === 'function' ? entry.options.label() : undefined]),
-    [['sidebar.panellist', 'agent-swarm', 80, 'Agent Swarm'], ['main', 'agent-swarm', undefined, undefined]],
-    'the rail entry is registered first, then the panel it addresses')
+  const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80, label: () => 'Agent Swarm', description: () => 'Missions, workers and evidence for this conversation', component: () => null })
+  const adapter = createRightSidebarAdapter(ctx, describe)
+  assert.equal(adapter.getSnapshot(), true, 'a registered tab reports integrated, so the dock stays hidden')
+  assert.deepEqual(types.map(type => [type.id, type.kind, type.title()]), [['dsh-external-agent-swarm', 'agent-swarm', 'Agent Swarm']],
+    'the tab type carries the implementation id, the kind navigation names, and its chip title')
+  assert.deepEqual(types[0].guide.map(entry => [entry.order, entry.title(), entry.description()]),
+    [[80, 'Agent Swarm', 'Missions, workers and evidence for this conversation']],
+    'and one guide capsule, which is the only route to a page type from the UI')
+  assert.deepEqual(seats.map(seat => [seat.slot, seat.key, typeof seat.component]), [['sidebar.right.pane.tab', 'dsh-external-agent-swarm', 'function']],
+    'the body sits in the keyed seat under that same id')
   assert.equal(adapter.open(), true)
-  assert.deepEqual(calls, ['agent-swarm'], 'open() selects the registered panel through the layout service')
+  assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'open() reveals the tab through the host controller')
   adapter.dispose()
   adapter.dispose()
-  assert.equal(adapter.getSnapshot(), false, 'disposal releases both entries')
-  assert.deepEqual(registered, [])
-  assert.equal(adapter.open(), false, 'a disposed adapter never selects anything')
+  assert.equal(adapter.getSnapshot(), false, 'disposal releases the type and the seat')
+  assert.deepEqual(types, [])
+  assert.deepEqual(seats, [])
+  assert.equal(adapter.open(), false, 'a disposed adapter never reveals anything')
 
-  // Hosts without the native sidebar (0.1.2/0.1.3) must fall back, not throw.
+  // Hosts without a right sidebar (0.1.2/0.1.3) must fall back, not throw.
   const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }
-  const fallback = createNativeSidebarAdapter(bare, describe)
+  const fallback = createRightSidebarAdapter(bare, describe)
   assert.equal(fallback.getSnapshot(), false)
-  assert.equal(fallback.open(), false, 'without a slots service the adapter reports not-integrated and the dock renders')
+  assert.equal(fallback.open(), false, 'without the registry the adapter reports not-integrated and the dock renders')
   fallback.dispose()
   // The adapter must stay structural: importing the sidebar package would pull a
   // 0.1.5-only peer into a plugin that also loads on 0.1.2/0.1.3.
   const source = await readFile(new URL('../src/client/sidebar.tsx', import.meta.url), 'utf8')
-  assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar/, 'no static import of the native sidebar package')
-  assert.match(source, /name: 'sidebar\.panellist'/, 'the rail entry is registered by slot name')
-  assert.match(source, /slots\.inject\('main', \(\) => slots\.register\(\{ name: 'main', key: panel\.id \}/, 'and the panel rides the rail declaration')
+  assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar-right/, 'no static import of the right-sidebar package')
+  assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
+  assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
+  assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
 })

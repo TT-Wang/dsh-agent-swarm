@@ -16,7 +16,7 @@ import { SwarmBoard } from './SwarmBoard.tsx'
 import { SWARM_CSS } from './styles.ts'
 import { ActivityPanel, OPEN_MONITOR } from './ActivityPanel.tsx'
 import { SidebarDock } from './SidebarDock.tsx'
-import { createNativeSidebarAdapter, createSidebarAdapter, SwarmRailIcon } from './sidebar.tsx'
+import { createRightSidebarAdapter, createSidebarAdapter } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
 import { DisposalRegistry } from './lifecycle.ts'
 import { CopyContext, en, zh } from './locale.tsx'
@@ -87,13 +87,15 @@ export function apply(ctx: Context): void {
         history.open(member.sessionId, member.name)
       }} /></Localized>
   }
-  // Surface preference: the host's own sidebar first (0.1.5 line), then Better
-  // Sidebar when a profile mounts it, then the standalone dock. Each adapter
-  // reports integrated only while its registration is live, so unloading a host
-  // sidebar hands the surface to the next one instead of leaving a blank column.
-  const native = createNativeSidebarAdapter(ctx, () => ({
-    id: 'agent-swarm', label: () => copy('Agent Swarm'), order: 80,
-    icon: ({ size }) => <SwarmRailIcon size={size} />,
+  // Surface preference: the host's own right sidebar first (0.1.5 line, the same
+  // pane Files uses), then Better Sidebar when a profile mounts it, then the
+  // standalone dock. Each adapter reports integrated only while its registration
+  // is live, so unloading a host pane hands the surface to the next one instead
+  // of leaving a blank column.
+  const native = createRightSidebarAdapter(ctx, () => ({
+    id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80,
+    label: () => copy('Agent Swarm'),
+    description: () => copy('Missions, workers and evidence for this conversation'),
     component: () => <Pane />,
   }))
   const sidebar = createSidebarAdapter(ctx, () => ({

@@ -31,9 +31,6 @@ body[data-ds-dark-theme] [data-swarm-dock]{background:#101b22}
 @media(max-width:700px){
 [data-swarm-dock]{inset:auto 0 0;width:100%;height:45dvh;border-left:0;border-top:1px solid #90a79c55}[data-swarm-dock][data-expanded=false]{height:40px}.sw-launcher{writing-mode:horizontal-tb;justify-content:center;padding:8px}.sw-sidebar-resize{display:none}}
 
-/* The rail glyph renders inside the host's sidebar column, so it is not scoped
-   under [data-swarm]; it inherits the column's colour and only fixes its box. */
-.sw-rail-icon{display:block;flex:none}
 .sw-open-monitor{border:1px solid #507c70;border-radius:7px;background:transparent;color:inherit;font:12px ui-sans-serif,system-ui,sans-serif;padding:6px 10px;cursor:pointer}
 [data-swarm-panel] .sw-panel-buttons{display:flex;gap:5px}[data-swarm-panel] .sw-panel-buttons button{width:29px;height:29px;padding:0;font-size:20px;background:transparent;border-color:transparent}
 [data-swarm-panel] .sw-panel-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:none;padding:10px 12px;border-bottom:1px solid var(--sw-border)}
