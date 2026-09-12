@@ -130,6 +130,10 @@ const meaningfulEvents: Record<string, string> = {
   'task/preparation-failed': 'Task preparation failed',
   'task/budget-resumed': 'Task resumed after budget pause', 'task/budget-resume-skipped': 'Task resume skipped',
   'member/added': 'Worker added', 'member/subscribed': 'Worker subscriptions updated',
+  // L1/L2 receipts: an answer bound to a question, a deliberate dismissal, and a
+  // question an owner turn left unanswered.
+  'message/answered': 'A question was answered', 'message/dismissed': 'A question was closed without an answer',
+  'owner/reply-missing': 'A question to the owner is still unanswered',
   'mission/pause': 'Mission paused', 'mission/resume': 'Mission resumed', 'mission/stop': 'Mission stopped',
   'mission/complete': 'Collaboration completed', 'automatic/completed': 'Collaboration completed',
   'mission/budget-exhausted': 'Resource limit reached', 'member/failure': 'Worker reported a failure',

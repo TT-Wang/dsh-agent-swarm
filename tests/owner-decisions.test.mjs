@@ -199,7 +199,9 @@ test('R15-A1: every notify() call site in src/ passes a subject argument (enumer
   // (src/notices.ts), the absence net, whose third argument is `[subject]` built
   // from `missionSubject(mission)`. The count moves 24 -> 25; nothing else in
   // this test changed, and the new site is visited and checked like every other.
-  assert.equal(sites, 25, `every .notify() site enumerated (found ${sites})`)
+  // L2 adds the owner-reply nudge and its block-mode twin (src/owner-reply.ts),
+  // both passing `noticeSubjectsFor(...)`; the count moves 25 -> 27.
+  assert.equal(sites, 27, `every .notify() site enumerated (found ${sites})`)
   assert.deepEqual(offenders, [], `every notify() site passes subjects as its third argument: ${offenders.join(' | ')}`)
 })
 

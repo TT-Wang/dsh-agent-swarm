@@ -855,6 +855,9 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'evidence/verdict': 'Normalized verdict row: evidence id, verdict and retired reviews',
   'trace/span': 'One orchestration step span with digests of its input and output',
   'message/queued': 'Directed message or topic broadcast queued durably',
+  'message/answered': 'The addressed recipient bound an answer to a question delivery id (L1 receipt)',
+  'message/dismissed': 'The addressed recipient closed a question delivery without an answer, recording the reason (L1 receipt)',
+  'owner/reply-missing': 'An owner turn ended with a delivered question still unanswered: the receipt was not bound by any tool call in that turn (L2)',
   // Every remaining type the runtime emits (F-14). The read path must name them
   // so an operator can reconstruct a decision instead of seeing an unknown row.
   'automatic/requested': 'Automatic planning request admitted with its goal and workspace',

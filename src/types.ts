@@ -440,6 +440,20 @@ export interface Post {
   ttlMs?: number
 }
 /** Model input for one board post; sender and sequence come from the host. */
+/** `swarm_message` input: one delivery, optionally bound to the question it answers. */
+export interface MessageInput {
+  to: string
+  kind: 'question' | 'finding'
+  content: string
+  topic?: string
+  /**
+   * L1: the question delivery this message answers. Answering is a durable
+   * receipt on that row, not a convention about prose.
+   */
+  replyTo?: string
+  /** L1: close the referenced question without sending a message (`content` is the reason). */
+  dismiss?: boolean
+}
 export interface PostInput {
   kind: PostKind
   body: string
@@ -525,6 +539,24 @@ export interface Delivery {
   subjects?: string[]
   /** Present on owner notices: dedup key and sent/queued/claimed lifecycle. */
   notice?: NoticeEnvelope
+  /**
+   * L0 receipt: this delivery asks a question, so it stays open until an answer
+   * is bound to its id. Written in the same transaction as the delivery itself;
+   * deliveries written by older builds carry no flag and are never retro-open.
+   */
+  replyExpected?: boolean
+  /** The question delivery this one answers, when it answers one. */
+  inReplyTo?: string
+  /** Receipt state of a `replyExpected` delivery. */
+  state?: 'open' | 'answered' | 'dismissed'
+  /** The member/owner key that answered or dismissed it, written once. */
+  answeredBy?: string
+  answeredAt?: number
+  /**
+   * L2: owner-reply nudges already spent on this question. Durable, so the bound
+   * survives a restart and a repeated turn cannot nudge forever.
+   */
+  replyNudges?: number
   /** Present when this delivery carries a typed owner escalation. */
   escalation?: Escalation
 }
@@ -913,6 +945,14 @@ export interface RuntimeConfig {
   checkTimeoutMs?: number
   /** Idle close-out nudges before an open attempt is checkpointed and abandoned; defaults to 2. */
   maxIdleCloseouts?: number
+  /**
+   * L2 owner-reply guard. `nudge` (default) records the missing reply and sends a
+   * bounded instruction to the owner; `block` additionally refuses the owner's
+   * next step, which ends the turn that answered in prose only.
+   */
+  ownerReplyGuard?: 'nudge' | 'block'
+  /** Owner-reply nudges before the guard terminal; defaults to 2. */
+  maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
   budgetWarnAt?: number[]
   /**

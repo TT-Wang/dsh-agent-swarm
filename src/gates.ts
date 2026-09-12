@@ -206,8 +206,33 @@ export class RuntimeGates {
       pendingDispatchable: view.pendingDispatchable,
       ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
       notices: counts,
+      // L3: the receipts nobody has settled yet. A question with no answer is a
+      // silent state by the same argument the board uses, so it is named here
+      // with the call that closes it, whether or not the owner acted on a nudge.
+      openAsks: this.openAsks(missionId),
       ...(full ? { noticeLedger: view.notices, escalations: view.escalations, arena: { missionId: view.missionId, status: view.status, members: view.members } } : {}),
       note: 'Read-only arena instruments: fingerprint, last witness, pending dispatchable tasks, notice counts' + (full ? ', the notice-delivery ledger, escalations and per-member presence/activity/attempt age/pending dependencies' : '') + '. Reading them changes no state.',
+    }
+  }
+
+  /** L3: open receipts as the owner reads them, bounded and answerable by id. */
+  private openAsks(missionId: string): { count: number; asks: Array<Record<string, unknown>>; note: string } {
+    const asks = this.rt.openAsks(missionId)
+      .sort((a, b) => (a.deliveredAt ?? a.createdAt) - (b.deliveredAt ?? b.createdAt))
+      .slice(0, 10)
+      .map(delivery => ({
+        deliveryId: delivery.id,
+        to: delivery.to === 'owner' ? 'owner' : delivery.to,
+        from: delivery.from,
+        ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
+        ageMs: Math.max(0, Date.now() - (delivery.deliveredAt ?? delivery.createdAt)),
+        nudges: delivery.replyNudges ?? 0,
+        question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
+      }))
+    return {
+      count: this.rt.openAsks(missionId).length,
+      asks,
+      note: 'Questions with no receipt. Answer one with swarm_message and its deliveryId in replyTo, or close it with dismiss: true; an owner question answered only in chat is still open here.',
     }
   }
 

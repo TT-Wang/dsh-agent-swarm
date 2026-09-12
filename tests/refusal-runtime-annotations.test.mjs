@@ -21,6 +21,8 @@ const ANNOTATED = {
     'owner_cannot_claim', 'evidence_tool_runs_required', 'invalid_evidence_outcome', 'supersede_foreign_evidence',
     'supersede_unrelated_evidence', 'verification_requires_verify', 'research_evidence_required', 'not_a_verification_task',
     'artifact_changed_during_verification', 'evidence_changed_during_verification',
+    // L0-L2 owner-reply receipts: every refusal names the id to pass instead.
+    'reply_target_required', 'unknown_reply_target', 'reply_target_not_question', 'reply_target_not_recipient',
   ],
   'src/workspaces.ts': [
     'workspace_not_repository_root', 'workspace_not_owned', 'verification_source_required', 'review_source_not_verification',
@@ -66,8 +68,15 @@ const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/no
  * carries the deletions as their own term instead of pretending a diagnostic code
  * was added for a refusal that no longer exists.
  */
-const ADDED_SITES = 3
+const ADDED_SITES = 7
 const REMOVED_UNCODED_SITES = 2
+/**
+ * Declared codes that REPLACED a previously-uncoded site (the earlier branch's
+ * contribution). The four owner-reply codes this branch declares are new refusal
+ * sites, not conversions: they add to the total site count via ADDED_SITES and
+ * leave the uncoded count exactly where the previous branch left it.
+ */
+const CONVERTED_UNCODED_SITES = 17
 const ALLOWLIST = []
 
 test('S3: every refusal code this branch added is present exactly once and compliant', async () => {
@@ -106,8 +115,8 @@ test('S3: the uncoded refusal count on the serialized files only shrinks, and th
   assert.equal(total, 235 + ADDED_SITES - REMOVED_UNCODED_SITES, 'the split control-path files still expose every refusal site (186 + 49, plus this round\'s coded site)')
   assert.ok(uncoded < PRE_BRANCH_UNCODED,
     `this branch must shrink the uncoded inventory (pre-branch ${PRE_BRANCH_UNCODED}, now ${uncoded})`)
-  assert.equal(uncoded, PRE_BRANCH_UNCODED - Object.values(ANNOTATED).flat().length - REMOVED_UNCODED_SITES,
-    'the shrink equals the codes this branch added plus the uncoded refusal the subprocess adoption deleted')
+  assert.equal(uncoded, PRE_BRANCH_UNCODED - CONVERTED_UNCODED_SITES - REMOVED_UNCODED_SITES,
+    'the uncoded inventory stays at the converted-and-deleted shrink: this branch declares new coded sites, so it converts none')
   const applied = applyAllowlist(INVENTORY_SOURCES.flatMap(file => sitesByFile[file]), ALLOWLIST,
     site => assessRefusal(site, { ...index, diagnosticProducers: diagnosticProducers([sitesByFile[site.file] ?? []]) }))
   assert.deepEqual(applied.stale, [], 'the allowlist handed over by T2 is empty and stays empty')

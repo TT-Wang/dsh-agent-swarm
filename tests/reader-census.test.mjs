@@ -52,6 +52,11 @@ const KEEP_ROLES = new Set(['engine', 'worker-decision', 'owner-decision', 'disp
  */
 const EVENT_CENSUS = [
   ["mission/created", "keep", "audit", "src/trace.ts", "Mission admitted with its frozen scope and budget"],
+  // L0-L2 owner-reply receipts: the answer link, the deliberate close and the
+  // owner-side miss, each with a writer and a reader that names it.
+  ["message/answered", "keep", "ui", "src/client/progress.ts", "The addressed recipient bound an answer to a question delivery id"],
+  ["message/dismissed", "keep", "ui", "src/client/progress.ts", "The addressed recipient closed a question without an answer, with the reason"],
+  ["owner/reply-missing", "keep", "owner-decision", "src/owner-reply.ts", "An owner turn ended with a delivered question still unanswered"],
   ["mission/recovered", "keep", "ui", "src/client/progress.ts", "Host restarted and recovered the mission from durable state"],
   ["mission/budget-updated", "keep", "audit", "src/trace.ts", "Owner changed the resource ceilings without resetting usage"],
   ["mission/stalled", "keep", "ui", "src/client/progress.ts", "No schedulable work remains and every live worker is idle"],

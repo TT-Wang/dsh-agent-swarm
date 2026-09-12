@@ -21,7 +21,7 @@ import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysO
 import { validScope } from './scope.ts'
 import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
@@ -559,6 +559,21 @@ interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; c
 interface MemberStartFailureFields { startFailures?: number }
 const startFailureFields = (member: Member): Member & MemberStartFailureFields => member as Member & MemberStartFailureFields
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
+/**
+ * L3: an owner-facing question is delivered with the exact call that answers it.
+ * The owner's prose is not part of this store and never reaches the asker, so the
+ * envelope states the receipt requirement where the question is read.
+ */
+function ownerQuestionContent(missionId: string, deliveryId: string, from: string, content: string, inReplyTo: Delivery | undefined): string {
+  const answers = inReplyTo === undefined ? '' : ` (this message also answers ${inReplyTo.id})`
+  return [
+    content,
+    '',
+    `[swarm receipt required] ${from} asked this through swarm_message${answers}. Text in this conversation is NOT delivered to the member.`,
+    `Answer with: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<your answer>", replyTo: "${deliveryId}" })`,
+    `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${from}", kind: "question", content: "<why not>", replyTo: "${deliveryId}", dismiss: true })`,
+  ].join('\n')
+}
 export class SwarmRuntime {
   /**
    * S5 inventory of every in-memory `Set`/`Map` reachable from the scheduling
@@ -1988,18 +2003,88 @@ export class SwarmRuntime {
   }
   
   /** Authenticated directed messages and selective topic broadcasts. */
-  message(actor: Actor, missionId: string, input: { to: string; kind: 'question' | 'finding'; content: string; topic?: string }): { queued: boolean } {
+  /**
+   * Deliver one message, and — when the caller names the question it answers —
+   * settle that question's receipt in the same transaction. L1: an answer is a
+   * durable link, never a convention about prose, because the owner's chat text
+   * is not part of this store and cannot be reconciled with the question.
+   */
+  message(actor: Actor, missionId: string, input: MessageInput): { queued: boolean; answered?: string; dismissed?: string } {
     const { key } = this.active(actor, missionId)
-    this.bounded(input.content)
+    if (input.dismiss === true && input.replyTo === undefined) {
+      throw new Error('[reply_target_required] dismiss closes the question named by `replyTo`, and none was passed: pass `replyTo` with the question delivery id (read the open receipts with `swarm_observe` and its `missionId`) and the reason in `content`, or send the answer normally.')
+    }
     if (input.to !== 'owner' && input.to !== 'subscribers' && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Recipient is not a live mission member')
     if (input.to === 'subscribers' && !input.topic) throw new Error('Broadcast requires a topic')
+    const question = input.replyTo === undefined ? undefined : this.answerableQuestion(missionId, key, input.replyTo)
+    if (input.dismiss === true) {
+      const reason = this.bounded(input.content)
+      this.commit(missionId, () => this.receipt(missionId, question!, key, 'dismissed', reason))
+      this.kick(missionId)
+      return { queued: false, dismissed: question!.id }
+    }
+    const content = this.bounded(input.content)
     this.commit(missionId, () => {
-      if (input.to === 'subscribers') this.topicDelivery(missionId, key, input.topic!, input.content)
-      else this.store.put('deliveries', { id: id('msg'), missionId, from: key, to: input.to, kind: input.kind, content: input.content, topic: input.topic, createdAt: Date.now() })
+      if (question !== undefined) this.receipt(missionId, question, key, 'answered', content)
+      if (input.to === 'subscribers') this.topicDelivery(missionId, key, input.topic!, content)
+      else {
+        const deliveryId = id('msg')
+        this.store.put('deliveries', {
+          id: deliveryId, missionId, from: key, to: input.to, kind: input.kind,
+          content: input.to === 'owner' && input.kind === 'question' ? ownerQuestionContent(missionId, deliveryId, key, content, question) : content,
+          topic: input.topic, createdAt: Date.now(),
+          // A receipt belongs to a question that asks something new. A reply that
+          // answers a question is information, so it never opens a second receipt.
+          ...(input.kind === 'question' && question === undefined ? { replyExpected: true, state: 'open' as const } : {}),
+          ...(question === undefined ? {} : { inReplyTo: question.id }),
+        })
+      }
       this.store.event(missionId, 'message/queued', key, input)
     })
     this.kick(missionId)
-    return { queued: true }
+    return { queued: true, ...(question === undefined ? {} : { answered: question.id }) }
+  }
+
+  /**
+   * L0: questions that were delivered and still carry no answer, optionally
+   * restricted to one recipient. The receipt is the durable link `replyTo`
+   * writes; a delivery written before this field existed is never retro-open.
+   */
+  openAsks(missionId: string, to?: string): Delivery[] {
+    return this.store.list('deliveries', missionId)
+      .filter(delivery => delivery.replyExpected === true && delivery.answeredBy === undefined && (to === undefined || delivery.to === to))
+  }
+
+  /** Resolve a `replyTo` target, refusing anything this caller cannot answer. */
+  private answerableQuestion(missionId: string, key: string, deliveryId: string): Delivery {
+    const target = this.store.get('deliveries', deliveryId)
+    if (target === undefined || target.missionId !== missionId) {
+      throw new Error('[unknown_reply_target] `replyTo` does not name a delivery of this mission: pass `replyTo` with the question delivery id you received, or read the open receipts with `swarm_observe` and its `missionId`.')
+    }
+    if (target.replyExpected !== true) {
+      throw new Error('[reply_target_not_question] that delivery asked no question, so there is no receipt to settle: pass the message without `replyTo`, or answer a question listed by `swarm_observe` with its `missionId`.')
+    }
+    if (target.to !== key) {
+      throw new Error('[reply_target_not_recipient] that question was addressed to another recipient, and only its recipient settles the receipt: pass `replyTo` for a question addressed to you, or leave it open (list receipts with `swarm_observe` and its `missionId`).')
+    }
+    return target
+  }
+
+  /**
+   * Write the receipt once. A replayed answer settles nothing twice and records
+   * no second event, so an idempotent retry cannot turn one question into two.
+   */
+  private receipt(missionId: string, target: Delivery, key: string, state: 'answered' | 'dismissed', detail?: string): boolean {
+    if (target.answeredBy !== undefined) return false
+    target.state = state
+    target.answeredBy = key
+    target.answeredAt = Date.now()
+    this.store.put('deliveries', target)
+    this.store.event(missionId, state === 'answered' ? 'message/answered' : 'message/dismissed', key, {
+      deliveryId: target.id, from: target.from, to: target.to,
+      ...(detail === undefined ? {} : { reason: detail.slice(0, 200) }),
+    })
+    return true
   }
   /**
    * Raise one typed, durable owner escalation. This is deliberately not a board
@@ -2088,12 +2173,22 @@ export class SwarmRuntime {
       const run = this.store.get('tool_runs', runId)
       if (!run || run.missionId !== missionId) throw new Error('Unknown tool run in this mission')
     }
+    let answered: Delivery | undefined
     if (input.replyTo !== undefined) {
       const parent = this.store.post(input.replyTo)
-      if (!parent || parent.missionId !== missionId) throw new Error('Unknown replyTo post in this mission')
+      if (parent !== undefined) {
+        if (parent.missionId !== missionId) throw new Error('Unknown replyTo post in this mission')
+      } else {
+        // L1: a board post may settle a question receipt instead of replying to
+        // another post. Both are receipts on durable rows; the id namespace says
+        // which one the caller meant.
+        answered = this.answerableQuestion(missionId, key, input.replyTo)
+      }
     }
     if (input.ttlMs !== undefined && (!Number.isSafeInteger(input.ttlMs) || input.ttlMs < 0)) throw new Error('ttlMs must be a nonnegative integer')
-    return this.commit(missionId, () => this.store.recordPost({
+    return this.commit(missionId, () => {
+      if (answered !== undefined) this.receipt(missionId, answered, key, 'answered', body)
+      return this.store.recordPost({
       id: id('post'), missionId, kind: input.kind, fromMemberId: key,
       ...(input.to === undefined ? {} : { toMemberId: input.to }),
       ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
@@ -2102,7 +2197,8 @@ export class SwarmRuntime {
       ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
       ...(input.ttlMs === undefined ? {} : { ttlMs: input.ttlMs }),
       createdAt: Date.now(),
-    }))
+      })
+    })
   }
   /**
    * Bounded board read. `to: 'me'` is the caller's inbox view: posts addressed

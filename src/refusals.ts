@@ -223,7 +223,7 @@ export class RefusalRegistry {
  * ------------------------------------------------------------------------- */
 
 /** The seven control-path chains whose terminal element must escalate. */
-export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'admission'
+export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'admission' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
 export interface DecisionExit {
@@ -265,6 +265,9 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   // of the seventh chain in the same family (R12-F9): the code is authored in
   // src/admission.ts and tests/guard-terminals.test.mjs asserts the two match.
   admission: 'dependency_assumption_missing',
+  // L2: the owner was asked a question and closed the turn in prose, so the
+  // answer never reached the asker. The chain names the receipt, not the model.
+  owner_reply: 'owner_reply_missing',
 }
 
 /**
@@ -281,6 +284,9 @@ const GUARD_TERMINAL_CO_FIRES: Record<GuardChainId, GuardChainId[]> = {
   review_admission: ['workspace', 'dispatch_preconditions'],
   dispatch_preconditions: ['workspace', 'attempt_lease', 'task_ceiling', 'budget', 'review_admission'],
   admission: ['workspace', 'dispatch_preconditions'],
+  // A missing owner reply co-fires with nothing: the board is untouched, and the
+  // ask's own delivery row is the witness.
+  owner_reply: [],
 }
 
 const described = (context: GuardTerminalContext, fallback: string): string => context.detail ?? fallback
@@ -301,6 +307,7 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     task_ceiling: `[task_ceiling_terminal] ${task} exhausted its own ceiling (${described(context, 'step or finding limit')}) and cannot be dispatched again. Propose its replacement with \`swarm_propose\`: name it in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` inside the mission budget, keeping the acceptance criteria verbatim; or withdraw it with \`swarm_cancel\` and its \`taskId\`.`,
     admission: `[dependency_assumption_missing] ${task} declares no dependency while its text assumes prior work is already available (${described(context, 'the worktree would be prepared from the bare mission baseline')}), so the work starts without the content it needs. Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task with the same acceptance criteria and budget; a repair may name the blocked task in \`replaces\` instead.`,
     review_admission: `[review_admission_terminal] Submitted work ${task} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`acceptance\`, or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`,
+    owner_reply: `[owner_reply_missing] An owner-facing question was delivered and the owner's turn ended without binding an answer to it (${described(context, 'the receipt is still open')}). Answer it with \`swarm_message\` by passing \`to\`, \`kind: 'question'\`, the answer in \`content\` and the asked question's id in \`replyTo\`, or close it deliberately with \`dismiss: true\` and a \`replyTo\`; prose in the conversation is never delivered to the asker.`,
     dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`, free a slot or raise a limit with \`swarm_budget\` and its \`budget\`, repair the work with \`swarm_propose\` and its \`replaces\`, withdraw the stuck work with \`swarm_cancel\` and its \`taskId\`, or decide with \`swarm_control\` and its \`action\`.`,
   }
   const exits: Record<GuardChainId, DecisionExit[]> = {
@@ -328,6 +335,10 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     review_admission: [
       { tool: 'swarm_propose', parameter: 'reviewOf', instruction: 'admit an independent verification task' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the unreviewable source' },
+    ],
+    owner_reply: [
+      { tool: 'swarm_message', parameter: 'replyTo', instruction: 'bind the answer to the question delivery id' },
+      { tool: 'swarm_message', parameter: 'dismiss', instruction: 'close a question the owner will not answer, with a reason' },
     ],
     dispatch_preconditions: [
       { tool: 'swarm_observe', parameter: 'taskId', instruction: 'read the exact blocker before deciding' },

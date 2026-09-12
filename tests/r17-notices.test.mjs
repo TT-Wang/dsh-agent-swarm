@@ -454,6 +454,12 @@ test('R17-G1: every notify() site is enumerated per site with its view consumpti
     'src/attempts.ts': [
       { consumes: false, reason: 'the attempt reporting bound reads the running attempt row and the elapsed clock; the board view carries the task but not the attempt\'s last durable progress instant, which is the fact this escalation is about' },
     ],
+    'src/owner-reply.ts': [
+      // 1 the bounded nudge for a question the owner's turn left open
+      { consumes: false, reason: 'the nudge reads the question delivery row (its receipt state, delivery time and nudge count); the shared board view carries task and member state and no receipt, so it cannot answer whether this question is settled' },
+      // 2 the step refusal while that receipt stays open (block mode)
+      { consumes: false, reason: 'the block reads the same receipt row at the owner step boundary; the board view has no receipt field, and the durable openAsks projection is the fact this refusal is derived from' },
+    ],
     'src/notices.ts': [
       { consumes: true },                                   // 1 absence net
       { consumes: true },                                   // 2 dispatch question (view.dispatchable above)
@@ -506,6 +512,8 @@ test('R17-G1: every notify() site is enumerated per site with its view consumpti
     if (!entry.consumes) assert.ok(typeof entry.reason === 'string' && entry.reason.length > 20, `${site.file} site #${perFile[site.file]} needs the fact it reads instead of the view`)
     ordinal += 1
   }
-  assert.equal(ordinal, 25, `the enumeration is exhaustive (found ${ordinal})`)
+  // L2 adds two sites (src/owner-reply.ts: the bounded nudge and the block-mode
+  // step refusal); the enumeration moves 25 -> 27 and both are classified above.
+  assert.equal(ordinal, 27, `the enumeration is exhaustive (found ${ordinal})`)
   assert.equal(Object.values(byFile).reduce((sum, count) => sum + count, 0), found.length)
 })

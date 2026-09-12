@@ -191,6 +191,11 @@ export const zh: Record<string, string> = {
   'Ready to dispatch.': '可以派发。', 'No work has been admitted yet.': '尚未准入任何工作。',
   'Admit work with swarm_propose or inspect the plan.': '用 swarm_propose 准入工作，或检查现有计划。',
   'No task can make further progress': '没有子任务还能继续推进',
+  // L1/L2 receipt vocabulary: the answer link, the deliberate close and the
+  // owner-side miss. Every path segment of the emitted types is a catalogue key.
+  'A question was answered': '问题已获答复', 'A question was closed without an answer': '问题已标记为不答复',
+  'A question to the owner is still unanswered': '主对话有一条问题尚未答复',
+  'owner': '主对话', 'answered': '已答复', 'dismissed': '已标记不答复', 'reply-missing': '缺少答复',
 }
 export const en = Object.fromEntries(Object.keys(zh).map(key => [key, key]))
 export const CopyContext = createContext<(text: string) => string>(text => text)

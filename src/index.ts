@@ -10,6 +10,7 @@ import { HarnessWorkers } from './harness-workers.ts'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS } from './workspaces.ts'
 import { registerTools, SWARM_PROMPT } from './tools.ts'
 import { RoleScoper } from './roles.ts'
+import { OwnerReplyGuard } from './owner-reply.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import { liveLineageSubject, noticeFamily } from './notices.ts'
@@ -73,6 +74,14 @@ export interface Config {
   traceSpillMaxFiles: number
   /** R17-G10: days a payload file is retained; `0` disables age retention and keeps the size bound only. */
   traceSpillRetentionDays: number
+  /**
+   * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
+   * left unanswered and instructs with the exact call; `block` additionally
+   * refuses the owner's next step while the receipt stays open.
+   */
+  ownerReplyGuard: 'nudge' | 'block'
+  /** Nudges spent on one unanswered owner question before the guard terminal; default 2. */
+  maxOwnerReplyNudges: number
 }
 export const Config: z<Config> = z.object({
   statePath: z.string().default(join(homedir(), '.dsh/agent-swarm/swarm.sqlite')),
@@ -91,6 +100,8 @@ export const Config: z<Config> = z.object({
   // campaign) and that value wins.
   checkTimeoutMs: z.natural().min(100).default(600000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
+  ownerReplyGuard: z.union(['nudge', 'block']).default('nudge'),
+  maxOwnerReplyNudges: z.natural().min(0).default(2),
   verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),
   allowDependencyLinkReads: z.boolean().default(false),
@@ -187,6 +198,11 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
   new RoleScoper(ctx, runtime)
   await runtime.start(grants)
+  // L2: the owner side of the reply protocol. The guard observes owner turns and
+  // reports questions the turn did not settle; it never answers on the owner's
+  // behalf and never edits a message.
+  const ownerReplies = new OwnerReplyGuard(ctx, runtime, { guard: config.ownerReplyGuard, maxNudges: config.maxOwnerReplyNudges })
+  ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
   ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
 }

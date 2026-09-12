@@ -190,7 +190,8 @@ test('invalid posts are rejected: kind, bound, citations, foreign member and rep
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'x'.repeat(65) }), /exceeds 64 characters/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'cite', evidenceIds: ['evidence_missing'] }), /Unknown evidence in this mission/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'cite', toolRunIds: ['run_missing'] }), /Unknown tool run in this mission/)
-  assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'reply', replyTo: 'post_missing' }), /Unknown replyTo post in this mission/)
+  assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'reply', replyTo: 'post_missing' }), /\[unknown_reply_target\]/,
+    'a replyTo that names neither a post nor a question delivery of this mission is refused with the id to pass instead')
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'me' , to: 'me' }), /read filter/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'unknown', to: 'member_missing' }), /Unknown recipient in this mission/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'task', taskId: 'task_missing' }), /Task is not in this mission/)

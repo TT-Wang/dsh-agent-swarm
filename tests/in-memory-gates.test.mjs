@@ -157,6 +157,16 @@ const CENSUS = [
   ["src/notices.ts",13,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",14,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",15,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  // L2 owner-reply guard: a plugin-side observer of host session events, not a
+  // participant in the runtime's decision path. Every durable fact it reports
+  // (the open receipt, its nudge count, the guard terminal) lives on the
+  // `deliveries` row and is re-derived on the next turn, so losing these
+  // collections costs at most one turn's report or one step refusal.
+  ["src/owner-reply.ts",1,"Map","private readonly bookings = new Map<string, Map<string, Booking>>()","outside","","outside the runtime decision path: the owner-reply guard books the questions an owner turn is expected to settle, and a lost booking only skips that turn's report — the receipt row stays open and the next turn re-books it from `deliveries`"],
+  ["src/owner-reply.ts",2,"Map","private readonly blocking = new Map<string, Set<string>>()","outside","","outside the runtime decision path: block mode remembers which receipts it refuses a step for; the refusal is re-derived from the same open receipt and stops once it is settled or the guard terminal is recorded"],
+  ["src/owner-reply.ts",3,"Set","private readonly attached = new Set<string>()","outside","","outside the runtime decision path: it only remembers which owner agents already carry the pre-step hook, so attaching twice cannot happen and nothing durable depends on it"],
+  ["src/owner-reply.ts",4,"Map","const booked = new Map<string, Booking>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/owner-reply.ts",5,"Set","const tracked = this.blocking.get(sessionId) ?? new Set<string>()","local","","function-local: read out of the guard's own map and handed back to it in the same synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",1,"Map","const result = new Map<string, Record<string, unknown>>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",2,"Set","const names = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/plans.ts",3,"Map","const byKey = new Map(tasks.map(task => [task.key, task])), visiting = new Set<string>(), done = new Set<string>(), result: PlanTask[] = []","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
