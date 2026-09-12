@@ -8,7 +8,7 @@ Turn a natural-language task into a team of collaborating agents inside [DeepSee
 
 One command starts a mission. The primary agent inspects the project, chooses the team and the resource budgets, and launches the work; workers propose tasks, ask peers, publish evidence, challenge results and hand off partial implementations. A durable runtime coordinates them, and nothing is accepted without an independent review of the exact artifact.
 
-**Version 0.7.0 · MIT · Local Git workspaces · Native DSH Web sidebar**
+**Version 0.7.0 · MIT · Local Git workspaces · Mounts in the host's native sidebar (Harness 0.1.5+)**
 
 ## Positioning
 
@@ -44,7 +44,8 @@ Stated as what a caller may rely on:
 ## Features
 
 - **One command to start.** `/agent-swarm` appears in native command autocomplete. Describe the outcome; the primary agent plans and launches without a configuration form.
-- **A sidebar beside your conversation.** Goal, current activity, per-worker progress, accepted-work count and recent progress come first; budgets, the work board, the dependency graph, evidence and the event history expand on demand.
+- **It lives in the host's own sidebar.** On Harness 0.1.5 and later the panel is a native right-sidebar tab beside Files: same pane, same tab strip, opened from that pane's Start page, from `/agent-swarm`, or from the conversation card. Better Sidebar and a standalone dock remain the fallbacks for older releases and other profiles — one surface at a time, chosen by what the host actually provides.
+- **Built for the pane it sits in.** Goal, current activity, per-worker progress and recent progress come first; budgets, the work board, the dependency graph, evidence and the event history expand on demand, and the layout reflows to the pane's width instead of assuming a full window.
 - **Real Harness workers.** Each worker is a native agent with its own session, inbox, tools and sandbox. Open a live worker conversation, or read its persisted transcript after it finishes.
 - **Independent acceptance, not self-assessment.** Code submissions become immutable Git commits. A different worker reviews each one, and the host runs the declared verification commands in a fresh checkout of the submitted commit. A failed command cannot be overridden by an agent claiming success.
 - **Verification that can actually run your checks.** The clean checkout is given your project's installed dependency directories, so `npm test`, `pytest` and friends find their toolchain instead of failing with "command not found".
@@ -137,7 +138,7 @@ The following exact Harness releases are supported:
 | [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` | npm `alpha` at the time |
 | [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` | npm `latest` at the time |
 
-All three are prereleases, and one adapter serves all three: the worker setup hook takes the agent from whichever host supplies it, so the plugin does not fork by host version. This plugin does not claim compatibility with the older `0.1.0-rc.5` SDK or with unreleased Harness commits. The development linker checks the release revision recorded in [compatibility.json](compatibility.json), not just a version string.
+All three are prereleases, and one adapter serves all three: the worker setup hook takes the agent from whichever host supplies it, so the plugin does not fork by host version. The host's native sidebar is a 0.1.5 feature — on 0.1.2/0.1.3 the panel falls back to Better Sidebar or the built-in dock from the same build, and no sidebar package is imported at any version. This plugin does not claim compatibility with the older `0.1.0-rc.5` SDK or with unreleased Harness commits. The development linker checks the release revision recorded in [compatibility.json](compatibility.json), not just a version string.
 
 Verification runs against packaged-artifact loading, native CLI profile installation and the real `/agent-swarm` browser workflow. Provider responses are scripted while Harness, tools, persistence, Git effects, authentication and browser interaction are real, so these checks establish integration behavior — not model planning success rates. See [validation](docs/validation.md).
 
@@ -243,8 +244,8 @@ Budgets are chosen by the primary agent and enforced by the runtime across the w
 
 The panel takes the first surface the host provides, and falls back in this order:
 
-1. **The host's own right sidebar** (Harness 0.1.5 and later), the pane the Files tab uses. Agent Swarm registers a tab type, its body, and one capsule on that pane's Start page, so the panel opens beside the conversation instead of taking the main column; `/agent-swarm` and the conversation card reveal the tab through the host's controller. The registration is structural — the plugin imports none of the sidebar packages — so the same build still loads on 0.1.2/0.1.3, where this path never fires.
-2. **Better Sidebar**, when a profile mounts it: pick **Agent Swarm** from its **+** tab menu; per-tab conversation scope and visibility are respected, and pinned tabs keep their own session.
+1. **The host's own right sidebar** (Harness 0.1.5 and later), the pane the Files tab uses. Agent Swarm registers a tab type, its body, and one capsule on that pane's Start page, so the panel opens beside the conversation instead of taking the main column. To open it: expand the right sidebar, choose **New tab** → the **Start** page, and pick the **Agent Swarm** capsule; afterwards `/agent-swarm` and the conversation card reveal the same tab, and it stays in the tab strip beside Files. The registration is structural — the plugin imports none of the sidebar packages — so the same build still loads on 0.1.2/0.1.3, where this path never fires.
+2. **Better Sidebar**, when a profile mounts it and the host has no native right sidebar: pick **Agent Swarm** from its **+** tab menu; per-tab conversation scope and visibility are respected, and pinned tabs keep their own session.
 3. **A standalone dock** beside the conversation: collapse and reopen from the Agent Swarm rail, and its width is remembered. Narrow screens move the panel below the conversation. The dock reserves its space by setting the host root's inline width, so it never names a host id and never needs `!important`.
 
 Whatever the surface, the panel body is the same projection of the durable state.
