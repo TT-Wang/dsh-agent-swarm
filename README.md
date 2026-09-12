@@ -241,9 +241,13 @@ Budgets are chosen by the primary agent and enforced by the runtime across the w
 
 ## Sidebar
 
-With **Better Sidebar** installed, pick **Agent Swarm** from its **+** tab menu; per-tab conversation scope and visibility are respected, and pinned tabs keep their own session.
+The panel takes the first surface the host provides, and falls back in this order:
 
-Without it, a resizable dock sits beside the conversation — collapse and reopen from the Agent Swarm rail, and its width is remembered. Narrow screens move the panel below the conversation.
+1. **The host's own sidebar** (Harness 0.1.5 and later). Agent Swarm registers a global panel: its icon joins the sidebar's panel rail, and selecting it opens the panel in the main column. The registration is structural — the plugin does not import the sidebar package — so the same build still loads on 0.1.2/0.1.3, where this path simply never fires. `/agent-swarm` and the conversation card select that panel through the host's layout service.
+2. **Better Sidebar**, when a profile mounts it: pick **Agent Swarm** from its **+** tab menu; per-tab conversation scope and visibility are respected, and pinned tabs keep their own session.
+3. **A standalone dock** beside the conversation: collapse and reopen from the Agent Swarm rail, and its width is remembered. Narrow screens move the panel below the conversation. The dock reserves its space by setting the host root's inline width, so it never names a host id and never needs `!important`.
+
+Whatever the surface, the panel body is the same projection of the durable state.
 
 The overview answers "what is happening" before any disclosure is opened:
 

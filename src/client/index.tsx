@@ -16,7 +16,7 @@ import { SwarmBoard } from './SwarmBoard.tsx'
 import { SWARM_CSS } from './styles.ts'
 import { ActivityPanel, OPEN_MONITOR } from './ActivityPanel.tsx'
 import { SidebarDock } from './SidebarDock.tsx'
-import { createSidebarAdapter } from './sidebar.tsx'
+import { createNativeSidebarAdapter, createSidebarAdapter, SwarmRailIcon } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
 import { DisposalRegistry } from './lifecycle.ts'
 import { CopyContext, en, zh } from './locale.tsx'
@@ -85,11 +85,23 @@ export function apply(ctx: Context): void {
         history.open(member.sessionId, member.name)
       }} /></Localized>
   }
+  // Surface preference: the host's own sidebar first (0.1.5 line), then Better
+  // Sidebar when a profile mounts it, then the standalone dock. Each adapter
+  // reports integrated only while its registration is live, so unloading a host
+  // sidebar hands the surface to the next one instead of leaving a blank column.
+  const native = createNativeSidebarAdapter(ctx, () => ({
+    id: 'agent-swarm', label: () => copy('Agent Swarm'), order: 80,
+    icon: ({ size }) => <SwarmRailIcon size={size} />,
+    component: () => <Pane />,
+  }))
   const sidebar = createSidebarAdapter(ctx, () => ({
     id: 'agent-swarm', title: () => copy('Agent Swarm'), single: true, order: 80,
     component: ({ scope, visible }) => <Pane sessionId={scope.sessionId} active={visible} />,
   }))
-  const openSidebar = () => { if (!sidebar.open()) window.dispatchEvent(new Event(OPEN_MONITOR)) }
+  const openSidebar = () => {
+    if (native.open()) return
+    if (!sidebar.open()) window.dispatchEvent(new Event(OPEN_MONITOR))
+  }
   registerSwarmCommandUi(ctx, { openSidebar, copy })
   const viewWorker = (member: Member) => {
     try { if (openWorker(ctx.sessions, member.sessionId)) return } catch { /* Fall back to persisted history. */ }
@@ -107,8 +119,9 @@ export function apply(ctx: Context): void {
     </div></Localized>
   }
   function Panel() {
+    const hostIntegrated = useSyncExternalStore(native.subscribe, native.getSnapshot, native.getSnapshot)
     const integrated = useSyncExternalStore(sidebar.subscribe, sidebar.getSnapshot, sidebar.getSnapshot)
-    return integrated ? null : <Localized><SidebarDock>{props => <Pane {...props} />}</SidebarDock></Localized>
+    return hostIntegrated || integrated ? null : <Localized><SidebarDock>{props => <Pane {...props} />}</SidebarDock></Localized>
   }
   ctx.uiConversation.events.register(swarmCardDefinition)
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({

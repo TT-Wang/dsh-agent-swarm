@@ -49,6 +49,35 @@ module appends a session event.
 
 Both targets use isolated SDK links. The rc.1 copy runs the same emitted JavaScript against rc.1 dependencies and its actual CLI; it is not an alpha.2-linked plugin with only a different CLI environment variable. Host and client TypeScript are also checked against the selected SDK without re-emitting that copy.
 
+## Native sidebar adaptation (2026-09-12) — current
+
+Harness 0.1.5 introduced the host's own sidebar (`@deepseek-ai/dsh-client-ui-sidebar`).
+Its extension point is the root-scoped `sidebar.panellist` list plus the layout's
+root-scoped `main` keyed slot: an icon registration and a panel registration that
+share one id, selected through `ctx.layout.selectPanel`. 0.1.3-alpha.2 and
+0.1.2-rc.1 ship an earlier sidebar without `sidebar.panellist`, so the adapter is
+structural (registered by slot name, no import of the sidebar package) and the
+standalone dock remains their surface.
+
+Measured on an isolated 0.1.5-rc.1 host booted for this check
+(`/Users/tongtao/code/dsh-015-rc1`, port 5196, its own `DSH_HOME`, plugin snapshot
+and `statePath` — the running 5192 preview was left untouched), with the real Web
+application in headless Chromium:
+
+| Check | Result |
+| --- | --- |
+| `npm run typecheck` (0.1.3-alpha.2 farm) | exit 0 — the adapter compiles against a host that has no `sidebar.panellist` |
+| Client suites (`ui`, `ui-progress`, `client-findings`, `client-event-projection`, `r17-worker-names`, `sidebar`, `r17-projection`, `client-command`) | **79/79** |
+| `npm run test:pack` (clean checkout of the committed artifact) | passed, 190 published files |
+| Rail registration | exactly one button in the host's `nav[aria-label="Global panels"]`: **"Agent Swarm"** |
+| Wake | clicking it mounts the panel in the main column: `[data-swarm-panel]` at x=280, 1160×900 beside the 280px sidebar |
+| Surface preference | the standalone dock is **absent** (`[data-swarm-dock]` count 0) once the native panel is registered |
+| Console | no page errors, no adapter warnings |
+
+The isolated host has no conversation of its own, so the panel reports its
+no-session state there ("Select a conversation to manage its missions"); the
+session-scoped RPC path is the one already measured on the running preview.
+
 ## Second UI pass (2026-09-11, client only) — current
 
 The owner asked for the remaining items of the 2026-09-11 UI review and then for the attended

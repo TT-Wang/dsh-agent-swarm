@@ -15,6 +15,7 @@ import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityP
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
 import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
+import { createNativeSidebarAdapter } from '../lib/types/client/sidebar.js'
 import { WorkerAvatar } from '../lib/types/client/MissionProgress.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
@@ -500,4 +501,64 @@ test('OWNER PASS 2026-09-11 #2: the avatar scales in half steps and the controls
   assert.match(styles, /\.sw-complete-control>\[data-swarm-completion\]\{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, 'and it is bounded with an ellipsis')
   assert.match(styles, /\.sw-member \.sw-worker-avatar\{width:48px;height:48px;border-radius:11px/, 'the member avatar is 48px')
   assert.match(styles, /\.sw-team \.sw-workers\{margin-top:10px;grid-template-columns:repeat\(auto-fit,minmax\(240px,1fr\)\)\}/, 'the roster widens for the larger card')
+})
+
+test('native sidebar adapter: one rail entry and one main panel behind the same id, released together', async () => {
+  // A fake host that behaves like the real slot service: `inject` waits for a
+  // declaration and returns its own disposer; the callback's argument is a scope,
+  // and registration goes through the service (the production contract the
+  // adapter got wrong once — registering on the scope fails silently).
+  const registered = []
+  const released = []
+  const slots = {
+    inject(name, factory) {
+      const release = factory()
+      return () => { released.push(name); release?.() }
+    },
+    register(options, component) {
+      const entry = { slot: options.name, options, component }
+      registered.push(entry)
+      return () => { const at = registered.indexOf(entry); if (at >= 0) registered.splice(at, 1) }
+    },
+  }
+  const calls = []
+  const ctx = {
+    inject(names, factory) {
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => (name === 'slots' ? slots : undefined) }
+      const release = factory(scope)
+      return { dispose: async () => { await release?.dispose?.() } }
+    },
+    get: name => (name === 'layout' ? { selectPanel: id => calls.push(id) } : undefined),
+    effect: fn => { fn() },
+  }
+  const adapter = createNativeSidebarAdapter(ctx, () => ({
+    id: 'agent-swarm', label: () => 'Agent Swarm', order: 80,
+    icon: () => null, component: () => null,
+  }))
+  assert.equal(adapter.getSnapshot(), true, 'a registered panel reports integrated, so the dock stays hidden')
+  assert.deepEqual(registered.map(entry => [entry.slot, entry.options.key ?? entry.options.id, entry.options.order,
+    typeof entry.options.label === 'function' ? entry.options.label() : undefined]),
+    [['main', 'agent-swarm', undefined, undefined], ['sidebar.panellist', 'agent-swarm', 80, 'Agent Swarm']],
+    'the main keyed entry and the rail list entry share one id; only the rail entry carries order and label')
+  assert.equal(adapter.open(), true)
+  assert.deepEqual(calls, ['agent-swarm'], 'open() selects the registered panel through the layout service')
+  adapter.dispose()
+  adapter.dispose()
+  assert.equal(adapter.getSnapshot(), false, 'disposal releases both entries')
+  assert.deepEqual(registered, [])
+  assert.deepEqual(released, ['main', 'sidebar.panellist'], 'each injection is released through its own disposer')
+  assert.equal(adapter.open(), false, 'a disposed adapter never selects anything')
+
+  // Hosts without the native sidebar (0.1.2/0.1.3) must fall back, not throw.
+  const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }
+  const fallback = createNativeSidebarAdapter(bare, () => ({ id: 'agent-swarm', label: () => 'x', icon: () => null, component: () => null }))
+  assert.equal(fallback.getSnapshot(), false)
+  assert.equal(fallback.open(), false, 'without a slots service the adapter reports not-integrated and the dock renders')
+  fallback.dispose()
+  // The adapter must stay structural: importing the sidebar package would pull a
+  // 0.1.5-only peer into a plugin that also loads on 0.1.2/0.1.3.
+  const source = await readFile(new URL('../src/client/sidebar.tsx', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar/, 'no static import of the native sidebar package')
+  assert.match(source, /name: 'sidebar\.panellist'/, 'the rail entry is registered by slot name')
+  assert.match(source, /slots\.register\(\{ name: 'main', key: panel\.id \}/, 'and the panel through the slot service, never through the injected scope')
 })
