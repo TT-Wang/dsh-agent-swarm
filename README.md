@@ -41,6 +41,31 @@ Stated as what a caller may rely on:
   experiments and check concurrency are owner-set, are never silently exceeded,
   and are never reset by a resume.
 
+## Pairs with the slice context policy
+
+This repository is DSH's **mission layer**. Its natural companion is
+[dsh-slice-agent-loop](https://github.com/TT-Wang/dsh-slice-agent-loop)
+(`@dsh-external/dsh-slice-agent-loop`), a **session layer** policy that bounds what
+one conversation carries from one request to the next. They address opposite ends
+of the same problem and are usually mounted together:
+
+- **The swarm fans work out.** One instruction becomes a mission: the owner plans
+  the task graph, then members run as native sessions in their own worktrees and
+  sandboxes, each producing evidence that a different member verifies.
+- **The slice policy keeps every one of those sessions bounded.** Completed turns
+  are sealed at the tail of an append-only tape, so a session's request keeps the
+  previous request's prefix and re-bills only the entry it just wrote, while
+  `recall_turn`, `recall_search` and `expand_result` keep the replaced history
+  retrievable instead of lost. A long mission's worker sessions stay bounded per
+  session without a plugin-side ceiling that would refuse a request and fail a
+  worker mid-task.
+
+Mount both rows in the same profile — the swarm bundle (or plugin package) and the
+slice patch. Both patches are additive, neither forks Harness core, and the tool
+surfaces do not overlap (`swarm_*` here; `recall_turn` / `recall_search` /
+`recall_step` / `expand_result` there). The slice package already bundles
+tool-result folding, so do not install the standalone folding plugin beside it.
+
 ## Features
 
 - **One command to start.** `/agent-swarm` appears in native command autocomplete. Describe the outcome; the primary agent plans and launches without a configuration form.
