@@ -586,4 +586,76 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
   assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs'\]/, 'and only when both the slot service and the sidebar registry are present')
   assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
+  assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
+  assert.match(source, /getSnapshot: \(\) => registered > 0 && opened/, 'and integration means the pane really shows the tab, not merely that a type was registered')
+})
+
+test('right sidebar adapter: a refused reveal keeps the dock and retries until a session surface exists', async () => {
+  // The 0.1.5 host answers a write with no mounted session surface by throwing
+  // (`sidebarRight: no session surface is mounted`). The adapter used to set its
+  // one-shot flag BEFORE that call, so the throw ended the only attempt while the
+  // successful registration hid the dock: the owner saw an empty right pane on
+  // 5196. The attempt is now contained, retried on a bounded schedule, resumed by
+  // the session the surface belongs to, and the dock stays until the tab is open.
+  const types = [], opened = []
+  let mounted = false
+  const registry = { register(definition) { types.push(definition); return () => { types.splice(types.indexOf(definition), 1) } } }
+  const slots = {
+    inject(name, factory) { const release = factory(); return () => release?.() },
+    register(options) { return () => {} },
+  }
+  const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ current: 's1' }) }
+  const ctx = {
+    inject(names, factory) {
+      const available = { slots, sidebarRightTabs: registry }
+      const missing = names.filter(name => available[name] === undefined)
+      if (missing.length) return { dispose: async () => {} }
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
+      const release = factory(scope)
+      return { dispose: async () => { await release?.dispose?.() } }
+    },
+    sessions: { list: sessions },
+    get: name => name === 'sidebarRight'
+      ? {
+        openTab: (kind, options) => {
+          if (!mounted) throw new Error('sidebarRight: no session surface is mounted')
+          opened.push(`${kind}:${JSON.stringify(options)}`)
+        },
+      }
+      : name === 'layout' ? { openRightbar: () => {} } : undefined,
+    effect: fn => { fn() },
+  }
+  const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null })
+  const adapter = createRightSidebarAdapter(ctx, describe)
+  assert.equal(adapter.getSnapshot(), false, 'a refused reveal is not integration: the dock keeps carrying the panel')
+  assert.deepEqual(opened, [], 'the host refused the write, so no tab was opened')
+  // A conversation reaches the screen: the session signal re-arms the attempt.
+  mounted = true
+  for (const listener of sessions.listeners) listener()
+  assert.equal(adapter.getSnapshot(), true, 'the adapter opens the tab as soon as the host can accept the write')
+  assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'and it opens exactly once')
+  adapter.dispose()
+  assert.equal(adapter.getSnapshot(), false, 'disposal releases the retry schedule with the registration')
+})
+
+test('right sidebar adapter: a host that never mounts a session surface is left quietly retrying, then disposed', async () => {
+  const registry = { register() { return () => {} } }
+  const slots = { inject(name, factory) { const release = factory(); return () => release?.() }, register() { return () => {} } }
+  const ctx = {
+    inject(names, factory) {
+      const available = { slots, sidebarRightTabs: registry }
+      if (names.some(name => available[name] === undefined)) return { dispose: async () => {} }
+      const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
+      const release = factory(scope)
+      return { dispose: async () => { await release?.dispose?.() } }
+    },
+    get: name => name === 'sidebarRight' ? { openTab: () => { throw new Error('sidebarRight: no session surface is mounted') } } : undefined,
+    effect: fn => { fn() },
+  }
+  const adapter = createRightSidebarAdapter(ctx, () => ({ id: 'x', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null }))
+  assert.equal(adapter.getSnapshot(), false, 'nothing integrates while the write keeps being refused')
+  assert.equal(adapter.open(), false, 'and open() reports the truth instead of claiming a pane that is not there')
+  await new Promise(resolve => setTimeout(resolve, 60))
+  adapter.dispose()
+  assert.equal(adapter.getSnapshot(), false, 'disposal stops the bounded retry schedule')
 })

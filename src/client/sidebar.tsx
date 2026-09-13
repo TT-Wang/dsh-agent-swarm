@@ -167,10 +167,26 @@ interface RightTabRegistry {
   }): () => void
 }
 
-/** The right-sidebar navigation controller. */
+/**
+ * The right-sidebar navigation controller. `openTab` is a WRITE and the host
+ * answers a write with no mounted session surface by throwing
+ * (`sidebarRight: no session surface is mounted`), so every call here is a
+ * best-effort attempt that may have to be repeated once a conversation is on
+ * screen.
+ */
 interface RightSidebarController {
   openTab(kind: string, options?: Record<string, unknown>): void
 }
+
+/** The session list, restricted to the signal that a session surface can mount. */
+interface SessionList {
+  subscribe?(listener: () => void): () => void
+  getSnapshot?(): { current?: string }
+}
+
+/** How long a tab that could not open yet keeps trying (30 x 500ms). */
+const REVEAL_ATTEMPTS = 60
+const REVEAL_INTERVAL_MS = 500
 
 /** The layout service, restricted to revealing the right pane. */
 interface LayoutReveal {
@@ -199,17 +215,48 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
   const listeners = new Set<() => void>()
   let disposed = false
   let registered = 0
-  let revealed = false
+  /** The tab is registered AND the pane actually shows it; only then is the dock redundant. */
+  let opened = false
+  let timer: ReturnType<typeof setInterval> | undefined
+  let attempts = 0
+  let stopWatchingSessions: (() => void) | undefined
   const notify = () => { for (const listener of [...listeners]) listener() }
-  /** Expand the right pane (if it is collapsed) and select this tab. */
+  const stopRetry = () => { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
+  /**
+   * Expand the right pane (if it is collapsed) and select this tab. Every step
+   * is best effort: the layout service is optional, and the controller refuses a
+   * write while no session surface is mounted — the host's own answer on a page
+   * that has not opened a conversation yet. A refusal is "not yet", so it stays
+   * contained here and the caller schedules another attempt.
+   */
   const reveal = (): boolean => {
     const tab = descriptor()
     const layout = ctx.get('layout') as unknown as LayoutReveal | undefined
     try { layout?.openRightbar?.(true, false) } catch { /* Layout optional; the tab still opens below. */ }
-    const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
-    if (controller === undefined || typeof controller.openTab !== 'function') return false
-    controller.openTab(tab.kind, { revealIfOpened: true })
+    try {
+      const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
+      if (controller === undefined || typeof controller.openTab !== 'function') return false
+      controller.openTab(tab.kind, { revealIfOpened: true })
+      return true
+    } catch { return false }
+  }
+  const attempt = (): boolean => {
+    if (disposed || opened) return true
+    if (!reveal()) return false
+    opened = true
+    stopRetry()
+    notify()
     return true
+  }
+  /** Try now; if the host has no session surface yet, keep trying for a bounded
+   * while instead of leaving a registered tab that nobody can see. */
+  const scheduleReveal = () => {
+    if (disposed || opened || attempt()) return
+    if (timer !== undefined) return
+    timer = setInterval(() => {
+      attempts += 1
+      if (attempt() || attempts >= REVEAL_ATTEMPTS) stopRetry()
+    }, REVEAL_INTERVAL_MS)
   }
   // Both services are required, and they are required together: the registry is
   // the host fact that a right sidebar exists, and asking for it in the same
@@ -238,10 +285,13 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     notify()
     // OWNER PASS: the host starts with an empty right pane, so a registered tab
     // that nobody opens is invisible — the panel had no affordance at all until
-    // the owner knew the New tab -> Start -> Agent Swarm path. Open it once per
-    // page load, the way the shipped Files pane appears, and keep the command and
-    // card paths working through open().
-    if (!revealed) { revealed = true; void reveal() }
+    // the owner knew the New tab -> Start -> Agent Swarm path. Open it as soon as
+    // a session surface exists, the way the shipped Files pane appears, and keep
+    // the command and card paths working through open(). Until the pane really
+    // shows it, `opened` stays false and the standalone dock keeps carrying the
+    // panel, so a host that never mounts a session surface still shows something.
+    attempts = 0
+    scheduleReveal()
     return () => {
       registered -= 1
       releaseBody()
@@ -249,22 +299,45 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
       notify()
     }
   }, 'agent-swarm: right sidebar tab'))
+  // A session surface mounts when a conversation reaches the screen, and that is
+  // the host signal that the refused write may now land. Being resumed from a
+  // session is worth a fresh budget of attempts; the adapter still opens the tab
+  // at most once per page load.
+  const sessions = (ctx as { sessions?: { list?: SessionList } }).sessions?.list
+  if (typeof sessions?.subscribe === 'function') {
+    try {
+      stopWatchingSessions = sessions.subscribe(() => {
+        if (disposed || opened) return
+        attempts = 0
+        scheduleReveal()
+      })
+    } catch { stopWatchingSessions = undefined }
+  }
   const dispose = () => {
     if (disposed) return
     disposed = true
+    stopRetry()
+    stopWatchingSessions?.()
+    stopWatchingSessions = undefined
     void dependency.dispose()
     listeners.clear()
   }
   ctx.effect(() => dispose, 'agent-swarm: right sidebar adapter')
   return {
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
-    getSnapshot: () => registered > 0,
+    getSnapshot: () => registered > 0 && opened,
     open() {
       if (registered === 0) return false
       // Revealing is best effort: the tab exists either way, and the host's own
-      // Tab control opens the pane when no controller is mounted.
-      reveal()
-      return true
+      // Tab control opens the pane when no controller is mounted. An already
+      // integrated tab is re-opened here (a user gesture that closed it must be
+      // able to bring it back); otherwise the bounded schedule takes over, and
+      // while the pane is not showing the tab this reports not-integrated, so the
+      // dock keeps the panel reachable and the caller can fall back to it.
+      attempts = 0
+      if (opened) opened = reveal()
+      scheduleReveal()
+      return opened
     },
     dispose,
   }

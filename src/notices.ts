@@ -111,6 +111,29 @@ export type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactReco
 /** The fact view of one delivery row, or undefined when it is not a notice. */
 export const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undefined => delivery.notice === undefined ? undefined : delivery.notice as NoticeRow
 
+/**
+ * OWNER QUIET: whether an owner delivery is moot because the owner has taken the
+ * mission out of play, judged by the owner's own decision rather than by a
+ * terminal status.
+ *
+ * `control()` deliberately writes no notice for its own pause/stop — the
+ * decision is already the owner's and the panel shows it — so without this rule
+ * the decisions a mission queued kept arriving after the owner stopped it, which
+ * reads as the swarm still running after it was stopped. The rule is keyed on
+ * the decision, never on `completed`: completion is automatic and can overtake
+ * the outbox, so a fact produced while the mission was still running must still
+ * land even though the mission has completed by the time the pump reaches it.
+ * A paused mission still delivers a question that awaits the owner's answer,
+ * because that is a receipt rather than a report, and `blocked` — a decision
+ * addressed to the owner — keeps its notices because the mission is not out of
+ * play at all.
+ */
+function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Delivery, 'kind' | 'replyExpected'>): boolean {
+  if (mission.status === 'stopped') return true
+  if (mission.status !== 'paused') return false
+  return !(delivery.kind === 'question' && delivery.replyExpected === true)
+}
+
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */
 function reasonDigest(reason: string): string {
   return reason.length === 0 ? 'none' : createHash('sha256').update(reason).digest('hex').slice(0, 16)
@@ -1307,6 +1330,10 @@ export class Notices {
           delivery.deliveredAt = Date.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
         }
       }
+      // OWNER QUIET: a delivery the owner's own lifecycle decision made moot is
+      // not sent, and its row stays durable and undelivered rather than being
+      // relabelled as a transport that never happened.
+      if (delivery.to === 'owner' && ownerDeliveryMoot(mission, delivery)) continue
       if (delivery.to !== 'owner' && (mission.status !== 'active' || mission.budgetPause)) continue
       const member = delivery.to === 'owner'
         ? { id: 'owner', missionId, name: 'owner', role: 'owner', sessionId: mission.ownerSessionId, workspace: mission.workspace, status: 'idle' as const, subscriptions: [] }
