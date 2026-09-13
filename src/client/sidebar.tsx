@@ -184,7 +184,7 @@ interface SessionList {
   getSnapshot?(): { current?: string }
 }
 
-/** How long a tab that could not open yet keeps trying (30 x 500ms). */
+/** How long a tab that could not open yet keeps trying (60 x 500ms). */
 const REVEAL_ATTEMPTS = 60
 const REVEAL_INTERVAL_MS = 500
 
@@ -203,142 +203,130 @@ export interface RightSidebarDescriptor {
   description?: () => string
   /** Ascending order on the guide page. */
   order?: number
-  component: () => ReactNode
+  component: (props: SidebarTabProps) => ReactNode
+}
+
+/** The host binds these standard session props and the tab hook at the body seat.
+ * Kept structural so earlier supported releases need no sidebar-right import. */
+interface RightSidebarBodyProps {
+  sessionId: string
+  useTabInfo(): { tab: { visible: boolean } }
 }
 
 /**
- * Contribute one right-sidebar tab. Integrated as soon as the tab body is
- * registered, so the caller does not also render the standalone dock; `open()`
- * reveals the tab through the host's controller.
+ * Contribute one right-sidebar tab. Integration requires a successful reveal
+ * through the current provider; until then the caller retains its fallback.
+ * The body projects the host tab's session and visibility into the monitor.
  */
 export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightSidebarDescriptor): SidebarAdapter {
   const listeners = new Set<() => void>()
   let disposed = false
-  let registered = 0
-  /** The tab is registered AND the pane actually shows it; only then is the dock redundant. */
-  let opened = false
-  let timer: ReturnType<typeof setInterval> | undefined
-  let attempts = 0
-  let stopWatchingSessions: (() => void) | undefined
+  let current: {
+    opened: boolean
+    scheduleReveal(reset?: boolean): void
+    open(): boolean
+    release(): void
+  } | undefined
   const notify = () => { for (const listener of [...listeners]) listener() }
-  const stopRetry = () => { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
-  /**
-   * Expand the right pane (if it is collapsed) and select this tab. Every step
-   * is best effort: the layout service is optional, and the controller refuses a
-   * write while no session surface is mounted — the host's own answer on a page
-   * that has not opened a conversation yet. A refusal is "not yet", so it stays
-   * contained here and the caller schedules another attempt.
-   */
-  const reveal = (): boolean => {
-    const tab = descriptor()
-    const layout = ctx.get('layout') as unknown as LayoutReveal | undefined
-    try { layout?.openRightbar?.(true, false) } catch { /* Layout optional; the tab still opens below. */ }
-    try {
-      const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
-      if (controller === undefined || typeof controller.openTab !== 'function') return false
-      controller.openTab(tab.kind, { revealIfOpened: true })
-      return true
-    } catch { return false }
-  }
-  const attempt = (): boolean => {
-    if (disposed || opened) return true
-    if (!reveal()) return false
-    opened = true
-    stopRetry()
-    notify()
-    return true
-  }
-  /** Try now; if the host has no session surface yet, keep trying for a bounded
-   * while instead of leaving a registered tab that nobody can see. */
-  const scheduleReveal = () => {
-    if (disposed || opened || attempt()) return
-    if (timer !== undefined) return
-    timer = setInterval(() => {
-      attempts += 1
-      if (attempt() || attempts >= REVEAL_ATTEMPTS) stopRetry()
-    }, REVEAL_INTERVAL_MS)
-  }
-  // Both services are required, and they are required together: the registry is
-  // the host fact that a right sidebar exists, and asking for it in the same
-  // injection is what keeps this adapter from claiming seats on a host whose
-  // slot tree has no right pane (0.1.2/0.1.3 declare neither service, and a
-  // registration into an undeclared slot would otherwise look like success and
-  // hide the dock the panel still needs).
-  const dependency = ctx.inject(['slots', 'sidebarRightTabs'], ready => ready.effect(() => {
+  // A navigation success belongs to this registry AND controller lifetime.
+  // Replacing either service must release the previous reveal and retry state.
+  const dependency = ctx.inject(['slots', 'sidebarRightTabs', 'sidebarRight'], ready => ready.effect(() => {
     if (disposed) return () => {}
     const slots = ready.get('slots') as unknown as SlotRegistrar | undefined
     const registry = ready.get('sidebarRightTabs') as unknown as RightTabRegistry | undefined
+    const controller = ready.get('sidebarRight') as unknown as RightSidebarController | undefined
     if (slots === undefined || typeof slots.inject !== 'function' || typeof slots.register !== 'function') return () => {}
-    if (registry === undefined || typeof registry.register !== 'function') return () => {}
+    if (registry === undefined || typeof registry.register !== 'function' || typeof controller?.openTab !== 'function') return () => {}
     const tab = descriptor()
     const releaseType = registry.register({
       id: tab.id, kind: tab.kind, title: () => tab.label(),
-      // The guide is the only route to a page type from the UI, so the panel
-      // names itself there instead of staying a registration nobody can pick.
       guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
     })
-    // The body and its chip title share the registry id as the seat key. The
-    // title seat is optional (the chip falls back to the captured title), so the
-    // panel registers its own name and stays independent of copy timing.
-    const releaseBody = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id }, () => tab.component()))
-    registered += 1
-    notify()
-    // OWNER PASS: the host starts with an empty right pane, so a registered tab
-    // that nobody opens is invisible — the panel had no affordance at all until
-    // the owner knew the New tab -> Start -> Agent Swarm path. Open it as soon as
-    // a session surface exists, the way the shipped Files pane appears, and keep
-    // the command and card paths working through open(). Until the pane really
-    // shows it, `opened` stays false and the standalone dock keeps carrying the
-    // panel, so a host that never mounts a session surface still shows something.
-    attempts = 0
-    scheduleReveal()
-    return () => {
-      registered -= 1
-      releaseBody()
-      releaseType()
-      notify()
-    }
-  }, 'agent-swarm: right sidebar tab'))
-  // A session surface mounts when a conversation reaches the screen, and that is
-  // the host signal that the refused write may now land. Being resumed from a
-  // session is worth a fresh budget of attempts; the adapter still opens the tab
-  // at most once per page load.
-  const sessions = (ctx as { sessions?: { list?: SessionList } }).sessions?.list
-  if (typeof sessions?.subscribe === 'function') {
+    let releaseBody: () => void
     try {
-      stopWatchingSessions = sessions.subscribe(() => {
-        if (disposed || opened) return
-        attempts = 0
-        scheduleReveal()
-      })
-    } catch { stopWatchingSessions = undefined }
+      releaseBody = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id },
+        function SwarmTabBody({ sessionId, useTabInfo }: RightSidebarBodyProps) {
+          const { tab: info } = useTabInfo()
+          return tab.component({ scope: { sessionId }, visible: info.visible })
+        }))
+    } catch (error) { releaseType(); throw error }
+    let timer: ReturnType<typeof setInterval> | undefined
+    let attempts = 0
+    let released = false
+    const stopRetry = () => { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
+    const live = () => !disposed && !released && current === entry
+    const reveal = (): boolean => {
+      if (!live()) return false
+      try {
+        const layout = ready.get('layout') as unknown as LayoutReveal | undefined
+        layout?.openRightbar?.(true, false)
+      } catch { /* Layout optional; the tab still opens below. */ }
+      try { controller.openTab(tab.kind, { revealIfOpened: true }); return true }
+      catch { return false }
+    }
+    const attempt = (): boolean => {
+      if (!live() || entry.opened) return true
+      if (!reveal()) return false
+      entry.opened = true
+      stopRetry()
+      notify()
+      return true
+    }
+    const entry: NonNullable<typeof current> = {
+      opened: false,
+      scheduleReveal(reset = false) {
+        if (!live() || entry.opened) return
+        if (reset) attempts = 0
+        if (attempt() || timer !== undefined) return
+        timer = setInterval(() => {
+          attempts += 1
+          if (attempt() || attempts >= REVEAL_ATTEMPTS) stopRetry()
+        }, REVEAL_INTERVAL_MS)
+      },
+      open() {
+        if (!live()) return false
+        if (entry.opened) {
+          entry.opened = reveal()
+          if (!entry.opened) notify()
+        }
+        entry.scheduleReveal(true)
+        return entry.opened
+      },
+      release() {
+        if (released) return
+        released = true
+        stopRetry()
+        entry.opened = false
+        if (current === entry) { current = undefined; notify() }
+        try { releaseBody() } finally { releaseType() }
+      },
+    }
+    current = entry
+    entry.scheduleReveal()
+    return entry.release
+  }, 'agent-swarm: right sidebar tab'))
+  // Only a live provider owns a retry budget. Session notifications on older
+  // hosts or during provider removal cannot start orphan reveal loops.
+  const sessions = (ctx as { sessions?: { list?: SessionList } }).sessions?.list
+  let stopWatchingSessions: (() => void) | undefined
+  if (typeof sessions?.subscribe === 'function') {
+    try { stopWatchingSessions = sessions.subscribe(() => current?.scheduleReveal(true)) }
+    catch { stopWatchingSessions = undefined }
   }
   const dispose = () => {
     if (disposed) return
     disposed = true
-    stopRetry()
     stopWatchingSessions?.()
     stopWatchingSessions = undefined
+    current?.release()
     void dependency.dispose()
     listeners.clear()
   }
   ctx.effect(() => dispose, 'agent-swarm: right sidebar adapter')
   return {
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
-    getSnapshot: () => registered > 0 && opened,
-    open() {
-      if (registered === 0) return false
-      // Revealing is best effort: the tab exists either way, and the host's own
-      // Tab control opens the pane when no controller is mounted. An already
-      // integrated tab is re-opened here (a user gesture that closed it must be
-      // able to bring it back); otherwise the bounded schedule takes over, and
-      // while the pane is not showing the tab this reports not-integrated, so the
-      // dock keeps the panel reachable and the caller can fall back to it.
-      attempts = 0
-      if (opened) opened = reveal()
-      scheduleReveal()
-      return opened
-    },
+    getSnapshot: () => current?.opened ?? false,
+    open: () => current?.open() ?? false,
     dispose,
   }
 }

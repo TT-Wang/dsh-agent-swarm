@@ -487,6 +487,14 @@ class ProcessOutput {
   }
 }
 
+/** A process deadline retains the bytes drained before the host stopped it. */
+class ProcessTimeoutError extends Error {
+  constructor(timeoutMs: number, readonly captured: ReturnType<ProcessOutput['result']>) {
+    super(`Execution timed out after ${timeoutMs}ms`)
+    this.name = 'ProcessTimeoutError'
+  }
+}
+
 /** Grace the host's termination procedure stages between SIGTERM and SIGKILL, and the bound it drains held pipes with. */
 const TERMINATION_GRACE_MS = 300
 
@@ -533,10 +541,15 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
   // merged into one controller whose reason classifies the failure once.
   const deadline = new AbortController()
   let failure: Error | undefined
+  let timedOut = false
   const cancel = (error: Error): void => { failure ??= error; deadline.abort(failure) }
   const onAbort = (): void => { cancel(new Error('Execution cancelled', { cause: options.signal?.reason })) }
   options.signal?.addEventListener('abort', onAbort, { once: true })
-  const timer = setTimeout(() => { cancel(new Error(`Execution timed out after ${options.timeoutMs}ms`)) }, options.timeoutMs)
+  const timer = setTimeout(() => {
+    if (failure !== undefined) return
+    timedOut = true
+    cancel(new Error(`Execution timed out after ${options.timeoutMs}ms`))
+  }, options.timeoutMs)
   const release = (): void => {
     clearTimeout(timer)
     options.signal?.removeEventListener('abort', onAbort)
@@ -568,9 +581,12 @@ export async function runProcess(argv: readonly string[], options: ProcessOption
   // A signal that aborted before the listener existed dispatches to nobody.
   if (options.signal?.aborted) onAbort()
   try {
-    const outcome = await handle.done.catch((error: unknown) => { throw failure ?? error })
+    const outcome = await handle.done
     if (failure !== undefined) throw failure
     return { exitCode: outcome.exitCode ?? 1, ...output.result() }
+  } catch (error) {
+    if (timedOut) throw new ProcessTimeoutError(options.timeoutMs, output.result())
+    throw failure ?? error
   } finally {
     release()
     // The run is over; release the range. Termination is idempotent, so this
@@ -1398,7 +1414,23 @@ export class Workspaces {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
           const commandStarted = Date.now()
-          const result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
+          let result: Awaited<ReturnType<typeof runProcess>>
+          try {
+            result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
+          } catch (error) {
+            // A check's own deadline is a failed execution, so the declared-check
+            // layer can durably record this pass and retry it. Caller cancellation
+            // remains cancellation, including when it arrives during timeout drain.
+            if (!(error instanceof ProcessTimeoutError)) throw error
+            signal.throwIfAborted()
+            const captured = new ProcessOutput(this.options.maxCheckOutputBytes, false)
+            captured.push(Buffer.from(`[swarm] ${error.message}\n`))
+            captured.push(Buffer.from(error.captured.output))
+            const bounded = captured.result()
+            const truncated = error.captured.truncated || bounded.truncated
+            result = { exitCode: 124, ...bounded, truncated,
+              ...(error.captured.attribution === undefined ? {} : { attribution: { ...error.captured.attribution, outputTruncated: truncated } }) }
+          }
           // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
           const output = result.exitCode === 127
             ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`

@@ -159,12 +159,20 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.match(nudge[0].content, new RegExp(`replyTo: "${ask.id}"`), 'the nudge carries the exact call')
   assert.match(nudge[0].content, /only that call writes the receipt/)
   assert.equal(f.runtime.openAsks(f.mission.id, 'owner').length, 1, 'the receipt is still open')
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(f.runtime.store.get('deliveries', nudge[0].id).deliveredAt, 'the first nudge reached transport')
 
   // Turn 2: still unanswered — the second nudge is the last one.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
   guard.observe(f.owner.sessionId, 'turn/end')
   assert.equal(f.events('owner/reply-missing').length, 2)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
+  const secondNudge = f.deliveries().find(item => item.to === 'owner'
+    && item.notice?.dedupKey?.startsWith('owner-reply-missing:') && item.id !== nudge[0].id)
+  assert.ok(secondNudge, 'the second unanswered turn creates the next wake instead of deduping it away')
+  assert.match(secondNudge.content, /nudge 2 of 2/)
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(f.runtime.store.get('deliveries', secondNudge.id).deliveredAt)
 
   // Turn 3: the bound is spent, so the guard terminal reports the decision once.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
@@ -206,6 +214,56 @@ test('L2: an answered turn is never nudged, and a repeated turn end is a no-op',
   guard.observe(f.owner.sessionId, 'turn/end')
   assert.equal(f.events('owner/reply-missing').length, 0, 'an end without a booked turn reports nothing')
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
+})
+
+test('L2: replacing the guard resumes the durable nudge ordinal and reaches escalation', async t => {
+  const f = await fixture(t)
+  const ask = await f.ask()
+  const first = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  first.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
+  first.observe(f.owner.sessionId, 'turn/end')
+  await f.runtime.flushOutbox(f.mission.id)
+  first.dispose()
+  const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  t.after(() => replacement.dispose())
+  replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
+  replacement.observe(f.owner.sessionId, 'turn/end')
+  replacement.observe(f.owner.sessionId, 'turn/end')
+  const nudges = f.deliveries().filter(row => row.notice?.dedupKey?.startsWith(`owner-reply-missing:${ask.id}`))
+  assert.equal(nudges.length, 2, 'guard state loss does not repeat or swallow a recovery ordinal')
+  assert.equal(new Set(nudges.map(row => row.notice.dedupKey)).size, 2)
+  await f.runtime.flushOutbox(f.mission.id)
+  replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
+  replacement.observe(f.owner.sessionId, 'turn/end')
+  assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
+  assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
+})
+
+test('L2: an outbox write failure does not spend a nudge without retaining its wake', async t => {
+  const f = await fixture(t)
+  const ask = await f.ask()
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  t.after(() => guard.dispose())
+  const original = f.runtime.store.put.bind(f.runtime.store)
+  let injected = false
+  f.runtime.store.put = (table, row) => {
+    if (table === 'deliveries' && row.notice?.dedupKey?.startsWith('owner-reply-missing:')) {
+      injected = true
+      throw new Error('injected outbox write failure')
+    }
+    return original(table, row)
+  }
+  try {
+    guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
+    assert.throws(() => guard.observe(f.owner.sessionId, 'turn/end'), /injected outbox write failure/)
+  } finally { f.runtime.store.put = original }
+  assert.ok(injected)
+  assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
+  assert.equal(f.events('owner/reply-missing').length, 0)
+  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
+  guard.observe(f.owner.sessionId, 'turn/end')
+  assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 1)
+  assert.equal(f.deliveries().filter(row => row.notice?.dedupKey?.startsWith('owner-reply-missing:')).length, 1)
 })
 
 test('L2/L3: a stopped asker does not hide the open receipt the owner still owes', async t => {

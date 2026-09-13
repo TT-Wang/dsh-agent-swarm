@@ -519,7 +519,7 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   // seats in it.
   const ctx = {
     inject(names, factory) {
-      const available = { slots, sidebarRightTabs: registry }
+      const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }
       const missing = names.filter(name => available[name] === undefined)
       if (missing.length) return { dispose: async () => {} }
       const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
@@ -584,10 +584,10 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar-right/, 'no static import of the right-sidebar package')
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
-  assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs'\]/, 'and only when both the slot service and the sidebar registry are present')
+  assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs', 'sidebarRight'\]/, 'and only while the slot service, registry and controller are present')
   assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
   assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
-  assert.match(source, /getSnapshot: \(\) => registered > 0 && opened/, 'and integration means the pane really shows the tab, not merely that a type was registered')
+  assert.match(source, /getSnapshot: \(\) => current\?\.opened \?\? false/, 'and integration means the pane really shows the tab, not merely that a type was registered')
 })
 
 test('right sidebar adapter: a refused reveal keeps the dock and retries until a session surface exists', async () => {
@@ -607,7 +607,7 @@ test('right sidebar adapter: a refused reveal keeps the dock and retries until a
   const sessions = { listeners: [], subscribe(listener) { this.listeners.push(listener); return () => {} }, getSnapshot: () => ({ current: 's1' }) }
   const ctx = {
     inject(names, factory) {
-      const available = { slots, sidebarRightTabs: registry }
+      const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }
       const missing = names.filter(name => available[name] === undefined)
       if (missing.length) return { dispose: async () => {} }
       const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
@@ -643,7 +643,7 @@ test('right sidebar adapter: a host that never mounts a session surface is left 
   const slots = { inject(name, factory) { const release = factory(); return () => release?.() }, register() { return () => {} } }
   const ctx = {
     inject(names, factory) {
-      const available = { slots, sidebarRightTabs: registry }
+      const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }
       if (names.some(name => available[name] === undefined)) return { dispose: async () => {} }
       const scope = { effect: fn => { const cleanup = fn(); return { dispose: async () => { cleanup?.() } } }, get: name => available[name] }
       const release = factory(scope)

@@ -8,6 +8,49 @@ Version **0.6.0** was checked on 2026-09-08. The full regression baseline and th
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Recovery and sidebar corrections (2026-09-13)
+
+The seven findings reviewed at `6b42c66` are addressed in the working tree on
+`codex/fix-review-20260913`:
+
+- Outbox acknowledgements merge into current mission and delivery rows. A stop,
+  pause, consumption signal, answer or dismissal during transport survives the
+  acknowledgement. A successful retry clears only its matching starvation record.
+- Each send rechecks lifecycle and the current question receipt. Completed
+  missions still deliver queued facts; a paused mission delivers only questions
+  that remain unanswered.
+- Owner reminders have distinct durable ordinals. The counter, miss event and
+  queued reminder commit atomically; guard replacement and a failed outbox write
+  do not consume a reminder without retaining its wake.
+- A handed-off wake summary cannot absorb new facts, including after a transport
+  timeout. Later facts get a new delivery ID and survive adapter deduplication.
+- Task admission checks the prospective effective dependency graph, including
+  replacement lineage and exact review sources. Valid repairs retain historical
+  rows. Typed graph failures reach native RPC as actionable `bad-request` errors;
+  generic errors imitating their text remain sanitized.
+- A real check deadline becomes exit 124 with bounded output, attribution and
+  environment. Completed checks and both passes are durable; the existing retry
+  decides acceptance or rejection. Explicit caller cancellation does not retry.
+- Native sidebar reveal state belongs to its registry/controller lifetime.
+  Replacement requires a fresh reveal, removal clears retries, and the host's
+  session and visibility hook govern the pane's monitor.
+
+Regression coverage includes deterministic adapter interleavings with the real
+runtime and SQLite, real subprocess deadlines, actual Cordis service replacement,
+and native Connection RPC. The new outbox and reminder cases failed against the
+pre-fix artifact. The timeout regressions also failed before normalization; the
+explicit-cancellation case already passed. The additional timeout/dedup summary
+case caught a gap in the initial correction and now guards that interleaving too.
+
+Build, typecheck and the full built-artifact behavioral suite pass: **889/889**,
+with zero failures or skipped tests (baseline: 865). Deterministic replay retains
+`sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`.
+An isolated packed artifact (193 files) boots and disposes through the real Loader
+on exact Harness `0.1.5-rc.1` (`183f08e9c6dde7e36cd2318eaee70b0da08fb35e`).
+The development peer links remain on `0.1.3-alpha.2`; they were not repointed.
+This pass runs no live model calls, full mission end-to-end execution, or browser
+workflow, and does not establish a new full three-version behavioral matrix.
+
 ## 0.1.5-rc.1 baseline (2026-09-11)
 
 The owner pass of 2026-09-11 adapted the plugin to the npm `latest` line and measured it on a checkout

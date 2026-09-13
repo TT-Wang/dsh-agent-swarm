@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
 import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { TaskGraphAdmissionError } from './admission.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
@@ -146,6 +147,12 @@ async function exposed<T>(operation: () => Promise<T> | T, userActionable: boole
   try { return await operation() } catch (error) {
     if (error instanceof MissingSession || error instanceof RequestError) throw error
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+    if (error instanceof TaskGraphAdmissionError) {
+      // Only the runtime's typed, authored diagnostic crosses this boundary;
+      // matching prose in an arbitrary internal Error grants no visibility.
+      throw new RequestError(message.length <= 4000 && !unsafeDetail.test(message) ? message
+        : '[task_graph_invalid] Task dependencies or review sources form an invalid graph. Inspect the tasks with swarm_observe, remove the cyclic dependencies or reviewOf edge, and retry with swarm_propose.')
+    }
     if (message !== '' && (userActionable === true || (typeof userActionable === 'function' && userActionable(message)))) throw new RequestError(message)
     throw new InternalFailure(error)
   }

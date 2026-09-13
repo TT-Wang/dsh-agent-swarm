@@ -96,3 +96,79 @@ test('lineage resolves deterministically to the oldest live replacement for impo
   assert.deepEqual(view().dependencies[0].replacementOf, [original.id])
   assert.deepEqual(view(), view(), 'repeated resolution is identical')
 })
+
+test('replacement admission rejects a cycle before persisting the task or check-change events', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  const dependent = f.propose({ title: 'Dependent', dependencies: [original.id] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Revise implementation' })
+  const before = f.runtime.store.list('tasks', f.mission.id)
+  const events = f.runtime.store.events(f.mission.id, 500)
+  assert.throws(() => f.propose({ title: 'Cyclic repair', replaces: [original.id], dependencies: [dependent.id], checks: ['other-check'] }),
+    /\[task_graph_cycle\]/)
+  assert.deepEqual(f.runtime.store.list('tasks', f.mission.id), before, 'rejected admission changes no durable task')
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 500), events, 'rejected admission publishes neither a proposal nor a check change')
+  const repair = f.propose({ title: 'Acyclic repair', replaces: [original.id] })
+  assert.deepEqual(f.runtime.effectiveDependencies(f.mission.id, dependent).map(task => task.id), [repair.id])
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, repair.id)
+  assert.equal(claimed.status, 'running', 'the corrected repair remains executable')
+})
+
+test('replacement admission follows transitive repairs and dependencies before checking cycles', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Revise implementation' })
+  const firstRepair = f.propose({ title: 'First repair', replaces: [original.id] })
+  const first = f.propose({ title: 'First dependent', dependencies: [original.id] })
+  const second = f.propose({ title: 'Second dependent', dependencies: [first.id] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: firstRepair.id, reason: 'Revise repair' })
+  assert.throws(() => f.propose({ title: 'Cyclic second repair', replaces: [firstRepair.id], dependencies: [second.id] }),
+    /\[task_graph_cycle\]/)
+  const repair = f.propose({ title: 'Corrected second repair', replaces: [firstRepair.id] })
+  assert.deepEqual(f.runtime.effectiveDependencies(f.mission.id, first).map(task => task.id), [repair.id])
+  assert.equal(f.current(original).status, 'cancelled')
+  assert.equal(f.current(firstRepair).status, 'cancelled')
+})
+
+test('replacement cycle validation includes the exact review-source edge', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  const dependent = f.propose({ title: 'Dependent', dependencies: [original.id] })
+  const review = f.propose({ title: 'Review dependent', kind: 'verification', reviewOf: dependent.id, checks: [] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Revise implementation' })
+  assert.throws(() => f.propose({ title: 'Repair waiting for its own downstream review', replaces: [original.id], dependencies: [review.id] }),
+    /\[task_graph_cycle\]/)
+  assert.equal(f.current(review).reviewOf, dependent.id, 'admission never rewrites a review to a different artifact')
+  assert.equal(f.current(dependent).dependencies[0], original.id, 'admission preserves declared dependency identities')
+})
+
+test('a combined repair preserves obsolete dependency and review edges without reviving their waits', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  const withdrawn = f.propose({ title: 'Withdrawn dependent', dependencies: [original.id] })
+  const rejectedReview = await f.block(original)
+  const dependent = f.propose({ title: 'Dependent', dependencies: [withdrawn.id] })
+  const obsoleteReview = f.propose({ title: 'Obsolete review', kind: 'verification', reviewOf: withdrawn.id, checks: [] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'Combine work into one repair' })
+  const historical = [original, rejectedReview, withdrawn, obsoleteReview].map(task => f.current(task))
+  const repair = f.propose({ title: 'Combined repair', replaces: [original.id, withdrawn.id] })
+  assert.deepEqual([original, rejectedReview, withdrawn, obsoleteReview].map(task => f.current(task)), historical,
+    'blocked sources, completed verdicts and cancelled reviews remain unchanged')
+  assert.deepEqual(f.runtime.effectiveDependencies(f.mission.id, dependent).map(task => task.id), [repair.id])
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, repair.id)
+  assert.equal(claimed.status, 'running', 'obsolete waits do not prevent a valid combined repair')
+})
+
+test('an unrelated historical graph defect does not prevent an independent repair', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  const one = f.propose({ title: 'Imported first' })
+  const two = f.propose({ title: 'Imported second', dependencies: [one.id] })
+  const imported = f.current(one)
+  imported.dependencies = [two.id]
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', imported))
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Revise independent work' })
+  const repair = f.propose({ title: 'Independent repair', replaces: [original.id] })
+  assert.equal(repair.status, 'pending')
+  assert.deepEqual(f.current(one).dependencies, [two.id], 'an unrelated import is neither rewritten nor used to block recovery')
+})

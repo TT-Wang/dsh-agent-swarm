@@ -372,6 +372,30 @@ test('unexpected web API failures are sanitized while validation messages stay a
   assert.match(internal.result.error.message, /logged/)
 })
 
+test('replacement cycles return an actionable bad-request through native RPC without admitting work', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Graph', objective: 'Repair dependencies' })
+  const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['true'] }
+  const original = f.runtime.propose(owner, mission.id, input)
+  const dependent = f.runtime.propose(owner, mission.id, { ...input, title: 'Dependent', dependencies: [original.id] })
+  f.runtime.cancel(owner, mission.id, { taskId: original.id, reason: 'Revise implementation' })
+  const before = f.runtime.store.list('tasks', mission.id)
+  const cyclic = { ...input, title: 'Repair', replaces: [original.id], dependencies: [dependent.id] }
+  const rejected = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
+  assert.equal(rejected.result.ok, false)
+  assert.equal(rejected.result.error.code, 'bad-request')
+  assert.match(rejected.result.error.message, /\[task_graph_cycle\]/)
+  assert.match(rejected.result.error.message, /dependencies.*reviewOf.*swarm_propose/)
+  assert.deepEqual(f.runtime.store.list('tasks', mission.id), before)
+  const message = rejected.result.error.message
+  f.runtime.propose = () => { throw new Error(message) }
+  const imitation = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
+  assert.equal(imitation.result.error.code, 'internal-error', 'a matching message alone is not a typed validation failure')
+  assert.doesNotMatch(imitation.result.error.message, /task_graph_cycle/)
+})
+
 test('add-member validates subscriptions as a string array before admitting a worker', async t => {
   const f = await fixture(t)
   const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)

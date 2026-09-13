@@ -6,8 +6,8 @@
  * owner row regardless of mission status. So a mission the owner had just
  * paused or stopped kept delivering the decisions it had queued earlier, which
  * the owner correctly reported as the swarm "still triggering" after it was
- * stopped. The rules now are: a terminal mission (stopped/completed) delivers
- * nothing further, a paused mission delivers only a question that still awaits
+ * stopped. A stopped mission delivers nothing further, automatic completion
+ * preserves queued facts, and a paused mission delivers only a question that still awaits
  * the owner's answer (a receipt, not a report), and `blocked` — a decision
  * addressed to the owner — keeps its notices.
  */

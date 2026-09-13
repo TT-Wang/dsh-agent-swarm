@@ -139,12 +139,6 @@ export class OwnerReplyGuard {
     // The durable miss record is bounded with the nudges: after the bound the
     // guard terminal is the outcome, so a later turn cannot keep writing rows
     // about a decision the owner has already been handed.
-    if (spent < this.options.maxNudges) {
-      this.rt.commit(booking.missionId, () => this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
-        deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
-        deliveredAt: booking.deliveredAt, nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
-      }))
-    }
     if (spent >= this.options.maxNudges) {
       // Idempotent by its own dedup key: the terminal is emitted once and later
       // turns re-derive the same decision without a second notice.
@@ -155,13 +149,19 @@ export class OwnerReplyGuard {
       })
       return
     }
-    delivery.replyNudges = spent + 1
-    this.rt.commit(booking.missionId, () => this.rt.store.put('deliveries', delivery))
-    try {
+    this.rt.commit(booking.missionId, () => {
+      this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
+        deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
+        deliveredAt: booking.deliveredAt, nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
+      })
+      delivery.replyNudges = spent + 1
+      this.rt.store.put('deliveries', delivery)
+      // Each recovery turn needs its own wake. Persist its ordinal and outbox
+      // row together so restart cannot spend a nudge without retaining it.
       this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
         this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
-        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}` })
-    } catch { /* A notice that cannot be queued must not lose the durable event above. */ }
+        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}` })
+    })
     if (this.options.guard === 'block') this.block(sessionId, deliveryId)
   }
 

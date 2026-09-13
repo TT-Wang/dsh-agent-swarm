@@ -19,7 +19,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope } from './scope.ts'
-import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock } from './admission.ts'
+import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { orderedTasks, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
@@ -1178,6 +1178,35 @@ export class SwarmRuntime {
   effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
   dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
   /**
+   * A repair redirects existing dependencies, so even a fresh task can close a
+   * cycle. Validate its prospective effective graph before writing anything.
+   * Review edges stay pinned to their exact source, as they do in the scheduler;
+   * completed and abandoned rows keep their history without retaining wait edges.
+   * Every newly introduced cycle must be reachable from the candidate, so an
+   * unrelated legacy defect cannot prevent the owner from admitting a repair.
+   */
+  private assertEffectiveTaskGraph(missionId: string, candidate: Task, tasks: Task[]): void {
+    const rows = [...tasks, candidate]
+    const byId = new Map(rows.map(task => [task.id, task]))
+    const graph: TaskGraphNode[] = []
+    const seen = new Set<string>()
+    const pending = [candidate.id]
+    while (pending.length) {
+      const taskId = pending.pop()!
+      if (seen.has(taskId)) continue
+      seen.add(taskId)
+      const task = byId.get(taskId)
+      if (task === undefined) continue // The shared validator reports the dangling edge.
+      const waiting = ['pending', 'running', 'submitted'].includes(task.status) || this.quiescencePending(task)
+      const dependencies = waiting ? task.dependencies.map(dependency => this.effectiveDependency(missionId, dependency, rows).id) : []
+      const reviewOf = waiting ? task.reviewOf : undefined
+      graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
+      pending.push(...dependencies, ...(reviewOf === undefined ? [] : [reviewOf]))
+    }
+    const defects = taskGraphDefects(graph)
+    if (defects.length) throw new TaskGraphAdmissionError(defects)
+  }
+  /**
    * R16-A: whether a dependency reference still has a live path. `dependencySatisfied`
    * answers the dispatcher's question ("may the dependent start?"); this answers the
    * notice classifier's ("can the obligation still advance?"). Both read the same
@@ -1591,6 +1620,7 @@ export class SwarmRuntime {
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
     if (input.checkTimeoutMs !== undefined) task.checkTimeoutMs = input.checkTimeoutMs
+    this.assertEffectiveTaskGraph(missionId, task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
       this.store.event(missionId, 'task/proposed', key, task)

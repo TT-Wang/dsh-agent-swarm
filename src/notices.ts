@@ -128,10 +128,10 @@ export const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undef
  * addressed to the owner — keeps its notices because the mission is not out of
  * play at all.
  */
-function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Delivery, 'kind' | 'replyExpected'>): boolean {
+function ownerDeliveryMoot(mission: Pick<Mission, 'status'>, delivery: Pick<Delivery, 'kind' | 'replyExpected' | 'answeredBy'>): boolean {
   if (mission.status === 'stopped') return true
   if (mission.status !== 'paused') return false
-  return !(delivery.kind === 'question' && delivery.replyExpected === true)
+  return !(delivery.kind === 'question' && delivery.replyExpected === true && delivery.answeredBy === undefined)
 }
 
 /** R17-G3: the stable digest of a recorded reason, so a fact key stays bounded. */
@@ -1320,10 +1320,13 @@ export class Notices {
 
   async flushOutbox(missionId: string): Promise<void> {
     if (this.rt.shuttingDown) return
-    const mission = this.rt.mission(missionId)
-    for (const delivery of this.rt.store.list('deliveries', missionId)) {
+    for (const queued of this.rt.store.list('deliveries', missionId)) {
       if (this.rt.shuttingDown) return
-      if (delivery.deliveredAt) continue
+      // A preceding transport can yield to stop/pause, receipts or another pump.
+      // Read both rows again before deciding whether this delivery may start.
+      const mission = this.rt.mission(missionId)
+      const delivery = this.rt.store.get('deliveries', queued.id)
+      if (delivery === undefined || delivery.deliveredAt !== undefined) continue
       if (delivery.kind === 'assignment' && delivery.taskId) {
         const task = this.rt.task(missionId, delivery.taskId)
         if (task.attempt?.id !== delivery.attemptId || task.status !== 'running') {
@@ -1345,6 +1348,12 @@ export class Notices {
       // and retried by a later pump (adapter acceptance is idempotent).
       if (this.delivering.has(delivery.id)) continue
       this.delivering.set(delivery.id, Date.now())
+      // An adapter may accept the message before its acknowledgement times out.
+      // Detach a summary at its first handoff: retries keep this ID's content
+      // immutable, and later facts get a fresh ID even after the attempt gate
+      // is released. Restart also starts a fresh in-memory summary window.
+      const window = this.wakeWindows[missionId]
+      if (window?.summaryId === delivery.id) delete window.summaryId
       let bound: ReturnType<typeof setTimeout> | undefined
       try {
         const settled = await Promise.race([
@@ -1352,14 +1361,26 @@ export class Notices {
           new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.stallPassTimeoutMs) }),
         ])
         if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
-        delivery.deliveredAt = Date.now()
         // R17-G8: delivery is the transport fact. It is never relabelled as
         // consumption; the host's claimed signal records consumption separately
         // (`recordConsumption`), with the adapter delivery timestamp as intake.
         this.rt.commit(missionId, () => {
-          this.rt.store.put('deliveries', delivery)
-          // A delivered notice clears the starvation record it followed.
-          if (mission.outboxStarved !== undefined) { delete mission.outboxStarved; this.rt.store.put('missions', mission) }
+          const current = this.rt.store.get('deliveries', delivery.id)
+          if (current !== undefined && current.deliveredAt === undefined) {
+            current.deliveredAt = Date.now()
+            this.rt.store.put('deliveries', current)
+          }
+          // Only acknowledge the failure this retry observed. New lifecycle,
+          // budget, receipt and starvation decisions may have landed while the
+          // adapter awaited persistence; none may be replaced by the old rows.
+          const latest = this.rt.mission(missionId)
+          const previous = mission.outboxStarved
+          const starvation = latest.outboxStarved
+          if (previous?.deliveryId === delivery.id && starvation?.deliveryId === delivery.id
+            && starvation.attempts === previous.attempts && starvation.at === previous.at) {
+            delete latest.outboxStarved
+            this.rt.store.put('missions', latest)
+          }
         })
       } catch { /* Durable outbox retries absent sessions; acceptance is idempotent in the adapter. */ }
       finally { if (bound !== undefined) clearTimeout(bound); this.delivering.delete(delivery.id) }

@@ -147,6 +147,14 @@ export function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): 
   return { code: defect.code, location, path: defect.target, message: defect.message }
 }
 
+/** Authored graph validation, distinguishable from an internal host failure at RPC. */
+export class TaskGraphAdmissionError extends Error {
+  constructor(readonly defects: readonly TaskGraphDefect[]) {
+    super(defects.map(defect => formatDiagnostic(taskGraphDiagnostic(defect, 'task'))).join('\n'))
+    this.name = 'TaskGraphAdmissionError'
+  }
+}
+
 /** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
 export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
   // The message is the caller's reason; the only call site (Runtime's review

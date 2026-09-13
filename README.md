@@ -116,6 +116,13 @@ of losing it. Exactly one live runtime may own a database; a second opener is
 refused by an owner lock that names the holding pid, and a lock left by a dead
 process is reclaimed.
 
+Owner delivery rechecks lifecycle before each message: stopped missions stay
+quiet, paused missions retain unanswered questions, and automatic completion
+preserves queued facts. A transport acknowledgement updates the latest durable
+rows, preserving newer lifecycle decisions and answer receipts. Unanswered owner
+questions receive distinct, bounded reminders whose counters and outbox entries
+are recorded together.
+
 ### Attempts are fenced
 
 Claiming a task creates an attempt with an epoch and a lease. The lease is
@@ -131,9 +138,12 @@ A submitted artifact is a Git commit. To accept it the host creates a fresh
 worktree at exactly that commit, materialises the project's installed dependency
 directories into it, runs each declared command with the task's timeout inside
 the Harness sandbox, and separately validates the artifact's changed paths
-against the declared scope. Any non-zero exit rejects the artifact. A command
-that cannot be found is reported as an environment failure, not as a defect in
-the work, so a reviewer does not retry the same artifact blindly.
+against the declared scope. A command that cannot be found is reported as an
+environment failure, not as a defect in the work. A failed pass is retried once
+on the same commit; the retry decides
+the verdict and both passes remain recorded. A check deadline is a failed
+execution (exit 124), with partial output and earlier completed checks retained.
+An explicit cancellation ends the attempt without starting that retry.
 
 ### The client is a projection
 
@@ -151,7 +161,7 @@ session vocabulary is closed, so the board is the single derivation over
 - **Peer messages never grant authority.** They cannot widen scope or budgets, change ownership or waive review.
 - **Independent verification means non-author.** A review is never assigned to the author of the work it reviews.
 - **No silent state.** Every non-terminal board leaves the owner a durable witness: progress, an owner-decision notice keyed by a stable fingerprint of the owner-observable board, or a stall notice naming the tasks that are stuck.
-- **Every command goes through the host.** Git plumbing, shell probes and declared checks all run through the host's subprocess service, which owns the process range and its termination.
+- **Worker execution uses the host.** Workspace provisioning, shell probes and declared checks use the host's subprocess service, which owns their process ranges and termination. Delivery and admission have the exceptions documented below.
 
 ## Compatibility
 
@@ -366,7 +376,7 @@ Suites use temporary profiles and Git workspaces, with the model boundary script
 
 ## Current limitations
 
-- **Local, single-host.** Git workspaces and the host's subprocess service (`ctx.subprocess`) are required: every command, including each declared check, runs as a provider-managed process range. Distributed workers and non-Git workspaces are not implemented.
+- **Local, single-host.** Git workspaces and the host's subprocess service (`ctx.subprocess`) are required. Delivery Git operations still use local asynchronous subprocesses, and admission's Git ignore probes are synchronous; these exceptions do not have host-managed process ranges. Distributed workers and non-Git workspaces are not implemented.
 - **Verification proves that your commands ran, not that they are sufficient.** The host executes exactly what a task declares, against the exact submitted commit. It cannot infer a complete test oracle from a natural-language goal.
 - **The verification checkout borrows your installed toolchain.** Dependency directories are copied into the disposable checkout by default, so `..` cannot resolve into your source checkout; a read-through `link` requires the explicit `allowDependencyLinkReads` opt-in. Either way they are not a fresh install and may differ from CI.
 - **Budget accounting is provider-reported.** In-flight requests are estimated, so an unusually large one can still cross a ceiling. Attempts that report no usage cannot be counted.

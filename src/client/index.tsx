@@ -89,14 +89,13 @@ export function apply(ctx: Context): void {
   }
   // Surface preference: the host's own right sidebar first (0.1.5 line, the same
   // pane Files uses), then Better Sidebar when a profile mounts it, then the
-  // standalone dock. Each adapter reports integrated only while its registration
-  // is live, so unloading a host pane hands the surface to the next one instead
-  // of leaving a blank column.
+  // standalone dock. Native integration also requires a successful reveal by
+  // the current provider, so its removal or a refused reveal restores fallback.
   const native = createRightSidebarAdapter(ctx, () => ({
     id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80,
     label: () => copy('Agent Swarm'),
     description: () => copy('Missions, workers and evidence for this conversation'),
-    component: () => <Pane />,
+    component: ({ scope, visible }) => <Pane sessionId={scope.sessionId} active={visible} />,
   }))
   const sidebar = createSidebarAdapter(ctx, () => ({
     id: 'agent-swarm', title: () => copy('Agent Swarm'), single: true, order: 80,
