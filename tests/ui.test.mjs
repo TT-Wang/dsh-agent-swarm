@@ -526,7 +526,9 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
       const release = factory(scope)
       return { dispose: async () => { await release?.dispose?.() } }
     },
-    get: name => (name === 'sidebarRight' ? { openTab: (kind, options) => opened.push(`${kind}:${JSON.stringify(options)}`) } : undefined),
+    get: name => (name === 'sidebarRight'
+      ? { openTab: (kind, options) => opened.push(`${kind}:${JSON.stringify(options)}`) }
+      : name === 'layout' ? { openRightbar: (track, fullscreen) => opened.push(`pane:${track}:${fullscreen}`) } : undefined),
     effect: fn => { fn() },
   }
   const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80, label: () => 'Agent Swarm', description: () => 'Missions, workers and evidence for this conversation', component: () => null })
@@ -539,8 +541,13 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
     'and one guide capsule, which is the only route to a page type from the UI')
   assert.deepEqual(seats.map(seat => [seat.slot, seat.key, typeof seat.component]), [['sidebar.right.pane.tab', 'dsh-external-agent-swarm', 'function']],
     'the body sits in the keyed seat under that same id')
+  // The host starts with an empty right pane, so the adapter opens its tab once
+  // when it registers: a registered tab nobody opens is invisible.
+  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'],
+    'registering reveals the pane and selects the tab once')
+  opened.length = 0
   assert.equal(adapter.open(), true)
-  assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'open() reveals the tab through the host controller')
+  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'], 'open() reveals the pane and the tab through the host services')
   adapter.dispose()
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal releases the type and the seat')
@@ -560,8 +567,10 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
     },
     get: () => undefined, effect: fn => { fn() },
   }
+  opened.length = 0
   const noRegistry = createRightSidebarAdapter(slotOnly, describe)
   assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing and the dock renders')
+  assert.deepEqual(opened, [], 'and it never reveals a pane that does not exist')
   assert.deepEqual(seats, [], 'and the body seat is never registered into an undeclared slot')
   noRegistry.dispose()
   const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }

@@ -172,6 +172,11 @@ interface RightSidebarController {
   openTab(kind: string, options?: Record<string, unknown>): void
 }
 
+/** The layout service, restricted to revealing the right pane. */
+interface LayoutReveal {
+  openRightbar?(track: boolean, fullscreen: boolean): void
+}
+
 export interface RightSidebarDescriptor {
   /** Registry id: also the key both seats register under. */
   id: string
@@ -194,7 +199,18 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
   const listeners = new Set<() => void>()
   let disposed = false
   let registered = 0
+  let revealed = false
   const notify = () => { for (const listener of [...listeners]) listener() }
+  /** Expand the right pane (if it is collapsed) and select this tab. */
+  const reveal = (): boolean => {
+    const tab = descriptor()
+    const layout = ctx.get('layout') as unknown as LayoutReveal | undefined
+    try { layout?.openRightbar?.(true, false) } catch { /* Layout optional; the tab still opens below. */ }
+    const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
+    if (controller === undefined || typeof controller.openTab !== 'function') return false
+    controller.openTab(tab.kind, { revealIfOpened: true })
+    return true
+  }
   // Both services are required, and they are required together: the registry is
   // the host fact that a right sidebar exists, and asking for it in the same
   // injection is what keeps this adapter from claiming seats on a host whose
@@ -220,6 +236,12 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     const releaseBody = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id }, () => tab.component()))
     registered += 1
     notify()
+    // OWNER PASS: the host starts with an empty right pane, so a registered tab
+    // that nobody opens is invisible — the panel had no affordance at all until
+    // the owner knew the New tab -> Start -> Agent Swarm path. Open it once per
+    // page load, the way the shipped Files pane appears, and keep the command and
+    // card paths working through open().
+    if (!revealed) { revealed = true; void reveal() }
     return () => {
       registered -= 1
       releaseBody()
@@ -239,10 +261,9 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     getSnapshot: () => registered > 0,
     open() {
       if (registered === 0) return false
-      const controller = ctx.get('sidebarRight') as unknown as RightSidebarController | undefined
       // Revealing is best effort: the tab exists either way, and the host's own
       // Tab control opens the pane when no controller is mounted.
-      if (controller !== undefined && typeof controller.openTab === 'function') controller.openTab(descriptor().kind, { revealIfOpened: true })
+      reveal()
       return true
     },
     dispose,
