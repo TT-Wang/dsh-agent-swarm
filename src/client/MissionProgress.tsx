@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { avatarCells } from './avatar.ts'
 import { acceptanceSummary, activityDuration, currentProgress, recentProgress, sidebarState, type ConnectionState } from './progress.ts'
 import { useCopy } from './locale.tsx'
+import { projectLiveWork } from './live-work.ts'
 
 function timestamp(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }
 /**
@@ -25,7 +26,7 @@ export function WorkerAvatar({ name, size: requested }: { name: string; size?: n
       width={sprite.cell} height={sprite.cell} fill={cell.color} />)}
   </svg>
 }
-export function MissionProgress({ snapshot, connection = 'connected', live = false }: { snapshot: Snapshot; connection?: ConnectionState; live?: boolean }) {
+export function MissionProgress({ snapshot, connection = 'connected', live = false, observedAt }: { snapshot: Snapshot; connection?: ConnectionState; live?: boolean; observedAt?: number }) {
   const t = useCopy(), current = currentProgress(snapshot, connection)
   const [clock, setClock] = useState(() => live && connection === 'connected' ? Date.now() : current.activity?.updatedAt ?? snapshot.mission.updatedAt)
   useEffect(() => {
@@ -34,14 +35,17 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     const timer = setInterval(() => setClock(Date.now()), 1000)
     return () => clearInterval(timer)
   }, [live, connection, current.activity?.id])
-  const duration = current.activity ? activityDuration(current.activity.startedAt, live ? clock : current.activity.updatedAt) : undefined
+  const currentTime = live && connection === 'connected' ? Math.max(clock, observedAt ?? 0) : observedAt ?? current.activity?.updatedAt ?? snapshot.mission.updatedAt
+  const operation = projectLiveWork(snapshot, { connection: live ? connection : 'paused', now: currentTime, observedAt }).rows.find(row => row.member.id === current.member?.id)
+  const unconfirmed = live && operation?.state === 'quiet'
+  const duration = current.activity ? activityDuration(current.activity.startedAt, currentTime) : undefined
   // R15-B: the owner-facing phase, its recovery age and any pending decision are
   // derived from durable rows only (see `sidebarState`); this render adds no
   // timer, request or model turn.
   const owner = sidebarState(snapshot, connection, live && connection === 'connected' ? clock : (current.observedAt ?? snapshot.mission.updatedAt))
-  return <div className="sw-focus" data-swarm-phase={owner.phase} data-swarm-current={current.activity?.kind ?? snapshot.mission.status} data-stale={live && (current.stale || owner.stale)}>
+  return <div className="sw-focus" data-swarm-phase={owner.phase} data-swarm-current={current.activity?.kind ?? snapshot.mission.status} data-stale={live && (current.stale || owner.stale || unconfirmed)}>
     {(!live || current.stale) && <small>{t(!live ? 'Recorded state' : 'Last observed state')}</small>}
-    <strong>{t(current.label)}</strong>
+    <strong>{t(unconfirmed ? 'Waiting for activity confirmation' : current.label)}</strong>
     {current.task && <p>{current.task.title}</p>}
     {current.note && <p className="sw-focus-note">{t(current.note)}</p>}
     {/* OWNER PASS 2026-09-11: the member sprite lives in the member's own row
@@ -59,7 +63,7 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     </p>}
     {owner.recovery && <p className="sw-focus-note" data-swarm-recovery={owner.recovery.subject}>{t(owner.recovery.action)}
       {owner.recovery.ageMs === undefined ? '' : ` · ${Math.round(owner.recovery.ageMs / 1000)}${t('sec')}`}{owner.recovery.since === undefined ? ` · ${t('start time unknown')}` : ''}</p>}
-    {owner.decision && <p className="sw-focus-note" data-swarm-decision={owner.decision.subject}>{t('Waiting for you')}: {owner.decision.subject} · {t('consumption unknown')}
+    {owner.decision && <p className="sw-focus-note" data-swarm-decision={owner.decision.subject}>{t('Waiting for the main agent')}
       <span className="sw-decision-content" data-swarm-decision-content="">{t(owner.decision.content)}</span></p>}
     {/* OWNER PASS 2026-09-11 (second pass): the projection's label, note, count
         and durable evidence used to be derived and then dropped; they are the
@@ -69,6 +73,7 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
       <summary>{t('Why this state')}</summary>
       <p className="sw-focus-note" data-swarm-owner-label="">{t(owner.label)}{owner.count === undefined ? '' : ` ${owner.count}`}</p>
       {owner.note && <p className="sw-focus-note" data-swarm-owner-note="">{t(owner.note)}</p>}
+      {owner.decision && <p className="sw-refs">{owner.decision.subject} · {t('consumption unknown')}</p>}
       <p className="sw-refs">{t('Derived from')}: <span className="sw-code" data-swarm-owner-evidence="">{owner.evidence}</span></p>
     </details>
     {live && (current.stale || owner.stale) && <p className="sw-focus-note">{t('Current execution is unconfirmed until updates resume.')}</p>}

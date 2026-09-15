@@ -27,6 +27,7 @@ export interface Config {
   workspacesRoot: string
   leaseMs: number
   tickMs: number
+  planningTimeoutMs: number
   maxMessageChars: number
   maxEvents: number
   maxAttempts: number
@@ -88,6 +89,7 @@ export const Config: z<Config> = z.object({
   workspacesRoot: z.string().default(join(homedir(), '.dsh/agent-swarm/workspaces')),
   leaseMs: z.natural().min(100).default(120000),
   tickMs: z.natural().min(10).default(1000),
+  planningTimeoutMs: z.natural().min(100).default(600000),
   maxMessageChars: z.natural().min(1000).default(16000),
   maxEvents: z.natural().min(1).default(100),
   maxAttempts: z.natural().min(1).default(3),

@@ -9,6 +9,7 @@ import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { activityGroups } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DeliveryPanel } from '../lib/types/client/DeliveryPanel.js'
+import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 
 function render(component, props, chinese = false) {
@@ -110,16 +111,16 @@ test('default historical card is compact and technical views are opt-in', () => 
   const snapshot = withActivity()
   const markup = render(SwarmBoard, { snapshot, onOpenWorker() {} })
   assert.match(markup, /Recorded state/)
-  // OWNER PASS 2026-09-11: members moved out of their disclosure into the top
-  // dynamic area, each with an avatar and its own progress bar; the technical
-  // pane stays opt-in and now opens on a title with unfoldable facts.
+  // Current work stays visible, while resting members and resource budgets
+  // no longer compete with the task's actual progress in the default view.
   assert.match(markup, /data-swarm-team=""/)
-  assert.match(markup, /class="sw-bar"/)
+  assert.match(markup, /class="sw-agent-avatar"/)
+  assert.doesNotMatch(markup, /class="sw-bar"/)
   assert.match(markup, /data-swarm-details="technical"/)
   assert.doesNotMatch(markup, /data-swarm-details="team"/)
-  assert.match(markup, /data-swarm-accepted="">1 \/ 5 tasks accepted/)
+  assert.match(markup, /<b>1<\/b>accepted/, 'accepted work is a separate factual count')
   assert.doesNotMatch(markup, /role="tab"|class="sw-metrics"|class="sw-board"/)
-  assert.equal((markup.match(/data-swarm-progress-event=/g) ?? []).length, 3)
+  assert.equal((markup.match(/data-event-id=/g) ?? []).length, 3)
   const expanded = render(SwarmBoard, { snapshot, initialView: 'graph' })
   assert.match(expanded, /data-swarm-details="technical" open=""/)
   assert.match(expanded, /data-swarm-details="mission"/, 'the detailed facts unfold inside the technical pane')
@@ -128,37 +129,31 @@ test('default historical card is compact and technical views are opt-in', () => 
   const chinese = render(SwarmBoard, { snapshot }, true)
   assert.match(chinese, /智能体正在思考/)
   assert.match(chinese, /任务与资源详情/)
-  assert.match(chinese, /项已验收/)
+  assert.match(chinese, /已验收/)
 })
 
 
-test('OWNER PASS 2026-09-11: members sit in the dynamic area with an avatar and their own live bar', () => {
+test('the compact overview preserves member identity and never presents resource consumption as completion', () => {
   const snapshot = uiSnapshot()
   const markup = render(SwarmBoard, { snapshot, onOpenWorker() {} })
-  // Item 5: the roster is part of the default overview, above the opt-in
-  // technical pane, and it is no longer a disclosure.
+  // The active assignment is visible; other members retain their portraits in
+  // a compact, collapsed roster before the opt-in technical pane.
   const team = markup.indexOf('data-swarm-team')
   const technical = markup.indexOf('data-swarm-details="technical"')
   assert.ok(team > 0 && technical > team, 'the team strip precedes the technical pane')
-  assert.doesNotMatch(markup, /data-swarm-details="team"/)
-  // Item 1: the mission focus line draws no avatar; the sprite lives in the rows.
-  const focus = markup.slice(markup.indexOf('class="sw-focus"'), markup.indexOf('data-swarm-team'))
+  assert.match(markup.slice(team), /aria-expanded="false"/, 'resting members start collapsed')
+  const focus = markup.slice(markup.indexOf('class="sw-focus"'), markup.indexOf('class="sw-live-view'))
   assert.doesNotMatch(focus, /<svg/, 'the focus line carries no avatar')
-  assert.equal((markup.match(/class="sw-worker-avatar"/g) ?? []).length, snapshot.members.length, 'one sprite per member row')
+  const identities = [...markup.matchAll(/data-agent-identity="([^"]+)"/g)].map(match => match[1])
+  assert.deepEqual(identities.sort(), snapshot.members.map(member => member.id).sort(), 'every durable member has one recognisable portrait')
   assert.doesNotMatch(markup, /class="sw-avatar"/, 'the initials block is gone')
-  // Item 2/5: every member row carries a bar; a step ceiling is determinate and a
-  // bare attempt is a lease countdown (never an invented percentage).
-  assert.equal((markup.match(/class="sw-bar"/g) ?? []).length, snapshot.members.length, 'one bar per member')
-  assert.match(markup, /data-swarm-member-basis="lease"/, 'the running attempt shows its lease')
-  assert.match(markup, /data-basis="lease"/, 'and the bar is the lease one')
+  assert.doesNotMatch(markup, /class="sw-bar"|data-basis="lease"/, 'lease duration is not a completion meter')
   const ceiling = uiSnapshot()
   ceiling.tasks[1].usedSteps = 3
   ceiling.tasks[1].maxSteps = 12
   const bounded = render(SwarmBoard, { snapshot: ceiling, onOpenWorker() {} })
-  assert.match(bounded, /data-swarm-member-basis="steps">steps 3\/12</, 'a declared step ceiling shows the ratio')
-  assert.match(bounded, /data-basis="steps"/, 'the bounded bar is the step one')
-  assert.match(bounded, /role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="25"/, 'a bounded bar is a meter, not an animation')
-  assert.match(bounded, /<span style="width:25%">/, 'and its width is the durable ratio')
+  assert.equal(bounded, markup, 'spending a different part of the step budget does not change perceived work progress')
+  assert.doesNotMatch(bounded, /role="meter"|data-basis="steps"|width:25%/, 'resource meters stay out of the compact overview')
 })
 
 test('OWNER PASS 2026-09-11: the technical pane opens on a title, and the facts unfold below it', () => {
@@ -171,13 +166,14 @@ test('OWNER PASS 2026-09-11: the technical pane opens on a title, and the facts 
 })
 
 
-test('OWNER PASS 2026-09-11: the new team labels are translated, not English leaks', () => {
+test('the compact execution, event and roster labels are translated', () => {
   const snapshot = uiSnapshot()
   const chinese = render(SwarmBoard, { snapshot, onOpenWorker() {} }, true)
-  assert.match(chinese, /团队动态/, 'the team strip title is translated')
-  assert.match(chinese, /名成员/, 'the member count is translated')
-  assert.match(chinese, /工作中/, 'a working member reads in Chinese')
-  assert.doesNotMatch(chinese, />Team activity</, 'no English team label leaks')
+  assert.match(chinese, /上次执行记录/, 'a historical view does not claim current execution')
+  assert.match(chinese, /其他成员/, 'the compact roster title is translated')
+  assert.match(chinese, /当前状态待确认/, 'historical availability is explicit in the avatar label')
+  assert.match(chinese, /只显示实际事件/, 'the event provenance is translated')
+  assert.doesNotMatch(chinese, /Recorded execution|Other members|Recorded events only|Current status unconfirmed/, 'no English presentation label leaks')
   const cancelled = uiSnapshot()
   cancelled.tasks[4] = { ...cancelled.tasks[4], status: 'cancelled' }
   const lanes = render(SwarmBoard, { snapshot: cancelled, initialView: 'board' }, true)
@@ -198,6 +194,8 @@ test('completed summary presents accepted output and actual review counts, never
   assert.match(markup, /Accepted research output/)
   assert.match(markup, /1 independent reviews accepted/)
   assert.doesNotMatch(markup, /Unaccepted implementation claim/)
+  assert.ok(markup.indexOf('Accepted research output') < markup.indexOf('data-swarm-team'), 'the accepted result precedes the roster')
+  assert.doesNotMatch(markup, /class="sw-live-view sw-live-execution"/, 'completed work no longer displays an execution lane')
 })
 
 test('new mission defaults to natural language guidance and connecting state is never shown as connected', () => {
@@ -246,9 +244,9 @@ test('OWNER PASS 2026-09-11 (second pass, item 1): the activity feed is grouped 
   const markup = render(SwarmBoard, { snapshot, initialView: 'activity' })
   assert.deepEqual([...markup.matchAll(/data-swarm-activity-group="([^"]+)"/g)].map(match => match[1]), ['b', 'a', 'owner'],
     'the rendered groups keep the derived order')
-  assert.match(markup, /data-swarm-activity-group="b"[\s\S]*?class="sw-worker-avatar"/, 'a member group header draws that member’s sprite')
+  assert.match(markup, /data-swarm-activity-group="b"[\s\S]*?class="sw-agent-avatar" data-agent-identity="b"/, 'a member group header uses the same durable avatar identity')
   assert.match(markup, /data-swarm-activity-group="b"[\s\S]*?2 events/, 'and its own event count')
-  assert.doesNotMatch(markup, /data-swarm-activity-group="owner"[\s\S]*?sw-worker-avatar/, 'the owner group draws no worker sprite')
+  assert.doesNotMatch(markup, /data-swarm-activity-group="owner"[\s\S]*?sw-agent-avatar/, 'the owner group draws no worker portrait')
   assert.equal((markup.match(/class="sw-event"/g) ?? []).length, snapshot.events.length, 'grouping keeps every event row')
   assert.doesNotMatch(markup, /class="sw-event-data">a · |class="sw-event-data">b · /, 'a row no longer repeats the actor its header already names')
 })
@@ -350,21 +348,48 @@ test('OWNER PASS 2026-09-11 #2: Pause and Stop share one horizontal control row'
   assert.doesNotMatch(html, /data-swarm-details="technical" open/)
 })
 
-test('OWNER PASS 2026-09-11 #2: the member card leads with a large avatar and a restacked identity', () => {
+test('compact member rows lead with the portrait and expose the assignment and conversation action', () => {
   const markup = render(SwarmBoard, { snapshot: uiSnapshot(), onOpenWorker() {} })
-  const start = markup.indexOf('data-swarm-member="b"')
-  const card = markup.slice(start, markup.indexOf('</article>', start))
-  const head = card.slice(card.indexOf('sw-member-head'), card.indexOf('sw-member-task'))
-  assert.match(head, /class="sw-worker-avatar"[^>]*width="48" height="48"/, 'the sprite is 48px, not a thumbnail')
-  assert.ok(head.indexOf('sw-worker-avatar') < head.indexOf('sw-worker-name'), 'the avatar anchors the head')
-  assert.match(head, /class="sw-worker-name">Nova</)
-  assert.match(head, /class="sw-chip" data-tone="live">working</, 'the status chip sits with the name')
-  assert.match(head, /sw-member-role">Runtime implementation</, 'the role is its own line under the name')
-  assert.doesNotMatch(card, /class="sw-person"/, 'the identity no longer rides the generic person row')
+  const start = markup.indexOf('<button class="sw-live-member"')
+  assert.ok(start > 0, 'the current assignment stays visible and clickable')
+  const card = markup.slice(start, markup.indexOf('</button>', start))
+  assert.match(card, /data-swarm-member="b"/)
+  assert.match(card, /aria-label="Open conversation: Nova"/, 'opening the actual member conversation is accessible')
+  assert.match(card, /class="sw-agent-avatar" data-agent-identity="b"[^>]*width:40px;height:40px/, 'the geometric portrait stays readable in a compact row')
+  assert.ok(card.indexOf('sw-agent-avatar') < card.indexOf('sw-live-member-heading'), 'the avatar anchors the identity')
+  assert.match(card, /<strong>Nova<\/strong><small>Runtime implementation<\/small>/)
+  assert.match(card, /class="sw-live-task">Implement lease renewal and fencing</)
+  assert.match(card, /data-state="stale"/, 'a recorded snapshot labels execution as unconfirmed')
+  assert.doesNotMatch(card, /data-moving="true"|sw-agent-avatar-ring|class="sw-bar"/, 'a historical row has neither busy animation nor a budget bar')
   assert.doesNotMatch(card, /initials/, 'and no initials block returns')
-  // Order inside the card: head, task, bar, meta, link.
-  const order = ['sw-member-head', 'sw-member-task', 'class="sw-bar"', 'sw-member-meta', 'data-worker-session']
-  for (let index = 1; index < order.length; index++) {
-    assert.ok(card.indexOf(order[index - 1]) < card.indexOf(order[index]), `${order[index - 1]} precedes ${order[index]}`)
+})
+
+test('the shared live overview animates only fresh native work; reconnects and heartbeat reads cannot invent progress', () => {
+  const snapshot = withActivity('tool'), observedAt = Date.now() + 60_000
+  snapshot.mission.updatedAt = observedAt
+  snapshot.tasks[1].epoch = snapshot.tasks[1].attempt.epoch
+  snapshot.tasks[1].attempt.leaseUntil = observedAt + 120_000
+  snapshot.members[1].activity.startedAt = observedAt - 5000
+  snapshot.members[1].activity.updatedAt = observedAt - 2000
+  snapshot.members[1].activity.tool = 'bash'
+  const props = { snapshot, live: true, observedAt, connection: 'connected' }
+  const working = render(LiveWorkOverview, props)
+  assert.match(working, /data-moving="true"/)
+  assert.match(working, /class="sw-agent-avatar-ring"/)
+  assert.match(working, /<b>1<\/b>observed working/)
+  assert.match(working, /Running a tool/)
+  const eventIds = markup => [...markup.matchAll(/data-event-id="([^"]+)"/g)].map(match => match[1])
+  for (const [name, overrides] of [['offline', { connection: 'reconnecting' }], ['heartbeat only', { observedAt: observedAt + 20_000 }]]) {
+    const html = render(LiveWorkOverview, { ...props, ...overrides })
+    assert.doesNotMatch(html, /data-moving="true"|class="sw-agent-avatar-ring"/, `${name} does not imply currently observed work`)
+    assert.deepEqual(eventIds(html), eventIds(working), `${name} adds no progress events`)
   }
+  const disconnected = render(LiveWorkOverview, { ...props, connection: 'reconnecting' })
+  assert.match(disconnected, /<b>1<\/b>previously working/, 'retained concurrency is explicitly historical')
+  assert.match(disconnected, /Recorded elapsed <b>5s<\/b>/, 'disconnect preserves the elapsed interval at the last successful read')
+  const unbound = structuredClone(snapshot)
+  unbound.members[1].activity.attemptId = 'revoked-attempt'
+  const revoked = render(LiveWorkOverview, { ...props, snapshot: unbound })
+  assert.doesNotMatch(revoked, /data-moving="true"|class="sw-agent-avatar-ring"|Running a tool/)
+  assert.match(revoked, /Waiting for activity confirmation/, 'revoked activity cannot make the current task look busy')
 })

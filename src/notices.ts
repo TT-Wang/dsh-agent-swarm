@@ -585,7 +585,9 @@ export class Notices {
     // fact is carried by the window's degraded summary instead of being dropped.
     const summary = this.wakeWindowFor(missionId, at)
     if (summary !== undefined && summary.count >= this.wakeBudget) {
-      this.appendToWakeSummary(missionId, summary, `[${fact?.trigger ?? noticeClass}] ${content}`, at)
+      this.appendToWakeSummary(missionId, summary, `[${fact?.trigger ?? noticeClass}] ${content}`, {
+        class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
+      }, at)
       return undefined
     }
     const { fact: _fact, ...deliveryExtra } = extra
@@ -619,14 +621,17 @@ export class Notices {
    * The summary is one delivery whose content lists every degraded fact; while it
    * is still undelivered the fact is appended to it, and once it has been
    * delivered the next over-budget fact opens a fresh summary — a fact is never
-   * dropped, it is only ever reported in degraded form.
+   * dropped, it is only ever reported in degraded form. Original identities are
+   * written with the content: the summary's transport key must never replace
+   * the class, sender and key used to deduplicate its constituent facts.
    */
-  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, line: string, at: number): void {
+  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, line: string, identity: NonNullable<NoticeRow['aggregatedIdentities']>[number], at: number): void {
     const existing = window.summaryId === undefined ? undefined : this.rt.store.get('deliveries', window.summaryId)
     if (existing !== undefined && existing.deliveredAt === undefined && existing.notice !== undefined) {
       const row = noticeRow(existing)!
       const facts = [...(row.facts ?? []), line]
       row.facts = facts
+      row.aggregatedIdentities = [...(row.aggregatedIdentities ?? []), identity]
       existing.content = `${WAKE_SUMMARY_HEADER}\n${facts.map(fact => `- ${fact}`).join('\n')}`
       this.rt.store.put('deliveries', existing)
       return
@@ -634,7 +639,7 @@ export class Notices {
     const summary: Delivery = {
       id: id('msg'), missionId, from: 'runtime', to: 'owner', kind: 'control',
       content: `${WAKE_SUMMARY_HEADER}\n- ${line}`, createdAt: at,
-      notice: { dedupKey: `wake-budget:${missionId}:${window.startedAt}`, class: 'decision', sentAt: at, queuedAt: at, facts: [line], trigger: 'wake-budget', reason: 'per-owner wake budget exceeded' } as NonNullable<Delivery['notice']>,
+      notice: { dedupKey: `wake-budget:${missionId}:${window.startedAt}`, class: 'decision', sentAt: at, queuedAt: at, facts: [line], aggregatedIdentities: [identity], trigger: 'wake-budget', reason: 'per-owner wake budget exceeded' } as NonNullable<Delivery['notice']>,
     }
     window.summaryId = summary.id
     this.rt.store.put('deliveries', summary)

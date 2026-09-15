@@ -1,5 +1,7 @@
+import { AGENT_AVATAR_CSS } from './AgentAvatar.tsx'
+import { LIVE_WORK_CSS } from './LiveWorkPanel.tsx'
 /** Scoped styles keep the monitor independent of the host's theme implementation. */
-export const SWARM_CSS = `
+export const SWARM_CSS = AGENT_AVATAR_CSS + LIVE_WORK_CSS + `
 [data-swarm] .sw-auto-start { margin:12px 0; padding:12px; border:1px solid var(--sw-line); border-radius:10px; }
 [data-swarm] .sw-auto-start p { margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
 [data-swarm] .sw-table-wrap { overflow-x:auto; }

@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { assertScopeSelectors, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks } from './admission.ts'
+import { assertScopeSelectors, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type TaskCeilingInput } from './admission.ts'
 import type { PlanInput, PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
@@ -86,9 +86,8 @@ export function validatePlan(value: unknown): PlanInput {
     if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key)))
     // Every admitted task carries its own step/finding ceiling; the runtime blocks the task at this limit.
     inspectAdmission(() => {
-      const ceilings = normalizeTaskCeilings(task as { maxSteps?: number; maxFindings?: number }, Number((value.budget as Record<string, unknown>).maxSteps), `tasks[${index}]`)
-      task.maxSteps = ceilings.maxSteps
-      task.maxFindings = ceilings.maxFindings
+      const ceilings = normalizeTaskCeilings(task as TaskCeilingInput, Number((value.budget as Record<string, unknown>).maxSteps), `tasks[${index}]`)
+      Object.assign(task, ceilings)
     })
     if (typeof task.objective === 'string') {
       const taskScope = Array.isArray(task.scope) ? task.scope as string[] : []
@@ -132,8 +131,8 @@ export function validatePlan(value: unknown): PlanInput {
       maxDurationMs: raw.budget.maxDurationMs, maxTasks: raw.budget.maxTasks, maxExperiments: raw.budget.maxExperiments },
     members: raw.members.map(({ key, name, role, provider, model, reasoningEffort, maxOutputTokens }) => ({ key, name, role, provider, model, reasoningEffort, maxOutputTokens })),
     workstreams: raw.workstreams.map(({ key, title, objective }) => ({ key, title, objective })),
-    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf }) =>
-      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf })),
+    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf }) =>
+      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf })),
   }
   orderedTasks(plan.tasks)
   return plan

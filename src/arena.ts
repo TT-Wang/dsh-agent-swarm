@@ -204,14 +204,20 @@ export function noticeLedger(deliveries: readonly Delivery[], limit = 20): Notic
  * Whether the same class already announced the same state fingerprint from the
  * same sender. `content` narrows the match to an identical message. A different
  * message in the same state is a different decision and must still reach the
- * owner; an identical repeat is spam. The dedup key recorded on the row stays
- * the state fingerprint.
+ * owner; an identical repeat is spam. Summaries retain the original identities
+ * on their durable row, so aggregation, delivery and restart cannot re-arm a
+ * fact. Older summaries without those identities cannot prove a match.
  */
 export function hasNotice(deliveries: readonly Delivery[], match: { class: NoticeClass; dedupKey: string; from: string; content?: string }): boolean {
+  const contentDigest = match.content === undefined ? undefined : createHash('sha256').update(match.content).digest('hex')
   return deliveries.some(delivery => {
     const entry = noticeEntry(delivery)
-    return entry !== undefined && entry.class === match.class && entry.dedupKey === match.dedupKey
-      && entry.from === match.from && (match.content === undefined || entry.content === match.content)
+    if (entry === undefined) return false
+    if (entry.class === match.class && entry.dedupKey === match.dedupKey
+      && entry.from === match.from && (match.content === undefined || entry.content === match.content)) return true
+    return delivery.notice?.aggregatedIdentities?.some(identity => identity.class === match.class
+      && identity.dedupKey === match.dedupKey && identity.from === match.from
+      && (contentDigest === undefined || identity.contentDigest === contentDigest)) ?? false
   })
 }
 

@@ -1383,6 +1383,10 @@ export class Workspaces {
       // Revocation fencing: the verification checkout is created only after the
       // persisted mission manifest still authorizes its recorded root.
       await this.assertWorkspaceAuthorized(mission.source, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
+      signal.throwIfAborted()
+      // Research can require independent review without declaring host commands.
+      // Keep the validation above, but reserve execution capacity only for checks.
+      if (task.checks.length === 0) return []
       // R11-19: declared-check executions are bounded per host. A verification
       // beyond the limit waits here in FIFO order (abort-aware), and its wait is
       // measured. The adapter reports `verification` activity for the whole

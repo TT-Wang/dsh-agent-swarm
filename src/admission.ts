@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
-import type { TaskCeiling, TaskCeilingDimension } from './types.ts'
+import type { TaskCeiling, TaskCeilingDimension, TaskCeilingProvenance } from './types.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
 export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
@@ -183,6 +183,7 @@ export function formatDiagnostic(diagnostic: AdmissionDiagnostic): string {
 export interface TaskCeilingInput {
   maxSteps?: number
   maxFindings?: number
+  ceilingProvenance?: TaskCeilingProvenance
 }
 
 /**
@@ -208,13 +209,21 @@ function assertCeilingValue(value: number, location: string, dimension: TaskCeil
  * bounded by the mission budget, so a plan without explicit ceilings still
  * carries per-task limits and cannot admit a task ceiling that can never bind.
  */
-export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: number, location: string): { maxSteps: number; maxFindings: number } {
+export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: number, location: string): { maxSteps: number; maxFindings: number; ceilingProvenance: TaskCeilingProvenance } {
   const maxSteps = task.maxSteps ?? Math.max(1, Math.min(missionMaxSteps, DEFAULT_TASK_MAX_STEPS))
   const maxFindings = task.maxFindings ?? DEFAULT_TASK_MAX_FINDINGS
   assertCeilingValue(maxSteps, location, 'maxSteps')
   assertCeilingValue(maxFindings, location, 'maxFindings')
   if (maxSteps > missionMaxSteps) throw new Error(`[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`)
-  return { maxSteps, maxFindings }
+  const provenance = (dimension: TaskCeilingDimension, value: number): NonNullable<TaskCeilingProvenance[TaskCeilingDimension]> => {
+    const prior = task.ceilingProvenance?.[dimension]
+    // Revalidation receives filled-in numbers. Retain their saved origin only
+    // while that exact value is unchanged; an edited number is an agent choice.
+    const source = task[dimension] == null ? 'default'
+      : prior?.value === value && (prior.source === 'agent' || prior.source === 'default') ? prior.source : 'agent'
+    return { source, value }
+  }
+  return { maxSteps, maxFindings, ceilingProvenance: { maxSteps: provenance('maxSteps', maxSteps), maxFindings: provenance('maxFindings', maxFindings) } }
 }
 
 export interface TaskCeilingState extends TaskCeilingInput {

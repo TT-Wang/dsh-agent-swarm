@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-model-selection/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { DraftPlan, Member, Snapshot, Task } from '../types.ts'
+import type { AutoStart, DraftPlan, Member, Snapshot, Task } from '../types.ts'
 import { SwarmMonitor } from './monitor.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { DraftEditor } from './DraftEditor.tsx'
@@ -13,6 +13,8 @@ import { WorkerHistory } from './history.ts'
 import { WorkerTranscript } from './WorkerTranscript.tsx'
 import { BaselineNotice, DeliveryPanel } from './DeliveryPanel.tsx'
 import type { ConnectionState } from './progress.ts'
+import { mergeStartResponse, requestStartControl, type StartAction } from './start-controls.ts'
+import { RequestDeadlineError } from './request-deadline.ts'
 
 export const OPEN_MONITOR = 'agent-swarm:open-monitor'
 const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting', paused: 'Updates paused' }
@@ -46,15 +48,19 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const [selection, setSelection] = useState(''), [localDraft, setLocalDraft] = useState<DraftPlan>(), [localMission, setLocalMission] = useState<Snapshot>()
   const [error, setError] = useState(''), [busy, setBusy] = useState(''), [stopArmed, setStopArmed] = useState(false), [editorOpen, setEditorOpen] = useState(false)
   const [editorMounted, setEditorMounted] = useState(false)
-  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }, [owner, monitor, history])
+  const [localStart, setLocalStart] = useState<AutoStart>(), [startUnconfirmed, setStartUnconfirmed] = useState(false)
+  const pendingStart = useRef<string>()
+  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setLocalStart(undefined); setStartUnconfirmed(false); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }, [owner, monitor, history])
   useEffect(() => { monitor.select(owner, active) }, [active, owner, monitor])
   const data = state.ownerSessionId === owner ? state.data : undefined
   const connection: ConnectionState = state.ownerSessionId === owner ? (state.connection ?? (state.loading ? 'connecting' : state.error ? 'reconnecting' : state.data ? 'connected' : 'connecting')) : 'connecting'
-  const starts = data?.starts ?? []
+  const starts = mergeStartResponse(data?.starts ?? [], localStart, owner)
   const latestStart = [...starts].sort((a, b) => b.createdAt - a.createdAt)[0]
+  const prelaunchStarts = starts.filter(item => ['planning', 'launching', 'failed', 'stopped'].includes(item.status) && !item.missionId)
   const autoDraftIds = new Set(starts.map(item => item.draftId))
   useEffect(() => {
     if (latestStart?.missionId) { history.close(); setSelection(`mission:${latestStart.missionId}`) }
+    else if (latestStart) { history.close(); setSelection(`start:${latestStart.id}`) }
   }, [latestStart?.id, latestStart?.missionId, history])
   const snapshots = [...(data?.snapshots ?? [])]
   if (state.ownerSessionId === owner && localMission) {
@@ -68,10 +74,10 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     if (index < 0 && !data?.drafts.some(item => item.id === localDraft.id && item.status !== 'draft')) drafts.unshift(localDraft)
     else if (index >= 0 && drafts[index]!.revision < localDraft.revision) drafts[index] = localDraft
   }
-  const knownSelection = selection === 'new' || drafts.some(item => `draft:${item.id}` === selection) || snapshots.some(item => `mission:${item.mission.id}` === selection)
+  const knownSelection = selection === 'new' || starts.some(item => `start:${item.id}` === selection) || drafts.some(item => `draft:${item.id}` === selection) || snapshots.some(item => `mission:${item.mission.id}` === selection)
   const launchedSelection = data?.drafts.find(item => `draft:${item.id}` === selection && item.status === 'launched')?.missionId
-  const selected = knownSelection ? selection : launchedSelection ? `mission:${launchedSelection}` : drafts[0] ? `draft:${drafts[0].id}` : snapshots[0] ? `mission:${snapshots[0].mission.id}` : ''
-  const showMissionPicker = drafts.length + snapshots.length > 1 || (selected === 'new' && drafts.length + snapshots.length > 0)
+  const selected = knownSelection ? selection : launchedSelection ? `mission:${launchedSelection}` : latestStart && prelaunchStarts.some(item => item.id === latestStart.id) ? `start:${latestStart.id}` : drafts[0] ? `draft:${drafts[0].id}` : snapshots[0] ? `mission:${snapshots[0].mission.id}` : ''
+  const showMissionPicker = drafts.length + snapshots.length + prelaunchStarts.length > 1 || (selected === 'new' && drafts.length + snapshots.length + prelaunchStarts.length > 0)
   const draft = drafts.find(item => `draft:${item.id}` === selected)
   const snapshot = snapshots.find(item => `mission:${item.mission.id}` === selected)
   // OWNER PASS 2026-09-11 (review C1): the generation fence is advanced in an
@@ -82,14 +88,16 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const selectedContext = useRef({ key: '', generation: 0 })
   const [generation, setGeneration] = useState(0)
   const context = `${owner ?? ''}:${selected}`
+  useEffect(() => () => { selectedContext.current = { key: '', generation: selectedContext.current.generation + 1 } }, [])
   useEffect(() => {
     if (selectedContext.current.key === context) return
     selectedContext.current = { key: context, generation: selectedContext.current.generation + 1 }
     setGeneration(selectedContext.current.generation)
   }, [context])
   const stillSelected = () => selectedContext.current.key === context && selectedContext.current.generation === generation
-  const selectedStart = snapshot ? starts.find(item => item.missionId === snapshot.mission.id) : selected === 'new' || draft ? undefined : latestStart
-  const start = selectedStart && ['planning', 'launching', 'failed'].includes(selectedStart.status) ? selectedStart : undefined
+  const selectedStart = starts.find(item => `start:${item.id}` === selected) ?? (snapshot ? starts.find(item => item.missionId === snapshot.mission.id) : selected === 'new' || draft ? undefined : latestStart)
+  const start = selectedStart && (['planning', 'launching', 'failed'].includes(selectedStart.status) || (selectedStart.status === 'stopped' && !snapshot)) ? selectedStart : undefined
+  useEffect(() => { setStartUnconfirmed(false) }, [state.updatedAt, context])
   const directory = useMemo(() => {
     if (!owner || (!sessionId && sessionState.currentAddress)) return undefined
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
@@ -106,6 +114,20 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
       })
   }
   const disabled = Boolean(busy) || connection !== 'connected'
+  const controlStart = async (action: StartAction) => {
+    if (!owner || !start || !data?.writable || connection !== 'connected' || pendingStart.current === context || busy || startUnconfirmed) return
+    pendingStart.current = context; setBusy(`start:${action}`); setError('')
+    try {
+      await selectedOperation(stillSelected, () => requestStartControl(monitor.request, owner, start, action), {
+        success: request => { setLocalStart(request); void monitor.refresh() },
+        failure: failure => {
+          setError(t(failure instanceof Error ? failure.message : String(failure)))
+          if (failure instanceof RequestDeadlineError) { setStartUnconfirmed(true); void monitor.refresh() }
+        },
+        settled: () => setBusy(''),
+      })
+    } finally { if (pendingStart.current === context) pendingStart.current = undefined }
+  }
   const status = snapshot?.mission.status
   // OWNER PASS 2026-09-11 #2: Pause/Resume and Stop/Complete used to be two
   // sibling rows, so the primary controls always stacked. They share one
@@ -142,6 +164,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     <div className="sw-panel-toolbar">{showMissionPicker && <select aria-label={t('Missions')} value={selected} onChange={event => choose(event.currentTarget.value)}>
       {!drafts.length && !snapshots.length && <option value="">{t('No missions yet')}</option>}
       {drafts.length > 0 && <optgroup label={t('Drafts')}>{drafts.map(item => <option key={item.id} value={`draft:${item.id}`}>{item.input.title || t('New mission')} · {t(item.status)}</option>)}</optgroup>}
+      {prelaunchStarts.length > 0 && <optgroup label={t('Saved requests')}>{prelaunchStarts.map(item => <option key={item.id} value={`start:${item.id}`}>{item.goal} · {t(item.status)}</option>)}</optgroup>}
       {snapshots.length > 0 && <optgroup label={t('Missions')}>{snapshots.map(item => <option key={item.mission.id} value={`mission:${item.mission.id}`}>{item.mission.title} · {t(item.mission.status)}</option>)}</optgroup>}
       {selected === 'new' && <option value="new">{t('New mission')}</option>}
     </select>}<button disabled={!owner || !data?.writable} onClick={() => choose('new')}>{t('New mission')}</button><button aria-label={t('Refresh')} onClick={() => { void monitor.refresh() }}>↻</button></div>
@@ -152,11 +175,17 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
       {!owner ? <div className="sw-empty">{t('Select a conversation to manage its missions.')}</div> : !data ? <div className="sw-empty">{t(state.loading ? 'Loading mission state…' : 'Swarm bridge is unavailable. Refresh to retry.')}</div> : null}
       {data && !data.writable && <p className="sw-notice">{t('Mission controls are read-only in worker conversations. Open the owner conversation to manage this mission.')}</p>}
       {start && <section className="sw-auto-start" data-swarm-start={start.status} role="status">
-        <strong>{t(start.status === 'planning' ? 'Planning collaboration…' : start.status === 'launching' ? 'Starting workers…' : 'Collaboration could not start')}</strong>
+        <strong>{t(start.status === 'planning' ? 'Planning collaboration…' : start.status === 'launching' ? 'Starting workers…' : start.status === 'stopped' ? 'Collaboration start stopped' : 'Collaboration could not start')}</strong>
         <p>{start.goal}</p>
         {['planning', 'launching'].includes(start.status) && <small>{t('Choosing roles, tasks and checks automatically using this conversation’s model.')}</small>}
-        {start.error && <p className="sw-error" role="alert">{start.error}</p>}
+        {start.status !== 'stopped' && start.error && <p className="sw-error" role="alert">{start.error}</p>}
         {start.baseline && !snapshot && <details><summary>{t('Project snapshot')}</summary><BaselineNotice baseline={start.baseline} /></details>}
+        {data?.writable && start.status !== 'stopped' && <div className="sw-controls" data-swarm-start-controls={start.id}>
+          {start.status === 'failed' && <button data-action="retry-start" disabled={disabled || startUnconfirmed} onClick={() => { void controlStart('retry') }}>{t('Retry this request')}</button>}
+          <button data-action="stop-start" disabled={disabled || startUnconfirmed} onClick={() => { void controlStart('stop') }}>{t('Stop starting')}</button>
+          {busy.startsWith('start:') && <span role="status">{t('Working')}…</span>}
+          {startUnconfirmed && <button onClick={() => { void monitor.refresh() }}>{t('Refresh')}</button>}
+        </div>}
       </section>}
       {owner && data && !snapshot && !start && <div className="sw-start-guide" data-swarm-natural-start="">
         <h2>{draft?.input.title || t('Start a collaboration')}</h2>
@@ -171,7 +200,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
           onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
           onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
       </details>}
-      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} actions={
+      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} observedAt={state.updatedAt} actions={
         controls || advancedControls ? <div className="sw-actions" data-swarm-actions="">{controls}{advancedControls}</div> : undefined}
         onCancelTask={data?.writable ? task => { void cancelTask(task) } : undefined}
         technicalDetails={snapshot.mission.baseline ? <BaselineNotice baseline={snapshot.mission.baseline} /> : undefined}

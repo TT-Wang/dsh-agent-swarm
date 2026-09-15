@@ -19,7 +19,7 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { RoleScoper } from '../lib/roles.js'
-import { registerTools, ENTRY_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
+import { registerTools, ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 
@@ -135,6 +135,136 @@ test('an ordinary session sees the entry set and prompt; owning a request promot
   // Owner usage is attributed to the planning request without charging any worker pool.
   const start = f.runtime.starts({ sessionId: 'owner-session' })[0]
   assert.deepEqual(start.ownerUsage, { uncachedInputTokens: 10, cacheReadTokens: 3, cacheWriteTokens: 4, outputTokens: 2, reasoningTokens: 1, requests: 1 }, 'only the request after promotion is attributed')
+})
+
+test('failed request history keeps owner tools with a short prompt, and a new start restores the full protocol immediately', async t => {
+  const f = await fixture(t, () => prompt('ok'))
+  const owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const actor = { sessionId: 'owner-session' }
+  const start = f.runtime.requestStart(actor, { commandId: 'failed-start', goal: 'Do it', workspace: f.source })
+  const failed = f.runtime.failStart(actor, start.id, 'Snapshot unavailable')
+  // Settled/legacy history has no undelivered recovery notice.
+  delete failed.recoveryNoticePending
+  f.runtime.commit(start.id, () => f.runtime.store.put('starts', failed))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  const tools = SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort()
+  assert.deepEqual(swarmNames(f.ctx.tools.schemas(owner.agent)), tools, 'query, result, restore and restart capabilities are unchanged')
+  owner.agent.followup({ id: 'history-query', role: 'user', content: [{ type: 'text', text: 'What happened?' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[0]).includes(HISTORICAL_OWNER_PROMPT))
+  assert.doesNotMatch(systemTextOf(f.requests[0]), /Agent Swarm owner protocol/)
+  assert.ok(HISTORICAL_OWNER_PROMPT.length < 800 && HISTORICAL_OWNER_PROMPT.length < OWNER_PROMPT.length / 4)
+  f.runtime.requestStart(actor, { commandId: 'new-start', goal: 'Try another task', workspace: f.source })
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'promotion precedes the next planning turn')
+  owner.agent.followup({ id: 'plan-again', role: 'user', content: [{ type: 'text', text: 'Plan the new task.' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[1]).includes(OWNER_PROMPT))
+  assert.ok(!systemTextOf(f.requests[1]).includes(HISTORICAL_OWNER_PROMPT))
+  assert.deepEqual(swarmNames(f.requests[1].tools), tools)
+})
+
+for (const ending of ['error', 'aborted']) test(`planning recovery retains the owner protocol through queued admission, ${ending} and reload`, async t => {
+  let owner
+  const f = await fixture(t, (_options, count) => {
+    if (count === 1) {
+      if (ending === 'error') throw new Error('scripted recovery failure')
+      owner.agent.cancel({ kind: 'user' })
+    }
+    return prompt('The recovery decision is recorded.')
+  })
+  owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const actor = { sessionId: 'owner-session' }
+  const request = f.runtime.requestStart(actor, { commandId: 'recover-start', goal: 'Do it', workspace: f.source })
+  f.runtime.failStart(actor, request.id, 'Planning deadline expired', request.planningEpoch)
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'durable recovery pending needs the full owner protocol')
+  const message = { id: `swarm-start:${request.id}:1:failure`, role: 'user', source: { kind: 'swarm-start', form: 'notice', summary: 'Planning needs recovery', requestId: request.id, commandId: request.commandId, planningEpoch: 1, phase: 'failure' }, content: [{ type: 'text', text: 'Inspect the failed request and decide retry or stop.' }] }
+  owner.agent.send(message, 'next-step', false)
+  f.runtime.ackStartMessage(actor, request.id, 1, 'failure')
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'admission acknowledgement is not a handled recovery')
+  f.scoper.dispose()
+  const restored = new RoleScoper(f.ctx, f.runtime)
+  t.after(() => restored.dispose())
+  assert.equal(restored.roleOf(owner.agent), 'owner', 'the durable inbox insertion protects a queued notice after reload')
+  owner.agent.followup({ id: 'wake-recovery', role: 'user', content: [{ type: 'text', text: 'Continue.' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[0]).includes(OWNER_PROMPT))
+  assert.equal(owner.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason.kind, ending)
+  restored.dispose()
+  const afterInterruption = new RoleScoper(f.ctx, f.runtime)
+  t.after(() => afterInterruption.dispose())
+  assert.equal(afterInterruption.roleOf(owner.agent), 'owner', 'an interrupted recovery keeps its current-epoch obligation')
+  owner.agent.followup({ id: 'finish-recovery', role: 'user', content: [{ type: 'text', text: 'Finish the recovery decision.' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[1]).includes(OWNER_PROMPT))
+  assert.equal(afterInterruption.roleOf(owner.agent), 'historical-owner')
+  const retry = f.runtime.controlStart(actor, request.id, 'retry', 'Resume saved request')
+  assert.equal(afterInterruption.roleOf(owner.agent), 'owner')
+  f.runtime.controlStart(actor, request.id, 'stop', 'User stopped this request')
+  assert.equal(afterInterruption.roleOf(owner.agent), 'historical-owner', 'stopped and superseded epochs cannot pin a historical session')
+  assert.equal(retry.planningEpoch, 2)
+})
+
+test('all nonterminal missions and unresolved owner questions retain the full owner role', async t => {
+  const f = await fixture(t, () => prompt('ok'))
+  const owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Lifecycle', objective: 'Keep obligations visible', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  // These are durable projection fixtures, not mission-completion/receipt tests.
+  for (const status of ['active', 'staged', 'paused', 'blocked']) {
+    f.runtime.commit(mission.id, () => f.runtime.store.put('missions', { ...mission, status }))
+    assert.equal(f.scoper.roleOf(owner.agent), 'owner', status)
+  }
+  f.runtime.commit(mission.id, () => f.runtime.store.put('missions', { ...mission, status: 'completed' }))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  const question = { id: 'open-owner-question', missionId: mission.id, from: 'reviewer', to: 'owner', kind: 'question', content: 'Which result should be delivered?', createdAt: Date.now(), replyExpected: true, state: 'open' }
+  f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', question))
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'terminal status does not settle an open question')
+  f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', { ...question, state: 'dismissed', answeredBy: 'owner', answeredAt: Date.now() }))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  f.runtime.commit(mission.id, () => {
+    f.runtime.store.put('missions', { ...mission, status: 'stopped' })
+    f.runtime.store.put('deliveries', { id: 'moot-stop-notice', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'A former stall', createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'old-stall', sentAt: Date.now(), queuedAt: Date.now() } })
+  })
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner', 'notices explicitly muted by stop do not pin the large prompt')
+})
+
+for (const ending of ['error', 'aborted']) test(`final owner notices retain their protocol through ${ending} turns and scoper reload`, async t => {
+  let owner
+  const f = await fixture(t, (_options, count) => {
+    if (count === 1) {
+      if (ending === 'error') throw new Error('scripted final-delivery failure')
+      owner.agent.cancel({ kind: 'user' })
+    }
+    return prompt('The final result is ready.')
+  })
+  owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Final delivery', objective: 'Report the result', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  // Mark transport accepted to keep the background outbox out of this focused
+  // host-intake test. A real adapter delivery below writes the owner session log.
+  const notice = { id: 'final-result', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Completed: report the final result.', createdAt: Date.now(), deliveredAt: Date.now(), notice: { class: 'decision', dedupKey: 'legacy-completion', sentAt: Date.now(), queuedAt: Date.now() } }
+  f.runtime.commit(mission.id, () => {
+    f.runtime.store.put('missions', { ...mission, status: 'completed' })
+    f.runtime.store.put('deliveries', notice)
+  })
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'transport alone is not final handling')
+  f.runtime.recordConsumption(notice.id)
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'claiming before prompt assembly does not remove the protocol')
+  await f.workers.deliver({ id: 'owner', missionId: mission.id, name: 'owner', role: 'owner', sessionId: 'owner-session', workspace: f.source, status: 'idle', subscriptions: [] }, notice)
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[0]).includes(OWNER_PROMPT))
+  assert.equal(owner.agent.session.snapshotEvents().filter(event => event.type === 'turn/end').at(-1).data.reason.kind, ending)
+  assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'failed handling is still owed')
+  f.scoper.dispose()
+  const restored = new RoleScoper(f.ctx, f.runtime)
+  t.after(() => restored.dispose())
+  assert.equal(restored.roleOf(owner.agent), 'owner', 'durable intake and failed ending survive a role-scoper reload')
+  owner.agent.followup({ id: 'finish-final-delivery', role: 'user', content: [{ type: 'text', text: 'Finish reporting the result.' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[1]).includes(OWNER_PROMPT), 'the successful handling turn still sees the complete protocol')
+  assert.equal(restored.roleOf(owner.agent), 'historical-owner', 'only a successful handling turn followed by idle demotes')
+  owner.agent.followup({ id: 'ordinary-follow-up', role: 'user', content: [{ type: 'text', text: 'Thanks.' }], source: { kind: 'user' } })
+  await owner.agent.whenIdle()
+  assert.ok(systemTextOf(f.requests[2]).includes(HISTORICAL_OWNER_PROMPT))
+  assert.deepEqual(swarmNames(f.requests[2].tools), SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort())
 })
 
 test('subagent sessions see no swarm tools, and unloading the scoper restores the global view', async t => {

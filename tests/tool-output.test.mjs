@@ -85,3 +85,34 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   await assert.rejects(definitions.get('swarm_launch').execute(input, execution), /tasks\[0\]\.checks\[0\].*invalid shell syntax/)
   assert.equal(launches, 1)
 })
+
+test('request control routes through the existing tool without accepting ambiguous identities', async () => {
+  const calls = [], definitions = new Map()
+  const runtime = { controlStart(...args) { calls.push(args); return { id: 'request-1', status: 'planning', planningEpoch: 2 } } }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const control = definitions.get('swarm_control')
+  const execution = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  await control.execute({ requestId: 'request-1', action: 'retry', reason: 'Recover saved plan' }, execution)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0].sessionId, 'owner')
+  assert.deepEqual(calls[0].slice(1), ['request-1', 'retry', 'Recover saved plan', undefined])
+  await assert.rejects(control.execute({ requestId: 'request-1', missionId: 'mission-1', action: 'stop', reason: 'stop' }, execution), /exactly one/)
+  await assert.rejects(control.execute({ action: 'stop', reason: 'stop' }, execution), /exactly one/)
+})
+
+test('observe lists bounded saved requests and permits one owner-scoped focused recovery read', async () => {
+  const definitions = new Map()
+  const requests = Array.from({ length: 20 }, (_, i) => ({ id: `request-${i}`, status: 'failed', updatedAt: i, goal: 'x'.repeat(1000), error: 'e'.repeat(1000), planningEpoch: 2 }))
+  const runtime = { list: () => [], starts: actor => actor.sessionId === 'owner' ? requests : [] }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const observe = definitions.get('swarm_observe')
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  const listed = await observe.execute({}, exec)
+  assert.equal(listed.result.totalRequests, 20)
+  assert.equal(listed.result.requests.length, 10)
+  assert.equal(listed.result.requests[0].id, 'request-19')
+  assert.ok(listed.result.requests[0].goal.length <= 240)
+  const focused = await observe.execute({ requestId: 'request-0' }, exec)
+  assert.equal(focused.result.request.goal.length, 1000)
+  await assert.rejects(observe.execute({ requestId: 'request-0' }, { ...exec, agent: { id: 'stranger' } }), /not owned/)
+})

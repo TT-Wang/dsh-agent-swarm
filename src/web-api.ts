@@ -358,6 +358,14 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body)), actionableMessage) } }
         }
         case 'control': {
+          if (body.requestId !== undefined) {
+            if (body.missionId !== undefined) throw new RequestError('Supply exactly one requestId or missionId')
+            const action = text(body, 'action')
+            if (!['retry', 'stop', 'extend'].includes(action)) throw new RequestError('Unknown automatic request control action')
+            if (body.timeoutMs !== undefined && (!Number.isSafeInteger(body.timeoutMs) || Number(body.timeoutMs) <= 0)) throw new RequestError('timeoutMs must be a positive safe integer')
+            const request = await exposed(() => runtime.controlStart(actor, text(body, 'requestId'), action as 'retry' | 'stop' | 'extend', text(body, 'reason'), body.timeoutMs as number | undefined), actionableMessage)
+            return { ok: true, value: { request } }
+          }
           const missionId = text(body, 'missionId')
           const action = text(body, 'action')
           if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new RequestError('Unknown mission control action')

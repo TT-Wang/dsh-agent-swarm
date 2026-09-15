@@ -573,3 +573,21 @@ test('watch wakes for native owner lifecycle without inventing a swarm revision'
   assert.equal(live.ownerLive, true)
   assert.equal(live.revision, initial.revision)
 })
+
+test('web request controls recover and stop prelaunch work with native session authorization', async t => {
+  const f = await fixture(t)
+  const actor = { sessionId: f.ownerId }
+  const request = f.runtime.requestStart(actor, { commandId: 'web-planning', workspace: f.workspace, goal: 'Inspect this repository' })
+  f.runtime.failStart(actor, request.id, 'Interrupted planning')
+  const denied = await f.rpc('control', { sessionId: 'other-owner', requestId: request.id, action: 'retry', reason: 'Retry' })
+  assert.equal(denied.result.ok, false)
+  const ambiguous = await f.rpc('control', { sessionId: f.ownerId, requestId: request.id, missionId: 'unknown', action: 'retry', reason: 'Retry' })
+  assert.equal(ambiguous.result.ok, false)
+  const retry = await f.rpc('control', { sessionId: f.ownerId, requestId: request.id, action: 'retry', reason: 'Retry' })
+  assert.equal(retry.result.ok, true, JSON.stringify(retry.result))
+  assert.equal(retry.result.value.request.planningEpoch, 2)
+  assert.equal(retry.result.value.request.planningDispatchPending, true)
+  const stop = await f.rpc('control', { sessionId: f.ownerId, requestId: request.id, action: 'stop', reason: 'User cancelled' })
+  assert.equal(stop.result.ok, true)
+  assert.equal(stop.result.value.request.status, 'stopped')
+})

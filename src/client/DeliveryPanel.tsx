@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import type { DeliveryApplication, DeliveryInspection, Snapshot, WorkspaceBaseline } from '../types.ts'
 import type { Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
-import { deliverableCommit, deliveryApplied } from './projection.ts'
+import { deliverableCommit } from './projection.ts'
+import type { LiveState } from './monitor.ts'
+import { requestWithDeadline, RequestDeadlineError } from './request-deadline.ts'
+import { checkDeliveryOutcome, projectDeliveryState, type DeliveryObservation } from './delivery-state.ts'
 
 export function BaselineNotice({ baseline }: { baseline: WorkspaceBaseline }) {
   const t = useCopy()
@@ -19,26 +22,50 @@ export function DeliveryPanel({ snapshot, sessionId, request, onApplied, disable
 }) {
   const t = useCopy()
   const [delivery, setDelivery] = useState<DeliveryInspection>()
-  const [result, setResult] = useState<DeliveryApplication>()
+  const [observation, setObservation] = useState<DeliveryObservation>()
   const [busy, setBusy] = useState(false), [error, setError] = useState('')
+  const [uncertain, setUncertain] = useState(false)
   const mounted = useRef(true), pending = useRef(false)
   const resultCommit = deliverableCommit(snapshot)
-  const applied = result?.status === 'applied' || deliveryApplied(snapshot, resultCommit)
+  const identity = `${sessionId}:${snapshot.mission.id}:${resultCommit ?? ''}`
+  const selected = useRef(identity)
+  selected.current = identity
+  const { applied, result } = projectDeliveryState(snapshot, resultCommit, observation)
   useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
+  useEffect(() => { setDelivery(undefined); setObservation(undefined); setUncertain(false); setError('') }, [identity])
   const run = async (apply: boolean) => {
     if (disabled || pending.current || !mounted.current || (apply && applied)) return
     pending.current = true; setBusy(true); setError('')
     const input = { sessionId, missionId: snapshot.mission.id }
+    const current = () => mounted.current && selected.current === identity
     try {
-      if (apply) {
-        const response = await request<{ result: DeliveryApplication }>('apply-delivery', input)
-        if (mounted.current) { setResult(response.result); onApplied() }
+      if (apply && uncertain) {
+        const response = await requestWithDeadline<LiveState>(request, 'state', { sessionId })
+        if (current()) {
+          const latest = response.snapshots.find(item => item.mission.id === snapshot.mission.id)
+          const checked = checkDeliveryOutcome(snapshot, resultCommit, latest)
+          if (checked.kind === 'missing') setError(t('The selected mission was not returned. Refresh the state before retrying.'))
+          else {
+            setObservation(checked.observation); setUncertain(false)
+            if (checked.kind === 'retry') setError(t('No successful application receipt was found. You can explicitly retry applying the result.'))
+            onApplied()
+          }
+        }
+      } else if (apply) {
+        const response = await requestWithDeadline<{ result: DeliveryApplication; snapshot?: Snapshot }>(request, 'apply-delivery', input)
+        if (current()) {
+          if (resultCommit) setObservation({ baseSnapshot: snapshot, commit: resultCommit, result: response.result, snapshot: response.snapshot })
+          onApplied()
+        }
       } else {
-        const response = await request<{ delivery: DeliveryInspection }>('delivery', input)
-        if (mounted.current) setDelivery(response.delivery)
+        const response = await requestWithDeadline<{ delivery: DeliveryInspection }>(request, 'delivery', input)
+        if (current()) setDelivery(response.delivery)
       }
     } catch (failure) {
-      if (mounted.current) setError(failure instanceof Error ? failure.message : String(failure))
+      if (current()) {
+        if (apply && failure instanceof RequestDeadlineError) { setUncertain(true); onApplied() }
+        setError(t(failure instanceof Error ? failure.message : String(failure)))
+      }
     } finally {
       pending.current = false
       if (mounted.current) setBusy(false)
@@ -49,7 +76,7 @@ export function DeliveryPanel({ snapshot, sessionId, request, onApplied, disable
     <p>{t('Only changes made after the project snapshot are applied. Your staged changes stay as they are.')}</p>
     <div className="sw-controls">
       <button data-action="view-delivery" disabled={busy || disabled} onClick={() => { void run(false) }}>{t('View changes')}</button>
-      <button data-action="apply-delivery" className="sw-primary" disabled={busy || disabled || applied} onClick={() => { void run(true) }}>{t(applied ? 'Applied' : 'Apply result')}</button>
+      <button data-action="apply-delivery" className="sw-primary" disabled={busy || disabled || applied} onClick={() => { void run(true) }}>{t(applied ? 'Applied' : uncertain ? 'Check application status' : 'Apply result')}</button>
       {busy && <span role="status">{t('Working')}…</span>}
     </div>
     {error && <p className="sw-error" role="alert">{error}</p>}

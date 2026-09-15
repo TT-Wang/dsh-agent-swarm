@@ -22,6 +22,8 @@ export type MemberPhase = 'active' | 'parked' | 'stopped'
 export type EvidenceStatus = 'unverified' | 'verified' | 'challenged' | 'refuted'
 /** Per-task effort dimensions that block the task itself instead of draining the mission budget. */
 export type TaskCeilingDimension = 'maxSteps' | 'maxFindings'
+/** Saved values keep origin labels truthful when canonical drafts are edited. */
+export type TaskCeilingProvenance = Partial<Record<TaskCeilingDimension, { source: 'agent' | 'default'; value: number }>>
 /**
  * Durable per-task ceiling exhaustion. The runtime blocks the task at its own
  * limit and records this reason, so a runaway task never consumes the mission
@@ -332,6 +334,8 @@ export interface Task {
   maxSteps?: number
   /** Per-task finding (published evidence) ceiling admitted with the task. */
   maxFindings?: number
+  /** Explicit agent choices or admission fallbacks; absent on legacy tasks. */
+  ceilingProvenance?: TaskCeilingProvenance
   /** Steps charged to this task's live attempt; durable so a restart cannot reset the ceiling. */
   usedSteps?: number
   /** Durable block reason when the task exhausted one of its own ceilings. */
@@ -496,6 +500,8 @@ export interface NoticeEnvelope {
   sentAt: number
   queuedAt: number
   claimedAt?: number
+  /** Original notice identities carried by a wake summary, independent of its transport identity. */
+  aggregatedIdentities?: Array<{ class: NoticeClass; dedupKey: string; from: string; contentDigest: string }>
 }
 /**
  * Typed durable owner escalation raised by a mission member. A board post is
@@ -737,6 +743,7 @@ export interface PlanTask {
   maxSteps?: number
   /** Per-task finding ceiling; admission derives a bounded default when the plan omits it. */
   maxFindings?: number
+  ceilingProvenance?: TaskCeilingProvenance
   checkTimeoutMs?: number
   priority?: number
   experiment?: boolean
@@ -781,6 +788,13 @@ export interface AutoStart extends RequestStartInput {
   id: string
   ownerSessionId: string
   status: 'planning' | 'launching' | 'running' | 'completed' | 'failed' | 'stopped'
+  /** Durable generation fences late planners after a retry or stop. Legacy rows are epoch 1. */
+  planningEpoch?: number
+  planningDeadlineAt?: number
+  planningFenced?: boolean
+  /** Durable inbox work, replayed by the native planner when the owner is available. */
+  planningDispatchPending?: boolean
+  recoveryNoticePending?: boolean
   draftId?: string
   missionId?: string
   error?: string
@@ -820,6 +834,7 @@ export interface ProposeTaskInput {
   maxSteps?: number
   /** Per-task finding ceiling; admission derives a bounded default when the proposal omits it. */
   maxFindings?: number
+  ceilingProvenance?: TaskCeilingProvenance
   checkTimeoutMs?: number
   priority?: number
   experiment?: boolean
@@ -938,6 +953,8 @@ export interface RuntimeConfig {
   statePath: string
   leaseMs: number
   tickMs: number
+  /** Prelaunch watchdog fallback; the owner can extend it with a reason. */
+  planningTimeoutMs?: number
   maxMessageChars: number
   maxEvents: number
   maxTasksPerMember: number

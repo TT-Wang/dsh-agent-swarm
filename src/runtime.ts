@@ -30,6 +30,17 @@ import type { CheckAttribution, CheckEnvironment, ObservedCheck } from './worksp
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
+/** Release a prelaunch caller even when an adapter ignores cancellation. Its late writes remain fenced. */
+async function abortableStart<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void operation.catch(() => {}); throw signal.reason }
+  let abort!: () => void
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+  })
+  try { return await Promise.race([operation, interrupted]) }
+  finally { signal.removeEventListener('abort', abort) }
+}
 /** Closed board kind vocabulary; a free-form kind is a validation error. */
 const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
 
@@ -846,6 +857,8 @@ export class SwarmRuntime {
       } else if (request.status === 'planning' || request.status === 'launching') {
         request.status = 'failed'
         request.error = 'Host restarted before automatic launch completed. Retry the saved request to continue.'
+        request.recoveryNoticePending = true
+        delete request.planningDispatchPending
       } else continue
       request.updatedAt = Date.now()
       this.store.transaction(() => this.store.put('starts', request))
@@ -942,6 +955,7 @@ export class SwarmRuntime {
       // is wedged in an adapter call or the lock is otherwise held, because the
       // pump reads only durable rows and never takes `exclusive`.
       this.pumpOutbox()
+      this.sweepStarts()
       this.checkSchedulingPasses()
       this.sweepDecisions()
       for (const mission of this.store.list('missions')) {
@@ -1375,8 +1389,16 @@ export class SwarmRuntime {
    * protocol depends on a display name.
    */
   async addMember(actor: Actor, missionId: string, input: { name?: string; role: string; model?: string; provider?: string; reasoningEffort?: string; maxOutputTokens?: number; subscriptions?: string[] }, admittedId?: string): Promise<Member> {
+    const automatic = admittedId ? this.store.list('starts', missionId)[0] : undefined
+    const assertAdmissionCurrent = () => {
+      actor.signal?.throwIfAborted()
+      const current = automatic ? this.store.get('starts', automatic.id) : undefined
+      if (current && ((current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1)
+        || current.planningFenced || current.status === 'failed' || current.status === 'stopped')) throw new Error('Plan assembly was interrupted')
+    }
     return this.exclusive(missionId, async () => {
       const { mission, owner } = this.active(actor, missionId, admittedId !== undefined)
+      assertAdmissionCurrent()
       if (!owner) throw new Error('Only the mission owner can add workers; send a bounded collaborator request')
       if (input.name !== undefined) requireText(input.name, 'name'); requireText(input.role, 'role')
       for (const field of ['provider', 'model', 'reasoningEffort'] as const) if (input[field] !== undefined) requireText(input[field]!, field)
@@ -1391,6 +1413,7 @@ export class SwarmRuntime {
       if (prior) {
         if (prior.missionId !== missionId || (input.name !== undefined && prior.name !== input.name) || memberPhaseOf(prior) === 'stopped') throw new Error('Member admission identity conflict')
         await this.workers.start({ mission, member: prior, ownerSessionId: mission.ownerSessionId })
+        assertAdmissionCurrent()
         return prior
       }
       const members = this.store.list('members', missionId)
@@ -1404,13 +1427,16 @@ export class SwarmRuntime {
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
       await this.assertWorkspaceAuthorized(mission)
+      assertAdmissionCurrent()
       if (!mission.baseline && this.workers.prepareBaseline) {
         const baseline = await this.workers.prepareBaseline(mission, actor.signal)
+        assertAdmissionCurrent()
         const current = this.active(actor, missionId, admittedId !== undefined).mission
         current.baseline = baseline; mission.baseline = baseline
         this.commit(missionId, () => { this.store.put('missions', current); this.store.event(missionId, 'workspace/snapshot', 'runtime', baseline) })
       }
       const workspace = await this.workers.prepareWorkspace(mission, memberId)
+      assertAdmissionCurrent()
       this.active(actor, missionId, admittedId !== undefined)
       // R17-G7: the durable row carries the phase; the in-memory record carries the
       // derivation's own output (a fresh active member owns no attempt), and the
@@ -1420,8 +1446,9 @@ export class SwarmRuntime {
       // derived status is never persisted, not even as an event snapshot.
       const { status: _derivedStatus, ...memberRecord } = member
       this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/added', 'owner', memberRecord) })
-      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
+      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }); assertAdmissionCurrent() }
       catch (error) {
+        assertAdmissionCurrent()
         if (this.shuttingDown || this.mission(missionId).status !== 'active') throw error
         // W8: a provider that rejects the requested reasoning effort must not
         // leave a stopped member behind with an untyped provider error. Retry
@@ -1434,6 +1461,7 @@ export class SwarmRuntime {
           delete fallback.reasoningEffort
           try {
             await this.workers.start({ mission, member: fallback, ownerSessionId: mission.ownerSessionId })
+            assertAdmissionCurrent()
             delete member.reasoningEffort
             this.commit(missionId, () => {
               this.store.put('members', member)
@@ -1442,6 +1470,7 @@ export class SwarmRuntime {
             this.kick(missionId)
             return member
           } catch (retryError) {
+            assertAdmissionCurrent()
             if (this.shuttingDown || this.mission(missionId).status !== 'active') throw retryError
             const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
             member.phase = 'stopped'
@@ -1503,7 +1532,11 @@ export class SwarmRuntime {
         const source = origin?.reviewOf ? this.task(missionId, origin.reviewOf) : origin
         input = { ...input, maxRecoveryAttempts: origin?.maxRecoveryAttempts,
           checkTimeoutMs: origin?.checkTimeoutMs ?? source?.checkTimeoutMs,
-          maxSteps: input.maxSteps ?? origin?.maxSteps, maxFindings: input.maxFindings ?? origin?.maxFindings }
+          maxSteps: input.maxSteps ?? origin?.maxSteps, maxFindings: input.maxFindings ?? origin?.maxFindings,
+          ceilingProvenance: {
+            maxSteps: input.maxSteps == null ? origin?.ceilingProvenance?.maxSteps : input.ceilingProvenance?.maxSteps,
+            maxFindings: input.maxFindings == null ? origin?.ceilingProvenance?.maxFindings : input.ceilingProvenance?.maxFindings,
+          } }
       }
       if (input.maxRecoveryAttempts === undefined) throw new Error('Automatic tasks require a recovery limit chosen by the primary agent')
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new Error('Automatic task checks require a timeout chosen by the primary agent')
@@ -1615,7 +1648,7 @@ export class SwarmRuntime {
     // D1: every admitted task carries its own step/finding ceiling; the runtime
     // blocks the task at that limit instead of letting it drain the mission budget.
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
-    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, proposedBy: key, evidenceIds: [], createdAt: Date.now(), maxSteps: ceilings.maxSteps, maxFindings: ceilings.maxFindings }
+    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
@@ -2683,7 +2716,7 @@ export class SwarmRuntime {
     const now = Date.now()
     const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     const request: AutoStart = { id: id('start'), ownerSessionId: actor.sessionId, commandId: input.commandId, goal, workspace: input.workspace, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source,
-      budget, status: 'planning', createdAt: now, updatedAt: now }
+      budget, status: 'planning', planningEpoch: 1, planningDeadlineAt: now + (this.config.planningTimeoutMs ?? 600000), createdAt: now, updatedAt: now }
     this.commit(request.id, () => {
       this.store.put('starts', request)
       this.store.event(request.id, 'automatic/requested', 'owner', { requestId: request.id, commandId: request.commandId, goal })
@@ -2691,29 +2724,97 @@ export class SwarmRuntime {
     return request
   }
   /** Capture before the owner's planning turn; retries retain the same immutable files. */
-  async prepareStart(actor: Actor, requestId: string): Promise<AutoStart> {
+  async prepareStart(actor: Actor, requestId: string, expectedEpoch?: number): Promise<AutoStart> {
+    const admittedEpoch = expectedEpoch ?? (this.ownedStart(actor, requestId).planningEpoch ?? 1)
     return this.exclusive(requestId, async () => {
       const request = this.ownedStart(actor, requestId)
-      if (!['planning', 'failed'].includes(request.status)) throw new Error('Request is no longer awaiting planning')
+      if (!['planning', 'failed'].includes(request.status) || request.planningFenced || (request.planningEpoch ?? 1) !== admittedEpoch) throw new Error('Request is no longer awaiting planning; inspect the saved request and retry through swarm_control')
       if (request.baseline) return request
       if (!this.workers.prepareBaseline) throw new Error('This worker adapter cannot snapshot a project for automatic planning')
-      // T3e: the synthetic baseline record must carry the request's recorded
-      // authorization. Dropping the source makes the X3 fail-closed rule fence a
-      // session-cwd request before planning (the native /agent-swarm path);
-      // dropping the root loses the grant anchor for a granted request.
-      const baseline = await this.workers.prepareBaseline({
-        id: `mission_draft_${request.id}`,
-        workspace: request.workspace,
-        ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }),
-        ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }),
-      }, actor.signal)
-      actor.signal?.throwIfAborted()
-      const current = this.ownedStart(actor, requestId)
-      if (!['planning', 'failed'].includes(current.status)) throw new Error('Snapshot preparation was interrupted')
-      current.baseline = baseline; current.updatedAt = Date.now()
-      this.commit(request.id, () => { this.store.put('starts', current); this.store.event(request.id, 'workspace/snapshot', 'runtime', baseline) })
-      return current
+      const controller = new AbortController()
+      this.startControllers.set(requestId, controller)
+      const signal = actor.signal ? AbortSignal.any([actor.signal, controller.signal]) : controller.signal
+      try {
+        // T3e: the synthetic baseline record must carry the request's recorded
+        // authorization. Dropping the source makes the X3 fail-closed rule fence a
+        // session-cwd request before planning (the native /agent-swarm path);
+        // dropping the root loses the grant anchor for a granted request.
+        const baseline = await abortableStart(this.workers.prepareBaseline({
+          id: `mission_draft_${request.id}`,
+          workspace: request.workspace,
+          ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }),
+          ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }),
+        }, signal), signal)
+        signal.throwIfAborted()
+        const current = this.ownedStart(actor, requestId)
+        if (!['planning', 'failed'].includes(current.status) || current.planningFenced || (current.planningEpoch ?? 1) !== admittedEpoch) throw new Error('Snapshot preparation was interrupted')
+        current.baseline = baseline; current.updatedAt = Date.now()
+        this.commit(request.id, () => { this.store.put('starts', current); this.store.event(request.id, 'workspace/snapshot', 'runtime', baseline) })
+        return current
+      } finally { if (this.startControllers.get(requestId) === controller) this.startControllers.delete(requestId) }
     })
+  }
+  /** Queue-independent prelaunch watchdog: no mission or worker lease exists yet. */
+  private sweepStarts(): void {
+    for (const request of this.store.list('starts')) {
+      if (!['planning', 'launching'].includes(request.status)) continue
+      const deadline = request.planningDeadlineAt ?? request.updatedAt + (this.config.planningTimeoutMs ?? 600000)
+      if (Date.now() < deadline) continue
+      this.failStart({ sessionId: request.ownerSessionId }, request.id,
+        'Planning or launch exceeded its deadline. The saved request and snapshot are retained. Inspect the request with swarm_observe, then use swarm_control with requestId and action=retry, or action=stop.', request.planningEpoch ?? 1)
+    }
+  }
+  /** Retire an assembly revision before releasing its caller; a hung body cannot hold the saved draft hostage. */
+  private fenceStartDraft(request: AutoStart): void {
+    const draft = request.draftId ? this.store.get('drafts', request.draftId) : undefined
+    if (draft?.status !== 'launching') return
+    draft.status = 'failed'; draft.revision++; draft.updatedAt = Date.now()
+    draft.error = request.error ?? 'Planning attempt was superseded; retry the saved request'
+    this.store.put('drafts', draft)
+  }
+  /** Owner decisions before mission activation never wait behind snapshot or launch I/O. */
+  controlStart(actor: Actor, requestId: string, action: 'retry' | 'stop' | 'extend', reason: string, timeoutMs?: number): AutoStart {
+    const request = this.ownedStart(actor, requestId)
+    this.bounded(reason)
+    if (!['retry', 'stop', 'extend'].includes(action)) throw new Error('Unknown automatic request action; use retry, stop or extend')
+    if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(Date.now() + timeoutMs))) throw new Error('timeoutMs must be a positive safe duration in milliseconds')
+    const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
+    if (mission && mission.status !== 'staged') throw new Error('This request already launched; control its missionId instead')
+    if (action === 'extend') {
+      if (!['planning', 'launching'].includes(request.status)) throw new Error('Only an active planning request can be extended; use retry for a failed request')
+      request.planningDeadlineAt = Date.now() + (timeoutMs ?? this.config.planningTimeoutMs ?? 600000)
+    } else {
+      if (action === 'retry' && request.status !== 'failed') throw new Error('Only a failed automatic request can be retried; stop an unwanted request or extend active planning')
+      if (action === 'retry' && this.starts(actor).some(other => other.id !== requestId && ['planning', 'launching', 'running'].includes(other.status))) throw new Error('This session already has an automatic swarm request in progress')
+      if (action === 'stop' && request.status === 'stopped') return request
+      this.startControllers.get(requestId)?.abort(new Error(reason))
+      request.planningEpoch = (request.planningEpoch ?? 1) + 1
+      request.status = action === 'stop' ? 'stopped' : 'planning'
+      request.planningFenced = action === 'stop'
+      request.planningDispatchPending = action === 'retry'
+      delete request.recoveryNoticePending
+      if (action === 'retry') {
+        request.planningDeadlineAt = Date.now() + (timeoutMs ?? this.config.planningTimeoutMs ?? 600000)
+        delete request.error
+      } else request.error = reason
+    }
+    request.updatedAt = Date.now()
+    this.commit(request.missionId ?? request.id, () => {
+      this.store.put('starts', request)
+      if (action !== 'extend') this.fenceStartDraft(request)
+      this.store.event(request.missionId ?? request.id, action === 'stop' ? 'automatic/failed' : 'automatic/requested', 'owner', { requestId, action, reason, planningEpoch: request.planningEpoch, deadline: request.planningDeadlineAt })
+    })
+    if (action === 'stop' && mission?.status === 'staged') this.control(actor, mission.id, 'stop', reason)
+    return request
+  }
+  /** Inbox admission acknowledgement is a generation-checked durable write. */
+  ackStartMessage(actor: Actor, requestId: string, epoch: number, kind: 'planning' | 'failure'): void {
+    const request = this.ownedStart(actor, requestId)
+    if ((request.planningEpoch ?? 1) !== epoch) return
+    const field = kind === 'planning' ? 'planningDispatchPending' : 'recoveryNoticePending'
+    if (!request[field]) return
+    delete request[field]
+    this.commit(request.missionId ?? request.id, () => this.store.put('starts', request))
   }
   /** Keep the journal synchronized inside the same transaction as mission control. */
   private syncStarts(mission: Mission): void {
@@ -2722,12 +2823,14 @@ export class SwarmRuntime {
       request.status = mission.status === 'completed' ? 'completed' : mission.status === 'stopped' ? 'stopped' : 'running'
       request.budget = { ...mission.budget }
       request.updatedAt = Date.now(); delete request.error
+      delete request.planningDispatchPending; delete request.recoveryNoticePending
       this.store.put('starts', request)
     }
   }
   /** Record an admission failure without revoking an already launched mission. */
-  failStart(actor: Actor, requestId: string, reason: string): AutoStart {
+  failStart(actor: Actor, requestId: string, reason: string, expectedEpoch?: number): AutoStart {
     const request = this.ownedStart(actor, requestId)
+    if (expectedEpoch !== undefined && (request.planningEpoch ?? 1) !== expectedEpoch) return request
     this.bounded(reason)
     const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
     if (mission && mission.status !== 'staged') {
@@ -2736,9 +2839,12 @@ export class SwarmRuntime {
     }
     if (request.status === 'stopped' || request.status === 'completed') return request
     request.status = 'failed'; request.error = reason; request.updatedAt = Date.now()
+    request.planningFenced = true; request.recoveryNoticePending = true
+    delete request.planningDispatchPending
     this.startControllers.get(requestId)?.abort(new Error(reason))
     this.commit(request.missionId ?? request.id, () => {
       this.store.put('starts', request)
+      this.fenceStartDraft(request)
       this.store.event(request.missionId ?? request.id, 'automatic/failed', 'runtime', { requestId, reason })
     })
     return request
@@ -2790,9 +2896,11 @@ export class SwarmRuntime {
    * while the primary agent chooses its resource budget. Retries resume the same
    * draft/member identities and accounting, including after interrupted assembly.
    */
-  async startPlan(actor: Actor, requestId: string, input: PlanInput): Promise<Snapshot> {
+  async startPlan(actor: Actor, requestId: string, input: PlanInput, planningEpoch?: number): Promise<Snapshot> {
+    const admittedEpoch = planningEpoch ?? 1
     return this.exclusive(requestId, async () => {
       let request = this.ownedStart(actor, requestId)
+      if ((request.planningEpoch ?? 1) !== admittedEpoch || request.planningFenced) throw new Error('Planning attempt is stale or cancelled. Inspect the saved request; retry a failed request with swarm_control, then pass its current planningEpoch to swarm_launch.')
       const priorMission = request.missionId ? this.store.get('missions', request.missionId) : undefined
       if (priorMission && priorMission.status !== 'staged') {
         if (priorMission.status === 'stopped') throw new Error('Automatic mission was stopped; start a new request to continue')
@@ -2800,6 +2908,7 @@ export class SwarmRuntime {
         return this.snapshot(actor, priorMission.id)
       }
       if (request.status === 'stopped' || request.status === 'completed') throw new Error('Automatic request cannot be launched in its current state')
+      if (this.starts(actor).some(other => other.id !== requestId && ['planning', 'launching', 'running'].includes(other.status))) throw new Error('This session already has an automatic swarm request in progress')
       const controller = new AbortController()
       this.startControllers.set(requestId, controller)
       const launchActor: Actor = { sessionId: actor.sessionId, signal: actor.signal ? AbortSignal.any([actor.signal, controller.signal]) : controller.signal }
@@ -2810,13 +2919,14 @@ export class SwarmRuntime {
         request.draftId ??= `draft_${request.id}`
         request.missionId ??= `mission_${request.draftId}`
         request.status = 'launching'; request.updatedAt = Date.now(); delete request.error
+        request.planningDeadlineAt = Math.max(request.planningDeadlineAt ?? 0, Date.now() + (this.config.planningTimeoutMs ?? 600000))
         this.commit(request.id, () => this.store.put('starts', request))
         launchActor.signal!.throwIfAborted()
         // Saving the deterministic link before the draft makes a crash between
         // these commits recoverable without creating an orphan or a duplicate.
         const draft = existing ?? this.createDraft(launchActor, plan, request.draftId)
         launchActor.signal!.throwIfAborted()
-        const snapshot = await this.launchDraft(launchActor, draft.id, draft.revision)
+        const snapshot = await abortableStart(this.launchDraft(launchActor, draft.id, draft.revision), launchActor.signal!)
         // The activation commit is authoritative even if cancellation raced its
         // acknowledgment; never report an active mission as an unlaunched retry.
         this.commit(snapshot.mission.id, () => {
@@ -2835,7 +2945,7 @@ export class SwarmRuntime {
           request = this.store.get('starts', requestId)!
           const mission = request.missionId ? this.store.get('missions', request.missionId) : undefined
           if (mission && mission.status !== 'staged') this.commit(mission.id, () => this.syncStarts(mission))
-          else {
+          else if ((request.planningEpoch ?? 1) === admittedEpoch && !request.planningFenced && request.status !== 'stopped') {
             request.status = 'failed'; request.error = String(error).slice(0, this.config.maxMessageChars); request.updatedAt = Date.now()
             this.commit(request.missionId ?? request.id, () => {
               this.store.put('starts', request)
@@ -2949,6 +3059,13 @@ export class SwarmRuntime {
       if (draft.revision !== revision) throw new Error('Draft changed; reload before launching')
       if (!['draft', 'failed'].includes(draft.status)) throw new Error('Draft cannot be launched in its current state')
       const automatic = this.store.list('starts').find(request => request.draftId === draft.id)
+      const assertCurrent = () => {
+        actor.signal?.throwIfAborted()
+        const current = automatic ? this.store.get('starts', automatic.id) : undefined
+        if (current && (current.planningFenced || current.status === 'failed' || current.status === 'stopped'
+          || (current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1))) throw new Error('Plan assembly was interrupted')
+      }
+      assertCurrent()
       const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input)
       draft.input = input
       draft.status = 'launching'; draft.revision++; draft.updatedAt = Date.now(); delete draft.error
@@ -2965,7 +3082,11 @@ export class SwarmRuntime {
           mission = this.create(actor, { title, objective, workspace, ...(anchor === undefined ? {} : { workspaceGrantRoot: anchor }), ...(source === undefined ? {} : { workspaceAuthorizationSource: source }), scope, acceptance, budget }, { id: missionId, status: 'staged' })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new Error('The partially assembled mission cannot be launched')
-        for (const member of input.members) await this.addMember(actor, missionId, member, `member_${draft.id}_${member.key}`)
+        for (const member of input.members) {
+          assertCurrent()
+          await this.addMember(actor, missionId, member, `member_${draft.id}_${member.key}`)
+        }
+        assertCurrent()
         for (const stream of input.workstreams) this.workstream(actor, missionId, stream, `stream_${draft.id}_${stream.key}`)
         for (const task of orderedTasks(input.tasks)) this.propose(actor, missionId, {
           ...task, workstreamId: `stream_${draft.id}_${task.workstreamKey}`,
@@ -2974,20 +3095,10 @@ export class SwarmRuntime {
           reviewOf: task.reviewOf ? `task_${draft.id}_${task.reviewOf}` : undefined,
         }, `task_${draft.id}_${task.key}`)
         mission = this.active(actor, missionId, true).mission
-        // S5c: the launch's cancellation decision is durable, not the in-memory
-        // abort handle. `failStart` records the failed request durably (the
-        // mission is still staged here, so it takes the failing branch); re-read
-        // it before activation so a launch cancelled while it was assembling
-        // cannot bring a mission active just because `startControllers` was lost
-        // or raced. A retry calls `startPlan` again, which sets the request back
-        // to `launching`, so only a change that happened after THIS launch began
-        // is honoured. The refusal reuses this site's existing message: the
-        // control-path refusal inventory on the serialized files must not grow,
-        // and the durable `automatic/failed` event `failStart` wrote already
-        // carries the cancellation reason.
-        const inFlight = automatic === undefined ? undefined : this.store.get('starts', automatic.id)
-        const cancelled = inFlight !== undefined && (inFlight.status === 'failed' || inFlight.status === 'stopped')
-        if (cancelled || mission.status !== 'staged') throw new Error('Plan assembly was interrupted')
+        // Re-read the durable generation after every admission commit; a lost
+        // abort handle cannot revive a cancelled or superseded assembly.
+        assertCurrent()
+        if (mission.status !== 'staged') throw new Error('Plan assembly was interrupted')
         mission.status = 'active'; mission.updatedAt = Date.now(); mission.deadline = Date.now() + mission.budget.maxDurationMs
         draft.status = 'launched'; draft.updatedAt = Date.now()
         this.commit(missionId, () => {
@@ -2999,7 +3110,7 @@ export class SwarmRuntime {
         return this.snapshot(actor, missionId)
       } catch (error) {
         draft.status = 'failed'; draft.error = String(error); draft.updatedAt = Date.now()
-        if (!this.closed) this.commit(draft.id, () => this.store.put('drafts', draft))
+        if (!this.closed && this.store.get('drafts', draft.id)?.revision === draft.revision) this.commit(draft.id, () => this.store.put('drafts', draft))
         throw error
       }
     })
@@ -3312,6 +3423,7 @@ export class SwarmRuntime {
   control(actor: Actor, missionId: string, action: 'pause' | 'resume' | 'stop' | 'complete' | 'coordinator', reason: string, coordinatorId?: string): Mission {
     const { mission, owner } = this.participant(actor, missionId)
     if (!owner) throw new Error('Only the user session controls mission lifecycle and coordinator appointment')
+    if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new Error('Unknown mission control action; retry and extend require a prelaunch requestId')
     this.bounded(reason)
     if (terminal(mission)) throw new Error('Mission is terminal; create a new mission to continue')
     if (mission.status === 'staged' && action !== 'stop') throw new Error('Use the saved plan launch action to activate staged work')

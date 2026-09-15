@@ -194,7 +194,8 @@ test('a reentrant failure while assembly waits fences activation and permits sav
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
   f.workers.onStart = async () => {}
-  await f.runtime.startPlan(f.owner, request.id, f.input)
+  const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Continue the saved plan')
+  await f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
   assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
   assert.equal(f.workers.prepared.length, 2)
 })
@@ -545,4 +546,170 @@ test('restart trusts an already activated mission when the last launch acknowled
     recovered.control(f.owner, replay.mission.id, 'stop', 'Stop after recovery')
     assert.equal(recovered.starts(f.owner)[0].status, 'stopped')
   } finally { await recovered.dispose() }
+})
+
+test('prelaunch deadline releases the session without a mission and queues durable owner recovery', async t => {
+  const f = await fixture(t)
+  await f.runtime.start()
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  request.planningDeadlineAt = Date.now() - 1
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', request))
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed')
+  const failed = f.runtime.starts(f.owner)[0]
+  assert.equal(failed.planningFenced, true)
+  assert.equal(failed.recoveryNoticePending, true)
+  assert.equal(f.runtime.list(f.owner.sessionId).length, 0)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /stale|cancelled/)
+  const next = f.runtime.requestStart(f.owner, { ...f.requestInput, commandId: 'new-request' })
+  assert.equal(next.status, 'planning')
+  assert.throws(() => f.runtime.controlStart(f.owner, request.id, 'retry', 'resume'), /in progress/)
+  f.runtime.controlStart(f.owner, next.id, 'stop', 'Use the saved snapshot instead')
+  const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'resume')
+  assert.equal(retry.planningDispatchPending, true)
+  assert.equal(retry.recoveryNoticePending, undefined)
+  assert.equal(retry.planningEpoch, 2)
+  f.runtime.failStart(f.owner, request.id, 'late callback', 1)
+  f.runtime.ackStartMessage(f.owner, request.id, 1, 'planning')
+  assert.equal(f.runtime.starts(f.owner)[0].status, 'planning')
+  assert.equal(f.runtime.starts(f.owner)[0].planningDispatchPending, true)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input, 1), /stale/)
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input, 2)
+  assert.equal(snapshot.mission.status, 'active')
+})
+
+test('stop releases an uncooperative snapshot and late completion cannot overwrite its retry', async t => {
+  const f = await fixture(t)
+  const entered = deferred(), gate = deferred()
+  const baseline = { sourceHead: 'head', snapshotCommit: 'snapshot', planningWorkspace: '/snapshot' }
+  f.workers.prepareBaseline = async () => { entered.resolve(); await gate.promise; return baseline }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const prepare = f.runtime.prepareStart(f.owner, request.id)
+  const rejected = assert.rejects(prepare, /user stop/)
+  await entered.promise
+  const stopped = f.runtime.controlStart(f.owner, request.id, 'stop', 'user stop')
+  await rejected
+  assert.equal(stopped.status, 'stopped')
+  gate.resolve(); await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.runtime.starts(f.owner)[0].baseline, undefined)
+  assert.equal(f.runtime.starts(f.owner)[0].status, 'stopped')
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /stale|cancelled/)
+  assert.throws(() => f.runtime.controlStart({ sessionId: 'stranger' }, request.id, 'retry', 'resume'), /not owned/)
+  assert.throws(() => f.runtime.controlStart(f.owner, request.id, 'retry', 'resume'), /Only a failed/)
+})
+
+test('planning retry preserves frozen baseline and usage and extension is an owner decision', async t => {
+  const f = await fixture(t)
+  const baseline = { sourceHead: 'head', snapshotCommit: 'snapshot', planningWorkspace: '/snapshot' }
+  f.workers.prepareBaseline = async () => baseline
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const ready = await f.runtime.prepareStart(f.owner, request.id)
+  ready.ownerUsage = { inputTokens: 300, outputTokens: 40, cacheReadTokens: 20, cacheWriteTokens: 0 }
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', ready))
+  f.runtime.failStart(f.owner, request.id, 'planner interrupted', 1)
+  const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Continue from saved context')
+  assert.deepEqual(retry.baseline, baseline)
+  assert.deepEqual(retry.ownerUsage, ready.ownerUsage)
+  assert.deepEqual((await f.runtime.prepareStart(f.owner, request.id, 2)).baseline, baseline)
+  const deadline = retry.planningDeadlineAt
+  assert.throws(() => f.runtime.controlStart(f.owner, request.id, 'extend', 'more time', 0), /positive/)
+  const extended = f.runtime.controlStart(f.owner, request.id, 'extend', 'large repository inspection', 1800000)
+  assert.ok(extended.planningDeadlineAt > deadline)
+  assert.equal(extended.planningEpoch, 2)
+  f.runtime.ackStartMessage(f.owner, request.id, 2, 'planning')
+  assert.equal(f.runtime.starts(f.owner)[0].planningDispatchPending, undefined)
+})
+
+test('an expired launch settles before an uncooperative adapter and cannot resurrect after retry', async t => {
+  const f = await fixture(t)
+  await f.runtime.start()
+  const entered = deferred(), gate = deferred()
+  f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const pending = f.runtime.startPlan(f.owner, request.id, f.input)
+  const rejected = assert.rejects(pending, /deadline/)
+  await entered.promise
+  const launching = f.runtime.starts(f.owner)[0]
+  launching.planningDeadlineAt = Date.now() - 1
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', launching))
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed')
+  await rejected
+  const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Resume retained assembly')
+  gate.resolve(); await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.runtime.starts(f.owner)[0].status, 'planning', 'old failure cannot overwrite retry')
+  assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged', 'old assembly cannot activate')
+  f.workers.onStart = async () => {}
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+  assert.equal(snapshot.mission.id, launching.missionId)
+  assert.equal(snapshot.mission.status, 'active')
+})
+
+test('prelaunch-only actions cannot accidentally stop an active mission', async t => {
+  const f = await fixture(t)
+  const { snapshot } = await launch(f)
+  for (const action of ['retry', 'extend', 'unknown']) {
+    assert.throws(() => f.runtime.control(f.owner, snapshot.mission.id, action, 'invalid target'), /Unknown mission control/)
+    assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status, 'active')
+  }
+})
+
+test('retry can activate the saved draft while its cancelled adapter call is still hung', async t => {
+  const f = await fixture(t)
+  f.config.stallPassTimeoutMs = 25
+  const entered = deferred(), gate = deferred()
+  f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const original = f.runtime.startPlan(f.owner, request.id, f.input)
+  const rejected = assert.rejects(original, /cancelled hung launch/)
+  await entered.promise
+  f.runtime.failStart(f.owner, request.id, 'cancelled hung launch')
+  await rejected
+  const saved = f.runtime.starts(f.owner)[0]
+  assert.equal(f.runtime.store.get('drafts', saved.draftId).status, 'failed')
+  const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover without waiting for old adapter')
+  f.workers.onStart = async () => {}
+  const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'running')
+  const snapshot = await launch
+  assert.equal(snapshot.mission.id, saved.missionId)
+  gate.resolve(); await new Promise(resolve => setImmediate(resolve))
+  assert.equal(f.runtime.store.get('drafts', saved.draftId).status, 'launched')
+  assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
+})
+
+test('stopping partially assembled planning also retires its staged mission', async t => {
+  const f = await fixture(t)
+  f.workers.onStart = async () => { throw new Error('adapter unavailable') }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /adapter unavailable/)
+  const failed = f.runtime.starts(f.owner)[0]
+  assert.equal(f.runtime.store.get('missions', failed.missionId).status, 'staged')
+  f.runtime.controlStart(f.owner, request.id, 'stop', 'Cancel this request')
+  assert.equal(f.runtime.store.get('missions', failed.missionId).status, 'stopped')
+  assert.equal(f.runtime.starts(f.owner)[0].status, 'stopped')
+})
+
+test('late failure from a superseded startup cannot stop the successfully retried member', async t => {
+  for (const loseAbortHandle of [false, true]) {
+    const f = await fixture(t)
+    f.config.stallPassTimeoutMs = 25
+    const entered = deferred(), gate = Promise.withResolvers()
+    f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
+    const request = f.runtime.requestStart(f.owner, f.requestInput)
+    const original = f.runtime.startPlan(f.owner, request.id, f.input)
+    const rejected = assert.rejects(original, /cancel|interrupted|old provider/)
+    await entered.promise
+    if (loseAbortHandle) f.runtime.startControllers.clear()
+    f.runtime.failStart(f.owner, request.id, 'cancel old startup')
+    const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover saved plan')
+    f.workers.onStart = async () => {}
+    const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    await eventually(() => f.runtime.starts(f.owner)[0].status === 'running')
+    const snapshot = await launch
+    const reviewer = snapshot.members.find(member => member.name === 'Reviewer')
+    gate.reject(new Error('old provider startup eventually failed'))
+    await rejected; await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.runtime.store.get('members', reviewer.id).phase, 'active')
+    assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
+    assert.equal(f.runtime.store.events(snapshot.mission.id, 1000).filter(event => event.type === 'member/failed').length, 0)
+  }
 })
