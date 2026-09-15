@@ -13,7 +13,7 @@ import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
+import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 export const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -268,19 +268,33 @@ export class RuntimeGates {
   }
 
   /** Reconcile durable Harness usage cumulatively, including after a crash before SQLite accounting. */
-  async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> {
+  async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets, source?: UsageSnapshotSource): Promise<void> {
     if (this.rt.closed) return
     if (!Number.isSafeInteger(totalTokens) || totalTokens < 0) throw new Error('Invalid authoritative usage snapshot')
     if (usage !== undefined && !validUsage(usage)) throw new Error('Invalid usage buckets')
+    if (source !== undefined && (!Number.isSafeInteger(source.generation) || source.generation < 0 || typeof source.restored !== 'boolean')) throw new Error('Invalid usage session generation')
     const member = this.rt.store.get('members', memberId)
     if (!member) throw new Error('Unknown worker in usage accounting')
     const mission = this.rt.mission(member.missionId)
-    const previouslyAccounted = member.accountedTokens ?? 0
-    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, member.usage)
-    if (totalTokens <= previouslyAccounted && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0))) return
-    member.accountedTokens = Math.max(previouslyAccounted, totalTokens)
-    mission.usedTokens += Math.max(0, totalTokens - previouslyAccounted)
-    if (bucketDelta !== undefined) { member.usage = usage; mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
+    // New native sessions restart their cumulative log at zero. Never use a
+    // member's lifetime total as that new log's watermark or erase old costs.
+    // A late observation from a retired generation must not reopen its ledger.
+    if (source !== undefined && member.usageSession !== undefined && source.generation < member.usageSession.generation) return
+    const sameSession = source !== undefined && member.usageSession?.generation === source.generation
+    const migrate = source !== undefined && member.usageSession === undefined && source.restored
+    const previous = source === undefined || migrate ? { accountedTokens: member.accountedTokens ?? 0, usage: member.usage }
+      : sameSession ? member.usageSession! : { accountedTokens: 0, usage: undefined }
+    const tokenDelta = Math.max(0, totalTokens - previous.accountedTokens)
+    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, previous.usage)
+    if (tokenDelta === 0 && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0)) && (source === undefined || sameSession)) return
+    member.accountedTokens = (member.accountedTokens ?? 0) + tokenDelta
+    mission.usedTokens += tokenDelta
+    if (bucketDelta !== undefined) { member.usage = addUsage(member.usage, bucketDelta); mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
+    if (source !== undefined) member.usageSession = {
+      generation: source.generation,
+      accountedTokens: Math.max(previous.accountedTokens, totalTokens),
+      ...(bucketDelta === undefined ? previous.usage === undefined ? {} : { usage: previous.usage } : { usage: addUsage(previous.usage, bucketDelta) }),
+    }
     this.rt.commit(mission.id, () => { this.rt.store.put('members', member); this.rt.store.put('missions', mission) })
     this.warnBudget(mission)
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)

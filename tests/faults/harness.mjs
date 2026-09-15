@@ -150,7 +150,7 @@ export class WorkspaceWorkers extends FakeWorkers {
  * Runtime + mission + two members + a propose helper. The runtime, store,
  * admission, scheduler and outbox are real; only the adapter is controlled.
  */
-export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['true'], workspace } = {}) {
+export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace } = {}) {
   const dir = await realpath(await tempDirectory('swarm-faults-'))
   const runtime = new SwarmRuntime({
     statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,

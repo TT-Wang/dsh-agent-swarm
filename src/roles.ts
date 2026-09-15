@@ -50,10 +50,11 @@ export class RoleScoper {
     if (starts.some(start => start.status === 'failed' && (start.recoveryNoticePending
       || (handling?.admitted.has(recoveryKey(start.id, start.planningEpoch)) && !handled?.has(recoveryKey(start.id, start.planningEpoch)))))) return 'owner'
     if (missions.some(mission => (mission.status !== 'stopped' && this.runtime.openAsks(mission.id, 'owner').length > 0)
-      // Completed missions still deliver queued notices, including legacy
-      // completion rows classified as decisions. Stopped missions mute them.
+      // Keep final facts (including legacy completion decisions) until handled;
+      // a stale action the outbox will not send cannot pin the large protocol.
       || (mission.status === 'completed' && this.runtime.store.list('deliveries', mission.id)
-        .some(delivery => delivery.to === 'owner' && delivery.notice !== undefined && !handled?.has(delivery.id))))) return 'owner'
+        .some(delivery => delivery.to === 'owner' && delivery.notice !== undefined && !handled?.has(delivery.id)
+          && this.runtime.ownerDeliveryRelevant(mission, delivery))))) return 'owner'
     // Claiming a notice happens before prompt assembly. Do not shorten the
     // protocol midway through the turn that closes the last obligation.
     if (agent.status !== 'idle' && this.applied.get(sessionId)?.role === 'owner') return 'owner'

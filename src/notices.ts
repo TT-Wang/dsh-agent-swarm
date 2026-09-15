@@ -225,7 +225,7 @@ export const NOTICE_TEMPLATES = {
   stall: {
     trigger: 'mission/stalled',
     build: (input: { reason: string; detail: string; subjects: readonly string[] }) =>
-      `Mission stalled: no task can be scheduled and workers are idle. ${input.reason}. Unschedulable: ${input.detail || 'none'}. Subjects: ${input.subjects.join(', ')}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`,
+      `Mission stalled: no task can be scheduled and workers are idle. ${input.reason}. Unschedulable: ${input.detail || 'none'}. Subjects: ${input.subjects.join(', ')}. Decide: amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose, or adjust the budget. If work is no longer required, withdraw it explicitly with swarm_cancel; completing a mission never cancels unfinished tasks. Use swarm_control stop to stop the mission.`,
   },
   parked: {
     trigger: 'member/waiting',
@@ -291,7 +291,7 @@ const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
  * dedup key the runtime itself writes (never from prose), because that key is the
  * identity the notice ledger and the dedup logic already use.
  */
-const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'guard-terminal', 'integration-gap', 'parked', 'review-blocked'] as const
+const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'guard-terminal', 'integration-gap', 'parked', 'review-blocked', 'obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'] as const
 /**
  * The families whose claim is "no live path will advance this subject". Only
  * these can be false wakes when the named subject's lineage is live. A
@@ -299,6 +299,7 @@ const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'gu
  * and is deliberately not judged by the wake-precision predicate.
  */
 const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])
+const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])
 
 /** R16-A: the family of one durable owner notice, from its dedup key or class. */
 export function noticeFamily(delivery: Pick<Delivery, 'notice' | 'kind'>): string {
@@ -349,6 +350,7 @@ export interface LineageRuntime {
   readonly stallPassTimeoutMs: number
   latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
+  reviewable(task: Task, tasks: Task[]): boolean
 }
 
 /**
@@ -418,6 +420,10 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   // attempt at all is unrecognised.
   if (task.status === 'running') return task.attempt !== undefined
   if (task.status === 'submitted') {
+    // Submission remains in this state for the entire independent review. Use
+    // the dispatcher's live-review rule, including an admitted/parked review,
+    // rather than mistaking the end of the admission grace for a stalled task.
+    if (rt.reviewable(task, tasks)) return true
     const submission = rt.latestSubmission(task.missionId, task.id)
     return submission === undefined || submission.age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
@@ -623,9 +629,13 @@ export class Notices {
     // fact is carried by the window's degraded summary instead of being dropped.
     const summary = this.wakeWindowFor(missionId, at)
     if (summary !== undefined && summary.count >= this.wakeBudget) {
-      this.appendToWakeSummary(missionId, summary, fact?.facts ?? [`[${fact?.trigger ?? noticeClass}] ${content}`], [{
+      const facts = fact?.facts ?? [`[${fact?.trigger ?? noticeClass}] ${content}`]
+      this.appendToWakeSummary(missionId, summary, facts, [{
         class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
-      }, ...(fact?.aggregatedIdentities ?? [])], at)
+      }, ...(fact?.aggregatedIdentities ?? [])], at, {
+        class: noticeClass, dedupKey, from, subjects: fact?.subjects ?? [],
+        trigger: fact?.trigger ?? noticeClass, reason: fact?.reason ?? '', createdAt: at,
+      })
       return undefined
     }
     const { fact: _fact, ...deliveryExtra } = extra
@@ -670,13 +680,15 @@ export class Notices {
    * written with the content: the summary's transport key must never replace
    * the class, sender and key used to deduplicate its constituent facts.
    */
-  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, addedFacts: string[], identities: NonNullable<NoticeRow['aggregatedIdentities']>, at: number): void {
+  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, addedFacts: string[], identities: NonNullable<NoticeRow['aggregatedIdentities']>, at: number, constituent: Omit<NonNullable<NoticeRow['aggregatedFacts']>[number], 'factStart' | 'factCount'>): void {
     const existing = window.summaryId === undefined ? undefined : this.rt.store.get('deliveries', window.summaryId)
     if (existing !== undefined && existing.deliveredAt === undefined && existing.notice !== undefined) {
       const row = noticeRow(existing)!
+      const factStart = row.facts?.length ?? 0
       const facts = [...(row.facts ?? []), ...addedFacts]
       row.facts = facts
       row.aggregatedIdentities = [...(row.aggregatedIdentities ?? []), ...identities]
+      row.aggregatedFacts = [...(row.aggregatedFacts ?? []), { ...constituent, factStart, factCount: addedFacts.length }]
       existing.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, facts, missionId, existing.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
       this.rt.store.put('deliveries', existing)
       return
@@ -684,7 +696,7 @@ export class Notices {
     const summary: Delivery = {
       id: id('msg'), missionId, from: 'runtime', to: 'owner', kind: 'control',
       content: '', createdAt: at,
-      notice: { dedupKey: `wake-budget:${missionId}:${window.startedAt}`, class: 'decision', sentAt: at, queuedAt: at, facts: addedFacts, aggregatedIdentities: identities, trigger: 'wake-budget', reason: 'per-owner wake budget exceeded' } as NonNullable<Delivery['notice']>,
+      notice: { dedupKey: `wake-budget:${missionId}:${window.startedAt}`, class: 'decision', sentAt: at, queuedAt: at, facts: addedFacts, aggregatedIdentities: identities, aggregatedFacts: [{ ...constituent, factStart: 0, factCount: addedFacts.length }], trigger: 'wake-budget', reason: 'per-owner wake budget exceeded' } as NonNullable<Delivery['notice']>,
     }
     summary.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, addedFacts, missionId, summary.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
     window.summaryId = summary.id
@@ -968,21 +980,14 @@ export class Notices {
       const fact = noticeRow(delivery)
       if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined
         || ['progress', 'completion'].includes(fact.class)
-        || ['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'].includes(noticeFamily(delivery))) continue
+        || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
       if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
-      const unresolved = (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
-        if (subject === missionSubject(mission)) {
-          if (fact.class === 'budget') {
-            return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
-          }
-          return mission.status === 'blocked' || mission.budgetPause !== undefined || view.stalled
-            || (view.tasks.length > 0 && view.nonTerminal.length === 0)
-        }
-        const task = taskFromSubject(subject, view.tasks)
-        return task !== undefined && !TERMINAL_STATES.has(task.status) && !this.waitsLegitimately(task, view.tasks)
-      })
+      const unresolved = this.unresolvedSubjects(view, delivery)
       if (unresolved.length === 0) continue
+      const priorContent = fact.aggregatedFacts === undefined ? delivery.content
+        : fact.aggregatedFacts.filter(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
+          .flatMap(part => this.summaryFactText(delivery, part)).join('\n')
       this.rt.commit(mission.id, () => {
         const current = this.rt.store.get('deliveries', delivery.id)
         const currentFact = current === undefined ? undefined : noticeRow(current)
@@ -990,10 +995,100 @@ export class Notices {
         currentFact.followupCount = spent + 1
         currentFact.followupAt = now
         this.rt.store.put('deliveries', current)
-        this.notify(mission.id, `Owner decision still unresolved (reminder ${spent + 1} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(delivery.content, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${spent + 1 === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
+        this.notify(mission.id, `Owner decision still unresolved (reminder ${spent + 1} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(priorContent, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${spent + 1 === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
           { dedupe: true, dedupKey: `obligation-followup:${delivery.id}:${spent + 1}`, trigger: 'owner-decision-unresolved', reason: delivery.id, stampWitness: false })
       })
     }
+  }
+
+  /** The current obligation, shared by reminder generation and queued reminders. */
+  private unresolvedSubjects(view: MissionInterpretation, delivery: Delivery): string[] {
+    const mission = view.mission
+    if (!['active', 'blocked'].includes(mission.status)) return []
+    if (delivery.notice !== undefined && (['progress', 'completion'].includes(delivery.notice.class)
+      || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery)))) return []
+    if (delivery.notice?.aggregatedFacts !== undefined) {
+      return [...new Set(delivery.notice.aggregatedFacts.flatMap(fact => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, fact))))]
+    }
+    return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
+      if (subject === missionSubject(mission)) {
+        if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
+        return mission.status === 'blocked' || mission.budgetPause !== undefined || view.stalled
+          || (view.tasks.length > 0 && view.nonTerminal.length === 0)
+      }
+      const task = taskFromSubject(subject, view.tasks)
+      return task !== undefined && !TERMINAL_STATES.has(task.status) && !this.waitsLegitimately(task, view.tasks)
+    })
+  }
+
+  /**
+   * Recheck actionable notices at the last outbox boundary and when selecting
+   * the owner's protocol. Superseded decisions stay in the durable ledger;
+   * they are not relabelled as delivered. Unclassified legacy facts and final
+   * results remain deliverable because completion can overtake the outbox.
+   */
+  ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean {
+    if (ownerDeliveryMoot(mission, delivery)) return false
+    const fact = noticeRow(delivery)
+    if (fact === undefined || fact.class === 'completion' || fact.class === 'progress') return true
+    if (fact.aggregatedFacts !== undefined) return this.relevantSummaryFacts(mission, delivery).length > 0
+    const family = noticeFamily(delivery)
+    if (mission.status === 'completed' && (['budget', 'stall', 'blocker'].includes(fact.class)
+      || ((DECISION_FAMILIES as readonly string[]).includes(family) && !family.startsWith('owner-reply-')))) return false
+    if (family === 'obligation-followup') {
+      const original = fact.reason === undefined ? undefined : this.rt.store.get('deliveries', fact.reason)
+      return this.unresolvedSubjects(this.interpretation(mission.id), original ?? delivery).length > 0
+    }
+    if (family === 'review-blocked' || family === 'fallthrough' || family === 'stall-root'
+      || family === 'dispatch-question' || family === 'parked') {
+      const tasks = this.rt.store.list('tasks', mission.id)
+      const subjects = delivery.subjects ?? fact.subjects ?? []
+      // Old unattributed rows cannot be judged from their text alone.
+      if (subjects.length === 0) return true
+      // A batch asserts the condition for every named subject. If one changes,
+      // the transition publisher emits the remaining subjects as a fresh fact.
+      return subjects.every(subject => {
+        if (subject === missionSubject(mission)) return true
+        const task = taskFromSubject(subject, tasks)
+        if (task === undefined || TERMINAL_STATES.has(task.status)) return false
+        if (family === 'review-blocked') return task.status === 'submitted' && !this.rt.reviewable(task, tasks)
+        if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
+        if (family === 'stall-root') return stallRootsFor(this.rt, tasks).some(root => root.id === task.id)
+        if (family === 'dispatch-question') return task.status === 'pending'
+        return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
+      })
+    }
+    // Before review-blocked was explicit, missing-review notices were generic
+    // decisions. Their still-submitted subjects are enough to recognize that
+    // admitting a review fulfilled the request without interpreting prose.
+    if (fact.class === 'decision' && fact.trigger === 'decision' && delivery.subjects?.length) {
+      const tasks = this.rt.store.list('tasks', mission.id)
+      if (delivery.subjects.every(subject => {
+        const task = taskFromSubject(subject, tasks)
+        return task?.status === 'submitted' && this.rt.reviewable(task, tasks)
+      })) return false
+    }
+    return true
+  }
+
+  /** Reuse the ordinary notice policy; legacy text-only summaries stay untouched. */
+  private relevantSummaryFacts(mission: Mission, delivery: Delivery): NonNullable<NoticeRow['aggregatedFacts']> {
+    return (delivery.notice?.aggregatedFacts ?? []).filter(fact => this.ownerDeliveryRelevant(mission, this.summaryFactDelivery(mission.id, delivery.id, fact)))
+  }
+
+  private summaryFactDelivery(missionId: string, deliveryId: string, fact: NonNullable<NoticeRow['aggregatedFacts']>[number]): Delivery {
+    return {
+      id: deliveryId, missionId, to: 'owner', from: fact.from,
+      kind: fact.class === 'escalation' ? 'escalation' : 'control', content: '',
+      subjects: fact.subjects, createdAt: fact.createdAt,
+      notice: { class: fact.class, dedupKey: fact.dedupKey, sentAt: fact.createdAt, queuedAt: fact.createdAt,
+        trigger: fact.trigger, reason: fact.reason } as NonNullable<Delivery['notice']>,
+    }
+  }
+
+  /** Constituents reference the existing text array so exact reads do not duplicate it. */
+  private summaryFactText(delivery: Delivery, fact: NonNullable<NoticeRow['aggregatedFacts']>[number]): string[] {
+    return (noticeRow(delivery)?.facts ?? []).slice(fact.factStart, fact.factStart + fact.factCount)
   }
 
   /**
@@ -1169,7 +1264,7 @@ export class Notices {
       })
       if (ripe.length) {
         this.rt.commit(missionId, () => {
-          this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`, view.subjectsOf(ripe))
+          this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`, view.subjectsOf(ripe), { family: 'review-blocked', trigger: 'task/review-blocked' })
         })
       }
       return
@@ -1181,7 +1276,7 @@ export class Notices {
     const nonTerminal = view.nonTerminal
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= Date.now())) return
     if (view.stalled) {
-      this.notifyStall(view, this.rt.completionError(mission, { cancelUnschedulable: true }) ?? this.rt.completionError(mission) ?? 'no task can make progress')
+      this.notifyStall(view, this.rt.completionError(mission) ?? 'no task can make progress')
       return
     }
     // R14-F2(c): the unnamed fallback is replaced. While every unfinished task is
@@ -1450,7 +1545,7 @@ export class Notices {
       // OWNER QUIET: a delivery the owner's own lifecycle decision made moot is
       // not sent, and its row stays durable and undelivered rather than being
       // relabelled as a transport that never happened.
-      if (delivery.to === 'owner' && ownerDeliveryMoot(mission, delivery)) continue
+      if (delivery.to === 'owner' && !this.ownerDeliveryRelevant(mission, delivery)) continue
       if (delivery.to !== 'owner' && (mission.status !== 'active' || mission.budgetPause)) continue
       const member = delivery.to === 'owner'
         ? { id: 'owner', missionId, name: 'owner', role: 'owner', sessionId: mission.ownerSessionId, workspace: mission.workspace, status: 'idle' as const, subscriptions: [] }
@@ -1461,6 +1556,12 @@ export class Notices {
       // that does not settle is abandoned, recorded durably on the mission row,
       // and retried by a later pump (adapter acceptance is idempotent).
       if (this.delivering.has(delivery.id)) continue
+      if (delivery.to === 'owner' && delivery.notice?.aggregatedFacts !== undefined && delivery.notice.handoffAt === undefined) {
+        const facts = this.relevantSummaryFacts(mission, delivery).flatMap(fact => this.summaryFactText(delivery, fact))
+        delivery.content = renderNoticeFacts('Current owner facts; superseded actions remain in the durable record.', facts, missionId, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+        delivery.notice.handoffAt = Date.now()
+        this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery))
+      }
       this.delivering.set(delivery.id, Date.now())
       // An adapter may accept the message before its acknowledgement times out.
       // Detach a summary at its first handoff: retries keep this ID's content

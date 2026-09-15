@@ -57,6 +57,38 @@ test('tool schemas match the enforced runtime contract for observe cursors and m
   assert.equal(member.subscriptions.items.type, 'string')
 })
 
+test('registered launch accepts omitted member names and forwards canonical identities', async () => {
+  const definitions = new Map(), launched = []
+  const snapshot = { mission: { id: 'named-mission' } }
+  const runtime = {
+    starts: () => [{ id: 'named-request', workspace: '/workspace' }],
+    async startPlan(_actor, requestId, plan) { launched.push({ requestId, plan }); return snapshot },
+    snapshot: () => snapshot,
+  }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  for (const name of ['swarm_stage', 'swarm_launch']) {
+    const member = definitions.get(name).parameters.properties.members.items
+    assert.equal(member.required.includes('name'), false, `${name} must permit the host-assigned default`)
+    assert.equal(member.required.includes('role'), true)
+  }
+  const input = { requestId: 'named-request', title: 'Research', objective: 'Understand the module', scope: ['src/'], acceptance: ['understood'], budget,
+    members: [{ key: 'author', role: 'Inspect the implementation', maxOutputTokens: 1024 }, { key: 'reviewer', name: 'Ada', role: 'Independently review the research', maxOutputTokens: 1024 }],
+    workstreams: [{ key: 'main', title: 'Research', objective: 'Understand the module' }],
+    tasks: [
+      { key: 'research', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the module', kind: 'research', scope: ['src/'], acceptance: ['understood'], assigneeKey: 'author', maxRecoveryAttempts: 2 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the evidence', kind: 'verification', scope: ['src/'], acceptance: ['understood'], assigneeKey: 'reviewer', reviewOf: 'research', maxRecoveryAttempts: 2 },
+    ] }
+  const execution = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  await definitions.get('swarm_launch').execute(input, execution)
+  assert.equal(launched.length, 1)
+  assert.equal(launched[0].requestId, input.requestId)
+  assert.deepEqual(launched[0].plan.members.map(member => ({ key: member.key, name: member.name, role: member.role })), [
+    { key: 'author', name: 'Alan', role: input.members[0].role },
+    { key: 'reviewer', name: 'Ada', role: input.members[1].role },
+  ])
+  assert.equal(input.members[0].name, undefined, 'tool parsing leaves the original input reusable')
+})
+
 test('launch rejects indexed shell syntax errors before admission and syntax checks never execute commands', async t => {
   const { mkdtemp, access, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')

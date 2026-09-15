@@ -15,7 +15,7 @@ await runScenario({
     const stateDir = join(root, 'state')
     await mkdir(stateDir, { recursive: true })
     const marker = join(root, 'apply-marker.json')
-    const f = await setup({ workspace: source, workers, config: { statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000 }, acceptance: ['value is two'], checks: ['true'] })
+    const f = await setup({ workspace: source, workers, config: { statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000 }, acceptance: ['value is two'], checks: [`node -e "require('node:assert/strict').equal(require('./value.cjs'), 2)"`] })
     let missionId
     let artifact
     try {

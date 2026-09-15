@@ -391,6 +391,42 @@ test('reviewer reads the submitted exact commit while its edits cannot change th
   assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer.txt`), 'proposed change')
 })
 
+test('explicit ignored report is frozen with a blob manifest; later author writes do not alter review', async t => {
+  const { workspaces, mission, member, task } = await fixture(t)
+  const reportTask = { ...task, kind: 'research', scope: ['**'], objective: 'Write review/final.md', acceptance: ['Write review/final.md'] }
+  await workspaces.prepareTask(member, reportTask, [])
+  await writeFile(path.join(member.workspace, '.gitignore'), 'review/\n.env\n')
+  await mkdir(path.join(member.workspace, 'review'))
+  await writeFile(path.join(member.workspace, 'review/final.md'), 'Reviewed version\n')
+  await writeFile(path.join(member.workspace, '.env'), 'private unrelated fixture\n')
+  const omitted = await workspaces.captureArtifact(member, reportTask)
+  assert.deepEqual(omitted.uncapturedPaths, ['review/final.md'])
+  assert.ok(!omitted.changedPaths.includes('review/final.md'))
+  const artifact = await workspaces.captureArtifact(member, reportTask, ['review/final.md'])
+  assert.ok(artifact.changedPaths.includes('review/final.md'))
+  assert.equal(artifact.uncapturedPaths, undefined)
+  assert.deepEqual(artifact.files, [{ path: 'review/final.md', blob: await git(member.workspace, 'rev-parse', `${artifact.commit}:review/final.md`), bytes: 17 }])
+  assert.ok(!artifact.changedPaths.includes('.env'))
+  await writeFile(path.join(member.workspace, 'review/final.md'), 'Later overwritten version\n')
+  const reviewer = { id: 'report-reviewer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'report-reviewer') }
+  const review = { ...reportTask, id: 'report-review', kind: 'verification', reviewOf: task.id, attempt: { sourceCommit: artifact.commit } }
+  await workspaces.prepareTask(reviewer, review, [], { ...reportTask, status: 'submitted', artifact })
+  assert.equal(await readFile(path.join(reviewer.workspace, 'review/final.md'), 'utf8'), 'Reviewed version\n')
+  assert.equal(await git(reviewer.workspace, 'hash-object', 'review/final.md'), artifact.files[0].blob)
+  await assert.rejects(workspaces.prepareTask(reviewer, { ...review, attempt: { sourceCommit: '0'.repeat(40) } }, [], { ...reportTask, status: 'submitted', artifact }), /review_source_changed/)
+})
+
+test('explicit output capture rejects directories, pathspecs, out-of-scope paths and symlink ancestors', async t => {
+  const { workspaces, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  await symlink('answer.txt', path.join(member.workspace, 'src/link.txt'))
+  await symlink('src', path.join(member.workspace, 'linked'))
+  for (const name of ['src/', 'src', '../outside.txt', 'outside.txt', 'src/*.txt', 'src/link.txt', 'linked/answer.txt', '.git/config']) {
+    await assert.rejects(workspaces.captureArtifact(member, task, [name]), error => error.code?.startsWith('invalid_deliverable'))
+  }
+  assert.equal(await git(member.workspace, 'log', '-1', '--format=%s'), 'initial', 'invalid requests publish no commit')
+})
+
 test('scope enforcement rejects a rename that moves a path out of scope and keeps in-scope renames', async t => {
   const { workspaces, member, task } = await fixture(t)
   await workspaces.prepareTask(member, task, [])

@@ -22,7 +22,7 @@ class ControlledWorkers {
   async deliver(m, d) { this.deliveries.push(d) }
   async stop(id) { if (this.stopGate) await this.stopGate; this.stopped.push(id) }
   isIdle() { return false }
-  async captureArtifact() { return this.artifact }
+  async captureArtifact(_member, task) { return task.kind === 'research' ? { ...this.artifact, changedPaths: [] } : this.artifact }
   async verifyArtifact() { return this.checks }
   async prepareTask(member,task) { this.prepared.push(task.epoch) }
   async dispose() {}
@@ -79,7 +79,7 @@ test('a claimed pass cannot override failing host verification',async t=>{
   await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:claimed.attempt.id,verdict:'accept',reason:'I think it passes'})
   const snapshot=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(snapshot.tasks.find(t=>t.id===task.id).status,'blocked')
-  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/cover every mission acceptance criterion.*Blocked work still needs repair/)
+  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/unfinished or blocked required work/)
 })
 test('handoff fences immediately but replacement waits for quiescence',async t=>{
   const f=await setup(t); const task=await f.runtime.claim(f.actorA,f.mission.id,f.propose().id)
@@ -245,16 +245,26 @@ test('an independently accepted repair retires blocked obligations and can conve
     await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'Checked exact artifact'})
     return review
   }
-  const original=f.propose(); await submitAndReview(original,true)
+  const original=f.propose(); const oldReview=await submitAndReview(original,true)
+  const oldVerdict=structuredClone(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===oldReview.id))
+  assert.equal(oldVerdict.status,'blocked')
   assert.throws(()=>f.propose(f.actorA,{replaces:[original.id],acceptance:['unrelated']}),/original obligations/)
   const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id]});await submitAndReview(repaired)
-  assert.equal(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===original.id).status,'cancelled')
+  const repairedBoard=f.runtime.snapshot(f.owner,f.mission.id)
+  assert.equal(repairedBoard.tasks.find(t=>t.id===original.id).status,'cancelled')
+  const retiredReview=repairedBoard.tasks.find(t=>t.id===oldReview.id)
+  assert.equal(retiredReview.status,'cancelled', 'accepted repair closes the obsolete negative review without owner cleanup')
+  assert.equal(retiredReview.reviewedCommit,oldVerdict.reviewedCommit)
+  assert.deepEqual(retiredReview.evidenceIds,oldVerdict.evidenceIds)
+  assert.ok(retiredReview.output.startsWith(oldVerdict.output), 'the historical negative verdict remains intact')
+  assert.match(retiredReview.output,/Superseded by review of replacement/)
   const integration=f.propose(f.actorA,{title:'Integrate',kind:'integration',dependencies:[repaired.id]});await submitAndReview(integration)
   assert.equal(f.runtime.control(f.owner,f.mission.id,'complete','Accepted integrated repair').status,'completed')
 })
 
 test('a disproved research hypothesis remains an accepted useful result after independent checks',async t=>{
   const f=await setup(t)
+  f.workers.artifact = { ...f.workers.artifact, changedPaths: [] }
   const source=f.propose(f.actorA,{kind:'research',checks:[]})
   const claimed=await f.runtime.claim(f.actorA,f.mission.id,source.id)
   await f.workers.callbacks.toolRun(f.a.id,{tool:'bash',arguments:{command:'experiment'},result:{observation:'counterexample'},isError:false})

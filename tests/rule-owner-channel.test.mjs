@@ -181,6 +181,171 @@ test('Q01: actual task resolution and explicit owner pause/stop suppress followu
   }
 })
 
+for (const reviewStatus of ['pending', 'running', 'parked']) test(`owner reminders stop when an independent review is ${reviewStatus}, including after reload`, async t => {
+  const f = await fixture(t), original = await stalledDecision(f)
+  const now = Date.now()
+  t.mock.timers.enable({ apis: ['Date'], now })
+  const source = f.runtime.task(f.mission.id, 'blocked-task')
+  source.status = 'submitted'
+  const review = { ...source, id: 'independent-review', kind: 'verification', reviewOf: source.id, status: reviewStatus === 'parked' ? 'blocked' : reviewStatus,
+    ...(reviewStatus === 'running' ? { attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: now + 3600000 } } : {}),
+    ...(reviewStatus === 'parked' ? { resumeAfterStop: { epoch: 1, at: now, memberId: f.member.id } } : {}) }
+  f.runtime.store.transaction(() => {
+    f.runtime.store.put('tasks', source)
+    f.runtime.store.event(f.mission.id, 'task/submitted', f.member.id, { taskId: source.id, epoch: source.epoch })
+    f.runtime.store.put('tasks', review)
+  })
+  t.mock.timers.tick(120000)
+  assert.ok(f.runtime.latestSubmission(f.mission.id, source.id).age >= f.runtime.config.tickMs)
+  assert.equal(f.runtime.notices.waitsLegitimately(source, f.runtime.store.list('tasks', f.mission.id)), true)
+  const key = `obligation-followup:${original.id}:`
+  for (let i = 0; i < 2; i++) {
+    f.runtime.notices.obligationFollowupMs = 0
+    f.runtime.notices.absenceNet(f.mission.id)
+    assert.equal(f.rows().filter(row => row.notice?.dedupKey.startsWith(key)).length, 0, 'admitting the review fulfills the request before its verdict')
+    if (i === 0) await f.reload()
+  }
+  const cancelled = f.runtime.task(f.mission.id, review.id)
+  cancelled.status = 'cancelled'; delete cancelled.resumeAfterStop; delete cancelled.attempt
+  f.runtime.store.put('tasks', cancelled)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(f.rows().filter(row => row.notice?.dedupKey.startsWith(key)).length, 1, 'a retired review leaves a real unresolved obligation visible')
+})
+
+test('a reminder queued before review admission is retained in the ledger but never sent afterwards', async t => {
+  const f = await fixture(t), original = await stalledDecision(f)
+  f.runtime.notices.obligationFollowupMs = 0
+  f.runtime.notices.absenceNet(f.mission.id)
+  const reminder = f.rows().find(row => row.notice?.dedupKey === `obligation-followup:${original.id}:1`)
+  assert.ok(reminder)
+  const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  f.runtime.store.transaction(() => {
+    f.runtime.store.put('tasks', source)
+    f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending' })
+    f.runtime.store.put('tasks', { ...source, id: 'other-submission' })
+    f.runtime.notify(f.mission.id, 'Admit the now-existing review', [`${source.id}@${source.epoch}`], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Stale mixed batch', [`${source.id}@${source.epoch}`, 'other-submission@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Current remaining request', ['other-submission@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`])
+  })
+  await f.runtime.flushOutbox(f.mission.id)
+  for (const row of f.rows().filter(row => row.id === reminder.id || ['Admit the now-existing review', 'Legacy review decision', 'Stale mixed batch'].includes(row.content))) {
+    assert.equal(row.deliveredAt, undefined, 'suppression is not a transport acknowledgement')
+    assert.equal(f.workers.deliveries.some(delivery => delivery.id === row.id), false)
+  }
+  assert.equal(f.workers.deliveries.some(delivery => delivery.content === 'Current remaining request'), true)
+})
+
+test('bounded reminders do not create reminders of reminders', async t => {
+  const f = await fixture(t), original = await stalledDecision(f)
+  f.runtime.notices.obligationFollowupMs = 0
+  for (let i = 0; i < 6; i++) {
+    f.runtime.notices.absenceNet(f.mission.id)
+    await f.runtime.flushOutbox(f.mission.id)
+  }
+  const reminders = f.rows().filter(row => row.notice?.dedupKey.startsWith('obligation-followup:'))
+  assert.equal(reminders.filter(row => row.notice.dedupKey.startsWith(`obligation-followup:${original.id}:`)).length, 2)
+  assert.ok(reminders.every(row => !reminders.some(parent => row.notice.dedupKey.startsWith(`obligation-followup:${parent.id}:`))))
+})
+
+test('review admission replaces a stale multi-subject decision with a fresh remaining-subject decision', async t => {
+  const f = await fixture(t)
+  await stalledDecision(f)
+  const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  const other = { ...source, id: 'remaining-submission' }
+  f.runtime.commit(f.mission.id, () => {
+    f.runtime.store.put('tasks', source)
+    f.runtime.store.put('tasks', other)
+  })
+  await flush()
+  const old = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 2)
+  assert.ok(old, 'the actual transition publisher announces both missing reviews')
+  f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', {
+    ...source, id: 'admitted-review', kind: 'verification', reviewOf: source.id, status: 'running',
+    attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 },
+  }))
+  await flush()
+  const fresh = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 1 && row.subjects[0] === `${other.id}@1`)
+  assert.ok(fresh, 'the same publisher regenerates the still-unresolved subject')
+  assert.notEqual(old.notice.dedupKey, fresh.notice.dedupKey)
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.equal(f.workers.deliveries.some(row => row.id === old.id), false)
+  assert.equal(f.workers.deliveries.some(row => row.id === fresh.id), true, 'suppressing the obsolete batch does not suppress the necessary owner wake')
+})
+
+test('completion suppresses old actions while delivering the final result and historical facts once', async t => {
+  const f = await fixture(t)
+  f.runtime.store.transaction(() => {
+    f.runtime.notify(f.mission.id, 'Old review action', ['old-source@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Old silence action', ['old-source@1'], { noticeClass: 'stall' })
+    f.runtime.notify(f.mission.id, 'Old budget action', ['mission:' + f.mission.id], { noticeClass: 'budget' })
+    f.runtime.notify(f.mission.id, 'Retained host fact', ['mission:' + f.mission.id], { noticeClass: 'progress' })
+    f.runtime.notify(f.mission.id, 'Completed result', ['mission:' + f.mission.id], { noticeClass: 'completion' })
+    const mission = f.runtime.mission(f.mission.id); mission.status = 'completed'; f.runtime.store.put('missions', mission)
+  })
+  await f.runtime.flushOutbox(f.mission.id)
+  await f.reload()
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.equal(f.workers.deliveries.filter(row => row.content === 'Old review action').length, 0)
+  assert.equal(f.workers.deliveries.filter(row => row.content === 'Old silence action' || row.content === 'Old budget action').length, 0)
+  assert.equal(f.workers.deliveries.filter(row => row.content === 'Completed result').length, 1)
+  assert.equal(f.workers.deliveries.filter(row => row.content === 'Retained host fact').length, 1)
+})
+
+for (const includeCompletion of [false, true]) test(`wake summaries recheck individual facts and preserve completion=${includeCompletion}`, async t => {
+  const f = await fixture(t)
+  f.runtime.notices.wakeBudget = 1
+  f.runtime.store.transaction(() => {
+    f.runtime.notify(f.mission.id, 'First fact occupies the individual wake', ['mission:' + f.mission.id], { noticeClass: 'progress' })
+    f.runtime.notify(f.mission.id, 'Obsolete review request', ['old-source@1'], { family: 'review-blocked' })
+    f.runtime.notify(f.mission.id, 'Obsolete silence request', ['old-source@1'], { noticeClass: 'stall' })
+    if (includeCompletion) f.runtime.notify(f.mission.id, 'Final accepted deliverable', ['mission:' + f.mission.id], { noticeClass: 'completion' })
+    const mission = f.runtime.mission(f.mission.id); mission.status = 'completed'; f.runtime.store.put('missions', mission)
+  })
+  const summary = f.rows().find(row => row.notice?.dedupKey.startsWith('wake-budget:'))
+  assert.ok(summary.notice.aggregatedFacts.length >= 2, 'new summaries retain each fact identity and subject')
+  await f.reload()
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), summary), includeCompletion)
+  await f.runtime.flushOutbox(f.mission.id)
+  await f.runtime.flushOutbox(f.mission.id)
+  const sent = f.workers.deliveries.filter(row => row.id === summary.id)
+  assert.equal(sent.length, includeCompletion ? 1 : 0)
+  if (includeCompletion) {
+    assert.match(sent[0].content, /Final accepted deliverable/)
+    assert.doesNotMatch(sent[0].content, /Obsolete review request|Obsolete silence request/)
+  }
+  const stored = f.runtime.store.get('deliveries', summary.id)
+  assert.ok(stored.notice.facts.some(fact => fact.includes('Obsolete review request')), 'filtering transport never erases the historical fact')
+})
+
+test('a delivered summary does not revive a resolved review request because unrelated work remains blocked', async t => {
+  const f = await fixture(t)
+  await stalledDecision(f)
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+  const source = { ...f.runtime.task(f.mission.id, 'blocked-task'), id: 'submitted-source', status: 'submitted' }
+  f.runtime.store.transaction(() => {
+    f.runtime.store.put('tasks', source)
+    f.runtime.store.event(f.mission.id, 'task/submitted', f.member.id, { taskId: source.id, epoch: source.epoch })
+  })
+  t.mock.timers.tick(120000)
+  f.runtime.notices.wakeBudget = 1
+  f.runtime.store.transaction(() => {
+    f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress' })
+    f.runtime.notify(f.mission.id, 'Please admit the review', [`${source.id}@1`], { family: 'review-blocked' })
+  })
+  await f.runtime.flushOutbox(f.mission.id)
+  const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
+  assert.ok(summary.deliveredAt)
+  const review = { ...source, id: 'summary-review', kind: 'verification', reviewOf: source.id, status: 'pending' }
+  f.runtime.store.put('tasks', review)
+  f.runtime.notices.obligationFollowupMs = 0
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(f.runtime.store.get('deliveries', summary.id).notice.followupCount, undefined)
+  review.status = 'cancelled'; f.runtime.store.put('tasks', review)
+  f.runtime.notices.absenceNet(f.mission.id)
+  assert.equal(f.runtime.store.get('deliveries', summary.id).notice.followupCount, 1, 'the constituent obligation becomes actionable again when its review is withdrawn')
+})
+
 test('Q02: empty scheduling passes and repeated failed tools cannot conceal a lack of progress', async t => {
   const f = await fixture(t)
   await stalledDecision(f)

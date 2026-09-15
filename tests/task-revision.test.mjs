@@ -72,7 +72,7 @@ async function fixture(t) {
   // The tick timer is deliberately not started: these tests drive writes directly
   // so the interleaving is deterministic rather than load-dependent.
   const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Task', objective: 'Task',
-    kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['true'], assigneeId: author.id })
+    kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test -d .'], assigneeId: author.id })
   const store = runtime.store
   const refusals = () => store.events(mission.id, 500).filter(event => event.type === STALE_TASK_REFUSAL_EVENT)
   const twoReaders = () => { const record = store.get('tasks', task.id); return [structuredClone(record), structuredClone(record)] }

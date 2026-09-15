@@ -545,10 +545,10 @@ export class Scheduling {
   }
 
   /**
-   * Tasks that can never be dispatched again: pending work whose dependency
+   * Tasks that cannot be dispatched under the current plan: pending work whose dependency
    * lineage or review source is dead, reviews assigned to their own author, and
-   * blocked work. They contribute nothing further; completion may cancel them
-   * once every acceptance criterion is independently covered.
+   * blocked work. This is a diagnostic for owner repair, not permission to
+   * cancel obligations or mark the mission complete.
    */
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
     const live = members.filter(member => memberPhaseOf(member) !== 'stopped')

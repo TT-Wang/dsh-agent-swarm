@@ -351,15 +351,14 @@ test('OWNER PASS 2026-09-11 #2: Pause and Stop share one horizontal control row'
 
 test('compact member rows lead with the portrait and expose the assignment and conversation action', () => {
   const markup = render(SwarmBoard, { snapshot: uiSnapshot(), onOpenWorker() {} })
-  const start = markup.indexOf('<button class="sw-live-member"')
-  assert.ok(start > 0, 'the current assignment stays visible and clickable')
-  const card = markup.slice(start, markup.indexOf('</button>', start))
+  const card = markup.match(/<button\b[^>]*class="sw-live-member"[^>]*>[\s\S]*?<\/button>/)?.[0]
+  assert.ok(card, 'the current assignment stays visible and clickable')
   assert.match(card, /data-swarm-member="b"/)
   assert.match(card, /aria-label="Open conversation: Nova"/, 'opening the actual member conversation is accessible')
   assert.match(card, /class="sw-agent-avatar" data-agent-identity="b"[^>]*width:40px;height:40px/, 'the geometric portrait stays readable in a compact row')
   assert.ok(card.indexOf('sw-agent-avatar') < card.indexOf('sw-live-member-heading'), 'the avatar anchors the identity')
-  assert.match(card, /<strong>Nova<\/strong><small>Runtime implementation<\/small>/)
-  assert.match(card, /class="sw-live-task">Implement lease renewal and fencing</)
+  assert.match(card, /<strong\b[^>]*>Nova<\/strong><small\b[^>]*>Runtime implementation<\/small>/)
+  assert.match(card, /class="sw-live-task"[^>]*>Implement lease renewal and fencing</)
   assert.match(card, /data-state="stale"/, 'a recorded snapshot labels execution as unconfirmed')
   assert.doesNotMatch(card, /data-moving="true"|sw-agent-avatar-ring|class="sw-bar"/, 'a historical row has neither busy animation nor a budget bar')
   assert.doesNotMatch(card, /initials/, 'and no initials block returns')

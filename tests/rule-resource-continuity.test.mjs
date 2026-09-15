@@ -113,7 +113,7 @@ test('task policy amendments preserve obligations and reject invalid scopes, cyc
   const submitted = f.rt.task(f.mission.id, a.id)
   submitted.status = 'submitted'; submitted.artifact = { commit: 'exact', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
   f.rt.commit(f.mission.id, () => f.rt.store.put('tasks', submitted))
-  assert.throws(() => f.rt.controlTask(f.owner, f.mission.id, a.id, 'amend', { checks: ['true'] }, 'Weaken check'), /immutable/)
+  assert.throws(() => f.rt.controlTask(f.owner, f.mission.id, a.id, 'amend', { checks: ['test -d .'] }, 'Weaken check'), /immutable/)
   f.rt.controlTask(f.owner, f.mission.id, a.id, 'amend', { checkTimeoutMs: 5000 }, 'Allow slow check')
   assert.equal(f.rt.task(f.mission.id, a.id).artifact.commit, 'exact')
 })

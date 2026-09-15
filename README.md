@@ -30,7 +30,7 @@ The primary agent inspects your project, organizes the work and chooses the team
 
 1. **Start with the project as it is.** A private Git snapshot captures tracked changes and non-ignored new files before planning. You do not need to make a manual commit; your branch, index and working files stay in place during capture.
 2. **Let the team work together.** The primary agent plans independently verifiable work and its real prerequisites. An eligible idle member can take a never-started task when its preferred member is busy; explicit bindings and active attempts stay protected. Members use native Harness sessions and separate Git worktrees.
-3. **Review the actual artifact.** A different member reviews submitted work. For code tasks, Harness also executes the declared checks against the exact submitted commit.
+3. **Review the actual artifact.** A different member reviews submitted work. Code and configuration changes require declared checks even when a task is labelled research. Harness runs them against the exact submitted commit; ordinary reports retain lightweight independent review.
 4. **Bring the result back when ready.** Once the mission completes, the sidebar offers **View changes** and **Apply result** for its accepted code deliverable. Application compares against the original snapshot and preserves your branch and index. It does not stage, commit or push for you.
 
 Existing edits remain part of the baseline, so they are not presented as new swarm output. Detected merge conflicts are reported before applying changes.
@@ -39,7 +39,7 @@ Existing edits remain part of the baseline, so they are not presented as new swa
 
 The sidebar answers three practical questions: **Who is working? What just changed? What needs attention?**
 
-- **Recognizable members.** Stable robot portraits stay with each member across role and name changes. Open a member's conversation to inspect its work.
+- **Recognizable members.** Host-assigned names and stable robot portraits make each member recognizable; responsibilities stay in a separate role field. Explicit custom names remain supported. Open a member's conversation to inspect its work.
 - **Visible execution.** See the current operation, how long it has been running and how recently Harness observed it. Fresh activity drives the animation; stale signals are shown as unconfirmed.
 - **Progress backed by events.** Tool results, submissions and acceptance events appear in the feed. Resource usage stays in details instead of masquerading as a completion percentage.
 - **Control close at hand.** Pause, resume or stop a mission from the sidebar. Saved planning requests also expose recovery controls when startup fails.
@@ -68,11 +68,13 @@ Captured on September 15, 2026 with simulated tasks and events. The surrounding 
 
 A long task needs more than a launch button. Agent Swarm keeps assignments, evidence, decisions and recovery state on disk so the team can continue through supported interruption and restart paths.
 
-**Repair without losing the task's purpose.** The primary can revise execution allowances and unsubmitted task policy on the same task, or repair a failed saved plan at a new revision. Immutable submitted work keeps its exact review source; replacement artifacts carry the original acceptance criteria and downstream dependencies follow their accepted repair.
+**Repair without losing the task's purpose.** The primary can revise execution allowances and unsubmitted task policy on the same task, or repair a failed saved plan at a new revision. Submitted checks may be strengthened in place without changing the artifact. Immutable submitted work keeps its exact review source; replacement artifacts carry the original acceptance criteria and downstream dependencies follow their accepted repair.
 
 **Bring decisions back to the primary agent.** Rejections, blocked work, provider problems and exhausted limits can generate durable notices. The primary agent can revise the plan, arrange a repair or adjust a budget with a recorded reason. Ordinary recovery decisions do not require you to configure the swarm again.
 
-**Keep resource use visible.** The primary agent chooses team size, task limits, step and token budgets, recovery allowances and verification timeouts. Usage is tracked across the team, with cache and output breakdowns and the primary conversation's usage shown separately. Resuming does not reset consumption.
+**Completion keeps its meaning.** Unfinished synthesis and review tasks stay on the board and bring the primary back to repair them. An empty runnable queue cannot silently cancel required work or mark the mission complete.
+
+**Keep resource use visible.** The primary agent chooses team size, task limits, step and token budgets, recovery allowances and verification timeouts. Usage is tracked across the team, with cache and output breakdowns and the primary conversation's usage shown separately. Resuming does not reset consumption. If a native worker session must be recreated, a durable accounting generation keeps new usage separate from the old watermark while preserving lifetime totals.
 
 Recovery runs within the mission's limits. Notifications remain queued while the primary agent is offline, and a stuck native model call may delay when it can process them. Provider-reported usage and estimates for requests still in flight can also allow a budget overshoot.
 
@@ -132,7 +134,8 @@ For bundle installation, upgrades, startup recovery and configuration, see the [
 ## Scope and practical limits
 
 - **Local execution.** Distributed workers, non-Git projects and Windows execution are not supported. Separate hosts need separate state directories; concurrent recovery of the same database is unsupported. Retained worktrees and artifact refs need explicit cleanup.
-- **Reviewable evidence.** Independent review and host checks make acceptance inspectable; they cannot guarantee that the chosen checks cover every requirement. Verification copies installed dependencies by default, including common virtualenv interpreters, but may still depend on host system libraries. Unsupported external dependency links require a self-contained installation or an explicit host opt-in; this is not a fresh CI environment.
+- **File deliverables.** Members list exact output paths in `swarm_submit.deliverables`; the host can capture those files even when Git ignores them, without changing the source checkout's ignore rules. Submission returns commit-bound blob IDs and sizes. Reviewers use the pinned source commit and host checks run in a fresh checkout of it, so later author edits cannot change the reviewed report. Reassigned reviews retain saved drafts for the same source. Omitted ignored paths inferred from task text remain advisory and appear as `artifact.uncapturedPaths`; arbitrary unlisted ignored files are not captured.
+- **Reviewable evidence.** Independent review and host checks make acceptance inspectable; they cannot guarantee that the chosen checks cover every requirement. Known report formats remain exempt from code checks; file-format classification is not semantic program analysis. Literal no-op checks are refused, but independent reviewers still judge meaningful coverage. Existing accepted history is not retroactively re-reviewed by an upgrade. Verification copies installed dependencies by default, including common virtualenv interpreters, but may still depend on host system libraries. Unsupported external dependency links require a self-contained installation or an explicit host opt-in; this is not a fresh CI environment.
 - **Human-controlled workspace access.** A mission uses its session workspace or a root configured in `authorizedWorkspaces`; a matched grant is recorded as `workspaceGrantRoot`. Agents cannot grant themselves a new root through swarm tools. Confinement follows Harness's sandbox; the plugin adds no independent network or credential isolation.
 - **Observable, bounded recovery.** The live UI shows operations and recorded events, not token-by-token output or a guaranteed ETA. Recovery does not promise exactly-once external side effects, arbitrary disk-fault recovery or filesystem-wide atomic application.
 

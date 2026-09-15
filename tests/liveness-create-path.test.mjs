@@ -3,8 +3,8 @@
  *
  * Pre-fix `completeAutomatic` returned false unless the mission had a `starts`
  * journal row, and only the automatic launch path wrote one. A mission created
- * through `swarm_create` could therefore never emit a stall notice and never
- * complete a stalled board, so the owner was not woken when the board parked
+ * through `swarm_create` could therefore never emit a stall notice,
+ * so the owner was not woken when the board parked
  * forever. `stalled()` also counted any submitted task as progress, so a
  * submission whose review was never admitted (or was retired) was reported as a
  * live board instead of a stalled one. Finally, a ceiling-parked member only
@@ -73,7 +73,7 @@ async function fixture(t) {
   return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, current, events, control, markAutomatic }
 }
 
-test('a swarm_create mission auto-completes a stalled board once independent verification covers every criterion', async t => {
+test('a covered swarm_create mission retains blocked work until the owner explicitly withdraws it', async t => {
   const f = await fixture(t)
   assert.deepEqual(f.runtime.starts(f.owner), [], 'the create path writes no starts journal row')
   // A ceiling-parked task can never be dispatched again. Its obligation is
@@ -91,19 +91,20 @@ test('a swarm_create mission auto-completes a stalled board once independent ver
   const review = f.propose({ kind: 'verification', reviewOf: cover.id, checks: [], title: 'Review' })
   const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
-  const completed = await eventually(() => {
-    const mission = f.runtime.store.get('missions', f.mission.id)
-    return mission.status === 'completed' ? mission : undefined
-  }, 'a swarm_create mission must reach automatic completion without owner action')
-  assert.match(completed.reason, /remaining tasks could no longer be scheduled/)
-  assert.equal(f.current(cover.id).status, 'accepted')
-  assert.equal(f.current(blocked.id).status, 'cancelled')
-  assert.match(f.current(blocked.id).output, /Cancelled at completion/)
-  assert.equal(f.events('automatic/completed').length, 1)
-  assert.equal(f.events('task/cancelled-at-completion').length, 1)
-  const notice = await eventually(() => f.control(/Completed/)[0], 'completion wakes the owner')
+  const notice = await eventually(() => f.control(/Mission stalled/).find(item => item.delivery.content.includes(blocked.id)), 'blocked required work wakes the owner')
   assert.equal(notice.delivery.to, 'owner')
-  assert.match(notice.delivery.content, /independently accepted/)
+  assert.equal(f.current(cover.id).status, 'accepted')
+  assert.equal(f.current(blocked.id).status, 'blocked')
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, false)
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'Coverage alone is insufficient'), /unfinished or blocked required work/)
+  assert.equal(f.events('automatic/completed').length, 0)
+  assert.equal(f.events('task/cancelled-at-completion').length, 0)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: blocked.id, reason: 'Owner withdraws the redundant attempt after reviewing the accepted alternative' })
+  await eventually(() => f.control(/ready to complete/)[0], 'explicit withdrawal makes the owner-assembled board ready')
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, true)
+  assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active', 'create-path completion remains an explicit owner decision')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'All remaining required work was accepted').status, 'completed')
+  assert.match(f.current(blocked.id).output, /Cancelled by the mission owner/)
 })
 
 test('a submitted task with no live review is reported stalled with its exact task id', async t => {

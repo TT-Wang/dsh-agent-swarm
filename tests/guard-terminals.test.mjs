@@ -529,9 +529,9 @@ test('S4r-D3: the admission guard refuses at propose() and at plan validation, n
       members: [{ key: 'builder', name: 'Builder', role: 'implementation' }],
       workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }],
     }
-    assert.throws(() => validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Resume from your own artifact `09883f3`.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['true'] }] }),
+    assert.throws(() => validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Resume from your own artifact `09883f3`.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }] }),
       /dependency_assumption_missing/, 'plan admission refuses the same prejudged content')
-    const valid = validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['true'] }] })
+    const valid = validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }] })
     assert.equal(valid.tasks.length, 1, 'a self-contained plan task is still admitted')
   } finally { await f.cleanup() }
 })

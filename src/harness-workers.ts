@@ -120,6 +120,8 @@ interface Composition {
   missionId: string
   memberId: string
   workspace: string
+  /** Durable accounting generation for the current native session log. */
+  usageGeneration?: number
   preset?: string
   options: AgentOptions
   selection?: ModelSelection
@@ -194,6 +196,7 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
   if (!isRecord(value) || value.version !== 1 || value.sessionId !== spec.member.sessionId || value.missionId !== spec.mission.id || value.memberId !== spec.member.id || value.workspace !== spec.member.workspace || typeof value.persona !== 'string' || (value.preset !== undefined && typeof value.preset !== 'string') || !isRecord(value.options)) throw new Error('Worker composition metadata is invalid or belongs to a different worker')
   const raw = value.options
   if ((raw.provider !== undefined && typeof raw.provider !== 'string') || (raw.model !== undefined && typeof raw.model !== 'string') || (raw.reasoningEffort !== undefined && (typeof raw.reasoningEffort !== 'string' || raw.reasoningEffort.length === 0)) || (raw.maxTokens !== undefined && (!Number.isSafeInteger(raw.maxTokens) || Number(raw.maxTokens) < 1))) throw new Error('Invalid persisted worker model options')
+  if (value.usageGeneration !== undefined && (!Number.isSafeInteger(value.usageGeneration) || Number(value.usageGeneration) < 0)) throw new Error('Invalid persisted worker usage generation')
   const options: AgentOptions = {}
   if (typeof raw.provider === 'string') options.provider = raw.provider
   if (typeof raw.model === 'string') options.model = raw.model
@@ -215,7 +218,7 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
   // silently handing one member another's scratch tree; compositions written
   // before this field existed are completed from the freshly computed value.
   assertCompositionScratch(value, environment.TMPDIR)
-  return { version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace, options, ...(selection === undefined ? {} : { selection }), persona: value.persona, environment, ...(typeof value.preset === 'string' ? { preset: value.preset } : {}) }
+  return { version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace, options, ...(selection === undefined ? {} : { selection }), persona: value.persona, environment, ...(typeof value.preset === 'string' ? { preset: value.preset } : {}), ...(typeof value.usageGeneration === 'number' ? { usageGeneration: value.usageGeneration } : {}) }
 }
 
 /**
@@ -650,6 +653,16 @@ export class HarnessWorkers implements WorkerAdapter {
     const composition = await this.composition(spec, abort.signal)
     abort.signal.throwIfAborted()
     const persisted = await persistedSessionHeader(persistence, SessionId(spec.member.sessionId), abort.signal) !== undefined
+    if (!persisted || composition.usageGeneration === undefined) {
+      // Write the generation before the native factory can materialize a new
+      // log. A crash before creation may skip an empty generation; a crash
+      // after creation resumes this same one without resetting its watermark.
+      composition.usageGeneration = persisted ? spec.member.usageSession?.generation ?? Date.now()
+        : Math.max(Date.now(), (composition.usageGeneration ?? -1) + 1, (spec.member.usageSession?.generation ?? -1) + 1)
+      await writePrivateJson(this.workspaces.metadataPath(spec.mission.id, spec.member.id), composition)
+      abort.signal.throwIfAborted()
+    }
+    const usageSource = { generation: composition.usageGeneration, restored: persisted }
     // The setup hook's shape moved in the 0.1.5 line: through 0.1.3-alpha.2 the
     // agent was reached through `agentCtx.agent` (removed at 0.1.5), and from
     // 0.1.5 the callback receives it as its second parameter. An OPTIONAL second
@@ -678,7 +691,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // Reconcile a session-log commit whose runtime budget transaction was
       // interrupted, before publication can release pending model requests.
       // `totalTokens` is the weighted charge; `usage` keeps the raw buckets.
-      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage })
+      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage }, usageSource)
       abort.signal.throwIfAborted()
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
@@ -785,7 +798,7 @@ export class HarnessWorkers implements WorkerAdapter {
               // The weighted charge is the accounted total; buckets stay raw.
               await this.ctx.sessions.flush(session)
               if (this.closing) return
-              await observer.usageSnapshot(spec.member.id, total, buckets)
+              await observer.usageSnapshot(spec.member.id, total, buckets, usageSource)
             } else await observer.usage(spec.member.id, tokens)
           })
         }
@@ -1027,7 +1040,8 @@ export class HarnessWorkers implements WorkerAdapter {
       }
     }
   }
-  captureArtifact(member: Member, task: Task): Promise<Artifact> { return this.workspaces.captureArtifact(member, task) }
+  captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables) }
+  inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> { return this.workspaces.inspectArtifact(member, artifact, signal) }
   /** R11-19: the owned Workspaces' measured declared-check envelope. */
   checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {

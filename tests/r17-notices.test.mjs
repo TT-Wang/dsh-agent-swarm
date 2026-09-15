@@ -74,7 +74,7 @@ async function fixture(t, config = {}) {
   const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
-  const propose = (title, input = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['true'], ...input })
+  const propose = (title, input = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notify(mission.id, content, subjects, options))
   return { dir, ctx, runtime, owner, mission, stream, addMember, propose, ownerNotices, emit }
@@ -223,14 +223,14 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   await f.addMember('Ada')
   f.propose('Waiting work')
   const view = f.runtime.interpretation(f.mission.id)
-  const reason = f.runtime.completionError(view.mission, { cancelUnschedulable: true }) ?? f.runtime.completionError(view.mission) ?? 'no task can make progress'
+  const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
   f.runtime.notices.notifyStall(view, reason)
   const notice = ownerNotice(f, 'mission/stalled')
   assert.ok(notice, 'the W3 stall was reported')
   const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
   const subjects = stuck.map(task => `${task.id}@${task.epoch}`)
   const detail = view.unschedulable.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
-  const expected = `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Subjects: ${subjects.join(', ')}. Decide: propose repairs or reviews with swarm_propose, adjust the budget, or use swarm_control complete (cancels unschedulable leftovers once every acceptance criterion is independently covered) or stop.`
+  const expected = `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Subjects: ${subjects.join(', ')}. Decide: amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose, or adjust the budget. If work is no longer required, withdraw it explicitly with swarm_cancel; completing a mission never cancels unfinished tasks. Use swarm_control stop to stop the mission.`
   assert.equal(notice.content, expected, 'the body replays from the rows and the recorded completion diagnostic')
 })
 

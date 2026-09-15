@@ -220,6 +220,11 @@ test('all nonterminal missions and unresolved owner questions retain the full ow
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'terminal status does not settle an open question')
   f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', { ...question, state: 'dismissed', answeredBy: 'owner', answeredAt: Date.now() }))
   assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', {
+    id: 'obsolete-review-action', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Admit a review for an old task',
+    subjects: ['old-source@1'], createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'review-blocked:old-source:missing', queuedAt: Date.now(), sentAt: Date.now() },
+  }))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner', 'an obsolete queued action that the outbox will suppress cannot pin the owner prompt')
   f.runtime.commit(mission.id, () => {
     f.runtime.store.put('missions', { ...mission, status: 'stopped' })
     f.runtime.store.put('deliveries', { id: 'moot-stop-notice', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'A former stall', createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'old-stall', sentAt: Date.now(), queuedAt: Date.now() } })

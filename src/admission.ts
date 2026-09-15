@@ -892,11 +892,15 @@ export function reconcileCheckPaths(command: string, location: string): Admissio
   }))
 }
 
+export function isNoopCheck(command: string): boolean { return /^(?:true|:|exit\s+0)\s*;?$/.test(command.trim()) }
+
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
     if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
     if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`)
+    const noop = checks.findIndex(isNoopCheck)
+    if (noop !== -1) throw new Error(`[check_noop] ${location}.checks[${noop}] is an always-passing no-op. Supply a real assertion in \`checks\` with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
     if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there until the check route is repaired. Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
     // Round 9-C: a check that names a host-absolute path cannot run in the

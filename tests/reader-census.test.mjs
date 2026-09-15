@@ -82,7 +82,7 @@ const EVENT_CENSUS = [
   ["task/rejected", "keep", "engine", "src/runtime.ts", "Independent verification rejected the source artifact"],
   ["task/blocked", "keep", "ui", "src/client/progress.ts", "Task blocked with the reason that must be repaired"],
   ["task/cancelled", "keep", "engine", "src/tools.ts", "Owner withdrew admitted work; dependents named as stranded"],
-  ["task/cancelled-at-completion", "keep", "ui", "src/client/progress.ts", "Unschedulable leftover cancelled at mission completion"],
+  ["task/cancelled-at-completion", "keep", "ui", "src/client/progress.ts", "Historical automatic withdrawals remain visible; completion no longer emits them"],
   ["task/lease-expired", "keep", "ui", "src/client/progress.ts", "Attempt lease expired and the owner was released"],
   ["task/ceiling-exhausted", "keep", "ui", "src/client/progress.ts", "Task exhausted its own step or finding ceiling and blocked without charging the mission budget"],
   ["task/checkpointed", "keep", "ui", "src/client/progress.ts", "Workspace checkpoint captured before reassignment"],
@@ -360,7 +360,13 @@ test('every event kind in the vocabulary has exactly one recorded decision, and 
       // how the writer is found, not what a reader names.
       assert.ok(textOf(proof).includes(kind), `${kind}: proof ${proof} does not mention it`)
       const writers = writersOf(kind)
-      assert.ok(writers.length > 0, `${kind}: kept, but no writer emits it and no historical decoder names it`)
+      if (kind === 'task/cancelled-at-completion') {
+        // Existing mission logs retain this fact even though completion no longer
+        // cancels work. Require its real UI reader and forbid a new producer.
+        assert.equal(writers.length, 0, 'completion must not reintroduce automatic task withdrawal')
+        assert.equal(proof, 'src/client/progress.ts')
+        assert.ok(textOf(proof).includes(`'${kind}': 'Task cancelled at completion'`))
+      } else assert.ok(writers.length > 0, `${kind}: kept, but no writer emits it and no historical decoder names it`)
       if (role === 'audit') {
         // The audit reader is the durable log itself: it is only a reader while
         // the row is written. A vocabulary description alone proves nothing.

@@ -23,7 +23,7 @@ class ControlledWorkers {
   async deliver(m, d) { this.deliveries.push(d) }
   async stop(id) { this.stopped.push(id) }
   isIdle(id) { return this.idle.has(id) }
-  async captureArtifact(member, task) { return { commit: `c-${task.id.slice(-8)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: ['src/a.ts'] } }
+  async captureArtifact(member, task) { return { commit: `c-${task.id.slice(-8)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/a.ts'] } }
   async verifyArtifact() { return this.checks }
   async prepareTask(member, task, dependencies) { this.prepared.push({ task: task.id, dependencies: dependencies.map(d => d.id) }) }
   async dispose() {}
@@ -177,7 +177,7 @@ test('a verification cannot be assigned to its source author or review finished 
   assert.throws(() => f.propose(f.actorB, { kind: 'verification', reviewOf: task.id, checks: [] }), /already accepted; a review can only start on submitted work/)
 })
 
-test('owner completion cancels tasks that can never be scheduled once every criterion is independently covered', async t => {
+test('owner completion preserves unschedulable obligations even when every criterion is independently covered', async t => {
   const f = await manual(t, {}, ['works', 'extra'])
   const task = await f.submitted()
   await assert.rejects(Promise.resolve().then(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'too early')), /unfinished or blocked required work/)
@@ -187,20 +187,31 @@ test('owner completion cancels tasks that can never be scheduled once every crit
   const dependent = f.propose(f.actorA, { kind: 'research', checks: undefined, dependencies: [rejected.id] })
   const review = f.propose(f.actorB, { kind: 'verification', reviewOf: dependent.id, checks: [] })
   const rejectedReview = await f.reviewed(rejected, 'reject')
-  // Blocked work whose criterion is uncovered keeps the mission open and says what is missing.
-  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'covered?'), /cover every mission acceptance criterion: \["extra"\]\. Blocked work still needs repair: /)
+  // Blocked work remains an obligation independently of text-level coverage.
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'covered?'), /unfinished or blocked required work/)
   const owned = f.runtime.observe(f.owner, f.mission.id)
   assert.deepEqual(new Set(owned.unschedulable), new Set([rejected.id, rejectedReview.id, dependent.id, review.id]), 'blocked work, dead prerequisites and unreachable reviews are reported transitively')
   // Covering the criterion with reviewed research keeps exactly one accepted implementation as the deliverable.
   const cover = await f.submitted({ kind: 'research', checks: undefined, acceptance: ['works', 'extra'] })
   await f.reviewed(cover)
-  const completed = f.runtime.control(f.owner, f.mission.id, 'complete', 'Every criterion is covered by accepted work')
-  assert.equal(completed.status, 'completed')
+  const before = f.runtime.snapshot(f.owner, f.mission.id)
+  assert.equal(before.completion.eligible, false)
+  assert.throws(() => f.runtime.control(f.owner, f.mission.id, 'complete', 'Every criterion is covered by accepted work'), /unfinished or blocked required work/)
+  assert.deepEqual(f.runtime.snapshot(f.owner, f.mission.id).tasks, before.tasks, 'failed completion never cancels or rewrites tasks')
+  const negativeChecks = f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.taskId === rejectedReview.id)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: rejected.id, reason: 'Withdraw the rejected alternative explicitly' })
+  const archivedReview = f.current(rejectedReview.id)
+  assert.equal(archivedReview.status, 'cancelled', 'explicit source withdrawal retires its moot negative review')
+  assert.equal(archivedReview.reviewedCommit, rejected.artifact.commit)
+  assert.equal(archivedReview.reviewedCommit, rejectedReview.reviewedCommit)
+  assert.equal(archivedReview.output, `${rejectedReview.output}\nSuperseded: ${rejected.id} was cancelled by the mission owner`, 'the original rejection remains readable alongside its retirement reason')
+  assert.deepEqual(f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.taskId === rejectedReview.id), negativeChecks, 'retirement retains the negative host-check evidence')
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: dependent.id, reason: 'Withdraw its no-longer-required follow-up explicitly' })
+  assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, true)
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'All remaining required work was accepted').status, 'completed')
   const final = f.runtime.snapshot(f.owner, f.mission.id)
-  for (const id of [rejected.id, rejectedReview.id, dependent.id, review.id]) {
-    assert.equal(final.tasks.find(item => item.id === id).status, 'cancelled'); assert.match(final.tasks.find(item => item.id === id).output, /Cancelled at completion/)
-  }
-  assert(final.events.some(event => event.type === 'task/cancelled-at-completion'))
+  for (const id of [rejected.id, rejectedReview.id, dependent.id, review.id]) assert.equal(final.tasks.find(item => item.id === id).status, 'cancelled')
+  assert(!final.events.some(event => event.type === 'task/cancelled-at-completion'))
 })
 
 test('usage buckets accumulate per worker without double counting and owner usage is attributed to the mission', async t => {
@@ -253,7 +264,7 @@ class AutoWorkers extends ControlledWorkers {
   async start(spec) { this.starts.push(spec) }
   async prepareBaseline() { return { sourceHead: 'h'.repeat(40), snapshotCommit: 'base', planningWorkspace: '/planning', changedPaths: [], createdAt: Date.now() } }
   async inspectDelivery(mission, resultCommit) { this.inspected.push(resultCommit); return { baselineCommit: 'base', resultCommit, changedPaths: ['src/value.cjs'], diff: '', truncated: false } }
-  async captureArtifact(member, task) { return { commit: `verified-${task.id.slice(-6)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: ['src/value.cjs'] } }
+  async captureArtifact(member, task) { return { commit: `verified-${task.id.slice(-6)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/value.cjs'] } }
 }
 async function automatic(t, tasks, acceptance = ['works']) {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-efficiency-auto-'))
@@ -311,7 +322,7 @@ test('several implementation branches still require a final integration, and one
   await assert.rejects(detached.runtime.startPlan(detached.owner, detached.request.id, detached.plan), /integration task must depend on implementation a/)
 })
 
-test('a stalled board wakes the owner once, and completes automatically when leftovers cannot run but every criterion is covered', async t => {
+test('a stalled automatic board preserves covered leftovers and completes only after explicit withdrawal', async t => {
   const research = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeKey: 'builder', maxRecoveryAttempts: 3, ...extra })
   const f = await automatic(t, [codeTask('impl'), reviewTask('review', 'impl'), research('base'), reviewTask('rbase', 'base'), research('follow', { dependencies: ['base'] }), reviewTask('rfollow', 'follow')], ['works', 'documented'])
   const snapshot = await f.runtime.startPlan(f.owner, f.request.id, f.plan)
@@ -336,19 +347,31 @@ test('a stalled board wakes the owner once, and completes automatically when lef
   assert.equal(byKey('base').status, 'blocked')
   // Nothing runs, follow/rfollow can never start, and 'documented' is uncovered: the owner is told exactly once.
   const stall = await eventually(() => f.workers.deliveries.find(delivery => delivery.kind === 'control' && /Mission stalled/.test(delivery.content)), 'stall notice')
-  assert.match(stall.content, /Unschedulable: .*_follow/); assert.match(stall.content, /documented/)
+  assert.match(stall.content, /Unschedulable: .*_follow/); assert.match(stall.content, /unfinished or blocked required work/)
   await settle()
   assert.equal(f.workers.deliveries.filter(delivery => delivery.kind === 'control' && /Mission stalled/.test(delivery.content)).length, 1, 'no repeated stall notices for the same state')
-  assert.throws(() => f.runtime.control(f.owner, missionId, 'complete', 'try'), /cover every mission acceptance criterion: \["documented"\]/)
+  assert.throws(() => f.runtime.control(f.owner, missionId, 'complete', 'try'), /unfinished or blocked required work/)
   // The owner covers the criterion with new reviewed research instead of repairing the blocked chain.
   const stream = f.runtime.store.list('workstreams', missionId)[0]
   const doc = f.runtime.propose(f.owner, missionId, { workstreamId: stream.id, title: 'doc', objective: 'Document', kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeId: builder.id, maxRecoveryAttempts: 3 })
   const rdoc = f.runtime.propose(f.owner, missionId, { workstreamId: stream.id, title: 'rdoc', objective: 'Review doc', kind: 'verification', reviewOf: doc.id, scope: ['src/'], acceptance: ['documented'], assigneeId: reviewer.id, maxRecoveryAttempts: 3 })
   await researchSubmitted(doc)
   await verdict(rdoc, 'accept')
-  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', missionId); return mission.status === 'completed' ? mission : undefined }, 'stalled-but-covered mission completes automatically')
-  assert.match(completed.reason, /remaining tasks could no longer be scheduled/)
+  await settle()
+  assert.equal(f.runtime.store.get('missions', missionId).status, 'active')
+  assert.equal(f.runtime.snapshot(f.owner, missionId).completion.eligible, false)
+  assert.equal(byKey('follow').status, 'pending'); assert.equal(byKey('rfollow').status, 'pending')
+  assert.equal(byKey('base').status, 'blocked'); assert.equal(byKey('rbase').status, 'blocked')
+  const rejectedReview = byKey('rbase')
+  f.runtime.cancel(f.owner, missionId, { taskId: byKey('base').id, reason: 'Owner withdraws the rejected source' })
+  assert.equal(byKey('rbase').status, 'cancelled', 'the source withdrawal retires its moot negative review')
+  assert.equal(byKey('rbase').reviewedCommit, rejectedReview.reviewedCommit)
+  assert.equal(byKey('rbase').reviewedCommit, byKey('base').artifact.commit)
+  assert.equal(byKey('rbase').output, `${rejectedReview.output}\nSuperseded: ${byKey('base').id} was cancelled by the mission owner`)
+  f.runtime.cancel(f.owner, missionId, { taskId: byKey('follow').id, reason: 'Owner withdraws the no-longer-required follow-up' })
+  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', missionId); return mission.status === 'completed' ? mission : undefined }, 'explicit withdrawal permits automatic completion')
+  assert.match(completed.reason, /independent verification satisfied/)
   for (const key of ['follow', 'rfollow', 'base', 'rbase']) assert.equal(byKey(key).status, 'cancelled', key)
-  assert.match(byKey('follow').output, /Cancelled at completion/)
+  assert.match(byKey('follow').output, /Cancelled by the mission owner/)
   assert.equal(byKey('impl').status, 'accepted'); assert.equal(f.runtime.store.get('tasks', doc.id).status, 'accepted')
 })

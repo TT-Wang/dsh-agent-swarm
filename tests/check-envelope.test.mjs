@@ -51,6 +51,8 @@ const FAILING_SUITE = [
 
 /** The check the fixture declares: a named stage, then the real failing suite. */
 const FAILING_CHECK = `echo "# stage: fixture-failing-suite" && node --test ${FIXTURE_TEST}`
+/** Successful controls still inspect the real artifact under the host envelope. */
+const PASSING_CHECK = 'test -s src/answer.txt'
 
 /**
  * R16-B: a real check that fails unless TMPDIR/TMP/TEMP name one writable
@@ -166,13 +168,13 @@ async function missionFixture(t, options = {}) {
   const reviewers = []
   for (const name of options.reviewerNames ?? ['Reviewer']) reviewers.push(await runtime.addMember(owner, mission.id, { name, role: 'verification' }))
   const source = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Source', objective: 'Source', kind: 'implementation',
-    scope: ['**'], acceptance: ['works'], checks: options.sourceChecks ?? ['true'], assigneeId: author.id })
+    scope: ['**'], acceptance: ['works'], checks: options.sourceChecks ?? [PASSING_CHECK], assigneeId: author.id })
   const sourceClaim = await runtime.claim({ sessionId: author.sessionId }, mission.id, source.id)
   await runtime.submit({ sessionId: author.sessionId }, mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
   const reviews = []
   for (const reviewer of reviewers) {
     const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${reviewer.id}`, objective: 'Review', kind: 'verification',
-      reviewOf: source.id, scope: ['**'], acceptance: ['works'], checks: options.reviewChecks ?? options.sourceChecks ?? ['true'], checkTimeoutMs: 30000, assigneeId: reviewer.id })
+      reviewOf: source.id, scope: ['**'], acceptance: ['works'], checks: options.reviewChecks ?? options.sourceChecks ?? [PASSING_CHECK], checkTimeoutMs: 30000, assigneeId: reviewer.id })
     const claim = await runtime.claim({ sessionId: reviewer.sessionId }, mission.id, review.id)
     reviews.push({ review, claim, reviewer })
   }
@@ -206,6 +208,71 @@ test('ENV: the envelope states HOME, the user cache roots, the sandbox policy an
   assert.equal(typeof envelope.limit, 'number')
 })
 
+test('ENV: dependency directory comparison uses sets without weakening membership or materialisation checks', () => {
+  const environment = dirs => ({
+    home: null, userCacheDir: null, huggingfaceCacheDir: null,
+    userCacheDirExists: false, huggingfaceCacheDirExists: false, xdgCacheHome: null,
+    sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: null },
+    dependencyLinks: { mode: 'copy', dirs }, checkCacheRoot: null, checkCacheRoots: {},
+  })
+  const declared = Object.freeze([...DEFAULT_DEPENDENCY_DIRS])
+  const measured = Object.freeze([...declared].reverse().concat(declared[0]))
+  assert.deepEqual(compareCheckEnvironments(environment(declared), environment(measured)).blocking, [],
+    'enumeration order and duplicate declarations do not change the dependency set')
+  assert.deepEqual(declared, DEFAULT_DEPENDENCY_DIRS, 'comparison leaves durable declarations unchanged')
+  for (const dirs of [declared.slice(1), [...declared, 'extra']]) {
+    const mismatches = compareCheckEnvironments(environment(declared), environment(dirs)).blocking
+    assert.deepEqual(mismatches.map(item => item.field), ['dependencyLinks.dirs'], 'a genuine addition or removal still blocks')
+  }
+  const copied = environment(declared)
+  const linked = { ...copied, dependencyLinks: { mode: 'link', dirs: [...declared].reverse() } }
+  assert.deepEqual(compareCheckEnvironments(copied, linked).blocking.map(item => item.field), ['dependencyLinks.mode'],
+    'copy and link remain distinct even when the directory sets agree')
+  assert.deepEqual(compareCheckEnvironments(environment(['a, b', 'c']), environment(['a', 'b, c'])).blocking.map(item => item.field),
+    ['dependencyLinks.dirs'], 'directory names containing the old display separator cannot conceal a changed set')
+})
+
+test('ENV: real host verification accepts dependency directories enumerated in Git order', async t => {
+  const fixture = await missionFixture(t)
+  const sourceRoot = fixture.mission.workspace
+  // Materialise every declared candidate so this test isolates order from a
+  // genuinely changed dependency set. Git enumerates these in lexical order.
+  await writeFile(path.join(sourceRoot, '.git', 'info', 'exclude'), DEFAULT_DEPENDENCY_DIRS.map(name => `/${name}/`).join('\n') + '\n')
+  for (const name of DEFAULT_DEPENDENCY_DIRS) {
+    await mkdir(path.join(sourceRoot, name), { recursive: true })
+    await writeFile(path.join(sourceRoot, name, 'fixture.txt'), 'installed dependency\n')
+  }
+  const reviewer = fixture.reviews[0]
+  const accepted = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, {
+    taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review with the declared dependencies',
+  })
+  assert.equal(accepted.status, 'accepted', 'passing host checks settle the review despite declaration/enumeration order')
+  assert.equal(fixture.ready().status, 'accepted', 'the source verdict is persisted')
+  const dependencies = fixture.workspaces.checkEnvelope().observed.environment.dependencyLinks
+  const measured = dependencies.materializedPaths
+  assert.deepEqual(dependencies.dirs, DEFAULT_DEPENDENCY_DIRS, 'the configured candidates remain distinct from materialised paths')
+  assert.deepEqual(measured, [...DEFAULT_DEPENDENCY_DIRS].sort(), 'the evidence retains the real Git enumeration order')
+  assert.notDeepEqual(measured, DEFAULT_DEPENDENCY_DIRS, 'the regression exercises differing orders on the actual check path')
+})
+
+test('ENV: a partially installed dependency set preserves policy and verifies the actual toolchain', async t => {
+  const fixture = await missionFixture(t, { sourceChecks: [PASSING_CHECK, 'test -s node_modules/fixture.txt'] })
+  const sourceRoot = fixture.mission.workspace
+  await writeFile(path.join(sourceRoot, '.git', 'info', 'exclude'), '/node_modules/\n')
+  await mkdir(path.join(sourceRoot, 'node_modules'), { recursive: true })
+  await writeFile(path.join(sourceRoot, 'node_modules', 'fixture.txt'), 'installed dependency\n')
+  const reviewer = fixture.reviews[0]
+  const accepted = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, {
+    taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review with the installed toolchain',
+  })
+  assert.equal(accepted.status, 'accepted', 'absent optional toolchain candidates do not create an environment mismatch')
+  assert.equal(fixture.ready().status, 'accepted', 'the real host verdict settles the source')
+  const observed = fixture.workspaces.checkEnvelope().observed
+  assert.equal(observed.attribution.command, 'test -s node_modules/fixture.txt', 'the host check read the materialised dependency')
+  assert.deepEqual(observed.environment.dependencyLinks.dirs, DEFAULT_DEPENDENCY_DIRS, 'the policy still permits all five candidates')
+  assert.deepEqual(observed.environment.dependencyLinks.materializedPaths, ['node_modules'], 'the execution records only the directory actually installed')
+})
+
 test('ENV: a completed check records the environment it ran under and its attribution', async t => {
   const fixture = await workspaceFixture(t)
   const mission = { id: 'mission-one', workspace: fixture.source }
@@ -225,7 +292,7 @@ test('ENV: a completed check records the environment it ran under and its attrib
   assert.match(envelope.observed.environment.checkCacheRoot, /verification/, 'the observed scoped cache root is inside a real verification checkout')
   // A later passing check replaces the observation: the envelope never carries a
   // stale attribution from an earlier failing run.
-  const passing = await fixture.workspaces.verifyArtifact(member, { ...task, checks: ['true'] }, artifact)
+  const passing = await fixture.workspaces.verifyArtifact(member, { ...task, checks: ['test -d .'] }, artifact)
   assert.equal(passing[0].exitCode, 0)
   assert.deepEqual(fixture.workspaces.checkEnvelope().observed.attribution.failingTests, [], 'the observation is the most recent check')
 })
@@ -274,7 +341,7 @@ test('ENV: truncating a real failing run at the bound keeps the failing test, th
 
 test('ENV: a failed declared check is attributable from durable state ahead of the output', async t => {
   // The host runs the reviewed artifact's own declared checks (the source task's).
-  const fixture = await missionFixture(t, { sourceChecks: [FAILING_CHECK], reviewChecks: ['true'] })
+  const fixture = await missionFixture(t, { sourceChecks: [FAILING_CHECK], reviewChecks: [PASSING_CHECK] })
   const reviewer = fixture.reviews[0]
   const rejected = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'reject', reason: 'The declared check fails' })
   assert.equal(rejected.status, 'blocked', 'the failing declared check blocks the source')
@@ -392,8 +459,8 @@ test('ENV × check-semaphore: host acceptance after a queued check hands its slo
     checkEnv: checkEnvFor(home),
     checkConcurrency: 1,
     reviewerNames: ['Reviewer A', 'Reviewer B'],
-    sourceChecks: ['sleep 1.5 && true'],
-    reviewChecks: ['true'],
+    sourceChecks: [`sleep 1.5 && ${PASSING_CHECK}`],
+    reviewChecks: [PASSING_CHECK],
   })
   const outcomes = await Promise.allSettled(fixture.reviews.map((reviewer, index) =>
     fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: `Independent review ${index}` })))
@@ -411,7 +478,7 @@ test('ENV × check-semaphore: host acceptance after a queued check hands its slo
 test('ENV × rejection: a failing check still blocks the source and records the mismatch', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
-  const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: ['true'] })
+  const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: [PASSING_CHECK] })
   const reviewer = fixture.reviews[0]
   const rejected = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'reject', reason: 'The artifact fails its declared check' })
   assert.equal(rejected.status, 'blocked', 'the failing check blocks the verification task')
@@ -429,7 +496,7 @@ test('ENV × rejection: a failing check still blocks the source and records the 
 test('ENV × rejection: an accept with a failing check is blocked by the failure, never accepted', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
-  const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: ['true'] })
+  const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home), sourceChecks: [FAILING_CHECK], reviewChecks: [PASSING_CHECK] })
   const reviewer = fixture.reviews[0]
   const verdict = await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })
   assert.equal(verdict.status, 'blocked')

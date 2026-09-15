@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
+import { WORKER_NAME_POOL } from '../lib/types.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -46,6 +47,40 @@ async function fixture(t) {
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, config, workers, runtime, owner, input: plan(directory) }
 }
+
+test('plan names reserve explicit identities and assign stable human defaults without changing roles', () => {
+  const input = plan('/workspace')
+  input.budget = { ...input.budget, maxWorkers: 5 }
+  delete input.members[0].name
+  input.members[1].name = 'Ada'
+  input.members.push({ key: 'custom', name: 'Research team lead', role: 'Plan the research' },
+    { key: 'analyst', role: 'Analyse evidence' }, { key: 'reserved', name: 'Alan', role: 'Review evidence' })
+  const before = structuredClone(input)
+  const canonical = validatePlan(input)
+  assert.deepEqual(canonical.members.map(member => member.name), ['Anita', 'Ada', 'Research team lead', 'Barbara', 'Alan'])
+  assert.deepEqual(canonical.members.map(member => member.role), input.members.map(member => member.role))
+  assert.deepEqual(input, before, 'normalization must not mutate the caller plan')
+  assert.deepEqual(validatePlan(input), canonical, 'raw retries assign the same names')
+  assert.deepEqual(validatePlan(canonical), canonical, 'persisted names survive revalidation')
+})
+
+test('explicit duplicate and invalid plan names are refused rather than silently replaced', () => {
+  for (const name of ['Builder', '', '  ', null, 7]) {
+    const input = plan('/workspace')
+    input.members[1].name = name
+    assert.throws(() => validatePlan(input), /members\[reviewer\]\.name/)
+  }
+})
+
+test('plans exceeding the default name pool can supply a unique explicit name', () => {
+  const input = plan('/workspace')
+  input.budget = { ...input.budget, maxWorkers: WORKER_NAME_POOL.length + 1 }
+  input.members = WORKER_NAME_POOL.map((name, index) => ({ key: index === 0 ? 'builder' : index === 1 ? 'reviewer' : `member_${index}`, name, role: 'Review evidence' }))
+  input.members.push({ key: 'additional', role: 'Research an independent question' })
+  assert.throws(() => validatePlan(input), /\[worker_name_pool_exhausted\].*members\[additional\]\.name/)
+  input.members.at(-1).name = 'Custom researcher'
+  assert.equal(validatePlan(input).members.at(-1).name, 'Custom researcher')
+})
 
 test('manual drafts retain legacy binding and round-trip only valid explicit assignment modes', async t => {
   const f = await fixture(t)

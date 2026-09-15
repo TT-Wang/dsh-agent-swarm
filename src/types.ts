@@ -61,6 +61,12 @@ export interface UsageBuckets {
   reasoningTokens: number
   requests: number
 }
+/** Host session generation, persisted before creating a replacement native log. */
+export interface UsageSnapshotSource {
+  generation: number
+  /** Only used to migrate a member written before session-specific watermarks existed. */
+  restored: boolean
+}
 /** Host-created immutable starting point; never supplied by a model plan. */
 export interface WorkspaceBaseline {
   sourceHead: string
@@ -242,10 +248,12 @@ export interface Member {
   reasoningEffort?: string
   /** Primary-agent-selected output allowance for each model request. */
   maxOutputTokens?: number
-  /** Last authoritative cumulative token total applied to the mission budget. */
+  /** Lifetime authoritative token charge applied to the mission budget, across native sessions. */
   accountedTokens?: number
-  /** Cumulative bucketed usage from this worker's persisted session log. */
+  /** Lifetime bucketed usage across this worker's native sessions. */
   usage?: UsageBuckets
+  /** Current native session's cumulative watermarks, separate from lifetime usage. */
+  usageSession?: { generation: number; accountedTokens: number; usage?: UsageBuckets }
   /**
    * R11-01: the last provider outage classified for this member. Present means
    * the member's route is quiescent (capacity/quota/availability), so a start
@@ -290,12 +298,20 @@ export interface Attempt {
   epoch: number
   ownerId: string
   leaseUntil: number
+  /** Immutable source selected when a verification attempt was assigned. */
+  sourceCommit?: string
 }
 export interface Artifact {
   commit: string
   baseCommit: string
   workspace: string
   changedPaths: string[]
+  /** Explicit file outputs, read back from this commit (never the mutable worktree). */
+  files?: Array<{ path: string; blob: string; bytes: number }>
+  /** Named outputs hidden by ignore rules and omitted from this submission. */
+  uncapturedPaths?: string[]
+  /** Changed executable files, symlinks or submodules in either tree, including deletions. */
+  executablePaths?: string[]
 }
 /** Owner revisions keep the obligation and history; submitted artifacts stay immutable. */
 export interface TaskAmendment {
@@ -526,6 +542,13 @@ export interface NoticeEnvelope {
   claimedAt?: number
   /** Original notice identities carried by a wake summary, independent of its transport identity. */
   aggregatedIdentities?: Array<{ class: NoticeClass; dedupKey: string; from: string; contentDigest: string }>
+  /** Structured constituents let a queued wake summary recheck each original obligation. */
+  aggregatedFacts?: Array<{
+    class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
+    subjects: string[]; trigger: string; reason: string; createdAt: number
+  }>
+  /** First transport handoff freezes the rendered summary across uncertain retries. */
+  handoffAt?: number
 }
 /**
  * Typed durable owner escalation raised by a mission member. A board post is
@@ -900,7 +923,7 @@ export interface WorkerCallbacks {
   beforeStep(memberId: string, hasFreshInput?: boolean): Promise<void | false>
   usage(memberId: string, tokens: number): Promise<void>
   /** Optional idempotent accounting path; cumulative persisted session total, never a delta. */
-  usageSnapshot?(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void>
+  usageSnapshot?(memberId: string, totalTokens: number, usage?: UsageBuckets, source?: UsageSnapshotSource): Promise<void>
   /** Optional owner-session usage report, attributed by the runtime to that owner's live missions or planning requests. */
   ownerUsage?(sessionId: string, usage: UsageBuckets): void
   /** Reject a revoked assignment by its durable delivery id; other peer messages retain their context. */
@@ -933,9 +956,11 @@ export interface WorkerAdapter {
   /** A unit of work closed for this member; the adapter may compact its history when idle and over its pressure threshold. */
   compactAtBoundary?(memberId: string): void
   isIdle(memberId: string): boolean
-  captureArtifact(member: Member, task: Task): Promise<Artifact>
+  captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact>
   /** Preserve any owned WIP after stop without treating it as an accepted artifact. */
   checkpointTask?(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
+  /** Read authoritative immutable Git facts, including fields absent from older stored records. */
+  inspectArtifact?(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
   verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<Array<{ command: string; exitCode: number; output: string }>>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */

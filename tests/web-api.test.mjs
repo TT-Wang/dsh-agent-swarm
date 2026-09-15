@@ -383,7 +383,7 @@ test('replacement cycles return an actionable bad-request through native RPC wit
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Graph', objective: 'Repair dependencies' })
-  const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['true'] }
+  const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
   const original = f.runtime.propose(owner, mission.id, input)
   const dependent = f.runtime.propose(owner, mission.id, { ...input, title: 'Dependent', dependencies: [original.id] })
   f.runtime.cancel(owner, mission.id, { taskId: original.id, reason: 'Revise implementation' })

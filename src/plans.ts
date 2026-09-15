@@ -1,7 +1,7 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
 import { assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
-import type { PlanInput, PlanTask } from './types.ts'
+import { nextWorkerName, type PlanInput, type PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Plan entries must be objects')
@@ -60,11 +60,24 @@ export function validatePlan(value: unknown): PlanInput {
   if (members.size > Number(value.budget.maxWorkers)) throw new Error('Roster exceeds worker budget')
   if (tasks.size > Number(value.budget.maxTasks) || streams.size > Number(value.budget.maxTasks)) throw new Error('Plan exceeds task/workstream budget')
   const names = new Set<string>()
-  // Field diagnostics are collected per record so the primary repairs one complete plan per round.
+  // Reserve every explicit name before assigning defaults, including names
+  // later in the roster. The detached canonical plan persists the result so
+  // admission retries retain the same display identities.
   for (const member of members.values()) inspectAdmission(() => {
-    text(member.name, `members[${member.key}].name`); text(member.role, `members[${member.key}].role`)
+    if (member.name === undefined) return
+    text(member.name, `members[${member.key}].name`)
     if (names.has(member.name)) throw new Error(`members[${member.key}].name duplicates another member; member names must be unique`)
     names.add(member.name)
+  })
+  // Field diagnostics are collected per record so the primary repairs one complete plan per round.
+  for (const member of members.values()) inspectAdmission(() => {
+    if (member.name === undefined) {
+      const name = nextWorkerName(names)
+      if (name === undefined) throw new Error(`[worker_name_pool_exhausted] members[${member.key}].name needs an explicit display name because the fixed worker-name pool has no unused names. Supply a unique \`name\` for this member and retry the same plan.`)
+      member.name = name
+      names.add(name)
+    }
+    text(member.role, `members[${member.key}].role`)
     for (const field of ['provider', 'model', 'reasoningEffort']) if (member[field] !== undefined) text(member[field], `members[${member.key}].${field}`)
     if (member.maxOutputTokens !== undefined && (!Number.isSafeInteger(member.maxOutputTokens) || Number(member.maxOutputTokens) < 1)) throw new Error(`members[${member.key}].maxOutputTokens must be a positive safe integer`)
     if (member.provider !== undefined && member.model === undefined) throw new Error(`members[${member.key}].provider requires a selected model`)

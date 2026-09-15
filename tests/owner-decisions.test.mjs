@@ -549,6 +549,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (referenceCarried(runtime, missionId, task, tasks)) return true
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
+    if (runtime.reviewable(task, tasks)) return true
     const submission = runtime.latestSubmission(missionId, task.id)
     return submission === undefined || submission.age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }

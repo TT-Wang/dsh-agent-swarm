@@ -7,6 +7,8 @@ import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
+import { PolicyError } from './policy-error.js'
+import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 export type { CheckEnvelope }
@@ -167,8 +169,10 @@ export interface CheckEnvironment {
   xdgCacheHome: string | null
   /** The confinement the host applies: workspace-write rooted at the checkout, full enforcement. */
   sandboxPolicy: { mode: string; enforcement: string; workspaceRoot: string | null }
-  /** Ignored dependency directories materialised into the checkout, and how. */
-  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[] }
+  /** Dependency materialisation policy. dirs is the configured set of directory names. */
+  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[];
+    /** Actual relative paths found and materialised in this execution; absent before execution. */
+    materializedPaths?: string[] }
   /** Scoped cache root the envelope provides inside the checkout; null for a self-run. */
   checkCacheRoot: string | null
   /** Package-manager cache roots the check sets below `checkCacheRoot`. */
@@ -1158,6 +1162,7 @@ export class Workspaces {
         if (task.reviewOf !== undefined) {
           if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
           await this.validateArtifact(member, reviewSource.artifact, signal)
+          if (task.attempt?.sourceCommit !== undefined && task.attempt.sourceCommit !== reviewSource.artifact.commit) throw new Error('[review_source_changed] Source artifact changed after assignment; reassign the same review before preparing its workspace')
         } else if (reviewSource !== undefined) throw new Error('[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
         const taskOwner = await readJson(this.taskPath(member.missionId, task.id))
         const ownsRecovery = taskOwner === undefined || (isRecord(taskOwner) && taskOwner.memberId === member.id)
@@ -1175,12 +1180,12 @@ export class Workspaces {
         }
         const dirty = (await this.uncommittedWork(member.workspace, signal)).length > 0
         let previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
-        if (record.task !== undefined && (record.task.taskId !== task.id || !sameDependencies)) {
+        if (record.task !== undefined && (record.task.taskId !== task.id || !sameDependencies || !sameReview || !ownsRecovery)) {
           // Dispatch only reaches this member after the old execution stopped.
           // Preserve all ordinary WIP, including out-of-scope work, separately
           // from accepted artifacts before removing anything from this checkout.
           if (dirty || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
-            await this.preserveWorkspace(record, signal)
+            await this.preserveWorkspace(record, signal, { allowSuperseded: true })
             await this.git(member.workspace, ['reset', '--hard', record.task.preservedCommit!], signal)
             previousHead = record.task.preservedCommit!
           }
@@ -1190,14 +1195,19 @@ export class Workspaces {
         // Each task starts only with the mission base and explicitly accepted dependencies.
         // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
         const mission = await this.missionRecord(member.missionId)
-        const recovery = reviewSource === undefined ? await this.recoverTask(member, task) : undefined
         const reviewCommit = reviewSource?.artifact?.commit
+        const recovered = await this.recoverTask(member, task)
+        // Review notes are task WIP too. Carry them across reviewers only while
+        // their immutable source is unchanged; old-source notes stay preserved
+        // in their own refs and must not be replayed onto another artifact.
+        const recovery = reviewCommit !== undefined && recovered?.baseCommit !== reviewCommit ? undefined : recovered
         const recompose = recovery !== undefined && JSON.stringify([...(recovery.dependencyCommits ?? [])].sort()) !== JSON.stringify(desiredDependencies)
         const conflicts: IntegrationConflict[] = recompose ? [] : recovery?.integrationConflicts ?? []
         const dependencyCommits: string[] = recompose ? [] : recovery?.dependencyCommits ?? []
         try {
-          await this.ensureSourceCommit(member.missionId, mission.source, reviewCommit ?? (recompose ? mission.baseCommit : recovery?.commit) ?? mission.baseCommit, signal)
-          await this.git(member.workspace, ['checkout', '--detach', reviewCommit ?? (recompose ? mission.baseCommit : recovery?.commit) ?? mission.baseCommit], signal)
+          const startingCommit = recompose ? reviewCommit ?? mission.baseCommit : recovery?.commit ?? reviewCommit ?? mission.baseCommit
+          await this.ensureSourceCommit(member.missionId, mission.source, startingCommit, signal)
+          await this.git(member.workspace, ['checkout', '--detach', startingCommit], signal)
           if ((recovery === undefined || recompose) && reviewCommit === undefined) for (const dependency of dependencies) {
             if (dependency.status !== 'accepted') throw new Error(`Dependency ${dependency.id} is not accepted`)
             if (dependency.artifact === undefined) {
@@ -1318,7 +1328,7 @@ export class Workspaces {
     })
   }
 
-  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal): Promise<void> {
+  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<void> {
     const task = record.task
     if (task === undefined) throw new Error('Cannot preserve a workspace without task ownership')
     const snapshot = await captureGitSnapshot(record.workspace, path.join(this.missionDir(record.missionId), 'preservation'),
@@ -1329,10 +1339,17 @@ export class Workspaces {
     const taskPath = this.taskPath(record.missionId, task.taskId)
     await this.withTaskRecordLock(taskPath, async () => {
       const current = await readJson(taskPath)
-      if (!isRecord(current) || current.memberId !== record.memberId || !isRecord(current.task) || current.task.epoch !== task.epoch) throw new Error('Task workspace ownership changed while preserving WIP; the snapshot remains in preservation refs')
+      const ownsTask = isRecord(current) && current.memberId === record.memberId && isRecord(current.task) && current.task.epoch === task.epoch
+      // Preparation may revisit a member's previous checkout after this task
+      // moved to someone else. Preserve that known local WIP without replacing
+      // the newer owner's checkpoint. Stop/checkpoint still requires ownership.
+      const superseded = options?.allowSuperseded === true && isRecord(current) && current.missionId === record.missionId
+        && current.memberId !== record.memberId && isRecord(current.task) && current.task.taskId === task.taskId
+        && Number.isSafeInteger(current.task.epoch) && Number(current.task.epoch) > task.epoch
+      if (!ownsTask && !superseded) throw new Error('Task workspace ownership changed while preserving WIP; the snapshot remains in preservation refs')
       task.preservedCommit = snapshot.snapshotCommit
       await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
-      await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace)
+      if (ownsTask) await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace)
     })
   }
 
@@ -1488,7 +1505,27 @@ export class Workspaces {
     return links
   }
 
-  async captureArtifact(member: Member, task: Task): Promise<Artifact> {
+  private async artifactChanges(workspace: string, baseCommit: string, commit: string, signal: AbortSignal): Promise<Pick<Artifact, 'changedPaths'> & { executablePaths: string[] }> {
+    const changedPaths = (await this.git(workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+    const rawChanges = (await this.git(workspace, ['diff', '--raw', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0')
+    const executablePaths: string[] = []
+    for (let index = 0; index + 1 < rawChanges.length; index += 2) {
+      const modes = /^:(\d+) (\d+) /.exec(rawChanges[index]!)
+      if (modes && modes.slice(1).some(mode => ['100755', '120000', '160000'].includes(mode))) executablePaths.push(rawChanges[index + 1]!)
+    }
+    return { changedPaths, executablePaths }
+  }
+
+  /** Re-read immutable Git facts for legacy records whose summary predates a policy field. */
+  async inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> {
+    return this.operation(member.id, async signal => {
+      await this.memberRecord(member)
+      await this.validateArtifact(member, artifact, signal)
+      return { ...artifact, ...await this.artifactChanges(member.workspace, artifact.baseCommit, artifact.commit, signal) }
+    }, signal)
+  }
+
+  async captureArtifact(member: Member, task: Task, deliverables: string[] = []): Promise<Artifact> {
     return await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
       if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('[workspace_baseline_missing] Task has no matching prepared workspace baseline Retry the task with `swarm_claim` and its `taskId`.')
@@ -1512,6 +1549,18 @@ export class Workspaces {
       // real untracked dependency directory is excluded as one unit (A2).
       const linkList = [...links]
       const dependencyContent = (name: string): boolean => linkList.some(link => name === link || name.startsWith(`${link}/`))
+      if (!Array.isArray(deliverables) || deliverables.some(name => typeof name !== 'string')) throw new Error('[invalid_deliverables] deliverables must be an array of relative file paths')
+      const outputs = [...new Set(deliverables)]
+      // Explicit outputs may override ignore rules, never scope, Git metadata,
+      // dependency exclusions or symlink containment. Do not force-add a folder.
+      for (const name of outputs) {
+        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name)) throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata and dependency directories. Correct \`deliverables\` with \`swarm_submit\`.`)
+        const parts = name.split('/')
+        for (let depth = 1; depth <= parts.length; depth++) {
+          const info = await lstat(path.join(member.workspace, ...parts.slice(0, depth))).catch(() => undefined)
+          if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
+        }
+      }
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
       // deleted source path too, instead of only the in-scope destination.
@@ -1527,21 +1576,33 @@ export class Workspaces {
       }
       for (const link of links) await this.git(member.workspace, ['rm', '--cached', '-r', '--force', '--quiet', '--', link], signal).catch(() => undefined)
       await this.git(member.workspace, ['add', '--all', '--', '.', ...[...links].map(link => `:(exclude,literal)${link}`)], signal)
+      if (outputs.length) await this.git(member.workspace, ['add', '--force', '--', ...outputs.map(name => `:(literal)${name}`)], signal)
       const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
       if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
       const commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
       await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
       for (const dependency of record.task.dependencyCommits ?? []) await this.git(member.workspace, ['merge-base', '--is-ancestor', dependency, commit], signal)
-      const changedPaths = (await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+      const { changedPaths, executablePaths } = await this.artifactChanges(member.workspace, baseCommit, commit, signal)
       for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new Error(`Committed artifact changes path outside task scope: ${name}`)
       // The commit is authoritative: re-check the recorded blobs so a working
       // tree edited after staging cannot smuggle a symlink into the artifact.
       await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
+      const files: NonNullable<Artifact['files']> = []
+      for (const name of outputs) {
+        const entry = await this.git(member.workspace, ['ls-tree', '--long', '-z', commit, '--', `:(literal)${name}`], signal, undefined, INVENTORY_BYTES, true)
+        const match = /^(100[0-7]{3}) blob ([a-f0-9]+)\s+(\d+)\t/.exec(entry)
+        if (!match) throw new PolicyError('deliverable_not_captured', 'conflict_error', `${JSON.stringify(name)} is not a regular file in the captured commit; correct the file and retry \`swarm_submit\` with \`deliverables\`.`)
+        files.push({ path: name, blob: match[2]!, bytes: Number(match[3]) })
+      }
+      // Heuristically named paths are hints, not permission to capture ignored
+      // content. Return the omission at submission while it is cheap to repair.
+      const uncapturedPaths = ignoredDeliverablePaths(member.workspace, deliverablePaths(task.objective ?? '', task.acceptance ?? [])).map(hit => hit.path).filter(name => !outputs.includes(name))
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
       delete record.task.preservedCommit
       await this.saveTaskWorkspace(record)
-      return { commit, baseCommit, workspace: member.workspace, changedPaths }
+      return { commit, baseCommit, workspace: member.workspace, changedPaths,
+        ...(files.length ? { files } : {}), ...(uncapturedPaths.length ? { uncapturedPaths } : {}), ...(executablePaths.length ? { executablePaths } : {}) }
     })
   }
 
@@ -1581,7 +1642,7 @@ export class Workspaces {
         // ENV: the facts this check runs under, recorded with it so a reader can
         // compare them with the envelope delivered to the assignee.
         const environment = this.checkEnvironment(env, checkout, true)
-        environment.dependencyLinks = { ...environment.dependencyLinks, dirs: linked.length ? linked : environment.dependencyLinks.dirs }
+        environment.dependencyLinks = { ...environment.dependencyLinks, materializedPaths: linked }
         const results: CheckResult[] = []
         let first = true
         for (const command of task.checks) {

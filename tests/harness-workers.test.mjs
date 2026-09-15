@@ -147,7 +147,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   const member = { id: 'worker-test', missionId: mission.id, sessionId: 'worker-session', name: 'worker', role: 'implementer', workspace: await adapter.prepareWorkspace(mission, 'worker-test'), ...config.member }
   const spec = { mission, member, ownerSessionId: 'owner-session' }
   if (config.start !== false) await adapter.start(spec)
-  return { ctx, adapter, owner, options, observations, callbacks, mission, member, spec, requests, workerOwnerScope }
+  return { root, ctx, adapter, owner, options, observations, callbacks, mission, member, spec, requests, workerOwnerScope }
 }
 
 const message = (member, id = 'delivery-one') => ({ id, missionId: member.missionId, from: 'coordinator-test', to: member.id, kind: 'assignment', content: 'Complete the assigned task.', createdAt: 1 })
@@ -447,8 +447,10 @@ test('cumulative usage snapshots reconcile persisted work before a resumed worke
   f.callbacks.idle = () => { idleResolve?.() }
   let accounted = 0
   const snapshots = []
-  f.callbacks.usageSnapshot = async (_memberId, total) => {
+  const sources = []
+  f.callbacks.usageSnapshot = async (_memberId, total, _usage, source) => {
     snapshots.push(total)
+    sources.push(source)
     const stored = await readStoredSession(f.ctx.sessionPersistence, SessionId(f.member.sessionId))
     // Each persisted request is charged 10 + 2 + 4 + 3 × 0.1 = 16.3 → 17 under the default weight.
     const persistedTotal = stored.events.reduce((sum, event) => event.type === 'assistant/message' && event.data.usage ? sum + 17 : sum, 0)
@@ -468,6 +470,9 @@ test('cumulative usage snapshots reconcile persisted work before a resumed worke
     await resumed.start(f.spec)
     assert.equal(accounted, 17)
     assert.deepEqual(snapshots, [17, 17])
+    assert.equal(sources[0].restored, false)
+    assert.equal(sources[1].restored, true)
+    assert.equal(sources[0].generation, sources[1].generation, 'resume keeps the durable native log accounting generation')
     assert.equal(f.requests.length, 1, 'reconciliation completes before another request')
     const nextIdle = waitForAccounting()
     await resumed.deliver(f.member, message(f.member, 'second-usage-message'))
@@ -475,6 +480,36 @@ test('cumulative usage snapshots reconcile persisted work before a resumed worke
     assert.equal(accounted, 34)
     assert.deepEqual(f.observations.failures, [])
   } finally { await resumed.dispose() }
+})
+
+test('recreating a missing native log advances its durable usage generation before new requests', async t => {
+  const f = await fixture(t)
+  const snapshots = []
+  f.callbacks.usageSnapshot = async (_memberId, total, usage, source) => { snapshots.push({ total, usage, source }) }
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => snapshots.length === 1, 'first accounted request')
+  const oldGeneration = snapshots[0].source.generation
+  await f.adapter.dispose()
+  // Only this fixture's retired log is lost; SQLite's member usage survives.
+  await rm(path.join(f.root, 'sessions'), { recursive: true, force: true })
+  const futureGeneration = oldGeneration + 60000
+  const spec = { ...f.spec, member: { ...f.member, accountedTokens: 900, usage: { ...rawScriptedBuckets, requests: 9 },
+    usageSession: { generation: futureGeneration, accountedTokens: 900, usage: { ...rawScriptedBuckets, requests: 9 } } } }
+  const recreated = new HarnessWorkers(f.ctx, f.options)
+  recreated.bind(f.callbacks)
+  try {
+    await recreated.start(spec)
+    const opened = snapshots.at(-1)
+    assert.equal(opened.total, 0)
+    assert.equal(opened.source.restored, false)
+    assert.equal(opened.source.generation, futureGeneration + 1, 'clock rollback cannot reuse an accounted generation')
+    const metadata = JSON.parse(await readFile(path.join(f.options.workspacesRoot, f.mission.id, `${f.member.id}.worker.json`), 'utf8'))
+    assert.equal(metadata.usageGeneration, opened.source.generation, 'the generation survives adapter and host restarts')
+    await recreated.deliver(f.member, message(f.member, 'after-recreation'))
+    await eventually(() => snapshots.at(-1).total === 17, 'replacement session first request')
+    assert.equal(snapshots.at(-1).source.generation, opened.source.generation)
+    assert.deepEqual(f.observations.failures, [])
+  } finally { await recreated.dispose() }
 })
 
 test('cache reads are charged at the configured weight while raw buckets stay exact for the UI', async t => {

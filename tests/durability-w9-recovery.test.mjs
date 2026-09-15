@@ -85,7 +85,7 @@ async function fixture(t) {
 test('W9: a cross-member recovery from a dirty workspace re-creates a clean baseline instead of blocking', async t => {
   const f = await fixture(t)
   const task = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Implement', objective: 'Implement',
-    kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['true'] })
+    kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   assert.equal(claimed.attempt.ownerId, f.author.id)
   const authorWorkspace = f.runtime.store.get('members', f.author.id).workspace

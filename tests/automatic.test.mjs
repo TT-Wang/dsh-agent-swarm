@@ -52,6 +52,30 @@ async function launch(f, input = f.input) {
   return { request, snapshot }
 }
 
+test('automatic default names persist in the plan and roster through a failed launch and retry', async t => {
+  const f = await fixture(t)
+  delete f.input.members[0].name
+  delete f.input.members[1].name
+  let fail = true
+  f.workers.onStart = async spec => { if (spec.member.name === 'Alan' && fail) throw new Error('Temporary named worker failure') }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Temporary named worker failure/)
+  const failed = f.runtime.starts(f.owner)[0]
+  const draft = f.runtime.store.get('drafts', failed.draftId)
+  assert.deepEqual(draft.input.members.map(member => member.name), ['Ada', 'Alan'])
+  const originalRoster = f.runtime.store.list('members', failed.missionId).map(member => ({ id: member.id, name: member.name, role: member.role }))
+  assert.deepEqual(originalRoster.map(member => member.name), ['Ada', 'Alan'])
+  assert.deepEqual(originalRoster.map(member => member.role), ['implementation', 'verification'])
+  fail = false
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.deepEqual(snapshot.members.map(member => ({ id: member.id, name: member.name, role: member.role })), originalRoster)
+  assert.equal(f.runtime.starts(f.owner)[0].draftId, draft.id)
+  assert.equal(f.workers.prepared.length, 2, 'retry reuses the durable workers')
+  const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.deepEqual(replay.members.map(member => ({ id: member.id, name: member.name, role: member.role })), originalRoster)
+  assert.deepEqual(f.input.members.map(member => member.name), [undefined, undefined], 'the caller may retry its original nameless input')
+})
+
 test('automatic launch persists assignment preferences and preserves an explicit pinned reviewer', async t => {
   const f = await fixture(t)
   f.input.tasks.find(task => task.kind === 'verification').assignmentMode = 'pinned'

@@ -385,3 +385,98 @@ test('optional ownership checkpoint still rejects stale task epoch metadata', as
   assert.equal(JSON.parse(await readFile(taskPath, 'utf8')).task.epoch, newer.task.epoch)
   assert.equal(await readFile(path.join(f.member.workspace, 'src/answer.txt'), 'utf8'), 'preserved WIP\n')
 })
+
+async function reviewerWorkspaceFixture(t) {
+  const f = await workspaceFixture(t)
+  const sourceTask = { ...f.task, scope: ['**'], checks: ['test "$(cat src/answer.txt)" = "submitted answer"'] }
+  await f.workspaces.prepareTask(f.member, sourceTask, [])
+  await writeFile(path.join(f.member.workspace, 'src/answer.txt'), 'submitted answer\n')
+  await writeFile(path.join(f.member.workspace, '.gitignore'), '.env\n')
+  const artifact = await f.workspaces.captureArtifact(f.member, sourceTask)
+  const source = { ...sourceTask, status: 'submitted', artifact }
+  const reviewers = await Promise.all(['beatrice', 'anita'].map(async id => ({ id, missionId: f.mission.id,
+    workspace: await f.workspaces.prepareWorkspace(f.mission, id) })))
+  const review = { ...f.task, id: 'review-task', kind: 'verification', reviewOf: source.id, scope: ['**'],
+    attempt: { sourceCommit: artifact.commit } }
+  const taskPath = path.join(f.temp, 'worktrees', f.mission.id, 'tasks', `${review.id}.json`)
+  return { ...f, source, review, reviewers, taskPath }
+}
+
+test('review handoff and return carry quiescent notes without changing the immutable source or its checks', async t => {
+  const f = await reviewerWorkspaceFixture(t)
+  const [first, second] = f.reviewers
+  await f.workspaces.prepareTask(first, f.review, [], f.source)
+  await mkdir(path.join(first.workspace, 'docs'))
+  await writeFile(path.join(first.workspace, 'docs/review.md'), 'first independent review\n')
+  await writeFile(path.join(first.workspace, 'src/answer.txt'), 'review experiment\n')
+  await writeFile(path.join(first.workspace, '.env'), 'ignored private local state\n')
+  await f.workspaces.checkpointTask(first, { ...f.review, epoch: 2 })
+  await f.workspaces.prepareTask(second, { ...f.review, epoch: 3 }, [], f.source)
+  assert.equal(await readFile(path.join(second.workspace, 'docs/review.md'), 'utf8'), 'first independent review\n')
+  assert.equal(await readFile(path.join(second.workspace, 'src/answer.txt'), 'utf8'), 'review experiment\n')
+  await assert.rejects(readFile(path.join(second.workspace, '.env')), { code: 'ENOENT' })
+  await writeFile(path.join(second.workspace, 'docs/review.md'), 'second reviewer continuation\n')
+  await f.workspaces.checkpointTask(second, { ...f.review, epoch: 4 })
+  await f.workspaces.prepareTask(first, { ...f.review, epoch: 5 }, [], f.source)
+  assert.equal(await readFile(path.join(first.workspace, 'docs/review.md'), 'utf8'), 'second reviewer continuation\n')
+  const record = JSON.parse(await readFile(f.taskPath, 'utf8'))
+  assert.equal(record.memberId, first.id)
+  assert.equal(record.task.baseCommit, f.source.artifact.commit)
+  assert.equal(f.review.attempt.sourceCommit, f.source.artifact.commit)
+  assert.equal(await git(first.workspace, 'show', `${f.source.artifact.commit}:src/answer.txt`), 'submitted answer')
+  const checks = await f.workspaces.verifyArtifact(first, f.source, f.source.artifact)
+  assert.equal(checks[0].exitCode, 0, 'declared checks run against the source, not the carried review experiment')
+})
+
+test('a former reviewer can leave a superseded dirty checkout without overwriting the current owner checkpoint', async t => {
+  const f = await reviewerWorkspaceFixture(t)
+  const [first, second] = f.reviewers
+  await f.workspaces.prepareTask(first, f.review, [], f.source)
+  await mkdir(path.join(first.workspace, 'docs'))
+  await writeFile(path.join(first.workspace, 'docs/review.md'), 'retained first draft\n')
+  await f.workspaces.checkpointTask(first, { ...f.review, epoch: 2 })
+  await f.workspaces.prepareTask(second, { ...f.review, epoch: 3 }, [], f.source)
+  await writeFile(path.join(second.workspace, 'docs/review.md'), 'current owner draft\n')
+  await f.workspaces.checkpointTask(second, { ...f.review, epoch: 4 })
+  const current = await readFile(f.taskPath, 'utf8')
+  await assert.rejects(f.workspaces.checkpointTask(first, f.review), /ownership changed while preserving WIP/)
+  await f.workspaces.prepareTask(first, { ...f.task, id: 'other-task' }, [])
+  assert.equal(await readFile(f.taskPath, 'utf8'), current, 'the newer task checkpoint is not replaced by the former owner')
+  assert.equal(await git(first.workspace, 'status', '--porcelain'), '')
+  await assert.rejects(readFile(path.join(first.workspace, 'docs/review.md')), { code: 'ENOENT' })
+  const repo = path.join(f.temp, 'worktrees', f.mission.id, 'artifacts.git')
+  const refs = (await git(repo, 'for-each-ref', '--format=%(objectname)', `refs/preservation/${f.review.id}/1/`)).split('\n')
+  assert.ok(refs.length > 0)
+  assert.equal(await git(repo, 'show', `${refs.at(-1)}:docs/review.md`), 'retained first draft')
+  assert.equal(await readFile(path.join(second.workspace, 'docs/review.md'), 'utf8'), 'current owner draft\n')
+})
+
+test('review recovery does not replay an old-source experiment onto a new source artifact', async t => {
+  const f = await reviewerWorkspaceFixture(t)
+  const [first, second] = f.reviewers
+  await f.workspaces.prepareTask(first, f.review, [], f.source)
+  await mkdir(path.join(first.workspace, 'docs'))
+  await writeFile(path.join(first.workspace, 'docs/review.md'), 'notes for the previous source only\n')
+  await f.workspaces.checkpointTask(first, { ...f.review, epoch: 2 })
+  const revised = { ...f.task, id: 'revised-source', scope: ['**'] }
+  await f.workspaces.prepareTask(f.member, revised, [])
+  await writeFile(path.join(f.member.workspace, 'src/answer.txt'), 'revised answer\n')
+  const artifact = await f.workspaces.captureArtifact(f.member, revised)
+  const source = { ...f.source, artifact }
+  await assert.rejects(f.workspaces.prepareTask(second, { ...f.review, epoch: 3 }, [], source), /review_source_changed/)
+  await f.workspaces.prepareTask(second, { ...f.review, epoch: 3, attempt: { sourceCommit: artifact.commit } }, [], source)
+  assert.equal(await git(second.workspace, 'rev-parse', 'HEAD'), artifact.commit)
+  assert.equal(await readFile(path.join(second.workspace, 'src/answer.txt'), 'utf8'), 'revised answer\n')
+  await assert.rejects(readFile(path.join(second.workspace, 'docs/review.md')), { code: 'ENOENT' })
+  const prior = JSON.parse(await readFile(path.join(f.temp, 'worktrees', f.mission.id, `${first.id}.workspace.json`), 'utf8'))
+  assert.equal(await git(first.workspace, 'show', `${prior.task.preservedCommit}:docs/review.md`), 'notes for the previous source only')
+})
+
+test('review preparation still refuses an unowned dirty workspace and preserves its files', async t => {
+  const f = await reviewerWorkspaceFixture(t)
+  const [first] = f.reviewers
+  await writeFile(path.join(first.workspace, 'unowned.txt'), 'unattributed work\n')
+  await assert.rejects(f.workspaces.prepareTask(first, f.review, [], f.source), /workspace_uncommitted/)
+  assert.equal(await readFile(path.join(first.workspace, 'unowned.txt'), 'utf8'), 'unattributed work\n')
+  await assert.rejects(readFile(f.taskPath), { code: 'ENOENT' })
+})

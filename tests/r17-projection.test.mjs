@@ -97,7 +97,7 @@ async function fixture(t, { workers: provided, registry } = {}) {
   const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
-  const propose = (title, input = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['true'], ...input })
+  const propose = (title, input = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const claim = (member, task) => runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
   const memberRow = member => runtime.store.get('members', member.id)
   const taskRow = task => runtime.store.get('tasks', task.id)
