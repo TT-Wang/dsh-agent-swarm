@@ -99,8 +99,10 @@ function assertBoardIsConsistent(f, label) {
   const cards = markup.split('<article class="sw-evidence">').slice(1)
   for (const evidence of snapshot.evidence) {
     const latest = verdicts.get(evidence.id)
-    assert.equal(latest?.type, VERDICT_FOR_STATUS[evidence.status],
-      `${label}: evidence ${evidence.id} is ${evidence.status} but its latest durable verdict is ${latest?.type ?? 'none'}`)
+    const latestRow = snapshot.events.find(event => event.seq === latest?.seq)
+    const verdictType = latest?.type === 'evidence/verdict' ? `evidence/${latestRow.data.verdict}` : latest?.type
+    assert.equal(verdictType, VERDICT_FOR_STATUS[evidence.status],
+      `${label}: evidence ${evidence.id} is ${evidence.status} but its latest durable verdict is ${verdictType ?? 'none'}`)
     const card = cards.find(segment => segment.includes(evidence.claim))
     assert.ok(card, `${label}: the board renders the card for evidence ${evidence.id} (${shortId(evidence.id)})`)
     assert.match(card, new RegExp(`>${evidence.status}</span>`), `${label}: the card badge shows the stored status`)
@@ -113,7 +115,7 @@ function assertBoardIsConsistent(f, label) {
   return snapshot
 }
 
-test('a rejected verification names the failing check in the durable reason and the owner notice', async t => {
+test('an infrastructure-deferred verification names the actual failed check and same-task owner recovery', async t => {
   const f = await fixture(t)
   const { source } = await f.submittedSourceWithEvidence()
   const verdict = f.proposeReview(source, 'Verdict review')
@@ -121,22 +123,23 @@ test('a rejected verification names the failing check in the durable reason and 
   f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: verdict.id, attemptId: claimed.attempt.id,
     verdict: 'accept', reason: 'passed every acceptance criterion' })
-  assert.equal(f.current(source.id).status, 'blocked')
+  assert.equal(f.current(source.id).status, 'submitted')
 
-  const [rejected] = f.events('task/rejected')
-  assert.ok(rejected, 'the rejection is durable')
+  const [rejected] = f.events('task/verification-deferred')
+  assert.ok(rejected, 'the deferred verdict is durable')
+  assert.equal(f.events('task/rejected').length, 0)
   const reason = rejected.data.reason
   assert.match(reason, /passed every acceptance criterion/, 'the reviewer reason is retained')
   assert.match(reason, /npm run typecheck && npm run build/, 'the failing command is named')
   assert.match(reason, /exited 127/, 'the exit code is named')
   assert.match(reason, /npm: command not found/, 'an output excerpt is carried')
   assert.equal(rejected.data.checks.length, 1, 'the host run id is still recorded')
-  assert.ok(Array.isArray(rejected.data.checkFailures), 'the durable event carries structured failing checks')
-  assert.deepEqual(rejected.data.checkFailures.map(check => [check.command, check.exitCode]),
-    [['npm run typecheck && npm run build', 127]], 'the structured failure names the command and exit code')
-  assert.match(rejected.data.checkFailures[0].output, /npm: command not found/, 'the structured failure carries the excerpt')
-  const [notice] = f.ownerNotices().filter(delivery => /blocked by independent verification/.test(delivery.content))
-  assert.ok(notice, 'the owner is woken by the rejection')
+  const recorded = f.runtime.store.get('tool_runs', rejected.data.checks[0])
+  assert.equal(recorded.result.exitCode, 127)
+  assert.match(recorded.result.output, /npm: command not found/)
+  const [notice] = f.ownerNotices().filter(delivery => /Verification could not establish a verdict/.test(delivery.content))
+  assert.ok(notice, 'the owner is woken for repair of the host environment')
+  assert.match(notice.content, /swarm_control/)
   assert.match(notice.content, /passed every acceptance criterion/, 'the notice keeps the reviewer reason')
   assert.match(notice.content, /npm run typecheck && npm run build/, 'the notice names the failing command')
   assert.match(notice.content, /exited 127/, 'the notice names the exit code')

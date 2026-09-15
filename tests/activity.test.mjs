@@ -84,7 +84,7 @@ test('deadline cancellation does not queue behind an active host verification',a
   await f.runtime.submit(f.actor,f.mission.id,{taskId:f.task.id,attemptId:f.task.attempt.id,output:'ready'})
   const reviewer=await f.runtime.addMember(f.owner,f.mission.id,{name:'Reviewer',role:'verification'})
   const review=await f.runtime.claim({sessionId:reviewer.sessionId},f.mission.id,f.propose({kind:'verification',reviewOf:f.task.id,checks:[]}).id)
-  const mission=f.runtime.store.get('missions',f.mission.id);mission.deadline=Date.now()+100;f.runtime.store.transaction(()=>f.runtime.store.put('missions',mission))
+  const mission=f.runtime.store.get('missions',f.mission.id);mission.budget.deadlineAt=Date.now()+100;mission.deadline=mission.budget.deadlineAt;f.runtime.store.transaction(()=>f.runtime.store.put('missions',mission))
   f.workers.verification=gate()
   const operation=f.runtime.verify({sessionId:reviewer.sessionId},f.mission.id,{taskId:review.id,attemptId:review.attempt.id,verdict:'accept',reason:'verified'})
   const outcome=operation.catch(error=>error)

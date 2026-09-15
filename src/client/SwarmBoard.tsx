@@ -1,13 +1,12 @@
-import { memo, useMemo, useState, type ReactNode } from 'react'
+import { createContext, memo, useContext, useMemo, useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
 import { LANES, activityGroups, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
-import { leaseExpired, useNow } from './clock.ts'
+import { leaseExpired, useVisibleClock } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
-import { MissionProgress, ResultSummary } from './MissionProgress.tsx'
 import { memberActivity, taskReasons, type ConnectionState } from './progress.ts'
 import { AgentAvatar } from './AgentAvatar.tsx'
-import { LiveWorkOverview } from './LiveWorkPanel.tsx'
+import { MissionOverview } from './LiveWorkPanel.tsx'
 
 type View = 'board' | 'evidence' | 'activity' | 'graph'
 /**
@@ -54,8 +53,22 @@ const cancellationLabels: Record<CancellationKind, string> = {
   'at-completion': 'still queued when the mission completed', withdrawn: 'withdrawn by the owner',
   unrecorded: 'cause not recorded in this snapshot',
 }
-function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, cancellation, onCancel }: {
-  task: Task; snapshot: Snapshot; live: boolean; now: number; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
+const LeaseTime = createContext(0)
+/** Only mounted in the visible task-list tab; its ticks update lease labels, not task cards or graph indexes. */
+function VisibleTaskLeases({ snapshot, tasks, live, connection, observedAt, children }: {
+  snapshot: Snapshot; tasks: readonly Task[]; live: boolean; connection: ConnectionState; observedAt?: number; children: ReactNode;
+}) {
+  const active = live && connection === 'connected' && snapshot.mission.status === 'active' && !snapshot.mission.budgetPause
+    && tasks.some(task => task.attempt !== undefined)
+  const { now, visible } = useVisibleClock(active)
+  return <LeaseTime.Provider value={active && visible ? Math.max(now, observedAt ?? 0) : observedAt ?? snapshot.mission.updatedAt}>{children}</LeaseTime.Provider>
+}
+function TaskLease({ attempt }: { attempt: NonNullable<Task['attempt']> }) {
+  const t = useCopy(), reference = useContext(LeaseTime)
+  return <span title={`${t('Attempt')} ${attempt.id}`}>{t('Attempt')} {attempt.epoch} · {t('lease')} {time(attempt.leaseUntil)}{leaseExpired(attempt.leaseUntil, reference) ? ` ${t('(expired)')}` : ''}</span>
+}
+function TaskCard({ task, snapshot, index, memberById, lane, reason, cancellation, onCancel }: {
+  task: Task; snapshot: Snapshot; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
   reason?: string; cancellation?: CancellationNote; onCancel?: (task: Task) => void;
 }) {
   const t = useCopy()
@@ -66,12 +79,11 @@ function TaskCard({ task, snapshot, live, now, index, memberById, lane, reason, 
   const dependencies = task.dependencies.map(id => index.byId.get(id))
   const blocked = index.blockedDependencies(task)
   const reviewSource = task.reviewOf ? index.byId.get(task.reviewOf) : undefined
-  const expired = task.attempt !== undefined && leaseExpired(task.attempt.leaseUntil, live ? now : snapshot.mission.updatedAt)
   return <article className="sw-task" data-lane={lane}>
     <div className="sw-row"><span className="sw-eyebrow">{t(task.kind)}</span><span className="sw-code sw-muted">{shortId(task.id)}</span></div>
     <div className="sw-task-title">{task.title}</div>
     <div className="sw-task-meta"><span>{member?.name ?? t('Unassigned')}{task.experiment ? ` · ${t('experiment')}` : ''}</span>
-      {task.attempt && <span title={`${t('Attempt')} ${task.attempt.id}`}>{t('Attempt')} {task.attempt.epoch} · {t('lease')} {time(task.attempt.leaseUntil)}{expired ? ` ${t('(expired)')}` : ''}</span>}
+      {task.attempt && <TaskLease attempt={task.attempt}/>}
       {blocked.length > 0 && <span>{t('Waiting on')} {blocked.length} {t(blocked.length === 1 ? 'prerequisite' : 'prerequisites')}</span>}
       {task.status === 'pending' && task.reviewOf && reviewSource?.status !== 'submitted' && <span>{t(reviewSource ? 'Waiting for source submission' : 'Review source is missing')}</span>}
       {task.evidenceIds.length > 0 && <span>{task.evidenceIds.length} {t(task.evidenceIds.length === 1 ? 'evidence record' : 'evidence records')}</span>}
@@ -145,12 +157,6 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
   const [view, setView] = useState<View>(initialView ?? 'board')
   const [detailsOpen, setDetailsOpen] = useState(initialView !== undefined)
   const [stream, setStream] = useState('all')
-  // The lease clock ticks only while a lease is on screen: every other card and
-  // the roster render from stable values, so a live mission no longer re-renders
-  // the whole board once per second (2026-09-11 review, M2/C-item).
-  const leaseVisible = live && snapshot.tasks.some(task => task.attempt !== undefined)
-  const now = useNow(leaseVisible)
-  const stableNow = snapshot.mission.updatedAt
   const { mission } = snapshot
   // One index and one lane pass per render; every card, edge and count reuses
   // them, so cost stays linear in tasks + edges (F-34).
@@ -181,13 +187,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
     <header className="sw-head"><div className="sw-row"><span className="sw-eyebrow">{t(live ? 'Current mission' : 'Mission snapshot')}</span><Badge value={mission.status} /></div>
       <h2>{mission.title}</h2>
     </header>
-    <div className="sw-overview">
-      <MissionProgress snapshot={snapshot} live={live} connection={connection} observedAt={observedAt} />
-      {actions}
-      {mission.status === 'completed' && <ResultSummary snapshot={snapshot} />}
-      {delivery}
-      <LiveWorkOverview snapshot={snapshot} connection={connection} live={live} observedAt={observedAt} onOpen={onOpenWorker}/>
-    </div>
+    <MissionOverview snapshot={snapshot} connection={connection} live={live} observedAt={observedAt} onOpen={onOpenWorker} actions={actions} delivery={delivery}/>
     <details className="sw-disclosure sw-technical" data-swarm-details="technical" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
       <summary>{t('Task details and resources')}</summary>
       {detailsOpen && <>
@@ -231,17 +231,17 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
           {LANES.map(lane => <span className="sw-lane-count" key={lane.id} data-lane-count={lane.id} data-empty={byLane.get(lane.id)!.length === 0}>
             {t(lane.label)} <b>{byLane.get(lane.id)!.length}</b></span>)}
         </div>
-        <div className="sw-board">{LANES.map(lane => {
+        <VisibleTaskLeases snapshot={snapshot} tasks={tasks} live={live} connection={connection} observedAt={observedAt}><div className="sw-board">{LANES.map(lane => {
         const items = byLane.get(lane.id)!
         return <section className="sw-lane" key={lane.id} data-lane={lane.id} data-empty={items.length === 0 ? '' : undefined} aria-label={t(lane.label)}>
           <div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
           {/* Item 3: an empty lane collapses to its header instead of drawing a
               dashed placeholder box in every one of the seven columns. */}
-          {items.length === 0 ? <div className="sw-lane-void" aria-hidden="true" /> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot} live={live}
-            now={task.attempt === undefined ? stableNow : now} index={index} memberById={memberById}
+          {items.length === 0 ? <div className="sw-lane-void" aria-hidden="true" /> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot}
+            index={index} memberById={memberById}
             lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} cancellation={cancellations.get(task.id)} onCancel={onCancelTask} />)}
         </section>
-      })}</div>
+      })}</div></VisibleTaskLeases>
         <details className="sw-section"><summary>{t('Mission contract and limits')}</summary><div className="sw-contract">
           <div><h3>{t('Acceptance')}</h3><ul>{mission.acceptance.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul></div>
           <div><h3>{t('Scope')}</h3><ul>{mission.scope.map((path, index) => <li key={index}>{path}</li>)}</ul>

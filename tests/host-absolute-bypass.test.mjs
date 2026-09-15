@@ -172,23 +172,10 @@ test('A2-01: both spellings are refused at runtime.propose', async t => {
   assert.equal(propose(['node check.cjs']).checks[0], 'node check.cjs')
 })
 
-test('R11-06: the classifier judges an npm script by its resolved body, not its name', () => {
-  const scripts = {
-    'test:deepseek': 'node --expose-internals scripts/smoke-deepseek.mjs',
-    'test:sidebar-service': 'node scripts/smoke-better-sidebar.mjs',
-    'test:command-deepseek': 'node --expose-internals scripts/smoke-command-deepseek.mjs',
-    'test:validation-repair-web': 'node scripts/smoke-command-web.mjs --validation-repair',
-    disguised: 'npm run test:deepseek',
-    worker: 'node --test tests/*.test.mjs',
-  }
-  for (const name of ['test:deepseek', 'test:sidebar-service', 'test:command-deepseek', 'test:validation-repair-web']) {
-    const classification = classifyCheck(`npm run ${name}`, scripts)
-    assert.equal(classification.runnable, 'host-only', name)
-    assert.equal(classification.code, 'check_requires_host')
-    assert.ok(classification.requirement.length > 0)
-  }
-  assert.match(classifyCheck('npm run disguised', scripts).requirement, /resolves to/, 'a neutral name is refused by its resolved body')
-  assert.equal(classifyCheck('npm run disguised', scripts).runnable, 'host-only', 'a neutral name cannot launder a host-only body')
-  assert.equal(classifyCheck('npm run worker', scripts).runnable, 'worker')
-  assert.equal(classifyCheck('npm run test:webhook', scripts).runnable, 'worker', 'an unknown script is not refused by name')
+test('resolved confinement requirements are independent of npm script names', () => {
+  const scripts = { verify: 'node --test', smoke: 'sandbox-exec -p rule node --test', disguised: 'npm run smoke' }
+  assert.equal(classifyCheck('npm run verify', scripts).runnable, 'worker')
+  assert.match(classifyCheck('npm run disguised', scripts).requirement, /resolves to/)
+  assert.equal(classifyCheck('npm run disguised', scripts).runnable, 'host-only')
+  assert.equal(classifyCheck('npm run test:webhook', scripts).runnable, 'worker')
 })

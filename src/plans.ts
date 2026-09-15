@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { assertScopeSelectors, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type TaskCeilingInput } from './admission.ts'
+import { assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import type { PlanInput, PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
@@ -43,6 +43,7 @@ export function validatePlan(value: unknown): PlanInput {
   value.scope = normalizeScopeSelectors(value.scope)
   // Return related scope/check corrections together so the primary repairs one full plan.
   const admissionIssues: string[] = []
+  const scripts = loadPackageScripts(String(value.workspace))
   const inspectAdmission = (inspect: () => void): void => {
     try { inspect() } catch (error) { admissionIssues.push(String(error instanceof Error ? error.message : error)) }
   }
@@ -51,9 +52,10 @@ export function validatePlan(value: unknown): PlanInput {
   for (const name of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments']) {
     if (!Number.isSafeInteger(value.budget[name]) || Number(value.budget[name]) < (name === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${name}`)
   }
+  if (value.budget.deadlineAt !== undefined && (!Number.isSafeInteger(value.budget.deadlineAt) || Number(value.budget.deadlineAt) < 1)) throw new Error('Invalid budget deadlineAt: use a positive safe integer Unix timestamp in milliseconds')
   // Mission-level write directives and named deliverables reconcile before any task is admitted.
-  for (const diagnostic of reconcileObjectiveScope(String(value.objective), value.scope as string[], 'objective')) admissionIssues.push(formatDiagnostic(diagnostic))
-  for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), String(value.objective), value.acceptance as string[], 'objective')) admissionIssues.push(formatDiagnostic(diagnostic))
+  for (const diagnostic of reconcileObjectiveScope(String(value.objective), value.scope as string[], 'objective')) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
+  for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), String(value.objective), value.acceptance as string[], 'objective')) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
   const members = keyed(value.members, 'Members'), streams = keyed(value.workstreams, 'Workstreams'), tasks = keyed(value.tasks, 'Tasks')
   if (members.size > Number(value.budget.maxWorkers)) throw new Error('Roster exceeds worker budget')
   if (tasks.size > Number(value.budget.maxTasks) || streams.size > Number(value.budget.maxTasks)) throw new Error('Plan exceeds task/workstream budget')
@@ -83,8 +85,8 @@ export function validatePlan(value: unknown): PlanInput {
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new Error(`${at}.maxRecoveryAttempts must be a positive safe integer`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new Error(`${at}.checkTimeoutMs must be a positive integer within the platform timer range`) })
-    if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key)))
-    // Every admitted task carries its own step/finding ceiling; the runtime blocks the task at this limit.
+    if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key), scripts))
+    // Every task carries a finite step allocation and an advisory finding estimate.
     inspectAdmission(() => {
       const ceilings = normalizeTaskCeilings(task as TaskCeilingInput, Number((value.budget as Record<string, unknown>).maxSteps), `tasks[${index}]`)
       Object.assign(task, ceilings)
@@ -92,8 +94,8 @@ export function validatePlan(value: unknown): PlanInput {
     if (typeof task.objective === 'string') {
       const taskScope = Array.isArray(task.scope) ? task.scope as string[] : []
       const taskAcceptance = Array.isArray(task.acceptance) ? task.acceptance as string[] : []
-      for (const diagnostic of reconcileObjectiveScope(task.objective, taskScope, `${at}.objective`)) admissionIssues.push(formatDiagnostic(diagnostic))
-      for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), task.objective, taskAcceptance, at)) admissionIssues.push(formatDiagnostic(diagnostic))
+      for (const diagnostic of reconcileObjectiveScope(task.objective, taskScope, `${at}.objective`)) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
+      for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), task.objective, taskAcceptance, at)) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
       // R12-F9 at plan admission: a task with no content-carrying edge whose own
       // text assumes prior work would be prepared from the bare baseline and
       // surprise its member at submit. Same guard as propose(), same exits.
@@ -102,9 +104,13 @@ export function validatePlan(value: unknown): PlanInput {
         acceptance: taskAcceptance,
         dependencies: [...(Array.isArray(task.dependencies) ? task.dependencies as string[] : []), ...(typeof task.reviewOf === 'string' ? [task.reviewOf] : [])],
         replaces: Array.isArray(task.replaces) ? task.replaces as string[] : [],
-      }, `${at}.objective`)) admissionIssues.push(formatDiagnostic(diagnostic))
+      }, `${at}.objective`)) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
     }
     inspectAdmission(() => { if (task.assigneeKey !== undefined && (typeof task.assigneeKey !== 'string' || !members.has(task.assigneeKey))) throw new Error(`${at}.assigneeKey must name an existing member key`) })
+    inspectAdmission(() => {
+      if (task.assignmentMode !== undefined && task.assignmentMode !== 'preferred' && task.assignmentMode !== 'pinned') throw new Error(`${at}.assignmentMode must be preferred or pinned`)
+      if (task.assignmentMode !== undefined && task.assigneeKey === undefined) throw new Error(`${at}.assignmentMode requires assigneeKey`)
+    })
     inspectAdmission(() => { if (task.priority !== undefined && (!Number.isInteger(task.priority) || Number(task.priority) < 0 || Number(task.priority) > 100)) throw new Error(`${at}.priority must be 0–100`) })
     inspectAdmission(() => { if (task.experiment !== undefined && typeof task.experiment !== 'boolean') throw new Error(`${at}.experiment must be boolean`) })
     if (task.experiment === true) experiments++
@@ -128,11 +134,12 @@ export function validatePlan(value: unknown): PlanInput {
   const plan: PlanInput = {
     title: raw.title, objective: raw.objective, workspace: raw.workspace, scope: raw.scope, acceptance: raw.acceptance,
     budget: { maxTokens: raw.budget.maxTokens, maxSteps: raw.budget.maxSteps, maxWorkers: raw.budget.maxWorkers,
-      maxDurationMs: raw.budget.maxDurationMs, maxTasks: raw.budget.maxTasks, maxExperiments: raw.budget.maxExperiments },
+      maxDurationMs: raw.budget.maxDurationMs, maxTasks: raw.budget.maxTasks, maxExperiments: raw.budget.maxExperiments,
+      ...(raw.budget.deadlineAt === undefined ? {} : { deadlineAt: raw.budget.deadlineAt }) },
     members: raw.members.map(({ key, name, role, provider, model, reasoningEffort, maxOutputTokens }) => ({ key, name, role, provider, model, reasoningEffort, maxOutputTokens })),
     workstreams: raw.workstreams.map(({ key, title, objective }) => ({ key, title, objective })),
-    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf }) =>
-      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, dependencies, reviewOf })),
+    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf }) =>
+      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf })),
   }
   orderedTasks(plan.tasks)
   return plan
@@ -152,4 +159,20 @@ export function orderedTasks(tasks: PlanTask[]): PlanTask[] {
   }
   for (const task of tasks) visit(task.key)
   return result
+}
+
+/** Advisory preflight over the actual target project; never changes plan authority. */
+export function planAdvisories(plan: PlanInput): AdmissionDiagnostic[] {
+  const scripts = loadPackageScripts(plan.workspace)
+  const diagnostics = [...reconcileObjectiveScope(plan.objective, plan.scope, 'objective'),
+    ...reconcileDeliverableIgnores(plan.workspace, plan.objective, plan.acceptance, 'objective')]
+  for (const task of plan.tasks) {
+    diagnostics.push(...reconcileObjectiveScope(task.objective, task.scope, `tasks[${task.key}].objective`),
+      ...reconcileDeliverableIgnores(plan.workspace, task.objective, task.acceptance, `tasks[${task.key}]`))
+    for (const [index, command] of (task.checks ?? []).entries()) {
+      const { preflight } = classifyCheck(command, scripts)
+      if (preflight) diagnostics.push({ code: 'check_preflight', severity: 'advisory', location: `tasks[${task.key}].checks[${index}]`, message: preflight })
+    }
+  }
+  return diagnostics
 }

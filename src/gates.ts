@@ -9,6 +9,8 @@
 import { randomUUID, createHash } from 'node:crypto'
 import { arenaView as projectArenaView } from './arena.ts'
 import { excerpt } from './declared-checks.ts'
+import { executionElapsed } from './resource-time.ts'
+import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
@@ -203,7 +205,7 @@ export class RuntimeGates {
       // witness record and F19 use, never the arena ledger's dedup digest.
       fingerprint: this.fingerprint(missionId),
       noticeDedupKey: this.rt.noticeKey(missionId),
-      pendingDispatchable: view.pendingDispatchable,
+      pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a
@@ -315,34 +317,70 @@ export class RuntimeGates {
 
   /**
    * Emit at most one approaching-limit warning per dimension per threshold. The
-   * first signal is an event, not a fatal pause; thresholds default to 0.7/0.9.
+   * first signal is a durable owner review notice; thresholds default to 0.7/0.9.
    */
   warnBudget(mission: Mission): void {
     if (mission.status !== 'active' || mission.budgetPause) return
     const thresholds = [...(this.rt.config.budgetWarnAt ?? DEFAULT_BUDGET_WARN_AT)]
       .filter(value => Number.isFinite(value) && value > 0 && value < 1).sort((a, b) => a - b)
     if (!thresholds.length) return
-    const dimensions: Array<{ dimension: string; used: number; limit: number }> = [
-      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens },
-      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps },
-      { dimension: 'maxDurationMs', used: Math.max(0, Date.now() - mission.createdAt), limit: mission.budget.maxDurationMs },
+    const members = this.rt.store.list('members', mission.id)
+    const inFlight = members.filter(member => memberPhaseOf(member) !== 'stopped'
+      && (this.rt.workers.currentActivity?.(member.id) ?? member.activity)?.kind === 'model')
+    const tasks = this.rt.store.list('tasks', mission.id)
+    const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; task?: Task }> = [
+      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
+      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
+      { dimension: 'maxDurationMs', used: executionElapsed(mission), limit: mission.budget.maxDurationMs, inFlight: 0 },
     ]
-    let changed = false
+    for (const task of tasks) {
+      if (['accepted', 'cancelled'].includes(task.status)) continue
+      if (task.maxSteps !== undefined) dimensions.push({ dimension: 'maxSteps', used: task.usedSteps ?? 0, limit: task.maxSteps,
+        inFlight: inFlight.some(member => member.id === task.attempt?.ownerId) ? 1 : 0, task })
+      if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: task.evidenceIds.length, limit: task.maxFindings, inFlight: 0, task })
+    }
+    const warnings: Array<{ gate: string; threshold: number; key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
+    let missionProgress: string | undefined
     for (const item of dimensions) {
       if (!(item.limit > 0)) continue
-      const crossed = thresholds.filter(threshold => item.used / item.limit >= threshold).at(-1)
-      if (crossed === undefined || crossed <= (mission.budgetWarned?.[item.dimension] ?? 0)) continue
-      mission.budgetWarned = { ...(mission.budgetWarned ?? {}), [item.dimension]: crossed }
-      changed = true
-      // F11: the division can land one ulp above an exact ceiling (700 / 0.7 is
-      // 1000.0000000000001), so Math.ceil alone suggests 1001. Round the ratio to
-      // six decimals first; the suggestion stays the smallest integer limit that
-      // holds the dimension at or below the crossed threshold.
-      const suggestedLimit = Math.ceil(Number((item.used / crossed).toFixed(6)))
-      this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
-        remaining: Math.max(0, item.limit - item.used), suggestedLimit })
+      const projected = item.used + item.inFlight
+      const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
+      const gate = `${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
+      if (crossed === undefined || crossed <= (this.rt.mission(mission.id).budgetWarned?.[gate] ?? 0)) continue
+      // A recommendation must actually increase the estimate. The owner still
+      // reviews it; no runtime path applies this value automatically.
+      const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
+      const suggestedLimit = Number.isSafeInteger(recommendation) ? recommendation : undefined
+      const scope = item.task === undefined ? 'Mission' : `Task ${item.task.id} (${item.task.title})`
+      const progress = item.task === undefined
+        ? missionProgress ??= `${tasks.filter(task => task.status === 'accepted').length}/${tasks.length} tasks accepted; ${this.rt.store.list('evidence', mission.id).length} evidence records`
+        : `status ${item.task.status}; ${item.task.evidenceIds.length} evidence records; artifact ${item.task.artifact?.commit ?? 'not submitted'}`
+      const data = { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
+        remaining: Math.max(0, item.limit - item.used), inFlightEstimate: item.inFlight, projected,
+        ...(suggestedLimit === undefined ? {} : { suggestedLimit }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
+      warnings.push({ gate, threshold: crossed, key: `budget-review:${mission.id}:${gate}:${crossed}`, data,
+        subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
+        content: `${scope}: ${item.dimension} settled ${item.used}/${item.limit}, remaining ${data.remaining}; in-flight estimate ${item.inFlight}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Suggested ${item.dimension}: ${suggestedLimit}.`} Progress: ${progress}.${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
-    if (changed) this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
+    if (!warnings.length) return
+    // One owner wake for this pass; each dimension keeps its durable event and
+    // identity so a later threshold, changed limit or restart remains distinct.
+    this.rt.commit(mission.id, () => {
+      const current = this.rt.mission(mission.id)
+      current.budgetWarned = { ...(current.budgetWarned ?? {}) }
+      for (const warning of warnings) {
+        current.budgetWarned[warning.gate] = warning.threshold
+        this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
+      }
+      this.rt.store.put('missions', current)
+      const keys = warnings.map(warning => warning.key)
+      const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
+      const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
+      this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
+        [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupe: true, dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
+          facts: [...warnings.map(warning => warning.content), instructions],
+          aggregatedIdentities: warnings.map(warning => ({ class: 'budget', dedupKey: warning.key, from: 'runtime', contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
+    })
   }
 
   blockBudget(mission: Mission): void {

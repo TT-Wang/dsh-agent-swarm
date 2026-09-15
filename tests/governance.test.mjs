@@ -148,18 +148,18 @@ test('F7: propose(admittedId) refuses to re-admit a cancelled record', async t =
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.find(item => item.id === admittedId).status, 'cancelled')
 })
 
-test('F11: suggestedLimit is the exact ceiling, not one above it', async t => {
+test('F11/R06: warning suggestions increase the limit and restore planning headroom', async t => {
   const f = await setup(t, { budget: { maxTokens: 1000 } })
   const builder = await f.addMember({ name: 'Builder', role: 'implementation' })
   await f.workers.callbacks.usageSnapshot(builder.id, 700)
   const warnings = () => f.events('mission/budget-warning')
   assert.equal(warnings().length, 1)
   assert.equal(warnings()[0].data.threshold, 0.7)
-  assert.equal(warnings()[0].data.suggestedLimit, 1000, '700 / 0.7 is exactly 1000, not 1001')
+  assert.equal(warnings()[0].data.suggestedLimit, 1001, 'a suggested adjustment must increase the current ceiling')
   await f.workers.callbacks.usageSnapshot(builder.id, 700)
   assert.equal(warnings().length, 1, 'the threshold warns once')
   await f.workers.callbacks.usageSnapshot(builder.id, 950)
   const last = warnings().at(-1)
   assert.equal(last.data.threshold, 0.9)
-  assert.equal(last.data.suggestedLimit, 1056, 'a non-integer ratio still rounds up')
+  assert.equal(last.data.suggestedLimit, 1358, 'a recommendation restores headroom below the first review threshold')
 })

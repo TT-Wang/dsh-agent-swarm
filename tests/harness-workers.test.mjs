@@ -160,6 +160,26 @@ async function eventually(read, what, timeoutMs = 10000) {
 /** The scripted provider reports this per request; cache reads are charged at the adapter weight, buckets stay raw. */
 const rawScriptedBuckets = { uncachedInputTokens: 10, cacheReadTokens: 3, cacheWriteTokens: 4, outputTokens: 2, reasoningTokens: 1, requests: 1 }
 
+test('cancelled native startup cannot publish a late worker and can be retried after cleanup', async t => {
+  const f = await fixture(t, undefined, { start: false })
+  const original = f.adapter.composition.bind(f.adapter)
+  let release, entered
+  const ready = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { release = resolve })
+  f.adapter.composition = async (...args) => { const composition = await original(...args); entered(); await gate; return composition }
+  const controller = new AbortController()
+  const opening = f.adapter.start(f.spec, controller.signal)
+  await ready
+  controller.abort(new Error('startup deadline'))
+  release()
+  await assert.rejects(opening, /startup deadline/)
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined)
+  assert.equal(f.requests.length, 0, 'abandoned setup cannot spend a model request')
+  f.adapter.composition = original
+  await f.adapter.start(f.spec)
+  assert.ok(f.ctx.agents.get(SessionId(f.member.sessionId)), 'clean retry can publish a native handle')
+})
+
 const reasoningModel = model => model === 'plain-model' ? {} : {
   reasoning: { efforts: [{ id: ReasoningEffortId('off'), name: 'Off' }, { id: ReasoningEffortId('high'), name: 'High' }], defaultEffort: ReasoningEffortId('off') },
 }

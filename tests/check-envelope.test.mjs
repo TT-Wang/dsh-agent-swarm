@@ -1,8 +1,8 @@
 /**
  * ENV regression: the declared-check envelope states the environment the host
  * check runs in, it is delivered with the assignment of an implementing and a
- * verifying attempt, a verification whose self-run cannot reproduce it reports
- * the mismatch instead of accepting the artifact, and a failed check stays
+ * verifying attempt. swarm_verify records self-run differences as diagnostics,
+ * binds acceptance to the supporting host checks, and a failed check stays
  * attributable from durable state ahead of truncation.
  *
  * Pre-fix head: `workspaces.checkEnvelope()` reported only the measured
@@ -327,23 +327,13 @@ test('ENV: the assignment of an implementing and a verifying attempt delivers th
  * A self-run that cannot reproduce the envelope reports the mismatch.
  * ------------------------------------------------------------------ */
 
-test('ENV: a verification whose self-run cannot reproduce the envelope reports the mismatch instead of accepting', async t => {
+test('ENV: a diagnostic environment mismatch is recorded while supporting host checks decide acceptance', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(home) })
   const reviewer = fixture.reviews[0]
-  await assert.rejects(
-    fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' }),
-    error => {
-      assert.equal(error.code, 'check_environment_mismatch')
-      assert.match(error.message, /\[check_environment_mismatch\]/, 'the refusal carries a stable code')
-      assert.match(error.message, /home: /, 'the refusal names the divergent field')
-      assert.match(error.message, /swarm_verify/, 'the refusal names the executable exit')
-      assert.ok(error.message.includes(`envelope ${home}`), `the refusal names the envelope value: ${error.message}`)
-      assert.ok(error.message.includes(`self-run ${process.env.HOME}`), `the refusal names the self-run value: ${error.message}`)
-      return true
-    })
-  assert.equal(fixture.ready().status, 'submitted', 'the artifact is not accepted under a different environment')
+  assert.equal((await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })).status, 'accepted', 'the supporting host checks pass under the declared envelope')
+  assert.equal(fixture.ready().status, 'accepted', 'unrelated diagnostic differences do not veto the host check')
   const events = fixture.events().filter(event => event.type === 'task/check-envelope')
   const mismatch = events.find(event => event.data?.reproduction === 'check-environment-mismatch')
   assert.ok(mismatch, 'the mismatch is durable')
@@ -351,10 +341,10 @@ test('ENV: a verification whose self-run cannot reproduce the envelope reports t
   assert.equal(mismatch.data.selfRunSource, 'host-ambient', 'the record names where the self-run facts came from')
   assert.equal(mismatch.data.envelope.home, home)
   assert.equal(mismatch.data.selfRun.home, process.env.HOME)
-  assert.equal(fixture.ready().status, 'submitted')
+  assert.equal(fixture.ready().status, 'accepted')
   assert.ok(fixture.workers.verifications.length >= 1, 'the host check really ran before the refusal')
   const review = fixture.runtime.store.get('tasks', reviewer.review.id)
-  assert.equal(review.status, 'running', 'the attempt survives so the reviewer can rerun under the envelope')
+  assert.equal(review.status, 'accepted', 'the review is decided by its supporting host checks')
 })
 
 test('ENV: an attempt whose recorded tool runs cannot reproduce the envelope is reported with that evidence', async t => {
@@ -367,13 +357,7 @@ test('ENV: an attempt whose recorded tool runs cannot reproduce the envelope is 
   assert.ok(runId, 'the self-run is recorded')
   const row = fixture.runtime.store.get('tool_runs', runId)
   assert.equal(row.checkEnvironment.home, process.env.HOME, 'the durable row carries the environment the self-run ran under')
-  await assert.rejects(
-    fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' }),
-    error => {
-      assert.equal(error.code, 'check_environment_mismatch')
-      assert.match(error.message, /host-recorded tool runs/, 'the refusal names the self-run evidence')
-      return true
-    })
+  assert.equal((await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })).status, 'accepted', 'the supporting host checks pass under the declared envelope')
   const mismatch = fixture.events().filter(event => event.type === 'task/check-envelope').find(event => event.data?.reproduction === 'check-environment-mismatch')
   assert.equal(mismatch.data.selfRunSource, 'tool-run')
   assert.equal(mismatch.data.selfRun.home, process.env.HOME)
@@ -401,7 +385,7 @@ test('ENV: a cold user cache is recorded as advisory and never refuses an accept
  * The guard's pairs: the check semaphore and the rejection path.
  * ------------------------------------------------------------------ */
 
-test('ENV × check-semaphore: a mismatch refusal after a queued check hands its slot back', async t => {
+test('ENV × check-semaphore: host acceptance after a queued check hands its slot back', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   t.after(async () => rm(path.dirname(home), { recursive: true, force: true }))
   const fixture = await missionFixture(t, {
@@ -413,17 +397,15 @@ test('ENV × check-semaphore: a mismatch refusal after a queued check hands its 
   })
   const outcomes = await Promise.allSettled(fixture.reviews.map((reviewer, index) =>
     fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: `Independent review ${index}` })))
-  for (const outcome of outcomes) {
-    assert.equal(outcome.status, 'rejected', 'the acceptance is refused under a non-reproducing environment')
-    assert.equal(outcome.reason.code, 'check_environment_mismatch')
-  }
+  assert.equal(outcomes.filter(outcome => outcome.status === 'fulfilled').length, 1, 'one exact review wins; the competing review is retired')
+  assert.equal(outcomes.filter(outcome => outcome.status === 'rejected').length, 1)
   const envelope = fixture.workers.workspaces.checkEnvelope()
   assert.equal(envelope.completed, 2, 'both declared checks ran')
   assert.equal(envelope.maxActive, 1, 'the semaphore serialized them')
   assert.ok(envelope.maxWaitMs > 0, `the second check was queued, saw maxWaitMs=${envelope.maxWaitMs}`)
   assert.equal(envelope.active, 0, 'the mismatch refusal left no slot held')
   assert.equal(envelope.queued, 0, 'the queue drained')
-  assert.equal(fixture.ready().status, 'submitted', 'nothing was accepted')
+  assert.equal(fixture.ready().status, 'accepted', 'host success accepts the exact source')
 })
 
 test('ENV × rejection: a failing check still blocks the source and records the mismatch', async t => {
@@ -497,7 +479,7 @@ test('ENV-R: the extractor reads only the environment a command declares for its
   assert.equal(managerRoot.checkCacheRoots.npm_config_cache, '/m', 'a package-manager cache root the command sets is carried')
 })
 
-test('ENV-R: a recorded self-run command that overrides HOME refuses the acceptance with its own environment', async t => {
+test('ENV-R: a recorded diagnostic HOME override does not veto the declared host check', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   const other = await realpath(await tempDirectory('swarm-env-other-'))
   await mkdir(path.join(other, '.cache'), { recursive: true })
@@ -518,17 +500,9 @@ test('ENV-R: a recorded self-run command that overrides HOME refuses the accepta
   assert.equal(row.checkEnvironmentSource.from, 'command', 'the row states how its facts were derived')
   assert.deepEqual(row.checkEnvironmentSource.operations, [{ name: 'HOME', value: other }])
 
-  await assert.rejects(
-    fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' }),
-    error => {
-      assert.equal(error.code, 'check_environment_mismatch')
-      assert.match(error.message, /home: /, 'the refusal names the divergent field')
-      assert.ok(error.message.includes(`envelope ${home}`), `the refusal names the envelope value: ${error.message}`)
-      assert.ok(error.message.includes(`self-run ${other}`), `the refusal names the executed command's value: ${error.message}`)
-      return true
-    })
-  assert.equal(fixture.ready().status, 'submitted', 'the artifact is not accepted under a different environment')
-  assert.equal(fixture.runtime.store.get('tasks', reviewer.review.id).status, 'running', 'the attempt survives so the reviewer can rerun under the envelope')
+  assert.equal((await fixture.runtime.verify({ sessionId: reviewer.reviewer.sessionId }, fixture.mission.id, { taskId: reviewer.review.id, attemptId: reviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })).status, 'accepted', 'the supporting host checks pass under the declared envelope')
+  assert.equal(fixture.ready().status, 'accepted', 'unrelated diagnostic differences do not veto the host check')
+  assert.equal(fixture.runtime.store.get('tasks', reviewer.review.id).status, 'accepted', 'the supporting host checks decide the review')
   const mismatch = fixture.events().filter(event => event.type === 'task/check-envelope').find(event => event.data?.reproduction === 'check-environment-mismatch')
   assert.ok(mismatch, 'the mismatch is durable')
   assert.equal(mismatch.data.selfRunSource, 'tool-run', 'the record names the recorded self-run as its evidence')
@@ -757,7 +731,7 @@ DOC"`
   assert.equal(home.length > 0, true)
 })
 
-test('ENV-R3: a command that leaves HOME untouched is not refused, and one that removes or overrides it is', async t => {
+test('ENV-R3: diagnostics retain HOME facts without vetoing passing host verification', async t => {
   const home = await cacheHome(await realpath(await tempDirectory('swarm-env-home-')), true)
   const other = await realpath(await tempDirectory('swarm-env-other-'))
   t.after(async () => { await rm(path.dirname(home), { recursive: true, force: true }); await rm(other, { recursive: true, force: true }) })
@@ -792,10 +766,8 @@ test('ENV-R3: a command that leaves HOME untouched is not refused, and one that 
   const removalRow = clearedFixture.runtime.store.get('tool_runs', removalRun)
   assert.equal(removalRow.checkEnvironment.home, null, 'the row records the removal')
   assert.deepEqual(removalRow.checkEnvironmentSource.operations, [{ name: 'HOME', value: null }])
-  await assert.rejects(
-    clearedFixture.runtime.verify({ sessionId: clearedReviewer.reviewer.sessionId }, clearedFixture.mission.id, { taskId: clearedReviewer.review.id, attemptId: clearedReviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' }),
-    error => error.code === 'check_environment_mismatch' && /home: /.test(error.message))
-  assert.equal(clearedFixture.ready().status, 'submitted', 'a real removal still refuses the acceptance')
+  assert.equal((await clearedFixture.runtime.verify({ sessionId: clearedReviewer.reviewer.sessionId }, clearedFixture.mission.id, { taskId: clearedReviewer.review.id, attemptId: clearedReviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })).status, 'accepted', 'the supporting host checks pass under the declared envelope')
+  assert.equal(clearedFixture.ready().status, 'accepted', 'diagnostic HOME removal cannot veto host success')
 
   // D1: `env "HOME=<other>"` really overrides HOME after quote removal and must
   // be recorded with that HOME rather than accepted.
@@ -809,10 +781,8 @@ test('ENV-R3: a command that leaves HOME untouched is not refused, and one that 
   const row = overrideFixture.runtime.store.get('tool_runs', runId)
   assert.equal(row.checkEnvironment.home, other, 'a quoted env operand is recorded as the override it is')
   assert.deepEqual(row.checkEnvironmentSource.operations, [{ name: 'HOME', value: other }])
-  await assert.rejects(
-    overrideFixture.runtime.verify({ sessionId: overrideReviewer.reviewer.sessionId }, overrideFixture.mission.id, { taskId: overrideReviewer.review.id, attemptId: overrideReviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' }),
-    error => error.code === 'check_environment_mismatch' && error.message.includes(`self-run ${other}`))
-  assert.equal(overrideFixture.ready().status, 'submitted', 'an executed override is refused, not accepted')
+  assert.equal((await overrideFixture.runtime.verify({ sessionId: overrideReviewer.reviewer.sessionId }, overrideFixture.mission.id, { taskId: overrideReviewer.review.id, attemptId: overrideReviewer.claim.attempt.id, verdict: 'accept', reason: 'Independent review' })).status, 'accepted', 'the supporting host checks pass under the declared envelope')
+  assert.equal(overrideFixture.ready().status, 'accepted', 'diagnostic HOME override cannot veto host success')
 })
 
 /* ------------------------------------------------------------------ *

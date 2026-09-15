@@ -7,6 +7,7 @@ import { selectedOperation } from './selection.ts'
 
 const lines = (value: string) => value.split('\n')
 const cleanLines = (value: string[]) => value.map(item => item.trim()).filter(Boolean)
+const localDeadline = (value?: number) => value === undefined ? '' : new Date(value).toLocaleString('sv-SE').replace(' ', 'T').slice(0, 16)
 export function cleanPlan(input: PlanInput): PlanInput {
   return { ...input, scope: cleanLines(input.scope), acceptance: cleanLines(input.acceptance), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), checks: task.checks ? cleanLines(task.checks) : undefined })) }
 }
@@ -61,7 +62,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
   const [busy, setBusy] = useState(''), [error, setError] = useState(''), [discard, setDiscard] = useState(false)
   const [modelError, setModelError] = useState('')
   const dirty = JSON.stringify(input) !== baseline
-  const editable = !saved || saved.status === 'draft'
+  const editable = !saved || saved.status === 'draft' || saved.status === 'failed'
   // One key map per render; a `find` per task made the editor Theta(tasks^2) (F-34).
   const taskByKey = useMemo(() => new Map(input.tasks.map(task => [task.key, task])), [input.tasks])
   const loadModels = () => { setModelError(''); void directory?.load().catch((failure: unknown) => setModelError(String(failure))) }
@@ -100,6 +101,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
     <div className="sw-row"><h2>{t('New mission')}</h2><span className="sw-chip">{t(dirty ? 'Unsaved changes' : 'Saved')}{saved ? ` · r${saved.revision}` : ''}</span></div>
     {error && <div className="sw-error" role="alert">{error}</div>}
     {saved?.error && <div className="sw-error">{saved.error}</div>}
+    {Array.isArray(saved?.advisories) && saved.advisories.length > 0 && <details className="sw-notice"><summary>{t('Plan preflight notes')}</summary><ul>{saved.advisories.filter(note => typeof note === 'string').slice(0, 20).map((note, index) => <li key={index}>{note}</li>)}</ul></details>}
     {draft && saved && draft.revision !== saved.revision && dirty && <div className="sw-notice">This draft changed elsewhere. Save will check its revision; reopen it to load the latest version.</div>}
     <fieldset disabled={Boolean(busy) || !editable}>
       <label>{t('Title')}<input data-testid="draft-title" value={input.title} required onChange={event => update({ title: event.currentTarget.value })} /></label>
@@ -111,11 +113,13 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
       <p className="sw-small">{t('One item per line')} · {t('Scope uses exact files, directory prefixes ending in /, or ** for the workspace.')}</p>
       <details open><summary>{t('Budget')}</summary><div className="sw-budget-fields">{([
         ['maxTokens', 'Tokens'], ['maxSteps', 'Steps'], ['maxWorkers', 'Workers'], ['maxDurationMs', 'Minutes'], ['maxTasks', 'Task limit'], ['maxExperiments', 'Experiment limit'],
-      ] as const).map(([key, label]) => <label key={key}>{t(label)}<input type="number" min={1} step={1} required value={key === 'maxDurationMs' ? input.budget[key] / 60_000 : input.budget[key]} onChange={event => update({ budget: { ...input.budget, [key]: Number(event.currentTarget.value) * (key === 'maxDurationMs' ? 60_000 : 1) } })} /></label>)}</div></details>
+      ] as const).map(([key, label]) => <label key={key}>{t(label)}<input type="number" min={1} step={1} required value={key === 'maxDurationMs' ? input.budget[key] / 60_000 : input.budget[key]} onChange={event => update({ budget: { ...input.budget, [key]: Number(event.currentTarget.value) * (key === 'maxDurationMs' ? 60_000 : 1) } })} /></label>)}
+        <label>{t('Fixed deadline (optional)')}<input type="datetime-local" value={localDeadline(input.budget.deadlineAt)} onChange={event => update({ budget: { ...input.budget, deadlineAt: event.currentTarget.value ? new Date(event.currentTarget.value).getTime() : undefined } })} /></label>
+      </div>{input.budget.deadlineAt !== undefined && <p className="sw-small">{t('Fixed deadline')}: {new Date(input.budget.deadlineAt).toLocaleString()}</p>}</details>
       <section className="sw-section"><div className="sw-row"><h3>{t('Roster')}</h3><button type="button" onClick={() => update({ members: [...input.members, { key: freshKey('worker'), name: `Worker ${input.members.length + 1}`, role: '' }] })}>{t('Add worker')}</button></div>
         {directory && <button className="sw-link" type="button" onClick={loadModels}>{t('Reload models')}</button>}
         {modelError && <p role="status" className="sw-error">{modelError}</p>}
-        {input.members.map(member => <div className="sw-edit-item" key={member.key}><div className="sw-row"><strong>{member.name || member.key}</strong><button type="button" onClick={() => update({ members: input.members.filter(item => item.key !== member.key), tasks: input.tasks.map(task => task.assigneeKey === member.key ? { ...task, assigneeKey: undefined } : task) })}>{t('Remove')}</button></div>
+        {input.members.map(member => <div className="sw-edit-item" key={member.key}><div className="sw-row"><strong>{member.name || member.key}</strong><button type="button" onClick={() => update({ members: input.members.filter(item => item.key !== member.key), tasks: input.tasks.map(task => task.assigneeKey === member.key ? { ...task, assigneeKey: undefined, assignmentMode: undefined } : task) })}>{t('Remove')}</button></div>
           <div className="sw-fields"><label>{t('Name')}<input value={member.name} required onChange={event => updateMember(member.key, { name: event.currentTarget.value })} /></label><label>{t('Role')}<input value={member.role} required onChange={event => updateMember(member.key, { role: event.currentTarget.value })} /></label></div>
           {directory ? <ModelPicker member={member} directory={directory} onChange={patch => updateMember(member.key, patch)} /> : <p className="sw-small">{t('Use owner model')}</p>}
         </div>)}
@@ -133,7 +137,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
           <label>{t('Title')}<input value={task.title} required onChange={event => updateTask(task.key, { title: event.currentTarget.value })} /></label>
           <label>{t('Objective')}<textarea value={task.objective} required onChange={event => updateTask(task.key, { objective: event.currentTarget.value })} /></label>
           <div className="sw-fields"><label>{t('Kind')}<select value={task.kind} onChange={event => updateTask(task.key, { kind: event.currentTarget.value as PlanTask['kind'], reviewOf: undefined })}>{['research', 'implementation', 'integration', 'verification'].map(kind => <option key={kind}>{kind}</option>)}</select></label>
-            <label>{t('Assignee')}<select value={task.assigneeKey ?? ''} onChange={event => updateTask(task.key, { assigneeKey: event.currentTarget.value || undefined })}><option value="">{t('Unassigned')}</option>{input.members.map(member => <option key={member.key} value={member.key}>{member.name}</option>)}</select></label>
+            <label>{t('Assignee')}<select value={task.assigneeKey ?? ''} onChange={event => updateTask(task.key, { assigneeKey: event.currentTarget.value || undefined, assignmentMode: event.currentTarget.value ? 'pinned' : undefined })}><option value="">{t('Unassigned')}</option>{input.members.map(member => <option key={member.key} value={member.key}>{member.name}</option>)}</select></label>
             <label>{t('Workstreams')}<select value={task.workstreamKey} required onChange={event => updateTask(task.key, { workstreamKey: event.currentTarget.value })}>{input.workstreams.map(stream => <option key={stream.key} value={stream.key}>{stream.title}</option>)}</select></label>
             <label>{t('Priority')}<input type="number" min={0} max={100} step={1} value={task.priority ?? 50} onChange={event => updateTask(task.key, { priority: Number(event.currentTarget.value) })} /></label>
             {task.kind === 'verification' && <label>{t('Review source')}<select value={task.reviewOf ?? ''} required onChange={event => updateTask(task.key, { reviewOf: event.currentTarget.value || undefined, dependencies: task.dependencies?.filter(key => key !== event.currentTarget.value) })}><option value="">{t('None')}</option>{input.tasks.filter(item => item.key !== task.key && item.kind !== 'verification').map(item => <option key={item.key} value={item.key}>{item.title}</option>)}</select></label>}

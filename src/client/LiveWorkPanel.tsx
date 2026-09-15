@@ -1,19 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import type { Member, Snapshot } from '../types.ts'
 import { AgentAvatar, type AgentAvatarState } from './AgentAvatar.tsx'
 import { projectLiveWork, type LiveWorkProjection, type LiveWorkRow } from './live-work.ts'
 import type { ConnectionState } from './progress.ts'
 import { useCopy } from './locale.tsx'
+import { useVisibleClock } from './clock.ts'
+import { MissionProgress, ResultSummary } from './MissionProgress.tsx'
 
 export function useLiveWork(snapshot: Snapshot, connection: ConnectionState = 'connected', live = true, observedAt?: number): LiveWorkProjection {
-  const [now, setNow] = useState(Date.now)
-  useEffect(() => {
-    if (!live || connection !== 'connected' || snapshot.mission.status !== 'active') return
-    setNow(Date.now())
-    const timer = setInterval(() => setNow(Date.now()), 1000)
-    return () => clearInterval(timer)
-  }, [live, connection, snapshot.mission.id, snapshot.mission.status])
-  return projectLiveWork(snapshot, { connection: live ? connection : 'paused', now: live ? Math.max(now, observedAt ?? 0) : snapshot.mission.updatedAt, observedAt })
+  const { now, visible } = useVisibleClock(live && connection === 'connected' && snapshot.mission.status === 'active' && !snapshot.mission.budgetPause)
+  return projectLiveWork(snapshot, { connection: live && visible ? connection : 'paused', now: live ? Math.max(now, observedAt ?? 0) : snapshot.mission.updatedAt, observedAt })
 }
 const duration = (value: number) => { const seconds = Math.max(0, Math.floor(value / 1000)); return seconds >= 60 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : `${seconds}s` }
 export function avatarState(row: LiveWorkRow): AgentAvatarState {
@@ -83,6 +79,25 @@ export function LiveWorkOverview({ snapshot, connection, live, observedAt, onOpe
   snapshot: Snapshot; connection?: ConnectionState; live?: boolean; observedAt?: number; onOpen?: (member: Member) => void;
 }) {
   const view = useLiveWork(snapshot, connection, live, observedAt)
+  return <LiveWorkContents snapshot={snapshot} view={view} onOpen={onOpen}/>
+}
+
+/** This small visible subtree owns one clock; task graph and technical views do not tick with it. */
+export function MissionOverview({ snapshot, connection = 'connected', live = false, observedAt, onOpen, actions, delivery }: {
+  snapshot: Snapshot; connection?: ConnectionState; live?: boolean; observedAt?: number; onOpen?: (member: Member) => void;
+  actions?: ReactNode; delivery?: ReactNode;
+}) {
+  const view = useLiveWork(snapshot, connection, live, observedAt)
+  return <div className="sw-overview">
+    <MissionProgress snapshot={snapshot} view={view} connection={live ? view.connection : connection} live={live}/>
+    {actions}
+    {snapshot.mission.status === 'completed' && <ResultSummary snapshot={snapshot}/>}
+    {delivery}
+    <LiveWorkContents snapshot={snapshot} view={view} onOpen={onOpen}/>
+  </div>
+}
+
+function LiveWorkContents({ snapshot, view, onOpen }: { snapshot: Snapshot; view: LiveWorkProjection; onOpen?: (member: Member) => void }) {
   const finished = ['completed', 'stopped'].includes(snapshot.mission.status)
   return <>{!finished && <LiveExecution view={view} onOpen={onOpen}/>}<LiveEvents view={view}/><LiveMembers view={view} onOpen={onOpen} all={finished}/></>
 }

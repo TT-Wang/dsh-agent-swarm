@@ -132,6 +132,10 @@ interface Composition {
    */
   environment: SessionEnvironment
 }
+// Teardown has a host-operation bound, separate from any model/task budget.
+// A timeout reports incomplete cleanup; stop() itself never claims success early.
+const DISPOSAL_TIMEOUT_MS = 5000
+
 interface Resident {
   spec: WorkerSpec
   abort: AbortController
@@ -329,11 +333,13 @@ export class HarnessWorkers implements WorkerAdapter {
     const owner = this
     const removeStream = ctx.on('llm/stream', async function* (options, next) {
       const resident = [...owner.residents.values()].find(item => item.spec.member.sessionId === options.sessionId)
-      if (resident === undefined || owner.closing || resident.abort.signal.aborted) { yield* next(); return }
+      if (resident === undefined) { yield* next(); return }
+      resident.abort.signal.throwIfAborted()
+      if (owner.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
       resident.requestSignal = options.signal
       const activity = owner.beginActivity(resident, { kind: 'model' }, options.signal)
       try {
-        for await (const chunk of next()) { activity.touch(); yield chunk }
+        for await (const chunk of next()) { resident.abort.signal.throwIfAborted(); activity.touch(); yield chunk }
       } finally { activity.end() }
     })
     // Owner sessions are ordinary Harness agents: attribute their usage to their swarm without charging the worker pool.
@@ -358,6 +364,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return value === undefined ? undefined : { ...value }
   }
   private publishActivity(resident: Resident): void {
+    if (this.closing) return
     try { this.callbacks?.activity?.(resident.spec.member.id, this.currentActivity(resident.spec.member.id)) }
     catch (error) { this.ctx.logger.error(`Swarm activity observer failed: ${errorText(error)}`) }
   }
@@ -409,6 +416,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return this.callbacks
   }
   private failure(memberId: string, error: unknown): void {
+    if (this.closing) return
     // R11-01: classify at the boundary where the provider error is still
     // structured, then report both the raw failure (existing contract) and the
     // typed outage. A callback failure must never mask the other report.
@@ -421,6 +429,7 @@ export class HarnessWorkers implements WorkerAdapter {
     catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
   private observe(resident: Resident, operation: () => Promise<void>): void {
+    if (this.closing) return
     let promise: Promise<void>
     try { promise = operation() } catch (error) { this.failure(resident.spec.member.id, error); return }
     resident.observations.add(promise)
@@ -563,20 +572,38 @@ export class HarnessWorkers implements WorkerAdapter {
     return applyDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)
   }
 
-  async start(spec: WorkerSpec): Promise<void> {
+  async start(spec: WorkerSpec, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     if (this.closing) throw new Error('Worker adapter is disposed')
     this.observer()
     const existing = this.residents.get(spec.member.id)
     if (existing !== undefined) {
       if (existing.spec.member.sessionId !== spec.member.sessionId) throw new Error('Worker identity changed')
-      if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec) }
-      return await existing.opening
+      if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec, signal) }
+      existing.abort.signal.throwIfAborted()
+      return await this.awaitOpening(existing, signal)
     }
     const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
-    try { await resident.opening }
+    try { await this.awaitOpening(resident, signal) }
     catch (error) { if (this.residents.get(spec.member.id) === resident) this.residents.delete(spec.member.id); throw error }
+  }
+
+  private async awaitOpening(resident: Resident, signal?: AbortSignal): Promise<void> {
+    const cancel = () => {
+      resident.abort.abort(signal?.reason)
+      this.workspaces.cancel(resident.spec.member.id)
+      this.clearActivities(resident)
+      try { resident.handle?.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true }) }
+      catch (error) {
+        try { this.ctx.logger.warn(`Swarm startup cancellation could not cancel its native handle: ${errorText(error)}`) } catch { /* The original startup cancellation remains primary. */ }
+      }
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
+    try { await resident.opening; resident.abort.signal.throwIfAborted() }
+    finally { signal?.removeEventListener('abort', cancel) }
   }
 
   private async composition(spec: WorkerSpec, signal: AbortSignal): Promise<Composition> {
@@ -618,6 +645,7 @@ export class HarnessWorkers implements WorkerAdapter {
     if (persistence === undefined) throw new Error('Swarm workers require Harness session persistence')
     if (this.ctx.get('sandboxPolicy') === undefined || this.ctx.get('approval') === undefined) throw new Error('Swarm workers require Harness sandbox-policy and user-approval services')
     const expectedWorkspace = await this.workspaces.prepareWorkspace(spec.mission, spec.member.id)
+    abort.signal.throwIfAborted()
     if (spec.member.workspace !== expectedWorkspace) throw new Error('Worker workspace does not match its owned worktree')
     const composition = await this.composition(spec, abort.signal)
     abort.signal.throwIfAborted()
@@ -629,15 +657,18 @@ export class HarnessWorkers implements WorkerAdapter {
     // from whichever host supplies it, so one callback serves every supported
     // release instead of forking the adapter by host version.
     const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
+      abort.signal.throwIfAborted()
       const presets = this.ctx.get('agentPresets')
       if (composition.preset !== undefined) {
         if (presets === undefined) throw new Error('Saved worker composition requires agent-presets')
         await presets.mount(agentCtx, composition.preset)
       } else if (presets !== undefined) throw new Error('A rosterless worker cannot silently resume under a new default preset')
+      abort.signal.throwIfAborted()
       const agent = setupAgent ?? (agentCtx as Context & { agent?: Agent }).agent
       if (agent === undefined) throw new Error('Worker setup received no agent from the Harness')
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
+      abort.signal.throwIfAborted()
       this.removeRevokedPending(resident, agent)
       resident.usage = emptyBuckets()
       resident.totalTokens = agent.session.snapshotEvents().reduce((total, event) => {
@@ -648,6 +679,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // interrupted, before publication can release pending model requests.
       // `totalTokens` is the weighted charge; `usage` keeps the raw buckets.
       await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage })
+      abort.signal.throwIfAborted()
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
@@ -671,11 +703,12 @@ export class HarnessWorkers implements WorkerAdapter {
       const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))
       const hidden = hiddenToolsFor('worker').filter(name => visible.has(name))
       if (hidden.length) agentCtx.tools.restrict({ deny: hidden })
-      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
+      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing || abort.signal.aborted ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
       agentCtx.on('agent/pre-step', async ({ signal, messages }, next) => {
+        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
         await this.drainObservations(resident)
         signal.throwIfAborted()
-        if (this.closing || resident.stopping !== undefined) return { kind: 'reject' }
+        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
         this.removeRevokedPending(resident, agent)
         // Claims are already removed from Inbox before this hook. Reject a
         // wholly stale batch and filter mixed batches through the admitted view.
@@ -683,7 +716,9 @@ export class HarnessWorkers implements WorkerAdapter {
           resident.rejectedPendingStep = true
           return { kind: 'reject' }
         }
+        abort.signal.throwIfAborted()
         const decision = await next()
+        abort.signal.throwIfAborted()
         if (decision.kind === 'reject') return decision
         const admitted = decision.messages.filter(message => !this.revokedAssignment(resident, message))
         const claimedIds = new Set(messages.map(message => message.id))
@@ -692,10 +727,13 @@ export class HarnessWorkers implements WorkerAdapter {
           resident.rejectedPendingStep = true
           return { kind: 'reject' }
         }
+        abort.signal.throwIfAborted()
         signal.throwIfAborted()
         return { kind: 'enter', messages: admitted.filter(message => !this.revokedAssignment(resident, message)) }
       })
       agentCtx.on('tools/execute', async (exec, next) => {
+        abort.signal.throwIfAborted()
+        if (this.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
         const activity = this.beginActivity(resident, { kind: 'tool', tool: exec.name }, exec.signal)
         try { return await next() } finally { activity.end() }
       })
@@ -703,6 +741,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // durable run id, so evidence can be cited without an observe round trip.
       agentCtx.on('tools/post-execute', async (exec, result, next) => {
         const decision = await next()
+        if (this.closing) return decision
         if (exec.name.startsWith('swarm_') || resident.recordedExecutions.has(exec)) return decision
         resident.recordedExecutions.add(exec)
         const content = decision.kind === 'accept' && decision.content !== undefined ? decision.content : result.content
@@ -745,6 +784,7 @@ export class HarnessWorkers implements WorkerAdapter {
               // The source total must survive a crash before SQLite accounts it.
               // The weighted charge is the accounted total; buckets stay raw.
               await this.ctx.sessions.flush(session)
+              if (this.closing) return
               await observer.usageSnapshot(spec.member.id, total, buckets)
             } else await observer.usage(spec.member.id, tokens)
           })
@@ -757,7 +797,7 @@ export class HarnessWorkers implements WorkerAdapter {
         if (this.continueAfterRejectedStep(resident, agent)) return
         this.compactIfRequested(resident)
         void this.drainObservations(resident).then(() => {
-          if (resident.stopping === undefined && !this.closing && agent.status === 'idle') this.observer().idle(spec.member.id)
+          if (resident.stopping === undefined && !this.closing && !abort.signal.aborted && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
       })
     }
@@ -765,8 +805,11 @@ export class HarnessWorkers implements WorkerAdapter {
     const handle = await this.ctx.agents.withoutInitiator(async () => persisted
       ? await this.ctx.agents.resume({ resumeSessionId: SessionId(spec.member.sessionId), agentOptions: composition.options, setup, signal: abort.signal })
       : await this.ctx.agents.create({ sessionId: SessionId(spec.member.sessionId), meta: { cwd: composition.workspace, ...(composition.preset === undefined ? {} : { agentPreset: composition.preset }) }, agentOptions: composition.options, setup, signal: abort.signal }))
-    resident.handle = handle
     try {
+      // Do not publish even a transient usable adapter handle after cancellation.
+      abort.signal.throwIfAborted()
+      if (this.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
+      resident.handle = handle
       for (const event of handle.agent.session.snapshotEvents()) {
         if (event.type === 'agent/inbox/spliced') for (const message of event.data.inserted) resident.delivered.add(message.id)
         if (event.type === 'user/message') resident.delivered.add(event.data.id)
@@ -774,7 +817,16 @@ export class HarnessWorkers implements WorkerAdapter {
       abort.signal.throwIfAborted()
       await this.ctx.sessions.flush(handle.agent.session)
       await this.preserveInbox(resident, handle.agent)
-    } catch (error) { await handle.dispose(); resident.handle = undefined; throw error }
+      abort.signal.throwIfAborted()
+    } catch (error) {
+      if (resident.handle === handle) resident.handle = undefined
+      try { handle.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true }) }
+      catch (cancelError) {
+        try { this.ctx.logger.warn(`Swarm failed startup could not cancel its native handle: ${errorText(cancelError)}`) } catch { /* Still dispose the handle. */ }
+      }
+      await handle.dispose()
+      throw error
+    }
   }
 
   /**
@@ -785,14 +837,14 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   compactAtBoundary(memberId: string): void {
     const resident = this.residents.get(memberId)
-    if (resident === undefined || this.closing || resident.stopping !== undefined) return
+    if (resident === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
   }
   private compactIfRequested(resident: Resident): void {
     const threshold = this.options.boundaryCompactionTokens ?? 250000
     const agent = resident.handle?.agent
-    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined) return
+    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
     // The compaction engine is an optional host service; structural access avoids a hard package dependency.
     const compaction = (this.ctx.get as (name: string) => unknown)('compaction') as { compactNow(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
@@ -818,11 +870,8 @@ export class HarnessWorkers implements WorkerAdapter {
         try {
           owner.send(message, 'next-step', true)
         } catch (error) {
-          // R17-G9: the host pre-append invariant refused this owner-facing
-          // decision. Record the refusal (a measurement) and ACKNOWLEDGE the
-          // delivery by returning, so the durable outbox does not retry forever a
-          // decision the invariant will refuse again; any other failure still
-          // propagates to the outbox's retry path.
+          // Only our exact false-wake predicate for this delivery can suppress
+          // it. Other host invariant failures remain durable outbox obligations.
           if (recordAppendRefusal(error, { id: delivery.id, missionId: delivery.missionId, family: noticeFamily(delivery), subjects: delivery.subjects ?? [] })) return
           throw error
         }
@@ -832,7 +881,9 @@ export class HarnessWorkers implements WorkerAdapter {
     }
     const resident = this.residents.get(member.id)
     if (resident === undefined) throw new Error('Worker must be started before delivery')
+    resident.abort.signal.throwIfAborted()
     await resident.opening
+    resident.abort.signal.throwIfAborted()
     if (this.closing || resident.stopping !== undefined || resident.handle === undefined) throw new Error('Worker is stopping')
     const id = MessageId(`swarm:${delivery.id}`)
     if (!resident.delivered.has(id)) {
@@ -842,6 +893,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // Journal the accepted identity before publication and outbox acknowledgement.
       resident.recoveryInbox.set(message.id, { target, message })
       await this.preserveInbox(resident, resident.handle.agent)
+      resident.abort.signal.throwIfAborted()
       if (this.closing || resident.stopping !== undefined) throw new Error('Worker is stopping')
       // Claims and findings are visible at the next step; a new assignment owns a turn.
       resident.handle.agent.send(message, target, true)
@@ -860,6 +912,9 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   private revokedAssignment(resident: Resident, message: UserMessage): boolean {
+    // Shutdown can finish before a deferred journal write. Preserve the item;
+    // the next activation checks its durable assignment before consumption.
+    if (this.closing) return false
     return message.source.kind === 'swarm' && message.source.deliveryKind === 'assignment'
       && this.observer().admitDelivery?.(resident.spec.member.id, message.source.deliveryId) === false
   }
@@ -946,7 +1001,7 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   isIdle(memberId: string): boolean {
     const resident = this.residents.get(memberId)
-    if (resident?.handle === undefined) return false
+    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
     const agent = resident.handle.agent
     const decision = strandedInboxDecision({
       stopping: resident.stopping !== undefined, observations: resident.observations.size,
@@ -977,24 +1032,42 @@ export class HarnessWorkers implements WorkerAdapter {
   checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {
     const resident = this.residents.get(member.id)
+    if (resident) {
+      resident.abort.signal.throwIfAborted()
+      signal = signal === undefined ? resident.abort.signal : AbortSignal.any([signal, resident.abort.signal])
+    }
     const activity = resident === undefined ? undefined : this.beginActivity(resident, { kind: 'verification' }, signal)
     try {
       // F3: the declared check runs under this member's own scratch root, so two
       // members' verification temp files cannot collide.
       const environment = await this.sessionEnvironment(member.missionId, member.id)
+      signal?.throwIfAborted()
       return await this.checkEnvironment.run(environment, () => this.workspaces.verifyArtifact(member, task, artifact, signal))
     }
     finally { activity?.end() }
   }
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> { return this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void> { return this.workspaces.checkpointTask(member, task, options) }
   dispose(): Promise<void> {
     return this.disposal ??= (async () => {
       this.closing = true
       this.removeStreamObserver()
-      const results = await Promise.allSettled([...this.residents.keys()].map(async id => { await this.stop(id) }))
-      await this.workspaces.dispose()
-      const errors = results.filter((item): item is PromiseRejectedResult => item.status === 'rejected').map(item => item.reason as unknown)
-      if (errors.length > 0) throw new AggregateError(errors, 'Worker disposal failed')
+      // All residents are fenced synchronously by stop() before this wait. Keep
+      // cleanup attached for late handles, but report an uncooperative host await
+      // instead of blocking plugin unload indefinitely or reporting a false stop.
+      const cleanup = Promise.allSettled([
+        ...[...this.residents.keys()].map(async id => { await this.stop(id) }),
+        this.workspaces.dispose(),
+      ]).then(results => {
+        const errors = results.filter((item): item is PromiseRejectedResult => item.status === 'rejected').map(item => item.reason as unknown)
+        if (errors.length > 0) throw new AggregateError(errors, 'Worker disposal failed')
+      })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([cleanup, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Worker disposal timed out; native startup or cleanup is still pending and all workers remain fenced')), DISPOSAL_TIMEOUT_MS)
+        })])
+      } finally { clearTimeout(timer) }
     })()
   }
 }

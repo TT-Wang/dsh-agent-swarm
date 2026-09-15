@@ -21,6 +21,8 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
+import { PolicyError } from '../lib/policy-error.js'
+import { errorTypeFor } from '../lib/trace.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -71,8 +73,12 @@ async function fixture(t) {
   class Catalog extends LlmAdapter {
     unavailable = false
     blockedModels = new Set()
+    failedCatalogs = new Set()
     providerInfo(id) { return { id, name: 'Public provider' } }
-    async listModels(provider) { return [{ provider, id: 'model-one', name: 'Model One', description: 'Public description' }] }
+    async listModels(provider) {
+      if (this.failedCatalogs.has(provider)) throw new Error('Catalog failed at /Users/private/provider.env')
+      return [{ provider, id: 'model-one', name: 'Model One', description: 'Public description' }]
+    }
     async resolveModel(provider, model) {
       if (this.unavailable || model === 'unroutable' || this.blockedModels.has(model)) throw new Error('Model route is unavailable')
       return { provider, id: model, name: model, ...(model === 'reasoning-model' ? {
@@ -590,4 +596,121 @@ test('web request controls recover and stop prelaunch work with native session a
   const stop = await f.rpc('control', { sessionId: f.ownerId, requestId: request.id, action: 'stop', reason: 'User cancelled' })
   assert.equal(stop.result.ok, true)
   assert.equal(stop.result.value.request.status, 'stopped')
+})
+
+
+test('M4-F3: authenticated catalog RPC retains healthy providers when another real adapter catalog fails', async t => {
+  const f = await fixture(t)
+  f.ctx.llm.registerAdapter(['failed-provider'], f.catalog)
+  f.catalog.failedCatalogs.add('failed-provider')
+  const response = await f.rpc('models', { sessionId: f.ownerId })
+  assert.equal(response.status, 200)
+  assert.equal(response.result.ok, true)
+  assert.deepEqual(response.result.value.models.map(model => [model.provider, model.id]), [['public-provider', 'model-one']])
+  assert.deepEqual(response.result.value.providerErrors, [{ provider: 'failed-provider', code: 'catalog-unavailable', message: 'Model catalog is temporarily unavailable' }])
+  assert.doesNotMatch(response.text, /private|provider\.env|Catalog failed/)
+  await f.bridge.dispose()
+  const unmounted = await f.rpc('models', { sessionId: f.ownerId })
+  assert.equal(unmounted.status, 404, 'the real route disposer completed before plugin unload resolves')
+})
+
+test('native web task controls revise the original policy and preserve session authority', async t => {
+  const f = await fixture(t)
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  const launched = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(launched.result.ok, true, launched.text)
+  const snapshot = launched.result.value.snapshot
+  const task = snapshot.tasks[0]
+  const payload = { missionId: snapshot.mission.id, taskId: task.id, action: 'amend', changes: { maxSteps: 20, maxRecoveryAttempts: 4 }, reason: 'Review estimates' }
+  const denied = await f.rpc('control', { ...payload, sessionId: 'other-owner' })
+  assert.equal(denied.result.ok, false)
+  const amended = await f.rpc('control', { ...payload, sessionId: f.ownerId })
+  assert.equal(amended.result.ok, true, amended.text)
+  const current = amended.result.value.snapshot.tasks.find(row => row.id === task.id)
+  assert.equal(current.maxSteps, 20)
+  assert.equal(current.maxRecoveryAttempts, 4)
+  assert.deepEqual(current.acceptance, task.acceptance)
+  assert.equal(amended.result.value.snapshot.tasks.length, snapshot.tasks.length)
+  const invalid = await f.rpc('control', { ...payload, sessionId: f.ownerId, changes: { scope: ['../escape'] } })
+  assert.equal(invalid.result.ok, false)
+  assert.match(invalid.result.error.message, /scope|relative|invalid/i)
+})
+
+test('authored draft refusals keep a stable category through native RPC when wording changes', async t => {
+  const f = await fixture(t)
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  f.runtime.store.transaction(() => f.runtime.store.put('drafts', { ...draft, status: 'launched' }))
+  const payload = { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision, input: f.input }
+  const response = await f.rpc('update-draft', payload)
+  assert.equal(response.result.ok, false)
+  assert.equal(response.result.error.code, 'bad-request')
+  assert.match(response.result.error.message, /Only draft or failed plans/)
+  assert.deepEqual(response.result.error.details, { issues: [], policyCode: 'draft_not_editable', category: 'conflict_error' })
+  assert.equal(f.runtime.store.get('drafts', draft.id).revision, draft.revision)
+  const refusal = new PolicyError('draft_not_editable', 'conflict_error', '请重新打开可编辑的草稿。')
+  f.runtime.updateDraft = () => { throw refusal }
+  const translated = await f.rpc('update-draft', payload)
+  assert.equal(translated.result.error.message, refusal.message)
+  assert.equal(translated.result.error.details.policyCode, refusal.code)
+  assert.equal(errorTypeFor(refusal), 'conflict_error', 'trace reads the same category without parsing the new prose')
+  for (const failure of [
+    new PolicyError('draft_not_editable', 'conflict_error', 'Cannot read /Users/private/secret.sqlite'),
+    new PolicyError('draft_not_editable', 'conflict_error', 'x'.repeat(4001)),
+    Object.assign(new Error('host operation failed unexpectedly'), { code: 'draft_not_editable', category: 'conflict_error' }),
+  ]) {
+    f.runtime.updateDraft = () => { throw failure }
+    const hidden = await f.rpc('update-draft', payload)
+    assert.equal(hidden.result.error.code, 'internal-error')
+    assert.doesNotMatch(hidden.result.error.message, /secret|private|host operation/)
+    assert.equal(hidden.result.error.details.policyCode, undefined, 'an untrusted shape or unsafe detail is not an authored public refusal')
+  }
+})
+
+test('mission owner refusals carry authorization even when the wording has no legacy match', async t => {
+  const f = await fixture(t)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, { ...f.input, workspace: f.workspace })
+  const member = await f.runtime.addMember({ sessionId: f.ownerId }, mission.id, { role: 'implementation' })
+  let refused
+  try { f.runtime.control({ sessionId: member.sessionId }, mission.id, 'pause', 'Pause') } catch (error) { refused = error }
+  assert.ok(refused instanceof PolicyError)
+  assert.equal(refused.code, 'mission_owner_required')
+  assert.equal(errorTypeFor(refused), 'authorization_error')
+  assert.equal(f.runtime.mission(mission.id).status, 'active')
+})
+
+test('task and scope controls distinguish owner lifecycle conflicts from member authorization refusals', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, { ...f.input, workspace: f.workspace })
+  const member = await f.runtime.addMember(owner, mission.id, { role: 'implementation' })
+  const actor = { sessionId: member.sessionId }
+  const taskPayload = { missionId: mission.id, taskId: 'guarded-task', action: 'resume', reason: 'Resume saved work' }
+  const scopePayload = { missionId: mission.id, action: 'amend', changes: { scope: mission.scope }, reason: 'Keep scope' }
+  const checkMember = () => {
+    for (const [call, code] of [
+      [() => f.runtime.controlTask(actor, mission.id, taskPayload.taskId, 'resume', {}, taskPayload.reason), 'task_owner_required'],
+      [() => f.runtime.amendScope(actor, mission.id, mission.scope, scopePayload.reason), 'mission_scope_owner_required'],
+    ]) assert.throws(call, error => error instanceof PolicyError && error.code === code && errorTypeFor(error) === 'authorization_error')
+  }
+  for (const status of ['staged', 'completed', 'stopped']) {
+    f.runtime.store.put('missions', { ...f.runtime.mission(mission.id), status })
+    checkMember()
+    for (const [payload, code] of [[taskPayload, 'mission_not_running'], [scopePayload, 'mission_scope_not_running']]) {
+      const response = await f.rpc('control', { sessionId: f.ownerId, ...payload })
+      assert.equal(response.result.ok, false)
+      assert.equal(response.result.error.code, 'bad-request')
+      assert.equal(response.result.error.details.policyCode, code)
+      assert.equal(response.result.error.details.category, 'conflict_error', `${status} is a lifecycle conflict for the owner`)
+    }
+    assert.equal(f.runtime.mission(mission.id).status, status)
+    assert.deepEqual(f.runtime.mission(mission.id).scope, mission.scope)
+  }
+  f.runtime.store.put('missions', { ...f.runtime.mission(mission.id), status: 'active' })
+  f.runtime.shuttingDown = true
+  try {
+    checkMember()
+    const response = await f.rpc('control', { sessionId: f.ownerId, ...taskPayload })
+    assert.equal(response.result.error.details.policyCode, 'runtime_shutting_down')
+    assert.equal(response.result.error.details.category, 'conflict_error')
+  } finally { f.runtime.shuttingDown = false }
 })

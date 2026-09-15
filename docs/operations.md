@@ -81,6 +81,8 @@ The primary agent chooses members, task structure, verification commands and res
 
 Before planning, the plugin captures tracked edits and non-ignored new files in a private Git snapshot. Your source branch, index and working files stay unchanged. The planning checkout and workers share that frozen baseline, including after a restart. Unresolved merge conflicts, dirty submodules and unsupported layouts produce an actionable error instead of silently omitting files.
 
+New automatic plans treat task assignees as preferences. If a preferred member is busy or unavailable, eligible idle members can take work that has never started; an active or recovering task keeps its existing lifecycle. The primary can set `assignmentMode: pinned` when a task requires a specific member or model. Pinned work keeps its required route through automatic startup recovery; the primary agent can explicitly amend its assignee after reviewing the requirement. Manual drafts and old task rows keep their previous binding when the field is absent. Choosing an assignee in the manual editor pins it; clearing the assignee clears its mode. No extra user configuration or planning turn is required, and step/token budgets remain the primary agent's decision.
+
 ### Open the sidebar
 
 The plugin uses the first available surface:
@@ -93,7 +95,7 @@ Only one surface mounts at a time. Hiding it stops display updates, not workers.
 
 ### Controls and delivery
 
-- **Pause / Resume:** pause work and resume from durable state. Raising a limit does not resume a paused mission or reset usage. The mission has a wall-clock deadline that continues to approach while paused; resuming does not reset it.
+- **Pause / Resume:** pause work and resume from durable state. Raising a limit does not resume a paused mission or reset usage. The execution-duration allowance excludes pauses and idle/resource waits. An explicit `deadlineAt` remains a fixed wall-clock deadline; neither consumption nor that deadline resets on resume.
 - **Stop:** requires a second click in the sidebar. Stopped missions stop owner notifications; paused missions retain unanswered questions while other reports wait. Automatically completed missions preserve queued facts.
 - **Complete:** normally automatic when required independent acceptances cover the mission criteria; a manual control is also available.
 - **View changes / Apply result:** for a completed code mission, inspect the independently accepted commit and apply its changes relative to the original project snapshot. Application preserves your branch and index, reports conflicts before writing and does not stage, commit or push. If application times out, check the host receipt before explicitly retrying.
@@ -114,6 +116,7 @@ Settings belong to Loader row `dsh-external-agent-swarm`. The full schema is in 
 | `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned for each resource dimension. |
 | `authorizedWorkspaces` | `[]` | Human-configured roots outside the session cwd: `{ path, note?, expiresAt? }`. |
 | `planningTimeoutMs` | `600000` | Prelaunch planning watchdog; the primary agent can extend it with a reason. |
+| `workerStartTimeoutMs` | `60000` | Native worker startup bound; recovery starts members independently and cancels abandoned startups. This is a host lifecycle limit, not a model step/token budget. |
 | `checkTimeoutMs` | `600000` | Fallback per-check timeout when the task supplies none. |
 | `leaseMs` | `120000` | Attempt lease, renewed while a real operation is observed. |
 | `tickMs` | `1000` | Scheduler tick interval. |
@@ -145,7 +148,7 @@ The primary agent chooses worker and mission ceilings and can revise them with a
 | Situation | What to expect and do |
 | --- | --- |
 | Planning times out before a mission exists | The saved request, frozen snapshot and usage remain. Use sidebar **Retry** or **Stop**; the agent/API can control the saved `requestId`. Retry advances the planning epoch so an old callback cannot launch cancelled work. |
-| Mission paused or budget exhausted | Ask the primary agent to inspect the reason, adjust the plan or ceiling as needed, then resume. Resuming resets neither consumption nor the deadline. |
+| Mission paused or budget exhausted | Ask the primary agent to inspect the reason, adjust the plan or ceiling as needed, then resume. Resuming resets neither consumption nor an explicit fixed deadline. |
 | Worker or host interrupted | Durable state and captured artifacts remain. Host-caused stops re-pend tasks without spending recovery credit; attempt leases fence stale workers. Recovery limits still apply to repeated execution failures. |
 | Provider quota, rate limit or availability failure | Classified outages preserve the attempt without spending recovery credit. The primary agent is notified on class transitions; work can route to another available member. |
 | Rejected task leaves downstream work waiting | The primary agent can admit a replacement that retains the original acceptance criteria. Dependents resolve through the replacement after it is accepted. |
@@ -156,6 +159,12 @@ The primary agent chooses worker and mission ceilings and can revise them with a
 | Missing provider key | Configure the model route and credentials in Harness. The plugin has no separate API-key store. |
 
 Verification runs the declared commands against the exact submitted commit. A failed command cannot be waived by an agent's success claim, but passing checks do not prove the commands cover every requirement. Ignored dependency directories are copied into verification checkouts by default; they are installed toolchain state, not a fresh CI install. Explicit link mode can expose reads through to the source checkout.
+
+Copy mode supports a dependency directory that is itself a symlink and relocates links within that dependency. A link to an external regular executable, such as a virtualenv's Python interpreter, becomes a copied executable; system libraries may still be required. Broken links, links into other source checkout content, and links to external directories or non-executable data are refused with a repair diagnostic. Use self-contained dependencies, or explicitly opt into external reads with both `verificationDependencyMode: link` and `allowDependencyLinkReads: true` in the host configuration.
+
+Snapshot selection follows the current Git index: a file removed from the index and now ignored remains excluded even if HEAD previously tracked it. Capture checks the resulting private index against current file contents and retries detected changes; concurrent multi-file edits still cannot be treated as an atomic filesystem snapshot.
+
+An invalid live update retains the last valid view and retries a full snapshot with backoff. Continued invalid data stays visibly disconnected rather than displaying invented progress. Owners can settle existing questions after pause, stop or completion without resuming workers. Trace metrics describe a bounded span window and expose its truncation explicitly; full durable records remain available separately.
 
 Worker confinement follows the configured Harness sandbox. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses and synchronous admission ignore probes also retain the process-management exceptions described in [known limitations](known-limitations.md).
 
@@ -189,3 +198,11 @@ This runs typecheck, build, the behavioral suite, packaged-artifact loading, rea
 | `npm run test:web` / `npm run test:command-web` | Sidebar and `/agent-swarm` browser workflows. |
 
 These suites use temporary profiles and Git workspaces with scripted provider responses. They establish integration behavior, not model planning success rates. `npm run test:deepseek` and `npm run test:command-deepseek` make real provider requests, can incur charges and are excluded from `verify`. Completed runs and their limits are recorded in [validation](validation.md).
+
+## Revise estimates and recover the same work
+
+The primary agent receives durable advance warnings for mission resources and task steps/findings, including estimates for in-flight model requests. Warnings do not change task shape. `swarm_budget(missionId, taskId, taskBudget, reason)` updates finite task allocations; omit `taskId` and supply `budget` to update the mission. Used steps/tokens, task identity and artifacts stay intact. A resource-only wait continues after the extension and stop confirmation; an explicit user pause still needs resume. Findings are advisory; an explicit user stop remains in force.
+
+`swarm_control(missionId, taskId, action: "amend", changes, reason)` corrects unsubmitted scope, dependencies, checks or assignee. `action: "resume"` retries the same task after a preparation or check-environment repair. Review retries keep the exact submitted artifact; failed assertions still need a corrected implementation and independent review. A worker stop and workspace preservation must finish before reassignment.
+
+Integration workers can resolve listed files in `.swarm-integration-conflicts.json` using ordinary edits, then remove that manifest and submit. The host retains accepted dependency commits and checks the final scoped artifact. Unknown script names or inferred prose paths are planning hints; actual authorization, scoped writes, check execution and independent review remain enforced. Failed saved plans can be edited and relaunched without discarding their request, snapshot, admitted work or recorded consumption.

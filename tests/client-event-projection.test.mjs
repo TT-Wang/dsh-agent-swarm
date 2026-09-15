@@ -33,7 +33,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { authorizeWorkspace, loadWorkspaceGrants } from '../lib/authorization.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { recentProgress } from '../lib/types/client/progress.js'
-import { RecentProgress } from '../lib/types/client/MissionProgress.js'
+import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { eventSummary } from '../lib/types/client/projection.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -94,7 +94,7 @@ test('the real runtime snapshot projects the workspace binding into the compact 
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /source: grant/)
   // The panel translates the label through the real zh table.
-  const chinese = renderChinese(RecentProgress, { snapshot })
+  const chinese = renderChinese(LiveWorkOverview, { snapshot })
   assert.match(chinese, /任务已绑定到授权工作目录/)
   assert.doesNotMatch(chinese, />Mission bound to an authorized workspace</)
 })
@@ -131,7 +131,7 @@ test('a real restart with the human root removed projects the revocation with it
   const summary = eventSummary(event.data)
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /blockedTasks: /)
-  assert.match(renderChinese(RecentProgress, { snapshot }), /任务工作目录授权已撤销/)
+  assert.match(renderChinese(LiveWorkOverview, { snapshot }), /任务工作目录授权已撤销/)
 })
 
 test('the sanctioned board stays model-tool-only in the client and the declared gap is documented', async t => {

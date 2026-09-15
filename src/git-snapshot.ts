@@ -15,6 +15,7 @@ interface SourceState {
   head: string
   fingerprint: string
   stagedOnly: string[]
+  removedFromIndex: string[]
 }
 class ChangedDuringSnapshot extends Error {}
 const paths = (value: string): string[] => value.split('\0').filter(Boolean)
@@ -46,7 +47,7 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
   }))
   const digest = createHash('sha256').update(head).update('\0').update(index)
   const stagedOnly: string[] = []
-  for (const filename of [...new Set([...headPaths, ...tracked, ...untracked])].sort()) {
+  for (const filename of [...new Set([...tracked, ...untracked])].sort()) {
     signal?.throwIfAborted()
     if (filename.endsWith('/')) throw new Error(`Nested repositories cannot be captured as swarm snapshots: ${filename}`)
     const absolute = path.join(source, filename)
@@ -102,7 +103,7 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
     if ((stat.isFile() || stat.isSymbolicLink()) && trackedSet.has(filename) && !headPaths.has(filename)) stagedOnly.push(filename)
     digest.update('\0')
   }
-  return { head, fingerprint: digest.digest('hex'), stagedOnly }
+  return { head, fingerprint: digest.digest('hex'), stagedOnly, removedFromIndex: [...headPaths].filter(filename => !trackedSet.has(filename)) }
 }
 
 /** Capture stable tracked and nonignored untracked content without touching the real index. */
@@ -117,6 +118,11 @@ export async function captureGitSnapshot(source: string, directory: string, git:
       before = await sourceState(source, git, signal)
       const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: '1' }
       await git(['read-tree', before.head], env)
+      // Seed trackedness from the current index, not historical HEAD. A file
+      // intentionally untracked and ignored must not re-enter the snapshot.
+      for (let offset = 0; offset < before.removedFromIndex.length; offset += 64) {
+        await git(['update-index', '--force-remove', '--', ...before.removedFromIndex.slice(offset, offset + 64)], env)
+      }
       await git(['add', '--all', '--', '.'], env)
       // Already-tracked additions may match ignore rules. They remain part of
       // the user's working state even though a fresh private index lacks them.
@@ -127,6 +133,10 @@ export async function captureGitSnapshot(source: string, directory: string, git:
       const tree = await git(['write-tree'], env)
       const after = await sourceState(source, git, signal)
       if (before.fingerprint !== after.fingerprint) continue
+      // A transient v1→v2→v1 edit during `add` can evade both source digests.
+      // Compare the captured index with the current worktree as a third check.
+      // This is bounded race detection, not an atomic multi-file filesystem snapshot.
+      if (await git(['diff', '--name-only', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '-z', '--'], env)) continue
       const originalTree = await git(['rev-parse', `${before.head}^{tree}`])
       const snapshotCommit = tree === originalTree ? before.head : await git(['commit-tree', tree, '-p', before.head, '-m', 'Agent Swarm private workspace baseline'])
       const changedPaths = paths(await git(['diff', '--name-only', '--no-renames', '-z', before.head, snapshotCommit, '--']))

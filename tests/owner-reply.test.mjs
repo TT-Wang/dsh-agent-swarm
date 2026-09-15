@@ -147,7 +147,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 1: the owner reads the question and ends the turn without the call.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const missing = f.events('owner/reply-missing')
   assert.equal(missing.length, 1)
   assert.equal(missing[0].data.deliveryId, ask.id)
@@ -164,7 +164,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 2: still unanswered — the second nudge is the last one.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
   const secondNudge = f.deliveries().find(item => item.to === 'owner'
@@ -176,7 +176,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 3: the bound is spent, so the guard terminal reports the decision once.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const terminal = f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal')
   assert.equal(terminal.length, 1, 'the guard terminal is the durable exit once nudging is spent')
   assert.equal(terminal[0].data.chain, 'owner_reply')
@@ -185,14 +185,14 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.equal(f.events('owner/reply-missing').length, 2, 'the durable miss record is bounded with the nudges')
   // Turn 4 with the same open receipt stays quiet: no further event, no duplicate terminal.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2)
   assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
 
   // The owner answers after the escalation: the receipt settles and the next turn is quiet.
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'target v2', replyTo: ask.id })
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 4000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2, 'a settled receipt is never reported again')
   assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
 
@@ -209,9 +209,9 @@ test('L2: an answered turn is never nudged, and a repeated turn end is a no-op',
   t.after(() => guard.dispose())
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'answered in-turn', replyTo: ask.id })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 0, 'the turn settled the receipt, so nothing is missing')
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 0, 'an end without a booked turn reports nothing')
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
 })
@@ -221,20 +221,20 @@ test('L2: replacing the guard resumes the durable nudge ordinal and reaches esca
   const ask = await f.ask()
   const first = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
   first.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-  first.observe(f.owner.sessionId, 'turn/end')
+  first.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   await f.runtime.flushOutbox(f.mission.id)
   first.dispose()
   const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
   t.after(() => replacement.dispose())
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  replacement.observe(f.owner.sessionId, 'turn/end')
-  replacement.observe(f.owner.sessionId, 'turn/end')
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const nudges = f.deliveries().filter(row => row.notice?.dedupKey?.startsWith(`owner-reply-missing:${ask.id}`))
   assert.equal(nudges.length, 2, 'guard state loss does not repeat or swallow a recovery ordinal')
   assert.equal(new Set(nudges.map(row => row.notice.dedupKey)).size, 2)
   await f.runtime.flushOutbox(f.mission.id)
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
-  replacement.observe(f.owner.sessionId, 'turn/end')
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
 })
@@ -255,13 +255,13 @@ test('L2: an outbox write failure does not spend a nudge without retaining its w
   }
   try {
     guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-    assert.throws(() => guard.observe(f.owner.sessionId, 'turn/end'), /injected outbox write failure/)
+    assert.throws(() => guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } }), /injected outbox write failure/)
   } finally { f.runtime.store.put = original }
   assert.ok(injected)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
   assert.equal(f.events('owner/reply-missing').length, 0)
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 1)
   assert.equal(f.deliveries().filter(row => row.notice?.dedupKey?.startsWith('owner-reply-missing:')).length, 1)
 })

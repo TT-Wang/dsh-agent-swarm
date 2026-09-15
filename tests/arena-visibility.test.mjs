@@ -146,7 +146,7 @@ class Workers {
   async stop() {}
   isIdle() { return false }
   async captureArtifact() { return { commit: 'artifact-commit', baseCommit: 'base-commit', workspace: '/isolated', changedPaths: ['src/a.txt'] } }
-  async verifyArtifact() { return [] }
+  async verifyArtifact(_member, task) { return task.checks.map(command => ({ command, exitCode: 0, output: 'fixture check passed' })) }
   async prepareTask() {}
   async dispose() {}
 }
@@ -261,12 +261,12 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
   })
   const waiting = f.runtime.propose(f.owner, f.mission.id, {
     workstreamId: f.stream.id, title: 'Waiting', objective: 'Depends on first', kind: 'research',
-    dependencies: [first.id], assigneeId: f.alice.id, scope: ['src/'], acceptance: ['arena works'],
+    dependencies: [first.id], assigneeId: f.alice.id, priority: 100, scope: ['src/'], acceptance: ['arena works'],
   })
   let view = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' })
   let row = view.arena.members.find(member => member.id === f.alice.id)
   assert.equal(row.status, 'idle')
-  assert.equal(row.pendingTaskId, waiting.id, 'the next pending task is named')
+  assert.equal(row.pendingTaskId, waiting.id, 'the highest-priority pending obligation is shown as diagnostic context, not a dispatch prediction')
   assert.deepEqual(row.pendingDependencies, [first.id], 'the unaccepted dependency is named')
   assert.equal(row.currentTaskId, undefined)
   assert.match(view.fingerprint, /^[a-f0-9]{32}$/, 'the owner sees the no-silent-state F(S), not the 64-hex ledger digest')

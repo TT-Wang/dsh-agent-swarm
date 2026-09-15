@@ -168,8 +168,8 @@ test('R14 pair: the workspace guard and the review-capture guard co-fire and the
   assert.ok(terminal.coFires.includes('review_admission'), 'the pair names the review-admission guard it co-fires with')
   assert.ok(terminal.coFires.includes('attempt_lease'), 'the pair names the attempt/lease guard it co-fires with')
   assert.deepEqual(lintRefusal(terminal.message), [])
-  assert.match(terminal.message, /swarm_propose/)
-  assert.match(terminal.message, /swarm_cancel/)
+  assert.match(terminal.message, /swarm_control/)
+  assert.match(terminal.message, /taskId/)
 })
 
 test('R14 pair: the workspace guard and "Member has uncommitted commits" co-fire with no exit before this round', () => {
@@ -231,34 +231,25 @@ test('R14: the terminal classification names the first chain that cannot progres
  * 3. The runtime-level pairs: the terminal is durable, contained and deduped.
  * ------------------------------------------------------------------------- */
 
-test('R14 runtime pair (dirty workspace x preparation): an exhausted preparation chain escalates with a coded decision request', async () => {
+test('R17 runtime pair (dirty workspace x preparation): deterministic failure preserves work and requests same-task owner recovery', async () => {
   const f = await setup({ config: { tickMs: 10 } })
   try {
     f.workers.autoIdle = true
-    // The exact field condition: preparation meets a workspace guard and throws.
-    f.workers.prepareTask = async () => { throw new Error('workspace_uncommitted: the member workspace has uncommitted changes') }
+    let calls = 0
+    f.workers.prepareTask = async () => { calls++; throw new Error('workspace_uncommitted: the member workspace has uncommitted changes') }
     const task = f.propose({ title: 'Prepare under a dirty workspace', maxRecoveryAttempts: 1 })
     const blocked = await eventually(() => {
       const row = f.runtime.store.get('tasks', task.id)
       return row.status === 'blocked' ? row : undefined
-    }, 'the task must exhaust its preparation recovery limit', 8_000)
+    }, 'the task must wait for preparation repair', 8_000)
     assert.match(blocked.output, /Workspace or worker preparation failed/)
-    const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
-      .filter(item => item.data.cause === 'guard-terminal').at(-1), 'the terminal escalation must be durable', 8_000)
-    assert.equal(event.data.chain, 'dispatch_preconditions')
-    assert.equal(event.data.code, 'dispatch_terminal')
-    assert.ok(event.data.coFires.includes('workspace'), 'the terminal names the workspace guard it co-fired with')
-    assert.equal(event.data.ownerNotified, true)
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dispatch_terminal\]/.test(delivery.content)),
-      'the owner must receive the coded decision request', 8_000)
-    assert.match(notice.content, /swarm_propose/)
-    assert.match(notice.content, /swarm_cancel/)
-    assert.deepEqual(lintRefusal(notice.content), [], 'the delivered message resolves through the refusal lint')
-    // One durable decision request per unchanged board: the repeat is the same
-    // request, never a second differently-worded one.
+    assert.equal(blocked.preparationFailure.transient, false)
+    assert.equal(blocked.recoveryCount ?? 0, 0)
+    const notice = await eventually(() => f.workers.deliveries.find(delivery => delivery.memberId === 'owner'
+      && delivery.content.includes(task.id) && /swarm_control/.test(delivery.content)), 'owner gets executable same-task recovery', 8_000)
+    assert.match(notice.content, /resume/)
     await sleep(80)
-    assert.equal(f.workers.deliveries.filter(delivery => /\[dispatch_terminal\]/.test(delivery.content)).length, 1)
+    assert.equal(calls, 1, 'unchanged workspace failure is never retried each tick')
   } finally { await f.cleanup() }
 })
 
@@ -409,8 +400,8 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
       .find(delivery => delivery.memberId === 'owner' && /\[workspace_terminal\]/.test(delivery.content)),
       'the owner must receive the workspace terminal', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
-    assert.match(notice.content, /swarm_propose/)
-    assert.match(notice.content, /swarm_cancel/)
+    assert.match(notice.content, /swarm_control/)
+    assert.match(notice.content, /taskId/)
   } finally { await f.cleanup() }
 })
 
@@ -454,7 +445,8 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[attempt_terminal\]/.test(delivery.content)),
       'the opt-in call delivers the owner notice', 8_000)
-    assert.match(notice.content, /swarm_handoff/)
+    assert.match(notice.content, /swarm_control/)
+    assert.doesNotMatch(notice.content, /swarm_handoff/)
     // The same call for the same board is the same decision request: the repeat
     // is suppressed because the request is durable, not because the caller chose
     // to stay silent.
@@ -693,7 +685,7 @@ test('S4b (task ceiling): the blocked task escalates with the coded ceiling term
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[task_ceiling_terminal\]/.test(delivery.content)),
       'the owner decision request replaces the prose-only ceiling notice', 8_000)
-    assert.match(notice.content, /swarm_propose/)
+    assert.match(notice.content, /swarm_budget/)
     assert.deepEqual(lintRefusal(notice.content), [])
   } finally { await f.cleanup() }
 })
@@ -706,7 +698,7 @@ test('S4b (owner-side ceiling): the refusal is a recorded coded decision, not on
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[task_ceiling_terminal\]/.test(delivery.content)),
       'the owner faces a recorded decision on the next read', 8_000)
-    assert.match(notice.content, /swarm_propose/)
+    assert.match(notice.content, /swarm_budget/)
     assert.match(notice.content, /\[task_ceiling_terminal\]/)
     assert.deepEqual(lintRefusal(notice.content), [])
   } finally { await f.cleanup() }

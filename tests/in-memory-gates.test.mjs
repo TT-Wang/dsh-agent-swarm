@@ -9,12 +9,12 @@
  * includes that work as the `scheduled` absence claim below and does not
  * duplicate it.
  *
- * What this file is: an EXHAUSTIVE census of every `new Map`/`new Set`/
+ * The historical table below records the original `new Map`/`new Set`/
  * `new WeakMap`/`new WeakSet` occurrence in `src/` (excluding `src/client`, the
  * browser bundle), each classified, plus one behaviour test per gate entry.
- * Absence claims here are backed by the census, never by example: the first
- * test fails if any occurrence in the tree is unclassified, so "there is no
- * other in-memory gate" is a machine check, not a reading.
+ * The active check inventories class fields and module bindings by identity,
+ * including new recovery state. Function-local scratch collections do not need
+ * an ordinal or full-source-text registration. Existing gate behavior tests remain.
  *
  * The unit that carries a LABEL is the runtime's own decision path:
  * `SwarmRuntime`, its seven extracted seams (`attempts`, `gates`, `notices`,
@@ -33,11 +33,11 @@
  *    work or a lost in-process notification. The test clears it and shows the
  *    durable result is unchanged.
  *
- * A third label was possible while a gate was neither; S5c closed it. Every
- * behaviour-gating entry in `src/` is now `derivable` or `cache-only`, and the
- * census test asserts that by NAME for the five entries that used to be reported
- * as neither (`queues`, `operations`, `startControllers`, `startFailures`,
- * `releasedPasses`): a new unlabelled state cannot hide behind an edited count.
+ * Existing policy gates retain these labels and their behavior tests. New
+ * recovery entries also distinguish native lifecycle ownership and an audit
+ * buffer that has not yet become durable; neither is relabelled as a harmless
+ * cache. Registration follows the binding name, so a new persistent collection
+ * cannot hide behind an edited occurrence count.
  * The five fixes are structural, not re-labelling — the mission queue no longer
  * chains past the declared bound, the launch's cancellation is re-read from the
  * durable start row before activation, the consecutive-failure count lives on
@@ -61,6 +61,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
 import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
+import { persistentCollections } from './source-semantics.mjs'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 
@@ -302,40 +303,57 @@ function occurrences(root) {
 const GATES = CENSUS.filter(entry => entry[4] === 'gate')
 const key = entry => `${entry[0]}:${entry[1]}`
 
-test('S5 census: every in-memory collection in src/ is classified, and none is unclassified', () => {
-  const found = occurrences(join(PROJECT, 'src'))
-  const declared = new Map(CENSUS.map(entry => [key(entry), entry]))
-  const seen = new Set()
-  for (const [file, index, kind, source] of found) {
-    const id = `${file}:${index}`
-    const entry = declared.get(id)
-    assert.ok(entry, `UNCLASSIFIED in-memory collection at ${id} (${kind}): ${source}\n` +
-      'Classify it in CENSUS: a gate needs a label (derivable | cache-only) and a test body in GATE_TESTS; a transient, constant or out-of-unit collection needs that class and a reason.')
-    assert.equal(entry[2], kind, `${id} changed constructor from ${entry[2]} to ${kind}; re-classify it`)
-    assert.equal(entry[3], source, `${id} changed text; if it is still the same collection, update CENSUS, otherwise classify the new one`)
-    seen.add(id)
+const RECOVERY_COLLECTIONS = {
+  'src/runtime.ts:ownerObserveCursors': { kind: 'Map', label: 'cache-only', proof: 'tests/observe-owner-delta.test.mjs',
+    behavior: 'owner cursors are replayable, scoped, bounded and disposable',
+    reason: 'At most64 immutable compact baselines belong to explicit owner/mission cursors; loss or eviction returns a complete compact view, never gates execution or settles an obligation.' },
+  'src/workspaces.ts:preparations': { kind: 'Map', label: 'in-flight', proof: 'tests/rule-workspace-recovery.test.mjs',
+    behavior: 'overlapping preparation of one member and epoch reuses its workspace after the first preparation settles',
+    reason: 'Per-member preparation promises serialize concurrent workspace I/O and release in finally; stop/dispose abort queued work. Durable workspace manifests, not this process-local queue, own restart recovery.' },
+  'src/invariant.ts:appendRefusalProofs': { kind: 'WeakMap', label: 'per-error', proof: 'tests/rule-owner-channel.test.mjs',
+    behavior: 'only the proven predicate and exact delivery', reason: 'Provenance binds only live Error instances to the actual rejecting predicate. Losing this ephemeral proof fails closed into retry, never falsely acknowledges a delivery.' },
+  'src/workspaces.ts:summary': { kind: 'Map', label: 'per-run', proof: 'tests/r12-workspace-fixes.test.mjs',
+    behavior: 'shell stages and repeated names are counted', reason: 'A CheckOutputScanner owns one declared-check run; this summary is discarded with that run and never decides later scheduling.' },
+  'src/attempts.ts:stopRetries': { kind: 'Map', label: 'derivable', proof: 'tests/r12-protocol-fixes.test.mjs',
+    behavior: 'one in-flight stop cannot duplicate or resurrect a cancelled epoch',
+    reason: 'Task.resumeAfterStop carries the fenced epoch and old owner; this map only coalesces attempts and delays retries.' },
+  'src/runtime.ts:workerStarts': { kind: 'Map', label: 'lifecycle', proof: 'tests/r12-native-start-fixes.test.mjs',
+    behavior: 'cancelled unpublished setup fences', reason: 'One cancellable native-start operation per member; durable member/mission checks fence late settlement, and adapter disposal owns handles.' },
+  'src/refusals.ts:writerRecoveries': { kind: 'WeakMap', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
+    behavior: 'writer recovery retains distinct refusals',
+    reason: 'Coalesced admission/guard persistence failures; never grants or blocks task authority. Until SQLite accepts a write this audit buffer is process-local.' },
+}
+const bindingName = source => /\b(?:readonly|const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=/.exec(source)?.[1] ?? /this\.([A-Za-z_$][\w$]*)\s*=/.exec(source)?.[1]
+
+test('S5 census: persistent collection identities have a recovery classification and behavior evidence', () => {
+  const files = [...new Set(occurrences(join(PROJECT, 'src')).map(entry => entry[0]))]
+  const found = new Map()
+  for (const file of files) {
+    for (const item of persistentCollections(readFileSync(join(PROJECT, file), 'utf8'), file)) {
+      const id = `${file}:${item.name}`
+      found.set(id, item)
+      const registered = RECOVERY_COLLECTIONS[id]
+      const inherited = CENSUS.find(entry => entry[0] === file && entry[4] !== 'local' && bindingName(entry[3]) === item.name)
+      assert.ok(registered || inherited, `UNCLASSIFIED persistent collection ${id}; record its owner, recovery semantics and behavior evidence`)
+      assert.equal(registered?.kind ?? inherited[2], item.kind, `${id}: changed collection kind`)
+      assert.ok((registered?.reason ?? inherited[6]).length > 15, `${id}: explain what survives cache loss or disposal`)
+    }
   }
-  for (const entry of CENSUS) assert.ok(seen.has(key(entry)), `stale census entry ${key(entry)} is no longer in the tree`)
-  const counts = CENSUS.reduce((all, entry) => ({ ...all, [entry[4]]: (all[entry[4]] ?? 0) + 1 }), {})
-  assert.equal(counts.gate, GATES.length)
-  // S5c: zero unlabelled behaviour-gating entries, asserted BY NAME for the five
-  // that used to carry the third state, not by a count that could be edited.
-  const CLOSED = {
-    'src/runtime.ts:6': 'cache-only',
-    'src/runtime.ts:7': 'cache-only',
-    'src/runtime.ts:8': 'derivable',
-    'src/runtime.ts:9': 'derivable',
-    'src/scheduling.ts:1': 'derivable',
+  for (const entry of GATES) {
+    const id = `${entry[0]}:${bindingName(entry[3])}`
+    assert.ok(found.has(id), `${id}: a registered policy gate disappeared; review its behavior test`)
+    assert.ok(['derivable', 'cache-only'].includes(entry[5]), `${id}: existing policy gates retain their tested labels`)
   }
-  for (const label of new Set(GATES.map(entry => entry[5]))) {
-    assert.ok(label === 'derivable' || label === 'cache-only',
-      `gate ${key(GATES.find(entry => entry[5] === label))} carries ${JSON.stringify(label)}; every gate must be derivable or cache-only`)
+  for (const [id, entry] of Object.entries(RECOVERY_COLLECTIONS)) {
+    assert.ok(found.has(id), `${id}: stale recovery registration`)
+    const proof = readFileSync(join(PROJECT, entry.proof), 'utf8')
+    assert.ok(proof.includes(entry.behavior), `${id}: behavior evidence must exist in ${entry.proof}`)
   }
-  for (const [entryKey, label] of Object.entries(CLOSED)) {
-    const entry = GATES.find(candidate => key(candidate) === entryKey)
-    assert.ok(entry !== undefined, `${entryKey} must still be a labelled gate entry`)
-    assert.equal(entry[5], label, `${entryKey} must be ${label}: S5c closed the gate that used to be reported as neither`)
-  }
+})
+
+test('S5 census recognizes persistent bindings without turning local refactors into new gates', () => {
+  assert.deepEqual(persistentCollections('const registry = new Map(); function f() { const transient = new Set(); } class Runtime { cache = new Map(); method() { return new Set(); } }'),
+    [{ name: 'registry', kind: 'Map' }, { name: 'cache', kind: 'Map' }])
 })
 
 test('S5 census: the round-13 `scheduled` Set stays deleted and the guard stays durable (T1, included here)', () => {

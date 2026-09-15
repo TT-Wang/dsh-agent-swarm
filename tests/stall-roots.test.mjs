@@ -9,6 +9,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
+import { waitsLegitimately } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -150,6 +151,34 @@ test('R14-F2v D2: a stop with no recorded start is a root, never silence', async
   await sleep(200)
   const roots = f.stallRoots()
   assert.equal(roots.length, 1, `an untimestamped stop escalates instead of staying silent: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
-  assert.equal(f.fallthroughs().length, 0, 'the root path names it, the fall-through is not needed')
+  assert.equal(f.fallthroughs().length, 0, `the recovered root waits for its selected member without a duplicate fallthrough: ${JSON.stringify(f.fallthroughs().map(delivery => ({ subjects: delivery.subjects, content: delivery.content })))}`)
+  assert.deepEqual(roots[0].subjects, [`${stuck.id}@${row.epoch}`], 'the original stop is named exactly once, without attributing its healthy sibling')
   assert.match(roots[0].content, /no recorded start/, `the notice states why the bound cannot hold: ${roots[0].content}`)
+})
+
+
+test('pending stop waits remain bounded and use the same owner scope as dispatch fencing', t => {
+  const now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const rt = { stallPassTimeoutMs: 100, config: { tickMs: 25 }, unfinishedDependencies: () => [] }
+  const pending = { id: 'next', missionId: 'mission', epoch: 0, status: 'pending', assigneeId: 'owner', dependencies: [] }
+  const stop = (id, memberId, at, epoch = 1) => ({ id, missionId: 'mission', status: 'cancelled', epoch: 1,
+    resumeAfterStop: { epoch, memberId, reason: 'handoff', ...(at === undefined ? {} : { at }) } })
+  const bounded = stop('old-work', 'owner', now - 50)
+  assert.equal(waitsLegitimately(rt, pending, [pending, bounded]), true, 'the assigned member will be released by this bounded stop')
+  assert.equal(waitsLegitimately(rt, pending, [pending, stop('unknown-owner', undefined, now - 50)]), true, 'an ambiguous owner scan reserves every member')
+  for (const expired of [stop('expired', 'owner', now - 101), stop('untimestamped', 'owner', undefined), stop('unknown-expired', undefined, now - 101)]) {
+    assert.equal(waitsLegitimately(rt, pending, [pending, expired]), false, 'an unbounded matching stop must remain actionable')
+    assert.equal(waitsLegitimately(rt, pending, [pending, bounded, expired]), false, 'one healthy stop cannot hide another matching stop past its bound')
+  }
+  assert.equal(waitsLegitimately(rt, pending, [pending, stop('unrelated', 'other', now - 50)]), false, 'another member stop is not this task path')
+  assert.equal(waitsLegitimately(rt, pending, [pending, stop('stale', 'owner', now - 50, 0)]), false, 'a stale stop epoch cannot justify waiting')
+  const running = { id: 'active-work', missionId: 'mission', status: 'running', epoch: 1, dependencies: [], attempt: { ownerId: 'owner', leaseUntil: now + 100 } }
+  assert.equal(waitsLegitimately(rt, pending, [pending, running]), true, 'the selected member is busy under a live lease')
+  assert.equal(waitsLegitimately(rt, pending, [pending, { ...running, attempt: { ...running.attempt, leaseUntil: now - 1 } }]), false, 'an expired lease cannot hide an overdue assignment')
+  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: ['missing'] }, [pending, running]), false, 'a busy owner does not repair a missing prerequisite')
+  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: ['missing'] }, [pending, bounded]), false, 'a bounded stop does not repair a missing prerequisite')
+  assert.equal(waitsLegitimately(rt, { ...pending, reviewOf: 'missing' }, [pending, bounded]), false, 'a bounded stop does not repair a missing review source')
+  const accepted = { id: 'accepted', missionId: 'mission', status: 'accepted', epoch: 1, dependencies: [] }
+  assert.equal(waitsLegitimately(rt, { ...pending, dependencies: [accepted.id] }, [pending, accepted, running]), true, 'accepted prerequisites remain ready while the member is busy')
 })

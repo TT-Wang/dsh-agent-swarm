@@ -87,14 +87,14 @@ test('every in-scope refusal is coded and its next step names a parameter that r
   assert.equal(applied.checked.length, sites.length, 'nothing is exempted: the allowlist is empty')
 })
 
-test('the motivating refusal names maxSteps and maxFindings, which resolve on swarm_propose', async () => {
+test('the task ceiling refusal names a real same-task allocation repair through swarm_budget', async () => {
   const { index, sites } = await inventory()
   const ceiling = sites.find(site => site.code === 'task_ceiling_exhausted')
   assert.ok(ceiling, 'the ceiling refusal is inventoried')
-  assert.deepEqual(ceiling.tools, ['swarm_propose'])
-  for (const parameter of ['replaces', 'maxSteps', 'maxFindings']) {
+  assert.deepEqual(ceiling.tools, ['swarm_budget'])
+  for (const parameter of ['taskId', 'taskBudget', 'reason']) {
     assert.ok(ceiling.params.includes(parameter), `the ceiling exit names ${parameter}`)
-    assert.ok(index.ownProperties.get('swarm_propose').has(parameter), `swarm_propose declares ${parameter}`)
+    assert.ok(index.ownProperties.get('swarm_budget').has(parameter), `swarm_budget declares ${parameter}`)
   }
   // Both plan entry points expose the same per-task ceilings.
   for (const name of ['swarm_propose', 'swarm_stage', 'swarm_launch']) {
@@ -183,4 +183,15 @@ test('refusals outside this branch are inventoried through the same helper and r
   // drives the deferred count to zero, and this test must stay green on the
   // assembled artifact. The count is reported for that task's inventory.
   t.diagnostic(`deferred refusal inventory: ${total} refusal sites in ${deferredSources.length} out-of-scope files, ${uncoded} not yet coded`)
+})
+
+
+test('advisory diagnostics stay visible without becoming imperative refusal rules', async () => {
+  const { index } = await inventory()
+  const diagnostic = "const note = { code: 'scope_hint', severity: 'advisory', message: 'This may be a read-only input reference.' }"
+  const [advisory] = refusalSites(diagnostic, 'src/probe.ts')
+  assert.equal(advisory.advisory, true)
+  assert.deepEqual(assess(advisory, index), [])
+  const [hard] = refusalSites(diagnostic.replace("severity: 'advisory', ", ''), 'src/probe.ts')
+  assert.ok(assess(hard, index).length > 0, 'real refusal diagnostics still require executable guidance')
 })

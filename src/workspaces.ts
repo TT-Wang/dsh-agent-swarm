@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { StringDecoder } from 'node:string_decoder'
-import { chmod, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
@@ -12,6 +12,7 @@ import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline 
 export type { CheckEnvelope }
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
+  failureKind?: 'timeout' | 'infrastructure'
   /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
   attribution?: CheckAttribution
   /** ENV: the environment this check actually ran under. */
@@ -235,6 +236,7 @@ class CheckOutputScanner {
   private readonly failingTests: string[] = []
   private failingTestCount = 0
   private failed = false
+  private specFailureSummary = false
   private readonly summary = new Map<string, string>()
   private plan: string | null = null
   push(chunk: Buffer): void {
@@ -259,6 +261,10 @@ class CheckOutputScanner {
    * the pre-existing behaviour.
    */
   private line(text: string): void {
+    if (/^(?:\$|>)\s+/.test(text)) this.specFailureSummary = false
+    // Spec repeats failures below this footer. Ignore that section, not repeated
+    // names in the live stream: different suites may use the same test name.
+    if (/^\s*✖\s+failing tests:\s*$/.test(text)) { this.specFailureSummary = true; return }
     const tap = /^\s*not ok\s+\d+\s*-\s+(.*\S)\s*$/.exec(text)
     // `✖ failing test (12.3ms)` — the spec reporter's failure marker, optional
     // leading indentation for nested subtests, optional trailing duration.
@@ -268,11 +274,7 @@ class CheckOutputScanner {
     const failure = tap ?? (spec !== null && /^(?:failing )?tests?:$/.test(spec[1]!.trim()) ? null : spec)
     const name = failure === null ? null : (spec === null ? failure[1]! : failure[1]!.replace(/\s*\(\d+(?:\.\d+)?(?:ms|s)\)\s*$/, ''))
     if (name !== null) {
-      // The spec reporter prints each failure twice: once in the live stream and
-      // again under its trailing `failing tests:` block. TAP prints it once, so
-      // only the spec path dedupes — a repeated name is the reporter's echo, not
-      // a second failing test, and counting it would double `failingTestCount`.
-      if (spec !== null && this.failingTests.includes(name)) return
+      if (spec !== null && this.specFailureSummary) return
       if (!this.failed) { this.failed = true; this.failingStage = this.stage; this.failingSubtest = this.subtest }
       this.failingTestCount++
       if (this.failingTests.length < MAX_ATTRIBUTED_FAILURES) this.failingTests.push(name.slice(0, MAX_ATTRIBUTED_NAME))
@@ -280,7 +282,7 @@ class CheckOutputScanner {
     }
     if (!this.failed) {
       // `▶ suite name` is the spec reporter's suite marker; the TAP trio stays.
-      const stage = /^>\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^$\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^#\s*stage:\s*(\S.*\S|\S)\s*$/i.exec(text) ?? /^\s*▶\s+(\S.*\S|\S)\s*$/.exec(text)
+      const stage = /^>\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^\$\s+(\S.*\S|\S)\s*$/.exec(text) ?? /^#\s*stage:\s*(\S.*\S|\S)\s*$/i.exec(text) ?? /^\s*▶\s+(\S.*\S|\S)\s*$/.exec(text)
       if (stage !== null) this.stage = stage[1]!.slice(0, MAX_ATTRIBUTED_NAME)
       const subtest = /^#\s*Subtest:\s*(\S.*\S|\S)\s*$/.exec(text)
       if (subtest !== null) this.subtest = subtest[1]!.slice(0, MAX_ATTRIBUTED_NAME)
@@ -421,7 +423,10 @@ export async function assertContainedSymlinkChain(relative: string, target: stri
   }
 }
 interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline; workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
-interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; recovery?: TaskRecovery }
+const INTEGRATION_CONFLICT_FILE = '.swarm-integration-conflicts.json'
+interface IntegrationConflict { dependencyId: string; commit: string; paths: string[] }
+interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; preservedCommit?: string; recovery?: TaskRecovery
+  dependencyCommits?: string[]; integrationConflicts?: IntegrationConflict[] }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 /**
@@ -801,23 +806,35 @@ export class Workspaces {
   private async createArtifactRepo(missionId: string, source: string, signal?: AbortSignal): Promise<string> {
     const dir = this.artifactRepoDir(missionId)
     const marker = path.join(dir, 'swarm-artifacts.json')
-    const saved = await readJson(marker)
+    let saved: unknown
+    let corruptMarker = false
+    try { saved = await readJson(marker) }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; corruptMarker = true }
+    if (saved === undefined && await lstat(dir).then(() => true, () => false)) {
+      // A marker is the final creation step. Recover an interrupted write only
+      // after proving this is the mission's owned bare repository; preserve all
+      // artifact refs and corrupt metadata for diagnosis.
+      await this.missionRecord(missionId)
+      if (await realpath(dir) !== dir || await this.git(dir, ['rev-parse', '--is-bare-repository'], signal) !== 'true'
+        || await realpath(await this.git(dir, ['rev-parse', '--absolute-git-dir'], signal)) !== dir) throw new Error('[artifact_repository_invalid] The mission artifact directory is not its owned bare repository; preserve it and repair its Git metadata before retrying.')
+      if (corruptMarker) await rename(marker, `${marker}.corrupt-${randomUUID()}`)
+      saved = { version: 1, missionId }
+      await writePrivateJson(marker, saved)
+    }
     if (isRecord(saved)) {
       if (saved.version !== 1 || saved.missionId !== missionId) throw new Error('Invalid per-mission artifact repository marker')
-      // A legacy repository that borrows the source through an alternate is not
-      // durable: rebuild it self-contained and carry every ref over.
-      if (!(await lstat(path.join(dir, 'objects', 'info', 'alternates')).then(() => true, () => false))) return dir
-      const refs = (await this.git(dir, ['for-each-ref', '--format=%(objectname) %(refname)']))
-        .split('\n').map(line => line.trim()).filter(Boolean)
-        .map(line => { const [commit, ref] = line.split(' '); return { commit: commit!, ref: ref! } })
-      await rm(dir, { recursive: true, force: true })
-      await this.cloneArtifactRepo(missionId, source, dir, signal)
-      for (const { commit, ref } of refs) await this.git(source, ['push', '--quiet', '--force', dir, `${commit}:${ref}`], signal)
+      // Copy referenced objects from a legacy alternate before disconnecting it.
+      // Never delete the existing artifact repository to rebuild it: some refs
+      // may already be absent from the source, and a crash must preserve them.
+      const alternate = path.join(dir, 'objects', 'info', 'alternates')
+      if (!(await lstat(alternate).then(() => true, () => false))) return dir
+      await this.git(dir, ['repack', '-a', '-d'], signal)
+      const backup = `${alternate}.retired-${randomUUID()}`
+      await rename(alternate, backup)
+      try { await this.git(dir, ['fsck', '--connectivity-only', '--no-dangling'], signal) }
+      catch (error) { await rename(backup, alternate); throw error }
       return dir
     }
-    // `git clone` refuses a non-empty destination, so drop a partial directory
-    // from an interrupted first attempt before cloning.
-    if (await lstat(dir).then(() => true, () => false)) await rm(dir, { recursive: true, force: true })
     await this.cloneArtifactRepo(missionId, source, dir, signal)
     return dir
   }
@@ -834,7 +851,7 @@ export class Workspaces {
       if (ref.startsWith('refs/artifacts/') || ref.startsWith('refs/baselines/')) continue
       await this.git(dir, ['update-ref', '-d', ref], signal)
     }
-    await writeFile(path.join(dir, 'swarm-artifacts.json'), JSON.stringify({ version: 1, missionId }), { mode: 0o600 })
+    await writePrivateJson(path.join(dir, 'swarm-artifacts.json'), { version: 1, missionId })
   }
 
   /**
@@ -845,6 +862,7 @@ export class Workspaces {
    */
   private async publishArtifactRef(missionId: string, cwd: string, commit: string, ref: string, legacyRef: string, signal?: AbortSignal): Promise<void> {
     const repo = await this.artifactRepo(missionId, cwd, signal)
+    await this.ensureSourceCommit(missionId, cwd, commit, signal)
     await this.git(cwd, ['push', '--quiet', '--force', repo, `${commit}:${ref}`], signal)
     await this.git(cwd, ['update-ref', '-d', legacyRef], signal).catch(() => undefined)
   }
@@ -1025,6 +1043,9 @@ export class Workspaces {
       const task = value.task
       if (!isRecord(task) || typeof task.taskId !== 'string' || !Number.isSafeInteger(task.epoch) || !commitId(task.baseCommit)) throw new Error('Invalid persisted task baseline')
       if (task.capturedCommit !== undefined && !commitId(task.capturedCommit)) throw new Error('Invalid persisted captured commit')
+      if (task.preservedCommit !== undefined && !commitId(task.preservedCommit)) throw new Error('Invalid persisted preservation commit')
+      if (task.dependencyCommits !== undefined && (!Array.isArray(task.dependencyCommits) || !task.dependencyCommits.every(commitId))) throw new Error('Invalid persisted dependency commits')
+      if (task.integrationConflicts !== undefined && (!Array.isArray(task.integrationConflicts) || !task.integrationConflicts.every(item => isRecord(item) && typeof item.dependencyId === 'string' && commitId(item.commit) && Array.isArray(item.paths) && item.paths.every(p => typeof p === 'string' && !path.isAbsolute(p) && !p.split('/').includes('..'))))) throw new Error('Invalid persisted integration conflicts')
       const saved = task.recovery
       let recovery: TaskRecovery | undefined
       if (saved !== undefined) {
@@ -1032,7 +1053,11 @@ export class Workspaces {
         recovery = { commit: saved.commit, previousOwnerId: saved.previousOwnerId, reason: saved.reason, at: saved.at as number }
       }
       record.task = { taskId: task.taskId, epoch: task.epoch as number, baseCommit: task.baseCommit,
-        ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}), ...(recovery === undefined ? {} : { recovery }) }
+        ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}),
+        ...(typeof task.preservedCommit === 'string' ? { preservedCommit: task.preservedCommit } : {}),
+        ...(task.dependencyCommits === undefined ? {} : { dependencyCommits: task.dependencyCommits as string[] }),
+        ...(task.integrationConflicts === undefined ? {} : { integrationConflicts: task.integrationConflicts as unknown as IntegrationConflict[] }),
+        ...(recovery === undefined ? {} : { recovery }) }
     }
     const mission = await this.missionRecord(member.missionId)
     const common = async (cwd: string): Promise<string> => await realpath(path.resolve(cwd, await this.git(cwd, ['rev-parse', '--git-common-dir'])))
@@ -1055,7 +1080,19 @@ export class Workspaces {
         return workspace
       }
       await mkdir(path.dirname(workspace), { recursive: true, mode: 0o700 })
-      await this.worktreeAdd(source, workspace, saved.baseCommit, signal)
+      const existing = await lstat(workspace).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+        throw error
+      })
+      if (existing === undefined) await this.worktreeAdd(source, workspace, saved.baseCommit, signal)
+      else if (!existing.isDirectory() || await realpath(workspace) !== workspace
+        || await this.git(workspace, ['rev-parse', '--show-toplevel'], signal) !== workspace
+        || await this.commonDir(workspace) !== await this.commonDir(source)
+        || await this.git(workspace, ['branch', '--show-current'], signal) !== ''
+        || await this.git(workspace, ['rev-parse', 'HEAD^{commit}'], signal) !== saved.baseCommit
+        || await this.git(workspace, ['status', '--porcelain=v1', '--untracked-files=all'], signal)) {
+        throw new Error('[workspace_recovery_requires_inspection] An unregistered member workspace contains unexpected state. Preserve its files and commits, inspect its ownership and work, then restore the recorded clean baseline before retrying.')
+      }
       await writePrivateJson(this.memberPath(mission.id, memberId), { version: 1, missionId: mission.id, memberId, workspace } satisfies MemberWorkspace)
       return workspace
     })
@@ -1104,57 +1141,131 @@ export class Workspaces {
     return work
   }
 
+  /** In-flight preparation gates; stop/dispose abort queued operations before workspace I/O. */
+  private readonly preparations = new Map<string, Promise<void>>()
+
   async prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> {
     await this.operation(member.id, async signal => {
-      const record = await this.memberRecord(member)
-      if (task.reviewOf !== undefined) {
-        if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
-        await this.validateArtifact(member, reviewSource.artifact)
-      } else if (reviewSource !== undefined) throw new Error('[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
-      const taskOwner = await readJson(this.taskPath(member.missionId, task.id))
-      const ownsRecovery = taskOwner === undefined || (isRecord(taskOwner) && taskOwner.memberId === member.id)
-      const sameReview = reviewSource === undefined || record.task?.baseCommit === reviewSource.artifact?.commit
-      if (sameReview && ownsRecovery && record.task?.taskId === task.id && record.task.epoch === task.epoch) return
-      if (sameReview && ownsRecovery && record.task?.taskId === task.id) {
-        if (record.task.epoch > task.epoch) throw new Error('Task attempt is older than the prepared workspace')
-        // Same-task recovery keeps both committed and uncommitted progress. The
-        // runtime must stop the previous attempt before preparing its replacement.
-        record.task.epoch = task.epoch
-        await this.saveTaskWorkspace(record)
-        return
-      }
-      if ((await this.uncommittedWork(member.workspace, signal)).length > 0) throw new Error('[workspace_uncommitted] Member workspace has uncommitted work; submit or resolve it before starting another task Submit the work with `swarm_submit` and its `taskId`, then retry.')
-      const previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
-      if (record.task !== undefined && previousHead !== (record.task.capturedCommit ?? record.task.baseCommit)) throw new Error('[commits_unsubmitted] Member has unsubmitted commits; capture them before preparing another task Submit the commits with `swarm_submit` and its `taskId`, then retry.')
-      if (record.task !== undefined && record.task.taskId !== task.id) await this.checkpointAbandonedTask(record, task.id)
-      // Each task starts only with the mission base and explicitly accepted dependencies.
-      // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
-      const mission = await this.missionRecord(member.missionId)
-      const recovery = reviewSource === undefined ? await this.recoverTask(member, task) : undefined
-      const reviewCommit = reviewSource?.artifact?.commit
+      const previousPreparation = this.preparations.get(member.id)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      this.preparations.set(member.id, gate)
       try {
-        await this.git(member.workspace, ['checkout', '--detach', reviewCommit ?? recovery?.commit ?? mission.baseCommit], signal)
-        if (recovery === undefined && reviewCommit === undefined) for (const dependency of dependencies) {
-          if (dependency.status !== 'accepted') throw new Error(`Dependency ${dependency.id} is not accepted`)
-          if (dependency.artifact === undefined) {
-            if (dependency.kind === 'implementation' || dependency.kind === 'integration') throw new Error(`Dependency ${dependency.id} has no immutable artifact`)
-            continue
-          }
-          await this.validateArtifact(member, dependency.artifact)
-          try { await this.git(member.workspace, ['merge', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
-          catch (error) { throw new Error(`Dependency integration conflict for ${dependency.id}: ${String(error)}`) }
+        await previousPreparation
+        signal.throwIfAborted()
+
+        const record = await this.memberRecord(member)
+        if (task.reviewOf !== undefined) {
+          if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
+          await this.validateArtifact(member, reviewSource.artifact, signal)
+        } else if (reviewSource !== undefined) throw new Error('[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
+        const taskOwner = await readJson(this.taskPath(member.missionId, task.id))
+        const ownsRecovery = taskOwner === undefined || (isRecord(taskOwner) && taskOwner.memberId === member.id)
+        const sameReview = reviewSource === undefined || record.task?.baseCommit === reviewSource.artifact?.commit
+        const desiredDependencies = dependencies.flatMap(dependency => dependency.artifact === undefined ? [] : [dependency.artifact.commit]).sort()
+        const sameDependencies = JSON.stringify([...(record.task?.dependencyCommits ?? [])].sort()) === JSON.stringify(desiredDependencies)
+        if (sameReview && sameDependencies && ownsRecovery && record.task?.taskId === task.id && record.task.epoch === task.epoch) return
+        if (sameReview && sameDependencies && ownsRecovery && record.task?.taskId === task.id) {
+          if (record.task.epoch > task.epoch) throw new Error('Task attempt is older than the prepared workspace')
+          // Same-task recovery keeps both committed and uncommitted progress. The
+          // runtime must stop the previous attempt before preparing its replacement.
+          record.task.epoch = task.epoch
+          await this.saveTaskWorkspace(record)
+          return
         }
-        record.task = { taskId: task.id, epoch: task.epoch, baseCommit: recovery?.baseCommit ?? await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal),
-          ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }) }
-        await this.saveTaskWorkspace(record)
-      } catch (error) {
-        // Entry required a clean owned checkout; rollback restores exactly that
-        // state and leaves all captured commits reachable through swarm refs.
-        await this.git(member.workspace, ['merge', '--abort']).catch(() => undefined)
-        await this.git(member.workspace, ['reset', '--hard', previousHead])
-        throw error
+        const dirty = (await this.uncommittedWork(member.workspace, signal)).length > 0
+        let previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
+        if (record.task !== undefined && (record.task.taskId !== task.id || !sameDependencies)) {
+          // Dispatch only reaches this member after the old execution stopped.
+          // Preserve all ordinary WIP, including out-of-scope work, separately
+          // from accepted artifacts before removing anything from this checkout.
+          if (dirty || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
+            await this.preserveWorkspace(record, signal)
+            await this.git(member.workspace, ['reset', '--hard', record.task.preservedCommit!], signal)
+            previousHead = record.task.preservedCommit!
+          }
+          await this.checkpointAbandonedTask(record, task.id)
+          if (record.task.taskId !== task.id && record.task.integrationConflicts?.length) await rm(path.join(member.workspace, INTEGRATION_CONFLICT_FILE), { force: true })
+        } else if (dirty) throw new Error('[workspace_uncommitted] Unowned workspace changes were preserved in place. The owner must inspect the workspace and use `swarm_control` with `taskId`, `action` resume and `reason` after correcting its ownership.')
+        // Each task starts only with the mission base and explicitly accepted dependencies.
+        // Captured task commits have durable Git refs; a rejected experiment cannot leak in.
+        const mission = await this.missionRecord(member.missionId)
+        const recovery = reviewSource === undefined ? await this.recoverTask(member, task) : undefined
+        const reviewCommit = reviewSource?.artifact?.commit
+        const recompose = recovery !== undefined && JSON.stringify([...(recovery.dependencyCommits ?? [])].sort()) !== JSON.stringify(desiredDependencies)
+        const conflicts: IntegrationConflict[] = recompose ? [] : recovery?.integrationConflicts ?? []
+        const dependencyCommits: string[] = recompose ? [] : recovery?.dependencyCommits ?? []
+        try {
+          await this.ensureSourceCommit(member.missionId, mission.source, reviewCommit ?? (recompose ? mission.baseCommit : recovery?.commit) ?? mission.baseCommit, signal)
+          await this.git(member.workspace, ['checkout', '--detach', reviewCommit ?? (recompose ? mission.baseCommit : recovery?.commit) ?? mission.baseCommit], signal)
+          if ((recovery === undefined || recompose) && reviewCommit === undefined) for (const dependency of dependencies) {
+            if (dependency.status !== 'accepted') throw new Error(`Dependency ${dependency.id} is not accepted`)
+            if (dependency.artifact === undefined) {
+              if (dependency.kind === 'implementation' || dependency.kind === 'integration') throw new Error(`Dependency ${dependency.id} has no immutable artifact`)
+              continue
+            }
+            await this.validateArtifact(member, dependency.artifact, signal)
+            dependencyCommits.push(dependency.artifact.commit)
+            try { await this.git(member.workspace, ['merge', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
+            catch (error) {
+              // Only integration tasks receive conflicts. The host makes the
+              // composition (including conflict markers) an immutable baseline,
+              // retaining both parents so workers need only edit normal files.
+              conflicts.push(await this.recordIntegrationConflict(member.workspace, task, { dependencyId: dependency.id, commit: dependency.artifact.commit }, `Dependency integration conflict for ${dependency.id}: ${String(error)}`, signal))
+              await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: unresolved composition for ${task.id}`], signal)
+            }
+          }
+          const baseCommit = recompose ? await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
+            : recovery?.baseCommit ?? await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
+          if (recompose && recovery !== undefined) {
+            // Carry only the previous task's own WIP delta onto the amended
+            // dependency baseline. Re-merging its old commit would silently keep
+            // removed dependency content and count newly added files as task edits.
+            const patchPath = path.join(this.missionDir(member.missionId), 'preservation', `rebase-${randomUUID()}.patch`)
+            await mkdir(path.dirname(patchPath), { recursive: true, mode: 0o700 })
+            await writeFile(patchPath, '', { mode: 0o600, flag: 'wx' })
+            try {
+              // File output avoids treating a large binary WIP patch as bounded
+              // human-readable command output. The host operation remains timed.
+              await this.git(member.workspace, ['diff', '--binary', '--no-ext-diff', '--no-textconv', `--output=${patchPath}`, recovery.baseCommit, recovery.commit, '--', '.', ...(recovery.integrationConflicts?.length ? [`:(exclude,literal)${INTEGRATION_CONFLICT_FILE}`] : [])], signal)
+              if ((await lstat(patchPath)).size > 0) {
+                try { await this.git(member.workspace, ['apply', '--3way', '--index', patchPath], signal) }
+                catch (error) {
+                  conflicts.push(await this.recordIntegrationConflict(member.workspace, task, { dependencyId: task.id, commit: recovery.commit }, `Preserved WIP conflicts with amended dependencies; its snapshot ${recovery.commit} is retained: ${String(error)}`, signal))
+                }
+                if (await this.git(member.workspace, ['diff', '--cached', '--name-only'], signal)) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: preserved WIP for ${task.id}`], signal)
+              }
+            } finally { await rm(patchPath, { force: true }) }
+          }
+          if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
+          record.task = { taskId: task.id, epoch: task.epoch, baseCommit,
+            ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
+            ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
+          await this.saveTaskWorkspace(record)
+          if (conflicts.length) await writePrivateJson(path.join(member.workspace, INTEGRATION_CONFLICT_FILE), {
+            instructions: 'Resolve every listed dependency conflict by editing working files. Read alternatives with git show <commit>:<path>; no Git metadata writes are required. Remove this manifest after resolving the conflicts, then swarm_submit. The host checks scope and dependency ancestry; independent review still decides acceptance.',
+            dependencyCommits, conflicts,
+          })
+        } catch (error) {
+          // Entry required a clean owned checkout; rollback restores exactly that
+          // state and leaves all captured commits reachable through swarm refs.
+          await this.git(member.workspace, ['merge', '--abort']).catch(() => undefined)
+          await this.git(member.workspace, ['reset', '--hard', previousHead])
+          throw error
+        }
+      } finally {
+        release()
+        if (this.preparations.get(member.id) === gate) this.preparations.delete(member.id)
       }
     })
+  }
+
+  /** Stage only real integration conflicts; each caller retains its own commit and rollback boundary. */
+  private async recordIntegrationConflict(workspace: string, task: Task, source: Omit<IntegrationConflict, 'paths'>, failure: string, signal: AbortSignal): Promise<IntegrationConflict> {
+    const paths = (await this.git(workspace, ['diff', '--name-only', '--diff-filter=U', '-z'], signal)).split('\0').filter(Boolean)
+    if (task.kind !== 'integration' || paths.length === 0) throw new Error(failure)
+    await this.git(workspace, ['add', '--all', '--', '.'], signal)
+    return { ...source, paths }
   }
 
   /**
@@ -1193,6 +1304,38 @@ export class Workspaces {
     await this.withTaskRecordLock(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
   }
 
+  /** Preserve quiescent WIP without applying artifact scope or changing the checkout. */
+  async checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void> {
+    await this.operation(member.id, async signal => {
+      if (await readJson(this.memberPath(member.missionId, member.id)) === undefined) return
+      const record = await this.memberRecord(member)
+      if (record.task === undefined) return
+      if (record.task.taskId !== task.id) {
+        if (options?.ifOwned === true) return
+        throw new Error('Cannot checkpoint a workspace owned by another task')
+      }
+      await this.preserveWorkspace(record, signal)
+    })
+  }
+
+  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal): Promise<void> {
+    const task = record.task
+    if (task === undefined) throw new Error('Cannot preserve a workspace without task ownership')
+    const snapshot = await captureGitSnapshot(record.workspace, path.join(this.missionDir(record.missionId), 'preservation'),
+      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal)
+    const nonce = randomUUID()
+    await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
+      `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
+    const taskPath = this.taskPath(record.missionId, task.taskId)
+    await this.withTaskRecordLock(taskPath, async () => {
+      const current = await readJson(taskPath)
+      if (!isRecord(current) || current.memberId !== record.memberId || !isRecord(current.task) || current.task.epoch !== task.epoch) throw new Error('Task workspace ownership changed while preserving WIP; the snapshot remains in preservation refs')
+      task.preservedCommit = snapshot.snapshotCommit
+      await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
+      await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace)
+    })
+  }
+
   /**
    * A member leaving a task for another one writes that task's immutable
    * checkpoint, so a later attempt never hits the uncheckpointed-owner dead end.
@@ -1222,17 +1365,20 @@ export class Workspaces {
   }
 
   /** Carry a previous owner's quiescent partial work into a replacement attempt. */
-  private async recoverTask(member: Member, task: Task): Promise<(Pick<Artifact, 'commit' | 'baseCommit'> & { recovery?: TaskRecovery }) | undefined> {
+  private async recoverTask(member: Member, task: Task): Promise<(Pick<Artifact, 'commit' | 'baseCommit'> & Pick<TaskBase, 'recovery' | 'dependencyCommits' | 'integrationConflicts'>) | undefined> {
     const value = await readJson(this.taskPath(member.missionId, task.id))
     if (value === undefined) return undefined
     if (!isRecord(value) || value.version !== 1 || value.missionId !== member.missionId || typeof value.memberId !== 'string' || typeof value.workspace !== 'string' || !isRecord(value.task) || value.task.taskId !== task.id || !Number.isSafeInteger(value.task.epoch) || !commitId(value.task.baseCommit)) throw new Error('Invalid task recovery metadata')
     if (Number(value.task.epoch) >= task.epoch) throw new Error('Task workspace is already owned by this or a newer attempt')
     const prior = await this.memberRecord({ id: value.memberId, missionId: member.missionId, workspace: value.workspace })
+    const composition = { ...(Array.isArray(value.task.dependencyCommits) ? { dependencyCommits: value.task.dependencyCommits as string[] } : {}),
+      ...(Array.isArray(value.task.integrationConflicts) ? { integrationConflicts: value.task.integrationConflicts as unknown as IntegrationConflict[] } : {}) }
+    if (commitId(value.task.preservedCommit)) return { commit: value.task.preservedCommit, baseCommit: value.task.baseCommit, ...composition }
     if (prior.task?.taskId === task.id) {
       // Task scoping is checked before committing partial work. The old worktree
       // is preserved if that check fails; no partial change is silently dropped.
       try {
-        return await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch })
+        return { ...await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch }), ...composition }
       } catch (error) {
         // W9: the previous owner's workspace cannot be captured (out-of-scope,
         // dirty or otherwise). Never dead-end the task permanently: leave that
@@ -1242,7 +1388,7 @@ export class Workspaces {
         const commit = commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit
         const recovery: TaskRecovery = { commit, previousOwnerId: value.memberId, reason: error instanceof Error ? error.message : String(error), at: Date.now() }
         this.recordRecoveryFallback(member.missionId, task.id, task.epoch, recovery)
-        return { commit, baseCommit: value.task.baseCommit, recovery }
+        return { commit, baseCommit: value.task.baseCommit, recovery, ...composition }
       }
     }
     if (!commitId(value.task.capturedCommit)) {
@@ -1251,9 +1397,9 @@ export class Workspaces {
       // (prepareTask refuses a dirty or ahead workspace), so that base is the
       // immutable checkpoint. Recover from it instead of dead-ending the task
       // permanently; a fresh record is written for the new attempt below.
-      return { commit: value.task.baseCommit, baseCommit: value.task.baseCommit }
+      return { commit: value.task.baseCommit, baseCommit: value.task.baseCommit, ...composition }
     }
-    return { commit: value.task.capturedCommit, baseCommit: value.task.baseCommit }
+    return { commit: value.task.capturedCommit, baseCommit: value.task.baseCommit, ...composition }
   }
 
   /** Bounded, host-visible record of a W9 recovery fallback; never masks the recovery. */
@@ -1265,12 +1411,24 @@ export class Workspaces {
     catch { /* reporting must not mask recovery */ }
   }
 
-  private async validateArtifact(member: Member, artifact: Artifact): Promise<void> {
+  private async validateArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<void> {
     if (!commitId(artifact.commit) || !commitId(artifact.baseCommit)) throw new Error('Artifact requires exact commit hashes')
     const mission = await this.missionRecord(member.missionId)
-    await this.git(mission.source, ['cat-file', '-e', `${artifact.commit}^{commit}`])
-    await this.git(mission.source, ['merge-base', '--is-ancestor', artifact.baseCommit, artifact.commit])
-    await this.git(mission.source, ['merge-base', '--is-ancestor', mission.baseCommit, artifact.commit])
+    await this.ensureSourceCommit(member.missionId, mission.source, artifact.commit, signal)
+    await this.git(mission.source, ['merge-base', '--is-ancestor', artifact.baseCommit, artifact.commit], signal)
+    await this.git(mission.source, ['merge-base', '--is-ancestor', mission.baseCommit, artifact.commit], signal)
+  }
+
+  /** Rehydrate a pruned local object from its durable mission repository. No
+   * shared source ref or FETCH_HEAD is created, preserving mission namespaces. */
+  private async ensureSourceCommit(missionId: string, source: string, commit: string, signal?: AbortSignal): Promise<void> {
+    if (!commitId(commit)) throw new Error('Artifact requires an exact commit hash')
+    try { await this.git(source, ['cat-file', '-e', `${commit}^{commit}`], signal); return }
+    catch { signal?.throwIfAborted() }
+    const repo = await this.artifactRepo(missionId, source, signal)
+    await this.git(repo, ['cat-file', '-e', `${commit}^{commit}`], signal)
+    await this.git(source, ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', '--no-write-fetch-head', '--no-auto-maintenance', repo, commit], signal)
+    await this.git(source, ['cat-file', '-e', `${commit}^{commit}`], signal)
   }
 
   /** Resolve one path inside a committed tree, following symlink blobs (F-C1). */
@@ -1335,6 +1493,16 @@ export class Workspaces {
       const record = await this.memberRecord(member)
       if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('[workspace_baseline_missing] Task has no matching prepared workspace baseline Retry the task with `swarm_claim` and its `taskId`.')
       const baseCommit = record.task.baseCommit
+      if (record.task.integrationConflicts?.length) {
+        if (await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Resolve the recorded dependency conflicts, remove ${INTEGRATION_CONFLICT_FILE}, then submit this same integration task`)
+        for (const name of new Set(record.task.integrationConflicts.flatMap(conflict => conflict.paths))) {
+          const file = path.join(member.workspace, name)
+          const info = await lstat(file).catch(() => undefined)
+          if (info?.isSymbolicLink()) continue // the artifact symlink containment checks below own this case
+          const content = await readFile(file, 'utf8').catch(error => { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error })
+          if (/^<{7}(?: .*)?\r?\n[\s\S]*?^={7}\r?\n[\s\S]*?^>{7}(?: .*)?$/m.test(content)) throw new Error(`Unresolved dependency conflict markers remain in ${name}`)
+        }
+      }
       // Member-created dependency links are toolchain state, not work: they are
       // excluded from the changed set, unstaged if an earlier capture staged
       // them, and kept out of the commit. A tracked path of the same name stays
@@ -1363,6 +1531,7 @@ export class Workspaces {
       if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
       const commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
       await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
+      for (const dependency of record.task.dependencyCommits ?? []) await this.git(member.workspace, ['merge-base', '--is-ancestor', dependency, commit], signal)
       const changedPaths = (await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, commit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
       for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new Error(`Committed artifact changes path outside task scope: ${name}`)
       // The commit is authoritative: re-check the recorded blobs so a working
@@ -1370,6 +1539,7 @@ export class Workspaces {
       await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
+      delete record.task.preservedCommit
       await this.saveTaskWorkspace(record)
       return { commit, baseCommit, workspace: member.workspace, changedPaths }
     })
@@ -1378,7 +1548,7 @@ export class Workspaces {
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     return await this.operation(member.id, async signal => {
       await this.memberRecord(member)
-      await this.validateArtifact(member, artifact)
+      await this.validateArtifact(member, artifact, signal)
       const mission = await this.missionRecord(member.missionId)
       // Revocation fencing: the verification checkout is created only after the
       // persisted mission manifest still authorizes its recorded root.
@@ -1444,7 +1614,7 @@ export class Workspaces {
           // failing test names, the TAP summary and the stage that failed.
           const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
             : { index: results.length + 1, command, ...result.attribution }
-          results.push({ command, exitCode: result.exitCode, ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
+          results.push({ command, exitCode: result.exitCode, ...([124, 126, 127].includes(result.exitCode) ? { failureKind: result.exitCode === 124 ? 'timeout' as const : 'infrastructure' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
           // ENV: the most recent completed check, whatever its verdict, so the
           // measured envelope never carries a stale attribution from an earlier run.
           this.lastCheck = { memberId: member.id, taskId: task.id, at: Date.now(), environment, ...(attribution === undefined ? {} : { attribution }), output: boundedOutput(output) }
@@ -1556,19 +1726,65 @@ export class Workspaces {
     const linked: string[] = []
     const copy = this.dependencyMode() === 'copy'
     for (const entry of ignored.split('\0')) {
-      if (!entry.endsWith('/')) continue
-      const relative = entry.slice(0, -1)
+      if (!entry) continue
+      const relative = entry.endsWith('/') ? entry.slice(0, -1) : entry
       if (!names.has(path.basename(relative)) || relative.split('/').some(part => part === '..' || part === '')) continue
       const target = path.join(source, relative), link = path.join(checkout, relative)
-      const targetStat = await lstat(target).catch(() => undefined)
+      const entryStat = await lstat(target).catch(() => undefined)
+      const resolved = await realpath(target).catch(() => undefined)
+      const targetStat = resolved === undefined ? undefined : await lstat(resolved).catch(() => undefined)
+      if (entryStat?.isSymbolicLink() && (targetStat === undefined || !targetStat.isDirectory())) throw new Error('[dependency_directory_unavailable] A dependency link has no readable directory target. Repair or reinstall the dependency directory and retry the check.', { cause: { dependency: relative } })
       if (targetStat === undefined || !targetStat.isDirectory()) continue
       if (await lstat(link).then(() => true, () => false)) continue
       await mkdir(path.dirname(link), { recursive: true })
-      if (copy) await cp(target, link, { recursive: true, dereference: false, verbatimSymlinks: true })
+      if (copy) await this.copyDependencyTree(resolved!, link, source, signal)
       else await symlink(target, link, 'dir')
       linked.push(relative)
     }
     return linked
+  }
+
+  /** Copy into staging, relocate internal links, and materialize external
+   * executable files (notably venv interpreters). No copied link may read through
+   * to the host, and source checkout contents outside this dependency stay out. */
+  private async copyDependencyTree(source: string, destination: string, workspaceSource: string, signal: AbortSignal): Promise<void> {
+    const staging = `${destination}.swarm-copy-${randomUUID()}`
+    const contained = (target: string): boolean => target === source || target.startsWith(`${source}${path.sep}`)
+    try {
+      signal.throwIfAborted()
+      await cp(source, staging, { recursive: true, dereference: false, verbatimSymlinks: true })
+      const rewrite = async (directory: string): Promise<void> => {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          signal.throwIfAborted()
+          const file = path.join(directory, entry.name)
+          if (entry.isDirectory()) { await rewrite(file); continue }
+          if (!entry.isSymbolicLink()) continue
+          const relative = path.relative(staging, file)
+          const target = await readlink(file)
+          const resolved = await realpath(path.resolve(source, path.dirname(relative), target)).catch(() => undefined)
+          if (resolved !== undefined && !contained(resolved)) {
+            const original = await lstat(resolved).catch(() => undefined)
+            const readsSource = resolved === workspaceSource || resolved.startsWith(`${workspaceSource}${path.sep}`)
+            // A virtualenv commonly links bin/python to a system interpreter.
+            // Freeze that regular executable into the copied environment, with
+            // its mode, rather than expanding the verification read boundary.
+            if (!readsSource && original?.isFile() && (original.mode & 0o111) !== 0) {
+              await rm(file)
+              await copyFile(resolved, file)
+              await chmod(file, original.mode & 0o777)
+              continue
+            }
+          }
+          if (resolved === undefined || !contained(resolved)) throw new Error('[dependency_copy_escape] A dependency link is broken or leaves its dependency directory without naming an external executable file. Links to source checkout contents, external directories and non-executable files cannot be copied. Install self-contained dependencies and retry the check; only a host that explicitly accepts external reads may enable verificationDependencyMode=link with allowDependencyLinkReads.', { cause: { dependency: relative } })
+          const relocated = path.join(staging, path.relative(source, resolved))
+          await rm(file)
+          await symlink(path.relative(path.dirname(file), relocated) || '.', file)
+        }
+      }
+      await rewrite(staging)
+      signal.throwIfAborted()
+      await rename(staging, destination)
+    } finally { await rm(staging, { recursive: true, force: true }) }
   }
   async dispose(): Promise<void> {
     this.closing = true

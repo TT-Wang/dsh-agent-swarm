@@ -4,9 +4,9 @@
  * pass/fail classification, the durable tool-run row per check and the rejection
  * text. M1a seam 5/7.
  *
- * Behaviour-identical to the code moved from src/runtime.ts. `verify` still
- * runs inside the same transaction: only the check execution moved, and it
- * records exactly the rows it recorded before.
+ * Check executions are outside the mission transaction; the verdict records
+ * their exact outcomes and retains bounded retry evidence. Explicit execution
+ * failures can defer review without converting infrastructure into a code verdict.
  */
 import type { SwarmRuntime } from './runtime.ts'
 import { randomUUID } from 'node:crypto'
@@ -27,7 +27,7 @@ export function excerpt(value: unknown, limit: number): string {
 }
 
 /** One declared check's outcome, as the host recorded it. */
-export type CheckResult = { command: string; exitCode: number; output: string; truncated?: boolean }
+export type CheckResult = import('./workspaces.js').CheckResult
 
 export class DeclaredChecks {
   /**
@@ -103,7 +103,7 @@ export class DeclaredChecks {
       const args = run.arguments
       if (typeof args !== 'object' || args === null) return false
       const named = args as { attempt?: unknown; commit?: unknown }
-      return run.memberId === where.memberId && run.taskId === where.taskId && run.attemptId === where.attemptId
+      return run.tool === 'swarm.host_verification' && run.isError && run.memberId === where.memberId && run.taskId === where.taskId && run.attemptId === where.attemptId
         && named.attempt === 1 && named.commit === where.commit
     })
   }
@@ -130,15 +130,35 @@ export class DeclaredChecks {
    */
   async run(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     const key = `${member.id}:${artifact.commit}:${source.id}`
-    const first = await this.rt.workers.verifyArtifact(member, source, artifact, signal)
+    const first = await this.execute(member, source, artifact, signal)
     if (first.every(check => check.exitCode === 0)) { this.checkRuns.delete(key); return first }
     // R16-G5a: the failed first pass is durable before the retry starts. If the
     // process is lost between the two passes, the record of the failure survives;
     // when the verification task cannot be resolved, the pair stays in memory.
     const durable = this.recordFirstPass(member, source, artifact, first)
-    const retry = await this.rt.workers.verifyArtifact(member, source, artifact, signal)
+    const retry = await this.execute(member, source, artifact, signal)
     if (!durable) this.checkRuns.set(key, [first, retry])
     return retry
+  }
+
+  /** Only host-identified infrastructure failures defer a verdict; assertion failures still reject. */
+  private async execute(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
+    try { return await this.rt.workers.verifyArtifact(member, source, artifact, signal) }
+    catch (error) {
+      if (signal?.aborted) throw error
+      const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+      const timeout = error instanceof Error && error.name === 'ProcessTimeoutError'
+      if (!timeout && !['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
+      return [{ command: '(verification preparation)', exitCode: timeout ? 124 : 125,
+        failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
+    }
+  }
+
+  /** Uncertain execution is not evidence that the artifact's assertions failed. */
+  recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
+    const failures = checks.filter(check => check.exitCode !== 0)
+    return failures.length > 0 && failures.every(check => check.failureKind === 'timeout' || check.failureKind === 'infrastructure'
+      || [124, 126, 127].includes(check.exitCode))
   }
 
   /**

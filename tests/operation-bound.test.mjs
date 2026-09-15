@@ -175,7 +175,7 @@ test('F1: the same silence never repeats, and the attempt stops being renewed un
   const expired = await eventually(() => runtime.store.events(mission.id, 500).find(event => event.type === 'task/lease-expired'), 'the lease must expire once the operation stops counting as liveness')
   assert.equal(expired.data.oldOwner, member.id)
   assert.notEqual(runtime.store.get('tasks', task.id).status, 'running')
-  assert.ok(workers.stopped.includes(member.id), 'the stuck worker is actually stopped')
+  await eventually(() => workers.stopped.includes(member.id), 'the stuck worker is actually stopped after fencing')
 })
 
 test('F1: a bounded operation that is still progressing neither escalates nor loses its lease renewal', async t => {

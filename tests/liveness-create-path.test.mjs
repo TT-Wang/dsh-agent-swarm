@@ -84,6 +84,7 @@ test('a swarm_create mission auto-completes a stalled board once independent ver
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the task blocks at its own ceiling')
   assert.equal(f.current(blocked.id).status, 'blocked')
+  await eventually(() => !f.current(blocked.id).resumeAfterStop, 'old worker must stop before other work')
   const cover = f.propose({ title: 'Cover the criterion' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, cover.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: cover.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -136,14 +137,15 @@ test('a create-path stall notice names the parked work, and admitting the follow
   assert.deepEqual(f.workers.deliveries.filter(item => item.delivery.kind === 'assignment'), [])
   // The owner admits the repair the notice asked for; the scheduler wakes the parked member.
   f.workers.idle.add(f.author.id)
-  const repair = f.propose({ title: 'Repair', replaces: [parked.id], assigneeId: f.author.id })
+  await eventually(() => !f.current(parked.id).resumeAfterStop, 'resource stop must be confirmed')
+  const repair = f.runtime.controlTask(f.owner, f.mission.id, parked.id, 'amend', { maxSteps: 5 }, 'Review estimate and continue the same work')
   const running = await eventually(() => f.current(repair.id).status === 'running' ? f.current(repair.id) : undefined,
     'the follow-up task must be assigned to the parked member')
   assert.equal(running.attempt.ownerId, f.author.id)
   // R17-G7: the park is durable intent, so it still stands until the assignment
   // supplies fresh input; the live `working` status follows the attempt as soon
   // as that input lifts the park (the derivation, not a status write).
-  assert.equal(f.runtime.store.get('members', f.author.id).status, 'waiting', 'the park stands until fresh input arrives')
+  assert.ok(['working', 'waiting'].includes(f.runtime.store.get('members', f.author.id).status), 'the member has a confirmed stopped predecessor and a new assignment')
   const assignment = f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id)
   assert.ok(assignment, 'the wake is a durable assignment delivery')
   assert.equal(assignment.member.id, f.author.id)

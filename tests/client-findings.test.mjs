@@ -14,7 +14,7 @@ import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import  {  boardIndex, dependencyMet, durableVerdict, eventSummary, readSnapshot, retiredReviews, snapshotFromResult, taskLane , cancellationNotes }  from '../lib/types/client/projection.js'
 import { recentProgress, taskReasons } from '../lib/types/client/progress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
-import { RecentProgress } from '../lib/types/client/MissionProgress.js'
+import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DraftEditor, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -168,7 +168,7 @@ test('F-14: the compact panel surfaces every recovery/control event type and pre
     assert.equal(surfaced.length, 1, `${type} is emitted but has no compact label; add one or name it in OMITTED with a reason`)
     const label = surfaced[0].label
     assert.ok(zh[label], `the compact label for ${type} has no zh translation: ${label}`)
-    assert.ok(render(RecentProgress, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
+    assert.ok(render(LiveWorkOverview, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
       `the compact panel does not translate ${label} for ${type}`)
   }
   // The R11-08 families and the promoted workspace-audit types are labeled.
@@ -203,14 +203,14 @@ test('R11-08: the review-path, check-change and restart-recovery payloads are th
   const reassigned = recentProgress(eventOnlySnapshot('task/reassigned', { taskId: 't2', from: 'b', to: 'a', reason: 'start failed twice' }), 20)[0]
   assert.equal(reassigned.label, 'Task re-routed to another member')
   assert.equal(reassigned.detail, 'b → a · start failed twice')
-  const chinese = render(RecentProgress, { snapshot: eventOnlySnapshot('task/check-changed', { taskId: 't2', reason: 'replacement', checks: ['npm run build'] }) }, true)
+  const chinese = render(LiveWorkOverview, { snapshot: eventOnlySnapshot('task/check-changed', { taskId: 't2', reason: 'replacement', checks: ['npm run build'] }) }, true)
   assert.match(chinese, /声明的检查已变更/)
   assert.doesNotMatch(chinese, />A declared check changed</)
 })
 
 test('task/ceiling-exhausted renders a compact ceiling block with a translated label', () => {
   const snapshot = uiSnapshot(), at = snapshot.mission.updatedAt
-  snapshot.events.push({ seq: 30, type: 'task/ceiling-exhausted', actor: 'runtime',
+  snapshot.events.push({ seq: 30, missionId: snapshot.mission.id, type: 'task/ceiling-exhausted', actor: 'runtime',
     data: { taskId: 't2', dimension: 'steps', limit: 8, used: 8, code: 'task_ceiling_exhausted' }, createdAt: at })
   const events = recentProgress(snapshot, 20)
   const ceiling = events.find(event => event.label === 'Task ceiling reached')
@@ -218,8 +218,8 @@ test('task/ceiling-exhausted renders a compact ceiling block with a translated l
   assert.equal(ceiling.detail, 'steps · 8/8 · task_ceiling_exhausted', 'the dimension and exhausted limit are the owner-facing detail')
   assert.equal(ceiling.detail === snapshot.tasks.find(task => task.id === 't2').title, false)
   // The panel translates the label in both languages.
-  assert.match(render(RecentProgress, { snapshot }), /Task ceiling reached/)
-  const chinese = render(RecentProgress, { snapshot }, true)
+  assert.match(render(LiveWorkOverview, { snapshot }), /Task ceiling reached/)
+  const chinese = render(LiveWorkOverview, { snapshot }, true)
   assert.match(chinese, /子任务超出执行上限/)
   assert.doesNotMatch(chinese, />Task ceiling reached</)
   assert.equal(zh['ceiling-exhausted'], '执行上限已耗尽', 'the event-type token is translated too')
@@ -230,7 +230,7 @@ test('task/ceiling-exhausted renders a compact ceiling block with a translated l
 
 test('task/preparation-failed renders the reason and recovery credit with a translated label', () => {
   const snapshot = uiSnapshot(), at = snapshot.mission.updatedAt
-  snapshot.events.push({ seq: 30, type: 'task/preparation-failed', actor: 'runtime',
+  snapshot.events.push({ seq: 30, missionId: snapshot.mission.id, type: 'task/preparation-failed', actor: 'runtime',
     data: { taskId: 't2', epoch: 2, reason: 'Workspace preparation failed: uncommitted work', recoveryCount: 1, maxRecoveryAttempts: 3, status: 'blocked' }, createdAt: at })
   const events = recentProgress(snapshot, 20)
   const failure = events.find(event => event.label === 'Task preparation failed')
@@ -238,8 +238,8 @@ test('task/preparation-failed renders the reason and recovery credit with a tran
   assert.equal(failure.detail, 'Workspace preparation failed: uncommitted work · recovery 1/3', 'the cause and the spent recovery credit are the owner-facing detail')
   assert.equal(failure.detail === snapshot.tasks.find(task => task.id === 't2').title, false)
   // The panel translates the label in both languages.
-  assert.match(render(RecentProgress, { snapshot }), /Task preparation failed/)
-  const chinese = render(RecentProgress, { snapshot }, true)
+  assert.match(render(LiveWorkOverview, { snapshot }), /Task preparation failed/)
+  const chinese = render(LiveWorkOverview, { snapshot }, true)
   assert.match(chinese, /子任务准备失败/)
   assert.doesNotMatch(chinese, />Task preparation failed</)
   assert.equal(zh['preparation-failed'], '准备失败', 'the event-type token is translated too')

@@ -48,7 +48,7 @@ export const swarmInvariantStatus: { registered: boolean; packageName: string } 
   registered: false, packageName: SWARM_INVARIANT_PACKAGE,
 }
 
-/** The durable refusal log: the count the round reports, oldest first. */
+/** The process-local refusal measurement: the count the round reports, oldest first. */
 export class DecisionRefusalLog {
   private readonly entries: DecisionRefusal[] = []
   /** Record one refused candidate (never throws; a refusal is a measurement). */
@@ -83,21 +83,16 @@ export interface InvariantRegistryLike {
   register(packageName: string, installer: (ctx: Context, fail: (message: string) => never) => void): () => void
 }
 
-/**
- * Record a host pre-append refusal raised while delivering one durable delivery,
- * and report whether the error was one (a host `InvariantError`, matched by name
- * and by its stable `INVARIANT` code rather than by message text). The adapter
- * uses this to acknowledge a refused delivery instead of letting the outbox retry
- * a decision the invariant will refuse again.
- */
+/** Only errors actually thrown by this registered predicate carry this proof. */
+const appendRefusalProofs = new WeakMap<object, RelayRefusal>()
+
+/** Match the exact package predicate invocation and delivery, never a host error name. */
 export function recordAppendRefusal(error: unknown, delivery: { id: string; missionId: string; family: string; subjects: readonly string[] }): boolean {
-  const row = error as { name?: unknown; code?: unknown } | null
-  if (row?.name !== 'InvariantError' && row?.code !== 'INVARIANT') return false
-  decisionRefusals.record({
-    at: Date.now(), missionId: delivery.missionId, family: delivery.family, subjects: [...delivery.subjects],
-    reason: error instanceof Error ? error.message : String(error), stage: 'append', deliveryId: delivery.id,
-  })
-  return true
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return false
+  const proof = appendRefusalProofs.get(error as object)
+  return proof !== undefined && proof.deliveryId === delivery.id && proof.missionId === delivery.missionId
+    && proof.family === delivery.family && proof.subjects.length === delivery.subjects.length
+    && proof.subjects.every(subject => delivery.subjects.includes(subject))
 }
 
 /**
@@ -139,7 +134,12 @@ export function installSwarmInvariant(ctx: Context, judge: RelayJudge): void {
           const refusal = judge(message)
           if (refusal === undefined) continue
           decisionRefusals.record({ at: Date.now(), ...refusal, stage: 'append' })
-          fail(`refusing an owner-facing ${refusal.family} decision naming ${refusal.subjects.join(', ') || 'unknown subject'}: ${refusal.reason}`)
+          try {
+            fail(`refusing an owner-facing ${refusal.family} decision naming ${refusal.subjects.join(', ') || 'unknown subject'}: ${refusal.reason}`)
+          } catch (error) {
+            if ((typeof error === 'object' && error !== null) || typeof error === 'function') appendRefusalProofs.set(error as object, refusal)
+            throw error
+          }
         }
       }, { global: true })
     })

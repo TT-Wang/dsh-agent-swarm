@@ -28,6 +28,8 @@ export interface LiveWorkEvent {
 }
 export interface LiveWorkProjection {
   rows: LiveWorkRow[]
+  /** One presentation reference shared by the mission focus and member rows. */
+  referenceTime: number
   connection: ConnectionState
   live: boolean
   /** Last successful snapshot read; this can advance without work advancing. */
@@ -125,7 +127,7 @@ export function projectLiveWork(snapshot: Snapshot, options: LiveWorkOptions): L
   const lastProgressAt = events.filter(event => event.kind !== 'activity').reduce<number | undefined>((latest, event) => Math.max(latest ?? 0, event.createdAt), undefined)
   const lastActivityAt = rows.reduce<number | undefined>((latest, row) => row.observedAt === undefined ? latest : Math.max(latest ?? 0, row.observedAt), undefined)
   const eventLimit = timestamp(options.eventLimit) ? Math.min(20, Math.floor(options.eventLimit)) : 6
-  return { rows, connection: options.connection, live: connected && snapshot.mission.status === 'active' && !snapshot.mission.budgetPause,
+  return { rows, referenceTime: connected ? now : observedAt ?? snapshot.mission.updatedAt, connection: options.connection, live: connected && snapshot.mission.status === 'active' && !snapshot.mission.budgetPause,
     ...(observedAt === undefined ? {} : { observedAt }), workingCount: rows.filter(row => row.state === 'observed').length,
     lastObservedWorkingCount, counts, ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
     ...(lastActivityAt === undefined ? {} : { lastActivityAt }), recentEvents: events.slice(0, eventLimit) }

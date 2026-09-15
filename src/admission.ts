@@ -1,4 +1,5 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
+import { assignmentAllows, type AssignmentCandidate } from './assignment.ts'
 import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
@@ -33,28 +34,16 @@ export function normalizeReviewDependencies(kind: string, reviewOf: string | und
 }
 
 /** The minimal task shape a review path needs: one verification task and its source. */
-export interface ReviewPathCandidate {
+export interface ReviewPathCandidate extends AssignmentCandidate {
   id: string
   kind: string
-  reviewOf?: string
-  status: string
-  assigneeId?: string
 }
 
-/**
- * The live independent review of one source, if any review can still reach a
- * verdict. A review is live only while it can still start: its status is live
- * (pending/running, or a quiescence-parked review the caller supplies), it does
- * not review itself, it is not assigned to the source author, and it is not
- * pinned to a retired member. A cancelled, accepted or author-assigned review is
- * not a review path, so a submitted artifact that only has one is unreviewable
- * and would otherwise sit submitted forever.
- */
+/** A live review needs at least one live member allowed to own it independently. */
 export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], sourceId: string, authorId: string | undefined, liveMemberIds: ReadonlySet<string>,
   isLiveStatus: (review: T) => boolean = review => review.status === 'pending' || review.status === 'running'): T | undefined {
   return reviews.find(review => review.kind === 'verification' && review.reviewOf === sourceId && isLiveStatus(review)
-    && (authorId === undefined || review.assigneeId !== authorId)
-    && (review.assigneeId === undefined || liveMemberIds.has(review.assigneeId)))
+    && [...liveMemberIds].some(memberId => memberId !== authorId && assignmentAllows(review, memberId, reviews)))
 }
 
 /* ------------------------------------------------------------------------- *
@@ -170,6 +159,8 @@ export function missingReviewDiagnostic(taskId: string, reason: string): Admissi
  * of parsing prose.
  */
 export interface AdmissionDiagnostic {
+  /** Heuristics explain potential risks without granting or denying authority. */
+  severity?: 'advisory'
   code: string
   location: string
   message: string
@@ -234,7 +225,6 @@ export interface TaskCeilingState extends TaskCeilingInput {
 /** The exhausted dimension, if the task already consumed its own ceiling. */
 export function taskCeilingExhaustion(task: TaskCeilingState): { dimension: TaskCeilingDimension; limit: number; used: number } | undefined {
   if (task.maxSteps !== undefined && (task.usedSteps ?? 0) >= task.maxSteps) return { dimension: 'maxSteps', limit: task.maxSteps, used: task.usedSteps ?? 0 }
-  if (task.maxFindings !== undefined && (task.evidenceIds?.length ?? 0) >= task.maxFindings) return { dimension: 'maxFindings', limit: task.maxFindings, used: task.evidenceIds?.length ?? 0 }
   return undefined
 }
 
@@ -249,9 +239,8 @@ export function taskCeilingBlock(task: TaskCeilingState, now = Date.now()): Task
   return {
     dimension: exhausted.dimension, limit: exhausted.limit, used: exhausted.used, code: 'task_ceiling_exhausted',
     // The durable reason is thrown and notified verbatim, so the code travels in
-    // the message itself and the exit names the two parameters that exist on
-    // `swarm_propose` after S3 exposed them.
-    reason: `[task_ceiling_exhausted] Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. The task blocks at its own ceiling instead of consuming the mission budget; raise this task's ceiling by proposing its replacement with \`swarm_propose\` — name this task in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` within the mission budget — while keeping its acceptance criteria and kind verbatim.`,
+    // the message itself and the exit names the owner's same-task budget repair.
+    reason: `[task_ceiling_exhausted] Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. Review progress and raise this task's finite \`maxSteps\` through \`swarm_budget\` with \`taskId\`, \`taskBudget\` and \`reason\`, within the mission budget. The original task, acceptance, artifacts and consumed work are preserved.`,
     at: now,
   }
 }
@@ -350,9 +339,10 @@ export function writeDirectivePaths(text: string, options: WriteDirectiveOptions
 export function reconcileObjectiveScope(objective: string, scope: readonly string[], location: string): AdmissionDiagnostic[] {
   return writeDirectivePaths(objective).filter(path => !withinScope(path, scope)).map(path => ({
     code: 'objective_write_outside_scope',
+    severity: 'advisory',
     location,
     path,
-    message: `the objective directs a write to ${JSON.stringify(path)}, which the scope ${JSON.stringify(scope)} does not cover. A worker cannot commit that path (capture rejects out-of-scope changes), so the objective would fail at submit after the work is done. Narrow the \`objective\` to an in-scope path or widen the task \`scope\` within mission scope, then retry the same task/request; never broaden scope just to pass validation.`,
+    message: `the text may refer to ${JSON.stringify(path)} outside scope ${JSON.stringify(scope)}. This can be a read-only reference; no scope expansion is required by this hint. Actual writes and captured artifact paths must remain within the authorized scope.`,
   }))
 }
 
@@ -376,8 +366,8 @@ export function namedPaths(text: string): string[] {
 /**
  * Deliverable paths named by an objective or its acceptance criteria. Objectives
  * use write directives (including factual ones) so a read-only input reference
- * is not mistaken for a deliverable; an acceptance criterion names an
- * obligation, so every non-negated path token in it counts.
+ * is not mistaken for a deliverable. Acceptance text uses the same advisory
+ * directive heuristic; a bare input path does not imply an output obligation.
  */
 export function deliverablePaths(objective: string, acceptance: readonly string[] = []): string[] {
   const found: string[] = []
@@ -386,7 +376,6 @@ export function deliverablePaths(objective: string, acceptance: readonly string[
   for (const path of writeDirectivePaths(objective, { strict: false })) add(path)
   for (const text of acceptance) {
     for (const path of writeDirectivePaths(text, { strict: false })) add(path)
-    for (const path of namedPaths(text)) add(path)
   }
   return found
 }
@@ -425,13 +414,14 @@ export function ignoredDeliverablePaths(workspace: string, paths: readonly strin
   return hits
 }
 
-/** Reject admission when a named deliverable would be silently absent from the captured artifact. */
+/** Advisory current-ignore inspection; text does not prove a path is an output. */
 export function reconcileDeliverableIgnores(workspace: string, objective: string, acceptance: readonly string[], location: string): AdmissionDiagnostic[] {
   return ignoredDeliverablePaths(workspace, deliverablePaths(objective, acceptance)).map(hit => ({
     code: 'deliverable_path_ignored',
+    severity: 'advisory',
     location,
     path: hit.path,
-    message: `the named deliverable ${JSON.stringify(hit.path)} is ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). Capture only records untracked, non-ignored paths, so this deliverable would be silently absent from the artifact. Add a negation for this exact path inside the task's own \`scope\`, or rename the deliverable in the \`objective\` and \`acceptance\`, and retry the same task/request.`,
+    message: `the text names ${JSON.stringify(hit.path)}, currently ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). It may be input or a planned ignore-rule repair. If it is an output, ensure the final captured artifact includes it; this hint does not require changing the source workspace before launch.`,
   }))
 }
 
@@ -583,39 +573,12 @@ export interface CheckClassification {
   runnable: 'worker' | 'host-only'
   code?: 'check_requires_host'
   requirement?: string
+  preflight?: string
 }
 
-/**
- * Commands that cannot run under the worker's workspace-write sandbox. They are
- * host-gate suites (Harness composition, the pack/profile smokes that compose a
- * nested workspace-write profile, web/command-web smoke, isolation) or a nested
- * sandbox invocation; declaring one as a task check guarantees an unrunnable
- * verification (W14).
- */
+/** Actual confinement requirements, independent of project script and file names. */
 const HOST_ONLY_CHECKS: Array<{ pattern: RegExp; requirement: string }> = [
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:harness(?:\s|$)/, requirement: 'the Harness composition suite needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:pack(?:\s|$)/, requirement: 'the pack smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:profile(?:\s|$)/, requirement: 'the profile smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:web(?:\s|$)/, requirement: 'the web smoke suite needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:command-web(?:\s|$)/, requirement: 'the command-web smoke suite needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:isolation(?:\s|$)/, requirement: 'the isolation suite asserts a real sandbox refusal and only runs on an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+run\s+verify(?:\s|$)/, requirement: '`npm run verify` includes the host-only test:harness, test:pack, test:profile, test:web and test:command-web suites' },
-  { pattern: /node\s+--expose-internals\s+tests\/harness-composition\.mjs/, requirement: 'Harness composition needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /node\s+scripts\/smoke-pack\.mjs/, requirement: 'the pack smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /node\s+scripts\/smoke-profile\.mjs/, requirement: 'the profile smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /node\s+scripts\/smoke-web\.mjs/, requirement: 'the web smoke suite needs the host web/session boundary' },
-  { pattern: /node\s+scripts\/smoke-command-web\.mjs/, requirement: 'the command-web smoke suite needs the host web/session boundary' },
-  { pattern: /tests\/verification-isolation\.mjs/, requirement: 'the isolation suite asserts a real sandbox refusal and only runs on an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])(?:sandbox-exec|dsh\s+sandbox)\b/, requirement: 'a nested sandbox invocation is refused inside a worker sandbox' },
-  // R11-06: the remaining declared host-gate entry points. The name patterns
-  // keep plan validation honest without a manifest, and `classifyCheck` also
-  // resolves the script body when the manifest is available (see below).
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:deepseek(?:\s|$)/, requirement: 'the deepseek smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:command-deepseek(?:\s|$)/, requirement: 'the command-deepseek smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:sidebar-service(?:\s|$)/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:validation-repair-web(?:\s|$)/, requirement: 'the validation-repair web smoke needs the host web/session boundary' },
-  { pattern: /node\s+--expose-internals\s+scripts\/smoke-[\w.-]+\.mjs/, requirement: 'an expose-internals smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /node\s+scripts\/smoke-better-sidebar\.mjs/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
+  { pattern: /(?:^|[\s;&|()])(?:sandbox-exec|dsh\s+sandbox)\b/, requirement: 'a nested sandbox invocation is refused inside the verifier workspace-write sandbox; run it through an available host check route or provide an equivalent artifact check supported by this verifier' },
 ]
 
 /**
@@ -624,7 +587,7 @@ const HOST_ONLY_CHECKS: Array<{ pattern: RegExp; requirement: string }> = [
  * the name actually resolves to, so a host-only suite cannot hide behind a
  * neutral script name and a worker-runnable script is never refused by name.
  * Returns undefined when the manifest is absent, unreadable, oversized or
- * malformed; the name patterns above still apply.
+ * malformed; unresolved scripts remain preflight hints, never name-based refusals.
  */
 export function loadPackageScripts(workspace: string): Record<string, string> | undefined {
   try {
@@ -664,7 +627,8 @@ export function classifyCheck(command: string, scripts?: Record<string, string>)
     const resolved = resolveHostOnlyScript(command, scripts, new Set(), 0)
     if (resolved !== undefined) return { command, runnable: 'host-only', code: 'check_requires_host', requirement: resolved }
   }
-  return { command, runnable: 'worker' }
+  const unresolved = [...command.matchAll(/(?:^|[\s;&|()])npm\s+(?:run\s+|run-script\s+)([A-Za-z0-9:_.-]+)/g)].map(match => match[1]!).filter(name => scripts?.[name] === undefined)
+  return { command, runnable: 'worker', ...(unresolved.length ? { preflight: `Unresolved target package scripts: ${unresolved.join(', ')}. Inspect the target manifest before execution; the immutable artifact must still pass its declared checks.` } : {}) }
 }
 
 /**
@@ -934,7 +898,7 @@ export function requireHostChecks(kind: string, checks: readonly string[] | unde
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
     if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
-    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
+    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there until the check route is repaired. Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
     // Round 9-C: a check that names a host-absolute path cannot run in the
     // disposable checkout. Refuse it here, at the shared admission point, so a
     // repair cannot silently swap its check for the source toolchain.

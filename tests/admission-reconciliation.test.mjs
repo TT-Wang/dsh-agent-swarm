@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { validatePlan } from '../lib/plans.js'
+import { planAdvisories, validatePlan } from '../lib/plans.js'
 import {
   DEFAULT_TASK_MAX_FINDINGS, DEFAULT_TASK_MAX_STEPS, classifyCheck, ignoredDeliverablePaths,
   reconcileObjectiveScope, taskCeilingBlock, taskCeilingExhaustion, writeDirectivePaths,
@@ -100,10 +100,9 @@ test('the ceiling contract blocks a task at its own limit with a durable, machin
   const stepBlock = taskCeilingBlock({ maxSteps: 3, maxFindings: 2, usedSteps: 3, evidenceIds: [] }, 1700000000000)
   assert.deepEqual({ ...stepBlock, reason: undefined }, { dimension: 'maxSteps', limit: 3, used: 3, code: 'task_ceiling_exhausted', reason: undefined, at: 1700000000000 })
   assert.match(stepBlock.reason, /maxSteps 3\/3/)
-  assert.match(stepBlock.reason, /instead of consuming the mission budget/)
+  assert.match(stepBlock.reason, /swarm_budget.*taskId.*taskBudget.*reason/)
   const findingBlock = taskCeilingBlock({ maxSteps: 10, maxFindings: 2, usedSteps: 4, evidenceIds: ['e1', 'e2'] })
-  assert.equal(findingBlock.dimension, 'maxFindings')
-  assert.equal(findingBlock.used, 2)
+  assert.equal(findingBlock, undefined, 'finding estimates prompt review without blocking submission')
   const both = taskCeilingBlock({ maxSteps: 1, maxFindings: 1, usedSteps: 1, evidenceIds: ['e1'] })
   assert.equal(both.dimension, 'maxSteps', 'steps take precedence when both ceilings are exhausted')
   assert.deepEqual(JSON.parse(JSON.stringify(stepBlock)), stepBlock, 'the durable block reason survives serialization')
@@ -121,16 +120,11 @@ test('the ceiling contract blocks a task at its own limit with a durable, machin
   assert.ok(missionUsedSteps < budget.maxSteps, 'the task ceiling binds before the mission budget')
 })
 
-test('admission rejects an objective that directs a write outside the task scope', () => {
+test('objective write heuristics remain advisory while scope stays explicit', () => {
   const input = plan('/workspace')
   input.tasks[1].objective = 'Add a file under `docs/` describing the change and implement it.'
-  assert.throws(() => validatePlan(input), error => {
-    assert.match(error.message, /\[objective_write_outside_scope\]/)
-    assert.match(error.message, /"docs\/"/)
-    assert.match(error.message, /\["src\/"\]/)
-    assert.match(error.message, /fail at submit/)
-    return true
-  })
+  assert.doesNotThrow(() => validatePlan(input))
+  assert.ok(planAdvisories(input).some(item => item.code === 'objective_write_outside_scope' && item.severity === 'advisory'))
   const diagnostics = reconcileObjectiveScope('Add a file under `docs/` describing the change.', ['src/'], 'tasks[1].objective')
   assert.deepEqual(diagnostics.map(item => [item.code, item.path]), [['objective_write_outside_scope', 'docs/']])
   const inScope = plan('/workspace')
@@ -143,12 +137,12 @@ test('admission rejects an objective that directs a write outside the task scope
   factual.tasks[1].objective = 'Implement the change; the pre-fix reproduction is committed at `docs/repro.mjs`.'
   assert.doesNotThrow(() => validatePlan(factual), 'a factual statement is not a write directive')
   const mission = plan('/workspace', { objective: 'Add `docs/design-notes.md` and deliver verified code' })
-  assert.throws(() => validatePlan(mission), /\[objective_write_outside_scope\]/, 'mission-level directives reconcile too')
+  assert.doesNotThrow(() => validatePlan(mission), 'mission-level language is advisory too')
   assert.deepEqual(writeDirectivePaths('Do not edit `src/types.ts`.'), [])
   assert.deepEqual(writeDirectivePaths('Add a file under `docs/` and commit `docs/review-x.md`.'), ['docs/', 'docs/review-x.md'])
 })
 
-test('admission rejects a named deliverable hidden by the effective ignore rules', async t => {
+test('ignored named paths advise without blocking input analysis or ignore repairs', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-admission-ignore-'))
   t.after(async () => { await rm(directory, { recursive: true, force: true }) })
   const git = args => {
@@ -164,18 +158,13 @@ test('admission rejects a named deliverable hidden by the effective ignore rules
   }
   const ignored = docsPlan()
   ignored.tasks[1].objective = 'Write `docs/review-round4.md` with the round summary.'
-  assert.throws(() => validatePlan(ignored), error => {
-    assert.match(error.message, /\[deliverable_path_ignored\]/)
-    assert.match(error.message, /docs\/review-round4\.md/)
-    assert.match(error.message, /\.gitignore:1/)
-    assert.match(error.message, /"docs\/review-\*\.md"/)
-    return true
-  })
+  assert.doesNotThrow(() => validatePlan(ignored))
+  assert.ok(planAdvisories(ignored).some(item => item.code === 'deliverable_path_ignored' && item.severity === 'advisory'))
   const clean = docsPlan()
   clean.tasks[1].objective = 'Write `docs/notes.md` with the round summary.'
   assert.doesNotThrow(() => validatePlan(clean))
   const missionLevel = docsPlan({ acceptance: ['works', 'the summary is committed at `docs/review-mission.md`'] })
-  assert.throws(() => validatePlan(missionLevel), /\[deliverable_path_ignored\]/, 'mission acceptance reconciles too')
+  assert.doesNotThrow(() => validatePlan(missionLevel))
   await mkdir(join(directory, 'docs'), { recursive: true })
   await writeFile(join(directory, 'docs', 'review-tracked.md'), 'tracked\n')
   git(['add', '-f', 'docs/review-tracked.md'])
@@ -190,10 +179,10 @@ test('admission rejects a named deliverable hidden by the effective ignore rules
   assert.doesNotThrow(() => validatePlan(negatedAcceptance), 'a negated deliverable named by acceptance is admitted')
   const directoryIgnored = docsPlan()
   directoryIgnored.tasks[1].objective = 'Write `artifacts/out.md` with the round summary.'
-  assert.throws(() => validatePlan(directoryIgnored), /\[deliverable_path_ignored\]/, 'a deliverable under an ignored directory is rejected')
+  assert.doesNotThrow(() => validatePlan(directoryIgnored))
   const acceptanceNamed = docsPlan()
   acceptanceNamed.tasks[1].acceptance = ['works', '`docs/review-taskacc.md` exists']
-  assert.throws(() => validatePlan(acceptanceNamed), /\[deliverable_path_ignored\]/, 'a deliverable named only by an acceptance criterion is rejected')
+  assert.doesNotThrow(() => validatePlan(acceptanceNamed))
   const acceptanceNegated = docsPlan()
   acceptanceNegated.tasks[1].acceptance = ['works', '`docs/review-keep.md` exists']
   assert.doesNotThrow(() => validatePlan(acceptanceNegated), 'a negated deliverable named by acceptance is admitted')
@@ -205,54 +194,15 @@ test('admission rejects a named deliverable hidden by the effective ignore rules
   assert.deepEqual(ignoredDeliverablePaths(directory, ['docs/review-keep.md']), [], 'a negated candidate alone is not hidden')
 })
 
-test('W14: a host-only check is rejected at admission with a typed reason naming the host requirement', () => {
-  assert.deepEqual(
-    { ...classifyCheck('npm run test:harness'), command: undefined },
-    { command: undefined, runnable: 'host-only', code: 'check_requires_host', requirement: 'the Harness composition suite needs a built Harness checkout and an unsandboxed host' })
-  assert.equal(classifyCheck('npm run verify').runnable, 'host-only')
-  assert.match(classifyCheck('npm run verify').requirement, /test:harness/)
-  assert.match(classifyCheck('npm run verify').requirement, /test:pack, test:profile/)
-  assert.equal(classifyCheck('node --expose-internals tests/harness-composition.mjs').runnable, 'host-only')
-  assert.equal(classifyCheck('node scripts/smoke-command-web.mjs').runnable, 'host-only')
-  assert.equal(classifyCheck('node tests/verification-isolation.mjs').runnable, 'host-only')
-  for (const command of ['npm run test:pack', 'npm run test:profile', 'node scripts/smoke-pack.mjs', 'node scripts/smoke-profile.mjs']) {
-    const classification = classifyCheck(command)
-    assert.equal(classification.runnable, 'host-only', command)
-    assert.equal(classification.code, 'check_requires_host')
-    assert.match(classification.requirement, /nested workspace-write sandbox|sandbox-prerequisite/, command)
+test('check admission inspects actual commands without a project-specific name veto', () => {
+  for (const command of ['npm run verify', 'npm run test:harness', 'node scripts/smoke-web.mjs', 'node tests/verification-isolation.mjs']) {
+    assert.equal(classifyCheck(command).runnable, 'worker', command)
+    const input = plan('/workspace'); input.tasks[1].checks = [command]
+    assert.doesNotThrow(() => validatePlan(input))
   }
-  assert.equal(classifyCheck('npm run typecheck && npm run test:web').runnable, 'host-only', 'a composite command is host-only when any segment is')
-  assert.equal(classifyCheck('npm run typecheck && npm run build && node --test tests/*.test.mjs && npm run test:faults').runnable, 'worker')
-  assert.equal(classifyCheck('npm run typecheck && npm run build && node --test tests/*.test.mjs && npm run test:load').runnable, 'worker')
-  assert.equal(classifyCheck('npm run typecheck && npm run build && node --test tests/*.test.mjs && npm run test:replay').runnable, 'worker')
-  assert.equal(classifyCheck('npm run test:webhook').runnable, 'worker', 'a script whose name merely starts with a host-only name stays worker-runnable')
-  assert.equal(classifyCheck('node check.cjs').runnable, 'worker')
-  const input = plan('/workspace')
-  input.tasks[1].checks = ['npm run typecheck && npm run test:harness']
-  assert.throws(() => validatePlan(input), error => {
-    assert.match(error.message, /\[check_requires_host\]/)
-    assert.match(error.message, /unsandboxed host/)
-    assert.match(error.message, /workspace-write sandbox/)
-    assert.match(error.message, /host gate/)
-    return true
-  })
-  const direct = plan('/workspace')
-  direct.tasks[1].checks = ['node scripts/smoke-web.mjs']
-  assert.throws(() => validatePlan(direct), /\[check_requires_host\]/)
-  const nestedSandbox = plan('/workspace')
-  nestedSandbox.tasks[1].checks = ['npm run typecheck && npm run build && node --test tests/*.test.mjs && npm run test:pack']
-  assert.throws(() => validatePlan(nestedSandbox), error => {
-    assert.match(error.message, /\[check_requires_host\]/)
-    assert.match(error.message, /test:pack/)
-    assert.match(error.message, /nested workspace-write sandbox/)
-    return true
-  }, 'the nested-sandbox pack gate cannot be declared as a worker check')
-  const profileGate = plan('/workspace')
-  profileGate.tasks[1].checks = ['npm run test:profile']
-  assert.throws(() => validatePlan(profileGate), /\[check_requires_host\]/)
-  const workerRunnable = plan('/workspace')
-  workerRunnable.tasks[1].checks = ['npm run typecheck && npm run build && node --test tests/*.test.mjs && npm run test:faults']
-  assert.doesNotThrow(() => validatePlan(workerRunnable))
+  const nested = plan('/workspace'); nested.tasks[1].checks = ['sandbox-exec -p rule node --test']
+  assert.throws(() => validatePlan(nested), /check_requires_host/)
+  assert.equal(classifyCheck('npm run typecheck && node --test tests/*.test.mjs').runnable, 'worker')
 })
 
 test('existing cycle, missing-review, uncovered-acceptance and integration-topology rejections remain green', async t => {

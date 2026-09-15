@@ -75,22 +75,22 @@ async function setup(t, { gamma = false, tickMs = 20 } = {}) {
   return { runtime, workers, mission, owner, alpha, beta, gamma: memberGamma, propose, task, member, events }
 }
 
-test('R5-02: a start failure spends one credit, re-pends, and re-routes after k consecutive failures', async t => {
+test('R5-02: a start failure preserves task credit, re-pends, and re-routes after k consecutive failures', async t => {
   const f = await setup(t)
   const proposed = f.propose({ assigneeId: f.alpha.id, maxRecoveryAttempts: 5 })
   // Fail only the assigned member's route; Beta stays healthy and capable.
   f.workers.failMember = f.alpha.id
   await f.runtime.start()
 
-  const repended = await eventually(() => f.task(proposed.id).recoveryCount === 1 && f.task(proposed.id),
-    'the first start failure did not spend a recovery credit')
+  const repended = await eventually(() => f.events('task/start-failed').length === 1 && f.task(proposed.id),
+    'the first start failure was not recorded')
   assert.equal(repended.status, 'pending', 'a recoverable start failure re-pends the task')
   assert.equal(repended.assigneeId, f.alpha.id, 'below the re-route limit the same live member retries')
   assert.match(repended.output, /Worker could not start: (Error: )?worker bootstrap failed for Alpha/)
   const first = f.events('task/start-failed')
   assert.equal(first.length, 1, 'the start failure emits a durable task transition, not only member/resume-failed')
   assert.equal(first[0].data.taskId, proposed.id)
-  assert.equal(first[0].data.recoveryCount, 1)
+  assert.equal(first[0].data.recoveryCount, 0)
   assert.equal(first[0].data.consecutiveFailures, 1)
   assert.equal(first[0].data.status, 'pending')
   assert.equal(f.events('task/blocked').length, 0, 'the first failure does not block the task')
@@ -102,7 +102,7 @@ test('R5-02: a start failure spends one credit, re-pends, and re-routes after k 
   assert.equal(reassigned.data.consecutiveFailures, K)
   assert.match(reassigned.data.reason, /worker bootstrap failed for Alpha/)
   const credits = f.events('task/start-failed').filter(event => event.data.taskId === proposed.id)
-  assert.deepEqual(credits.map(event => event.data.recoveryCount), [1, 2, 3], 'each start failure spends exactly one credit')
+  assert.deepEqual(credits.map(event => event.data.recoveryCount), [0, 0, 0], 'startup failures preserve execution recovery credit')
   assert.deepEqual(credits.map(event => event.data.consecutiveFailures), [1, 2, 3])
   assert.equal(f.member(f.alpha.id).status, 'stopped', 'the route is retired after k consecutive failures')
   assert.notEqual(f.member(f.beta.id).status, 'stopped')
@@ -112,30 +112,20 @@ test('R5-02: a start failure spends one credit, re-pends, and re-routes after k 
     'the re-routed task was not re-dispatched to the other member')
   assert.equal(running.attempt.ownerId, f.beta.id)
   assert.equal(running.assigneeId, f.beta.id)
-  assert.equal(running.recoveryCount, 3, 'a successful dispatch spends no further credit')
+  assert.equal(running.recoveryCount ?? 0, 0, 'a successful dispatch spends no further credit')
   assert(f.workers.starts.includes(f.beta.id))
 })
 
-test('R5-02: a start failure blocks only when the task recovery limit is exhausted', async t => {
+test('R16: a small task recovery allowance cannot block infrastructure rerouting', async t => {
   const f = await setup(t)
-  const proposed = f.propose({ assigneeId: f.alpha.id, maxRecoveryAttempts: 2 })
+  const proposed = f.propose({ assigneeId: f.alpha.id, maxRecoveryAttempts: 1 })
   f.workers.failMember = f.alpha.id
   await f.runtime.start()
-
-  const blocked = await eventually(() => f.task(proposed.id).status === 'blocked' && f.task(proposed.id),
-    'the task never blocked after exhausting its recovery limit')
-  assert.equal(blocked.recoveryCount, 2)
-  assert.match(blocked.output, /Worker could not start: (Error: )?worker bootstrap failed for Alpha/)
-  const credits = f.events('task/start-failed').filter(event => event.data.taskId === proposed.id)
-  assert.deepEqual(credits.map(event => event.data.status), ['pending', 'blocked'], 'the task re-pends until the limit and blocks only then')
-  assert.deepEqual(credits.map(event => event.data.recoveryCount), [1, 2])
-  const blockEvents = f.events('task/blocked').filter(event => event.data.taskId === proposed.id)
-  assert.equal(blockEvents.length, 1)
-  assert.match(blockEvents[0].data.reason, /Worker could not start/)
-  assert.equal(f.events('task/reassigned').length, 0, 'a task blocks at its own limit before the member re-route threshold')
-  await new Promise(resolve => setTimeout(resolve, 100))
-  assert.equal(f.task(proposed.id).status, 'blocked', 'later start failures cannot revive a blocked task')
-  assert.equal(f.task(proposed.id).recoveryCount, 2)
+  const running = await eventually(() => f.task(proposed.id).status === 'running' && f.task(proposed.id), 'healthy route did not resume the obligation')
+  assert.equal(running.assigneeId, f.beta.id)
+  assert.equal(running.recoveryCount ?? 0, 0)
+  assert.equal(f.events('task/blocked').length, 0)
+  assert.deepEqual(f.events('task/start-failed').map(event => event.data.consecutiveFailures), [1, 2, 3])
 })
 
 test('R5-02: a successful start resets the consecutive failure counter', async t => {
@@ -143,7 +133,7 @@ test('R5-02: a successful start resets the consecutive failure counter', async t
   const proposed = f.propose({ assigneeId: f.alpha.id, maxRecoveryAttempts: 8 })
   f.workers.failMember = f.alpha.id
   await f.runtime.start()
-  await eventually(() => f.task(proposed.id).recoveryCount >= 2, 'two start failures did not spend two credits')
+  await eventually(() => f.events('task/start-failed').length >= 2, 'two start failures were not recorded')
   assert.equal(f.task(proposed.id).status, 'pending')
 
   // Heal the route: the same member starts and takes its work back.
@@ -151,12 +141,12 @@ test('R5-02: a successful start resets the consecutive failure counter', async t
   const recovered = await eventually(() => f.task(proposed.id).status === 'running' && f.task(proposed.id),
     'the member did not recover after the transient start failure')
   assert.equal(recovered.attempt.ownerId, f.alpha.id)
-  assert.equal(recovered.recoveryCount, 2)
+  assert.equal(recovered.recoveryCount ?? 0, 0)
 
   // Fail once more. Without the reset this is consecutive failure 3 and would
   // re-route; with the reset it is failure 1 of a new run and stays with Alpha.
   f.workers.failMember = f.alpha.id
-  await eventually(() => f.task(proposed.id).recoveryCount >= 3, 'the post-recovery start failure did not spend a credit')
+  await eventually(() => f.events('task/start-failed').length >= 3, 'the post-recovery start failure was not recorded')
   f.workers.failMember = undefined
   const after = f.task(proposed.id)
   assert.equal(after.status, 'pending')
@@ -166,7 +156,7 @@ test('R5-02: a successful start resets the consecutive failure counter', async t
   const rerun = await eventually(() => f.task(proposed.id).status === 'running' && f.task(proposed.id),
     'the healed member did not take the task again')
   assert.equal(rerun.attempt.ownerId, f.alpha.id)
-  assert.equal(rerun.recoveryCount, 3, 'a successful start spends no credit')
+  assert.equal(rerun.recoveryCount ?? 0, 0, 'a successful start spends no credit')
 })
 
 test('R5-02: re-route never picks the author of the verification source it would review', async t => {

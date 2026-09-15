@@ -7,7 +7,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
+import { boardIndex, taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
 import { leaseExpired } from '../lib/types/client/clock.js'
 import { swarmCardDefinition } from '../lib/types/client/card-definition.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
@@ -16,7 +16,8 @@ import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { openWorker } from '../lib/types/client/navigation.js'
 import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
 import { createRightSidebarAdapter } from '../lib/types/client/sidebar.js'
-import { WorkerAvatar } from '../lib/types/client/MissionProgress.js'
+import { AgentAvatar, AGENT_AVATAR_CSS } from '../lib/types/client/AgentAvatar.js'
+import { LIVE_WORK_CSS } from '../lib/types/client/LiveWorkPanel.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -72,6 +73,20 @@ test('UI reads native private metadata and rejects incompatible historical paylo
   assert.deepEqual(snapshotFromResult(undefined, [{ type: 'tool-result', content: [{ type: 'text', text: JSON.stringify({ snapshot }) }] }]), snapshot)
   assert.equal(snapshotFromResult({ swarmSnapshot: { mission: { id: 'broken' } } }, []), undefined)
   assert.equal(snapshotFromResult(undefined, [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: JSON.stringify(snapshot) }] }]), undefined)
+})
+
+test('board keeps borrowable work ready when its preference stops and validates assignment policy', () => {
+  const snapshot = uiSnapshot()
+  const task = { ...snapshot.tasks[4], epoch: 0, assigneeId: 'a', assignmentMode: 'preferred' }
+  const members = snapshot.members.map(member => member.id === 'a' ? { ...member, status: 'stopped' } : member)
+  const tasks = [task]
+  assert.equal(boardIndex(tasks).lane(task, members), 'ready')
+  assert.equal(boardIndex(tasks).lane({ ...task, assignmentMode: 'pinned' }, members), 'blocked')
+  assert.equal(boardIndex(tasks).lane({ ...task, assignmentMode: undefined }, members), 'blocked')
+  assert.equal(boardIndex(tasks).lane({ ...task, epoch: 1 }, members), 'blocked', 'started work follows recovery instead of borrowing')
+  assert.equal(boardIndex(tasks).lane(task, members.map(member => ({ ...member, status: 'stopped' }))), 'blocked')
+  assert.ok(readSnapshot({ ...snapshot, tasks }))
+  assert.equal(readSnapshot({ ...snapshot, tasks: [{ ...task, assignmentMode: 'unexpected' }] }), undefined)
 })
 
 test('native conversation fold presents only successful explicit swarm observations', () => {
@@ -247,7 +262,7 @@ test('graph and Chinese card render real task/evidence projections and worker li
   assert.match(graph, /stroke-dasharray="4 4"/)
   const chinese = renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, React.createElement(SwarmBoard, { snapshot, initialView: 'board', onOpenWorker() {} })))
   assert.match(chinese, /任务看板/)
-  assert.match(chinese, /data-worker-session=/)
+  assert.match(chinese, /data-swarm-member="b"[^>]*aria-label="打开对话: Nova"/)
   assert.match(chinese, /打开对话/)
 })
 
@@ -486,21 +501,20 @@ test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly 
   assert.match(index, /ctx\.effect\(\(\) => \(\) => disposals\.dispose\(\), 'agent-swarm: pane resources'\)/, 'plugin unload drains the registry')
 })
 
-test('OWNER PASS 2026-09-11 #2: the avatar scales in half steps and the controls row never wraps', async () => {
-  const render = props => renderToStaticMarkup(React.createElement(WorkerAvatar, props))
-  assert.match(render({ name: 'Nova' }), /width="32" height="32" viewBox="0 0 32 32"/, 'the default renders the sprite grid exactly')
-  assert.match(render({ name: 'Nova', size: 48 }), /width="48" height="48" viewBox="0 0 32 32"/, '48px is 1.5x the grid, so the cells stay integer')
-  assert.match(render({ name: 'Nova', size: 28 }), /width="32" height="32"/, 'a smaller request never shrinks below the grid; the stylesheet sizes the header')
-  assert.equal(render({ name: 'Nova' }), render({ name: 'Nova', size: 32 }))
+test('current robot avatars remain readable at their actual sizes and controls remain one row', async () => {
+  const render = props => renderToStaticMarkup(React.createElement(AgentAvatar, { id: 'nova-id', name: 'Nova', ...props }))
+  assert.match(render({}), /width:40px;height:40px/, 'the current member portrait defaults to 40px')
+  assert.match(render({ size: 26 }), /width:26px;height:26px/, 'the compact roster uses its actual requested size')
+  assert.match(render({ size: 28 }), /width:28px;height:28px/, 'the activity header uses its actual requested size')
+  assert.match(render({ state: 'active' }), /class="sw-agent-avatar-ring"/, 'observed native activity keeps the robot ring')
+  assert.match(AGENT_AVATAR_CSS, /prefers-reduced-motion:reduce/, 'the current ring supports reduced motion')
+  assert.match(LIVE_WORK_CSS, /prefers-reduced-motion:reduce/, 'live waves and event arrivals support reduced motion')
   const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
   assert.match(styles, /\.sw-actions\{display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;overflow-x:auto/,
     'the mission control row is one horizontal row that scrolls instead of wrapping')
   assert.match(styles, /\.sw-actions>\.sw-mission-controls\{padding:0;flex:0 0 auto;flex-wrap:nowrap;align-items:flex-start\}/)
-  assert.match(styles, /\.sw-member-head\{display:grid;grid-template-columns:auto minmax\(0,1fr\);gap:12px/, 'the member head is avatar + identity')
   assert.match(styles, /\.sw-complete-control\{display:flex;flex-direction:column/, 'the completion blocker is the button caption, not an inline sentence that displaces Stop')
   assert.match(styles, /\.sw-complete-control>\[data-swarm-completion\]\{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, 'and it is bounded with an ellipsis')
-  assert.match(styles, /\.sw-member \.sw-worker-avatar\{width:48px;height:48px;border-radius:11px/, 'the member avatar is 48px')
-  assert.match(styles, /\.sw-team \.sw-workers\{margin-top:10px;grid-template-columns:repeat\(auto-fit,minmax\(240px,1fr\)\)\}/, 'the roster widens for the larger card')
 })
 
 test('right sidebar adapter: one tab type, its body seat, and host navigation', async () => {

@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { hasNotice } from './arena.ts'
 import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
+import { memberPhaseOf } from './projection.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -25,6 +26,18 @@ import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
+
+/** A fenced handle must finish stopping before that member can own new work. */
+export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
+  return tasks.some(task => {
+    const marker = task.resumeAfterStop
+    if (marker?.epoch !== task.epoch) return false
+    if (marker.memberId !== undefined) return marker.memberId === memberId
+    // An unresolved legacy owner is a conservative stop of every mission
+    // handle; reserve every member until the complete scan confirms quiescence.
+    return true
+  })
+}
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
 export const DEFAULT_IDLE_CLOSEOUTS = 2
@@ -86,8 +99,112 @@ export class Attempts {
    * the scheduling pass re-reads it; losing this map changes no durable outcome.
    */
   readonly idleSignals = new Map<string, { attemptId: string; at: number }>()
+  /** Retry timing is disposable; the fenced task row owns the recovery obligation. */
+  private readonly stopRetries = new Map<string, { epoch: number; memberId?: string; retries: number; retryAt: number; inFlight: boolean }>()
 
   constructor(private readonly rt: SwarmRuntime) {}
+
+  /** Stop outside the pass queue; only confirmed quiescence can re-pend this epoch. */
+  resumeStoppedAttempt(missionId: string, task: Task): void {
+    const marker = task.resumeAfterStop
+    if (marker?.epoch !== task.epoch) return
+    if (marker.memberId === undefined) {
+      const eventType = marker.reason === 'handoff' ? 'task/handoff-started' : marker.reason === 'lease-expired' ? 'task/lease-expired' : 'task/closeout-abandoned'
+      const event = this.rt.store.latestTaskEvent(missionId, task.id, eventType)
+      const data = event?.data as { oldOwner?: string; ownerId?: string } | undefined
+      const recorded = marker.reason === 'handoff' ? data?.oldOwner ?? (event?.actor === 'runtime' ? undefined : event?.actor) : marker.reason === 'lease-expired' ? data?.oldOwner : data?.ownerId
+      const fallback = task.priorOwnerIds?.length === 1 ? task.priorOwnerIds[0] : marker.reason !== 'handoff' && !task.priorOwnerIds?.length ? task.assigneeId : undefined
+      const memberId = task.attempt?.ownerId ?? recorded ?? fallback
+      if (memberId !== undefined) {
+        marker.memberId = memberId
+        this.rt.commit(missionId, () => this.rt.store.put('tasks', task))
+      } else {
+        // A legacy handoff can have lost the identity of its old handle. A
+        // bounded scan stops every candidate without guessing its new target.
+        // Fence other live attempts first, preserving their own checkpoint debt.
+        const peers = this.rt.store.list('tasks', missionId).filter(peer => peer.id !== task.id && peer.status === 'running' && peer.attempt !== undefined)
+        const prior = this.rt.store.latestTaskEvent(missionId, task.id, 'mission/stalled')?.data as { cause?: string; epoch?: number } | undefined
+        if (peers.length > 0 || prior?.cause !== 'stop-owner-unresolved' || prior.epoch !== task.epoch) this.rt.commit(missionId, () => {
+          for (const peer of peers) {
+            const oldOwner = peer.attempt!.ownerId
+            peer.status = 'blocked'; peer.epoch++; this.dropAttempt(peer); delete peer.budgetResume
+            peer.resumeAfterStop = { epoch: peer.epoch, memberId: oldOwner, reason: 'handoff', at: Date.now() }
+            this.rt.store.put('tasks', peer)
+            this.rt.store.event(missionId, 'task/handoff-started', 'runtime', { taskId: peer.id, oldOwner, reason: 'legacy stop owner recovery' })
+          }
+          this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: 'stop-owner-unresolved', taskId: task.id, epoch: task.epoch, recovery: 'stop and checkpoint all recorded members' })
+        })
+      }
+    }
+    let retry = this.stopRetries.get(task.id)
+    if (retry === undefined || retry.epoch !== task.epoch || retry.memberId !== marker.memberId) {
+      retry = { epoch: task.epoch, memberId: marker.memberId, retries: 0, retryAt: 0, inFlight: false }
+      this.stopRetries.set(task.id, retry)
+    }
+    if (retry.inFlight || retry.retryAt > Date.now()) return
+    const state = retry
+    state.inFlight = true
+    this.rt.defer(async () => {
+      try {
+        const queued = this.rt.store.get('tasks', task.id)
+        if (this.rt.shuttingDown || queued === undefined || queued.epoch !== state.epoch
+          || queued.resumeAfterStop?.epoch !== state.epoch || queued.resumeAfterStop.memberId !== state.memberId) return
+        const stoppedMember = state.memberId === undefined ? undefined : this.rt.store.get('members', state.memberId)
+        const candidates = state.memberId === undefined ? this.rt.store.list('members', missionId) : stoppedMember === undefined ? [] : [stoppedMember]
+        const ownerIds = state.memberId === undefined ? candidates.map(member => member.id) : [state.memberId]
+        const results = await Promise.allSettled(ownerIds.map(memberId => this.rt.workers.stop(memberId)))
+        const failed = results.find(result => result.status === 'rejected')
+        if (failed?.status === 'rejected') throw failed.reason
+        if (this.rt.shuttingDown) return
+        const stoppedTask = this.rt.task(missionId, task.id)
+        if (stoppedTask.epoch !== state.epoch || stoppedTask.resumeAfterStop?.epoch !== state.epoch || stoppedTask.resumeAfterStop.memberId !== state.memberId) return
+        if (candidates.length === 0 && this.rt.workers.checkpointTask !== undefined) throw new Error('The recorded stop owner is missing; its workspace checkpoint cannot be confirmed')
+        for (const candidate of candidates) await this.rt.workers.checkpointTask?.(candidate, stoppedTask, state.memberId === undefined ? { ifOwned: true } : undefined)
+        await this.rt.exclusive(missionId, async () => {
+          const mission = this.rt.mission(missionId)
+          const fresh = this.rt.task(missionId, task.id)
+          if (fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId) return
+          const recoveryExhausted = marker.reason !== 'resource' && marker.reason !== 'handoff' && (fresh.recoveryCount ?? 0) >= (fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember)
+          const exhausted = recoveryExhausted || fresh.ceiling !== undefined || fresh.preparationFailure !== undefined || fresh.verificationRecovery !== undefined
+            || (fresh.status === 'blocked' && fresh.artifact !== undefined)
+            || (fresh.evidenceIds ?? []).some(evidenceId => this.rt.store.get('evidence', evidenceId)?.status === 'refuted')
+          const released = ownerIds.map(memberId => this.rt.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
+          if (marker.reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
+          if (fresh.status !== 'cancelled' && fresh.status !== 'accepted') fresh.status = exhausted ? 'blocked' : 'pending'
+          delete fresh.resumeAfterStop
+          this.rt.commit(missionId, () => {
+            for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
+              member.status = 'idle'
+              if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
+              else if (state.memberId !== undefined && (marker.reason === 'handoff' || marker.reason === 'resource')) member.phase = 'active'
+              this.rt.store.put('members', member)
+            }
+            this.rt.store.put('tasks', fresh)
+            this.rt.store.event(missionId, marker.reason === 'worker-closeout' ? (exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready') : marker.reason === 'handoff' ? 'task/handoff-ready' : 'task/quiescence-recovered', 'runtime', {
+              taskId: fresh.id, ...(state.memberId === undefined ? { memberIds: ownerIds } : { memberId: state.memberId }), reason: marker.reason, retries: state.retries,
+            })
+          })
+          if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, detail: `${marker.reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
+        })
+        if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
+        if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && peer.resumeAfterStop?.epoch === peer.epoch) this.resumeStoppedAttempt(missionId, peer)
+        if (this.rt.mission(missionId).status === 'active') this.rt.kick(missionId)
+      } catch (error) {
+        state.retries++
+        state.retryAt = Date.now() + Math.min(30_000, 1000 * 2 ** Math.min(state.retries - 1, 5))
+        if (this.rt.shuttingDown) return
+        const fresh = this.rt.store.get('tasks', task.id)
+        const mission = this.rt.store.get('missions', missionId)
+        if (fresh === undefined || fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId || mission === undefined) return
+        if (mission.status !== 'active') {
+          this.rt.commit(missionId, () => this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: 'worker-stop-failed', taskId: task.id, memberId: state.memberId, retryAt: state.retryAt, reason: String(error) }))
+          return
+        }
+        emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: state.memberId,
+          detail: `Worker stop failed; the task remains fenced and will retry after ${state.retryAt}: ${error instanceof Error ? error.message : String(error)}` })
+      } finally { state.inFlight = false }
+    })
+  }
 
   ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
     const { member } = this.rt.active(actor, missionId)
@@ -116,6 +233,21 @@ export class Attempts {
     const owner = ownerId ?? task.attempt?.ownerId
     if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
     delete task.attempt
+  }
+  /** Cancel synchronously while retaining any outstanding stop/checkpoint obligation. */
+  cancelForStop(task: Task): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
+    const previousStatus = task.status
+    const attempt = task.attempt
+    const priorStop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+    // Submitted work may retain an author who now owns another task. Only an
+    // active attempt or an existing stop marker can identify a handle to stop.
+    const stopOwner = priorStop?.memberId ?? (previousStatus === 'running' ? attempt?.ownerId : undefined)
+    task.status = 'cancelled'
+    if (priorStop === undefined) task.epoch++
+    this.dropAttempt(task)
+    delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    if (stopOwner !== undefined && priorStop === undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: stopOwner, reason: 'handoff', at: Date.now() }
+    return { previousStatus, attempt, stopOwner }
   }
   /**
    * The live operation an attempt currently holds, or undefined when none is
@@ -335,8 +467,7 @@ export class Attempts {
     // instead of a different member starting from the mission baseline.
     current.assigneeId = member.id
     current.plannedAssigneeId ??= member.id
-    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout', at: Date.now() }
-    const epoch = current.epoch
+    current.resumeAfterStop = { epoch: current.epoch, reason: 'worker-closeout', memberId: member.id, at: Date.now() }
     this.rt.commit(mission.id, () => {
       this.rt.store.put('tasks', current)
       this.rt.store.event(mission.id, 'task/closeout-abandoned', 'runtime', { taskId: current.id, ownerId: member.id, commit: checkpoint.commit, recoveryCount: current.recoveryCount })
@@ -350,31 +481,7 @@ export class Attempts {
     // limit is already spent) with the close-out exhaustion terminal below.
     emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: current.id, memberId: member.id, detail: `idle close-out abandoned attempt ${task.attempt?.id ?? 'unknown'}: the workspace was checkpointed at ${checkpoint.commit} and the task was re-pended (recovery ${current.recoveryCount ?? 0})` })
     this.idleSignals.delete(member.id)
-    this.rt.defer(async () => {
-      await this.rt.workers.stop(member.id)
-      await this.rt.exclusive(mission.id, async () => {
-        const fresh = this.rt.task(mission.id, task.id)
-        if (fresh.epoch !== epoch || fresh.status !== 'blocked') return
-        const released = this.rt.store.get('members', member.id)
-        if (released !== undefined && released.status !== 'stopped') { released.status = 'idle'; this.rt.store.put('members', released) }
-        const exhausted = (fresh.recoveryCount ?? 0) >= (fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember)
-        if (!exhausted) {
-          fresh.status = 'pending'; delete fresh.resumeAfterStop
-          if (released === undefined || released.status === 'stopped') delete fresh.assigneeId
-        } else delete fresh.resumeAfterStop
-        this.rt.commit(mission.id, () => {
-          this.rt.store.put('tasks', fresh)
-          this.rt.store.event(mission.id, exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready', 'runtime', { taskId: fresh.id, memberId: member.id })
-        })
-        // S4b (owner finding, measured: 2 of 2 silent): the exhausted close-out
-        // leaves the task blocked with a durable event and no owner decision.
-        // The re-pended branch is progress and stays silent. Co-firing guards:
-        // the recovery-limit guard meets the close-out guard here, and the
-        // workspace checkpoint guard is the one that produced the checkpoint.
-        if (exhausted) emitGuardTerminal(this.rt, mission.id, 'attempt_lease', { taskId: fresh.id, memberId: member.id, detail: `idle close-out reached the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
-      })
-      this.rt.kick(mission.id)
-    })
+    this.resumeStoppedAttempt(mission.id, current)
   }
 
   /**
@@ -393,6 +500,11 @@ export class Attempts {
         for (const listed of this.rt.store.list('tasks', missionId)) {
           if (this.rt.shuttingDown) return false
           let task = this.rt.store.get('tasks', listed.id)
+          if (task !== undefined && task.resumeAfterStop?.epoch === task.epoch) {
+            this.resumeStoppedAttempt(missionId, task)
+            continue
+          }
+          this.stopRetries.delete(listed.id)
           if (task === undefined || task.missionId !== missionId || task.status !== 'running' || !task.attempt) continue
           const oldOwner = task.attempt.ownerId
           const attemptId = task.attempt.id
@@ -467,18 +579,9 @@ export class Attempts {
           const planned = expiring.plannedAssigneeId === undefined ? undefined : this.rt.store.get('members', expiring.plannedAssigneeId)
           if (planned !== undefined && planned.status !== 'stopped') expiring.assigneeId = planned.id
           else delete expiring.assigneeId
-          expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired', at: Date.now() }
+          expiring.resumeAfterStop = { epoch: expiring.epoch, reason: 'lease-expired', memberId: oldOwner, at: Date.now() }
           this.rt.commit(missionId, () => { this.rt.store.put('tasks', expiring); this.rt.store.event(missionId, 'task/lease-expired', 'runtime', { taskId: expiring.id, oldOwner }) })
-          await this.rt.workers.stop(oldOwner)
-          const reopened = this.rt.task(missionId, task.id)
-          if (reopened.epoch !== expiring.epoch || reopened.status !== 'blocked') continue
-          const limit = reopened.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember
-          const exhausted = (reopened.recoveryCount ?? 0) >= limit
-          reopened.status = exhausted ? 'blocked' : 'pending'; delete reopened.resumeAfterStop
-          this.rt.commit(missionId, () => { this.rt.store.put('tasks', reopened) })
-          // S4b: exhausting the recovery limit on a lease expiry left a durable
-          // event and no owner decision; the re-pend branch is progress.
-          if (exhausted) emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: reopened.id, memberId: oldOwner, detail: `lease expiry exhausted the recovery limit (${reopened.recoveryCount ?? 0}/${limit}) and left the task blocked` })
+          this.resumeStoppedAttempt(missionId, expiring)
         }
     return true
   }

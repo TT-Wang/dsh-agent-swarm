@@ -8,11 +8,14 @@
  */
 import { randomUUID } from 'node:crypto'
 import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { selectAcceptedDelivery } from './task-graph.ts'
+import { assignmentAllows, canBorrowTask } from './assignment.ts'
+import { pendingStopOwner } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { WorkspaceRevokedError } from './workspace-admission.ts'
+import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -210,6 +213,7 @@ export class Scheduling {
         for (const member of this.rt.interpretation(missionId).members) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
           if (memberPhaseOf(member) === 'stopped') continue
+          if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // S1: an abandoned pass body (its guard was released after the declared
           // bound) must never dispatch into the newer pass's turn.
           if (this.passReleased(pass)) return false
@@ -223,12 +227,11 @@ export class Scheduling {
           // dispatching the other members.
           try {
           if (!this.rt.isolationAllows(missionId, member)) continue
-          try { await this.rt.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
+          try { await this.rt.startWorker(mission, member) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            this.rt.onStartFailure(mission, member, error)
             continue
           }
           this.rt.startFailures.delete(member.id)
@@ -246,6 +249,7 @@ export class Scheduling {
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (this.startBlocker(member) !== undefined) continue
           const view = this.rt.interpretation(missionId)
+          if (pendingStopOwner(view.tasks, member.id)) continue
           const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
@@ -297,7 +301,8 @@ export class Scheduling {
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             if (this.passReleased(pass)) return false
             const fresh = this.rt.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
+            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
+              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
             // S7: re-read the isolation invariant after the external preparation
             // await. A state change during it (a member added into this worktree, a
             // second running task admitted) is refused here, never dispatched.
@@ -320,31 +325,28 @@ export class Scheduling {
               return false
             }
             const fresh = this.rt.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
-            // W18: a workspace or worker preparation failure is recoverable, not
-            // terminal. Mirror the attempt-failure, close-out and lease-expiry
-            // policy: spend exactly one recovery credit per failure, re-pend while
-            // the limit is not exhausted, and block only once it is.
-            const reason = `Workspace or worker preparation failed: ${String(error)}`
-            fresh.recoveryCount = (fresh.recoveryCount ?? 0) + 1
-            fresh.output = reason
+            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
+              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
+            // Retry only identified transient host failures, with durable bounded
+            // backoff. Repeating unchanged deterministic work is not recovery.
+            const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, this.rt.config.maxMessageChars - 650))}`
+            const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+            const transient = ['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ETIMEDOUT'].includes(code)
+              || (error instanceof Error && error.name === 'ProcessTimeoutError')
+            const attempts = (fresh.preparationFailure?.attempts ?? 0) + 1
+            const limit = Math.max(1, Math.min(3, fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember))
+            const retry = transient && attempts < limit
+            fresh.preparationFailure = { reason, transient, attempts,
+              ...(retry ? { retryAt: Date.now() + Math.min(30_000, 1000 * 2 ** (attempts - 1)) } : {}) }
+            fresh.output = `${reason}\n${retry ? 'The host will retry after bounded backoff.' : `Work remains preserved. Correct the reported condition, then resume this same task with swarm_control(action: "resume", taskId: "${fresh.id}", reason: "condition repaired").`}`
             fresh.epoch++
-            const limit = fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember
-            const exhausted = fresh.recoveryCount >= limit
-            fresh.status = exhausted ? 'blocked' : 'pending'
+            fresh.status = retry ? 'pending' : 'blocked'
             this.rt.commit(missionId, () => {
               this.rt.store.put('tasks', fresh)
-              this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, recoveryCount: fresh.recoveryCount, maxRecoveryAttempts: limit, status: fresh.status })
-              if (!exhausted) return false
-              this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason })
-            })
-            // Round 14: this is the terminal element of the dispatch-precondition
-            // chain. The task cannot be prepared again (its recovery limit is
-            // spent), so no earlier element of the chain can yield an action; the
-            // escalation is unconditional and names the executable exits instead
-            // of leaving the owner a bare reason string.
-            if (exhausted) this.escalateGuardTerminal(missionId, 'dispatch_preconditions', {
-              taskId: fresh.id, detail: `its recovery limit of ${limit} is exhausted after preparation failures: ${reason}`,
+              this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
+              if (retry) return
+              this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
+              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { from: 'runtime' })
             })
           }
           } catch (error) {
@@ -388,31 +390,39 @@ export class Scheduling {
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    *
-   * Otherwise the returned notice is one of exactly two honest answers:
+   * Otherwise the notice names a handle holder, a current prerequisite failure,
+   * or an unexplained dispatch gap. An idle handle alone proves no budget refusal.
    * - `handle-busy`: every member eligible for the task is working by the
    *   adapter's contract. The named holder is the task's assignee when the task
    *   is pinned, else the first eligible member whose handle is busy;
-   * - admission: at least one eligible member is startable, so the dispatcher
-   *   could have dispatched and did not — the refusal came from admission limits,
-   *   budget or a task ceiling.
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
     for (const task of dispatchable) {
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it, and a second owner wake would be noise.
       if (task.attempt !== undefined) continue
-      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && this.ready(task, member, tasks))
+      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       if (eligible.some(member => this.startBlocker(member) === undefined)) {
+        const edges = [...task.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])]
+        const assumptions = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: edges, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`)
+        const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
+        const startable = eligible.filter(member => this.startBlocker(member) === undefined)
+        const isolated = startable.filter(member => !issues.some(issue => issue.memberIds.includes(member.id)))
+        const detail = assumptions.length
+          ? `Its dependency assumptions require repair: ${assumptions.map(item => item.message).join(' ')} Amend this task with explicit content-carrying dependencies using swarm_control(taskId: "${task.id}", action: "amend", changes: { dependencies: [...] }, reason: "dependency repaired").`
+          : isolated.length === 0
+            ? `Workspace isolation prevents dispatch: ${issues.filter(issue => startable.some(member => issue.memberIds.includes(member.id))).map(issue => issue.message).join(' ')} Inspect the named members and repair their isolated workspaces before retrying.`
+            : 'An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.'
         return { task, subjects, dedupKey,
-          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for an eligible member the dispatcher could start but was not dispatched this tick, and no member handle is holding it: the dispatch was refused by mission admission limits or budget. Free a slot, raise a limit with swarm_budget, or withdraw the blocking work with swarm_cancel.` }
+          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. ${detail}` }
       }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
       const holder = pinned ?? eligible[0]!
       return { task, holder, subjects, dedupKey,
-        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), re-propose the task with a different assigneeId, or withdraw it with swarm_cancel.` }
+        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), amend this task's assigneeId with swarm_control(taskId: "${task.id}", action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw it with swarm_cancel.` }
     }
     return undefined
   }
@@ -501,8 +511,20 @@ export class Scheduling {
   }
 
   ready(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (task.status !== 'pending' || (task.assigneeId && task.assigneeId !== member.id)) return false
-    return this.capable(task, member, tasks)
+    if (task.status !== 'pending' || (task.preparationFailure?.retryAt ?? 0) > Date.now()) return false
+    if (task.assigneeId === undefined || task.assigneeId === member.id) return this.capable(task, member, tasks)
+    if (!canBorrowTask(task)) return false
+    const all = tasks ?? this.rt.store.list('tasks', task.missionId)
+    if (!assignmentAllows(task, member.id, all) || !this.capable(task, member, all)) return false
+    // Keep useful context on the preferred member when it can take this work
+    // now. A busy, stopping, retired or non-independent preference cannot reserve
+    // an untouched task while another member is idle. This adds no reservation.
+    const preferred = this.rt.store.get('members', task.assigneeId)
+    return preferred === undefined || memberPhaseOf(preferred) === 'stopped'
+      || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
+      || pendingStopOwner(all, preferred.id)
+      || this.startBlocker(preferred) !== undefined
+      || !this.capable(task, preferred, all)
   }
 
   /**
@@ -544,9 +566,9 @@ export class Scheduling {
           || (task.reviewOf !== undefined && (() => {
             const source = this.rt.task(mission.id, task.reviewOf)
             return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
-              || (task.assigneeId !== undefined && this.rt.authorIds(source).has(task.assigneeId))
+              || !live.some(member => assignmentAllows(task, member.id, tasks) && !this.rt.authorIds(source).has(member.id))
           })())
-          || (task.assigneeId !== undefined && !live.some(member => member.id === task.assigneeId))
+          || (task.assigneeId !== undefined && !live.some(member => assignmentAllows(task, member.id, tasks)))
         if (stuck) { dead.add(task.id); changed = true }
       }
     }
@@ -575,13 +597,9 @@ export class Scheduling {
    */
   unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
     const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
     return unreviewed.every(task => {
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]!
-        if (event.type !== 'task/submitted' || (event.data as { taskId?: string } | undefined)?.taskId !== task.id) continue
-        return Date.now() - event.createdAt >= grace
-      }
+      const event = this.rt.store.latestTaskEvent(missionId, task.id, 'task/submitted')
+      if (event !== undefined) return Date.now() - event.createdAt >= grace
       // No durable submission record: the grace cannot have elapsed yet.
       return false
     })
@@ -608,27 +626,8 @@ export class Scheduling {
   quiescencePending(task: Task): boolean { return task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch }
 
   /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
-  selectDeliveryTarget(missionId: string, tasks: Task[]): Task {
-    const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
-    // A dependency reference to a replaced original also covers its accepted repair.
-    const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
-      if (seen.has(task.id)) return false
-      seen.add(task.id)
-      return task.dependencies.some(id => {
-        const identities = this.rt.dependencyIdentities(missionId, id, tasks)
-        return identities.has(sourceId) || tasks.some(parent => identities.has(parent.id) && covers(parent, sourceId, seen))
-      })
-    }
-    if (!tasks.some(task => task.kind === 'integration')) {
-      // A single reviewed implementation is the deliverable when the plan needed no assembly step.
-      if (implementations.length === 1 && implementations[0]!.artifact) return implementations[0]!
-      throw new Error('A unique independently accepted implementation artifact is required when the plan has no integration task')
-    }
-    const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
-    // A later integration may subsume an earlier one; never guess among independent final artifacts.
-    const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && covers(other, candidate.id)))
-    if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required')
-    return finals[0]!
+  selectDeliveryTarget(_missionId: string, tasks: Task[]): Task {
+    return selectAcceptedDelivery(tasks)
   }
 
   /** One completion policy is shared by manual controls and automatic requests. */
@@ -832,8 +831,9 @@ export class Scheduling {
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
       const mission = this.rt.store.get('missions', missionId)
-      if (progressed && mission?.schedulingStallNotice !== undefined) {
+      if (progressed && mission !== undefined && (mission.schedulingStallNotice !== undefined || mission.schedulingWedgeNotice !== undefined)) {
         delete mission.schedulingStallNotice
+        delete mission.schedulingWedgeNotice
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
       }
       if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {
@@ -930,7 +930,8 @@ export class Scheduling {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return
     const fingerprint = info.fingerprintNow
-    if (mission.schedulingStallNotice === fingerprint) return
+    const noticeKey = info.reason === 'pass-timeout' ? 'schedulingWedgeNotice' : 'schedulingStallNotice'
+    if (mission[noticeKey] === fingerprint) return
     // A pass-timeout wedge is its own subject: the pass body was abandoned and its
     // guard released. A board-level witness (another notice that announced the
     // same fingerprint) must not suppress it — that cross-subject conflation is
@@ -978,7 +979,7 @@ export class Scheduling {
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
     const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
-    mission.schedulingStallNotice = fingerprint
+    mission[noticeKey] = fingerprint
     mission.updatedAt = Date.now()
     mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
     this.rt.commit(missionId, () => {

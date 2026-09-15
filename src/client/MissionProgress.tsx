@@ -1,57 +1,25 @@
 import type { Snapshot } from '../types.ts'
-import { useEffect, useState } from 'react'
-import { avatarCells } from './avatar.ts'
-import { acceptanceSummary, activityDuration, currentProgress, recentProgress, sidebarState, type ConnectionState } from './progress.ts'
+import { acceptanceSummary, activityDuration, currentProgress, sidebarState, type ConnectionState } from './progress.ts'
 import { useCopy } from './locale.tsx'
-import { projectLiveWork } from './live-work.ts'
+import type { LiveWorkProjection } from './live-work.ts'
 
 function timestamp(value: number): string { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }
-/**
- * R17-G12: the worker's sprite, drawn inline as `<rect>`s with `crispEdges`.
- * It is decoration derived from the name, so it is `aria-hidden` — identity
- * stays with the name text — and it adds no image asset, no request, no
- * dependency and no model turn.
- */
-export function WorkerAvatar({ name, size: requested }: { name: string; size?: number }) {
-  const sprite = avatarCells(name), base = sprite.grid * sprite.cell
-  // OWNER PASS 2026-09-11 #2: the sprite is scaled by a whole or half step, so the
-  // pixel grid stays crisp at every size the layout asks for — 48px is 1.5x a 32px
-  // sprite (6px cells, integer at a 2x device pixel ratio), 28px is the compact
-  // activity header, and the default renders the grid exactly.
-  const scale = requested === undefined ? 1 : Math.max(1, Math.round((requested / base) * 2) / 2)
-  const size = base * scale
-  return <svg className="sw-worker-avatar" aria-hidden="true" focusable="false" role="presentation"
-    width={size} height={size} viewBox={`0 0 ${base} ${base}`} shapeRendering="crispEdges">
-    {sprite.cells.map(cell => <rect key={`${cell.x}:${cell.y}`} x={cell.x * sprite.cell} y={cell.y * sprite.cell}
-      width={sprite.cell} height={sprite.cell} fill={cell.color} />)}
-  </svg>
-}
-export function MissionProgress({ snapshot, connection = 'connected', live = false, observedAt }: { snapshot: Snapshot; connection?: ConnectionState; live?: boolean; observedAt?: number }) {
-  const t = useCopy(), current = currentProgress(snapshot, connection)
-  const [clock, setClock] = useState(() => live && connection === 'connected' ? Date.now() : current.activity?.updatedAt ?? snapshot.mission.updatedAt)
-  useEffect(() => {
-    if (!live || connection !== 'connected' || !current.activity) return
-    setClock(Date.now())
-    const timer = setInterval(() => setClock(Date.now()), 1000)
-    return () => clearInterval(timer)
-  }, [live, connection, current.activity?.id])
-  const currentTime = live && connection === 'connected' ? Math.max(clock, observedAt ?? 0) : observedAt ?? current.activity?.updatedAt ?? snapshot.mission.updatedAt
-  const operation = projectLiveWork(snapshot, { connection: live ? connection : 'paused', now: currentTime, observedAt }).rows.find(row => row.member.id === current.member?.id)
+/** Presentation only: its owner supplies the same realtime view used by the member rows. */
+export function MissionProgress({ snapshot, view, connection = 'connected', live = false }: { snapshot: Snapshot; view: LiveWorkProjection; connection?: ConnectionState; live?: boolean }) {
+  const t = useCopy(), current = currentProgress(snapshot, connection, view.rows)
+  const operation = view.rows.find(row => row.member.id === current.member?.id)
   const unconfirmed = live && operation?.state === 'quiet'
-  const duration = current.activity ? activityDuration(current.activity.startedAt, currentTime) : undefined
+  const duration = current.activity ? activityDuration(0, operation?.operationDurationMs ?? 0) : undefined
   // R15-B: the owner-facing phase, its recovery age and any pending decision are
   // derived from durable rows only (see `sidebarState`); this render adds no
   // timer, request or model turn.
-  const owner = sidebarState(snapshot, connection, live && connection === 'connected' ? clock : (current.observedAt ?? snapshot.mission.updatedAt))
+  const owner = sidebarState(snapshot, connection, view.referenceTime)
   return <div className="sw-focus" data-swarm-phase={owner.phase} data-swarm-current={current.activity?.kind ?? snapshot.mission.status} data-stale={live && (current.stale || owner.stale || unconfirmed)}>
     {(!live || current.stale) && <small>{t(!live ? 'Recorded state' : 'Last observed state')}</small>}
     <strong>{t(unconfirmed ? 'Waiting for activity confirmation' : current.label)}</strong>
     {current.task && <p>{current.task.title}</p>}
     {current.note && <p className="sw-focus-note">{t(current.note)}</p>}
-    {/* OWNER PASS 2026-09-11: the member sprite lives in the member's own row
-        (`TeamActivity`), not floating in the mission focus line, and the row is
-        also where the member's progress bar is. This line keeps the name for
-        screen readers and the focus contract without drawing a second avatar. */}
+    {/* The portrait belongs to the member row; the focus keeps its accessible name. */}
     {current.member && <p className="sw-focus-note sw-person" data-swarm-member={current.member.id}
       data-swarm-worker-name={current.member.name} data-swarm-worker-role={current.member.role}>
       {`${current.member.name} · ${current.member.role}`}{current.activity?.tool ? ` · ${current.activity.tool}` : ''}
@@ -78,17 +46,6 @@ export function MissionProgress({ snapshot, connection = 'connected', live = fal
     </details>
     {live && (current.stale || owner.stale) && <p className="sw-focus-note">{t('Current execution is unconfirmed until updates resume.')}</p>}
   </div>
-}
-
-export function RecentProgress({ snapshot }: { snapshot: Snapshot }) {
-  const t = useCopy(), events = recentProgress(snapshot), counts = acceptanceSummary(snapshot)
-  return <section className="sw-recent" data-swarm-progress="">
-    <div className="sw-row"><h3>{t('Recent progress')}</h3><span className="sw-accepted-count" data-swarm-accepted="">{counts.accepted} / {counts.total} {t('tasks accepted')}</span></div>
-    {events.length ? <ol>{events.map(event => <li key={event.seq} data-swarm-progress-event={event.seq}>
-      <time dateTime={new Date(event.createdAt).toISOString()}>{timestamp(event.createdAt)}</time>
-      <div><p>{t(event.label)}</p>{event.detail && <small>{event.detail}</small>}</div>
-    </li>)}</ol> : <p className="sw-muted">{t('No progress events recorded yet.')}</p>}
-  </section>
 }
 
 export function ResultSummary({ snapshot }: { snapshot: Snapshot }) {

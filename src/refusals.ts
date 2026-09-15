@@ -32,6 +32,10 @@ export function validatedBudget(input: Budget): Budget {
     if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${key}`)
     budget[key] = value
   }
+  if (input.deadlineAt !== undefined) {
+    if (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 1) throw new Error('Invalid budget deadlineAt')
+    budget.deadlineAt = input.deadlineAt
+  }
   return budget
 }
 
@@ -47,6 +51,22 @@ export function unsupportedEffort(error: unknown): { requested?: string; message
   if (code !== 'UNSUPPORTED_REASONING_EFFORT' && !/does not support reasoning effort/i.test(message)) return undefined
   const requested = /reasoning effort "([^"]+)"/i.exec(message)?.[1]
   return { ...(requested === undefined ? {} : { requested }), message }
+}
+
+type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
+  { candidate: AdmissionCandidate }
+  | { missionId: string; chain: GuardChainId; context: GuardTerminalContext }
+)
+const writerRecoveries = new WeakMap<SwarmRuntime, Map<string, WriterBusyRecovery & { count: number }>>()
+
+/** Coalesce one failed origin, retaining distinct admissions and guard failures. */
+export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery): void {
+  const pending = writerRecoveries.get(rt) ?? new Map<string, WriterBusyRecovery & { count: number }>()
+  writerRecoveries.set(rt, pending)
+  const key = 'candidate' in recovery ? `admission:${recovery.candidate.missionId}:${admissionRowId(recovery.candidate, 'writer_busy')}`
+    : `guard:${JSON.stringify([recovery.missionId, recovery.chain, recovery.context.taskId, recovery.context.memberId])}`
+  const previous = pending.get(key)
+  pending.set(key, { ...recovery, at: previous?.at ?? recovery.at, count: (previous?.count ?? 0) + 1 })
 }
 
 export class RefusalRegistry {
@@ -132,7 +152,7 @@ export class RefusalRegistry {
       this.rt.commit(candidate.missionId, () => this.upsertAdmission(record))
     } catch (error) {
       if (error instanceof WriterBusyError) {
-        this.rt.writerBusy = { at: Date.now(), attempts: error.attempts, candidate, detail: error.message }
+        queueWriterBusy(this.rt, { at: Date.now(), attempts: error.attempts, candidate, detail: error.message })
         return
       }
       throw error
@@ -154,15 +174,33 @@ export class RefusalRegistry {
    * Flush the classified writer conflict as a durable `writer_busy` admission row
    * once the writer is free again. The flag survives while the store stays busy.
    */
-  recordWriterBusyRecovery(mission: Mission): void {
-    const busy = this.rt.writerBusy
-    if (busy === undefined) return
-    const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, Date.now() - busy.at))
-    try {
-      this.rt.commit(mission.id, () => this.upsertAdmission(record))
-      this.rt.writerBusy = undefined
-    } catch (error) {
-      if (!(error instanceof WriterBusyError)) { this.rt.writerBusy = undefined; throw error }
+  recordWriterBusyRecovery(mission?: Mission): void {
+    const pending = writerRecoveries.get(this.rt)
+    if (pending === undefined) return
+    for (const [key, busy] of pending) {
+      const missionId = 'candidate' in busy ? busy.candidate.missionId : busy.missionId
+      if (mission !== undefined && mission.id !== missionId) continue
+      try {
+        this.rt.commit(missionId, () => {
+          if ('candidate' in busy) {
+            const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, Date.now() - busy.at))
+            record.count = busy.count; record.firstAt = busy.at
+            this.upsertAdmission(record)
+          } else {
+            // This was a failed escalation write, never an admission decision.
+            // Record the historical failure; normal guards re-evaluate today's state.
+            this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
+              cause: 'guard-terminal-write-failed', chain: busy.chain,
+              taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
+              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at, ownerNotified: false,
+            })
+          }
+        })
+        if (pending.get(key) === busy) pending.delete(key)
+      } catch (error) {
+        if (error instanceof WriterBusyError) return
+        throw error
+      }
     }
   }
 
@@ -301,36 +339,40 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
   const task = context.taskId ?? 'the held work'
   const member = context.memberId ?? 'the member'
   const messages: Record<GuardChainId, string> = {
-    budget: `[budget_terminal] The mission budget is exhausted or paused (${described(context, 'no lease can be admitted')}), so ${member} cannot be given work and no attempt can renew. Raise the mission ceiling with \`swarm_budget\` by passing the raised \`budget\` and a \`reason\`, or withdraw the work holding the slot with \`swarm_cancel\` by naming the \`taskId\` and a \`reason\`, then decide with \`swarm_control\` and an \`action\`.`,
-    workspace: `[workspace_terminal] The mission workspace cannot produce an artifact (${described(context, 'workspace state is unresolved')}), so ${task} would loop without an exit. Repair the member workspace, then re-propose the blocked work with \`swarm_propose\` by passing the \`objective\`, \`dependencies\` and \`replaces\`, or withdraw it with \`swarm_cancel\` by naming the \`taskId\` and a \`reason\`.`,
-    attempt_lease: `[attempt_terminal] The attempt on ${task} cannot advance (${described(context, 'the lease or the workspace guard refused it')}). Release the attempt with \`swarm_handoff\` by passing the \`attemptId\` and a \`summary\` and let the next owner resume, or withdraw the task with \`swarm_cancel\` and its \`taskId\` and then re-propose the work with \`swarm_propose\` and its \`objective\`.`,
-    task_ceiling: `[task_ceiling_terminal] ${task} exhausted its own ceiling (${described(context, 'step or finding limit')}) and cannot be dispatched again. Propose its replacement with \`swarm_propose\`: name it in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` inside the mission budget, keeping the acceptance criteria verbatim; or withdraw it with \`swarm_cancel\` and its \`taskId\`.`,
-    admission: `[dependency_assumption_missing] ${task} declares no dependency while its text assumes prior work is already available (${described(context, 'the worktree would be prepared from the bare mission baseline')}), so the work starts without the content it needs. Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task with the same acceptance criteria and budget; a repair may name the blocked task in \`replaces\` instead.`,
+    budget: `[budget_terminal] The mission budget is exhausted or paused (${described(context, 'no lease can be admitted')}), so ${member} cannot be given work and no attempt can renew. Raise the finite mission ceiling with \`swarm_budget\` using \`budget\` and \`reason\`; a sufficient extension resumes budget-paused work after stop confirmation. Explicit user pause remains until \`swarm_control\` with \`action: resume\`. Use \`swarm_cancel\` with \`taskId\` and \`reason\` to withdraw mistaken work; cancellation never resets consumed budget.`,
+    workspace: `[workspace_terminal] ${task} cannot prepare its workspace (${described(context, 'workspace state is unresolved')}). Repair the condition, then use \`swarm_control\` with \`taskId\`, \`action: resume\` and \`reason\`; or amend the same task's scope/dependencies/assignee with \`action: amend\` and \`changes\`.`,
+    attempt_lease: `[attempt_terminal] ${task} cannot advance (${described(context, 'the lease or workspace guard refused it')}). The owner can use \`swarm_control\` with \`taskId\`, \`action: amend\`, \`changes.assigneeId\` and \`reason\` to fence and reassign it, or \`action: resume\` after repair. No member attemptId is required.`,
+    task_ceiling: context.taskId === undefined ? `[task_ceiling_terminal] Mission admission reached its allocation (${described(context, 'admission budget')}). Review the need and use \`swarm_budget\` with a finite raised \`budget\` and \`reason\`, then retry the original admission.` : `[task_ceiling_terminal] ${task} reached its execution estimate (${described(context, 'step limit')}). Review progress, then raise its finite allocation with \`swarm_budget\` using \`taskId\`, \`taskBudget\` and \`reason\`. Raise the mission budget first if needed. Preserve this task, its consumption, dependencies and evidence; no replacement is needed.`,
+    admission: `[dependency_assumption_missing] ${task} declares no dependency while its text assumes prior work is already available (${described(context, 'the worktree would be prepared from the bare mission baseline')}), so the work starts without the content it needs. ${context.taskId === undefined ? 'Correct the proposal with `swarm_propose` by passing the content-carrying `dependencies`, or state in `objective` how the work will obtain that content.' : 'Amend this admitted task with `swarm_control` using `taskId`, `action: amend`, `changes.dependencies` and `reason` to name the task carrying the required content.'} Preserve the acceptance criteria and consumed work.`,
     review_admission: `[review_admission_terminal] Submitted work ${task} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`acceptance\`, or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`,
     owner_reply: `[owner_reply_missing] An owner-facing question was delivered and the owner's turn ended without binding an answer to it (${described(context, 'the receipt is still open')}). Answer it with \`swarm_message\` by passing \`to\`, \`kind: 'question'\`, the answer in \`content\` and the asked question's id in \`replyTo\`, or close it deliberately with \`dismiss: true\` and a \`replyTo\`; prose in the conversation is never delivered to the asker.`,
-    dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`, free a slot or raise a limit with \`swarm_budget\` and its \`budget\`, repair the work with \`swarm_propose\` and its \`replaces\`, withdraw the stuck work with \`swarm_cancel\` and its \`taskId\`, or decide with \`swarm_control\` and its \`action\`.`,
+    dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`. Extend resource allocations with \`swarm_budget\`; amend an unsubmitted task or resume it after environment repair with \`swarm_control\` and its \`taskId\`. Rejected implementations require \`swarm_propose\` with \`replaces\` and unchanged acceptance. Withdraw mistaken work with \`swarm_cancel\`, or decide to complete or stop with \`swarm_control\` and its \`action\`.`,
   }
   const exits: Record<GuardChainId, DecisionExit[]> = {
     budget: [
       { tool: 'swarm_budget', parameter: 'budget', instruction: 'raise the mission ceiling with a reason' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the work holding the slot' },
-      { tool: 'swarm_control', parameter: 'action', instruction: 'resume, complete or stop the mission' },
+      { tool: 'swarm_control', parameter: 'action', instruction: 'resume an explicit user pause, or complete or stop the mission' },
     ],
     workspace: [
-      { tool: 'swarm_propose', parameter: 'dependencies', instruction: 're-propose the work with the dependency that carries missing content' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'resume or amend the same task after workspace repair' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the work the workspace cannot produce' },
     ],
     attempt_lease: [
-      { tool: 'swarm_handoff', parameter: 'attemptId', instruction: 'release the attempt to another owner' },
-      { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the task and re-propose it' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend assignee or resume the same task after repair' },
+      { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw mistaken work' },
     ],
-    task_ceiling: [
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'propose the replacement with a raised ceiling' },
+    task_ceiling: context.taskId === undefined ? [
+      { tool: 'swarm_budget', parameter: 'budget', instruction: 'raise the finite mission admission allocation, then retry admission' },
+    ] : [
+      { tool: 'swarm_budget', parameter: 'taskBudget', instruction: 'raise the finite allocation of this taskId' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the exhausted task' },
     ],
-    admission: [
+    admission: context.taskId === undefined ? [
       { tool: 'swarm_propose', parameter: 'dependencies', instruction: 'add the dependency that carries the assumed content' },
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair the task that carried the content, or state in the objective how it will be obtained' },
+      { tool: 'swarm_propose', parameter: 'objective', instruction: 'state how the proposed work will obtain the required content' },
+    ] : [
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend the admitted task with changes.dependencies and a reason' },
     ],
     review_admission: [
       { tool: 'swarm_propose', parameter: 'reviewOf', instruction: 'admit an independent verification task' },
@@ -342,7 +384,9 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     ],
     dispatch_preconditions: [
       { tool: 'swarm_observe', parameter: 'taskId', instruction: 'read the exact blocker before deciding' },
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair or extend the board' },
+      { tool: 'swarm_budget', parameter: 'budget', instruction: 'extend the required allocation; use taskId and taskBudget for task allocations' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend unsubmitted policy or resume the same task after environment repair' },
+      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair a rejected implementation while preserving acceptance' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the stuck work' },
       { tool: 'swarm_control', parameter: 'action', instruction: 'complete or stop the mission' },
     ],
@@ -411,7 +455,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
     // The state is re-derived on the next pass, and the board-level witness path
     // still speaks for a stalled board, so no silence follows.
     if (error instanceof WriterBusyError) {
-      rt.writerBusy = { at: Date.now(), attempts: error.attempts, candidate: { missionId, memberId: 'runtime', taskId: context.taskId ?? 'unknown', taskClass: 'research', scope: '**', epoch: 0 }, detail: error.message }
+      queueWriterBusy(rt, { at: Date.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
       return terminal
     }
     throw error

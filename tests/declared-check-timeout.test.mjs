@@ -34,7 +34,7 @@ async function fixture(t, checks, options = {}) {
   }
 }
 
-for (const recovers of [false, true]) test(`real check deadline ${recovers ? 'recovers on retry' : 'blocks after retry'} with both passes durable`, async t => {
+for (const recovers of [false, true]) test(`real check deadline ${recovers ? 'recovers on retry' : 'defers same-artifact verification after retry'} with both passes durable`, async t => {
   const slow = 'printf "before-timeout\\nnot ok 1 - slow check\\n%02000d\\n" 0; sleep 60'
   const deadline = recovers
     ? `if test -f "$SWARM_TEST_MARKER"; then echo recovered; else : > "$SWARM_TEST_MARKER"; ${slow}; fi`
@@ -44,7 +44,8 @@ for (const recovers of [false, true]) test(`real check deadline ${recovers ? 're
   assert.equal(f.workers.verified.length, 2, 'a real timeout retries the same immutable artifact once')
   assert.equal(new Set(f.workers.verified.map(run => run.commit)).size, 1)
   assert.equal(verdict.status, recovers ? 'accepted' : 'blocked')
-  assert.equal(f.runtime.store.get('tasks', f.source.id).status, verdict.status)
+  assert.equal(f.runtime.store.get('tasks', f.source.id).status, recovers ? 'accepted' : 'submitted')
+  if (!recovers) assert.equal(verdict.verificationRecovery.commit, f.runtime.store.get('tasks', f.source.id).artifact.commit)
   const runs = f.runs()
   assert.deepEqual(runs.map(run => run.arguments.attempt), [1, 1, 2, 2])
   assert.deepEqual(runs.map(run => run.result.exitCode), [0, 124, 0, recovers ? 0 : 124])

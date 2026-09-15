@@ -1,11 +1,4 @@
-/**
- * W18 regression: a workspace or worker preparation failure during dispatch is
- * recoverable. Pre-fix the dispatch catch set the task straight to `blocked`
- * with no recovery credit, so only the owner could revive it. The fix mirrors
- * the attempt-failure, close-out and lease-expiry policy: one recovery credit
- * per failure, re-pend while the limit is not exhausted, block only then, keep
- * the reason in `task.output` and record a durable `task/preparation-failed`.
- */
+/** Preparation failures preserve task identity and use bounded retries only for typed transient causes. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -25,6 +18,7 @@ async function eventually(read, message, timeoutMs = 10000) {
 class PrepWorkers {
   calls = 0
   failures = 0
+  transient = true
   gate
   deliveries = []
   bind(callbacks) { this.callbacks = callbacks }
@@ -35,7 +29,7 @@ class PrepWorkers {
   isIdle() { return true }
   async prepareTask() {
     this.calls++
-    if (this.calls <= this.failures) throw new Error(`dirty workspace ${this.calls}`)
+    if (this.calls <= this.failures) throw Object.assign(new Error(`workspace condition ${this.calls}`), this.transient ? { code: 'EBUSY' } : {})
     if (this.gate) await this.gate
   }
   async captureArtifact() { return { commit: 'prep', baseCommit: 'base', workspace: '/isolated', changedPaths: [] } }
@@ -62,49 +56,65 @@ async function setup(t, overrides = {}) {
   return { runtime, workers, mission, owner, member, propose, task, events }
 }
 
-test('W18: a preparation failure spends one recovery credit and re-pends until it succeeds', async t => {
+test('R17: a transient preparation failure backs off and re-pends without spending task recovery credit', async t => {
   const f = await setup(t)
   f.workers.failures = 1
   let release
   f.workers.gate = new Promise(resolve => { release = resolve })
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
-  await eventually(() => f.task(proposed.id).recoveryCount === 1, 'the first preparation failure did not spend a recovery credit')
+  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded')
   const repended = f.task(proposed.id)
   assert.equal(repended.status, 'pending', 'a recoverable preparation failure re-pends the task')
-  assert.equal(repended.recoveryCount, 1)
-  assert.match(repended.output, /Workspace or worker preparation failed: (Error: )?dirty workspace 1/)
+  assert.equal(repended.recoveryCount ?? 0, 0)
+  assert.ok(repended.preparationFailure.retryAt > Date.now())
+  assert.match(repended.output, /Workspace or worker preparation failed: (Error: )?workspace condition 1/)
   const failed = f.events('task/preparation-failed')
   assert.equal(failed.length, 1)
   assert.equal(failed[0].data.taskId, proposed.id)
-  assert.equal(failed[0].data.recoveryCount, 1)
-  assert.equal(failed[0].data.maxRecoveryAttempts, 2)
+  assert.equal(failed[0].data.attempts, 1)
+  assert.equal(failed[0].data.transient, true)
   assert.equal(failed[0].data.status, 'pending')
   assert.equal(failed[0].data.epoch, repended.epoch, 'the event names the failed attempt epoch')
-  assert.match(failed[0].data.reason, /dirty workspace 1/)
+  assert.match(failed[0].data.reason, /workspace condition 1/)
   assert.equal(f.events('task/blocked').length, 0, 'the first failure does not block the task')
   release()
   await eventually(() => f.task(proposed.id).status === 'running', 'the task was not re-dispatched once preparation succeeded')
-  assert.equal(f.task(proposed.id).recoveryCount, 1, 'a successful dispatch spends no further credit')
+  assert.equal(f.task(proposed.id).recoveryCount ?? 0, 0, 'preparation never spends task execution credit')
   assert.equal(f.workers.calls, 2)
 })
 
-test('W18: a preparation failure blocks only when the recovery limit is exhausted', async t => {
+test('R17: transient preparation retries are bounded and end in owner-resumable wait', async t => {
   const f = await setup(t)
   f.workers.failures = Number.POSITIVE_INFINITY
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
   await eventually(() => f.task(proposed.id).status === 'blocked', 'the task never blocked after exhausting its recovery limit')
   const blocked = f.task(proposed.id)
-  assert.equal(blocked.recoveryCount, 2)
-  assert.match(blocked.output, /Workspace or worker preparation failed: (Error: )?dirty workspace 2/)
+  assert.equal(blocked.recoveryCount ?? 0, 0)
+  assert.equal(blocked.preparationFailure.attempts, 2)
+  assert.match(blocked.output, /swarm_control/)
+  assert.match(blocked.output, /Workspace or worker preparation failed: (Error: )?workspace condition 2/)
   const failed = f.events('task/preparation-failed')
   assert.deepEqual(failed.map(event => event.data.status), ['pending', 'blocked'])
-  assert.deepEqual(failed.map(event => event.data.recoveryCount), [1, 2])
+  assert.deepEqual(failed.map(event => event.data.attempts), [1, 2])
   assert.equal(failed.at(-1).data.taskId, proposed.id)
-  assert.match(failed.at(-1).data.reason, /dirty workspace 2/)
+  assert.match(failed.at(-1).data.reason, /workspace condition 2/)
   const blockEvents = f.events('task/blocked').filter(event => event.data.taskId === proposed.id)
   assert.equal(blockEvents.length, 1)
   assert.match(blockEvents[0].data.reason, /Workspace or worker preparation failed/)
   assert.equal(f.workers.calls, 2, 'no further preparation attempts after the block')
   await new Promise(resolve => setTimeout(resolve, 100))
   assert.equal(f.workers.calls, 2, 'a blocked task is not dispatchable again')
+})
+
+test('R17: deterministic preparation failures wait immediately for cause-changing owner recovery', async t => {
+  const f = await setup(t)
+  f.workers.transient = false
+  f.workers.failures = Number.POSITIVE_INFINITY
+  const proposed = f.propose({ maxRecoveryAttempts: 4 })
+  await eventually(() => f.task(proposed.id).status === 'blocked', 'deterministic failure should become resumable wait')
+  assert.equal(f.workers.calls, 1)
+  assert.equal(f.task(proposed.id).recoveryCount ?? 0, 0)
+  assert.match(f.task(proposed.id).output, /swarm_control/)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(f.workers.calls, 1, 'unchanged deterministic failure is not retried every tick')
 })

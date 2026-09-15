@@ -30,6 +30,7 @@ import { lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/prom
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
+import { PolicyError } from './policy-error.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
 export const TRACE_OPERATIONS = ['agent', 'tool', 'llm', 'retrieval', 'review', 'merge'] as const
@@ -56,6 +57,7 @@ export const isTraceStatus = (value: unknown): value is TraceStatus => value ===
 export const isTraceErrorType = (value: unknown): value is TraceErrorType => typeof value === 'string' && (TRACE_ERROR_TYPES as readonly string[]).includes(value)
 /** Map a thrown orchestration failure onto the closed `error.type` vocabulary. */
 export function errorTypeFor(error: unknown): TraceErrorType {
+  if (error instanceof PolicyError) return error.category
   const message = error instanceof Error ? error.message : String(error)
   if (/not a participant|unauthorized|Only the mission owner|Only a member|Only the primary user|Workers cannot|authenticated|bypass mission authority|owner session|workspace_not_authorized/i.test(message)) return 'authorization_error'
   if (/budget|exhausted|deadline/i.test(message)) return 'budget_error'
@@ -482,6 +484,8 @@ export interface TraceSpillState {
 /** Structural slice of `SwarmStore` the trace layer needs; keeps store.ts untouched. */
 export interface TraceStore {
   events(missionId: string, limit: number, after?: number): SwarmEvent[]
+  /** Newest matching spans in chronological order; optional for older store adapters. */
+  traceEvents?(missionId: string, limit: number, filter?: { taskId?: string; attemptId?: string; step?: string }): SwarmEvent[]
   event(missionId: string, type: string, actor: string, data: unknown): void
   transaction<T>(operation: () => T): T
 }
@@ -615,7 +619,17 @@ const HISTORY_SCAN_LIMIT = 100000
 const HISTORY_PAGE_DEFAULT = 50
 const HISTORY_PAGE_MAX = 500
 
+export interface TraceWindow {
+  limit: number
+  spans: number
+  truncated: boolean
+  source: 'trace-spans' | 'events'
+  firstSpanId?: string
+  lastSpanId?: string
+}
 interface SpanIndex {
+  truncated: boolean
+  source: TraceWindow['source']
   byTask: Map<string, TraceSpan[]>
   byAttempt: Map<string, TraceSpan[]>
   all: TraceSpan[]
@@ -652,8 +666,10 @@ export class TraceRecorder {
   private index(missionId: string): SpanIndex {
     const existing = this.indexes.get(missionId)
     if (existing) return existing
-    const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }
-    for (const event of this.store.events(missionId, SEED_LIMIT, 0)) {
+    const source = this.store.traceEvents ? 'trace-spans' : 'events'
+    const events = this.store.traceEvents?.(missionId, SEED_LIMIT + 1) ?? this.store.events(missionId, SEED_LIMIT + 1, 0)
+    const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [], source, truncated: events.length > SEED_LIMIT }
+    for (const event of events.slice(-SEED_LIMIT)) {
       if (event.type !== 'trace/span') continue
       const span = event.data as TraceSpan | undefined
       if (span === null || typeof span !== 'object' || typeof span.spanId !== 'string') continue
@@ -666,8 +682,24 @@ export class TraceRecorder {
     index.all.push(span)
     if (span.taskId) { const list = index.byTask.get(span.taskId) ?? []; list.push(span); index.byTask.set(span.taskId, list) }
     if (span.attemptId) { const list = index.byAttempt.get(span.attemptId) ?? []; list.push(span); index.byAttempt.set(span.attemptId, list) }
+    if (index.all.length > SEED_LIMIT) {
+      const expired = index.all.shift()!
+      for (const [map, key] of [[index.byTask, expired.taskId], [index.byAttempt, expired.attemptId]] as const) {
+        if (!key) continue
+        const list = map.get(key)!
+        list.shift()
+        if (list.length === 0) map.delete(key)
+      }
+      index.truncated = true
+    }
   }
   spansFor(missionId: string): TraceSpan[] { return [...this.index(missionId).all] }
+  /** Metrics explicitly describe the retained window, never imply complete history. */
+  windowFor(missionId: string): TraceWindow {
+    const index = this.index(missionId)
+    return { limit: SEED_LIMIT, spans: index.all.length, truncated: index.truncated, source: index.source,
+      ...(index.all.length ? { firstSpanId: index.all[0]!.spanId, lastSpanId: index.all.at(-1)!.spanId } : {}) }
+  }
   /**
    * A step with no mission scope (draft planning, the mission list) cannot
    * carry a valid `mission_id`, so it is counted rather than recorded. The
@@ -688,18 +720,33 @@ export class TraceRecorder {
       for (let position = spans.length - 1; position >= 0; position--) { const span = spans[position]!; if (predicate(span)) return span }
       return undefined
     }
+    // Once history exceeds the cache, resolve scoped parents directly in the
+    // durable span rows. Activity/tool events cannot hide a claim or submission,
+    // and a missing scoped parent must not attach this task to an unrelated one.
+    const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => {
+      const event = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)
+      const span = event?.data as TraceSpan | undefined
+      return span && typeof span.spanId === 'string' ? span : undefined
+    }
+    const lookup = (filter: { taskId?: string; attemptId?: string; step?: string }, spans: TraceSpan[] | undefined) =>
+      index.truncated && this.store.traceEvents ? stored(filter)
+        : latest(spans, span => filter.step === undefined || span.step === filter.step)
     if (context.step === 'swarm_verify' && context.reviewOfTaskId) {
-      const reviewed = index.byTask.get(context.reviewOfTaskId)
-      return (latest(reviewed, span => span.step === 'swarm_submit') ?? latest(reviewed))?.spanId ?? index.all.at(-1)?.spanId
+      const taskId = context.reviewOfTaskId, reviewed = index.byTask.get(taskId)
+      return (lookup({ taskId, step: 'swarm_submit' }, reviewed)
+        ?? (index.truncated && !this.store.traceEvents ? undefined : lookup({ taskId }, reviewed)))?.spanId
     }
     if (context.step !== 'swarm_claim' && context.attemptId) {
-      const attempt = index.byAttempt.get(context.attemptId)
-      const parent = latest(attempt, span => span.step === 'swarm_claim') ?? latest(attempt)
-      if (parent) return parent.spanId
+      const attemptId = context.attemptId, attempt = index.byAttempt.get(attemptId)
+      return (lookup({ attemptId, step: 'swarm_claim' }, attempt)
+        ?? (index.truncated && !this.store.traceEvents ? undefined : lookup({ attemptId }, attempt)))?.spanId
     }
     if (context.taskId) {
-      const parent = latest(index.byTask.get(context.taskId))
-      if (parent) return parent.spanId
+      const parent = lookup({ taskId: context.taskId }, index.byTask.get(context.taskId))
+      if (parent || context.step !== 'swarm_propose') return parent?.spanId
+      // A new proposal joins a mission-level setup span, never another task.
+      return (latest(index.all, span => !span.taskId && !span.attemptId)
+        ?? stored({ step: 'swarm_launch' }) ?? stored({ step: 'swarm_create' }) ?? stored({ step: 'swarm_stage' }))?.spanId
     }
     return index.all.at(-1)?.spanId
   }
@@ -756,6 +803,7 @@ export function spanContractViolation(span: unknown): string | undefined {
 
 export interface TraceViolation { seq?: number; spanId?: string; step?: string; reason: string }
 export interface TraceMetrics {
+  window?: TraceWindow
   spans: number
   roots: number
   contractCompliance: number
@@ -767,7 +815,7 @@ export interface TraceMetrics {
   payloads: { referenced: number; stored: number; omitted: number; verified: number; missing: number; mismatched: number; spill?: TraceSpillState }
 }
 /** Contract compliance, causal closure and first-violating-step over a span window (F-44). */
-export async function traceMetrics(spans: readonly TraceSpan[], options: { payloads?: TracePayloadStore; seqOf?: (span: TraceSpan, index: number) => number | undefined } = {}): Promise<TraceMetrics> {
+export async function traceMetrics(spans: readonly TraceSpan[], options: { payloads?: TracePayloadStore; seqOf?: (span: TraceSpan, index: number) => number | undefined; window?: TraceWindow } = {}): Promise<TraceMetrics> {
   const violations: TraceViolation[] = []
   const operations: Record<string, number> = {}
   const payloads: TraceMetrics['payloads'] = { referenced: 0, stored: 0, omitted: 0, verified: 0, missing: 0, mismatched: 0 }
@@ -798,6 +846,7 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
   const total = spans.length
   const first = violations.find(violation => violation.seq !== undefined) ?? violations[0]
   return {
+    ...(options.window === undefined ? {} : { window: options.window }),
     spans: total, roots, contractCompliance: total === 0 ? 1 : (total - violations.length) / total,
     causalClosure: total === 0 ? 1 : (total - orphans) / total, orphanParents: orphans, violations,
     ...(first === undefined ? {} : { firstViolatingStep: first }), operations, payloads,
@@ -810,7 +859,13 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
  * events (F-12) and the trace rows themselves.
  */
 export const EVENT_VOCABULARY: Record<string, string> = {
-  'mission/created': 'Mission admitted with its frozen scope and budget',
+  'task/verification-deferred': 'Check infrastructure needs repair; exact submitted source and verification evidence preserved',
+  'task/amended': 'Owner revised task execution policy while retaining task identity and acceptance',
+  'mission/scope-amended': 'Owner revised execution scope within the human workspace authorization',
+  'task/plan-repaired': 'Unused staged task policy repaired with its previous revision preserved',
+  'member/plan-repaired': 'Staged member configuration repaired after stop acknowledgement',
+  'plan/admissions-repaired': 'Saved plan reconciled with retained mission and resource identities',
+  'mission/created': 'Mission admitted with its initial scope and budget',
   'mission/recovered': 'Host restarted and recovered the mission from durable state',
   'mission/budget-updated': 'Owner changed the resource ceilings without resetting usage',
   'mission/stalled': 'No schedulable work remains and every live worker is idle',
@@ -831,7 +886,7 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'task/cancelled': 'Owner withdrew admitted work; dependents named as stranded',
   'task/cancelled-at-completion': 'Unschedulable leftover cancelled at mission completion',
   'task/lease-expired': 'Attempt lease expired and the owner was released',
-  'task/ceiling-exhausted': 'Task exhausted its own step or finding ceiling and blocked without charging the mission budget',
+  'task/ceiling-exhausted': 'Task exhausted its step allocation and preserved work for owner-directed continuation',
   'task/checkpointed': 'Workspace checkpoint captured before reassignment',
   'task/checkpoint-failed': 'Checkpoint capture failed; workspace preserved, recovery refuses a dirty tree',
   'task/closeout-nudged': 'Idle worker nudged to finish its open attempt',
@@ -960,7 +1015,8 @@ export function readEventHistory(store: TraceStore, missionId: string, options: 
   const limit = Math.min(HISTORY_PAGE_MAX, Math.max(1, Math.trunc(options.limit ?? HISTORY_PAGE_DEFAULT)))
   const before = options.before
   if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) throw new Error('before must be a nonnegative integer')
-  const all = store.events(missionId, HISTORY_SCAN_LIMIT, 0)
+  const scanned = store.events(missionId, HISTORY_SCAN_LIMIT + 1, 0)
+  const all = scanned.slice(-HISTORY_SCAN_LIMIT)
   const window = before === undefined ? all : all.filter(event => event.seq < before)
   const events = window.slice(-limit)
   const hasOlder = window.length > events.length
@@ -968,7 +1024,7 @@ export function readEventHistory(store: TraceStore, missionId: string, options: 
     events, total: all.length, pageSize: limit,
     ...(events.length ? { firstSeq: events[0]!.seq, lastSeq: events.at(-1)!.seq } : {}),
     ...(hasOlder && events.length ? { nextBefore: events[0]!.seq } : {}),
-    hasOlder, truncated: all.length >= HISTORY_SCAN_LIMIT,
+    hasOlder, truncated: scanned.length > HISTORY_SCAN_LIMIT,
   }
 }
 
@@ -1076,13 +1132,25 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
   // replayed into a sequence that no legal mission could have produced.
   const graph: TaskGraphNode[] = []
   for (const event of events) {
-    if (event.type !== 'task/proposed') continue
-    const data = asObject(event.data, event.seq, event.type)
-    graph.push({
-      id: required(data, 'id', event.seq),
-      dependencies: Array.isArray(data.dependencies) ? data.dependencies.filter((id): id is string => typeof id === 'string') : [],
-      ...(typeof data.reviewOf === 'string' && data.reviewOf ? { reviewOf: data.reviewOf } : {}),
-    })
+    if (event.type === 'task/proposed') {
+      const data = asObject(event.data, event.seq, event.type)
+      graph.push({
+        id: required(data, 'id', event.seq),
+        dependencies: Array.isArray(data.dependencies) ? data.dependencies.filter((id): id is string => typeof id === 'string') : [],
+        ...(typeof data.reviewOf === 'string' && data.reviewOf ? { reviewOf: data.reviewOf } : {}),
+      })
+    } else if (event.type === 'task/amended' || event.type === 'task/plan-repaired') {
+      const data = asObject(event.data, event.seq, event.type)
+      const taskId = required(data, 'taskId', event.seq)
+      const node = graph.find(task => task.id === taskId)
+      if (!node) throw new ReplayTruncationError(`durable log lacks the admission for amended task ${taskId}`, [taskId])
+      const changes = asObject(event.type === 'task/amended' ? data.changes : data.task, event.seq, `${event.type} changes`)
+      if (Array.isArray(changes.dependencies)) node.dependencies = [...new Set(changes.dependencies.filter((id): id is string => typeof id === 'string' && id !== node.reviewOf))]
+      if (event.type === 'task/plan-repaired') {
+        if (typeof changes.reviewOf === 'string' && changes.reviewOf) node.reviewOf = changes.reviewOf
+        else delete node.reviewOf
+      }
+    }
   }
   const graphDefects = taskGraphDefects(graph)
   if (graphDefects.length > 0) {
@@ -1098,6 +1166,11 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       if (reason) throw new TraceContractError(`trace span at seq ${event.seq} violates the D6 contract: ${reason}`, event.seq, (event.data as Partial<TraceSpan>).step)
       continue
     }
+    if (event.type === 'task/amended') {
+      const data = asObject(event.data, event.seq, event.type)
+      if (typeof data.fencedAttemptId === 'string' && open.get(data.fencedAttemptId)?.taskId === data.taskId) open.delete(data.fencedAttemptId)
+      continue
+    }
     if (event.type !== 'task/claimed' && !ATTEMPT_CLOSERS.has(event.type)) continue
     const data = asObject(event.data, event.seq, event.type)
     if (event.type === 'task/claimed') {
@@ -1105,6 +1178,9 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       const attempt = asObject(data.attempt, event.seq, 'task/claimed attempt')
       const attemptId = required(attempt, 'id', event.seq)
       const memberId = required(attempt, 'ownerId', event.seq)
+      const earlier = [...open.entries()].find(([, record]) => record.taskId === taskId)
+      if (earlier) throw new ReplayTruncationError(`durable log is truncated: ${taskId} was dispatched again at seq ${event.seq} before attempt ${earlier[0]} reached a closing event`, [`${taskId}#${earlier[0]}`])
+      if (open.has(attemptId)) throw new ReplayCorruptionError(`attempt ${attemptId} was claimed for another task at seq ${event.seq}`, event.seq)
       commands.push({ kind: 'dispatch', seq: event.seq, taskId, memberId, attemptId })
       open.set(attemptId, { taskId, memberId })
       continue

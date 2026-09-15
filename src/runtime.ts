@@ -3,11 +3,12 @@ import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts } from './attempts.ts'
+import { Attempts, pendingStopOwner } from './attempts.ts'
+import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions, type WakePrecision } from './notices.ts'
-import { RefusalRegistry, emitGuardTerminal, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
+import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
@@ -15,13 +16,17 @@ import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
+import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
-import { validScope } from './scope.ts'
+import { validScope, scopeSubset } from './scope.ts'
 import { assertScopeSelectors, formatDiagnostic, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { orderedTasks, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { assignmentAllows } from './assignment.ts'
+import { executionClock, executionElapsed } from './resource-time.ts'
+import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
@@ -560,6 +565,14 @@ const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =
   typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
 /** The model-visible position already delivered to one member; the next default read starts after it. */
 interface DeliveredCursor { eventSeq: number; runSeq: number; postSeq: number; current?: string }
+type OwnerRows = Record<'board' | 'members' | 'evidence', Array<{ id: string }>>
+interface OwnerCursor {
+  scope: string
+  token: string
+  eventSeq: number
+  postSeq: number
+  rows: Record<keyof OwnerRows, Map<string, string>>
+}
 /**
  * S5c: consecutive `workers.start` failures, carried on the member row so the
  * count survives a lost map or a restart instead of handing a failing route a
@@ -605,7 +618,7 @@ export class SwarmRuntime {
    *  clears it and asserts the durable result is unchanged):
    *   - `queues`, `releasedPasses`, `idleSignals` (durable `Task.idleSignal`),
    *     `startFailures`, `budgetStops`, `operations`, `startControllers`,
-   *     `fingerprintCache` (keyed by store revision), `observeCursors`.
+   *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
    *
    * There is deliberately no in-memory `scheduled` Set: the Row-13 incident was
    * that Set swallowing the tick timer's only liveness action while the pass it
@@ -622,6 +635,8 @@ export class SwarmRuntime {
    */
   private readonly operations = new Set<Promise<unknown>>()
   private readonly startControllers = new Map<string, AbortController>()
+  private readonly workerStarts = new Map<string, { controller: AbortController; promise: Promise<void>; retryAfter?: number; nativePending?: boolean; admissionSignal?: AbortSignal }>()
+  private disposal?: Promise<void>
   
   
   /**
@@ -638,11 +653,12 @@ export class SwarmRuntime {
    * so a stale position can never hide events from a member.
    */
   private readonly observeCursors = new Map<string, DeliveredCursor>()
+  // Explicit compact-view baselines scoped to owner/mission. Recent cursors
+  // remain replayable after a lost response; eviction/restart gives a full reset.
+  private readonly ownerObserveCursors = new Map<string, OwnerCursor>()
   private timer?: ReturnType<typeof setInterval>
   closed = false
   shuttingDown = false
-  /** A classified SQLITE_BUSY that must become a durable `writer_busy` admission row. */
-  writerBusy?: { at: number; attempts: number; candidate: AdmissionCandidate; detail: string }
   /**
    * F2: automatic review admissions per submitted source, and the exact
    * owner-notice already sent for an unreviewable one. The map keeps the
@@ -873,21 +889,27 @@ export class SwarmRuntime {
             if (memberPhaseOf(member) !== 'stopped') { member.phase = 'stopped'; this.store.put('members', member) }
           }
         })
+        for (const task of this.store.list('tasks', mission.id)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(mission.id, task)
         continue
       }
       this.commit(mission.id, () => {
+        if (mission.executionTime !== undefined) {
+          const lastEvent = this.store.events(mission.id, 1).at(-1)?.createdAt ?? mission.updatedAt
+          mission.executionTime = { usedMs: executionElapsed(mission, lastEvent) }; executionClock(mission, false); this.store.put('missions', mission)
+        }
         if (mission.budgetPause) { mission.budgetPause.quiesced = true; this.store.put('missions', mission) }
         for (const task of this.store.list('tasks', mission.id)) {
-          if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
-            const reason = task.resumeAfterStop.reason
-            // A handoff never spends recovery credit; lease expiry and idle
-            // close-out respect the task's recovery limit across restarts.
-            const exhausted = (task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? this.config.maxTasksPerMember)
-            task.status = reason === 'handoff' || !exhausted ? 'pending' : 'blocked'
-            delete task.resumeAfterStop
+          // Finding volume is advisory. Retire only this obsolete ceiling;
+          // independent rejection or preparation failures still need repair.
+          if (task.ceiling?.dimension === 'maxFindings') {
+            delete task.ceiling
+            const refuted = task.evidenceIds.some(evidenceId => this.store.get('evidence', evidenceId)?.status === 'refuted')
+            if (task.status === 'blocked' && task.resumeAfterStop === undefined && task.artifact === undefined && !task.verificationRecovery && !task.preparationFailure && !refuted) task.status = 'pending'
             this.store.put('tasks', task)
-            this.store.event(mission.id, 'task/quiescence-recovered', 'runtime', { taskId: task.id, reason })
           }
+          // A cold host confirms the old process is gone, but a durable stop
+          // still owes WIP preservation before another member may reuse it.
+          if (task.resumeAfterStop?.epoch === task.epoch) continue
           if (task.status === 'running') {
             // R11-07: a host restart is a host-caused stop, never a worker
             // recovery failure. No recovery credit is spent (a
@@ -920,19 +942,16 @@ export class SwarmRuntime {
         }
         this.store.event(mission.id, 'mission/recovered', 'runtime', {})
       })
+      for (const task of this.store.list('tasks', mission.id)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(mission.id, task)
       if (mission.status === 'active') unstarted.push(mission)
       this.kick(mission.id)
     }
-    // R15-A2: the tick timer is installed AFTER every recovery commit (so no
-    // tick can write a stale mission row over a recovery) but BEFORE the first
-    // worker startup is awaited. A `workers.start` that never settles therefore
-    // cannot silence the owner: the timer keeps pumping the outbox, releasing a
-    // wedged pass and generating decision notices off the pass.
+    // Install the ticker after recovery commits, before independent native
+    // starts. It keeps delivering notices and checking budgets during recovery.
     this.startTicker()
-    for (const mission of unstarted) {
-      if (this.shuttingDown) break
-      await this.ensureWorkers(mission)
-    }
+    // Native recovery is independent per member. Plugin registration must finish
+    // even when one host startup is slow; each startup has its own abort bound.
+    for (const mission of unstarted) this.ensureWorkers(mission)
   }
   /**
    * R15-A2: the queue-external tick. Everything here reads durable rows and runs
@@ -949,23 +968,35 @@ export class SwarmRuntime {
    * sees the released row rather than racing the watchdog for the same state.
    */
   private startTicker(): void {
+    if (this.timer !== undefined) return
     this.timer = setInterval(() => {
+      if (this.closed || this.shuttingDown) return
       // S2: the outbox pump is driven from the tick timer, never from a mission
       // queue. A durable owner notice is delivered even when the mission's pass
       // is wedged in an adapter call or the lock is otherwise held, because the
       // pump reads only durable rows and never takes `exclusive`.
-      this.pumpOutbox()
-      this.sweepStarts()
-      this.checkSchedulingPasses()
-      this.sweepDecisions()
-      for (const mission of this.store.list('missions')) {
+      this.tickGuard('outbox', () => this.pumpOutbox())
+      this.tickGuard('starts', () => this.sweepStarts())
+      this.tickGuard('passes', () => this.checkSchedulingPasses())
+      this.tickGuard('decisions', () => this.sweepDecisions())
+      this.tickGuard('writer-recovery', () => this.refusals.recordWriterBusyRecovery())
+      this.tickGuard('missions', () => { for (const mission of this.store.list('missions')) this.tickGuard(`mission ${mission.id}`, () => {
+        if (mission.executionTime !== undefined) executionClock(mission, mission.executionTime.since !== undefined)
         // Deadline cancellation cannot queue behind a long verification holding the mission queue.
         if (mission.status === 'active' && Date.now() >= mission.deadline) this.blockBudget(mission)
         else if (mission.status === 'active') this.warnBudget(mission)
         if (!terminal(mission)) this.kick(mission.id)
-      }
+      }) })
     }, this.config.tickMs)
     this.timer.unref()
+  }
+  /** A failed durable write must not silence unrelated guards or missions. */
+  private tickGuard(name: string, operation: () => void): void {
+    try { operation() }
+    catch (error) {
+      // Logging must not throw into the timer either (for example a closed pipe).
+      try { if (!this.closed) process.stderr.write(`[agent-swarm] ${name} tick failed: ${String(error)}\n`) } catch { /* next tick retries durable state */ }
+    }
   }
   /**
    * R15-F2, deleted by R17-G7: `reconcileMemberStatus` used to upgrade a stale
@@ -1006,6 +1037,8 @@ export class SwarmRuntime {
     if (this.closed || this.shuttingDown) return
     for (const mission of this.store.list('missions')) {
       if (this.closed || this.shuttingDown) return
+      for (const task of this.store.list('tasks', mission.id)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(mission.id, task)
+      if (mission.status === 'blocked') { this.notices.absenceNet(mission.id); continue }
       if (terminal(mission) || mission.status !== 'active') continue
       try {
         // R17-G7: no member-status reconciliation runs here any more. Every
@@ -1091,7 +1124,19 @@ export class SwarmRuntime {
     if (this.closed) throw new Error('Swarm runtime is closed')
     this.commitDepth += 1
     let result: T
-    try { result = this.store.transaction(fn) } finally { this.commitDepth -= 1 }
+    try { result = this.store.transaction(() => {
+      const value = fn()
+      const clocked = this.store.get('missions', missionId)
+      if (clocked?.executionTime !== undefined) {
+        const running = clocked.status === 'active' && !clocked.budgetPause && this.store.list('tasks', missionId).some(task => {
+          if (task.status !== 'running' || task.attempt === undefined) return false
+          const member = this.store.get('members', task.attempt.ownerId)
+          return member?.activity !== undefined || this.workers.isIdle?.(task.attempt.ownerId) !== true
+        })
+        if (running !== (clocked.executionTime.since !== undefined)) { executionClock(clocked, running); this.store.put('missions', clocked) }
+      }
+      return value
+    }) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
     // R17-G5: and it publishes its decision facts in the same transition — the
     // classifier runs here (never from the tick sample), against the state this
@@ -1132,6 +1177,7 @@ export class SwarmRuntime {
   mission(missionId: string): Mission {
     const mission = this.store.get('missions', missionId)
     if (!mission) throw new Error('Unknown mission')
+    if (mission.executionTime !== undefined && !terminal(mission)) executionClock(mission, mission.executionTime.since !== undefined)
     return mission
   }
   participant(actor: Actor, missionId: string): { mission: Mission; member?: Member; key: string; owner: boolean } {
@@ -1161,33 +1207,17 @@ export class SwarmRuntime {
    * repair resolves to that repair, recursively; the original identity in a
    * dependent's `dependencies` therefore keeps working after replacement.
    */
-  private lineage(missionId: string, dependencyId: string, tasks = this.store.list('tasks', missionId)): Task[] {
-    const chain = [this.task(missionId, dependencyId)]
-    const seen = new Set<string>()
-    while ((chain.at(-1)!.status === 'cancelled' || chain.at(-1)!.status === 'blocked') && !seen.has(chain.at(-1)!.id)) {
-      const current = chain.at(-1)!
-      seen.add(current.id)
-      const replacements = tasks.filter(task => task.replaces?.includes(current.id) && task.kind === current.kind && !seen.has(task.id))
-      const accepted = replacements.filter(task => task.status === 'accepted')
-      // Two accepted artifacts for one obligation is ambiguous history: fail closed so no arbitrary artifact is trusted.
-      if (accepted.length > 1) return [...chain, { ...current, status: 'blocked', output: `Ambiguous accepted replacements ${accepted.map(task => task.id).join(', ')} for ${current.id}` }]
-      // Resolution is deterministic: the oldest live replacement wins, with the
-      // id as a total tie-break. Newest-wins made two live replacements resolve
-      // differently as one advanced through the lifecycle. Admission keeps at
-      // most one live replacement, so this only matters for imported history.
-      const oldest = (candidates: Task[]) => [...candidates].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
-      const next = accepted[0]
-        ?? oldest(replacements.filter(task => ['pending', 'running', 'submitted'].includes(task.status)))
-        ?? oldest(replacements.filter(task => task.status === 'blocked' || task.status === 'cancelled'))
-      if (!next) break
-      chain.push(next)
-    }
+  private lineage(missionId: string, dependencyId: string, tasks = this.store.list('tasks', missionId), graph = taskGraphIndex(tasks)): Task[] {
+    const chain = graph.lineage(dependencyId)
+    if (!chain.length) throw new Error('Task is not in this mission')
     return chain
   }
   /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
   effectiveDependencies(missionId: string, task: Task): Task[] {
+    if (!task.dependencies.length) return []
+    const tasks = this.store.list('tasks', missionId), graph = taskGraphIndex(tasks)
     const seen = new Set<string>()
-    return task.dependencies.map(dep => this.effectiveDependency(missionId, dep)).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
+    return task.dependencies.map(dep => this.lineage(missionId, dep, tasks, graph).at(-1)!).filter(dependency => !seen.has(dependency.id) && seen.add(dependency.id))
   }
   effectiveDependency(missionId: string, dependencyId: string, tasks?: Task[]): Task { return this.lineage(missionId, dependencyId, tasks).at(-1)! }
   dependencySatisfied(missionId: string, dependencyId: string, tasks?: Task[]): boolean { return this.effectiveDependency(missionId, dependencyId, tasks).status === 'accepted' }
@@ -1201,7 +1231,7 @@ export class SwarmRuntime {
    */
   private assertEffectiveTaskGraph(missionId: string, candidate: Task, tasks: Task[]): void {
     const rows = [...tasks, candidate]
-    const byId = new Map(rows.map(task => [task.id, task]))
+    const index = taskGraphIndex(rows)
     const graph: TaskGraphNode[] = []
     const seen = new Set<string>()
     const pending = [candidate.id]
@@ -1209,10 +1239,10 @@ export class SwarmRuntime {
       const taskId = pending.pop()!
       if (seen.has(taskId)) continue
       seen.add(taskId)
-      const task = byId.get(taskId)
+      const task = index.byId.get(taskId)
       if (task === undefined) continue // The shared validator reports the dangling edge.
       const waiting = ['pending', 'running', 'submitted'].includes(task.status) || this.quiescencePending(task)
-      const dependencies = waiting ? task.dependencies.map(dependency => this.effectiveDependency(missionId, dependency, rows).id) : []
+      const dependencies = waiting ? task.dependencies.map(dependency => this.lineage(missionId, dependency, rows, index).at(-1)!.id) : []
       const reviewOf = waiting ? task.reviewOf : undefined
       graph.push({ id: task.id, dependencies, ...(reviewOf === undefined ? {} : { reviewOf }) })
       pending.push(...dependencies, ...(reviewOf === undefined ? [] : [reviewOf]))
@@ -1249,12 +1279,14 @@ export class SwarmRuntime {
    * and the scheduler resolve a replaced dependency through the same lineage.
    */
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[] {
+    if (!task.dependencies.length) return []
     const rows = tasks ?? this.store.list('tasks', missionId)
+    const graph = taskGraphIndex(rows)
     const seen = new Set<string>()
     const unfinished: Task[] = []
     for (const dependency of task.dependencies) {
-      if (!this.dependencyUnfinished(missionId, dependency, rows)) continue
-      const effective = this.effectiveDependency(missionId, dependency, rows)
+      const effective = graph.effective(dependency)
+      if (effective === undefined || effective.status === 'accepted' || effective.status === 'cancelled') continue
       if (seen.has(effective.id)) continue
       seen.add(effective.id)
       unfinished.push(effective)
@@ -1367,7 +1399,7 @@ export class SwarmRuntime {
     const budget = validatedBudget(input.budget)
     const now = Date.now()
     if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new Error('Mission duration exceeds the supported clock range')
-    const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, deadline: now + budget.maxDurationMs }
+    const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, executionTime: { usedMs: 0 }, deadline: Math.min(budget.deadlineAt ?? Number.MAX_SAFE_INTEGER, now + budget.maxDurationMs) }
     if (this.store.get('missions', mission.id)) throw new Error('Mission already exists')
     this.commit(mission.id, () => {
       this.store.put('missions', mission)
@@ -1412,7 +1444,7 @@ export class SwarmRuntime {
       const prior = admittedId ? this.store.get('members', admittedId) : undefined
       if (prior) {
         if (prior.missionId !== missionId || (input.name !== undefined && prior.name !== input.name) || memberPhaseOf(prior) === 'stopped') throw new Error('Member admission identity conflict')
-        await this.workers.start({ mission, member: prior, ownerSessionId: mission.ownerSessionId })
+        await this.startWorker(mission, prior, { admission: true, signal: actor.signal })
         assertAdmissionCurrent()
         return prior
       }
@@ -1446,7 +1478,7 @@ export class SwarmRuntime {
       // derived status is never persisted, not even as an event snapshot.
       const { status: _derivedStatus, ...memberRecord } = member
       this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/added', 'owner', memberRecord) })
-      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }); assertAdmissionCurrent() }
+      try { await this.startWorker(mission, member, { admission: true, signal: actor.signal }); assertAdmissionCurrent() }
       catch (error) {
         assertAdmissionCurrent()
         if (this.shuttingDown || this.mission(missionId).status !== 'active') throw error
@@ -1460,11 +1492,16 @@ export class SwarmRuntime {
           const fallback: Member = { ...member }
           delete fallback.reasoningEffort
           try {
-            await this.workers.start({ mission, member: fallback, ownerSessionId: mission.ownerSessionId })
+            // A rejected option is a completed native attempt; this explicit fallback is a new one.
+            this.workerStarts.delete(member.id)
+            await this.startWorker(mission, fallback, { admission: true, signal: actor.signal })
             assertAdmissionCurrent()
             delete member.reasoningEffort
             this.commit(missionId, () => {
-              this.store.put('members', member)
+              const latest = this.store.get('members', member.id)
+              if (latest === undefined) throw new Error('Worker admission disappeared')
+              delete latest.reasoningEffort
+              this.store.put('members', latest)
               this.store.event(missionId, 'member/effort-downgraded', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, reason: rejection.message })
             })
             this.kick(missionId)
@@ -1475,7 +1512,8 @@ export class SwarmRuntime {
             const retryMessage = retryError instanceof Error ? retryError.message : String(retryError)
             member.phase = 'stopped'
             this.commit(missionId, () => {
-              this.store.put('members', member)
+              const latest = this.store.get('members', member.id)
+              if (latest !== undefined) { latest.phase = 'stopped'; this.store.put('members', latest) }
               this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
               this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
             })
@@ -1483,7 +1521,7 @@ export class SwarmRuntime {
           }
         }
         member.phase = 'stopped'
-        this.commit(missionId, () => { this.store.put('members', member); this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }) })
+        this.commit(missionId, () => { const latest = this.store.get('members', member.id); if (latest !== undefined) { latest.phase = 'stopped'; this.store.put('members', latest) }; this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: String(error) }) })
         throw error
       }
       this.kick(missionId)
@@ -1559,7 +1597,8 @@ export class SwarmRuntime {
       replaces: input.replaces,
       knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
     })
-    if (reconciliation.length) throw new Error(reconciliation.map(formatDiagnostic).join('\n'))
+    const refused = reconciliation.filter(item => item.severity !== 'advisory')
+    if (refused.length) throw new Error(refused.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')
     const tasks = this.store.list('tasks', missionId)
@@ -1580,23 +1619,14 @@ export class SwarmRuntime {
       emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission experiment budget exhausted (${used}/${mission.budget.maxExperiments} experiments admitted)` })
       throw new Error('Mission experiment budget exhausted')
     }
-    // R11-17: a worker's board share is bounded inside the mission task ceiling.
-    // The allowance is derived from `maxTasks`/`maxWorkers`, both owner-set, so
-    // no tool argument and no member action can raise it; the owner raises it by
-    // raising the ceiling with swarm_budget.
-    if (!owner) {
-      const allowance = computeProposalAllowance(mission, this.store.list('members', missionId), tasks, key)
-      if (allowance.admitted >= allowance.limit) this.refuseProposal(mission, key, input.title,
-        `reached its per-member proposal allowance (${allowance.admitted}/${allowance.limit} non-cancelled tasks proposed; mission ceiling ${allowance.ceiling} tasks over ${allowance.plannedMembers} planned workers)`,
-        allowance.limit)
-    }
-    if (input.priority !== undefined && (!Number.isInteger(input.priority) || input.priority < 0 || input.priority > 100)) throw new Error('priority must be an integer from 0 to 100')
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
     for (const dependency of dependencies) {
       const effective = this.effectiveDependency(missionId, dependency, tasks)
       if (effective.status === 'cancelled' || effective.status === 'blocked') throw new Error(`Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
     if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown assignee')
+    if (input.assignmentMode !== undefined && input.assignmentMode !== 'preferred' && input.assignmentMode !== 'pinned') throw new Error('[assignment_mode_invalid] Set `assignmentMode` to preferred or pinned with `swarm_propose`, then retry.')
+    if (input.assignmentMode !== undefined && input.assigneeId === undefined) throw new Error('[assignment_member_required] Supply `assigneeId` with `assignmentMode` in `swarm_propose`, then retry.')
     if (input.kind === 'verification') {
       if (!input.reviewOf) throw new Error('Verification requires reviewOf')
       const source = this.task(missionId, input.reviewOf)
@@ -1628,7 +1658,7 @@ export class SwarmRuntime {
         throw new Error(`replaces ${previousId}: that task is ${previous.status}, and ${rule}${replacement ? `; it is already replaced by ${replacement.id} (${replacement.status})` : repairable ? '; wait for its verdict or use swarm_handoff/challenge' : ''}`)
       }
       if (replacement !== undefined) throw new Error(`replaces ${previousId}: that task is ${previous.status}, and is already replaced by ${replacement.id} (${replacement.status}); wait for its verdict, withdraw it with swarm_cancel, or repair that replacement instead of admitting a second one`)
-      if (previous.resumeAfterStop?.epoch === previous.epoch) throw new Error(`replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
+      if (previous.status !== 'cancelled' && previous.resumeAfterStop?.epoch === previous.epoch) throw new Error(`replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
       if (previous.kind !== input.kind) throw new Error(`replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
       const missing = previous.acceptance.filter(item => !input.acceptance.includes(item))
       if (missing.length) throw new Error(`replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
@@ -1651,6 +1681,7 @@ export class SwarmRuntime {
     const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
+    if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
     if (input.checkTimeoutMs !== undefined) task.checkTimeoutMs = input.checkTimeoutMs
     this.assertEffectiveTaskGraph(missionId, task, tasks)
@@ -1665,9 +1696,9 @@ export class SwarmRuntime {
   }
   
   /**
-   * X1 (P0): every member who ever owned this task or is planned to own it. None
-   * of them may be admitted to, claim, or accept its review — independence is a
-   * property of the whole ownership history, not only the last attempt.
+   * X1 (P0): current assignment and every actual prior owner cannot review this
+   * work. An unused initial preference is not added to history when borrowed;
+   * independence follows actual ownership, not a discarded planning preference.
    */
   authorIds(task: Task): Set<string> {
     const ids = new Set(task.priorOwnerIds ?? [])
@@ -1716,11 +1747,17 @@ export class SwarmRuntime {
    * envelope and no self-run evidence has nothing to compare, and the verdict
    * proceeds as before.
    */
-  private checkEnvironmentReproduction(missionId: string, memberId: string, taskId: string, attemptId: string):
-    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'tool-run' | 'host-ambient'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+  private checkEnvironmentReproduction(missionId: string, memberId: string, taskId: string, attemptId: string, checks?: ReadonlyArray<{ environment?: CheckEnvironment }>):
+    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'tool-run' | 'host-ambient' | 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
     const envelope = this.deliveredCheckEnvironment(missionId, taskId, attemptId) ?? this.declaredCheckEnvelope()?.environment
     if (envelope === undefined) return undefined
-    const evidence = this.selfRunEnvironmentEvidence(missionId, memberId, taskId, attemptId)
+    // Declared host checks are the supporting executions. A later unrelated
+    // diagnostic cannot substitute its environment for those immutable-artifact checks.
+    const measured = checks?.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
+      ?? checks?.find(check => check.environment !== undefined)?.environment
+    const evidence = checks !== undefined && checks.length > 0
+      ? measured === undefined ? undefined : { environment: measured, source: 'host-check' as const, at: Date.now() }
+      : this.selfRunEnvironmentEvidence(missionId, memberId, taskId, attemptId)
     if (evidence === undefined) return undefined
     return { envelope, selfRun: evidence.environment, source: evidence.source, at: evidence.at, comparison: compareCheckEnvironments(envelope, evidence.environment) }
   }
@@ -1734,7 +1771,7 @@ export class SwarmRuntime {
     const envelope = this.declaredCheckEnvelope()
     if (envelope?.environment === undefined) return {}
     return { checkEnvironment: {
-      note: 'These are the facts the host runs this task\'s declared checks under. A self-run must reproduce them: the runtime reports the mismatch instead of accepting an artifact when it cannot. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits. A command that sets HOME or a cache root for itself (`HOME=… cmd`, `export …`, `env -i`, `unset …`) is recorded as the environment that self-run really used, and the comparison names the divergent field with both values.',
+      note: 'These are the facts the host runs this task\'s declared checks under. Acceptance compares the supporting host checks with this envelope; unrelated diagnostics do not determine the verdict. The scoped cache roots are provided inside the disposable verification checkout; the user cache roots and HOME are what a self-run inherits. A command that sets HOME or a cache root for itself (`HOME=… cmd`, `export …`, `env -i`, `unset …`) is recorded as the environment that self-run really used, and the comparison names the divergent field with both values.',
       environment: envelope.environment,
       ...(envelope.selfRunEnvironment === undefined ? {} : { selfRun: envelope.selfRunEnvironment }),
     } }
@@ -1759,6 +1796,7 @@ export class SwarmRuntime {
   
   
   assign(task: Task, member: Member): Task {
+    if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
     this.recordWriterBusyRecovery(mission)
@@ -1769,8 +1807,9 @@ export class SwarmRuntime {
       this.recordRefusal(candidate, decision, latencyMs)
       throw new AdmissionRefusedError(decision)
     }
+    if (task.assignmentMode === 'preferred' && task.epoch === 0) task.plannedAssigneeId = member.id
     task.epoch++
-    task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Date.now() + this.config.leaseMs }
+    task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Math.min(Date.now() + this.config.leaseMs, mission.deadline) }
     // R17-G7: assigning the attempt is what makes the derived status `working`;
     // there is no member status to write and none to fall behind the attempt.
     task.status = 'running'; task.assigneeId = member.id
@@ -1782,14 +1821,14 @@ export class SwarmRuntime {
         this.store.put('tasks', task); this.store.put('members', member)
         this.store.recordAdmission(admitted)
         this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-          content: JSON.stringify({ missionId: task.missionId, task, ...this.assignmentCheckEnvironment(), instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
+          content: JSON.stringify({ missionId: task.missionId, task, ...this.assignmentCheckEnvironment(), instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. For integration tasks, inspect .swarm-integration-conflicts.json when present; resolve its listed files and remove the manifest before swarm_submit. Git metadata writes are not required. Verification tasks use swarm_verify. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
       })
     } catch (error) {
       // A classified writer conflict is an admission refusal, not a task failure:
       // nothing was committed, the task stays pending, and the next tick retries.
       if (error instanceof WriterBusyError) {
-        this.writerBusy = { at: Date.now(), attempts: error.attempts, candidate, detail: error.message }
+        queueWriterBusy(this, { at: Date.now(), attempts: error.attempts, candidate, detail: error.message })
         throw new AdmissionRefusedError({ reason: 'writer_busy', admitted: false, detail: `writer_busy after ${error.attempts} attempt(s): ${error.message}` })
       }
       throw error
@@ -1802,12 +1841,15 @@ export class SwarmRuntime {
       const { member } = this.active(actor, missionId)
       if (!member) throw new Error('[owner_cannot_claim] Only a member can claim work: Inspect `taskId` with `swarm_observe`, or decide the mission with `swarm_control` and its `action`.')
       const task = this.task(missionId, taskId)
+      if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
       if (!this.ready(task, member)) throw new Error('Task is not ready for this member')
       await this.assertWorkspaceAuthorized(this.mission(missionId))
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
       this.active(actor, missionId)
       const fresh = this.task(missionId, taskId)
-      if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) throw new Error('Task changed while preparing its workspace')
+      if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
+        || fresh.plannedAssigneeId !== task.plannedAssigneeId || fresh.assignmentMode !== task.assignmentMode
+        || !this.ready(fresh, member)) throw new Error('Task changed while preparing its workspace')
       const result = this.assign(fresh, member)
       this.kick(missionId)
       return result
@@ -1929,6 +1971,7 @@ export class SwarmRuntime {
       if (source.status !== 'submitted' || source.artifact?.commit !== artifact.commit) throw new Error('[artifact_changed_during_verification] Reviewed artifact changed during verification. Verify again with `swarm_verify` and the reviewed `taskId`.')
       if (prepared.evidenceRevision !== JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))) throw new Error('[evidence_changed_during_verification] Evidence changed during verification; inspect the new challenge and verify again. Inspect `evidenceId` with `swarm_observe`, then verify again with `swarm_verify` and its `verdict`.')
       const independentRuns = this.store.list('tool_runs', missionId).filter(run => run.memberId === member.id && run.taskId === task.id && run.attemptId === input.attemptId && !run.isError)
+      if (input.verdict === 'accept' && source.checks.length > 0 && checks.length === 0) throw new Error('Declared host checks returned no execution evidence; retry verification of the same artifact')
       if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
       const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
       // ENV: the host check attaches the environment it ran under and, on
@@ -1944,9 +1987,10 @@ export class SwarmRuntime {
       // attempt's own self-run. A blocking divergence is durable before it is
       // reported, so a later reader sees the environments, not only the refusal.
       const reproduction = this.checkEnvironmentReproduction(missionId, member.id, task.id, input.attemptId)
+      const supportingReproduction = outcomes.length > 0 ? this.checkEnvironmentReproduction(missionId, member.id, task.id, input.attemptId, outcomes) : reproduction
       if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
         this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
-          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
+          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch', diagnosticOnly: outcomes.length > 0,
           envelope: reproduction.envelope, selfRun: reproduction.selfRun, selfRunSource: reproduction.source, selfRunAt: reproduction.at,
           blocking: reproduction.comparison.blocking, advisory: reproduction.comparison.advisory,
           ...(failureAttribution === undefined ? {} : { attribution: failureAttribution }),
@@ -1956,13 +2000,28 @@ export class SwarmRuntime {
       // mismatch is recorded above). An acceptance, though, is refused rather
       // than validating an artifact under an environment the host check cannot
       // reproduce.
-      if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
-        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(reproduction.comparison,
-          reproduction.source === 'tool-run' ? "recorded on this attempt's host-recorded tool runs" : 'the ambient host environment'))
+      if (passed && supportingReproduction !== undefined && supportingReproduction.comparison.blocking.length > 0) {
+        this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
+        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(supportingReproduction.comparison,
+          supportingReproduction.source === 'host-check' ? 'recorded on the declared host checks' : supportingReproduction.source === 'tool-run' ? "recorded on this attempt's host-recorded tool runs" : 'the ambient host environment'))
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
+      if (this.declaredChecks.recoveryRequired(checks)) {
+        const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - 750))}\nVerification could not establish a verdict. The immutable source ${source.id} at ${artifact.commit} remains submitted. Fix the reported environment or amend checkTimeoutMs with swarm_budget, then resume review ${task.id} using swarm_control(action: "resume", taskId: "${task.id}", reason: "condition repaired").`
+        this.commit(missionId, () => {
+          const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
+          task.status = 'blocked'; task.output = this.bounded(reason)
+          task.reviewedCommit = artifact.commit
+          task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: Date.now() }
+          this.store.put('tasks', task)
+          this.store.event(missionId, 'task/verification-deferred', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason, checks: runIds })
+          this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([source, task]), { from: member.id })
+        })
+        this.kick(missionId)
+        return task
+      }
       const runIds: string[] = []
       const released = new Set<string>()
       this.commit(missionId, () => {
@@ -1975,6 +2034,7 @@ export class SwarmRuntime {
         // ones would re-pend against a source that is no longer submitted.
         const verdictReason = `${source.id} was ${passed ? 'accepted' : 'rejected'} by review ${task.id}`
         const siblings = this.retireReviewSiblings(missionId, source.id, { exclude: task.id, reason: verdictReason })
+        const retired = siblings.retired.map(review => review.id)
         for (const memberId of siblings.released) released.add(memberId)
         if (passed) for (const previousId of source.replaces ?? []) {
           const previous = this.task(missionId, previousId)
@@ -1986,14 +2046,15 @@ export class SwarmRuntime {
             this.store.put('tasks', previous)
           }
           const oldReviews = this.retireReviewSiblings(missionId, previousId, { exclude: source.id, reason: `Superseded by review of replacement ${source.id}` })
+          retired.push(...oldReviews.retired.map(review => review.id))
           for (const memberId of oldReviews.released) released.add(memberId)
         }
+        const verdictEvidence: Array<{ id: string; outcome: string }> = []
         for (const evidenceId of source.evidenceIds) {
           const evidence = this.store.get('evidence', evidenceId)!
           // F-12: the durable log must reconstruct which claim became verified or
           // refuted and which reviews the verdict retired; `task/accepted` alone
           // names neither the evidence nor the retired tasks.
-          const retired = siblings.retired.map(retiredReview => retiredReview.id)
           if (!passed) {
             // F3-B: a rejected verification refutes the claim exactly once and
             // the stored status matches the `evidence/refuted` event. Leaving
@@ -2004,6 +2065,7 @@ export class SwarmRuntime {
               this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
             }
             this.store.put('evidence', evidence)
+            verdictEvidence.push(evidence)
             continue
           }
           // Status follows the verdict and the claim's own outcome: an inconclusive
@@ -2012,6 +2074,7 @@ export class SwarmRuntime {
           evidence.status = status
           this.store.put('evidence', evidence)
           if (status !== 'verified') continue
+          verdictEvidence.push(evidence)
           this.store.event(missionId, 'evidence/verified', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, commit: artifact.commit, retired })
           for (const previous of evidence.supersedes) {
             const old = this.store.get('evidence', previous)!
@@ -2025,6 +2088,13 @@ export class SwarmRuntime {
         }
         this.store.event(missionId, passed ? 'task/accepted' : 'task/rejected', member.id, { sourceTaskId: source.id, verificationTaskId: task.id, commit: artifact.commit, reason: rejection, checks: runIds,
           ...(passed ? {} : { checkFailures: failingChecks.slice(0, MAX_REPORTED_CHECK_FAILURES).map(check => ({ command: check.command, exitCode: check.exitCode, ...attributionOf(check), output: excerpt(check.output, 400) })) }) })
+        // The actual verdict, exact artifact and retirements commit together.
+        // Deferred checks never enter this branch; accepted inconclusive claims
+        // retain unverified status and therefore have no verified verdict row.
+        for (const row of verdictRows({ sourceTaskId: source.id, verificationTaskId: task.id, verdict: passed ? 'verified' : 'refuted',
+          reason: task.output, evidence: verdictEvidence, retired })) {
+          this.store.event(missionId, 'evidence/verdict', member.id, { ...row, commit: artifact.commit })
+        }
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
           this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, this.interpretation(missionId).subjectsOf([source]), { from: member.id })
@@ -2038,9 +2108,8 @@ export class SwarmRuntime {
             content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"], keeping its acceptance verbatim and its kind (${source.kind}). Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
         }
       })
-      // Retired reviewers are released inside the verdict transaction; their
-      // handles stop outside it so a slow adapter never holds mission state.
-      if (released.size) this.defer(async () => { await Promise.all([...released].map(memberId => this.workers.stop(memberId))) })
+      // Retired reviewers carry durable stop/checkpoint markers; retirement
+      // starts recovery outside the transaction so a slow stop holds no state lock.
       // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
       if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
@@ -2073,12 +2142,38 @@ export class SwarmRuntime {
    * is not part of this store and cannot be reconciled with the question.
    */
   message(actor: Actor, missionId: string, input: MessageInput): { queued: boolean; answered?: string; dismissed?: string } {
+    actor.signal?.throwIfAborted()
+    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    const participant = this.participant(actor, missionId)
+    // Owner replies remain a control channel during resumable pauses. Retain
+    // their full payload in the normal outbox; transport itself waits for resume.
+    const ownerQuestion = participant.owner && input.replyTo !== undefined
+      ? this.answerableQuestion(missionId, participant.key, input.replyTo) : undefined
+    const content = this.bounded(input.content)
+    if (ownerQuestion !== undefined && input.dismiss !== true) {
+      const same = this.store.list('deliveries', missionId).find(delivery => delivery.inReplyTo === ownerQuestion.id
+        && delivery.from === participant.key && delivery.to === input.to && delivery.kind === input.kind
+        && delivery.content === content && delivery.topic === input.topic)
+      if (same !== undefined) return { queued: !terminal(participant.mission) && same.deliveredAt === undefined, answered: ownerQuestion.id }
+    }
+    if (ownerQuestion !== undefined && (participant.mission.status !== 'active' || participant.mission.budgetPause !== undefined || Date.now() >= participant.mission.deadline)) {
+      const state = input.dismiss === true ? 'dismissed' : 'answered'
+      const deferred = state === 'answered' && !terminal(participant.mission)
+      if (deferred && input.to !== ownerQuestion.from) throw new Error('A deferred reply must address the member that asked the question')
+      this.commit(missionId, () => {
+        this.receipt(missionId, ownerQuestion, participant.key, state, content)
+        if (deferred) {
+          this.store.put('deliveries', { id: id('msg'), missionId, from: participant.key, to: ownerQuestion.from,
+            kind: input.kind, content, topic: input.topic, inReplyTo: ownerQuestion.id, createdAt: Date.now() })
+          this.store.event(missionId, 'message/queued', participant.key, { ...input, deferred: true })
+        }
+      })
+      return { queued: deferred, ...(state === 'dismissed' ? { dismissed: ownerQuestion.id } : { answered: ownerQuestion.id }) }
+    }
     const { key } = this.active(actor, missionId)
     if (input.dismiss === true && input.replyTo === undefined) {
       throw new Error('[reply_target_required] dismiss closes the question named by `replyTo`, and none was passed: pass `replyTo` with the question delivery id (read the open receipts with `swarm_observe` and its `missionId`) and the reason in `content`, or send the answer normally.')
     }
-    if (input.to !== 'owner' && input.to !== 'subscribers' && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Recipient is not a live mission member')
-    if (input.to === 'subscribers' && !input.topic) throw new Error('Broadcast requires a topic')
     const question = input.replyTo === undefined ? undefined : this.answerableQuestion(missionId, key, input.replyTo)
     if (input.dismiss === true) {
       const reason = this.bounded(input.content)
@@ -2086,7 +2181,8 @@ export class SwarmRuntime {
       this.kick(missionId)
       return { queued: false, dismissed: question!.id }
     }
-    const content = this.bounded(input.content)
+    if (input.to !== 'owner' && input.to !== 'subscribers' && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Recipient is not a live mission member')
+    if (input.to === 'subscribers' && !input.topic) throw new Error('Broadcast requires a topic')
     this.commit(missionId, () => {
       if (question !== undefined) this.receipt(missionId, question, key, 'answered', content)
       if (input.to === 'subscribers') this.topicDelivery(missionId, key, input.topic!, content)
@@ -2178,7 +2274,7 @@ export class SwarmRuntime {
       if (attemptId !== undefined) {
         if (task.attempt?.id !== attemptId) throw new Error('Escalation attempt does not belong to that task')
         if (task.attempt.ownerId !== member.id) throw new Error('Escalation attempt is not owned by the caller')
-      }
+      } else if ((task.attempt?.ownerId ?? task.assigneeId) !== member.id) throw new Error('Escalation task is not owned by the caller')
     }
     const dedupKey = this.noticeKey(missionId)
     const at = Date.now()
@@ -2392,19 +2488,9 @@ export class SwarmRuntime {
     if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown new owner')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
-    task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', at: Date.now() }
+    task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: Date.now() }
     this.commit(missionId, () => { this.store.put('tasks', task); this.store.event(missionId, 'task/handoff-started', member.id, { taskId: task.id, to: input.to ?? null, summary: input.summary }) })
-    this.defer(async () => {
-      await this.workers.stop(member.id)
-      await this.exclusive(missionId, async () => {
-        const fresh = this.task(missionId, task.id)
-        if (fresh.epoch !== task.epoch || fresh.status !== 'blocked') return
-        const m = this.store.get('members', member.id)!
-        m.phase = 'active'; fresh.status = 'pending'; delete fresh.resumeAfterStop
-        this.commit(missionId, () => { this.store.put('tasks', fresh); this.store.put('members', m); this.store.event(missionId, 'task/handoff-ready', 'runtime', { taskId: fresh.id }) })
-      })
-      this.kick(missionId)
-    })
+    this.attempts.resumeStoppedAttempt(missionId, task)
     return { handoff: 'Ownership revoked; reassignment waits for the previous worker to stop. End your turn.' }
   }
   /**
@@ -2412,8 +2498,8 @@ export class SwarmRuntime {
    * closed. Pending reviews could never start, running reviews would burn model
    * and host-check tokens and hold a lease until expiry, and quiescence-parked
    * reviews would re-pend after lease expiry against a source that can no longer
-   * be reviewed. Each retirement is durable, releases the reviewer immediately
-   * and returns the members whose handles must be stopped after the commit.
+   * be reviewed. Each retirement fences the reviewer durably until its handle has
+   * stopped and its workspace checkpoint has finished outside the transaction.
    * Must be called inside a mission transaction.
    */
   private retireReviewSiblings(missionId: string, sourceId: string, options: { exclude?: string; reason: string }): { retired: Task[]; released: Set<string> } {
@@ -2421,10 +2507,9 @@ export class SwarmRuntime {
     const released = new Set<string>()
     for (const review of this.store.list('tasks', missionId)) {
       if (review.id === options.exclude || review.reviewOf !== sourceId) continue
-      const previousStatus = review.status
-      const moot = previousStatus === 'pending' || previousStatus === 'running' || this.quiescencePending(review)
+      const moot = review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)
       if (!moot) continue
-      const attempt = review.attempt
+      const { previousStatus, attempt } = this.attempts.cancelForStop(review)
       if (attempt !== undefined) {
         const owner = this.store.get('members', attempt.ownerId)
         if (owner !== undefined && memberPhaseOf(owner) !== 'stopped') {
@@ -2432,13 +2517,12 @@ export class SwarmRuntime {
           this.store.put('members', owner); released.add(owner.id)
         }
       }
-      review.status = 'cancelled'; review.epoch++
-      this.dropAttempt(review); delete review.resumeAfterStop; delete review.budgetResume; delete review.closeout; delete review.idleSignal; delete review.gitWriteDenied
       review.output = `${review.output ?? ''}\nSuperseded: ${options.reason}`.trim()
       this.store.put('tasks', review)
       this.store.event(missionId, 'task/review-retired', 'runtime', { taskId: review.id, reviewOf: sourceId, previousStatus,
         ...(attempt === undefined ? {} : { attemptId: attempt.id, ownerId: attempt.ownerId }), reason: options.reason })
       retired.push(review)
+      if (review.resumeAfterStop !== undefined) this.defer(async () => this.attempts.resumeStoppedAttempt(missionId, this.task(missionId, review.id)))
     }
     return { retired, released }
   }
@@ -2451,9 +2535,10 @@ export class SwarmRuntime {
     const author = source.attempt?.ownerId ?? source.assigneeId
     const authors = this.authorIds(source)
     const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
-    return liveReviewFor(this.store.list('tasks', missionId), source.id, author, live,
+    const tasks = this.store.list('tasks', missionId)
+    return liveReviewFor(tasks, source.id, author, live,
       review => (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
-        && (review.assigneeId === undefined || !authors.has(review.assigneeId)))
+        && [...live].some(memberId => !authors.has(memberId) && assignmentAllows(review, memberId, tasks)))
   }
   /**
    * F2/R11-16: why a freshly submitted artifact has no review path, or
@@ -2498,20 +2583,15 @@ export class SwarmRuntime {
   }
   /** The newest durable submission of one task: how long ago, and its event seq. */
   latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined {
-    const events = this.store.events(missionId, this.config.maxEvents)
-    for (let index = events.length - 1; index >= 0; index--) {
-      const event = events[index]!
-      if (event.type !== 'task/submitted' || (event.data as { taskId?: string } | undefined)?.taskId !== taskId) continue
-      return { seq: event.seq, age: Math.max(0, Date.now() - event.createdAt) }
-    }
-    return undefined
+    const event = this.store.latestTaskEvent(missionId, taskId, 'task/submitted')
+    return event === undefined ? undefined : { seq: event.seq, age: Math.max(0, Date.now() - event.createdAt) }
   }
   /** Record the missing review once per submission; false when it is already recorded. */
   private reportMissingReview(mission: Mission, source: Task, submissionSeq: number): boolean {
     const key = `${mission.id}:${source.id}:${submissionSeq}`
     // S5: the durable `task/review-missing` event for this exact submission is
     // the gate; this re-read makes the in-memory set a pure cache.
-    if (this.reviewPathReported.has(key) && this.missingReviewRecorded(mission.id, source.id, submissionSeq)) return false
+    if (this.missingReviewRecorded(mission.id, source.id, submissionSeq)) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
     this.reviewPathReported.add(key)
@@ -2524,20 +2604,10 @@ export class SwarmRuntime {
    * restarted runtime does not duplicate the audit row for the same submission.
    */
   private missingReviewRecorded(missionId: string, taskId: string, submissionSeq: number): boolean {
-    const events = this.store.events(missionId, this.config.maxEvents)
-    let latestSubmission = -1
-    let reported = false
-    for (const event of events) {
-      const data = event.data as { taskId?: string; submissionSeq?: number } | undefined
-      if (data?.taskId !== taskId) continue
-      if (event.type === 'task/submitted') latestSubmission = Math.max(latestSubmission, event.seq)
-      else if (event.type === 'task/review-missing') {
-        // Legacy rows carry no submissionSeq; they still prove a report for the
-        // submission current at the time they were written.
-        if (data.submissionSeq === undefined ? event.seq > latestSubmission : data.submissionSeq === submissionSeq) reported = true
-      }
-    }
-    return reported
+    const event = this.store.latestTaskEvent(missionId, taskId, 'task/review-missing')
+    if (event === undefined) return false
+    const data = event.data as { submissionSeq?: number }
+    return data.submissionSeq === undefined ? event.seq > submissionSeq : data.submissionSeq === submissionSeq
   }
   /** An automatic review admitted earlier for this source, once the owner has withdrawn it. */
   private withdrawnAutomaticReview(missionId: string, sourceId: string): string | undefined {
@@ -2560,6 +2630,8 @@ export class SwarmRuntime {
   /** The concrete reason the runtime cannot admit an independent review right now. */
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
+    const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
+    if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
     const authors = this.authorIds(source)
@@ -2612,9 +2684,7 @@ export class SwarmRuntime {
     if (task.status === 'accepted') throw new Error(`Task ${task.id} is accepted; accepted work is immutable. Propose a replacement instead.`)
     // Cancellation is terminal and idempotent: a replay never mutates or re-audits it.
     if (task.status === 'cancelled') return task
-    const previousStatus = task.status
-    const attempt = task.attempt
-    // Every member released by this withdrawal is stopped once, outside the transaction.
+    const { previousStatus, attempt, stopOwner } = this.attempts.cancelForStop(task)
     const released = new Set<string>()
     const releaseMember = (memberId: string): Member | undefined => {
       const member = this.store.get('members', memberId)
@@ -2622,10 +2692,8 @@ export class SwarmRuntime {
       member.phase = 'active'; delete member.activity
       return member
     }
-    task.status = 'cancelled'; task.epoch++
-    this.dropAttempt(task); delete task.resumeAfterStop; delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
     task.output = `${task.output ?? ''}\nCancelled by the mission owner: ${input.reason}`.trim()
-    const ownerMember = attempt === undefined ? undefined : releaseMember(attempt.ownerId)
+    const ownerMember = stopOwner === undefined ? undefined : releaseMember(stopOwner)
     if (ownerMember !== undefined) released.add(ownerMember.id)
     const strandedDependents: string[] = []
     this.commit(missionId, () => {
@@ -2655,7 +2723,7 @@ export class SwarmRuntime {
         this.notify(missionId, `Cancelling ${task.id} stranded admitted dependents ${strandedDependents.join(', ')}. Propose a replacement for ${task.id} with replaces; dependents resolve to the live repair automatically.`, view.subjectsOf([task, ...view.tasks.filter(candidate => strandedDependents.includes(candidate.id))]), { from: key })
       }
     })
-    if (released.size) this.defer(async () => { await Promise.all([...released].map(memberId => this.workers.stop(memberId))) })
+    if (task.resumeAfterStop !== undefined) this.attempts.resumeStoppedAttempt(missionId, task)
     this.kick(missionId)
     return task
   }
@@ -2759,7 +2827,21 @@ export class SwarmRuntime {
     for (const request of this.store.list('starts')) {
       if (!['planning', 'launching'].includes(request.status)) continue
       const deadline = request.planningDeadlineAt ?? request.updatedAt + (this.config.planningTimeoutMs ?? 600000)
-      if (Date.now() < deadline) continue
+      const remaining = deadline - Date.now()
+      if (remaining > 0) {
+        const threshold = Math.max(30000, Math.ceil((this.config.planningTimeoutMs ?? 600000) * 0.2))
+        if (remaining <= threshold && request.planningWarning?.deadline !== deadline) {
+          request.planningDeadlineAt = deadline
+          request.planningWarning = { deadline, threshold }
+          this.commit(request.missionId ?? request.id, () => {
+            this.store.put('starts', request)
+            this.store.event(request.missionId ?? request.id, 'mission/budget-warning', 'runtime', {
+              requestId: request.id, dimension: 'planningDurationMs', deadline, remaining, threshold,
+            })
+          })
+        }
+        continue
+      }
       this.failStart({ sessionId: request.ownerSessionId }, request.id,
         'Planning or launch exceeded its deadline. The saved request and snapshot are retained. Inspect the request with swarm_observe, then use swarm_control with requestId and action=retry, or action=stop.', request.planningEpoch ?? 1)
     }
@@ -2852,6 +2934,8 @@ export class SwarmRuntime {
   /** Automatic requests must contain a complete independently verifiable topology. */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
     const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) })
+    // New automatic plans use preferences; old/manual task rows keep their binding.
+    for (const task of plan.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
     const issues: string[] = []
     if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
@@ -2914,7 +2998,7 @@ export class SwarmRuntime {
       const launchActor: Actor = { sessionId: actor.sessionId, signal: actor.signal ? AbortSignal.any([actor.signal, controller.signal]) : controller.signal }
       try {
         const existing = request.draftId ? this.store.get('drafts', request.draftId) : undefined
-        const plan = this.automaticPlan(existing?.input ?? input, request)
+        const plan = this.automaticPlan(input, request)
         request.budget = { ...plan.budget }
         request.draftId ??= `draft_${request.id}`
         request.missionId ??= `mission_${request.draftId}`
@@ -2924,7 +3008,9 @@ export class SwarmRuntime {
         launchActor.signal!.throwIfAborted()
         // Saving the deterministic link before the draft makes a crash between
         // these commits recoverable without creating an orphan or a duplicate.
-        const draft = existing ?? this.createDraft(launchActor, plan, request.draftId)
+        const draft = existing
+          ? (JSON.stringify(existing.input) === JSON.stringify(plan) ? existing : this.updateDraft(launchActor, existing.id, existing.revision, plan))
+          : this.createDraft(launchActor, plan, request.draftId)
         launchActor.signal!.throwIfAborted()
         const snapshot = await abortableStart(this.launchDraft(launchActor, draft.id, draft.revision), launchActor.signal!)
         // The activation commit is authoritative even if cancellation raced its
@@ -3004,45 +3090,50 @@ export class SwarmRuntime {
   drafts(actor: Actor): DraftPlan[] { return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded') }
   private ownedDraft(actor: Actor, draftId: string): DraftPlan {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const draft = this.store.get('drafts', draftId)
-    if (!draft || draft.ownerSessionId !== actor.sessionId) throw new Error('Draft is not owned by this session')
+    if (!draft || draft.ownerSessionId !== actor.sessionId) throw new PolicyError('draft_not_owned', 'authorization_error', 'Draft is not owned by this session')
     return draft
+  }
+  private prepareDraftInput(input: PlanInput) {
+    const admitted = validatePlan(input)
+    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    // Store the authorization anchor on the draft, outside its canonical plan.
+    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
+    return { clean, authorized }
   }
   /** Saving a plan creates no workers, worktrees or model calls. */
   createDraft(actor: Actor, input: PlanInput, admittedId?: string): DraftPlan {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
-    if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new Error('Workers cannot create independent missions or budgets')
-    if (this.drafts(actor).filter(d => ['draft', 'failed', 'launching'].includes(d.status)).length >= 32) throw new Error('Discard unused drafts before creating more')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
+    if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('draft_owner_required', 'authorization_error', 'Workers cannot create independent missions or budgets')
+    if (this.drafts(actor).filter(d => ['draft', 'failed', 'launching'].includes(d.status)).length >= 32) throw new PolicyError('draft_limit_reached', 'budget_error', 'Discard unused drafts before creating more')
     const now = Date.now()
-    if (admittedId && this.store.get('drafts', admittedId)) throw new Error('Draft admission identity already exists')
-    // A staged draft carries the same authorization anchor as a created
-    // mission, so launching it cannot introduce a root the admission check did
-    // not already accept. The anchor is stored on the draft record, never
-    // inside `input`: the saved plan stays exactly the validated plan.
-    const admitted = validatePlan(input)
-    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
-    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
-    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: clean, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, createdAt: now, updatedAt: now }
-    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/staged', 'owner', { draftId: draft.id, revision: draft.revision }) })
+    if (admittedId && this.store.get('drafts', admittedId)) throw new PolicyError('draft_identity_conflict', 'conflict_error', 'Draft admission identity already exists')
+    const { clean, authorized } = this.prepareDraftInput(input)
+    const advisories = planAdvisories(clean)
+    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: clean, advisories: advisories.slice(0, 20).map(formatDiagnostic), workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, createdAt: now, updatedAt: now }
+    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/staged', 'owner', { draftId: draft.id, revision: draft.revision, advisories }) })
     return draft
   }
   updateDraft(actor: Actor, draftId: string, revision: number, input: PlanInput): DraftPlan {
     const draft = this.ownedDraft(actor, draftId)
-    if (draft.revision !== revision) throw new Error('Draft changed; reload before saving')
-    if (draft.status !== 'draft') throw new Error('Only unlaunched drafts can be edited; discard a failed launch to create a different plan')
-    const admitted = validatePlan(input)
-    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
-    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
+    if (draft.revision !== revision) throw new PolicyError('draft_revision_conflict', 'conflict_error', 'Draft changed; reload before saving')
+    if (!['draft', 'failed'].includes(draft.status)) throw new PolicyError('draft_not_editable', 'conflict_error', 'Only draft or failed plans can be edited while dispatch is closed')
+    const { clean, authorized } = this.prepareDraftInput(input)
+    this.validateDraftRepair(draft, clean)
+    const previousInput = draft.input
+    const advisories = planAdvisories(clean)
+    draft.advisories = advisories.slice(0, 20).map(formatDiagnostic)
     draft.input = clean; draft.workspaceGrantRoot = authorized.grantRoot; draft.workspaceAuthorizationSource = authorized.source; draft.revision++; draft.updatedAt = Date.now()
-    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/edited', 'owner', { draftId, revision: draft.revision }) })
+    delete draft.error
+    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/edited', 'owner', { draftId, revision: draft.revision, previousInput, input: clean, advisories }) })
     return draft
   }
   discardDraft(actor: Actor, draftId: string, revision: number): DraftPlan {
     const draft = this.ownedDraft(actor, draftId)
-    if (draft.revision !== revision) throw new Error('Draft changed; reload before discarding')
-    if (!['draft', 'failed'].includes(draft.status)) throw new Error('A launching or launched plan cannot be discarded; stop its mission instead')
+    if (draft.revision !== revision) throw new PolicyError('draft_revision_conflict', 'conflict_error', 'Draft changed; reload before discarding')
+    if (!['draft', 'failed'].includes(draft.status)) throw new PolicyError('draft_not_discardable', 'conflict_error', 'A launching or launched plan cannot be discarded; stop its mission instead')
     if (draft.missionId) {
       const mission = this.store.get('missions', draft.missionId)
       if (mission && !terminal(mission)) this.control(actor, mission.id, 'stop', 'Discarded the unlaunched plan after an assembly failure')
@@ -3050,6 +3141,101 @@ export class SwarmRuntime {
     draft.status = 'discarded'; draft.revision++; draft.updatedAt = Date.now()
     this.commit(draft.id, () => this.store.put('drafts', draft))
     return draft
+  }
+  /** Check a saved repair while dispatch remains fenced; submitted facts are immutable. */
+  private validateDraftRepair(draft: DraftPlan, input: PlanInput): void {
+    const mission = draft.missionId ? this.store.get('missions', draft.missionId) : undefined
+    if (!mission) return
+    if (mission.status !== 'staged') throw new Error('Only a staged mission can repair its saved draft')
+    if (input.workspace !== mission.workspace) throw new Error('A staged plan must retain its saved workspace and baseline')
+    const missing = draft.input.acceptance.filter(criterion => !input.acceptance.includes(criterion))
+    if (missing.length) throw new Error(`Draft repair must retain the original acceptance obligations: ${JSON.stringify(missing)}`)
+    for (const original of draft.input.tasks) {
+      const next = input.tasks.find(task => task.key === original.key)
+      const admitted = mission ? this.store.get('tasks', `task_${draft.id}_${original.key}`) : undefined
+      const immutable = admitted && (admitted.artifact || admitted.attempt || admitted.evidenceIds.length || ['submitted', 'accepted', 'running'].includes(admitted.status))
+      if (immutable && JSON.stringify(next) !== JSON.stringify(original)) throw new Error(`Task ${admitted.id} has execution or immutable evidence; preserve it and revise separate unsubmitted work`)
+      if (next && original.kind !== next.kind && admitted) throw new Error(`Task ${admitted.id} must retain its kind; use a new plan key for incompatible work`)
+      const carriers = next ? [next] : input.tasks.filter(task => task.kind === original.kind)
+      const obligations = [...original.acceptance, ...(admitted?.acceptance ?? [])]
+      if (original.kind !== 'verification' && obligations.some(criterion => !carriers.some(task => task.acceptance.includes(criterion)))) {
+        throw new Error(`Draft repair must retain the acceptance obligations of task ${original.key}`)
+      }
+      if (admitted?.status === 'cancelled' && next) throw new Error(`Task ${admitted.id} was cancelled by the owner; use a new key instead of reviving it`)
+    }
+  }
+  /** Reconcile only unused staged resources; retain compatible ids, baseline, usage and recorded artifacts. */
+  private async repairDraftAdmissions(actor: Actor, draft: DraftPlan, input: PlanInput, assertCurrent: () => void): Promise<void> {
+    if (!draft.missionId) return
+    let mission = this.store.get('missions', draft.missionId)
+    if (!mission) return
+    const assertStaged = () => {
+      assertCurrent()
+      if (this.mission(draft.missionId!).status !== 'staged' || this.store.get('drafts', draft.id)?.revision !== draft.revision) throw new Error('Plan repair was interrupted')
+    }
+    assertStaged()
+    await this.assertWorkspaceAuthorized(mission)
+    assertStaged()
+    const members = new Map(input.members.map(member => [`member_${draft.id}_${member.key}`, member]))
+    for (const member of this.store.list('members', mission.id)) {
+      const next = members.get(member.id)
+      const changed = next && (['name', 'role', 'provider', 'model', 'reasoningEffort', 'maxOutputTokens'] as const).some(field => member[field] !== next[field])
+      if (next && !changed && memberPhaseOf(member) !== 'stopped') continue
+      if (this.store.list('tasks', mission.id).some(task => task.attempt?.ownerId === member.id)) throw new Error(`Worker ${member.id} still owns an attempt; preserve and stop that execution before repairing its plan resources`)
+      const opening = this.workerStarts.get(member.id)
+      opening?.controller.abort(new Error('Saved plan resource repair'))
+      const timeout = AbortSignal.timeout(this.config.workerStartTimeoutMs ?? 60_000)
+      const signal = actor.signal ? AbortSignal.any([actor.signal, timeout]) : timeout
+      await abortableStart(this.workers.stop(member.id), signal)
+      assertStaged()
+      this.workerStarts.delete(member.id)
+      const latest = this.store.get('members', member.id)!
+      const previousSessionId = latest.sessionId
+      if (next) {
+        Object.assign(latest, { name: next.name, role: next.role, provider: next.provider, model: next.model,
+          reasoningEffort: next.reasoningEffort, maxOutputTokens: next.maxOutputTokens, phase: 'active' })
+        if (changed) latest.sessionId = id('swarm-session')
+      } else latest.phase = 'stopped'
+      this.commit(mission.id, () => {
+        this.store.put('members', latest)
+        this.store.event(mission!.id, 'member/plan-repaired', 'owner', { memberId: latest.id, revision: draft.revision, previousSessionId, sessionId: latest.sessionId, retired: !next })
+      })
+    }
+    assertStaged()
+    mission = this.mission(mission.id)
+    const tasks = new Map(input.tasks.map(task => [`task_${draft.id}_${task.key}`, task]))
+    this.commit(mission.id, () => {
+      Object.assign(mission!, { title: input.title, objective: input.objective, scope: [...input.scope], acceptance: [...input.acceptance], budget: { ...input.budget }, updatedAt: Date.now() })
+      this.store.put('missions', mission!)
+      for (const stream of input.workstreams) {
+        const previous = this.store.get('workstreams', `stream_${draft.id}_${stream.key}`)
+        if (previous) { previous.title = stream.title; previous.objective = stream.objective; this.store.put('workstreams', previous) }
+      }
+      for (const task of this.store.list('tasks', mission!.id)) {
+        const next = tasks.get(task.id)
+        if (task.artifact || task.attempt || task.evidenceIds.length || ['submitted', 'accepted', 'running'].includes(task.status)) continue
+        if (!next) {
+          if (task.status !== 'cancelled') { task.status = 'cancelled'; task.epoch++; task.output = 'Withdrawn by saved plan repair'; this.store.put('tasks', task) }
+          continue
+        }
+        if (task.status === 'cancelled') throw new Error(`Task ${task.id} was cancelled by the owner; use a new plan key`)
+        const previous = { ...task }
+        Object.assign(task, { title: next.title, objective: next.objective, workstreamId: `stream_${draft.id}_${next.workstreamKey}`,
+          dependencies: normalizeReviewDependencies(next.kind, next.reviewOf, next.dependencies).map(key => `task_${draft.id}_${key}`),
+          scope: [...next.scope], acceptance: [...next.acceptance], checks: [...(next.checks ?? [])],
+          priority: next.priority ?? 50, experiment: next.experiment ?? false,
+          assigneeId: next.assigneeKey ? `member_${draft.id}_${next.assigneeKey}` : undefined,
+          plannedAssigneeId: next.assigneeKey ? `member_${draft.id}_${next.assigneeKey}` : undefined,
+          assignmentMode: next.assignmentMode, reviewOf: next.reviewOf ? `task_${draft.id}_${next.reviewOf}` : undefined,
+          ...normalizeTaskCeilings(next, input.budget.maxSteps, 'task'),
+          maxRecoveryAttempts: next.maxRecoveryAttempts, checkTimeoutMs: next.checkTimeoutMs })
+        if (JSON.stringify(previous) !== JSON.stringify(task)) {
+          this.store.put('tasks', task)
+          this.store.event(mission!.id, 'task/plan-repaired', 'owner', { taskId: task.id, draftRevision: draft.revision, previous, task })
+        }
+      }
+      this.store.event(mission!.id, 'plan/admissions-repaired', 'owner', { draftId: draft.id, revision: draft.revision })
+    })
   }
   /** Build the entire topology while dispatch is fenced, then activate it in one commit. */
   async launchDraft(actor: Actor, draftId: string, revision: number): Promise<Snapshot> {
@@ -3068,12 +3254,14 @@ export class SwarmRuntime {
       assertCurrent()
       const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input)
       draft.input = input
+      draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
       draft.status = 'launching'; draft.revision++; draft.updatedAt = Date.now(); delete draft.error
       draft.missionId ??= `mission_${draft.id}`
       this.commit(draft.id, () => this.store.put('drafts', draft))
       const missionId = draft.missionId
       try {
         let mission = this.store.get('missions', missionId)
+        const repairing = mission !== undefined
         if (!mission) {
           const { title, objective, workspace, scope, acceptance, budget } = input
           const extra = input as PlanInput & { workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
@@ -3082,6 +3270,7 @@ export class SwarmRuntime {
           mission = this.create(actor, { title, objective, workspace, ...(anchor === undefined ? {} : { workspaceGrantRoot: anchor }), ...(source === undefined ? {} : { workspaceAuthorizationSource: source }), scope, acceptance, budget }, { id: missionId, status: 'staged' })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new Error('The partially assembled mission cannot be launched')
+        if (repairing) await this.repairDraftAdmissions(actor, draft, input, assertCurrent)
         for (const member of input.members) {
           assertCurrent()
           await this.addMember(actor, missionId, member, `member_${draft.id}_${member.key}`)
@@ -3099,12 +3288,12 @@ export class SwarmRuntime {
         // abort handle cannot revive a cancelled or superseded assembly.
         assertCurrent()
         if (mission.status !== 'staged') throw new Error('Plan assembly was interrupted')
-        mission.status = 'active'; mission.updatedAt = Date.now(); mission.deadline = Date.now() + mission.budget.maxDurationMs
+        mission.status = 'active'; mission.updatedAt = Date.now(); executionClock(mission, false)
         draft.status = 'launched'; draft.updatedAt = Date.now()
         this.commit(missionId, () => {
           this.store.put('missions', mission!); this.store.put('drafts', draft)
           this.syncStarts(mission!)
-          this.store.event(missionId, 'plan/launched', 'owner', { draftId, revision: draft.revision })
+          this.store.event(missionId, 'plan/launched', 'owner', { draftId, revision: draft.revision, advisories: draft.advisories })
         })
         this.kick(missionId)
         return this.snapshot(actor, missionId)
@@ -3144,7 +3333,9 @@ export class SwarmRuntime {
    * position and the default read returns only the delta — new events and tool
    * runs, plus the current assignment when it changed — so appended content
    * keeps the cached prompt prefix intact instead of re-sending superseded
-   * snapshots (docs/observe-context-measurement.md). `detail=full` is owner-only.
+   * snapshots (docs/observe-context-measurement.md). Owners pass an explicit
+   * `nextCursor` back as `cursor` for compact row deltas; a missing/expired
+   * baseline gives a full compact view. `detail=full` is owner-only.
    */
   observe(actor: Actor, missionId: string, query: ObserveQuery = {}, options: { advanceEventCursor?: boolean } = {}): unknown {
     actor.signal?.throwIfAborted()
@@ -3156,10 +3347,11 @@ export class SwarmRuntime {
     // it for worker sessions while the owner path keeps the complete view.
     if (member && query.detail === 'full') throw new ObserveDetailRefusedError()
     const tasks = this.store.list('tasks', missionId), members = this.projectedMembers(missionId)
+    let dependencyGraph: TaskGraphIndex | undefined
     const runRef = (run: ToolRun) => ({ id: run.id, seq: run.seq ?? 0, taskId: run.taskId, attemptId: run.attemptId, memberId: run.memberId, tool: run.tool, isError: run.isError, arguments: excerpt(run.arguments, 240) })
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
-    const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
+    const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
       ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}) })
     const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
@@ -3167,6 +3359,12 @@ export class SwarmRuntime {
       const all = this.store.toolRuns(missionId, { ...filter, ...(afterSeq === undefined ? {} : { afterSeq }) })
       const shown = afterSeq === undefined ? all.slice(-limit) : all.slice(0, limit)
       return { toolRuns: shown.map(runRef), totalToolRuns: all.length, ...(shown.length ? { nextAfterRun: shown.at(-1)!.seq ?? 0 } : {}), ...(all.length > shown.length ? { omittedToolRuns: all.length - shown.length } : {}) }
+    }
+    if (query.deliveryId !== undefined) {
+      if (!owner) throw new PolicyError('observe_delivery_owner_only', 'authorization_error', 'Only the mission owner can read a stored delivery')
+      const delivery = this.store.get('deliveries', query.deliveryId)
+      if (!delivery || delivery.missionId !== missionId) throw new PolicyError('observe_delivery_unknown', 'validation_error', 'Unknown delivery in this mission')
+      return { delivery }
     }
     if (query.runId !== undefined) {
       const run = this.store.get('tool_runs', query.runId)
@@ -3184,13 +3382,17 @@ export class SwarmRuntime {
     if (query.taskId !== undefined) {
       const task = this.task(missionId, query.taskId)
       return { task: taskRecord(task, 6000), evidence: evidenceOf(task, true), reviews: tasks.filter(item => item.reviewOf === task.id).map(taskRef),
-        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+        dependencies: task.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
         ...(task.reviewOf ? { reviewSource: taskRef(this.task(missionId, task.reviewOf)) } : {}), ...runsWindow({ taskId: task.id }, 40, query.afterRun) }
     }
     // A member's delivered position is the default cursor; an explicit
     // after/afterRun overrides it for one read and still advances it.
     const delivered = member === undefined ? undefined : this.observeCursors.get(member.id)
-    const after = query.after ?? delivered?.eventSeq
+    if (query.cursor !== undefined && (typeof query.cursor !== 'string' || query.cursor.length > 200 || !owner)) throw new PolicyError('observe_cursor_invalid', 'validation_error', 'cursor must be an owner observation cursor of at most 200 characters')
+    const ownerKey = JSON.stringify([actor.sessionId, missionId])
+    const savedOwner = owner && query.cursor !== undefined ? this.ownerObserveCursors.get(query.cursor) : undefined
+    const ownerCursor = query.detail !== 'full' && savedOwner?.scope === ownerKey ? savedOwner : undefined
+    const after = query.after ?? delivered?.eventSeq ?? ownerCursor?.eventSeq
     const afterRun = query.afterRun ?? delivered?.runSeq
     const eventLimit = 12
     // `after: 0` keeps its original meaning (no cursor): a member cursor of 0
@@ -3225,7 +3427,7 @@ export class SwarmRuntime {
         // unchanged one stays in the cached prefix and is not re-sent.
         ...(delivered.current === currentKey ? {} : { current: current === undefined ? null : {
           task: taskRecord(current!, 2400), attemptId: current!.attempt!.id,
-          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current!.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } }),
         events, ...eventCursor, ...runs,
@@ -3238,7 +3440,7 @@ export class SwarmRuntime {
         member: { id: member.id, name: member.name, role: member.role, status: member.status },
         current: current ? {
           task: taskRecord(current, 2400), attemptId: current.attempt!.id,
-          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks)).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
+          dependencies: current.dependencies.map(dep => this.lineage(missionId, dep, tasks, dependencyGraph ??= taskGraphIndex(tasks))).map(chain => ({ ...taskRef(chain.at(-1)!), output: excerpt(chain.at(-1)!.output ?? '', 600), ...(chain.length > 1 ? { replacementOf: chain.slice(0, -1).map(item => item.id) } : {}) })),
           ...(source ? { reviewSource: { ...taskRecord(source, 2400), evidence: evidenceOf(source) } } : {}),
         } : null,
         evidence: current ? evidenceOf(current) : [],
@@ -3250,25 +3452,58 @@ export class SwarmRuntime {
       }
     }
     const evidence = this.store.list('evidence', missionId)
-    return {
-      mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
+    const rows: OwnerRows = {
       members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status, ...(item.activity ? { activity: item.activity.kind } : {}), accountedTokens: item.accountedTokens ?? 0, requests: item.usage?.requests ?? 0 })),
       board: full ? tasks.map(task => taskRecord(task, 6000)) : tasks.map(taskRef),
       evidence: (full ? evidence : evidence.filter(item => item.status === 'challenged' || item.status === 'refuted')).map(item => evidenceRef(item, full)),
+    }
+    const postAfter = ownerCursor?.postSeq
+    const newest = this.store.posts(missionId, { ...(postAfter === undefined ? {} : { afterSeq: postAfter }), newest: true, limit: BOARD_DELTA_POSTS })
+    const postCount = this.store.countPosts(missionId, postAfter === undefined ? {} : { afterSeq: postAfter })
+    let cursorView: Record<string, unknown> = {}
+    if (owner && !full) {
+      const signatures = {} as OwnerCursor['rows']
+      const removed = {} as Record<keyof OwnerRows, string[]>
+      for (const key of ['board', 'members', 'evidence'] as const) {
+        signatures[key] = new Map(rows[key].map(row => [row.id, JSON.stringify(row)]))
+        if (ownerCursor) {
+          removed[key] = [...ownerCursor.rows[key].keys()].filter(id => !signatures[key].has(id))
+          rows[key] = rows[key].filter(row => ownerCursor.rows[key].get(row.id) !== signatures[key].get(row.id))
+          if (!rows[key].length && !removed[key].length) signatures[key] = ownerCursor.rows[key]
+        }
+      }
+      // A history-only read substitutes the events after this function returns.
+      // Leave its baseline untouched; the next ordinary read may repeat data,
+      // but cannot skip an event the caller has never seen.
+      if (options.advanceEventCursor !== false) {
+        const eventSeq = events.at(-1)?.seq ?? after ?? 0, postSeq = newest.at(-1)?.seq ?? postAfter ?? 0
+        const unchanged = ownerCursor && eventSeq === ownerCursor.eventSeq && postSeq === ownerCursor.postSeq
+          && (['board', 'members', 'evidence'] as const).every(key => signatures[key] === ownerCursor.rows[key])
+        const token = unchanged ? ownerCursor.token : randomUUID()
+        if (!unchanged) {
+          this.ownerObserveCursors.set(token, { scope: ownerKey, token, rows: signatures, eventSeq, postSeq })
+          if (this.ownerObserveCursors.size > 64) this.ownerObserveCursors.delete(this.ownerObserveCursors.keys().next().value!)
+        }
+        cursorView.nextCursor = token
+      } else if (ownerCursor) cursorView.nextCursor = ownerCursor.token
+      cursorView = { ...cursorView, ...(ownerCursor ? { delta: true, removed } : query.cursor === undefined ? {} : { cursorReset: true }) }
+    }
+    return {
+      mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
+      ...rows, ...cursorView,
       unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
       pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => !delivery.deliveredAt).length,
-      // The owner has no delivered cursor, so the board appears as a bounded
-      // total plus the newest few posts; swarm_board pages the full history.
-      posts: { total: this.store.countPosts(missionId), newest: this.store.posts(missionId, { newest: true, limit: BOARD_DELTA_POSTS }).map(post => postView(post)) },
+      posts: { total: this.store.countPosts(missionId), newest: newest.map(post => postView(post)),
+        ...(postAfter === undefined ? {} : { count: postCount }), ...(postCount > newest.length ? { omitted: postCount - newest.length } : {}) },
       events, ...eventCursor,
       ...(owner ? this.ownerInstruments(missionId, full) : {}),
-      detail: full ? 'Complete task records and evidence claims; tool payloads are read by runId.' : 'Compact board. taskId reads one task with evidence and runs; detail=full expands every task record; after returns only newer events.',
+      detail: full ? 'Complete task records and evidence claims; tool payloads are read by runId.' : 'Pass nextCursor as cursor for changed board/members/evidence rows and removed ids; mission statistics and open questions remain visible. Missing or expired cursor returns a complete compact board. after pages events independently; taskId/runId/evidenceId reads one record; detail=full expands records.',
       ...(owner ? {} : { note: 'Non-member observer' }),
     }
   }
   
   /** Requests already streaming have no reported usage yet; estimate each at its worker's average. */
-  private inFlightEstimate(members: Member[]): number {
+  inFlightEstimate(members: Member[]): number {
     let total = 0
     for (const member of members) {
       if (memberPhaseOf(member) === 'stopped') continue
@@ -3325,9 +3560,9 @@ export class SwarmRuntime {
       const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
       return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
     }
-    if (tasks.some(task => task.kind === 'implementation') && !accepted.some(task => task.kind === 'integration' && task.artifact)) {
-      const implementations = accepted.filter(task => task.kind === 'implementation' && task.artifact)
-      if (tasks.some(task => task.kind === 'integration') || implementations.length !== 1) return 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
+    if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled' && !leftover.has(task.id))) {
+      try { this.selectDeliveryTarget(mission.id, tasks.filter(task => !leftover.has(task.id))) }
+      catch (error) { return error instanceof Error ? error.message : String(error) }
     }
     // Evidence of cancelled or dead work no longer supports any accepted result; live disputes still block.
     const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))
@@ -3389,28 +3624,121 @@ export class SwarmRuntime {
   
   
   
+  /** Amend execution policy without replacing the task or resetting its accumulated work. */
+  controlTask(actor: Actor, missionId: string, taskId: string, action: 'amend' | 'resume', changes: TaskAmendment, reason: string): Task {
+    actor.signal?.throwIfAborted()
+    const { mission, owner } = this.participant(actor, missionId)
+    if (!owner || this.isWorkerSession(actor.sessionId)) throw new PolicyError('task_owner_required', 'authorization_error', 'Only the primary user session may amend task execution')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
+    if (terminal(mission) || mission.status === 'staged') throw new PolicyError('mission_not_running', 'conflict_error', 'Task policy requires a launched, nonterminal mission')
+    if (!['amend', 'resume'].includes(action)) throw new PolicyError('task_action_invalid', 'validation_error', 'Task control supports amend or resume')
+    this.bounded(reason)
+    const allowed = ['scope', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
+    if (changes === null || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !allowed.includes(key))) throw new PolicyError('task_amendment_invalid', 'validation_error', 'Unknown task amendment field')
+    const task = this.task(missionId, taskId)
+    if (['accepted', 'cancelled'].includes(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
+    if (this.store.list('tasks', missionId).some(row => row.status !== 'cancelled' && row.replaces?.includes(task.id))) throw new PolicyError('task_replaced', 'conflict_error', 'Task has a live replacement; amend that task instead')
+    const structural = ['scope', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
+    if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', 'Submitted artifact policy is immutable; repair rejected work through a replacement')
+    if (task.status === 'blocked' && task.evidenceIds.some(key => this.store.get('evidence', key)?.status === 'refuted') && !task.verificationRecovery) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
+    const next: Task = { ...task }
+    for (const key of ['maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs'] as const) {
+      const value = changes[key]
+      if (value === undefined) continue
+      if (!Number.isSafeInteger(value) || value < 1 || (key === 'checkTimeoutMs' && value > 2147483647)) throw new PolicyError('task_allocation_invalid', 'validation_error', `${key} must be a positive safe allocation`)
+      if (key === 'maxSteps' && (value > mission.budget.maxSteps || value < (task.usedSteps ?? 0))) throw new PolicyError('task_step_allocation_invalid', 'budget_error', 'Task maxSteps must cover consumed steps and fit the mission budget')
+      if (key === 'maxRecoveryAttempts' && value < (task.recoveryCount ?? 0)) throw new PolicyError('task_recovery_allocation_invalid', 'budget_error', 'maxRecoveryAttempts cannot be below consumed recovery attempts')
+      next[key] = value
+    }
+    if (changes.scope !== undefined) {
+      requireStrings(changes.scope, 'scope'); next.scope = normalizeScopeSelectors(changes.scope)
+      assertScopeSelectors(next.scope, 'scope', mission.scope)
+    }
+    if (changes.dependencies !== undefined) {
+      if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
+      next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]
+      for (const dependency of next.dependencies) this.task(missionId, dependency)
+    }
+    if (changes.checks !== undefined) {
+      if (!Array.isArray(changes.checks) || changes.checks.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_checks_invalid', 'validation_error', 'Invalid checks')
+      requireHostChecks(task.kind, changes.checks, 'task', task.title, loadPackageScripts(mission.workspace))
+      next.checks = [...changes.checks]
+    }
+    if (changes.assigneeId !== undefined) {
+      if (changes.assigneeId === null || changes.assigneeId === '') { delete next.assigneeId; delete next.plannedAssigneeId }
+      else {
+        const member = this.store.get('members', changes.assigneeId)
+        if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
+        if (task.reviewOf && this.authorIds(this.task(missionId, task.reviewOf)).has(member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        next.assigneeId = member.id; next.plannedAssigneeId = member.id
+      }
+    }
+    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next) === undefined)
+    if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
+    if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
+    if (resumes && task.verificationRecovery) {
+      const source = this.task(missionId, task.verificationRecovery.sourceTaskId)
+      if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
+    }
+    if (resumes && (next.recoveryCount ?? 0) >= (next.maxRecoveryAttempts ?? this.config.maxTasksPerMember)) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
+    if (taskCeilingBlock(next) === undefined) delete next.ceiling
+    if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
+    const activeOwner = task.attempt?.ownerId
+    if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
+      next.status = 'blocked'; next.epoch++; this.dropAttempt(next)
+      next.resumeAfterStop = { epoch: next.epoch, memberId: activeOwner, reason: 'handoff', at: Date.now() }
+    } else {
+      if (structural && !next.resumeAfterStop) next.epoch++ // Fence a preparation already awaiting I/O.
+      if (resumes && !next.resumeAfterStop && next.status === 'blocked') next.status = 'pending'
+    }
+    this.assertEffectiveTaskGraph(missionId, { ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
+    next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
+    this.commit(missionId, () => {
+      this.store.put('tasks', next)
+      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])) })
+    })
+    this.attempts.resumeStoppedAttempt(missionId, next)
+    if (mission.status === 'active') this.kick(missionId)
+    return next
+  }
+  amendScope(actor: Actor, missionId: string, scope: string[], reason: string): Mission {
+    const { mission, owner } = this.participant(actor, missionId)
+    if (!owner || this.isWorkerSession(actor.sessionId)) throw new PolicyError('mission_scope_owner_required', 'authorization_error', 'Only the primary user session may revise mission scope')
+    if (terminal(mission) || mission.status === 'staged') throw new PolicyError('mission_scope_not_running', 'conflict_error', 'Mission scope requires a launched, nonterminal mission; edit the saved plan before launch')
+    this.bounded(reason); requireStrings(scope, 'scope')
+    const normalized = normalizeScopeSelectors(scope); assertScopeSelectors(normalized, 'scope')
+    if (this.store.list('tasks', missionId).some(task => task.status !== 'cancelled' && !scopeSubset(task.scope, normalized))) throw new PolicyError('mission_scope_in_use', 'validation_error', 'Mission scope must retain admitted task paths')
+    const previous = mission.scope; mission.scope = normalized
+    this.commit(missionId, () => { this.store.put('missions', mission); this.store.event(missionId, 'mission/scope-amended', 'owner', { previous, scope: normalized, reason }) })
+    return mission
+  }
   /** Primary-agent resource decisions change ceilings without resetting consumed work. */
   updateBudget(actor: Actor, missionId: string, input: Budget, reason?: string): Budget {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const { mission, owner } = this.participant(actor, missionId)
-    if (!owner || this.isWorkerSession(actor.sessionId)) throw new Error('Only the primary user session may update a mission budget')
-    if (terminal(mission)) throw new Error('Mission is terminal; its budget cannot be changed')
-    if (mission.status === 'staged') throw new Error('Use the saved plan to set the budget before launch')
+    if (!owner || this.isWorkerSession(actor.sessionId)) throw new PolicyError('mission_budget_owner_required', 'authorization_error', 'Only the primary user session may update a mission budget')
+    if (terminal(mission)) throw new PolicyError('mission_budget_closed', 'conflict_error', 'Mission is terminal; its budget cannot be changed')
+    if (mission.status === 'staged') throw new PolicyError('mission_budget_staged', 'conflict_error', 'Use the saved plan to set the budget before launch')
     if (reason !== undefined) this.bounded(reason)
-    const budget = validatedBudget(input)
+    const budget = validatedBudget({ ...input, deadlineAt: input.deadlineAt ?? mission.budget.deadlineAt })
     const tasks = this.store.list('tasks', missionId)
     const admitted = { maxTokens: mission.usedTokens, maxSteps: mission.usedSteps,
-      maxWorkers: this.store.list('members', missionId).length, maxTasks: Math.max(tasks.length, this.store.list('workstreams', missionId).length),
+      maxWorkers: this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').length, maxTasks: Math.max(tasks.length, this.store.list('workstreams', missionId).length),
       maxExperiments: tasks.filter(task => task.experiment).length }
     for (const key of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxTasks', 'maxExperiments'] as const) {
-      if (budget[key] < admitted[key]) throw new Error(`${key} cannot be below existing consumption or admitted work (${admitted[key]})`)
+      if (budget[key] < admitted[key]) throw new PolicyError('mission_allocation_invalid', 'budget_error', `${key} cannot be below existing consumption or admitted work (${admitted[key]})`)
     }
-    const deadline = mission.createdAt + budget.maxDurationMs
-    if (!Number.isSafeInteger(deadline)) throw new Error('Mission duration exceeds the supported clock range')
-    if (mission.status === 'active' && deadline <= Date.now()) throw new Error('An active mission needs a duration deadline in the future')
+    const elapsed = executionElapsed(mission)
+    if (budget.maxDurationMs < elapsed) throw new PolicyError('mission_duration_allocation_invalid', 'budget_error', 'maxDurationMs cannot be below consumed execution time')
+    if (!Number.isSafeInteger(Date.now() + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'validation_error', 'Mission duration exceeds the supported clock range')
     const previous = mission.budget
-    mission.budget = budget; mission.deadline = deadline; mission.updatedAt = Date.now(); delete mission.budgetWarned
+    mission.budget = budget; mission.updatedAt = Date.now(); mission.budgetReviewedAt = mission.updatedAt
+    executionClock(mission, mission.status === 'active' && !mission.budgetPause && this.store.list('tasks', missionId).some(task => task.status === 'running'))
+    const deadline = mission.deadline
+    const resumeResourceWait = mission.status === 'blocked' && mission.budgetPause !== undefined
+      && mission.usedTokens < budget.maxTokens && mission.usedSteps < budget.maxSteps && Date.now() < deadline
+    if (resumeResourceWait) { mission.status = 'active'; mission.reason = reason ?? 'Owner reviewed and extended the execution budget' }
     this.commit(missionId, () => {
       this.store.put('missions', mission)
       this.syncStarts(mission)
@@ -3422,37 +3750,45 @@ export class SwarmRuntime {
   /** Owner control does not depend on an agent's willingness to follow a message. */
   control(actor: Actor, missionId: string, action: 'pause' | 'resume' | 'stop' | 'complete' | 'coordinator', reason: string, coordinatorId?: string): Mission {
     const { mission, owner } = this.participant(actor, missionId)
-    if (!owner) throw new Error('Only the user session controls mission lifecycle and coordinator appointment')
-    if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new Error('Unknown mission control action; retry and extend require a prelaunch requestId')
+    if (!owner) throw new PolicyError('mission_owner_required', 'authorization_error', 'Only the user session controls mission lifecycle and coordinator appointment')
+    if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new PolicyError('mission_action_invalid', 'validation_error', 'Unknown mission control action; retry and extend require a prelaunch requestId')
     this.bounded(reason)
-    if (terminal(mission)) throw new Error('Mission is terminal; create a new mission to continue')
-    if (mission.status === 'staged' && action !== 'stop') throw new Error('Use the saved plan launch action to activate staged work')
+    if (terminal(mission)) throw new PolicyError('mission_terminal', 'conflict_error', 'Mission is terminal; create a new mission to continue')
+    if (mission.status === 'staged' && action !== 'stop') throw new PolicyError('mission_staged', 'conflict_error', 'Use the saved plan launch action to activate staged work')
     if (action === 'coordinator') {
-      if (!coordinatorId || !this.store.list('members', missionId).some(m => m.id === coordinatorId && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown coordinator')
+      if (!coordinatorId || !this.store.list('members', missionId).some(m => m.id === coordinatorId && memberPhaseOf(m) !== 'stopped')) throw new PolicyError('coordinator_invalid', 'validation_error', 'Unknown coordinator')
       mission.coordinatorId = coordinatorId
     } else if (action === 'complete') {
       // The owner decides; verified coverage and the deliverable are still required.
       const error = this.completionError(mission, { cancelUnschedulable: true })
-      if (error) throw new Error(error)
+      if (error) throw new PolicyError('mission_completion_pending', 'validation_error', error)
       mission.status = 'completed'
     } else if (action === 'resume') {
-      if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens || Date.now() >= mission.deadline) throw new Error('Mission budget exhausted; it cannot be resumed with a fresh allowance')
+      if (mission.usedSteps >= mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens || Date.now() >= mission.deadline) throw new PolicyError('mission_budget_exhausted', 'budget_error', 'Mission budget exhausted; it cannot be resumed with a fresh allowance')
       mission.status = 'active'
     } else mission.status = action === 'pause' ? 'paused' : 'stopped'
+    if (mission.status !== 'active' && mission.executionTime !== undefined) executionClock(mission, false)
     mission.reason = reason; mission.updatedAt = Date.now()
     this.commit(missionId, () => {
       this.store.put('missions', mission)
       this.syncStarts(mission)
       if (action === 'complete') for (const task of this.unschedulable(mission, this.store.list('tasks', missionId), this.store.list('members', missionId))) {
-        task.status = 'cancelled'; task.epoch++; this.dropAttempt(task); delete task.resumeAfterStop; delete task.budgetResume
+        task.status = 'cancelled'
+        if (task.resumeAfterStop?.epoch !== task.epoch) task.epoch++
+        this.dropAttempt(task); delete task.budgetResume
         task.output = `${task.output ?? ''}\nCancelled at completion: this task could no longer be scheduled and every acceptance criterion was independently covered.`.trim()
         this.store.put('tasks', task)
         this.store.event(missionId, 'task/cancelled-at-completion', 'owner', { taskId: task.id, reason })
       }
       if (action === 'pause' || action === 'stop') for (const task of this.store.list('tasks', missionId)) {
-        if (task.status !== 'running' && !(task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch)) continue
-        task.status = action === 'pause' ? 'pending' : 'cancelled'; task.epoch++; this.dropAttempt(task)
-        delete task.resumeAfterStop
+        const priorStop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+        if (task.status !== 'running' && priorStop === undefined) continue
+        const oldOwner = priorStop?.memberId ?? task.attempt?.ownerId
+        if (action === 'stop') task.status = 'cancelled'
+        else if (task.status !== 'cancelled') task.status = 'blocked'
+        if (priorStop === undefined) task.epoch++
+        this.dropAttempt(task)
+        if (oldOwner !== undefined && priorStop === undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: oldOwner, reason: 'handoff', at: Date.now() }
         delete task.budgetResume
         task.handoff = `${task.handoff ?? ''}\nMission ${action}: ${reason}. Inspect prior workspace/evidence before repeating effects.`
         this.store.put('tasks', task)
@@ -3468,8 +3804,20 @@ export class SwarmRuntime {
         this.store.put('missions', mission)
       }
     })
+    if (mission.status !== 'active') {
+      for (const member of this.store.list('members', missionId)) {
+        const opening = this.workerStarts.get(member.id)
+        this.workerStarts.delete(member.id)
+        opening?.controller.abort(new Error(`Mission ${mission.status}`))
+      }
+    }
+    for (const task of this.store.list('tasks', missionId)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(missionId, task)
     if (mission.status !== 'active') this.defer(async () => {
       await Promise.all(this.store.list('members', missionId).map(async member => {
+        // Tasks with a marker own their stop and checkpoint; never run a stale
+        // second stop after that barrier releases a replacement handle.
+        if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) return
+        if (this.mission(missionId).status === 'active') return
         await this.workers.stop(member.id)
         if (this.closed || !terminal(this.mission(missionId))) return
         const current = this.store.get('members', member.id)
@@ -3491,11 +3839,9 @@ export class SwarmRuntime {
     const mission = this.mission(member.missionId)
     if (mission.status !== 'active' || Date.now() >= mission.deadline || mission.usedSteps > mission.budget.maxSteps || mission.usedTokens >= mission.budget.maxTokens) return 'Mission is inactive or out of budget'
     if (mission.budgetPause) return 'Budget pause is waiting for worker quiescence and a fresh resume assignment'
-    if (/subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
+    if (/^(?:subagent|spawn_agent|agent_teams|cordis|plugin|workflow|ralph)(?:$|_)/.test(tool) || ['send_message', 'interrupt_agent', ...OWNER_ONLY_TOOLS].includes(tool)) return 'Use the swarm work board; alternate delegation and runtime modification bypass mission authority'
     const active = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
-    // W7: a denied worker-side git write is surfaced once as a typed, actionable
-    // error; the workspace is still publishable through swarm_submit.
-    if (active?.gitWriteDenied !== undefined && !tool.startsWith('swarm_')) return gitWriteDeniedMessage(active.gitWriteDenied.command)
+    // A sandbox Git refusal is diagnostic; reads, edits, and checks remain available.
     if (active && !active.dependencies.every(dep => this.dependencySatisfied(member.missionId, dep))) return 'A prerequisite was invalidated; stop work and inspect the challenge'
     if (active?.reviewOf && this.task(member.missionId, active.reviewOf).status !== 'submitted') return 'The reviewed source is no longer submitted; await a fresh review assignment'
     if (active?.attempt && active.attempt.leaseUntil < Date.now()) return 'Task lease expired; await reassignment'
@@ -3545,7 +3891,8 @@ export class SwarmRuntime {
     task.status = 'blocked'
     task.ceiling = ceiling
     task.epoch++
-    this.dropAttempt(task); delete task.resumeAfterStop; delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    this.dropAttempt(task); delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    if (ownerId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: ownerId, reason: 'resource', at: Date.now() }
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
     if (member !== undefined && memberPhaseOf(member) !== 'stopped') { member.phase = 'parked'; delete member.activity }
     this.commit(mission.id, () => {
@@ -3556,15 +3903,9 @@ export class SwarmRuntime {
     // S4b: the durable event carried the code, the owner notice did not. The
     // shared coded terminal names the task, the dimension and the exits.
     emitGuardTerminal(this, mission.id, 'task_ceiling', { taskId: task.id, ...(ownerId === undefined ? {} : { memberId: ownerId }), detail: `${task.title} (${task.id}) exhausted its own ${ceiling.dimension} ceiling (${ceiling.used}/${ceiling.limit}) and blocked` })
+    this.attempts.resumeStoppedAttempt(mission.id, task)
     this.kick(mission.id)
   }
-  
-  
-  
-  
-  
-  
-  
   
   private onActivity(memberId: string, activity?: WorkerActivity): void {
     if (this.closed || this.shuttingDown) return
@@ -3636,7 +3977,7 @@ export class SwarmRuntime {
       }
       if (!firstDenial) return
       // Durable audit plus a typed delivery, so the worker learns the supported
-      // exit even if its next tool is allowed before the guard denies one.
+      // host capture path without disabling unrelated workspace tools.
       this.store.event(member.missionId, 'task/git-write-denied', memberId, { taskId: task.id, attemptId: task.attempt!.id, command: denied, runId: run.id })
       this.store.put('deliveries', { id: id('msg'), missionId: member.missionId, from: 'runtime', to: memberId, kind: 'control', content: gitWriteDeniedMessage(denied!), createdAt: Date.now() })
     })
@@ -3650,6 +3991,9 @@ export class SwarmRuntime {
    * charges recovery credit.
    */
   private recordProviderOutage(member: Member, outage: ProviderOutage): void {
+    const current = this.store.get('members', member.id)
+    if (current === undefined || memberPhaseOf(current) === 'stopped') return
+    member = current
     const previous = member.providerOutage
     const duplicate = previous !== undefined && previous.class === outage.class && Date.now() - previous.at < PROVIDER_OUTAGE_EVENT_WINDOW_MS
     member.providerOutage = { ...outage, at: Date.now() }
@@ -3734,6 +4078,9 @@ export class SwarmRuntime {
     const missionId = mission.id
     const current = this.store.get('missions', missionId)
     if (current === undefined || current.status !== 'active') return
+    const latest = this.store.get('members', member.id)
+    if (latest === undefined || memberPhaseOf(latest) === 'stopped') return
+    member = latest
     // R11-01: classify at the boundary. A provider outage (quota, rate limit,
     // provider unavailable) is a quiescent route, not this member's failure:
     // it spends no recovery credit, does not count toward retiring the route,
@@ -3753,29 +4100,28 @@ export class SwarmRuntime {
     // Below the limit the member stays live so the next tick retries the same
     // route; at the limit it is retired exactly like a dead session. A quiescent
     // route is always kept live: the provider may recover on the next tick.
-    member.phase = reroute ? 'stopped' : 'active'
+    if (reroute) member.phase = 'stopped'
     this.commit(missionId, () => {
       if (outage === undefined) this.store.put('members', member)
       else this.recordProviderOutage(member, outage)
       for (const task of this.store.list('tasks', missionId)) {
         if (task.assigneeId !== member.id || !['pending', 'running'].includes(task.status)) continue
-        if (outage === undefined) task.recoveryCount = (task.recoveryCount ?? 0) + 1
         task.output = reason
-        task.epoch++
+        if (task.attempt !== undefined) task.epoch++
         this.dropAttempt(task); delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
         const pinned = task.assigneeId
         delete task.assigneeId
         task.status = 'pending'
         const limit = task.maxRecoveryAttempts ?? this.config.maxTasksPerMember
-        const target = outage !== undefined || reroute ? this.rerouteTarget(missionId, task, member.id) : undefined
+        const target = task.assignmentMode !== 'pinned' && (outage !== undefined || reroute) ? this.rerouteTarget(missionId, task, member.id) : undefined
         // Re-route wins over the credit limit: the obligation moves to another
         // live route instead of blocking, and the credit spent so far travels
         // with the task so the new owner still has a bounded budget.
         if (target !== undefined) task.assigneeId = target.id
         // No capable target: keep the same live route below the limit, and
         // release the work to any live member once the route is retired.
-        else if (!reroute) task.assigneeId = pinned
-        const exhausted = outage === undefined && target === undefined && (task.recoveryCount ?? 0) >= limit
+        else if (!reroute || task.assignmentMode === 'pinned') task.assigneeId = pinned
+        const exhausted = false // Route startup is infrastructure recovery, never task execution credit.
         task.status = exhausted ? 'blocked' : 'pending'
         this.store.put('tasks', task)
         this.store.event(missionId, 'task/start-failed', 'runtime', { taskId: task.id, epoch: task.epoch, reason, recoveryCount: task.recoveryCount ?? 0, maxRecoveryAttempts: limit, status: task.status, consecutiveFailures, quiescent: outage !== undefined })
@@ -3792,8 +4138,8 @@ export class SwarmRuntime {
       // recovery credit that was never spent.
       if (outage !== undefined) return
       this.notify(missionId, reroute
-        ? `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work was re-routed to a live member.`
-        : `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its work was re-pended with one recovery credit.`,
+        ? `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`
+        : `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
         this.noticeSubjectsFor(missionId, { memberId: member.id }))
     })
   }
@@ -3922,15 +4268,79 @@ export class SwarmRuntime {
       }
     })
   }
-  private async ensureWorkers(mission: Mission): Promise<void> {
+  private ensureWorkers(mission: Mission): void {
     for (const member of this.store.list('members', mission.id)) {
       if (this.shuttingDown) return
       if (memberPhaseOf(member) === 'stopped') continue
-      // R5-02: a failed resume is recovered by the same policy as the scheduler
-      // start path; a successful start clears the consecutive failure counter.
-      try { await this.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }); this.startFailures.delete(member.id); this.clearProviderOutage(mission.id, member.id) }
-      catch (error) { this.onStartFailure(mission, member, error) }
+      this.defer(async () => { try { await this.startWorker(mission, member) } catch { /* recorded once by startWorker */ } })
     }
+  }
+  /** One bounded startup per member, shared by admission, recovery and dispatch. */
+  startWorker(mission: Mission, member: Member, options: { admission?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+    if (this.closed || this.shuttingDown) return Promise.reject(new Error('Swarm runtime is shutting down'))
+    if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) return Promise.reject(new Error('Worker is waiting for its previous attempt to stop'))
+    const existing = this.workerStarts.get(member.id)
+    const superseded = existing !== undefined && options.admission && (existing.admissionSignal !== options.signal || (!existing.nativePending && existing.retryAfter !== undefined))
+    if (superseded) existing.controller.abort(new Error('Worker startup superseded by a new admission'))
+    else if (existing !== undefined && (existing.nativePending || existing.retryAfter === undefined || Date.now() < existing.retryAfter)) return existing.promise
+    const controller = new AbortController()
+    const cancel = () => controller.abort(options.signal?.reason)
+    options.signal?.addEventListener('abort', cancel, { once: true })
+    if (options.signal?.aborted) cancel()
+    const configured = this.config.workerStartTimeoutMs
+    const timeoutMs = configured !== undefined && Number.isFinite(configured) && configured > 0 ? Math.min(configured, 2147483647) : 60_000
+    const timer = setTimeout(() => controller.abort(new Error(`Worker startup timed out after ${timeoutMs}ms`)), timeoutMs)
+    let failed = false
+    const promise = Promise.resolve().then(async () => {
+      try {
+        controller.signal.throwIfAborted()
+        const current = this.store.get('missions', mission.id)
+        const latest = this.store.get('members', member.id)
+        const active = current?.status === 'active' || (options.admission && current?.status === 'staged')
+        if (!active || latest === undefined || memberPhaseOf(latest) === 'stopped') throw new Error('Worker startup is no longer active')
+        if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
+        try {
+          const selected = options.admission ? { ...latest, provider: member.provider, model: member.model, reasoningEffort: member.reasoningEffort } : latest
+          const native = Promise.resolve(this.workers.start({ mission: current!, member: selected, ownerSessionId: current!.ownerSessionId }, controller.signal))
+          const entry = this.workerStarts.get(member.id)!
+          entry.nativePending = true
+          void native.then(() => { entry.nativePending = false }, () => { entry.nativePending = false })
+          await abortableStart(native, controller.signal)
+          controller.signal.throwIfAborted()
+        } catch (error) {
+          failed = true
+          controller.abort(error)
+          // The admission caller owns its option fallback/rollback. Shared
+          // recovery/dispatch waiters record one actual native failure only.
+          if (!options.admission && !options.signal?.aborted && this.workerStarts.get(member.id)?.controller === controller) this.onStartFailure(mission, member, error)
+          throw error
+        }
+        if (this.closed || this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+        const live = this.store.get('members', member.id)
+        const status = this.store.get('missions', mission.id)?.status
+        if ((status !== 'active' && !(options.admission && status === 'staged')) || live === undefined || memberPhaseOf(live) === 'stopped') {
+          controller.abort(new Error('Worker startup is no longer active'))
+          this.defer(() => this.workers.stop(member.id))
+          throw controller.signal.reason
+        }
+        // A bookkeeping failure is not a failed native startup: it must not
+        // cancel a working handle or charge task recovery credit.
+        this.startFailures.delete(member.id)
+        this.clearProviderOutage(mission.id, member.id)
+      } finally {
+        clearTimeout(timer)
+        options.signal?.removeEventListener('abort', cancel)
+        const entry = this.workerStarts.get(member.id)
+        if (entry?.controller === controller) {
+          // Keep a timed-out opening fenced until its native cleanup settles.
+          // Multiple callers of that same opening never spend more credits.
+          if (failed) entry.retryAfter = Date.now() + this.config.tickMs
+          else this.workerStarts.delete(member.id)
+        }
+      }
+    })
+    this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined })
+    return promise
   }
   private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.shuttingDown) return
@@ -3966,11 +4376,14 @@ export class SwarmRuntime {
   
   
   /** Drain all runtime operations and worker handles before releasing database ownership. */
-  async dispose(): Promise<void> {
-    if (this.shuttingDown) return
+  dispose(): Promise<void> {
+    return this.disposal ??= this.disposeRuntime()
+  }
+  private async disposeRuntime(): Promise<void> {
     this.shuttingDown = true
     if (this.timer) clearInterval(this.timer)
     for (const controller of this.startControllers.values()) controller.abort(new Error('Swarm runtime is shutting down'))
+    for (const { controller } of this.workerStarts.values()) controller.abort(new Error('Swarm runtime is shutting down'))
     let workerError: unknown
     try { await this.workers.dispose() } catch (error) { workerError = error }
     try {
@@ -3988,6 +4401,7 @@ export class SwarmRuntime {
     finally {
       // R17-G8: and the claimed-signal subscription goes with it.
       this.notices.dispose()
+      this.observeCursors.clear(); this.ownerObserveCursors.clear()
       this.closed = true; this.listeners.clear(); this.store.close()
     }
     if (workerError !== undefined) throw workerError

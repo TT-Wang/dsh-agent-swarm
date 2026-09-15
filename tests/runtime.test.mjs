@@ -106,13 +106,19 @@ test('all workers draw from one step budget and peer text cannot alter authority
 test('pause preserves mission accounting and revokes old task attempts',async t=>{
   const f=await setup(t); const task=await f.runtime.claim(f.actorA,f.mission.id,f.propose().id)
   await f.workers.callbacks.usage(f.a.id,51)
+  let releaseStop
+  f.workers.stopGate=new Promise(resolve=>{releaseStop=resolve})
+  t.after(()=>releaseStop())
   f.runtime.control(f.owner,f.mission.id,'pause','User interruption')
   let s=f.runtime.snapshot(f.owner,f.mission.id)
-  assert.equal(s.tasks[0].status,'pending'); assert.equal(s.tasks[0].attempt,undefined)
+  assert.equal(s.tasks[0].status,'blocked'); assert.equal(s.tasks[0].attempt,undefined)
+  assert.equal(s.tasks[0].resumeAfterStop.memberId,f.a.id)
   f.runtime.control(f.owner,f.mission.id,'resume','Continue')
   s=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(s.mission.usedTokens,51)
   assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,{taskId:task.id,attemptId:task.attempt.id,claim:'late',outcome:'supported',toolRunIds:[]}),/Stale/)
+  releaseStop()
+  await eventually(()=>f.runtime.task(f.mission.id,task.id).resumeAfterStop===undefined,'pause stop must settle before reassignment')
 })
 test('store rejects concurrent runtime ownership and rolls back outbox with state',async t=>{
   const dir=await mkdtemp(join(tmpdir(),'swarm-store-'));const path=join(dir,'state.sqlite')
@@ -177,6 +183,7 @@ test('duplicate review source edges are removed but submission and unrelated acc
 test('missing code checks reject a proposal without admitting work and permit correction on the same mission', async t => {
   const f = await setup(t)
   const before = f.runtime.snapshot(f.owner, f.mission.id)
+  const storedMission = f.runtime.store.get('missions', f.mission.id)
   assert.throws(() => f.propose(f.actorA, { title: 'Implement value', checks: [] }), error => {
     assert.match(error.message, /task\.checks \(task "Implement value"\)/)
     assert.match(error.message, /real repository acceptance command/)
@@ -189,7 +196,8 @@ test('missing code checks reject a proposal without admitting work and permit co
   }
   const after = f.runtime.snapshot(f.owner, f.mission.id)
   assert.deepEqual(after.tasks, before.tasks)
-  assert.deepEqual(after.mission, before.mission)
+  assert.deepEqual(f.runtime.store.get('missions', f.mission.id), storedMission, 'rejected admission does not change durable authority or accounting')
+  assert.equal(after.mission.executionTime.usedMs, before.mission.executionTime.usedMs)
   const corrected = f.propose(f.actorA, { title: 'Implement value', checks: ['node check.cjs'] })
   assert.equal(corrected.kind, 'implementation')
   assert.deepEqual(corrected.acceptance, ['works'])
@@ -407,7 +415,7 @@ test('approaching-limit warnings fire once per dimension and threshold', async t
   await f.workers.callbacks.usageSnapshot(f.a.id, 950)
   assert.deepEqual(warnings().map(event => [event.data.dimension, event.data.threshold]), [['maxTokens', 0.7], ['maxTokens', 0.9]])
   assert.equal(warnings().at(-1).data.remaining, 50)
-  assert.equal(warnings().at(-1).data.suggestedLimit, Math.ceil(950 / 0.9))
+  assert.equal(warnings().at(-1).data.suggestedLimit, Math.ceil(950 / 0.7))
 })
 
 test('budget exhaustion names the exhausted dimension in the reason and event', async t => {

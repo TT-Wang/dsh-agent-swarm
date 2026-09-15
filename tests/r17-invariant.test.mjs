@@ -117,6 +117,7 @@ test('R17-G9: the host registry refuses an illegal candidate before publication'
       assert.equal(error.name, 'InvariantError', 'the host facility names the refusal')
       assert.match(error.message, new RegExp(SWARM_INVARIANT_PACKAGE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
       assert.match(error.message, /refusing an owner-facing fallthrough decision naming task-1@1/)
+      assert.equal(recordAppendRefusal(error, { id: 'delivery-illegal', missionId: 'mission-1', family: 'fallthrough', subjects: ['task-1@1'] }), true, 'the real host preserves exact predicate provenance')
       return true
     },
   )
@@ -215,7 +216,7 @@ test('R17-G9 pair: the classifiers\' own candidates pass and a blocked non-root 
   assert.equal(liveLineageSubject(f.runtime, { missionId: f.mission.id, family: undefined, subjects: [taskSubject(f.runtime.store.get('tasks', original.id))] }), undefined, 'an unclassified notice is not judged')
 })
 
-test('R17-G9: an append refusal is recorded and acknowledged, never retried as an unknown failure', async t => {
+test('R17-G9: an error naming the package is not proof of its delivery predicate', async t => {
   decisionRefusals.clear()
   const ctx = new Context()
   const ownerSession = { snapshotEvents: () => [] }
@@ -232,17 +233,12 @@ test('R17-G9: an append refusal is recorded and acknowledged, never retried as a
   const member = { id: 'owner', missionId: 'mission-1', name: 'owner', role: 'owner', sessionId: 'owner-session', workspace: '/w', status: 'idle', subscriptions: [] }
   // The adapter resolves (acknowledges) instead of rejecting: the durable outbox
   // must not retry a decision the invariant will refuse again.
-  await workers.deliver(member, delivery)
-  const recorded = decisionRefusals.list()
-  assert.equal(recorded.length, 1, 'the append refusal is recorded')
-  assert.equal(recorded[0].stage, 'append')
-  assert.equal(recorded[0].deliveryId, 'delivery-refused')
-  assert.equal(recorded[0].family, 'fallthrough')
-  assert.deepEqual(recorded[0].subjects, ['task-1@1'])
+  await assert.rejects(workers.deliver(member, delivery), error => error === refusal)
+  assert.equal(decisionRefusals.count(), 0, 'unproven host errors remain transport failures')
 
   // An unrelated failure is NOT a refusal: it is left to the outbox retry path.
   assert.equal(recordAppendRefusal(new Error('Mission owner is offline'), { id: 'd2', missionId: 'mission-1', family: 'fallthrough', subjects: [] }), false)
-  assert.equal(decisionRefusals.count(), 1)
+  assert.equal(decisionRefusals.count(), 0)
 })
 
 test('R17-G9: only swarm relays are judged, and both relay shapes are seen', () => {

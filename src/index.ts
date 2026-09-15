@@ -28,6 +28,7 @@ export interface Config {
   leaseMs: number
   tickMs: number
   planningTimeoutMs: number
+  workerStartTimeoutMs: number
   maxMessageChars: number
   maxEvents: number
   maxAttempts: number
@@ -89,6 +90,7 @@ export const Config: z<Config> = z.object({
   workspacesRoot: z.string().default(join(homedir(), '.dsh/agent-swarm/workspaces')),
   leaseMs: z.natural().min(100).default(120000),
   tickMs: z.natural().min(10).default(1000),
+  workerStartTimeoutMs: z.natural().min(100).default(60000),
   planningTimeoutMs: z.natural().min(100).default(600000),
   maxMessageChars: z.natural().min(1000).default(16000),
   maxEvents: z.natural().min(1).default(100),
@@ -199,7 +201,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
   new RoleScoper(ctx, runtime)
-  await runtime.start(grants)
   // L2: the owner side of the reply protocol. The guard observes owner turns and
   // reports questions the turn did not settle; it never answers on the owner's
   // behalf and never edits a message.
@@ -207,4 +208,5 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
   ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
+  await runtime.start(grants)
 }

@@ -47,6 +47,23 @@ async function fixture(t) {
   return { directory, config, workers, runtime, owner, input: plan(directory) }
 }
 
+test('manual drafts retain legacy binding and round-trip only valid explicit assignment modes', async t => {
+  const f = await fixture(t)
+  const draft = f.runtime.createDraft(f.owner, f.input)
+  assert.ok(draft.input.tasks.every(task => task.assignmentMode === undefined))
+  const changed = structuredClone(f.input)
+  changed.tasks[0].assignmentMode = 'pinned'
+  changed.tasks[1].assignmentMode = 'preferred'
+  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, changed)
+  assert.deepEqual(edited.input.tasks.map(task => task.assignmentMode), ['pinned', 'preferred'])
+  changed.tasks[0].assignmentMode = 'surprise'
+  assert.throws(() => validatePlan(changed), /assignmentMode/)
+  changed.tasks[0].assignmentMode = 'pinned'
+  delete changed.tasks[0].assigneeKey
+  assert.throws(() => validatePlan(changed), /assignmentMode requires assigneeKey/)
+  assert.equal(f.runtime.drafts(f.owner)[0].revision, edited.revision)
+})
+
 test('draft edits are durable, optimistic and cannot consume workers before launch', async t => {
   const f = await fixture(t)
   const draft = f.runtime.createDraft(f.owner, f.input)
@@ -101,9 +118,10 @@ test('failed launch resumes existing admissions without duplicating workers or r
   assert.equal(failed.status, 'failed')
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
-  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input), /unlaunched/)
+  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input)
+  assert.equal(revised.revision, failed.revision + 1)
   fail = false
-  const snapshot = await f.runtime.launchDraft(f.owner, failed.id, failed.revision)
+  const snapshot = await f.runtime.launchDraft(f.owner, revised.id, revised.revision)
   assert.equal(snapshot.members.length, 2)
   assert.equal(f.workers.prepared.length, 2)
   assert.equal(f.runtime.list(f.owner.sessionId).length, 1)

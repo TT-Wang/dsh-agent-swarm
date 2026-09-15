@@ -80,17 +80,19 @@ test('an accepting verdict retires a running sibling, a pending sibling and a pa
   const sibling = f.proposeReview(source, 'Running sibling')
   const pending = f.proposeReview(source, 'Pending review')
   const parked = f.proposeReview(source, 'Parked review')
+  const parkedOwner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Parked reviewer', role: 'verification' })
   const claimedVerdict = await f.runtime.claim(f.actor(f.first), f.mission.id, verdict.id)
   await f.runtime.claim(f.actor(f.second), f.mission.id, sibling.id)
   const parkedRecord = f.current(parked.id)
   parkedRecord.status = 'blocked'; parkedRecord.epoch++
-  parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, reason: 'lease-expired' }
+  parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, memberId: parkedOwner.id, reason: 'lease-expired', at: Date.now() }
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', parkedRecord))
   assert.equal(f.current(sibling.id).status, 'running')
   assert.equal(f.current(pending.id).status, 'pending')
   await f.runtime.verify(f.actor(f.first), f.mission.id, { taskId: verdict.id, attemptId: claimedVerdict.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
   assert.equal(f.current(source.id).status, 'accepted')
   assert.equal(f.current(verdict.id).status, 'accepted', 'the verdict task itself is accepted')
+  await eventually(() => [sibling, parked].every(task => f.current(task).resumeAfterStop === undefined), 'retired reviewers stop before their markers clear')
   for (const [task, previous] of [[f.current(sibling.id), 'running'], [f.current(pending.id), 'pending'], [f.current(parked.id), 'blocked']]) {
     assert.equal(task.status, 'cancelled', 'a sibling that can no longer reach a verdict is retired')
     assert.equal(task.attempt, undefined, 'the retired attempt is fenced')
@@ -185,7 +187,7 @@ test('cancelling a source retires its running reviews with a durable event', asy
   for (const [task, attempt] of [[f.current(first.id), claimedFirst], [f.current(second.id), claimedSecond]]) {
     assert.equal(task.status, 'cancelled', 'a running review of withdrawn work is retired')
     assert.equal(task.attempt, undefined)
-    assert.equal(task.resumeAfterStop, undefined)
+    assert.equal(task.resumeAfterStop.memberId, attempt.attempt.ownerId, 'retirement retains its stop barrier')
   }
   const retireEvents = f.events('task/review-retired')
   assert.equal(retireEvents.length, 2, 'each cancellation retirement is durable')
@@ -196,6 +198,7 @@ test('cancelling a source retires its running reviews with a durable event', asy
     assert.match(event.data.reason, /cancelled by the mission owner/)
   }
   await eventually(() => f.workers.stopped.includes(f.first.id) && f.workers.stopped.includes(f.second.id), 'both retired reviewer handles are stopped')
+  await eventually(() => [first, second].every(task => f.current(task).resumeAfterStop === undefined), 'confirmed stops clear the barriers without reopening cancelled tasks')
   // A later scheduling pass must not re-pend or reassign either review.
   f.workers.callbacks.idle(f.first.id)
   f.workers.callbacks.idle(f.second.id)

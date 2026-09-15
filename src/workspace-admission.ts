@@ -110,6 +110,7 @@ export function executedShellCommand(tool: string, args: unknown): string | unde
  */
 function unquotedShellText(command: string): string {
   let text = ''
+  let wordStart = true
   let quote: '"' | "'" | undefined
   let arithmetic = 0
   let literal: '[' | '{' | undefined
@@ -154,8 +155,14 @@ function unquotedShellText(command: string): string {
       text += char
       continue
     }
-    if (char === '"' || char === "'") { quote = char; continue }
-    if (char === '#') {
+    if (char === '\\' && index + 1 < command.length) {
+      const escaped = command[++index]!
+      text += char + escaped
+      if (escaped !== '\n') wordStart = false
+      continue
+    }
+    if (char === '"' || char === "'") { quote = char; wordStart = false; continue }
+    if (char === '#' && wordStart) {
       // Leave the newline for the heredoc flush below: a trailing comment on a
       // heredoc operator's line must not skip the body that follows it.
       const newline = command.indexOf('\n', index)
@@ -164,24 +171,29 @@ function unquotedShellText(command: string): string {
       continue
     }
     if (char === '$' && command[index + 1] === '(' && command[index + 2] === '(') {
+      wordStart = false
       arithmetic = 2
       index += 2
       continue
     }
     if (char === '$' && command[index + 1] === '[') {
+      wordStart = false
       literal = '['; literalDepth = 0; text += char
       continue
     }
     if (char === '$' && command[index + 1] === '{') {
+      wordStart = false
       literal = '{'; literalDepth = 0; text += char
       continue
     }
     if (char === '(' && command[index + 1] === '(') {
+      wordStart = false
       arithmetic = 2
       index += 1
       continue
     }
     if (char === '<') {
+      wordStart = true
       let run = 0
       while (command[index + run] === '<') run++
       if (run === 2) {
@@ -210,6 +222,7 @@ function unquotedShellText(command: string): string {
       // heredocs, so the text stays commands and a later write is still seen.
     }
     text += char
+    wordStart = /[\s;&|()<>]/.test(char)
   }
   return text
 }
@@ -464,9 +477,9 @@ export class WorkspaceAdmission {
    * inspected; a quoted span that merely names a git-write phrase (a search
    * pattern, an edit body, a message) is data, never a denial and never a latch,
    * and a successful command is never a denial. R6-01: the result text is not
-   * inspected either, because a failed command that merely prints the refusal
-   * phrase is not a sandbox refusal; a denial is a failed run of an executed
-   * metadata-write command. R6-02: the subcommand must sit at command position
+   * sufficient by itself: the command must execute a metadata write, fail,
+   * and report an explicit permission failure. This is a diagnostic, never
+   * authority to disable unrelated tools. R6-02: the subcommand must sit at command position
    * in one shell segment, so a write word mentioned in a pattern or path is data
    * even when the command fails. A command hidden inside a nested shell string
    * is not seen: the sandbox still blocks it and the worker sees the raw refusal.
@@ -474,6 +487,9 @@ export class WorkspaceAdmission {
   deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined {
     const command = executedShellCommand(input.tool, input.arguments)
     if (command === undefined || !input.isError || gitWriteSubcommand(unquotedShellText(command)) === undefined) return undefined
+    // A Git error may be an assertion, conflict, or empty commit. Only an
+    // explicit permission failure is described as a sandbox refusal.
+    if (!/(?:EPERM|EACCES|[Oo]peration not permitted|[Pp]ermission denied)/.test(JSON.stringify(input.result))) return undefined
     return command.length > 200 ? `${command.slice(0, 200)}…` : command
   }
 
@@ -513,8 +529,8 @@ export class WorkspaceAdmission {
 
   /** The isolation precondition for one dispatch: refuse the member and record why when it fails. */
   isolationAllows(missionId: string, member: Member): boolean {
-    const violation = this.isolationViolations(missionId).find(entry => entry.includes(member.id))
-    if (violation !== undefined) { this.rt.refuseIsolation(missionId, member, violation); return false }
+    const violation = this.isolationIssues(missionId).find(entry => entry.memberIds.includes(member.id))
+    if (violation !== undefined) { this.rt.refuseIsolation(missionId, member, violation.message); return false }
     // Change-and-return: a repaired board forgets the refusal key, so the same
     // violation recurring later wakes the owner again instead of staying silent.
     const mission = this.rt.store.get('missions', missionId)
@@ -538,33 +554,44 @@ export class WorkspaceAdmission {
    * per-member worktrees, it refuses a dispatch that would lose them.
    */
   isolationViolations(missionId: string): string[] {
-    const violations: string[] = []
-    const members = this.rt.store.list('members', missionId).filter(member => member.status !== 'stopped')
+    return this.isolationIssues(missionId).map(issue => issue.message)
+  }
+
+  private isolationIssues(missionId: string): IsolationIssue[] {
+    return isolationIssues(this.rt.store.list('members', missionId), this.rt.store.list('tasks', missionId), (left, right) => this.rt.scopesOverlap(left, right))
+  }
+}
+
+export interface IsolationIssue { memberIds: string[]; message: string }
+
+/** Identity-bearing evidence shared by admission and its read-only explanation. */
+export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {
+    const violations: IsolationIssue[] = []
+    const members = allMembers.filter(member => member.status !== 'stopped')
     const byWorkspace = new Map<string, Member[]>()
     for (const member of members) {
-      if (!member.workspace) { violations.push(`member ${member.id} (${member.name}) has no provisioned isolated worktree`); continue }
+      if (!member.workspace) { violations.push({ memberIds: [member.id], message: `member ${member.id} (${member.name}) has no provisioned isolated worktree` }); continue }
       byWorkspace.set(member.workspace, [...(byWorkspace.get(member.workspace) ?? []), member])
     }
     for (const [workspace, group] of byWorkspace) {
-      if (group.length > 1) violations.push(`live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees`)
+      if (group.length > 1) violations.push({ memberIds: group.map(member => member.id), message: `live workers ${group.map(member => member.id).join(', ')} share one provisioned worktree (${workspace}); live workers must never exceed provisioned worktrees` })
     }
-    const running = this.rt.store.list('tasks', missionId).filter(task => task.status === 'running' && task.attempt !== undefined)
+    const running = tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
     const byTaskWorkspace = new Map<string, Task[]>()
     for (const task of running) {
-      const owner = this.rt.store.get('members', task.attempt!.ownerId)
-      if (owner === undefined || owner.status === 'stopped') { violations.push(`running task ${task.id} has no live owner (${task.attempt!.ownerId})`); continue }
+      const owner = allMembers.find(member => member.id === task.attempt!.ownerId)
+      if (owner === undefined || owner.status === 'stopped') { violations.push({ memberIds: [task.attempt!.ownerId], message: `running task ${task.id} has no live owner (${task.attempt!.ownerId})` }); continue }
       byTaskWorkspace.set(owner.workspace, [...(byTaskWorkspace.get(owner.workspace) ?? []), task])
     }
     for (const [workspace, group] of byTaskWorkspace) {
-      if (group.length > 1) violations.push(`concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}`)
+      if (group.length > 1) violations.push({ memberIds: group.map(task => task.attempt!.ownerId), message: `concurrently running tasks ${group.map(task => task.id).join(', ')} share worktree ${workspace}` })
       for (let left = 0; left < group.length; left++) {
         for (let right = left + 1; right < group.length; right++) {
-          if (this.rt.scopesOverlap(group[left]!.scope, group[right]!.scope)) {
-            violations.push(`concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}`)
+          if (overlaps(group[left]!.scope, group[right]!.scope)) {
+            violations.push({ memberIds: [group[left]!.attempt!.ownerId, group[right]!.attempt!.ownerId], message: `concurrently running tasks ${group[left]!.id} and ${group[right]!.id} declare overlapping scope in worktree ${workspace}` })
           }
         }
       }
     }
     return violations
-  }
 }

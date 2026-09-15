@@ -11,7 +11,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { registerTools } from '../lib/tools.js'
+import { OWNER_PROMPT, registerTools } from '../lib/tools.js'
+import { guardTerminal } from '../lib/refusals.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
 
@@ -51,6 +52,11 @@ test('the propose tool refuses a ceiling above the mission budget with its own c
   const properties = f.definitions.get('swarm_propose').parameters.properties
   assert.equal(properties.maxSteps.type, 'integer')
   assert.equal(properties.maxFindings.type, 'integer')
+  assert.match(properties.maxFindings.description, /advisory/i)
+  assert.doesNotMatch(properties.maxFindings.description, /blocks the task/)
+  assert.match(f.definitions.get('swarm_propose').description, /swarm_budget\(taskId, taskBudget, reason\)/)
+  assert.doesNotMatch(f.definitions.get('swarm_propose').description, /raise.*name it in replaces/i)
+  assert.match(OWNER_PROMPT, /swarm_message with replyTo/)
   await assert.rejects(f.propose({ maxSteps: budget.maxSteps + 1 }), /\[task_ceiling_exceeds_mission_budget\]/)
   await assert.rejects(f.propose({ maxFindings: 0 }), /\[task_ceiling_invalid\]/)
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.length, 0, 'a refused ceiling admits no task')
@@ -59,30 +65,40 @@ test('the propose tool refuses a ceiling above the mission budget with its own c
   assert.equal(admitted.maxFindings, 3)
 })
 
-test('the task_ceiling_exhausted advice is executable: replaces + a raised maxSteps through the tool', async t => {
+test('task ceiling advice raises the original task allocation through the registered tool', async t => {
   const f = await setup(t)
   const task = (await f.propose({ maxSteps: 2 })).result
   await f.runtime.claim({ sessionId: f.builder.sessionId }, f.mission.id, task.id)
   await f.workers.callbacks.beforeStep(f.builder.id)
   await f.workers.callbacks.beforeStep(f.builder.id)
-  assert.equal(await f.workers.callbacks.beforeStep(f.builder.id), false, 'the exhausted step parks the worker')
-  const blocked = f.runtime.snapshot(f.owner, f.mission.id).tasks.find(item => item.id === task.id)
-  assert.equal(blocked.status, 'blocked')
-  // The durable refusal must carry the code and an exit whose names resolve in
-  // the schema the tool surface actually installs.
-  assert.match(blocked.ceiling.reason, /\[task_ceiling_exhausted\]/)
-  assert.match(blocked.ceiling.reason, /`swarm_propose`/)
-  assert.match(blocked.ceiling.reason, /`replaces`/)
-  assert.match(blocked.ceiling.reason, /`maxSteps`/)
-  const properties = f.definitions.get('swarm_propose').parameters.properties
-  for (const parameter of ['replaces', 'maxSteps', 'maxFindings']) assert.ok(properties[parameter], `swarm_propose declares ${parameter}`)
-  const repair = (await f.propose({ title: 'Repair', objective: 'Repair the bounded work', replaces: [task.id], maxSteps: 9, maxFindings: 4 })).result
-  assert.equal(repair.maxSteps, 9, 'the repair carries the raised ceiling instead of discarding the headroom')
-  assert.equal(repair.maxFindings, 4)
-  assert.deepEqual(repair.replaces, [task.id])
-  assert.deepEqual(repair.acceptance, ['works'], 'the repair keeps the blocked acceptance verbatim')
-  const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
-  assert.equal(snapshot.tasks.filter(item => item.id === task.id).length, 1)
-  const admittedRepair = snapshot.tasks.find(item => item.id === repair.id)
-  assert.ok(['pending', 'running'].includes(admittedRepair.status), `the repair is admitted and schedulable (${admittedRepair.status})`)
+  assert.equal(await f.workers.callbacks.beforeStep(f.builder.id), false)
+  const blocked = f.runtime.task(f.mission.id, task.id)
+  assert.match(blocked.ceiling.reason, /`swarm_budget`/)
+  assert.match(blocked.ceiling.reason, /`taskBudget`/)
+  const tool = f.definitions.get('swarm_budget')
+  assert.ok(tool.parameters.properties.taskBudget.properties.maxSteps)
+  await tool.execute({ missionId: f.mission.id, taskId: task.id, taskBudget: { maxSteps: 9, maxFindings: 4 }, reason: 'Useful work needs more allowance' }, { agent: { id: f.owner.sessionId }, signal: new AbortController().signal })
+  for (let i = 0; i < 100 && f.runtime.task(f.mission.id, task.id).resumeAfterStop; i++) await new Promise(resolve => setTimeout(resolve, 5))
+  const revised = f.runtime.task(f.mission.id, task.id)
+  assert.equal(revised.maxSteps, 9)
+  assert.equal(revised.maxFindings, 4)
+  assert.equal(revised.usedSteps, 2)
+  assert.deepEqual(revised.acceptance, ['works'])
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 1)
+  assert.equal(revised.status, 'pending')
+})
+
+test('guard exits select the actual mission or same-task amendment parameter', () => {
+  const mission = guardTerminal('task_ceiling')
+  assert.deepEqual(mission.exits.map(exit => [exit.tool, exit.parameter]), [['swarm_budget', 'budget']])
+  assert.doesNotMatch(mission.message, /`taskBudget`/)
+  const task = guardTerminal('task_ceiling', { taskId: 'existing-task' })
+  assert.equal(task.exits[0].parameter, 'taskBudget')
+  assert.match(task.message, /`taskId`/)
+  const admission = guardTerminal('admission', { taskId: 'existing-task' })
+  assert.deepEqual(admission.exits.map(exit => [exit.tool, exit.parameter]), [['swarm_control', 'taskId']])
+  assert.match(admission.message, /`changes.dependencies`/)
+  assert.doesNotMatch(admission.message, /replaces|swarm_propose/)
+  assert.match(guardTerminal('admission').message, /`swarm_propose`/)
+  assert.match(guardTerminal('budget').message, /sufficient extension resumes budget-paused work after stop confirmation/)
 })

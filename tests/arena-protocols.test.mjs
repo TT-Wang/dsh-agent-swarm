@@ -110,63 +110,26 @@ async function eventually(read, message, timeoutMs = 5000) {
   assert.fail(message)
 }
 
-test('R11-17: the per-member allowance is derived from the owner-set ceiling, and refusal wakes the owner with member, limit and reason', async t => {
+test('proposal capacity is the aggregate mission budget and never shrinks when the roster expands', async t => {
   const f = await fixture(t, { budget: { maxTasks: 6, maxWorkers: 2 } })
-  const tools = definitions(f.runtime)
-  const propose = tools.get('swarm_propose')
+  const propose = definitions(f.runtime).get('swarm_propose')
   const alice = execution(f.alice.sessionId)
-  const bob = execution(f.bob.sessionId)
-
-  // ceil(6 / 2) = 3. The owner-proposed count is not a worker allowance.
-  for (let index = 0; index < 3; index++) {
+  for (let index = 0; index < 6; index++) {
     const admitted = await propose.execute(proposal(f, { title: `Alice task ${index}` }), alice)
-    assert.equal(admitted.result.proposedBy, f.alice.id, 'the durable proposer key is host-derived')
+    assert.equal(admitted.result.proposedBy, f.alice.id)
   }
-  const before = f.runtime.store.list('tasks', f.mission.id).length
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3' }), alice), /per-member proposal allowance/)
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, before, 'a refused proposal admits nothing')
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).filter(task => task.proposedBy === f.alice.id).length, 3)
-
-  const refusal = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/proposal-refused').at(-1)
-  assert.ok(refusal, 'the refusal is a durable event')
-  assert.equal(refusal.data.memberId, f.alice.id)
-  assert.equal(refusal.data.limit, 3)
-  assert.match(refusal.data.reason, /allowance/)
-  const allowanceNotice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
-  assert.ok(allowanceNotice, 'the refusal records an owner notice')
-  assert.match(allowanceNotice.content, new RegExp(f.alice.id), 'the notice names the member')
-  assert.match(allowanceNotice.content, /limit 3/, 'the notice names the limit')
-  assert.match(allowanceNotice.content, /allowance/, 'the notice names the reason')
-
-  // An identical retry, and a retry with a different title, are the same
-  // decision in the same state: one notice, no spam.
-  const afterFirst = notices(f).length
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3' }), alice), /per-member proposal allowance/)
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3 renamed' }), alice), /per-member proposal allowance/)
-  assert.equal(notices(f).length, afterFirst, 'an unchanged state does not spam the owner')
-  // No tool argument is a lever: the allowance is a function of durable state.
-  await assert.rejects(propose.execute({ ...proposal(f, { title: 'Alice task 3' }), maxProposalsPerMember: 99 }, alice), /per-member proposal allowance/)
-  assert.equal(notices(f).length, afterFirst, 'an extra tool argument grants nothing')
-
-  // A different member's refusal in that state is a different decision.
-  for (let index = 0; index < 3; index++) await propose.execute(proposal(f, { title: `Bob task ${index}` }), bob)
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 6, 'the mission ceiling is now full')
-  await assert.rejects(propose.execute(proposal(f, { title: 'Bob task 3' }), bob), /task budget exhausted/)
-  const ceilingNotice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
-  assert.equal(notices(f).length, afterFirst + 1, 'a different member is a new decision')
-  assert.match(ceilingNotice.content, new RegExp(f.bob.id))
-  assert.match(ceilingNotice.content, /task budget exhausted \(6\/6/, 'the ceiling reason and its numbers are named')
-  assert.match(ceilingNotice.content, /limit 6/)
-
-  // A member cannot raise its own allowance: budget updates are owner-only.
-  assert.throws(() => f.runtime.updateBudget(f.aliceActor, f.mission.id, { ...f.budget, maxTasks: 30 }, 'raise my allowance'), /Only the primary user session/)
-
-  // The owner raises the ceiling and the allowance follows; the member can work again.
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxTasks: 12 }, 'more board for repairs')
-  const raised = proposalAllowance(f.runtime.store.get('missions', f.mission.id), f.runtime.store.list('members', f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.alice.id)
-  assert.equal(raised.limit, 6, 'ceil(12 / 2)')
-  const admitted = await propose.execute(proposal(f, { title: 'Alice task 4' }), alice)
-  assert.equal(admitted.result.proposedBy, f.alice.id, 'the owner-set ceiling raises the allowance')
+  await assert.rejects(propose.execute(proposal(f, { title: 'Over aggregate' }), alice), /task budget exhausted/)
+  const notice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
+  assert.match(notice.content, /6\/6/)
+  const count = notices(f).length
+  await assert.rejects(propose.execute(proposal(f, { title: 'Still over aggregate' }), alice), /task budget exhausted/)
+  assert.equal(notices(f).length, count)
+  assert.throws(() => f.runtime.updateBudget(f.aliceActor, f.mission.id, { ...f.budget, maxTasks: 30 }, 'self increase'), /Only the primary user session/)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxTasks: 12, maxWorkers: 6 }, 'more repair capacity')
+  const allowance = proposalAllowance(f.runtime.mission(f.mission.id), f.runtime.store.list('members', f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.alice.id)
+  assert.equal(allowance.limit, 12)
+  const admitted = await propose.execute(proposal(f, { title: 'Same member continues' }), alice)
+  assert.equal(admitted.result.proposedBy, f.alice.id)
 })
 
 test('R11-17: the experiment ceiling refuses a worker proposal with an owner notice naming the reason', async t => {
@@ -184,10 +147,10 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   const f = await fixture(t)
   const propose = definitions(f.runtime).get('swarm_propose')
   const alice = execution(f.alice.sessionId)
-  for (let index = 0; index < 3; index++) await propose.execute(proposal(f, { title: `Ledger task ${index}` }), alice)
+  for (let index = 0; index < 6; index++) await propose.execute(proposal(f, { title: `Ledger task ${index}` }), alice)
   // Trigger the refusal synchronously so the outbox has not drained yet: the
   // same call through the tool awaits a trace write, which lets setImmediate run.
-  assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger task 3' })), /per-member proposal allowance/)
+  assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger over capacity' })), /task budget exhausted/)
 
   // Synchronous read: the notice is recorded and queued, not yet delivered.
   const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)

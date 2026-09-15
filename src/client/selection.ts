@@ -2,7 +2,9 @@
 export async function selectedOperation<T>(isSelected: () => boolean, operation: () => Promise<T>, callbacks: {
   success: (value: T) => void | Promise<void>
   failure: (error: unknown) => void
-  settled: () => void
+  settled?: () => void
+  /** Operation-owned cleanup, also called after selection changes. Must not clear another operation. */
+  release?: () => void
 }): Promise<void> {
   try {
     const value = await operation()
@@ -10,6 +12,6 @@ export async function selectedOperation<T>(isSelected: () => boolean, operation:
   } catch (error) {
     if (isSelected()) callbacks.failure(error)
   } finally {
-    if (isSelected()) callbacks.settled()
+    try { if (isSelected()) callbacks.settled?.() } finally { callbacks.release?.() }
   }
 }

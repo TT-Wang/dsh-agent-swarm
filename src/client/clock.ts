@@ -10,14 +10,22 @@ export function leaseExpired(leaseUntil: number, reference: number): boolean {
   return leaseUntil < reference
 }
 
-/** Ticking wall clock for live lease markers; the interval is idle for historical cards. */
-export function useNow(active: boolean, intervalMs = 1000): number {
+/** A local presentation clock; hidden documents never keep an interval alive. */
+export function useVisibleClock(active: boolean, intervalMs = 1000): { now: number; visible: boolean } {
   const [now, setNow] = useState(() => Date.now())
+  const [visible, setVisible] = useState(() => typeof document === 'undefined' || !document.hidden)
   useEffect(() => {
-    if (!active) return
+    if (typeof document === 'undefined') return
+    const update = () => setVisible(!document.hidden)
+    update()
+    document.addEventListener('visibilitychange', update)
+    return () => document.removeEventListener('visibilitychange', update)
+  }, [])
+  useEffect(() => {
+    if (!active || !visible) return
     setNow(Date.now())
     const timer = setInterval(() => setNow(Date.now()), intervalMs)
     return () => clearInterval(timer)
-  }, [active, intervalMs])
-  return now
+  }, [active, visible, intervalMs])
+  return { now, visible }
 }

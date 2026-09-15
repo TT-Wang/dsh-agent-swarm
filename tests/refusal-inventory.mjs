@@ -311,7 +311,7 @@ export function refusalSites(source, file) {
     const properties = objectProperties(source, masked, open, close)
     const property = properties.has('message') ? 'message' : properties.has('reason') ? 'reason' : undefined
     if (property === undefined) continue
-    sites.push(describe({ kind: 'message', file, source, masked, index: open, objectRange: [open, close], code: match[1], property, expression: properties.get(property) }))
+    sites.push(describe({ kind: 'message', file, source, masked, index: open, objectRange: [open, close], advisory: /^['"]advisory['"]$/.test(properties.get('severity')?.trim() ?? ''), code: match[1], property, expression: properties.get(property) }))
   }
   return sites.sort((left, right) => left.line - right.line || (left.kind === right.kind ? 0 : left.kind === 'throw' ? -1 : 1))
 }
@@ -425,6 +425,8 @@ export const CALLER_COMPOSED_MESSAGES = [
 
 /** The contract checks for one site. Returns a list of violations (empty means compliant). */
 export function assessRefusal(site, index) {
+  // Advisory diagnostics are inventoried for visibility, but do not refuse anything or require an imperative exit.
+  if (site.kind === 'message' && site.advisory) return []
   const violations = []
   const text = site.text
   if (site.guard) {

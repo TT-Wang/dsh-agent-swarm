@@ -9,12 +9,13 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
 import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { TaskGraphAdmissionError } from './admission.ts'
+import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, Mission, PlanInput, PlanMember } from './types.ts'
+import type { Actor, Budget, Mission, PlanInput, PlanMember, TaskAmendment } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -50,7 +51,9 @@ function revision(body: Record<string, unknown>): number {
   return Number(value)
 }
 /** A user-actionable request failure whose message is safe to return to the browser. */
-class RequestError extends Error {}
+class RequestError extends Error {
+  constructor(message: string, readonly policy?: { code: string; category: string }) { super(message) }
+}
 /**
  * Authored policy/validation refusals the browser may see. Every other
  * collaborator failure is unexpected: the host logs its full detail and the
@@ -87,13 +90,9 @@ const actionableMessages: readonly RegExp[] = [
   /^Worker (?:name already exists|already owns an open task|membership is inactive)$/,
   /^Workers cannot create independent missions or budgets$/,
   /^Swarm runtime is (?:closed|shutting down)$/,
-  /^Draft is not owned by this session$/,
   /^Draft changed; reload before (?:saving|discarding|launching)$/,
-  /^Draft admission identity already exists$/,
   /^Draft cannot be launched in its current state$/,
   /^Discard unused drafts before creating more$/,
-  /^Only unlaunched drafts can be edited/,
-  /^A launching or launched plan cannot be discarded/,
   /^The partially assembled mission cannot be launched$/,
   /^Plan assembly was interrupted$/,
   /^Task (?:is not in this mission|is not ready for this member|changed while preparing its workspace|has no active attempt|identity conflict)$/,
@@ -146,6 +145,12 @@ class InternalFailure extends Error {
 async function exposed<T>(operation: () => Promise<T> | T, userActionable: boolean | ((message: string) => boolean) = false): Promise<T> {
   try { return await operation() } catch (error) {
     if (error instanceof MissingSession || error instanceof RequestError) throw error
+    if (error instanceof PolicyError) {
+      // A type is not permission to expose host paths or unbounded details.
+      if (error.message.length === 0 || error.message.length > 4000 || unsafeDetail.test(error.message)
+        || !/^[a-z][a-z0-9_]{0,79}$/.test(error.code)) throw new InternalFailure(error)
+      throw new RequestError(error.message, { code: error.code, category: error.category })
+    }
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
     if (error instanceof TaskGraphAdmissionError) {
       // Only the runtime's typed, authored diagnostic crosses this boundary;
@@ -261,10 +266,18 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       switch (endpoint) {
         case 'models': {
           const providers = ctx.llm.listProviders().map(provider => ({ id: provider.id, name: provider.name }))
-          const models = (await Promise.all(providers.map(async provider => await ctx.llm.listModels(provider.id)))).flat()
+          const catalogs = await Promise.allSettled(providers.map(async provider => await ctx.llm.listModels(provider.id)))
+          signal.throwIfAborted()
+          const models = catalogs.flatMap(result => result.status === 'fulfilled' ? result.value : [])
             .map(model => ({ provider: model.provider, id: model.id, name: model.name,
               ...(model.description === undefined ? {} : { description: model.description }) }))
-          return { ok: true, value: { providers, models } }
+          const providerErrors = catalogs.flatMap((result, index) => {
+            if (result.status === 'fulfilled') return []
+            const provider = providers[index]!.id
+            try { ctx.logger.warn('agent-swarm: model catalog %s failed: %s', provider, String(result.reason)) } catch { /* Preserve the healthy catalogs. */ }
+            return [{ provider, code: 'catalog-unavailable', message: 'Model catalog is temporarily unavailable' }]
+          })
+          return { ok: true, value: { providers, models, ...(providerErrors.length ? { providerErrors } : {}) } }
         }
         case 'delivery':
         case 'apply-delivery': {
@@ -368,6 +381,15 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           }
           const missionId = text(body, 'missionId')
           const action = text(body, 'action')
+          if (body.taskId !== undefined) {
+            await exposed(() => runtime.controlTask(actor, missionId, text(body, 'taskId'), action as 'resume' | 'amend', body.changes === undefined ? {} : object(body.changes) as TaskAmendment, text(body, 'reason')), actionableMessage)
+            return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
+          }
+          if (action === 'amend') {
+            const changes = object(body.changes)
+            await exposed(() => runtime.amendScope(actor, missionId, changes.scope as string[], text(body, 'reason')), actionableMessage)
+            return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
+          }
           if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new RequestError('Unknown mission control action')
           const coordinatorId = body.coordinatorId === undefined ? undefined : text(body, 'coordinatorId')
           await exposed(() => runtime.control(actor, missionId, action as Parameters<SwarmRuntime['control']>[2], text(body, 'reason'), coordinatorId), actionableMessage)
@@ -403,7 +425,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
     } catch (error) {
       if (signal.aborted || lifetime.signal.aborted) return { ok: false, error: { code: 'cancelled', message: 'Swarm request was cancelled', details: {} } }
       if (error instanceof MissingSession) return { ok: false, error: { code: 'session-not-found', message: error.message, details: { sessionId: error.sessionId } } }
-      if (error instanceof RequestError) return { ok: false, error: { code: 'bad-request', message: error.message, details: { issues: [] } } }
+      if (error instanceof RequestError) return { ok: false, error: { code: 'bad-request', message: error.message, details: { issues: [], ...(error.policy ? { policyCode: error.policy.code, category: error.policy.category } : {}) } } }
       // L3: an unexpected failure can carry absolute paths, store schema text or
       // internal route codes. Log the original host-side and return a stable
       // public message; only authored policy text passes the allowlist above.
@@ -424,7 +446,12 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
   // Origin and browser-authentication fence. The client posts the standard
   // envelope to `/api/agent-swarm/<endpoint>`.
   const releases: Array<() => Promise<void>> = []
-  ctx.effect(() => () => { for (const release of releases.splice(0)) void release() }, 'agent-swarm: web routes')
+  ctx.effect(() => async () => {
+    const results = await Promise.allSettled(releases.splice(0).map(async release => await release()))
+    for (const result of results) if (result.status === 'rejected') {
+      try { ctx.logger.warn('agent-swarm: web route release failed: %s', String(result.reason)) } catch { /* Teardown must still settle. */ }
+    }
+  }, 'agent-swarm: web routes')
   const reply = (rpcId: string, result: ConnectionRpcResult<unknown>): Response => new Response(
     JSON.stringify({ type: 'server-response', rpcId: RpcId(rpcId), result } satisfies ServerResponse),
     { status: 200, headers: { 'content-type': 'application/json' } })

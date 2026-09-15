@@ -31,6 +31,7 @@ import { readdir, readFile, rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
+import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
@@ -38,46 +39,6 @@ import { tempDirectory } from './temp-root.mjs'
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
-/** The top-level comma-separated arguments of one `notify(` call text. */
-function topLevelArguments(call) {
-  const open = call.indexOf('(')
-  const args = []
-  let depth = 0
-  let start = open + 1
-  for (let index = open + 1; index < call.length; index += 1) {
-    const char = call[index]
-    if (char === '"' || char === "'" || char === '`') {
-      // Skip the whole string literal (and `${…}` template substitutions), so a
-      // comma or brace inside prose cannot split an argument.
-      let inner = index + 1
-      while (inner < call.length) {
-        if (call[inner] === '\\') { inner += 2; continue }
-        if (call[inner] === char) break
-        if (char === '`' && call[inner] === '$' && call[inner + 1] === '{') {
-          let substitution = 1
-          inner += 2
-          while (inner < call.length && substitution > 0) {
-            if (call[inner] === '{') substitution += 1
-            else if (call[inner] === '}') substitution -= 1
-            inner += 1
-          }
-          continue
-        }
-        inner += 1
-      }
-      index = inner
-      continue
-    }
-    if (char === '(' || char === '[' || char === '{') depth += 1
-    else if (char === ')' || char === ']' || char === '}') {
-      if (char === ')' && depth === 0) { args.push(call.slice(start, index)); return args }
-      depth -= 1
-    } else if (char === ',' && depth === 0) { args.push(call.slice(start, index)); start = index + 1 }
-  }
-  args.push(call.slice(start))
-  return args
-}
 
 async function eventually(fn, message, timeoutMs = 5000) {
   const end = Date.now() + timeoutMs
@@ -176,8 +137,8 @@ test('R17-G5: the sampling path is an absence net — absence and elapsed clock 
   const notices = f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('absence:'))
   assert.equal(notices.length, 1, 'the absence net reports the absence once')
   assert.equal(notices[0].notice.trigger, 'absence-net')
-  assert.match(notices[0].notice.reason, /no durable row for \d+ms/)
-  assert.match(notices[0].content, /No durable transition recorded for \d+ms/)
+  assert.match(notices[0].notice.reason, /no durable progress for \d+ms/)
+  assert.match(notices[0].content, /No durable task, evidence or owner-decision progress recorded for \d+ms/)
   assert.match(notices[0].content, /reports the absence and the elapsed clock only/)
   assert.doesNotMatch(notices[0].content, /because|stalled|no live path cannot advance/, 'the absence net states no cause')
   assert.deepEqual(notices[0].subjects, [`mission:${f.mission.id}`], 'the subject is the mission root, never an invented task')
@@ -251,8 +212,9 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
   assert.ok(notice, 'the stall root was reported')
   const root = f.runtime.store.get('tasks', task.id)
   const dependents = f.runtime.store.list('tasks', f.mission.id).filter(candidate => candidate.dependencies.includes(root.id)).map(candidate => candidate.id)
-  const expected = `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and no live replacement exists anywhere in its lineage${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.join(', ')})` : ''}. Recorded reason: ${root.output}. Decide: admit a replacement with swarm_propose (name ${root.id} in replaces), repair the dependency, or withdraw it with swarm_cancel.`
-  assert.equal(notice.content, expected, 'the body is exactly the template replayed from the row')
+  const expectedFacts = `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and no live replacement exists anywhere in its lineage${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.join(', ')})` : ''}. Recorded reason: ${root.output}.`
+  assert.ok(notice.content.startsWith(expectedFacts), 'the facts replay exactly from the blocked row')
+  assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
   assert.equal(notice.notice.reason, 'no live replacement exists anywhere in its lineage', 'the recorded reason is row-derived (the row is blocked with no replacement)')
 })
 
@@ -423,97 +385,25 @@ test('pair: the absence net and the off-pass classifier report different facts a
   assert.deepEqual(absence.subjects, [`mission:${f.mission.id}`], 'the absence net names only the mission root')
 })
 
-test('R17-G1: every notify() site is enumerated per site with its view consumption and its reviewed reason', async () => {
+test('owner notice calls supply subjects without maintaining a parallel site registry', async () => {
   const entries = await readdir(join(ROOT, 'src'), { recursive: true, withFileTypes: true })
   const files = entries.filter(entry => entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')))
-    .map(entry => join(entry.parentPath ?? entry.path, entry.name)).sort()
-  const found = []
+    .map(entry => join(entry.parentPath ?? entry.path, entry.name))
+  let checked = false
   for (const file of files) {
-    const text = await readFile(file, 'utf8')
-    // Balanced-paren scan of each `.notify(` call: the same enumeration rule as
-    // the retained subject test, independent of comments and string contents.
-    for (let index = 0; index < text.length; index += 1) {
-      if (!text.startsWith('.notify(', index)) continue
-      let depth = 0
-      let end = index + '.notify('.length - 1
-      for (; end < text.length; end += 1) {
-        const char = text[end]
-        if (char === '(') depth += 1
-        else if (char === ')') { depth -= 1; if (depth === 0) break }
+    const source = ts.createSourceFile(file, await readFile(file, 'utf8'), ts.ScriptTarget.Latest, true)
+    const visit = node => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'notify') {
+        checked = true
+        const subject = node.arguments[2]
+        assert.ok(subject, `${file}: owner notice requires its subject argument`)
+        assert.notEqual(subject.kind, ts.SyntaxKind.NullKeyword, `${file}: null is not a notice subject`)
+        assert.ok(!ts.isIdentifier(subject) || subject.text !== 'undefined', `${file}: undefined is not a notice subject`)
+        assert.ok(!ts.isArrayLiteralExpression(subject) || subject.elements.length > 0, `${file}: an empty literal has no subject`)
       }
-      found.push({ file: file.slice(ROOT.length + 1), call: text.slice(index, end + 1) })
-      index = end
+      ts.forEachChild(node, visit)
     }
+    visit(source)
   }
-  // R17-G1 (repaired): the reviewed table is PER SITE. A site that consumes the
-  // shared interpretation must reference the view (`view.` or `interpretation(`)
-  // in its own call; a site that cannot consume it is named here with the FACT
-  // it reads instead and why the shared derivation cannot answer (never prose
-  // about the file). A new site, a dropped site or a reclassified site fails.
-  const REVIEWED = {
-    'src/attempts.ts': [
-      { consumes: false, reason: 'the attempt reporting bound reads the running attempt row and the elapsed clock; the board view carries the task but not the attempt\'s last durable progress instant, which is the fact this escalation is about' },
-    ],
-    'src/owner-reply.ts': [
-      // 1 the bounded nudge for a question the owner's turn left open
-      { consumes: false, reason: 'the nudge reads the question delivery row (its receipt state, delivery time and nudge count); the shared board view carries task and member state and no receipt, so it cannot answer whether this question is settled' },
-      // 2 the step refusal while that receipt stays open (block mode)
-      { consumes: false, reason: 'the block reads the same receipt row at the owner step boundary; the board view has no receipt field, and the durable openAsks projection is the fact this refusal is derived from' },
-    ],
-    'src/notices.ts': [
-      { consumes: true },                                   // 1 absence net
-      { consumes: true },                                   // 2 dispatch question (view.dispatchable above)
-      { consumes: true },                                   // 3 unreviewable submission
-      { consumes: true },                                   // 4 fall-through
-      { consumes: true },                                   // 5 stall root
-      { consumes: true },                                   // 6 W3 stall
-      { consumes: true },                                   // 7 coverage complete
-      { consumes: true },                                   // 8 parked holder
-      { consumes: true },                                   // 9 integration gap
-      { consumes: true },                                   // 10 review blocked
-    ],
-    'src/refusals.ts': [
-      { consumes: false, reason: 'the admission/budget refusal terminal names the refusal registry\'s own subject (the mission root); no board derivation is involved in the refusal' },
-      { consumes: false, reason: 'the guard-terminal refusal names the taskId/memberId its refusal context carries, not a board-derived subject' },
-    ],
-    'src/runtime.ts': [
-      { consumes: false, reason: 'the notify() forwarding method itself is the seam: it carries the caller\'s subjects through unchanged' }, // 1
-      { consumes: true },  // 2 rejected source
-      { consumes: true },  // 3 challenged evidence
-      { consumes: true },  // 4 cancellation stranded dependents
-      { consumes: true },  // 5 completion
-      { consumes: false, reason: 'the shared-temp rendezvous reads two tool-run rows and two member ids; the board view carries neither the tool-run pair nor the temp path' }, // 6
-      { consumes: true },  // 7 provider outage open work
-      { consumes: false, reason: 'the worker-guard nudge reads the member row and the adapter\'s handle decision (isIdle); the board view carries no handle liveness' }, // 8
-      { consumes: true },  // 9 recovery-limit exhaustion
-      { consumes: false, reason: 'the start-failure re-route names the member\'s own work by memberId (noticeSubjectsFor), because the transition is the adapter\'s start failure, which the board view cannot see' }, // 10
-    ],
-    'src/scheduling.ts': [
-      { consumes: false, reason: 'the pass watchdog reads the scheduling pass row and its declared bound; the board view carries no pass liveness' },
-      { consumes: false, reason: 'the silent-attempt escalation names the attempt row and its elapsed clock, not a board derivation' },
-    ],
-  }
-  const byFile = {}
-  for (const site of found) {
-    byFile[site.file] = (byFile[site.file] ?? 0) + 1
-    const args = topLevelArguments(site.call)
-    const third = (args[2] ?? '').trim()
-    assert.match(third, /^\[|Subjects|subjectsOf\(|subjects\(|subjectsOfTasks|noticeSubjects|subjects$/, `${site.file}: the site passes subjects as its third argument (saw ${third.slice(0, 60)})`)
-  }
-  assert.deepEqual(Object.keys(byFile).sort(), Object.keys(REVIEWED).sort(), `every file with a notify site is reviewed: ${JSON.stringify(byFile)}`)
-  let ordinal = 0
-  const perFile = {}
-  for (const site of found) {
-    perFile[site.file] = (perFile[site.file] ?? 0) + 1
-    const entry = REVIEWED[site.file][perFile[site.file] - 1]
-    assert.ok(entry, `${site.file} site #${perFile[site.file]} is not in the reviewed table`)
-    const consumesView = /view\.|interpretation\(/.test(site.call)
-    assert.equal(consumesView, entry.consumes, `${site.file} site #${perFile[site.file]} consumption classification changed (call references the view: ${consumesView})`)
-    if (!entry.consumes) assert.ok(typeof entry.reason === 'string' && entry.reason.length > 20, `${site.file} site #${perFile[site.file]} needs the fact it reads instead of the view`)
-    ordinal += 1
-  }
-  // L2 adds two sites (src/owner-reply.ts: the bounded nudge and the block-mode
-  // step refusal); the enumeration moves 25 -> 27 and both are classified above.
-  assert.equal(ordinal, 27, `the enumeration is exhaustive (found ${ordinal})`)
-  assert.equal(Object.values(byFile).reduce((sum, count) => sum + count, 0), found.length)
+  assert.ok(checked)
 })

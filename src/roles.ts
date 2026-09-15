@@ -6,6 +6,7 @@ import { ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, hiddenToolsFor, OWNER_PROMPT, ty
 import type { SwarmRuntime } from './runtime.ts'
 
 interface Applied { role: SwarmRole; dispose: () => void }
+/** Presentation history only: a completed turn does not settle task or notice obligations. */
 interface Handling { admitted: Set<string>; pending: Set<string>; handled: Set<string> }
 const recoveryKey = (requestId: string, epoch = 1): string => `start:${requestId}:${epoch}:failure`
 
@@ -48,7 +49,7 @@ export class RoleScoper {
     const handled = handling?.handled
     if (starts.some(start => start.status === 'failed' && (start.recoveryNoticePending
       || (handling?.admitted.has(recoveryKey(start.id, start.planningEpoch)) && !handled?.has(recoveryKey(start.id, start.planningEpoch)))))) return 'owner'
-    if (missions.some(mission => this.runtime.openAsks(mission.id, 'owner').length > 0
+    if (missions.some(mission => (mission.status !== 'stopped' && this.runtime.openAsks(mission.id, 'owner').length > 0)
       // Completed missions still deliver queued notices, including legacy
       // completion rows classified as decisions. Stopped missions mute them.
       || (mission.status === 'completed' && this.runtime.store.list('deliveries', mission.id)

@@ -4,8 +4,8 @@
  * The five measured round-14 gaps, each pinned by a test that fails without its
  * mechanism:
  *
- * 1. `subjects` on every `notify()` site, enforced by an ENUMERATION of the call
- *    sites in `src/` (not a sample) plus durable-readback assertions for the
+ * 1. `subjects` on every `notify()` site, with the shared parsed-source check
+ *    in r17-notices.test.mjs plus durable-readback assertions for the
  *    classes the round-14 review read back without subjects (the guard-terminal
  *    notice behind the task-ceiling path, the W3 stall notice, the escalation).
  * 2. Off-pass decision generation: with `workers.start` hung — the failure-first
@@ -23,17 +23,15 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
 import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -78,132 +76,8 @@ async function scenario(t, { workers = new Workers(), config = {}, directory } =
   return { ...f, owner, mission, stream, addMember, actorFor, propose, notices, block }
 }
 
-/** Skip one string or template literal (including `${...}` substitutions). */
-function skipString(text, start) {
-  const quote = text[start]
-  let index = start + 1
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '\\') { index += 2; continue }
-    if (char === quote) return index + 1
-    if (quote === '`' && char === '$' && text[index + 1] === '{') {
-      let depth = 1
-      index += 2
-      while (index < text.length && depth > 0) {
-        const inner = text[index]
-        if (inner === '\\') { index += 2; continue }
-        if (inner === '"' || inner === "'" || inner === '`') { index = skipString(text, index); continue }
-        if (inner === '{') depth += 1
-        else if (inner === '}') depth -= 1
-        index += 1
-      }
-      continue
-    }
-    index += 1
-  }
-  return index
-}
-
-/** Skip one regular-expression literal (a quote inside one must not open a string). */
-function skipRegex(text, start) {
-  let index = start + 1
-  let inClass = false
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '\\') { index += 2; continue }
-    if (char === '[') { inClass = true; index += 1; continue }
-    if (char === ']') { inClass = false; index += 1; continue }
-    if (char === '/' && !inClass) return index + 1
-    if (char === '\n') return start + 1
-    index += 1
-  }
-  return start + 1
-}
-
-/** Offsets of every `.notify(` call OUTSIDE strings, comments and regexes. */
-function notifyCallOffsets(text) {
-  const offsets = []
-  let index = 0
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '/' && text[index + 1] === '/') { while (index < text.length && text[index] !== '\n') index += 1; continue }
-    if (char === '/' && text[index + 1] === '*') { const end = text.indexOf('*/', index + 2); if (end === -1) break; index = end + 2; continue }
-    if (char === '/' && !/[/*]/.test(text[index + 1] ?? '')) {
-      let before = index - 1
-      while (before >= 0 && /\s/.test(text[before])) before -= 1
-      if (before < 0 || '([{,;:=!&|?+-*%<>~^'.includes(text[before])) { index = skipRegex(text, index); continue }
-    }
-    if (char === '"' || char === "'" || char === '`') { index = skipString(text, index); continue }
-    if (char === '.' && text.startsWith('.notify(', index)) { offsets.push(index + '.notify('.length - 1); index += '.notify('.length; continue }
-    index += 1
-  }
-  return offsets
-}
-
-/** The top-level comma-separated arguments of the call whose `(` is at `open`. */
-function topLevelArguments(text, open) {
-  let depth = 0
-  let index = open + 1
-  let start = open + 1
-  const args = []
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '/' && text[index + 1] === '/') { while (index < text.length && text[index] !== '\n') index += 1; continue }
-    if (char === '/' && text[index + 1] === '*') { const end = text.indexOf('*/', index + 2); if (end === -1) return undefined; index = end + 2; continue }
-    if (char === '"' || char === "'" || char === '`') { index = skipString(text, index); continue }
-    if (char === '(' || char === '[' || char === '{') depth += 1
-    else if (char === ')' || char === ']' || char === '}') {
-      if (char === ')' && depth === 0) { args.push(text.slice(start, index)); return args }
-      depth -= 1
-    } else if (char === ',' && depth === 0) { args.push(text.slice(start, index)); start = index + 1 }
-    index += 1
-  }
-  return undefined
-}
-
-test('R15-A1: every notify() call site in src/ passes a subject argument (enumeration, not a sample)', async () => {
-  const entries = await readdir(join(root, 'src'), { recursive: true, withFileTypes: true })
-  const files = entries.filter(entry => entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')))
-    .map(entry => join(entry.parentPath ?? entry.path, entry.name))
-  let sites = 0
-  const offenders = []
-  const isSubjectArgument = value => value.startsWith('[')
-    || /^(subjects|subjectList|[a-zA-Z.]*Subjects)$/.test(value)
-    // R17-B2r: the shared interpretation's own subject helper
-    // (`view.subjectsOf`, `this.interpretation(id).subjectsOf`, a ternary over it).
-    || /subjectsOf\(/.test(value)
-    || /^[a-zA-Z.]*SubjectsFor\(/.test(value)
-    || /^[a-zA-Z.]*subjectsOfTasks\(/.test(value)
-    || /^[a-zA-Z.]*(Subjects|subjects)\(/.test(value)
-    || /^question\.subjects$/.test(value)
-    || /^noticeSubjects\(/.test(value)
-  const stripComments = value => value.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
-  for (const file of files) {
-    const text = await readFile(file, 'utf8')
-    // The scanner must see every raw occurrence: a file it mis-parses would make
-    // this enumeration quietly incomplete, which is the failure mode it exists to
-    // prevent.
-    assert.equal(notifyCallOffsets(text).length, (text.match(/\.notify\(/g) ?? []).length, `every raw .notify( occurrence in ${file.slice(root.length + 1)} is parsed by the enumeration scanner`)
-    for (const open of notifyCallOffsets(text)) {
-      sites += 1
-      const args = topLevelArguments(text, open)
-      if (args === undefined) { offenders.push(`${file.slice(root.length + 1)}: unparsed argument list`); continue }
-      const third = stripComments(args[2] ?? '').trim()
-      if (!isSubjectArgument(third)) offenders.push(`${file.slice(root.length + 1)}: ${third.slice(0, 60)}`)
-    }
-  }
-  // The count is part of the claim: a NEW call site must be visited and given a
-  // subject, and this number is what makes the enumeration complete. R16-D added
-  // `Scheduling.escalateSilentAttempt` (src/scheduling.ts, `[taskSubject(task)]`),
-  // moving 23 -> 24. R17-B2 adds exactly one more — `Notices.absenceNet`
-  // (src/notices.ts), the absence net, whose third argument is `[subject]` built
-  // from `missionSubject(mission)`. The count moves 24 -> 25; nothing else in
-  // this test changed, and the new site is visited and checked like every other.
-  // L2 adds the owner-reply nudge and its block-mode twin (src/owner-reply.ts),
-  // both passing `noticeSubjectsFor(...)`; the count moves 25 -> 27.
-  assert.equal(sites, 27, `every .notify() site enumerated (found ${sites})`)
-  assert.deepEqual(offenders, [], `every notify() site passes subjects as its third argument: ${offenders.join(' | ')}`)
-})
+// The parsed source subject-presence check lives in r17-notices.test.mjs.
+// These tests verify the durable subject attribution and owner behavior.
 
 test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carries subjects in its own durable row', async t => {
   const f = await scenario(t)
@@ -685,6 +559,11 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
     return source !== undefined && !TERMINAL_STATES.has(source.status)
+  }
+  if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
+    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && runtime.effectiveDependency(missionId, id, tasks).status === 'accepted')) {
+    const stop = task.resumeAfterStop
+    return stop.at !== undefined && Date.now() - stop.at <= runtime.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
     if (!tasks.some(candidate => candidate.id === id)) return false

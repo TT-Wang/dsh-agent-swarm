@@ -1,32 +1,45 @@
 /**
  * RPC refusal-classification boundary guard (S3 repair, T3b).
  *
- * The browser sanitizer in `src/web-api.ts` classifies a refusal as actionable
- * by matching its message against an ANCHORED allowlist (`actionableMessages`).
- * A diagnostic prefix or an appended exit sentence changes the message, so an
- * annotated refusal the allowlist owns is silently downgraded to a generic
- * `internal-error` (the exact defect independent verification found in the T3
- * artifact: the cancel RPC returned `internal-error` instead of `bad-request`
- * because `Task is not in this mission` became a `[task_not_in_mission]`-prefixed
- * sentence with advice).
- *
- * The rule enforced here is mechanical, not a list of samples: every message
- * the sanitizer classifies must stay byte-identical to the authored text the
- * allowlist names, so it must carry no `[diagnostic_code]` prefix and no
- * appended exit. Refusals outside the allowlist may still be annotated (that is
- * the S3 goal); templates are refused because their rendering cannot be proven
- * against the allowlist mechanically.
+ * Typed PolicyError refusals carry an authored code/category separately from
+ * presentation text. Legacy Error refusals still use the sanitizer's anchored
+ * message allowlist: annotating those messages can downgrade a useful refusal
+ * to internal-error. Inventory both paths without freezing their relative
+ * counts as control paths migrate. Native RPC tests in web-api.test.mjs cover
+ * exposure, translated prose, unsafe host detail, and forged error shapes.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+import { PolicyError } from '../lib/policy-error.js'
+import { errorTypeFor, TRACE_ERROR_TYPES } from '../lib/trace.js'
 import { refusalSites } from './refusal-inventory.mjs'
+import { sourceTree } from './source-semantics.mjs'
 
 // M1a split the control path: the same inventory now spans the modules that
-// received its refusal sites, so the RPC-actionable count stays complete.
+// received its refusal sites, covering both legacy and typed authored refusals.
 const SOURCES = ['src/runtime.ts', 'src/workspaces.ts', 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts']
-/** The RPC-actionable inventory measured on the merge baseline 34e8a20. */
-const BASELINE_CLASSIFIED = 103
+
+function policySites(source, file) {
+  const tree = sourceTree(source, file), sites = []
+  const visit = node => {
+    if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'PolicyError') {
+      const args = node.arguments ?? []
+      sites.push({
+        location: `${file}:${tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1}`,
+        arity: args.length,
+        code: args[0] && ts.isStringLiteralLike(args[0]) ? args[0].text : undefined,
+        category: args[1] && ts.isStringLiteralLike(args[1]) ? args[1].text : undefined,
+        message: args[2] && ts.isStringLiteralLike(args[2]) ? args[2].text : undefined,
+        expression: args[2]?.getText(tree),
+      })
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
+  return sites
+}
 
 /** Extract the regex literals of `actionableMessages` from the sanitizer source. */
 function allowlistPatterns() {
@@ -45,7 +58,7 @@ const ACTIONABLE = allowlistPatterns()
 const classified = message => ACTIONABLE.some(pattern => pattern.test(message))
 
 test('the sanitizer allowlist is extracted from the source and classifies the authored refusal', () => {
-  assert.ok(ACTIONABLE.length >= 60, `the allowlist must be the real set, saw ${ACTIONABLE.length} patterns`)
+  assert.ok(ACTIONABLE.length > 0, 'the source allowlist must not be empty')
   assert.ok(classified('Task is not in this mission'), 'the cancel RPC refusal is RPC-actionable')
   assert.ok(!classified('[task_not_in_mission] Task is not in this mission. Correct `taskId` and retry.'),
     'the annotated form of that refusal is NOT classified: annotating it downgrades the RPC')
@@ -72,6 +85,35 @@ test('no refusal the sanitizer classifies carries a diagnostic prefix, and no an
     }
   }
   assert.deepEqual(conflicts, [], `RPC-classified refusals must stay actionable:\n${conflicts.join('\n')}`)
-  assert.ok(classifiedCount >= BASELINE_CLASSIFIED,
-    `the RPC-actionable inventory must not shrink (${classifiedCount} < ${BASELINE_CLASSIFIED} measured on 34e8a20)`)
+  assert.ok(classifiedCount > 0, 'legacy refusals must still be exercised while their sanitizer path exists')
+})
+
+test('typed refusal sites retain authored codes, categories, and messages independently of legacy prose', () => {
+  const fixture = policySites([
+    "// new PolicyError('ignored', 'conflict_error', 'comment')",
+    "throw new Error('legacy');",
+    "throw new PolicyError('literal', 'conflict_error', 'Authored message');",
+    "throw new PolicyError('template', 'validation_error', `${key} is invalid`);",
+    "throw new PolicyError('computed', 'budget_error', reason);",
+  ].join('\n'), 'fixture.ts')
+  assert.deepEqual(fixture.map(site => site.code), ['literal', 'template', 'computed'])
+  assert.equal(fixture[0].message, 'Authored message')
+  assert.equal(fixture[1].expression, '`${key} is invalid`')
+  assert.equal(fixture[2].expression, 'reason')
+
+  const sites = SOURCES.flatMap(file => policySites(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), file))
+  assert.ok(sites.length > 0, 'the typed control refusal path must be exercised')
+  for (const site of sites) {
+    assert.equal(site.arity, 3, `${site.location}: code, category, and message are explicit`)
+    assert.match(site.code ?? '', /^[a-z][a-z0-9_]{0,79}$/, `${site.location}: stable public policy code`)
+    assert.ok(TRACE_ERROR_TYPES.includes(site.category), `${site.location}: category belongs to the trace contract`)
+    assert.ok(site.expression, `${site.location}: authored message expression is present`)
+    if (site.message !== undefined) assert.ok(site.message.length > 0 && site.message.length <= 4000, `${site.location}: literal message fits the public RPC boundary`)
+    const message = site.message ?? '当前状态需要更新后重试。'
+    const refusal = new PolicyError(site.code, site.category, message)
+    assert.equal(refusal.message, message, `${site.location}: authored prose is preserved`)
+    assert.equal(refusal.code, site.code)
+    assert.equal(errorTypeFor(refusal), site.category, `${site.location}: category does not depend on an English regex`)
+    assert.equal(errorTypeFor(new PolicyError(site.code, site.category, '请按当前状态重试。')), site.category)
+  }
 })

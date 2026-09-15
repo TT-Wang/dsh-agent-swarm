@@ -1,12 +1,222 @@
 # Validation
 
-Version **0.6.0** was checked on 2026-09-08. The full regression baseline and the final watch-lifecycle correction are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile.
+Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile.
 
 | Harness release | Exact source commit |
 | --- | --- |
 | `0.1.5-rc.1` | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+
+## Consolidation and context efficiency (2026-09-15)
+
+All ten follow-up consolidation items are implemented in the current 0.7.0
+working tree on `codex/r12-recovery-fixes` (base `73a232a`). They preserve
+owner-directed budgets, task identity, immutable evidence, independent review,
+stop confirmation and WIP recovery. No live campaign or budget was changed.
+
+The runtime now owns normalized verdict events in the actual verdict transaction;
+check-infrastructure deferral emits no refutation. Draft and owner-control
+refusals carry explicit business codes/categories through Web and trace, with
+size/path redaction retained. Owner observations support explicit scoped cursors,
+replay, full reset and exact delivery reads. Bounded notices retain full facts and
+per-dimension budget identities. The UI shares its visible projection/clock and
+removes retired components. Cancellation preparation, draft diagnostics, task-graph
+indexes and integration-conflict staging reuse their existing local paths.
+
+Validation of the final product sources:
+
+- `npm run build` and `npm run typecheck`: passed.
+- Full behavioral execution: **1,136 tests**, with 1,131 passing initially.
+  Five test-maintenance failures were corrected: two migrated UI event fixtures
+  needed their mission ID; the new disposable owner-cursor cache needed its
+  recovery registration; the event-reader inventory still named the removed tool
+  consumer; and the refusal inventory assumed an English-regex site count could
+  never decrease. The latter now checks typed codes/categories as well as the
+  retained legacy path and native Web redaction behavior.
+- The affected census/UI fixture rerun passed **40/40**. Event/refusal inventory
+  reruns passed **13/13**, including one new typed-refusal test. Final frontend
+  behavior and mounted-clock tests passed **78/78**, including the later fix that
+  disables lease timing when the active filter hides all leased tasks. These
+  scoped reruns complete coverage; the initial full run is not represented as a
+  zero-failure run. The mounted-clock and typed-refusal tests bring the current
+  suite to 1,138 cases across full execution and scoped reruns.
+- Registered-tool verdict/recovery tests passed **124/124**; notification and
+  lifecycle tests passed **133/133**; owner delta/history tests passed **11/11**;
+  typed Web/trace/resource tests passed **44/44**. These overlap the full suite.
+- `DSH_HARNESS_ROOT=.../deepseek-harness-015 node scripts/smoke-pack.mjs`:
+  clean-source prepack and the actual **0.1.5-rc.1** Loader passed, with **236**
+  published files. It exercised registered model tools, real bash, evidence,
+  independent verification, integration, completion, owner-independent restart
+  recovery and unload. The clean-source copier was corrected to honor tracked
+  working-tree deletions without changing the Git index.
+
+Build/type checks use the linked **0.1.3-alpha.2** dependencies; package loading
+was checked against the exact **0.1.5-rc.1** revision in the table above. Providers
+were scripted and test workspaces/profiles isolated. No billable model requests
+were made. UI lifecycle evidence comes from mounted React under jsdom; the full
+browser E2E suite was not rerun for this consolidation.
+
+Bounded measurements (not general token, throughput or memory guarantees):
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| Owner read, 32 tasks, one changed task | 6,743 serialized bytes | 2,205 bytes |
+| Owner read, 128 tasks, one changed task | 14,768 serialized bytes | 2,206 bytes |
+| Five synchronous graph operations, 32 tasks | 151 index constructions | 5 |
+| Same operations, 128 tasks | 583 index constructions | 5 |
+| Same operations, 256 tasks | 1,159 index constructions | 5 |
+| One draft operation, package metadata reads | 3 | 2 |
+
+Graph shapes included fan-in, a two-hop replacement chain and an exact review
+source. Outputs matched before/after, including a subsequent carrier change.
+Uninstrumented medians after warmup were 0.302→0.095 ms, 3.511→0.120 ms and
+13.103→0.221 ms respectively (Node 22.22.3, seven batches of twenty operations).
+Heap readings were GC-sensitive and did not consistently improve, so no general
+memory reduction is claimed. Draft tests also preserve 25 complete diagnostics
+in the event, cap displayed diagnostics at 20, and read changed scripts on the
+next operation.
+
+Mounted UI measurements: the compact overview runs one clock; a visible leased
+task list adds one independent clock; hiding/filtering away that list removes
+its clock. Hidden, offline, paused, stopped, completed, resource-paused and
+historical views run zero clocks. Four elapsed ticks performed four native
+activity reads and zero board-title/dependency rereads, while event DOM identities
+remained stable. Robot identities, dynamic rings, reduced-motion behavior and
+Chinese/English state labels remain covered by the frontend tests.
+
+## Rule recovery and resource continuity (2026-09-15)
+
+The current working tree on `codex/r12-recovery-fixes`, based on `73a232a`,
+implements the 26 recorded rule-audit items and both follow-up observations.
+This includes the earlier shared task-graph interpretation and advance budget
+review TODOs. The detailed local implementation map is
+`docs/local/rule-audit-2026-09-15.md`; it is excluded from Git and published
+packages. The package version remains 0.7.0.
+
+Owners can amend finite task allocations and recover the same task without
+resetting consumption, rebuilding the DAG or discarding artifacts. Durable
+advance warnings and bounded reminders distinguish delivered notifications
+from completed decisions, and meaningful-progress detection ignores repeated
+failed-tool and scheduling noise. Explicit user pauses remain authoritative.
+Effective execution time excludes idle/resource waits; an optional absolute
+deadline remains a separate constraint.
+
+Recovery tests cover stop confirmation before workspace reuse, legacy records
+without a recorded worker identity, WIP preservation, dependency amendments,
+same-artifact review after infrastructure failure, integration conflict
+resolution and independent review. Shared graph selectors align completion,
+delivery and UI facts. Heuristic path/script diagnostics no longer override
+actual scope, host capability or artifact evidence. Historical policy documents
+are marked as archived instead of retaining conflicting current mandates.
+
+An existing stall-root regression exposed a duplicate alert after legacy stop
+recovery: pending work was treated as stuck while its selected member was
+stopping or executing another task. The classifier now recognizes those
+bounded waits while retaining dead-prerequisite and expired-stop alerts.
+An overdue scheduling pass still produces its own task-specific dispatch
+question. The affected owner/notice/recovery group passed **84/84** after this
+correction, including the original attribution assertions and new paired cases.
+
+- `npm run typecheck` and `npm run build` passed for the backend and browser.
+- `node --test --test-concurrency=4 tests/*.test.mjs`: **1,120/1,120 passed**,
+  with zero failures, cancellations or skips (166 seconds;
+  `/tmp/swarm-rule-final-full-tests.log`). This final run includes the
+  Round 12 fixes, lean assignment work and all rule-recovery changes above.
+- `DSH_HARNESS_ROOT=/Users/tongtao/code/deepseek-harness-015 node scripts/smoke-pack.mjs`
+  passed against exact Harness **0.1.5-rc.1** commit
+  `183f08e9c6dde7e36cd2318eaee70b0da08fb35e`. Clean-source prepack emitted
+  both declared entry points and the **236-file package** passed the real
+  Loader composition: tool registration, peer proposals, real shell execution,
+  evidence, independent verification, integration, completion,
+  owner-independent restart recovery and unload
+  (`/tmp/swarm-rule-final-pack-loader.log`).
+
+The first packed check caught an outdated model-visible assignment snapshot:
+integration workers now receive instructions for their conflict manifest.
+Only that intentional instruction was updated in the four affected snapshots;
+the subsequent packed check passed. This did not change product code.
+
+Behavioral tests use the linked **0.1.3-alpha.2** host; the packed check links
+its temporary extraction to **0.1.5-rc.1**. Providers are scripted, while host,
+Git, filesystem, persistence and Loader interactions are real. These checks do
+not establish paid-model planning quality, general throughput improvements or
+arbitrary infrastructure fault tolerance. This pass did not restart user
+services, alter live mission budgets or resume the paused campaign, and did not
+repeat browser rendering checks.
+
+## Lean planning and idle borrowing (2026-09-15)
+
+On the same working branch, planning guidance now favors independently
+verifiable outcomes and real input dependencies, accounting for coordination
+cost. The owner prompt grew by 83 characters (two English words net); no
+additional planning agent, tool, model turn or scheduler loop was introduced.
+
+New automatic plans persist `assignmentMode: preferred`. Only pending work at
+epoch 0 without an attempt or recovery marker may be borrowed when the preferred
+member cannot start it. Explicit `pinned` and legacy/manual binding remain;
+actual authors cannot review their own work, and borrowing cannot consume a
+source's pinned reviewer. Once claimed, the actual member owns recovery.
+Runtime, review-path and client projections use the same pure assignment rules.
+
+Behavior tests exercise busy and idle preferences, independent review through
+acceptance, pinned/legacy/recovery exclusions, cancellation or reassignment
+during preparation, and restart persistence. Automatic and manual plan tests
+also verify the default, explicit override and saved representation. Browser
+projection tests cover a stopped preference and malformed assignment modes.
+
+- `npm run typecheck` and the backend/browser build passed.
+- `node --test --test-concurrency=4 tests/*.test.mjs`: **1,045/1,045 passed**,
+  zero failures, cancellations or skips (`/tmp/lean-full-tests.log`). This also
+  reran all Round 12 fixes recorded below.
+- `DSH_HARNESS_ROOT=/Users/tongtao/code/deepseek-harness-015 node scripts/smoke-pack.mjs`
+  passed against exact Harness **0.1.5-rc.1** commit
+  `183f08e9c6dde7e36cd2318eaee70b0da08fb35e`: clean-source prepack and the
+  227-file artifact passed real Loader collaboration, review, integration,
+  restart recovery and unload (`/tmp/lean-pack-harness-015.log`). A handled
+  `SessionHandleClosedError` flush diagnostic appeared during teardown; the
+  unload assertions still confirmed no remaining worker handles or swarm tools.
+
+The suite uses the linked **0.1.3-alpha.2** host; the packed check links its own
+temporary extraction to 0.1.5-rc.1. Scripted providers avoid paid model calls.
+These checks prove the assignment and recovery behavior, not a measured
+wall-time speedup or improved model decomposition quality. Existing user
+services/profiles were not restarted or modified.
+
+## Round 12 recovery fixes (2026-09-15)
+
+The working tree on `codex/r12-recovery-fixes`, based on `73a232a`, addresses 40
+reported findings and hardens snapshot consistency for one further item; five
+reported items did not warrant changes after revalidation. The detailed local
+log is `review/round-12-fixes.md` (excluded from Git and published packages).
+The plugin package version remains 0.7.0.
+
+The local peer links resolve to **0.1.3-alpha.2**, even though the checkout is
+named `deepseek-harness-latest`. Typecheck, the built backend/browser bundle,
+and the behavioral suite use those links. A separate extracted package was
+linked to **0.1.5-rc.1**, commit `183f08e9c6dde7e36cd2318eaee70b0da08fb35e`,
+for the real Loader check; neither host checkout nor user profiles were changed.
+
+- `npm run typecheck` and `npm run build` passed.
+- `node --test --test-concurrency=4 tests/*.test.mjs` ran 1,029 tests:
+  1,028 passed, and one test caught an ownership diagnostic that no longer
+  explained “not owned” in plain language. The message was repaired while
+  retaining its stable diagnostic code and actionable parameters; the affected
+  tool and diagnostic suites were then rerun against the rebuilt artifact:
+  **55/55 passed**, with no skips. The other passing checks were reused because
+  the final change only restored that diagnostic sentence.
+- `DSH_HARNESS_ROOT=/Users/tongtao/code/deepseek-harness-015 node scripts/smoke-pack.mjs`
+  passed: clean-source prepack builds both entry points; the 221-file package
+  passes real Loader registration, native tool execution, independent review,
+  integration, completion, owner-independent restart recovery and unload.
+
+The Loader uses a scripted provider and real local host services, not a paid
+model or a model-quality benchmark. SQLite restore tests kill subprocesses at
+defined publication points; they do not establish arbitrary power-loss or
+concurrent multi-host restore safety. Git tests use temporary repositories and
+include actual Python virtualenv execution. UI recovery is checked through
+monitor, projection and component behavior; this pass does not re-render the
+README showcase or change the avatar design.
 
 ## Recovery and sidebar corrections (2026-09-13)
 

@@ -1,4 +1,6 @@
 import type { Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
+import { taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
+import { assignmentAllows } from '../assignment.ts'
 
 export type BoardLane = 'ready' | 'queued' | 'active' | 'review' | 'blocked' | 'cancelled' | 'done'
 /**
@@ -30,54 +32,9 @@ export interface BoardIndex {
   lane(task: Task, members?: readonly Member[]): BoardLane
 }
 
-function oldest(tasks: readonly Task[]): Task | undefined {
-  let best: Task | undefined
-  for (const task of tasks) {
-    if (best === undefined || task.createdAt < best.createdAt
-      || (task.createdAt === best.createdAt && task.id < best.id)) best = task
-  }
-  return best
-}
-
-/**
- * One pass over the task list that resolves every lane and lineage question
- * through maps. The board and graph call this once per render, so their cost
- * stays O(tasks + edges) instead of rescanning the task array per task and per
- * edge (F-34). The lineage rule matches the runtime exactly: two accepted
- * repairs for one obligation is ambiguous history and fails closed, otherwise
- * the oldest live repair wins with the id as a total tie-break.
- */
+/** One pure identity index supplies dependency and exact review-source facts. */
 export function boardIndex(tasks: readonly Task[]): BoardIndex {
-  const byId = new Map<string, Task>()
-  const replacements = new Map<string, Task[]>()
-  for (const task of tasks) {
-    byId.set(task.id, task)
-    for (const target of task.replaces ?? []) {
-      const list = replacements.get(target)
-      if (list === undefined) replacements.set(target, [task])
-      else list.push(task)
-    }
-  }
-  const resolved = new Map<string, Task | undefined>()
-  const effective = (id: string): Task | undefined => {
-    if (resolved.has(id)) return resolved.get(id)
-    let current = byId.get(id)
-    const seen = new Set<string>()
-    while (current && (current.status === 'cancelled' || current.status === 'blocked') && !seen.has(current.id)) {
-      seen.add(current.id)
-      const candidates = (replacements.get(current.id) ?? []).filter(task => task.kind === current!.kind && !seen.has(task.id))
-      const accepted = candidates.filter(task => task.status === 'accepted')
-      // Two accepted artifacts for one obligation is ambiguous history: no arbitrary artifact is trusted.
-      const next = accepted.length > 1 ? undefined
-        : (accepted[0] ?? oldest(candidates.filter(task => ['pending', 'running', 'submitted'].includes(task.status)))
-          ?? oldest(candidates.filter(task => task.status === 'blocked' || task.status === 'cancelled')))
-      if (!next) break
-      current = next
-    }
-    resolved.set(id, current)
-    return current
-  }
-  const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
+  const { byId, effective, dependencyMet, reviewSource } = taskGraphIndex(tasks)
   const blockedDependencies = (task: Task): string[] => task.dependencies.filter(id => !dependencyMet(id))
   // A task is still alive while it can reach an acceptance or a verdict on its
   // own; only a dead one makes its dependents blocked rather than queued.
@@ -93,13 +50,17 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
     // unschedulable); a pending task assigned to a stopped member has no live
     // owner either way.
     if (task.reviewOf !== undefined) {
-      const source = effective(task.reviewOf)
+      const source = reviewSource(task)
       if (source?.status !== 'submitted') return source !== undefined && alive(source.status) ? 'queued' : 'blocked'
     }
     const unmet = blockedDependencies(task)
     if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
-    if (members !== undefined && task.assigneeId !== undefined
-      && !members.some(member => member.id === task.assigneeId && member.status !== 'stopped')) return 'blocked'
+    if (members !== undefined) {
+      const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
+      const authors = new Set([...(source?.priorOwnerIds ?? []), source?.attempt?.ownerId, source?.assigneeId])
+      if (!members.some(member => member.status !== 'stopped' && !authors.has(member.id)
+        && assignmentAllows(task, member.id, tasks))) return 'blocked'
+    }
     return 'ready'
   }
   return { byId, effective, dependencyMet, blockedDependencies, lane }
@@ -130,6 +91,18 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 function strings(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === 'string') }
 function finite(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) }
+function nonnegative(value: unknown): value is number { return finite(value) && value >= 0 }
+function optionalCount(value: unknown): boolean { return value === undefined || nonnegative(value) }
+function usage(value: unknown): boolean {
+  return value === undefined || (record(value) && ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'].every(key => nonnegative(value[key])))
+}
+function activity(value: unknown): boolean {
+  return value === undefined || (record(value) && typeof value.id === 'string' && typeof value.kind === 'string'
+    && nonnegative(value.startedAt) && nonnegative(value.updatedAt)
+    && (value.tool === undefined || typeof value.tool === 'string')
+    && (value.attemptId === undefined || typeof value.attemptId === 'string')
+    && optionalCount(value.retryAt) && optionalCount(value.retryAttempt))
+}
 function artifact(value: unknown): boolean {
   return value === undefined || (record(value) && typeof value.commit === 'string'
     && typeof value.baseCommit === 'string' && strings(value.changedPaths))
@@ -185,6 +158,13 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     || !finite(mission.usedSteps) || !finite(mission.usedTokens)
     || !record(mission.budget) || !strings(mission.scope) || !strings(mission.acceptance)) return undefined
   if (!['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].every(key => finite((mission.budget as Record<string, unknown>)[key]))) return undefined
+  // Optional fields keep pre-accounting and pre-recovery snapshots readable,
+  // but any values present must be safe for the progress and usage renderers.
+  if (!usage(mission.workerUsage) || !usage(mission.ownerUsage)) return undefined
+  if (mission.budgetPause !== undefined && !(record(mission.budgetPause)
+    && typeof mission.budgetPause.id === 'string' && typeof mission.budgetPause.quiesced === 'boolean'
+    && (mission.budgetPause.stopping === undefined || (record(mission.budgetPause.stopping)
+      && typeof mission.budgetPause.stopping.instanceId === 'string' && nonnegative(mission.budgetPause.stopping.at))))) return undefined
   if (candidate.deliveryTarget !== undefined && !(record(candidate.deliveryTarget)
     && typeof candidate.deliveryTarget.taskId === 'string' && typeof candidate.deliveryTarget.commit === 'string')) return undefined
   if (candidate.completion !== undefined && !(record(candidate.completion)
@@ -209,6 +189,7 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     && (task.objective === undefined || typeof task.objective === 'string')
     && (task.workstreamId === undefined || typeof task.workstreamId === 'string')
     && (task.assigneeId === undefined || typeof task.assigneeId === 'string')
+    && (task.assignmentMode === undefined || task.assignmentMode === 'preferred' || task.assignmentMode === 'pinned')
     && (task.reviewOf === undefined || typeof task.reviewOf === 'string')
     && (task.reviewedCommit === undefined || typeof task.reviewedCommit === 'string')
     && (task.replaces === undefined || strings(task.replaces))
@@ -218,9 +199,15 @@ export function readSnapshot(value: unknown): Snapshot | undefined {
     && (task.priority === undefined || finite(task.priority))
     && (task.epoch === undefined || finite(task.epoch))
     && (task.createdAt === undefined || finite(task.createdAt))
+    && optionalCount(task.usedSteps) && optionalCount(task.maxSteps)
+    && optionalCount(task.recoveryCount) && optionalCount(task.maxRecoveryAttempts)
+    && (task.resumeAfterStop === undefined || (record(task.resumeAfterStop)
+      && nonnegative(task.resumeAfterStop.epoch) && typeof task.resumeAfterStop.reason === 'string'
+      && optionalCount(task.resumeAfterStop.at)))
     && attempt(task.attempt) && artifact(task.artifact))) return undefined
   if (!(candidate.members as unknown[]).every(member => record(member) && typeof member.id === 'string'
-    && typeof member.name === 'string' && typeof member.role === 'string' && typeof member.status === 'string')) return undefined
+    && typeof member.name === 'string' && typeof member.role === 'string' && typeof member.status === 'string'
+    && activity(member.activity) && usage(member.usage))) return undefined
   if (!(candidate.evidence as unknown[]).every(evidence => record(evidence) && typeof evidence.claim === 'string'
     && typeof evidence.id === 'string' && typeof evidence.authorId === 'string' && typeof evidence.taskId === 'string'
     && typeof evidence.status === 'string' && typeof evidence.outcome === 'string' && artifact(evidence.artifact)
@@ -253,21 +240,11 @@ export function snapshotFromResult(meta: unknown, content: unknown): Snapshot | 
   return undefined
 }
 
-/**
- * The deliverable the runtime will apply. The runtime projects its unique maximal
- * accepted integration as `deliveryTarget`; only a legacy snapshot without that
- * projection falls back to the historical local rule (first accepted integration,
- * or the single accepted implementation when the plan needed no assembly step).
- */
+/** The projected runtime target is authoritative; legacy snapshots use the same pure selector. */
 export function deliverableTask(snapshot: Snapshot): Task | undefined {
   const target = readDeliveryTarget(snapshot)
   if (target) return snapshot.tasks.find(task => task.id === target.taskId)
-  const accepted = snapshot.tasks.filter(task => task.status === 'accepted' && task.artifact)
-  const integration = accepted.find(task => task.kind === 'integration')
-  if (integration) return integration
-  if (snapshot.tasks.some(task => task.kind === 'integration')) return undefined
-  const implementations = accepted.filter(task => task.kind === 'implementation')
-  return implementations.length === 1 ? implementations[0] : undefined
+  try { return selectAcceptedDelivery(snapshot.tasks) } catch { return undefined }
 }
 
 /** The projected runtime target commit is authoritative; the local rule is a legacy fallback only. */

@@ -51,6 +51,19 @@ async function launch(f, input = f.input) {
   const snapshot = await f.runtime.startPlan(f.owner, request.id, input)
   return { request, snapshot }
 }
+
+test('automatic launch persists assignment preferences and preserves an explicit pinned reviewer', async t => {
+  const f = await fixture(t)
+  f.input.tasks.find(task => task.kind === 'verification').assignmentMode = 'pinned'
+  const { request, snapshot } = await launch(f)
+  assert.equal(snapshot.tasks.find(task => task.kind !== 'verification').assignmentMode, 'preferred')
+  assert.equal(snapshot.tasks.find(task => task.kind === 'verification').assignmentMode, 'pinned')
+  const saved = f.runtime.store.get('drafts', f.runtime.store.get('starts', request.id).draftId)
+  assert.equal(saved.input.tasks.find(task => task.kind !== 'verification').assignmentMode, 'preferred')
+  const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.equal(replay.tasks.find(task => task.kind === 'verification').assignmentMode, 'pinned')
+  assert.equal(f.input.tasks.find(task => task.kind !== 'verification').assignmentMode, undefined, 'admission does not mutate the caller plan')
+})
 async function accept(f, snapshot, { evidence = false } = {}) {
   const missionId = snapshot.mission.id
   const builder = snapshot.members.find(member => member.name === 'Builder')
@@ -174,8 +187,8 @@ test('failed assembly and retries retain one deterministic plan and worker roste
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
   fail = false
-  const snapshot = await f.runtime.startPlan(f.owner, request.id, { ...f.input, title: 'Ignore retry mutation' })
-  assert.equal(snapshot.mission.title, f.input.title)
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, { ...f.input, title: 'Corrected saved plan' })
+  assert.equal(snapshot.mission.title, 'Corrected saved plan')
   assert.equal(f.runtime.starts(f.owner)[0].draftId, failed.draftId)
   assert.equal(f.workers.prepared.length, 2)
 })
@@ -245,11 +258,15 @@ test('primary-agent budget adjustments preserve consumption, admitted counts and
   f.runtime.control(f.owner, snapshot.mission.id, 'pause', 'Primary agent inspecting remaining work')
   const chosen = { ...budget, maxTokens: 765432, maxSteps: 321, maxWorkers: 4, maxTasks: 19, maxDurationMs: 900000 }
   assert.deepEqual(f.runtime.updateBudget(f.owner, snapshot.mission.id, chosen, 'More integration checks are required'), chosen)
+  const observedBefore = Date.now()
   const updated = f.runtime.snapshot(f.owner, snapshot.mission.id)
+  const observedAfter = Date.now()
   assert.equal(updated.mission.usedTokens, 17)
   assert.equal(updated.mission.usedSteps, 3)
   assert.equal(updated.mission.status, 'paused')
-  assert.equal(updated.mission.deadline, updated.mission.createdAt + chosen.maxDurationMs)
+  const remainingExecutionMs = chosen.maxDurationMs - updated.mission.executionTime.usedMs
+  assert.ok(updated.mission.deadline >= observedBefore + remainingExecutionMs && updated.mission.deadline <= observedAfter + remainingExecutionMs, 'paused deadline projection uses remaining execution allowance')
+  assert.equal(updated.mission.executionTime.since, undefined, 'pause does not accrue execution time')
   assert.equal(updated.members.length, 2); assert.equal(updated.tasks.length, 2)
   assert.deepEqual(f.runtime.starts(f.owner)[0].budget, chosen)
   assert.equal(updated.events.findLast(event => event.type === 'mission/budget-updated').data.reason, 'More integration checks are required')
@@ -257,7 +274,7 @@ test('primary-agent budget adjustments preserve consumption, admitted counts and
   assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status, 'active')
 })
 
-test('a budget-blocked mission needs explicit resume after adjustment and keeps recorded usage', async t => {
+test('a resource-blocked mission continues after an owner extension without resetting usage', async t => {
   const f = await fixture(t)
   const { snapshot } = await launch(f)
   const builder = snapshot.members.find(member => member.name === 'Builder')
@@ -265,8 +282,7 @@ test('a budget-blocked mission needs explicit resume after adjustment and keeps 
   const chosen = { ...budget, maxTokens: budget.maxTokens * 2, maxDurationMs: 900000 }
   f.runtime.updateBudget(f.owner, snapshot.mission.id, chosen)
   let current = f.runtime.snapshot(f.owner, snapshot.mission.id).mission
-  assert.equal(current.status, 'blocked'); assert.equal(current.usedTokens, budget.maxTokens + 123)
-  f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Continue the remaining work')
+  assert.equal(current.status, 'active'); assert.equal(current.usedTokens, budget.maxTokens + 123)
   current = f.runtime.snapshot(f.owner, snapshot.mission.id).mission
   assert.equal(current.status, 'active'); assert.equal(current.usedTokens, budget.maxTokens + 123)
 })

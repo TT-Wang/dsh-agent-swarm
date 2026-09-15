@@ -153,8 +153,12 @@ test('owner cancel wins a handoff race: the blocked task never re-opens after th
   f.workers.stopGate = gate.promise
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'Reassign' })
   assert.equal(f.current(task.id).status, 'blocked')
+  const beforeCancel = f.current(task.id)
   const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'No longer needed' })
   assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.epoch, beforeCancel.epoch)
+  assert.deepEqual(cancelled.resumeAfterStop, beforeCancel.resumeAfterStop, 'cancellation keeps the existing stop owner and checkpoint obligation')
+  assert.deepEqual(f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Replay' }), cancelled)
   gate.resolve()
   await new Promise(resolve => setTimeout(resolve, 30))
   assert.equal(f.current(task.id).status, 'cancelled', 'the deferred handoff cannot reopen cancelled work')
@@ -197,19 +201,21 @@ test('cancelling a source retires a running review so it cannot re-pend after le
   // though its source can never be reviewed again; model that durable state.
   const parked = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Parked review', objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
+  const parkedOwner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Parked reviewer', role: 'verification' })
   const parkedRecord = f.current(parked.id)
-  parkedRecord.status = 'blocked'; parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, reason: 'lease-expired' }
+  parkedRecord.status = 'blocked'; parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, memberId: parkedOwner.id, reason: 'lease-expired', at: Date.now() }
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', parkedRecord))
   f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Source withdrawn' })
   const retired = f.current(review.id)
   assert.equal(retired.status, 'cancelled', 'a running review of withdrawn work is retired with its source')
   assert.equal(retired.attempt, undefined, 'the review attempt is fenced')
-  assert.equal(retired.resumeAfterStop, undefined, 'a retired review cannot re-pend')
+  assert.equal(retired.resumeAfterStop.memberId, f.reviewer.id, 'retirement fences the old owner until it stops')
   assert.match(retired.output, /Superseded/)
   const parkedAfter = f.current(parked.id)
   assert.equal(parkedAfter.status, 'cancelled', 'a quiescence-parked review of withdrawn work is retired too')
-  assert.equal(parkedAfter.resumeAfterStop, undefined)
+  assert.equal(parkedAfter.resumeAfterStop.memberId, parkedOwner.id)
   await eventually(() => f.workers.stopped.includes(f.reviewer.id), 'the retired reviewer is stopped')
+  await eventually(() => [review, parked].every(task => f.current(task).resumeAfterStop === undefined), 'confirmed stops clear the markers without reopening the cancelled reviews')
   // Even a later scheduling pass must not re-pend or reassign the review.
   f.workers.callbacks.idle(f.reviewer.id)
   await new Promise(resolve => setTimeout(resolve, 30))

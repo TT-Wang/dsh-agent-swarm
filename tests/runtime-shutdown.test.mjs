@@ -87,7 +87,7 @@ for (const scenario of [
       interrupted.assigneeId = nextOwner.id
       interrupted.handoff = 'Preserve the prior worktree checkpoint and finish the task.'
       interrupted.recoveryCount = scenario.recoveryCount
-      interrupted.resumeAfterStop = { epoch: scenario.markerEpoch, reason: scenario.reason }
+      interrupted.resumeAfterStop = { epoch: scenario.markerEpoch, memberId: previousOwner.id, reason: scenario.reason }
       delete interrupted.attempt
       persisted.transaction(() => persisted.put('tasks', interrupted))
     } finally { persisted.close() }

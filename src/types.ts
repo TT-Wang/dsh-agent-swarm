@@ -45,6 +45,8 @@ export interface Budget {
   maxDurationMs: number
   maxTasks: number
   maxExperiments: number
+  /** Optional absolute user deadline, distinct from the execution-time estimate. */
+  deadlineAt?: number
 }
 /**
  * Provider-reported usage split into billing buckets. `outputTokens` already
@@ -142,6 +144,8 @@ export interface Mission {
   createdAt: number
   updatedAt: number
   deadline: number
+  /** Active execution time; paused, idle and resource-waiting time is excluded. */
+  executionTime?: { usedMs: number; since?: number }
   coordinatorId?: string
   reason?: string
   baseline?: WorkspaceBaseline
@@ -168,6 +172,8 @@ export interface Mission {
    * one unchanged board. Cleared when a pass advances durable state.
    */
   schedulingStallNotice?: string
+  /** Separate timeout witness: an earlier no-progress notice cannot suppress a wedge. */
+  schedulingWedgeNotice?: string
   /**
    * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
    * `F(S)` of the board state at the moment the last owner-decision notice was
@@ -179,6 +185,7 @@ export interface Mission {
   /** R10-14: fingerprint of the coverage-complete state the owner was told about. */
   coverageNotice?: string
   /** Highest approaching-limit threshold already warned per budget dimension. */
+  budgetReviewedAt?: number
   budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
   appliedDelivery?: { resultCommit: string; appliedAt: number }
@@ -290,6 +297,17 @@ export interface Artifact {
   workspace: string
   changedPaths: string[]
 }
+/** Owner revisions keep the obligation and history; submitted artifacts stay immutable. */
+export interface TaskAmendment {
+  scope?: string[]
+  dependencies?: string[]
+  checks?: string[]
+  assigneeId?: string | null
+  maxSteps?: number
+  maxFindings?: number
+  maxRecoveryAttempts?: number
+  checkTimeoutMs?: number
+}
 export interface Task {
   id: string
   missionId: string
@@ -320,7 +338,9 @@ export interface Task {
    */
   revision?: number
   assigneeId?: string
-  /** Plan-intended owner; restored when a lease expiry re-pends the task and the member is still live. */
+  /** Only preferred tasks that have never started may be borrowed. Absent preserves legacy binding. */
+  assignmentMode?: 'preferred' | 'pinned'
+  /** Initial plan owner; a preferred task fixes this to its first actual owner for recovery. */
   plannedAssigneeId?: string
   attempt?: Attempt
   /** Lease value already warned about, so a lease-expiring event is emitted once per lease. */
@@ -340,12 +360,16 @@ export interface Task {
   usedSteps?: number
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
+  /** Highest warning per dimension and allocation; runtime estimates never refill themselves. */
+  budgetWarned?: Record<string, number>
+  preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
+  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
   budgetResume?: { pauseId: string; attemptId: string; epoch: number }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
-  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number }
+  resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
   closeout?: { nudges: number; at: number }
   /**
@@ -623,7 +647,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
 ]
 
 export const ATTEMPT_FENCING_EVENTS: readonly string[] = [
-  'task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion',
+  'task/submitted', 'task/blocked', 'task/verification-deferred', 'task/cancelled', 'task/cancelled-at-completion',
   'task/lease-expired', 'task/restart-repended', 'task/ceiling-exhausted',
   'task/handoff-started', 'task/invalidated', 'task/review-retired',
   'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected',
@@ -748,6 +772,7 @@ export interface PlanTask {
   priority?: number
   experiment?: boolean
   assigneeKey?: string
+  assignmentMode?: 'preferred' | 'pinned'
   dependencies?: string[]
   reviewOf?: string
 }
@@ -763,6 +788,8 @@ export interface DraftPlan {
   status: 'draft' | 'launching' | 'launched' | 'failed' | 'discarded'
   /** Validated plan exactly as supplied; the authorization anchor lives beside it, never inside. */
   input: PlanInput
+  /** Bounded advisory preflight notes; they never change launch eligibility. */
+  advisories?: string[]
   /** Human-authorization anchor captured at staging; carried into the launched mission. */
   workspaceGrantRoot?: string
   /** Host-derived authorization origin captured with the anchor; never inside `input`. */
@@ -791,6 +818,8 @@ export interface AutoStart extends RequestStartInput {
   /** Durable generation fences late planners after a retry or stop. Legacy rows are epoch 1. */
   planningEpoch?: number
   planningDeadlineAt?: number
+  /** A durable deadline-review notice; transport acknowledgement keeps the request active. */
+  planningWarning?: { deadline: number; threshold: number; deliveredAt?: number }
   planningFenced?: boolean
   /** Durable inbox work, replayed by the native planner when the owner is available. */
   planningDispatchPending?: boolean
@@ -806,6 +835,10 @@ export interface AutoStart extends RequestStartInput {
 }
 /** Bounded, focused reads for the model; the complete board stays in the UI projection. */
 export interface ObserveQuery {
+  /** Owner compact board baseline from nextCursor; missing/stale cursors return a full compact reset. */
+  cursor?: string
+  /** Owner-only exact read of a durable notification or question and its facts. */
+  deliveryId?: string
   /** Return only events after this sequence number. */
   after?: number
   /** Return only this participant's visible tool runs after this per-mission position. */
@@ -839,6 +872,7 @@ export interface ProposeTaskInput {
   priority?: number
   experiment?: boolean
   assigneeId?: string
+  assignmentMode?: 'preferred' | 'pinned'
   reviewOf?: string
   replaces?: string[]
 }
@@ -891,7 +925,7 @@ export interface WorkerAdapter {
   inspectDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
-  start(spec: WorkerSpec): Promise<void>
+  start(spec: WorkerSpec, signal?: AbortSignal): Promise<void>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */
@@ -900,6 +934,8 @@ export interface WorkerAdapter {
   compactAtBoundary?(memberId: string): void
   isIdle(memberId: string): boolean
   captureArtifact(member: Member, task: Task): Promise<Artifact>
+  /** Preserve any owned WIP after stop without treating it as an accepted artifact. */
+  checkpointTask?(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
   verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<Array<{ command: string; exitCode: number; output: string }>>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
@@ -955,6 +991,8 @@ export interface RuntimeConfig {
   tickMs: number
   /** Prelaunch watchdog fallback; the owner can extend it with a reason. */
   planningTimeoutMs?: number
+  /** Bound for native worker startup; independent of model/task execution budgets. */
+  workerStartTimeoutMs?: number
   maxMessageChars: number
   maxEvents: number
   maxTasksPerMember: number

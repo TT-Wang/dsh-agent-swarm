@@ -37,6 +37,7 @@ import { SWARM_TOOLS } from '../lib/tools.js'
 import { EVENT_VOCABULARY, eventVocabularyReport } from '../lib/trace.js'
 import { SwarmStore } from '../lib/store.js'
 import { tempDirectory } from './temp-root.mjs'
+import { emittedEventTypes } from './source-semantics.mjs'
 
 const ROOT = join(fileURLToPath(import.meta.url), '..', '..')
 const CENSUS_FILE = 'tests/reader-census.test.mjs'
@@ -51,6 +52,12 @@ const KEEP_ROLES = new Set(['engine', 'worker-decision', 'owner-decision', 'disp
  * mention the kind it claims to read.
  */
 const EVENT_CENSUS = [
+  ["task/verification-deferred", "keep", "ui", "src/client/progress.ts", "Check infrastructure needs repair while the exact submitted artifact is retained"],
+  ["task/amended", "keep", "audit", "src/trace.ts", "Owner revised task execution policy while retaining task identity and acceptance"],
+  ["mission/scope-amended", "keep", "audit", "src/trace.ts", "Owner revised execution scope within the human workspace authorization"],
+  ["task/plan-repaired", "keep", "audit", "src/trace.ts", "Unused staged task policy repaired with its previous revision preserved"],
+  ["member/plan-repaired", "keep", "audit", "src/trace.ts", "Staged member configuration repaired after stop acknowledgement"],
+  ["plan/admissions-repaired", "keep", "audit", "src/trace.ts", "Saved plan reconciled with retained mission and resource identities"],
   ["mission/created", "keep", "audit", "src/trace.ts", "Mission admitted with its frozen scope and budget"],
   // L0-L2 owner-reply receipts: the answer link, the deliberate close and the
   // owner-side miss, each with a writer and a reader that names it.
@@ -85,7 +92,7 @@ const EVENT_CENSUS = [
   ["task/closeout-failed", "keep", "ui", "src/client/progress.ts", "Idle close-out could not capture a checkpoint"],
   ["task/handoff-started", "keep", "ui", "src/client/progress.ts", "Ownership revoked; reassignment waits for the previous worker to stop"],
   ["task/handoff-ready", "keep", "ui", "src/client/progress.ts", "Previous worker stopped and the handed-off task is schedulable again"],
-  ["task/review-retired", "keep", "engine", "src/tools.ts", "Sibling review retired because its source can never reach a verdict"],
+  ["task/review-retired", "keep", "replay", "src/trace.ts", "Replay the stop command for the retired review's recorded owner"],
   ["task/invalidated", "keep", "ui", "src/client/progress.ts", "Dependent work invalidated by a challenged prerequisite"],
   ["task/git-write-denied", "keep", "ui", "src/client/progress.ts", "Sandbox refused a worker git write; the supported exit is named"],
   ["task/budget-resume-skipped", "keep", "ui", "src/client/progress.ts", "Budget-resume marker was stale and skipped"],
@@ -94,7 +101,7 @@ const EVENT_CENSUS = [
   ["evidence/published", "keep", "ui", "src/client/progress.ts", "Unverified claim published with host-recorded run ids"],
   ["evidence/challenged", "keep", "ui", "src/client/progress.ts", "Claim challenged with counterevidence"],
   ["evidence/verified", "keep", "ui", "src/client/progress.ts", "Verdict verified the claim and names the retired reviews"],
-  ["evidence/refuted", "keep", "engine", "src/tools.ts", "Verdict refuted the claim and names the retired reviews"],
+  ["evidence/refuted", "keep", "ui", "src/client/progress.ts", "Show the durable finding refutation in mission activity"],
   ["evidence/verdict", "keep", "ui", "src/client/locale.tsx", "Normalized verdict row: evidence id, verdict and retired reviews"],
   ["trace/span", "keep", "engine", "src/tools.ts", "One orchestration step span with digests of its input and output"],
   ["message/queued", "keep", "audit", "src/trace.ts", "Directed message or topic broadcast queued durably"],
@@ -136,7 +143,7 @@ const EVENT_CENSUS = [
   ["mission/workspace-bound", "keep", "ui", "src/client/progress.ts", "Mission bound to its resolved workspace and the matched authorized root"],
   ["mission/workspace-revoked", "keep", "engine", "src/scheduling.ts", "Mission fenced: its workspace is no longer inside a human-authorized root"],
   ["escalation/raised", "keep", "ui", "src/client/progress.ts", "A member raised a typed durable owner escalation with its mission-state fingerprint"],
-  ["task/proposal-refused", "keep", "ui", "src/client/progress.ts", "A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified"],
+  ["task/proposal-refused", "keep", "ui", "src/client/progress.ts", "A worker proposal exceeded an aggregate mission admission bound; the owner was notified"],
   ["provider/outage", "keep", "ui", "src/client/progress.ts", "Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent"],
   ["provider/recovered", "keep", "ui", "src/client/progress.ts", "A quiescent provider route answered successfully again; the outage marker is cleared"],
   ["task/restart-repended", "keep", "ui", "src/client/progress.ts", "Host restart re-pended a running task without spending recovery credit; the task and epoch are named"],
@@ -172,7 +179,7 @@ const TOOL_CENSUS = [
   ["swarm_claim", "keep", "worker-decision", "tests/durability-w9-recovery.test.mjs", "Claim ready work as yourself; ownership is atomic and expires"],
   ["swarm_publish", "keep", "worker-decision", "tests/harness-composition.mjs", "Publish a finding backed by host run ids from this attempt (each tool result ends with its id)"],
   ["swarm_submit", "keep", "worker-decision", "tests/harness-composition.mjs", "Submit your current task and immutable artifact for independent verification"],
-  ["swarm_verify", "keep", "worker-decision", "tests/check-envelope.test.mjs", "Independent verifier: run the source checks on its exact artifact and record accept or reject with a reason"],
+  ["swarm_verify", "keep", "worker-decision", "tests/harness-composition.mjs", "Independent verifier: run the source checks on its exact artifact and record accept or reject with a reason"],
   ["swarm_message", "keep", "worker-decision", "tests/harness-composition.mjs", "Send a question or finding to a member id or owner; topic broadcasts reach subscribers only"],
   ["swarm_challenge", "keep", "worker-decision", "src/tools.ts", "Challenge a finding with a reason and optional host-recorded counterevidence"],
   ["swarm_handoff", "keep", "worker-decision", "tests/guard-terminals.test.mjs", "Checkpoint work and release your attempt to another member or the ready queue; new ownership begins after you "],
@@ -180,7 +187,7 @@ const TOOL_CENSUS = [
   ["swarm_wait", "keep", "worker-decision", "tests/harness-workers.test.mjs", "Members only: park until relevant work or a direct message arrives, then end the turn"],
   ["swarm_observe", "keep", "worker-decision", "tests/harness-composition.mjs", "Bounded mission reads"],
   ["swarm_control", "keep", "worker-decision", "tests/harness-composition.mjs", "Owner: pause/resume/stop/complete the mission or replace its coordinator"],
-  ["swarm_cancel", "keep", "worker-decision", "tests/guard-terminals.test.mjs", "Owner only: withdraw one admitted-but-mistaken task"],
+  ["swarm_cancel", "keep", "worker-decision", "tests/owner-cancel.test.mjs", "Owner only: withdraw one admitted-but-mistaken task"],
   ["swarm_registry", "keep", "worker-decision", "tests/arena-visibility.test.mjs", "Owner only, read-only: the cross-mission artifact registry"],
   ["swarm_escalate", "keep", "worker-decision", "tests/arena-protocols.test.mjs", "Members only: typed durable owner escalation"],
   ["swarm_post", "keep", "worker-decision", "tests/board.test.mjs", "Sanctioned mission board: post one durable, immutable typed note (ASK/ANSWER/IDEA/ALERT/ARTIFACT/HANDOFF)"],
@@ -308,13 +315,7 @@ const EMITTERS = (() => {
   const map = new Map()
   const add = (kind, path) => { const list = map.get(kind) ?? []; if (!list.includes(path)) list.push(path); map.set(kind, list) }
   for (const path of sources) {
-    const text = textOf(path)
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*([^,]+?)\s*,/g)) {
-      const argument = match[1].trim()
-      if (argument.startsWith("'") && argument.endsWith("'")) add(argument.slice(1, -1), path)
-      else if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(argument) && constants.has(argument)) add(constants.get(argument), path)
-    }
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*[^,?]+\?\s*'([^']+)'\s*:\s*'([^']+)'/g)) { add(match[1], path); add(match[2], path) }
+    for (const kind of emittedEventTypes(textOf(path), path, constants)) add(kind, path)
   }
   return map
 })()
@@ -324,6 +325,11 @@ function writersOf(kind) {
   if (token !== undefined) return TREE.filter(path => path.startsWith('src/') && textOf(path).includes(token))
   return EMITTERS.get(kind) ?? []
 }
+
+test('event writer discovery follows nested conditional type branches without counting unrelated strings', () => {
+  const source = "store.event(mission, handoff ? 'task/handoff-ready' : closeout ? (exhausted ? 'task/closeout-exhausted' : 'task/closeout-ready') : 'task/quiescence-recovered', 'runtime', { note: 'not-an-event' });"
+  assert.deepEqual(emittedEventTypes(source).sort(), ['task/handoff-ready', 'task/closeout-exhausted', 'task/closeout-ready', 'task/quiescence-recovered'].sort())
+})
 
 /** The recorded-decision table is the only place a decision may live. */
 function decisionFor(rows, key) {

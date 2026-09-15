@@ -1,4 +1,5 @@
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
+import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
 export interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
@@ -31,17 +32,17 @@ export function memberActivity(member: Member, tasks: readonly Task[] | Readonly
 }
 
 /** A transport refresh is not work. Only native activity and persisted task state drive this projection. */
-export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected'): CurrentProgress {
+export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected', rows?: readonly LiveWorkRow[]): CurrentProgress {
   const { mission } = snapshot
   const stale = connection !== 'connected'
   if (statusLabels[mission.status]) return { label: statusLabels[mission.status]!, note: mission.reason, stale }
   const running = runningByOwner(snapshot.tasks)
-  const observed = snapshot.members.flatMap(member => {
+  const observed = (rows ? rows.flatMap(row => row.activity ? [{ member: row.member, activity: row.activity, task: row.task }] : []) : snapshot.members.flatMap(member => {
     const activity = memberActivity(member, running)
     if (!activity) return []
     // A lifecycle notification for a revoked attempt cannot describe the current task.
     return [{ member, activity, task: running.get(member.id) }]
-  }).sort((a, b) => activityPriority[b.activity.kind] - activityPriority[a.activity.kind]
+  })).sort((a, b) => activityPriority[b.activity.kind] - activityPriority[a.activity.kind]
     || b.activity.startedAt - a.activity.startedAt || a.member.id.localeCompare(b.member.id) || a.activity.id.localeCompare(b.activity.id))
   const latest = observed[0]
   if (latest) return { label: activityLabels[latest.activity.kind], ...latest, observedAt: latest.activity.updatedAt, stale }
@@ -53,51 +54,6 @@ export function currentProgress(snapshot: Snapshot, connection: ConnectionState 
 }
 
 /** Elapsed wall time describes an observed operation; it is never a completion estimate. */
-/**
- * OWNER PASS 2026-09-11: one member's live row — the state, the task it holds and
- * the bar under it. The bar is determinate only when the snapshot carries a real
- * bound; otherwise it is an indeterminate live bar rather than an invented
- * percentage:
- *  - `steps`: the task's own step ceiling (`usedSteps`/`maxSteps`, both durable);
- *  - `lease`: the attempt's lease countdown (a countdown, not a ratio — the
- *    attempt record has no start instant, so a fraction would be a guess);
- *  - no bound: `percent` is undefined and the CSS animation carries "working".
- */
-export type MemberRowState = 'working' | 'waiting' | 'idle' | 'stopped'
-export interface MemberProgressView {
-  state: MemberRowState
-  task?: Task
-  activity?: WorkerActivity
-  /** 0..100 when a durable bound exists; undefined means an indeterminate live bar. */
-  percent?: number
-  basis?: 'steps' | 'lease'
-  /** `used/limit` for a step ceiling; rendered with the caller's locale. */
-  basisCount?: string
-  /** Whole seconds left on the attempt lease; 0 means it already expired. */
-  leaseRemaining?: number
-}
-export function memberProgress(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>, now: number): MemberProgressView {
-  const task = memberTask(member, tasks)
-  const activity = member.activity ?? memberActivity(member, tasks)
-  const state: MemberRowState = member.phase === 'stopped' || member.status === 'stopped' ? 'stopped'
-    : member.status === 'working' || (task !== undefined && member.status !== 'waiting') ? 'working'
-      : member.status === 'waiting' ? 'waiting' : 'idle'
-  if (task?.usedSteps !== undefined && task.maxSteps !== undefined && task.maxSteps > 0) {
-    const percent = Math.max(0, Math.min(100, (task.usedSteps / task.maxSteps) * 100))
-    return { state, task, ...(activity === undefined ? {} : { activity }), percent, basis: 'steps', basisCount: `${task.usedSteps}/${task.maxSteps}` }
-  }
-  if (task?.attempt !== undefined) {
-    return { state, task, ...(activity === undefined ? {} : { activity }), basis: 'lease',
-      leaseRemaining: Math.max(0, Math.round((task.attempt.leaseUntil - now) / 1000)) }
-  }
-  return { state, task, ...(activity === undefined ? {} : { activity }) }
-}
-/** The running task one member owns, or undefined when it holds none. */
-function memberTask(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>): Task | undefined {
-  if (!Array.isArray(tasks)) return (tasks as ReadonlyMap<string, Task>).get(member.id)
-  return (tasks as readonly Task[]).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-}
-
 export function activityDuration(startedAt: number, now: number): { minutes: number; seconds: number } {
   const elapsed = Number.isFinite(startedAt) && Number.isFinite(now) ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0
   return { minutes: Math.floor(elapsed / 60), seconds: elapsed % 60 }
@@ -105,6 +61,10 @@ export function activityDuration(startedAt: number, now: number): { minutes: num
 
 export interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
 const meaningfulEvents: Record<string, string> = {
+  'task/verification-deferred': 'Verification needs environment repair',
+  'task/amended': 'Task plan amended', 'mission/scope-amended': 'Mission scope amended',
+  'task/plan-repaired': 'Task plan amended', 'member/plan-repaired': 'Worker configuration repaired',
+  'plan/admissions-repaired': 'Saved plan repaired',
   'workspace/snapshot': 'Project snapshot saved', 'plan/launched': 'Collaboration started',
   // Compatibility label: no writer in this repository's history emits
   // `attempt/started` (the live kind is `task/claimed`), but a historical card
@@ -170,7 +130,7 @@ const DETAIL_EXCERPT = 400
 function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, DETAIL_EXCERPT) : undefined }
 function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
-const reasonFirst = new Set(['task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
+const reasonFirst = new Set(['task/verification-deferred', 'task/amended', 'mission/scope-amended', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
   'task/review-blocked', 'mission/workspace-revoked'])
 /** A bounded preview of a changed check list; the Activity view carries the full summary. */
 function checkPreview(value: unknown): string | undefined {

@@ -143,7 +143,7 @@ test('budget exhaustion records durable budget_exceeded rows for waiting tasks',
   const stream = runtime.workstream(owner, m.id, { title: 'w', objective: 'o' })
   const alice = await addWorker(runtime, m, 'alice')
   const task = propose(runtime, m, stream, alice, 'src/a/')
-  runtime.updateBudget(owner, m.id, { ...budget, maxDurationMs: Date.now() - m.createdAt + 40 }, 'load-test squeeze')
+  runtime.updateBudget(owner, m.id, { ...budget, deadlineAt: Date.now() + 40 }, 'explicit wall-clock deadline')
   await eventually(() => runtime.admissionLedger(owner, m.id, { reason: 'budget_exceeded' }).length > 0, 'budget refusal was not recorded')
   const rows = runtime.admissionLedger(owner, m.id, { reason: 'budget_exceeded' })
   assert.ok(rows.some(row => row.taskId === task.id && /maxDurationMs/.test(row.detail)))

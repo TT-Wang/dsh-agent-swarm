@@ -63,12 +63,13 @@ export async function traceFixture(t, options = {}) {
   const claim = await call('swarm_claim', { missionId, taskId: source.id }, builder.sessionId)
   const runId = await workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'true' }, result: { output: 'ok' }, isError: false })
   const bigClaim = `evidence-${'x'.repeat(4000)}`
-  await call('swarm_publish', { missionId, taskId: source.id, attemptId: claim.attempt.id, claim: bigClaim, outcome: 'supported', toolRunIds: [runId] }, builder.sessionId)
+  await call('swarm_publish', { missionId, taskId: source.id, attemptId: claim.attempt.id, claim: bigClaim, outcome: options.outcome ?? 'supported', toolRunIds: [runId] }, builder.sessionId)
   await call('swarm_submit', { missionId, taskId: source.id, attemptId: claim.attempt.id, output: 'candidate' }, builder.sessionId)
   const review = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, assigneeId: reviewer.id }, owner)
   const reviewClaim = await call('swarm_claim', { missionId, taskId: review.id }, reviewer.sessionId)
   const review2 = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Second review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, assigneeId: reviewer2.id }, owner)
   const review2Claim = await call('swarm_claim', { missionId, taskId: review2.id }, reviewer2.sessionId)
+  await options.beforeVerify?.({ runtime, workers, missionId, owner, source, review, reviewClaim, review2, reviewer, reviewer2 })
   const verdict = await call('swarm_verify', { missionId, taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: options.verdict ?? 'accept', reason: options.reason ?? 'Independent accept' }, reviewer.sessionId)
   const events = () => runtime.store.events(missionId, 1000, 0)
   return {

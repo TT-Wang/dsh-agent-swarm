@@ -100,6 +100,7 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
     assert.equal(claimed.status, 'running', 'the dependent becomes ready through the repair lineage')
     // Release the author for the next dependent; the claim itself is the assertion.
     f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: dependent.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'Continue elsewhere' })
+    await eventually(() => f.current(dependent.id).resumeAfterStop === undefined, 'the old worker must stop before it claims different work')
   }
 })
 
