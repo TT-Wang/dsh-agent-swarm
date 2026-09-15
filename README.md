@@ -10,6 +10,28 @@ One command starts a mission. The primary agent inspects the project, chooses th
 
 **Version 0.7.0 · MIT · Local Git workspaces · Mounts in the host's native sidebar (Harness 0.1.5+)**
 
+## UI gallery
+
+Captured from the local renderer on September 15, 2026. All tasks, names, activity
+events and results in these screenshots are simulated; the renderer makes no
+model requests. Its surrounding presentation is a preview shell, not the Harness
+application chrome. Click an image to see it at full size.
+
+**Current plugin components.** These views render the source `ActivityPanel`,
+including the shared worker avatars, live activity feed and delivery controls.
+
+| Live worker activity · light theme | Accepted results and delivery · dark theme |
+| --- | --- |
+| [![Current plugin live work panel with robot identities, operation ages and recent tool events](docs/images/live-work-light.jpg)](docs/images/live-work-light.jpg) | [![Current plugin completed mission with independent acceptance and delivery controls](docs/images/delivery-dark.jpg)](docs/images/delivery-dark.jpg) |
+
+**Design previews.** The simplified overall layout and avatar showcase below are
+renderer prototypes. The avatars and live activity components are already shared
+with the plugin; the complete proposed layout has not yet replaced its sidebar.
+
+| Simplified sidebar layout · preview | Robot identities and activity rings · showcase |
+| --- | --- |
+| [![Proposed compact sidebar with parallel work, worker portraits and task controls](docs/images/sidebar-preview-light.jpg)](docs/images/sidebar-preview-light.jpg) | [![Robot avatar showcase with fine orbital arcs in the dark theme](docs/images/avatars-dark.jpg)](docs/images/avatars-dark.jpg) |
+
 ## Positioning
 
 Agent Swarm is DSH's **mission layer**: the part of the platform that turns one
@@ -71,6 +93,8 @@ tool-result folding, so do not install the standalone folding plugin beside it.
 - **One command to start.** `/agent-swarm` appears in native command autocomplete. Describe the outcome; the primary agent plans and launches without a configuration form.
 - **It lives in the host's own sidebar.** On Harness 0.1.5 and later the panel is a native right-sidebar tab beside Files: same pane, same tab strip, opened from that pane's Start page, from `/agent-swarm`, or from the conversation card. Better Sidebar and a standalone dock remain the fallbacks for older releases and other profiles — one surface at a time, chosen by what the host actually provides.
 - **Built for the pane it sits in.** Goal, current activity, per-worker progress and recent progress come first; budgets, the work board, the dependency graph, evidence and the event history expand on demand, and the layout reflows to the pane's width instead of assuming a full window.
+- **Recognizable team members.** A pool of 40 human names supports automatic naming, with custom names available. Robot portraits derive from stable member IDs across 1,152 possible combinations of colors, heads, eyes, antennae and mouth marks; different IDs can still share a portrait. Renaming a member keeps its face.
+- **Activity grounded in host signals.** Worker cards show the current operation, its age and signal freshness; recent tool results, submissions and acceptance events show actual progress. Orbit animations require fresh activity, a valid attempt and an eligible mission state. Waiting, paused and unconfirmed workers remain still, and reduced-motion preferences disable the animations. Rendering makes no model requests.
 - **Real Harness workers.** Each worker is a native agent with its own session, inbox, tools and sandbox. Open a live worker conversation, or read its persisted transcript after it finishes.
 - **Independent acceptance, not self-assessment.** Code submissions become immutable Git commits. A different worker reviews each one, and the host runs the declared verification commands in a fresh checkout of the submitted commit. A failed command cannot be overridden by an agent claiming success.
 - **Verification that can actually run your checks.** The clean checkout is given your project's installed dependency directories, so `npm test`, `pytest` and friends find their toolchain instead of failing with "command not found".
