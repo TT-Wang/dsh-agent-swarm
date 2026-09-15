@@ -55,7 +55,7 @@ caller that needs another root — the attended preview uses its own — sets
 `DSH_AGENT_SWARM_ROOT`, or overrides this row's `config` in a later patch layer
 (a `--patch <file>` overlay or the profile's own `cordis.patch.yml`), which is
 the layer order the launcher defines. Every other plugin setting keeps its
-documented default; see [storage and configuration](../README.md#storage-and-configuration).
+documented default; see [storage and configuration](../docs/operations.md#storage-and-configuration).
 
 ## Tests
 

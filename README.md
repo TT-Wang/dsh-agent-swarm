@@ -1,418 +1,160 @@
 # Agent Swarm for DeepSeek Harness
 
-Turn a natural-language task into a team of collaborating agents inside [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
+**English** · [简体中文](README.zh-CN.md)
+
+### One goal. A coordinated team. Work you can review.
+
+Describe what you want to build, fix or investigate. Agent Swarm brings a team of collaborating agents into [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), with shared objectives, visible activity, independent review and a clear path back to your project.
 
 ```text
-/agent-swarm 为这个项目添加搜索功能，保留现有接口，并验证相关测试通过。
+/agent-swarm Fix the duplicate search results. Preserve the API, add regression tests, and independently verify the change.
 ```
 
-One command starts a mission. The primary agent inspects the project, chooses the team and the resource budgets, and launches the work; workers propose tasks, ask peers, publish evidence, challenge results and hand off partial implementations. A durable runtime coordinates them, and nothing is accepted without an independent review of the exact artifact.
+The primary agent inspects your project, organizes the work and chooses the team and resource budgets. You follow the mission in the sidebar and inspect the result when it is ready.
 
-**Version 0.7.0 · MIT · Local Git workspaces · Mounts in the host's native sidebar (Harness 0.1.5+)**
+**v0.7.0 · MIT · Local Git projects · Native Harness integration**
+
+[Get started](#get-started) · [See the UI](#ui-gallery) · [How it works](#architecture) · [中文介绍](README.zh-CN.md)
+
+## Built for work that benefits from a team
+
+| Your goal | How the team helps |
+| --- | --- |
+| Fix a difficult bug | Investigate the cause, implement a repair and have another member check the edge cases. |
+| Deliver a feature across several parts of a project | Split independent work, coordinate dependencies and assemble a reviewed result. |
+| Understand unfamiliar code | Gather evidence, compare findings and produce an analysis without changing the code when requested. |
+
+**You describe the outcome. The primary agent manages the collaboration.** There is no required team-size form or token-budget setup before each mission. Members can exchange findings, ask questions, challenge evidence and hand off partial work within the mission's scope.
+
+## From your request to your project
+
+1. **Start with the project as it is.** A private Git snapshot captures tracked changes and non-ignored new files before planning. You do not need to make a manual commit; your branch, index and working files stay in place during capture.
+2. **Let the team work together.** The primary agent sets the plan and acceptance criteria. Members run in native Harness sessions with separate Git worktrees; dependencies determine when work can start.
+3. **Review the actual artifact.** A different member reviews submitted work. For code tasks, Harness also executes the declared checks against the exact submitted commit.
+4. **Bring the result back when ready.** Once the mission completes, the sidebar offers **View changes** and **Apply result** for its accepted code deliverable. Application compares against the original snapshot and preserves your branch and index. It does not stage, commit or push for you.
+
+Existing edits remain part of the baseline, so they are not presented as new swarm output. Detected merge conflicts are reported before applying changes.
+
+## Know what is happening
+
+The sidebar answers three practical questions: **Who is working? What just changed? What needs attention?**
+
+- **Recognizable members.** Stable robot portraits stay with each member across role and name changes. Open a member's conversation to inspect its work.
+- **Visible execution.** See the current operation, how long it has been running and how recently Harness observed it. Fresh activity drives the animation; stale signals are shown as unconfirmed.
+- **Progress backed by events.** Tool results, submissions and acceptance events appear in the feed. Resource usage stays in details instead of masquerading as a completion percentage.
+- **Control close at hand.** Pause, resume or stop a mission from the sidebar. Saved planning requests also expose recovery controls when startup fails.
+
+The UI follows host state without making model requests to render updates. Operation activity is a liveness signal, not a guarantee that useful work has finished.
 
 ## UI gallery
 
-Captured from the local renderer on September 15, 2026. All tasks, names, activity
-events and results in these screenshots are simulated; the renderer makes no
-model requests. Its surrounding presentation is a preview shell, not the Harness
-application chrome. Click an image to see it at full size.
+Captured on September 15, 2026 with simulated tasks and events. The surrounding page is a local preview shell, not the Harness application. Click an image to enlarge it.
 
-**Current plugin components.** These views render the source `ActivityPanel`,
-including the shared worker avatars, live activity feed and delivery controls.
+**Current plugin components** — these screenshots render the actual `ActivityPanel` with simulated data.
 
 | Live worker activity · light theme | Accepted results and delivery · dark theme |
 | --- | --- |
-| [![Current plugin live work panel with robot identities, operation ages and recent tool events](docs/images/live-work-light.jpg)](docs/images/live-work-light.jpg) | [![Current plugin completed mission with independent acceptance and delivery controls](docs/images/delivery-dark.jpg)](docs/images/delivery-dark.jpg) |
+| [![Current worker operations and recent activity](docs/images/live-work-light.jpg)](docs/images/live-work-light.jpg) | [![Accepted work and controls for inspecting and applying the result](docs/images/delivery-dark.jpg)](docs/images/delivery-dark.jpg) |
+| Follow current operations, elapsed time and recent tool events. | See the accepted result and choose when to bring it into your project. |
 
-**Design previews.** The simplified overall layout and avatar showcase below are
-renderer prototypes. The avatars and live activity components are already shared
-with the plugin; the complete proposed layout has not yet replaced its sidebar.
+**Design previews** — the shared avatars and live activity components are integrated into the plugin. The complete simplified layout below remains a renderer prototype.
 
-| Simplified sidebar layout · preview | Robot identities and activity rings · showcase |
+| Simplified sidebar layout · preview | Independent verification in progress · dark preview |
 | --- | --- |
-| [![Proposed compact sidebar with parallel work, worker portraits and task controls](docs/images/sidebar-preview-light.jpg)](docs/images/sidebar-preview-light.jpg) | [![Robot avatar showcase with fine orbital arcs in the dark theme](docs/images/avatars-dark.jpg)](docs/images/avatars-dark.jpg) |
+| [![Proposed sidebar showing the goal and parallel work](docs/images/sidebar-preview-light.jpg)](docs/images/sidebar-preview-light.jpg) | [![Echo independently verifying another member's submission](docs/images/verification-preview-dark.jpg)](docs/images/verification-preview-dark.jpg) |
+| Keep the goal, parallel work and task controls together. | Echo is checking another member's submission; that submission still awaits acceptance. |
 
-## Positioning
+## Keep momentum through interruptions
 
-Agent Swarm is DSH's **mission layer**: the part of the platform that turns one
-instruction into bounded, isolated, independently verified work.
+A long task needs more than a launch button. Agent Swarm keeps assignments, evidence, decisions and recovery state on disk so the team can continue through supported interruption and restart paths.
 
-DSH already owns the agent layer — the model loop, sessions, the inbox, the tool
-surface, the sandbox, approvals, the durable session log and telemetry — and this
-plugin never re-implements any of it. What DSH does not provide is coordination:
-who does what, under which limit, against which baseline, verified by whom, and
-who has to decide when the work stops moving. That is what this plugin adds,
-without forking Harness core and without patching it.
+**Repair without losing the task's purpose.** Replacement tasks carry the original acceptance criteria, and dependent work follows the replacement. A repaired implementation can unblock integration without rebuilding the whole plan.
 
-Stated as what a caller may rely on:
+**Bring decisions back to the primary agent.** Rejections, blocked work, provider problems and exhausted limits can generate durable notices. The primary agent can revise the plan, arrange a repair or adjust a budget with a recorded reason. Ordinary recovery decisions do not require you to configure the swarm again.
 
-- **One specification in, one artifact plus evidence out.** A mission
-  specification — objective, scope, acceptance criteria, dependency graph,
-  budgets, workspace — produces a committed artifact, a non-author verdict,
-  host-recorded check runs and a durable record.
-- **One owner decision loop.** The owner is told when a decision is needed — a
-  submission to review, a blocked or unreviewable task, a challenged finding, an
-  exhausted ceiling, a board that cannot advance — not on every tick. A mission
-  is not an unattended black box.
-- **Failures are facts with exits.** Every refusal on a model-facing path carries
-  a stable bracket code and an executable next step, such as
-  `[workspace_not_authorized]`, `[workspace_uncommitted]` or
-  `[verification_requires_verify]`; a non-terminal state always has a recorded
-  successor or a bounded escalation.
-- **Resources are accounted and bounded.** Tokens, steps, wall time, tasks,
-  experiments and check concurrency are owner-set, are never silently exceeded,
-  and are never reset by a resume.
+**Keep resource use visible.** The primary agent chooses team size, task limits, step and token budgets, recovery allowances and verification timeouts. Usage is tracked across the team, with cache and output breakdowns and the primary conversation's usage shown separately. Resuming does not reset consumption.
 
-## Pairs with the slice context policy
-
-This repository is DSH's **mission layer**. Its natural companion is
-[dsh-slice-agent-loop](https://github.com/TT-Wang/dsh-slice-agent-loop)
-(`@dsh-external/dsh-slice-agent-loop`), a **session layer** policy that bounds what
-one conversation carries from one request to the next. They address opposite ends
-of the same problem and are usually mounted together:
-
-- **The swarm fans work out.** One instruction becomes a mission: the owner plans
-  the task graph, then members run as native sessions in their own worktrees and
-  sandboxes, each producing evidence that a different member verifies.
-- **The slice policy keeps every one of those sessions bounded.** Completed turns
-  are sealed at the tail of an append-only tape, so a session's request keeps the
-  previous request's prefix and re-bills only the entry it just wrote, while
-  `recall_turn`, `recall_search` and `expand_result` keep the replaced history
-  retrievable instead of lost. A long mission's worker sessions stay bounded per
-  session without a plugin-side ceiling that would refuse a request and fail a
-  worker mid-task.
-
-Mount both rows in the same profile — the swarm bundle (or plugin package) and the
-slice patch. Both patches are additive, neither forks Harness core, and the tool
-surfaces do not overlap (`swarm_*` here; `recall_turn` / `recall_search` /
-`recall_step` / `expand_result` there). The slice package already bundles
-tool-result folding, so do not install the standalone folding plugin beside it.
-
-## Features
-
-- **One command to start.** `/agent-swarm` appears in native command autocomplete. Describe the outcome; the primary agent plans and launches without a configuration form.
-- **It lives in the host's own sidebar.** On Harness 0.1.5 and later the panel is a native right-sidebar tab beside Files: same pane, same tab strip, opened from that pane's Start page, from `/agent-swarm`, or from the conversation card. Better Sidebar and a standalone dock remain the fallbacks for older releases and other profiles — one surface at a time, chosen by what the host actually provides.
-- **Built for the pane it sits in.** Goal, current activity, per-worker progress and recent progress come first; budgets, the work board, the dependency graph, evidence and the event history expand on demand, and the layout reflows to the pane's width instead of assuming a full window.
-- **Recognizable team members.** A pool of 40 human names supports automatic naming, with custom names available. Robot portraits derive from stable member IDs across 1,152 possible combinations of colors, heads, eyes, antennae and mouth marks; different IDs can still share a portrait. Renaming a member keeps its face.
-- **Activity grounded in host signals.** Worker cards show the current operation, its age and signal freshness; recent tool results, submissions and acceptance events show actual progress. Orbit animations require fresh activity, a valid attempt and an eligible mission state. Waiting, paused and unconfirmed workers remain still, and reduced-motion preferences disable the animations. Rendering makes no model requests.
-- **Real Harness workers.** Each worker is a native agent with its own session, inbox, tools and sandbox. Open a live worker conversation, or read its persisted transcript after it finishes.
-- **Independent acceptance, not self-assessment.** Code submissions become immutable Git commits. A different worker reviews each one, and the host runs the declared verification commands in a fresh checkout of the submitted commit. A failed command cannot be overridden by an agent claiming success.
-- **Verification that can actually run your checks.** The clean checkout is given your project's installed dependency directories, so `npm test`, `pytest` and friends find their toolchain instead of failing with "command not found".
-- **Dependency-aware scheduling.** Tasks unlock only when their prerequisites are accepted, a rejected task is repaired by a replacement that carries the original acceptance criteria, and dependents follow the repair automatically.
-- **Evidence with provenance.** A finding cites the host's own tool-run ids and, for code, an artifact commit. A challenge reopens the affected result and invalidates what depended on it.
-- **Visible cost.** Token usage is reported in disjoint buckets — uncached input, cache read, cache write, output (with its reasoning share) and physical request count — per worker and per mission, with the primary conversation's usage shown separately.
-- **Agent-selected resource limits.** The primary chooses token and step budgets, team size, task and experiment limits, mission duration, model routes, per-worker output allowances, recovery attempts and verification timeouts, and can revise them later with a recorded reason without resetting usage.
-- **Durable collaboration.** SQLite coordination state, attempt fencing, retained worktrees and recoverable peer messages survive restarts, handoffs and worker failures.
-- **English and Chinese UI**, light and dark themes, following the host's setting.
-
-This is an external Harness plugin: it needs no fork of, and no changes to, Harness core.
+Recovery runs within the mission's limits. Notifications remain queued while the primary agent is offline, and a stuck native model call may delay when it can process them. Provider-reported usage and estimates for requests still in flight can also allow a budget overshoot.
 
 ## Architecture
 
-```text
-┌───────────────────────────── DeepSeek Harness (host) ──────────────────────────────┐
-│ agent loop · sessions & inbox · tool surface · sandbox · subprocess service        │
-│ approvals · durable session log · web server & browser authentication              │
-└───────────────▲───────────────────────────────▲───────────────────────▲────────────┘
-                │ tools / RPC / slots            │ worker sessions        │ subprocess
-┌───────────────┴───────────────────────────────┴───────────────────────┴────────────┐
-│ Agent Swarm (plugin)                                                               │
-│                                                                                    │
-│  tools.ts ── model-facing surface, role-scoped visibility, coded refusals           │
-│  runtime.ts ── missions, members, workstreams, tasks, attempts, notices, decisions  │
-│  scheduling.ts ── tick loop: dispatch, stall witnesses, coverage, check envelopes   │
-│  admission.ts / plans.ts ── plan validation before any worker starts                │
-│  workspaces.ts ── baseline snapshot, member worktrees, verification checkouts       │
-│  verification + delivery ── declared checks on the exact commit, scope check, apply  │
-│  harness-workers.ts ── worker adapter: bind, prepare, start, observe, submit, close │
-│  store.ts ── SQLite state, durable outbox, owner lock, snapshots and restore         │
-│  web-api.ts ── host RPC: live state, watch cursor, mission controls                  │
-│  client/ ── React panel: a pure projection of the durable state                      │
-└────────────────────────────────────────────────────────────────────────────────────┘
+**The primary agent chooses the direction. The runtime coordinates the work. Harness runs the agents.**
+
+```mermaid
+flowchart TD
+    G["Your goal"] --> P["Primary agent · plan, team and budgets"]
+    P -->|Plan and decisions| R["Swarm runtime · durable coordination"]
+    R -->|Decision notices| P
+    R -->|Ready assignments| W["Native workers · parallel collaboration"]
+    W -->|Submitted artifact and evidence| V["Independent review + host checks"]
+    V -->|Verdict or repair needed| R
+    R -->|Accepted deliverable| D["Inspect changes · apply to your project"]
 ```
 
-### Coordination is durable state, not process memory
+**Freedom inside a clear contract.** Workers share evidence and propose further work; the runtime checks scope, dependencies and review requirements. Peer messages cannot expand permissions, raise budgets or waive independent review.
 
-The store is the single source of truth: missions, members, workstreams, tasks,
-attempts, evidence, deliveries, passes, notices, drafts and the event log. The
-scheduler is a tick loop over that state, so a restart resumes the board instead
-of losing it. Exactly one live runtime may own a database; a second opener is
-refused by an owner lock that names the holding pid, and a lock left by a dead
-process is reclaimed.
+**Recovery is part of coordination.** Durable state links each task to its attempt, artifact and decisions. When an attempt is interrupted, the runtime fences stale writes and uses the supported checkpoint, retry or reassignment path. Cases that need judgment return to the primary agent. Accepted replacements become the prerequisites for downstream work.
 
-Owner delivery rechecks lifecycle before each message: stopped missions stay
-quiet, paused missions retain unanswered questions, and automatic completion
-preserves queued facts. A transport acknowledgement updates the latest durable
-rows, preserving newer lifecycle decisions and answer receipts. Unanswered owner
-questions receive distinct, bounded reminders whose counters and outbox entries
-are recorded together.
+**Native execution, one visible mission.** Harness supplies model execution, sessions, the inbox, tools and sandboxing. The plugin owns mission coordination and verification policy; the sidebar projects mission state and observed activity. Collaboration messages use the native inbox and session log, while coordination records live in SQLite. No Harness core fork is required.
 
-### Attempts are fenced
+For the implementation contracts and their origins, see [design notes](docs/design.md).
 
-Claiming a task creates an attempt with an epoch and a lease. The lease is
-renewed only while the adapter observes a real, uncancelled operation — a live
-model stream, tool call or provider retry — never from a heartbeat or from
-persisted activity after a restart. Every mutating call carries the attempt id,
-so a stale attempt cannot commit: after a reassignment, a handoff or a lease
-expiry, the old worker's writes are refused with a durable reason.
+## Get started
 
-### Verification is host-side
+Agent Swarm currently ships as a source plugin. You need:
 
-A submitted artifact is a Git commit. To accept it the host creates a fresh
-worktree at exactly that commit, materialises the project's installed dependency
-directories into it, runs each declared command with the task's timeout inside
-the Harness sandbox, and separately validates the artifact's changed paths
-against the declared scope. A command that cannot be found is reported as an
-environment failure, not as a defect in the work. A failed pass is retried once
-on the same commit; the retry decides
-the verdict and both passes remain recorded. A check deadline is a failed
-execution (exit 124), with partial output and earlier completed checks retained.
-An explicit cancellation ends the attempt without starting that retry.
-
-### The client is a projection
-
-The panel renders a snapshot of durable rows and events, derived on demand over
-the plugin's own RPC. It holds no coordination state, starts no agent turn, and
-sends no model request to draw a progress bar. Live updates are a cancellable
-watch with keepalives; hiding the pane stops its requests, and reopening fetches
-authoritative state. The plugin writes nothing into a session log — the host's
-session vocabulary is closed, so the board is the single derivation over
-`swarm.sqlite` rather than a plugin-owned event.
-
-### Invariants
-
-- **Accepted work is immutable.** It is replaced, never edited.
-- **Peer messages never grant authority.** They cannot widen scope or budgets, change ownership or waive review.
-- **Independent verification means non-author.** A review is never assigned to the author of the work it reviews.
-- **No silent state.** Every non-terminal board leaves the owner a durable witness: progress, an owner-decision notice keyed by a stable fingerprint of the owner-observable board, or a stall notice naming the tasks that are stuck.
-- **Worker execution uses the host.** Workspace provisioning, shell probes and declared checks use the host's subprocess service, which owns their process ranges and termination. Delivery and admission have the exceptions documented below.
-
-## Compatibility
-
-The following exact Harness releases are supported:
-
-| Harness release | Release commit | Distribution |
-| --- | --- | --- |
-| [0.1.5-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.1) | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` | npm `latest` |
-| [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` | npm `alpha` at the time |
-| [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` | npm `latest` at the time |
-
-All three are prereleases, and one adapter serves all three: the worker setup hook takes the agent from whichever host supplies it, so the plugin does not fork by host version. The host's native sidebar is a 0.1.5 feature — on 0.1.2/0.1.3 the panel falls back to Better Sidebar or the built-in dock from the same build, and no sidebar package is imported at any version. This plugin does not claim compatibility with the older `0.1.0-rc.5` SDK or with unreleased Harness commits. The development linker checks the release revision recorded in [compatibility.json](compatibility.json), not just a version string.
-
-Verification runs against packaged-artifact loading, native CLI profile installation and the real `/agent-swarm` browser workflow. Provider responses are scripted while Harness, tools, persistence, Git effects, authentication and browser interaction are real, so these checks establish integration behavior — not model planning success rates. See [validation](docs/validation.md).
-
-## Install from source
-
-You need:
-
-- Node.js `^22.19.0 || >=24.0.0`, Git, and a POSIX system such as macOS or Linux: declared checks and syntax probes execute through `/bin/sh`, and delivery relies on POSIX link semantics. Windows execution is unsupported.
-- A checkout of one of the exact Harness releases above, with dependencies installed and its CLI and Web application built.
-- A working Harness model/provider configuration. Credentials are configured in Harness; the plugin uses the owner conversation's model by default.
+- **Node.js `^22.19.0 || >=24.0.0`, Git, and macOS or Linux.** Work happens in local Git repositories.
+- **A built, supported DeepSeek Harness checkout.** The default target is `0.1.5-rc.1`; `0.1.3-alpha.2` and `0.1.2-rc.1` are also listed in the [exact compatibility matrix](compatibility.json).
+- **A working model configuration in Harness.** Credentials stay with the host. Workers inherit the primary conversation's model unless the plan selects another route.
 
 ```sh
 git clone https://github.com/TT-Wang/dsh-agent-swarm.git
 cd dsh-agent-swarm
-
 export DSH_HARNESS_ROOT="/absolute/path/to/deepseek-harness"
 npm run link:dsh
 npm run build
-```
-
-`link:dsh` links dependencies from that Harness checkout, including its shared runtime packages and build tools; no separate `npm install` is needed in the plugin directory.
-
-Install the built directory into the Web profile with the **matching Harness CLI**:
-
-```sh
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "link:$PWD"
 ```
 
-Start that profile from your project:
+Start Harness from the project you want to work on:
 
 ```sh
 cd /absolute/path/to/your-project
 node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 ```
 
-Open the authenticated launch URL Harness prints. Its login exchange sets the browser cookie; a bare unauthenticated URL returns HTTP 401. The plugin adds mission and session ownership checks on top of Harness's own authentication.
+Open the authenticated launch URL printed by Harness, choose a model in a conversation, and enter `/agent-swarm` followed by your goal. The command appears in native autocomplete.
 
-Keep the linked plugin directory in place. After rebuilding it, restart the profile and refresh the browser. If you run several Harness versions at once, link a separate checkout or built copy to each — relinking one shared directory changes the packages every host loads.
+On the supported `0.1.5-rc.1` host, Agent Swarm lives in the native right sidebar beside Files. Earlier supported hosts use Better Sidebar when available, or the plugin's dock. The UI supports English, Chinese, light and dark themes.
 
-### Mount by declaration (bundle profile)
+For bundle installation, upgrades, startup recovery and configuration, see the [operations guide](docs/operations.md).
 
-`add "link:$PWD"` is the **direct mount**: the plugin package itself is the
-profile's bundle layer. The repository also ships a bundle package,
-[`profile/`](profile/README.md) (`@dsh-external/dsh-agent-swarm-profile`), whose
-runtime content is its patch document plus its dependency on this plugin. It is
-the **declared mount**: one layer composes the platform and its Web client UI,
-with portable roots, explicit defaults, and its prerequisites and conflicts named
-in the package's own metadata.
+## Scope and practical limits
 
-```sh
-node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" plugin --profile web add "file:$PWD/profile"
-```
+- **Local execution.** Distributed workers, non-Git projects and Windows execution are not supported. Retained worktrees and artifact refs need explicit cleanup.
+- **Reviewable evidence.** Independent review and host checks make acceptance inspectable; they cannot guarantee that the chosen checks cover every requirement. Verification reuses installed dependencies by copying them by default, so it is not necessarily identical to CI.
+- **Human-controlled workspace access.** A mission uses its session workspace or a root configured in `authorizedWorkspaces`; a matched grant is recorded as `workspaceGrantRoot`. Agents cannot grant themselves a new root through swarm tools. Confinement follows Harness's sandbox; the plugin adds no independent network or credential isolation.
+- **Observable, bounded recovery.** The live UI shows operations and recorded events, not token-by-token output or a guaranteed ETA. Recovery does not promise exactly-once external side effects, arbitrary disk-fault recovery or filesystem-wide atomic application.
 
-The CLI installs the bundle and this plugin as its payload, and appends the
-bundle to `dsh.profile.bundles` after the `@deepseek-ai/dsh-base` and
-`@deepseek-ai/dsh-web-app` layers it declares as prerequisites. Its roots are
-portable and explicit — `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm` —
-and a caller points them elsewhere with that variable or with a `--patch` overlay
-that addresses the `dsh-external-agent-swarm` row by id.
+Details and residual risks are documented in [known limitations](docs/known-limitations.md). Integration evidence is recorded in [validation](docs/validation.md); scripted-provider tests are not model-quality or speed benchmarks.
 
-Mount this bundle **or** the plugin package as a layer, never both: both patch
-layers insert the same row id, and the bundle declares that conflict in its
-metadata.
+<a id="storage-and-configuration"></a>
 
-## Use it
+## Documentation and ecosystem
 
-Open a conversation in a **Git workspace**, choose your model, then describe the task:
-
-```text
-/agent-swarm Add search to this project, preserve the existing API, and verify the relevant tests pass.
-```
-
-```text
-/agent-swarm 修复登录后偶尔跳回登录页的问题。先定位原因，再实现修复，补充回归测试并独立验证。
-```
-
-```text
-/agent-swarm 审查这个项目的缓存逻辑，找出可能导致过期数据的问题，提交带证据的分析报告，本次不要修改代码。
-```
-
-You do not enter worker counts, token limits or step counts, and you do not press Launch or Complete. The primary agent plans from the task, and the mission completes automatically once the required independent acceptances are in.
-
-**Before planning, your project is frozen into a private Git snapshot.** Tracked changes and non-ignored new files are included; your branch, index and working files are untouched, and no manual commit is needed. The primary agent inspects a frozen planning checkout, and every worker — including after a restart — starts from that same snapshot, so later edits to your source never change the baseline. Unresolved merge conflicts, dirty submodules and unsupported layouts produce a specific error rather than silently omitting work.
-
-**Planning recovery.** A prelaunch watchdog also runs before a mission exists. Its default is ten minutes (`planningTimeoutMs`); the primary agent can extend it with a reason when the task needs more planning time. Expiry preserves the request, frozen snapshot and recorded usage, releases the session, and queues a recovery notice in the native owner inbox. The owner can retry the saved request or stop it through `swarm_control` using `requestId`; the Web `control` endpoint exposes the same operations. Retry advances a durable planning epoch so old callbacks cannot activate the cancelled attempt. The sidebar exposes Stop during planning and Retry/Stop for a failed saved request; the agent/API retains the same operations. Requests have a bounded wait, and late responses cannot overwrite a newer planning epoch. An offline owner receives the persisted notice when available; a hung native model call still needs Harness to reach an inbox boundary before the agent can act, while runtime cancellation remains independent.
-
-**Controls.** **Pause**, **Resume**, **Complete** and **Stop** sit in one row beside the progress summary; **Stop** asks for a second click. Hiding the sidebar pauses its display, not the workers. Raising a budget does not by itself resume a paused mission and never resets consumption; mission duration is wall-clock from creation, including time spent paused.
-
-**When something goes wrong.** The primary agent is told only when a decision is needed — a rejected review, a challenged finding, a worker failure, an approaching or exhausted budget, a board where nothing can be scheduled, or completion. It can withdraw admitted-but-mistaken work, repair blocked work with a replacement task that keeps the original acceptance criteria, or raise a ceiling with a recorded reason.
-
-**The deliverable** for code work is an independently accepted commit and its worktree — the final integration, or the single reviewed implementation when the plan needed no assembly step. A completed mission's sidebar offers **View changes** and **Apply result**, both measured against the project snapshot so your pre-existing edits are never counted as swarm output. Applying merges into your working files while preserving your branch and index, reports conflicts before changing anything, and does not stage, commit or push.
-
-## Resource limits and cost
-
-Budgets are chosen by the primary agent and enforced by the runtime across the whole team. Planning explicitly asks for each task’s step and finding ceilings. If omitted, the existing fallback still applies; `ceilingProvenance` records whether each value was agent-chosen or defaulted and survives plan revalidation, inheritance and restart.
-
-- **Token accounting is bucketed.** Uncached input, cache read, cache write, output (including its reasoning share) and physical request count are recorded per worker and per mission. The sidebar shows the breakdown under *Task details and resources*.
-- **Cached input is charged at a discount.** Cache reads count toward the budget at `cacheReadWeight` (default `0.1`) while the raw buckets stay exact, so a cache-heavy review is not throttled at roughly ten times its real cost. Displayed volume and charged cost are therefore different numbers, deliberately.
-- **The primary conversation's own usage is tracked separately** and attributed to its mission, but is not charged against the worker pool.
-- **Warnings arrive before exhaustion.** The primary agent is notified as each dimension crosses `budgetWarnAt` (default `0.7` and `0.9`), and an exhausted mission names which dimension ran out.
-- **A step is refused when the pool is already committed.** Requests still streaming are estimated at each worker's average, so an in-flight burst is less likely to overshoot the ceiling.
-- **Check execution is bounded per host.** `checkConcurrency` limits how many declared checks run at once; the rest queue in FIFO order, and the measured envelope (limit, active, queued, wait and run times) is recorded durably.
-
-## Sidebar
-
-The panel takes the first surface the host provides, and falls back in this order:
-
-1. **The host's own right sidebar** (Harness 0.1.5 and later), the pane the Files tab uses. Agent Swarm registers a tab type, its body, and one capsule on that pane's Start page, so the panel opens beside the conversation instead of taking the main column. To open it: expand the right sidebar, choose **New tab** → the **Start** page, and pick the **Agent Swarm** capsule; afterwards `/agent-swarm` and the conversation card reveal the same tab, and it stays in the tab strip beside Files. The registration is structural — the plugin imports none of the sidebar packages — so the same build still loads on 0.1.2/0.1.3, where this path never fires.
-2. **Better Sidebar**, when a profile mounts it and the host has no native right sidebar: pick **Agent Swarm** from its **+** tab menu; per-tab conversation scope and visibility are respected, and pinned tabs keep their own session.
-3. **A standalone dock** beside the conversation: collapse and reopen from the Agent Swarm rail, and its width is remembered. Narrow screens move the panel below the conversation. The dock reserves its space by setting the host root's inline width, so it never names a host id and never needs `!important`.
-
-Whatever the surface, the panel body is the same projection of the durable state.
-
-The overview answers "what is happening" before any disclosure is opened:
-
-- **Mission state** — the projected phase with its own provenance: the label, the note, the count it quantifies and the durable fact it was derived from (`data-swarm-owner-state`).
-- **Execution activity** — compact parallel member rows with stable avatars, current operation, elapsed time and the age of the last runtime signal. Only a valid, recent native operation animates. Idle members collapse; step and token usage remain in resource details, never a completion bar.
-- **Work board** — seven lanes (ready, queued, in progress, awaiting acceptance, blocked, cancelled, accepted) led by a one-line lane-count strip. An empty lane collapses to its header, a card's reason is one clipped line that unfolds, and a cancelled card names its cause.
-- **Activity** — the retained event window grouped by durable actor, newest first, with each worker's stable avatar on its group. The compact live feed uses durable event identities, so reconnects and heartbeats do not manufacture new progress.
-- **Evidence, dependency graph, budgets and usage** — behind *Task details and resources*.
-
-**Worker identity.** Every worker carries a human given name from a fixed pool of 40 names — no vendor or product name — together with the responsibility text it was admitted with. `swarm_add_member` assigns the next unused name in assignment order when the caller supplies none; a name is unique within its mission and never reused while the mission is active, and an explicit name is still honoured. The name is a display identity only: `role` keeps the responsibility text unchanged and every delivery, assignment and tool argument addresses the **member id**, so nothing in the protocol depends on a display name. Each member has a deterministic SVG bot portrait derived from its member id (name fallback), with independently varied palette, head, eyes and antenna. Role and name changes preserve the same id's appearance. Runtime state is a separate indicator: recently observed work animates, waiting has a pause mark, and stale activity becomes unconfirmed. Reduced-motion preferences disable animation. The portrait adds no image download, dependency or model request.
-
-Activity labels come from real model requests, tool executions, verification runs and provider retries. Elapsed time counts from the operation's observed start. These describe what the host has seen — an active request is not a promise of useful progress. On a connection failure the panel shows **Reconnecting**, freezes operation times and marks retained activity as last-observed. A connected panel with no recent runtime signal also stops busy animations and reports unconfirmed activity; it does not infer failure. Verification includes preparation and queueing. Completed results appear before the member roster, and application timeouts require checking the host receipt before an explicit retry.
-
-An **Advanced: configure a mission** disclosure remains available for explicit manual planning with saved drafts, model choices and task graphs. Saving a draft starts no workers. The natural-language command is the normal entry point.
-
-## Collaboration model
-
-1. The primary agent supplies a complete plan: objective, scope, acceptance criteria, budgets, members, workstreams and a task graph. The runtime validates it before any worker starts and returns every field problem at once so one repair fixes the whole plan.
-2. Workers propose further work inside the mission, exchange attributed peer messages, publish evidence tied to host-recorded tool executions, and post typed notes to the sanctioned mission board (`swarm_post`, read back with `swarm_board`). Every tool result a worker receives carries the host's own run id, so a claim can cite it.
-3. Work is submitted as an immutable artifact. Independent review starts as soon as the source is submitted; ordinary dependencies unlock only after acceptance. A review is never assigned to the author of the work it reviews.
-4. A challenge reopens the affected result and invalidates whatever depended on it. A handoff checkpoints partial work and stops the previous attempt before a replacement can begin.
-5. Blocked work is repaired by a replacement task that carries the original acceptance criteria. Dependents follow the repair automatically — a task that depended on the rejected original becomes ready when the accepted replacement lands, and is built against the replacement's artifact.
-6. A mission completes when independently accepted work covers every acceptance criterion. If the board reaches a state where nothing can ever be scheduled again, the primary agent is told once, with the specific tasks that are stuck.
-
-Coordination policy lives in the runtime; lifecycle and sandboxing use native Harness services. See [design traceability](docs/design.md).
-
-### Arena contracts and the no-silent-state invariant
-
-- **No silent state.** Every non-terminal board state leaves the owner a durable witness: progress, an owner-decision notice keyed by the mission-state fingerprint `F(S)`, or a stall notice for `F(S)`. `F(S)` is a stable digest of the owner-observable board — task and member status, dispatchable readiness, unreviewable submissions, pending deliveries, open challenges and hit ceilings — with wall-clock fields excluded, so an idle tick never re-notifies and a state that changes and returns can.
-- **Typed escalation.** `swarm_escalate` lets a member raise a first-class durable escalation to the owner (authenticated sender, mission, task/attempt, fingerprint). It is not a board post and grants no authority; it appears in the owner's notice ledger and arena view.
-- **Bounded proposals.** A worker's board share is bounded inside the owner-set mission ceiling (`ceil(maxTasks / maxWorkers)`, floor 1). A refusal for the allowance, the task budget or the experiment budget records a durable `task/proposal-refused` event and wakes the owner with the member, the limit and the reason; only the owner raises the allowance, by raising the ceiling.
-- **Read-only registry.** `swarm_registry` is the owner-only, read-only cross-mission artifact registry (commit, task, mission, acceptance state, review verdict). Per-mission artifact refs are private, so this durable projection is the sanctioned cross-mission read path.
-- **Notice ledger.** Every owner notice records its class, the fingerprint it announced and its sent/queued/claimed lifecycle; the owner reads the ledger read-only through `swarm_observe`.
-- **Provider-outage routing.** A classified quota, rate-limit or unavailable provider failure is a quiescent route, not a worker failure: the attempt is preserved, no recovery credit is spent, the owner is told once per class transition, and the work is routed to another live member when one exists.
-- **Store snapshot and restore.** The store writes periodic `VACUUM INTO` snapshots beside the state file. A truncated or deleted store fails closed naming its snapshot, and the owner stages one validated snapshot with `swarm_restore`; the next host start applies it before the store opens.
-- **Host restart.** A host-caused stop re-pends the task without spending recovery credit and records a per-task `task/restart-repended` event, so a `maxRecoveryAttempts: 1` task survives one restart.
-- **Isolation.** Verification checkouts copy ignored dependency directories by default. The shared temp roots are a cross-member channel, so the runtime records a bounded `isolation/temp-rendezvous` event when two members name the same shared-temp path inside the window.
-
-## Storage and configuration
-
-The plugin's Loader row is `dsh-external-agent-swarm`. Settings are defined in [src/index.ts](src/index.ts):
-
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `statePath` | `~/.dsh/agent-swarm/swarm.sqlite` | Coordination state. One live runtime per file. |
-| `workspacesRoot` | `~/.dsh/agent-swarm/workspaces` | Snapshots, worker worktrees, verification checkouts. Must be outside your source repository. |
-| `verificationDependencyDirs` | `["node_modules", ".venv", "venv", "vendor", ".tox"]` | Installed dependency directories made available to verification checkouts. |
-| `verificationDependencyMode` | `"link"` | `link` is honored only with `allowDependencyLinkReads`; otherwise the effective mode is `copy` (clones them per checkout). |
-| `allowDependencyLinkReads` | `false` | Human opt-in that makes a configured `verificationDependencyMode: "link"` effective. |
-| `checkConcurrency` | `2` | Maximum declared-check executions per host; the rest queue in FIFO order. |
-| `cacheReadWeight` | `0.1` | Budget weight for cached input. Raw buckets are unaffected. |
-| `budgetWarnAt` | `[0.7, 0.9]` | Fractions at which the primary agent is warned per dimension. |
-| `authorizedWorkspaces` | `[]` | Human-authorized roots (`{ path, note?, expiresAt? }`) a mission may target outside the session cwd. Loaded once at start; no tool can change it. |
-| `checkTimeoutMs` | `600000` | Fallback timeout for one declared check when a task does not choose one. |
-| `leaseMs` | `120000` | Attempt lease, renewed only while a real operation is observed. |
-| `tickMs` | `1000` | Scheduler tick. |
-
-Only one live runtime may own a database. To run independent Harness processes, give each an absolute `statePath` and `workspacesRoot` through its profile overlay. **Changing `DSH_HOME` alone does not isolate this plugin's storage.** The [bundle profile](profile/README.md) states both roots explicitly and portably — `DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm` — and a caller points them elsewhere with that variable or a `--patch` overlay.
-
-Infrastructure settings never replace the primary agent's decisions: an automatic plan must still supply its own complete resource budgets and task policies.
-
-### Authorized workspaces (human-only surface)
-
-A mission workspace is accepted only when it equals the calling session's working directory or resolves (realpath, symlink-resolved) inside one of the roots in `authorizedWorkspaces`. The roots are read once from plugin configuration at start; **no model-callable tool can create, widen or revoke a root**, and changing the set requires a human editing the profile or `cordis.patch.yml` and restarting the host. `swarm_create` and `swarm_stage` overwrite the model-supplied workspace with the resolved path and record the matched root durably as `mission.workspaceGrantRoot` plus a `mission/workspace-bound` audit event; `workspace/grant-loaded` records each configured root at start. An unauthorized path is refused with a field-level `[workspace_not_authorized]` diagnostic naming the requirement and how a human grants it. Removing a root and restarting refuses new missions and fences a running one (durable blocked reason plus an owner notice) at its next workspace preparation or verification checkout. Worker sessions never create missions or use a grant. See [known limitations](docs/known-limitations.md) for the residual risks — model write access to the configuration file, TOCTOU on a replaced root, and the fact that authorization is not confidentiality.
-
-## Development and verification
-
-After linking a Harness checkout:
-
-```sh
-npm run verify
-```
-
-That runs typecheck, build, the behavioral suite, packaged-artifact loading, real Harness Loader composition, CLI profile installation, and the two browser workflows. Individual suites:
-
-| Command | What it covers |
+| Read more | What you will find |
 | --- | --- |
-| `npm test` | The full behavioral suite against the built artifact. |
-| `npm run test:faults` | Fault injection — each scenario must first prove its fault actually fired. |
-| `npm run test:replay` | Deterministic replay over the durable log. |
-| `npm run test:load` | Admission and scheduling under load. |
-| `npm run test:isolation` | Sandbox and workspace confinement (host-only). |
-| `npm run test:harness` | Real Harness Loader composition, end to end. |
-| `npm run test:pack` / `test:packed` | The packaged artifact loads and runs what it declares. |
-| `npm run test:profile` | Real CLI profile install and lifecycle. |
-| `npm run test:bundle` | The declarative bundle profile: metadata, portable roots, host composition, and a real `dsh --profile web` boot. |
-| `npm run test:web` / `test:command-web` | The sidebar and `/agent-swarm` browser workflows. |
+| [Operations guide](docs/operations.md) · [中文指南](docs/operations.zh-CN.md) | Installation, supported hosts, storage, configuration, recovery and development commands. |
+| [Design notes](docs/design.md) | Collaboration contracts, authority boundaries and design traceability. |
+| [Validation](docs/validation.md) | Completed integration checks and the limits of their evidence. |
+| [Known limitations](docs/known-limitations.md) | Detailed operating constraints and remaining issues. |
 
-Suites use temporary profiles and Git workspaces, with the model boundary scripted. `test:deepseek` and `test:command-deepseek` make real provider requests, can incur charges, and are excluded from `verify`. Completed runs and their measured numbers are recorded in [validation](docs/validation.md).
+Agent Swarm can be paired with [dsh-slice-agent-loop](https://github.com/TT-Wang/dsh-slice-agent-loop) for session context management: Swarm coordinates work across members, while the slice policy manages history within each session. See the [integration notes](docs/operations.md#companion-context-policy).
 
-## Current limitations
+Contributions are welcome. Development verification requires the repository checkout; start with the [development commands](docs/operations.md#development-and-verification). Live-provider checks are opt-in and may incur API charges.
 
-- **Local, single-host.** Git workspaces and the host's subprocess service (`ctx.subprocess`) are required. Delivery Git operations still use local asynchronous subprocesses, and admission's Git ignore probes are synchronous; these exceptions do not have host-managed process ranges. Distributed workers and non-Git workspaces are not implemented.
-- **Verification proves that your commands ran, not that they are sufficient.** The host executes exactly what a task declares, against the exact submitted commit. It cannot infer a complete test oracle from a natural-language goal.
-- **The verification checkout borrows your installed toolchain.** Dependency directories are copied into the disposable checkout by default, so `..` cannot resolve into your source checkout; a read-through `link` requires the explicit `allowDependencyLinkReads` opt-in. Either way they are not a fresh install and may differ from CI.
-- **Budget accounting is provider-reported.** In-flight requests are estimated, so an unusually large one can still cross a ceiling. Attempts that report no usage cannot be counted.
-- **Confinement follows the configured Harness sandbox.** Artifact capture checks changed paths against declared scopes. The plugin adds no independent network or credential isolation, and its tool restrictions are not a complete boundary for every side-effecting tool.
-- **Recovery is bounded.** Attempt leases renew only while a live operation is observed, within the mission deadline; this does not detect every stuck request. Retained worktrees and Git refs require explicit cleanup.
-- **Views are deliberately limited.** Live updates reconcile committed state rather than streaming tokens. Cold worker history is a text and tool-record projection, with media shown by type and long entries truncated.
-- **Compatibility is bounded by the tested compositions.** Better Sidebar integration was exercised against version 0.18.0; that does not establish compatibility with every other plugin or custom profile.
+## License and acknowledgements
 
-See [known limitations](docs/known-limitations.md) for the detailed list.
+MIT · [License](LICENSE) · [Third-party notices](NOTICE)
 
-## License
-
-MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Design traceability is recorded in [docs/design.md](docs/design.md); the tested matrix and its limits in [docs/validation.md](docs/validation.md).
+The project draws on [dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) for packaging and integration patterns, and builds its collaboration runtime on native DeepSeek Harness services. Attribution and design traceability are retained in the linked documents.

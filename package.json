@@ -30,6 +30,7 @@
     "cordis.patch.yml",
     "profile",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE",
     "NOTICE",
     "compatibility.json",
@@ -37,6 +38,9 @@
     "docs/design.md",
     "docs/validation.md",
     "docs/known-limitations.md",
+    "docs/operations.md",
+    "docs/operations.zh-CN.md",
+    "docs/images",
     "scripts/packed-smoke.mjs"
   ],
   "engines": {
