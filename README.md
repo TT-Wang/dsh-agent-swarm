@@ -153,8 +153,6 @@ Agent Swarm can be paired with [dsh-slice-agent-loop](https://github.com/TT-Wang
 
 Contributions are welcome. Development verification requires the repository checkout; start with the [development commands](docs/operations.md#development-and-verification). Live-provider checks are opt-in and may incur API charges.
 
-## License and acknowledgements
+## License
 
 MIT · [License](LICENSE) · [Third-party notices](NOTICE)
-
-The project draws on [dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) for packaging and integration patterns, and builds its collaboration runtime on native DeepSeek Harness services. Attribution and design traceability are retained in the linked documents.

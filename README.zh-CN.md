@@ -157,8 +157,6 @@ Agent Swarm 可以与 [dsh-slice-agent-loop](https://github.com/TT-Wang/dsh-slic
 
 欢迎参与改进。开发验证需要完整仓库，参见[开发命令](docs/operations.zh-CN.md#development-and-verification)。真实供应商测试需显式运行，可能产生 API 费用。
 
-## 开源协议与致谢
+## 开源协议
 
 MIT · [开源协议](LICENSE) · [第三方声明](NOTICE)
-
-项目的打包与集成方式参考了 [dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)，协作运行时建立在 DeepSeek Harness 原生服务之上。相关署名与设计来源保留在上述文档中。
