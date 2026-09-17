@@ -518,6 +518,29 @@ class ProcessTimeoutError extends Error {
   }
 }
 
+/**
+ * R19-H2: the two documented ways out of a dependency directory the host cannot
+ * copy, written for the operator who reads them from a deferred review. The
+ * link opt-in trades the R11-13 read boundary for the real toolchain; the
+ * directory list keeps the boundary and leaves the check to find its own.
+ */
+const DEPENDENCY_MATERIALISATION_REPAIR = 'Install self-contained dependencies, or repair the host configuration and resume the review: either set verificationDependencyMode: "link" together with allowDependencyLinkReads: true so checks read the source toolchain through a link (this exposes uncommitted source state to checks), or change verificationDependencyDirs so this directory is not materialised ([] disables materialisation).'
+
+/**
+ * R19-H2: a dependency directory that cannot be materialised into the clean
+ * checkout. No declared command has run, so this is a host-environment
+ * condition (a pnpm/npm workspace symlink farm, a dangling install link), not a
+ * verdict on the artifact. It carries no errno `code`; the declared-check layer
+ * recognises it by name and defers the review with a durable record instead of
+ * letting it escape `swarm_verify` as a bare throw.
+ */
+export class DependencyMaterialisationError extends Error {
+  constructor(code: 'dependency_copy_escape' | 'dependency_directory_unavailable', detail: string, dependency: string) {
+    super(`[${code}] ${detail} (dependency: ${dependency}). ${DEPENDENCY_MATERIALISATION_REPAIR}`, { cause: { dependency } })
+    this.name = 'DependencyMaterialisationError'
+  }
+}
+
 /** Grace the host's termination procedure stages between SIGTERM and SIGKILL, and the bound it drains held pipes with. */
 const TERMINATION_GRACE_MS = 300
 
@@ -1777,19 +1800,24 @@ export class Workspaces {
       // Research can require independent review without declaring host commands.
       // Keep the validation above, but reserve execution capacity only for checks.
       if (task.checks.length === 0) return []
-      // R11-19: declared-check executions are bounded per host. A verification
-      // beyond the limit waits here in FIFO order (abort-aware), and its wait is
-      // measured. The adapter reports `verification` activity for the whole
-      // call, so the runtime's lease renewal keeps the queued attempt alive.
-      const waitMs = await this.checks.acquire(signal)
-      const startedAt = Date.now()
-      let released = false
-      const release = (): void => { if (!released) { released = true; this.checks.release(Date.now() - startedAt) } }
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
+      let release: (() => void) | undefined
       try {
         await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
         await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
+        // R19-M-d: the toolchain copy can be a whole node_modules and has no
+        // deadline of its own, so it lands before the slot is taken. A slow or
+        // refused copy then neither idles a slot another verification is queued
+        // for nor counts against the check deadline and the measured run time,
+        // which both start with the command.
         const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
+        // R11-19: declared-check executions are bounded per host. A verification
+        // beyond the limit waits here in FIFO order (abort-aware), and its wait is
+        // measured. The adapter reports `verification` activity for the whole
+        // call, so the runtime's lease renewal keeps the queued attempt alive.
+        const waitMs = await this.checks.acquire(signal)
+        const startedAt = Date.now()
+        release = () => this.checks.release(Date.now() - startedAt)
         // R16-B: both scoped roots are created before the check starts. The temp
         // root must exist: a TMPDIR pointing at a missing directory fails
         // `mkdtemp` with ENOENT, which is a different failure from the denied
@@ -1846,7 +1874,7 @@ export class Workspaces {
         }
         return results
       } finally {
-        release()
+        release?.()
         await this.cleanupVerification(mission.source, checkout)
       }
     }, signal)
@@ -1953,11 +1981,11 @@ export class Workspaces {
       const entryStat = await lstat(target).catch(() => undefined)
       const resolved = await realpath(target).catch(() => undefined)
       const targetStat = resolved === undefined ? undefined : await lstat(resolved).catch(() => undefined)
-      if (entryStat?.isSymbolicLink() && (targetStat === undefined || !targetStat.isDirectory())) throw new Error('[dependency_directory_unavailable] A dependency link has no readable directory target. Repair or reinstall the dependency directory and retry the check.', { cause: { dependency: relative } })
+      if (entryStat?.isSymbolicLink() && (targetStat === undefined || !targetStat.isDirectory())) throw new DependencyMaterialisationError('dependency_directory_unavailable', 'A dependency link has no readable directory target; repair or reinstall the dependency directory', relative)
       if (targetStat === undefined || !targetStat.isDirectory()) continue
       if (await lstat(link).then(() => true, () => false)) continue
       await mkdir(path.dirname(link), { recursive: true })
-      if (copy) await this.copyDependencyTree(resolved!, link, source, signal)
+      if (copy) await this.copyDependencyTree(resolved!, link, source, relative, signal)
       else await symlink(target, link, 'dir')
       linked.push(relative)
     }
@@ -1967,7 +1995,7 @@ export class Workspaces {
   /** Copy into staging, relocate internal links, and materialize external
    * executable files (notably venv interpreters). No copied link may read through
    * to the host, and source checkout contents outside this dependency stay out. */
-  private async copyDependencyTree(source: string, destination: string, workspaceSource: string, signal: AbortSignal): Promise<void> {
+  private async copyDependencyTree(source: string, destination: string, workspaceSource: string, name: string, signal: AbortSignal): Promise<void> {
     const staging = `${destination}.swarm-copy-${randomUUID()}`
     const contained = (target: string): boolean => target === source || target.startsWith(`${source}${path.sep}`)
     try {
@@ -1995,7 +2023,7 @@ export class Workspaces {
               continue
             }
           }
-          if (resolved === undefined || !contained(resolved)) throw new Error('[dependency_copy_escape] A dependency link is broken or leaves its dependency directory without naming an external executable file. Links to source checkout contents, external directories and non-executable files cannot be copied. Install self-contained dependencies and retry the check; only a host that explicitly accepts external reads may enable verificationDependencyMode=link with allowDependencyLinkReads.', { cause: { dependency: relative } })
+          if (resolved === undefined || !contained(resolved)) throw new DependencyMaterialisationError('dependency_copy_escape', 'A dependency link is broken or leaves its dependency directory without naming an external executable file; links to source checkout contents, external directories and non-executable files cannot be copied', path.join(name, relative))
           const relocated = path.join(staging, path.relative(source, resolved))
           await rm(file)
           await symlink(path.relative(path.dirname(file), relocated) || '.', file)
