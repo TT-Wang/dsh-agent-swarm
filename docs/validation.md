@@ -33,6 +33,17 @@ coverage gaps it named.
   running. Names the member never wrote, tracked inputs named after a write verb, and directory
   tokens are never obligations, so the review's dead-end and secret-capture scenarios cannot occur;
   rows accepted before the gate are named in the completion notice instead of blocking completion.
+- **H-1 gate hardening** (`tests/r19c-deliverable-gate.test.mjs`). A second review of the gate
+  found that preservation snapshots force-include hinted ignored files (so a draft survives a
+  handoff) and a recovered checkout therefore had them tracked, out of the gate's sight. A recovered
+  checkout now un-tracks every hinted path the snapshot pulled in (tracked, ignored by pattern,
+  absent from the task base), so a member-created `.env` never reaches an artifact ref through a
+  handoff or a same-member task switch while the draft stays on disk. Hints and declared outputs
+  resolve to their on-disk spelling on case-folding filesystems; `swarm_verify` with `deliverables`
+  refuses on `reviewArtifact.uncapturedPaths` with the same repairs; paths inside ignored dependency
+  directories or the scratch root are neither obligations nor deliverables; a `git check-ignore` run
+  that does not complete fails the capture with `[deliverable_gate_unavailable]` instead of silently
+  opening the gate.
 - **H-2/M-d dependency materialisation** (`tests/r19-dependency-materialisation.test.mjs`). The copy
   of a source repository's `node_modules` refused any symlink resolving outside the dependency
   directory with a codeless `Error` that the declared-check classifier could not recognise, so on a

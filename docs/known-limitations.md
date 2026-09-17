@@ -477,7 +477,8 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   without a path is captured only when listed in `swarm_submit.deliverables`; unnamed ignored files
   are never swept because they are indistinguishable from scratch and secrets; a named path the member
   never wrote is a review question, not a capture refusal. Rows accepted before this round whose
-  stored artifact still lists `uncapturedPaths` are named in the completion notice.
+  stored artifact still lists `uncapturedPaths` are named in the completion notice. A verification that passes no `deliverables` captures nothing and is therefore not gated: a
+  hinted ignored review report is checked only when at least one review deliverable is declared.
 - **Inherited preservation snapshots.** A replacement that inherits the previous owner's preservation
   snapshot also inherits out-of-scope changes the artifact refused and must revert or move them before
   `swarm_submit`; the fallback notice says so. When preservation itself fails the uncaptured work still
