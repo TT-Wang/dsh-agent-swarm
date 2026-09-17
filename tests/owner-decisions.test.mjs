@@ -390,7 +390,8 @@ test('R15-D1: a hung workers.start is named while a healthy sibling holds a live
     && (delivery.notice.dedupKey.startsWith('fallthrough:') || delivery.notice.dedupKey.startsWith('dispatch-question:'))
     && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${pending.id}@`)))
   assert.ok(named, `the pending task is named while the sibling's lease is live: ${JSON.stringify(fresh.map(delivery => ({ key: delivery.notice?.dedupKey, subjects: delivery.subjects, content: delivery.content.slice(0, 70) })))}`)
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged past its declared bound')
+  assert.ok(f.runtime.store.events(f.mission.id, 500).some(event => event.type === 'mission/stalled' && event.data.wedged === true), 'the physical operation crossed its bound and was durably named')
+  assert.ok(f.runtime.queues.has(f.mission.id), 'a newer logical pass cannot release the still-hung physical operation')
   assert.equal(named.subjects.some(subject => subject.startsWith(`${sibling.id}@`)), false, 'the healthy sibling is not named as the stuck subject')
   assert.equal(f.runtime.store.get('tasks', pending.id).status, 'pending', 'the task really is still undispatched')
 })
@@ -886,7 +887,8 @@ test('R16-A4 pair: the off-pass sweep of a wedged pass applies the lineage-resol
   const startedAt = Date.now()
   workers.options.hangStart = true
   await sleep(700)
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged past its declared bound')
+  assert.ok(f.runtime.store.events(f.mission.id, 500).some(event => event.type === 'mission/stalled' && event.data.wedged === true), 'the physical operation crossed its bound and was durably named')
+  assert.ok(f.runtime.queues.has(f.mission.id), 'the still-hung operation keeps physical ownership despite logical pass revocation')
   const fresh = f.notices().filter(delivery => delivery.createdAt >= startedAt)
   const falseWake = fresh.filter(delivery => typeof delivery.notice?.dedupKey === 'string'
     && delivery.notice.dedupKey.startsWith('fallthrough:')

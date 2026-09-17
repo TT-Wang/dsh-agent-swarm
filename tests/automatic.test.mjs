@@ -742,7 +742,16 @@ test('late failure from a superseded startup cannot stop the successfully retrie
     f.runtime.failStart(f.owner, request.id, 'cancel old startup')
     const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover saved plan')
     f.workers.onStart = async () => {}
-    const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    let launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    if (loseAbortHandle) {
+      // Losing the native cancellation handle does not prove the old startup
+      // stopped. The retry is bounded and refused until that physical call
+      // settles, rather than overlapping another startup in the same workspace.
+      await assert.rejects(launch, /mission_operation_pending/)
+      gate.reject(new Error('old provider startup eventually failed'))
+      await rejected
+      launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    }
     await eventually(() => f.runtime.starts(f.owner)[0].status === 'running')
     const snapshot = await launch
     const reviewer = snapshot.members.find(member => member.name === 'Reviewer')

@@ -210,3 +210,13 @@ Integration workers can resolve listed files in `.swarm-integration-conflicts.js
 A mission cannot complete while required synthesis or review work remains unfinished, even if other accepted tasks repeat its acceptance text. A stranded task stays recoverable and notifies the primary; amend its dependencies or assignee in place. Withdraw obsolete work explicitly with `swarm_cancel`. Completion itself never cancels tasks.
 
 Check-environment records distinguish the configured `dependencyLinks.dirs` set from the actual relative `materializedPaths` found for that execution. Directory ordering and absent optional dependency folders do not change the configured policy; real policy-set or copy/link-mode changes still reject a mismatched verification.
+
+## Recovering orchestration issues
+
+Amend a stale dependency list on the existing task before creating a duplicate deliverable. `changes.dependencies` replaces the entire list; the response includes added and removed dependencies. Cancelling a prerequisite reports `strandedDependents`. Replacements must continue the live repair chain, rather than fork an ancestor with an active or accepted descendant.
+
+A stop must finish and preserve the previous attempt before its member workspace can be reused. A timed-out queue wait returns an actionable refusal without running overlapping workspace operations. The owner can still pause, stop, inspect and work on other missions. Deterministic preservation failures retain the fence and emit one decision notice per task/epoch/cause; after repairing the reported condition, `swarm_control(action: "resume", taskId, reason)` retries cleanup even for a cancelled task without reviving it.
+
+Named in-scope ignored output files are included in private recovery checkpoints. Unlisted ignored files are not collected: a conflicting workspace switch refuses and reports the paths. `swarm_verify.deliverables` optionally captures a separate review report in immutable blobs; the verdict remains durable when no report file is requested. The source artifact and its host checks remain pinned to the original commit.
+
+Budget warnings include task slots needed for known unpaired reviews. `suggestedLimit` restores warning headroom only; the primary must consider remaining work and actual progress before choosing a new ceiling. A delivery marked queued is not proof of worker receipt: failed transports appear in the compact member view and wake the primary. Owner reminders are checked again when the host admits them into context, so stopped work, answered questions and superseded budget warnings do not cause an extra decision turn. Already consumed historical messages remain in the session log.

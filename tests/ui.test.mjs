@@ -517,7 +517,7 @@ test('current robot avatars remain readable at their actual sizes and controls r
   assert.match(styles, /\.sw-complete-control>\[data-swarm-completion\]\{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, 'and it is bounded with an ellipsis')
 })
 
-test('right sidebar adapter: one tab type, its body seat, and host navigation', async () => {
+test('right sidebar adapter: passive tab registration, its body seat, and explicit host navigation', async t => {
   // A fake host modelled on the real right-sidebar kit: the registry takes the
   // tab type, the slot service takes the body under the same id, and the
   // controller opens the pane by kind.
@@ -547,21 +547,18 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   }
   const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80, label: () => 'Agent Swarm', description: () => 'Missions, workers and evidence for this conversation', component: () => null })
   const adapter = createRightSidebarAdapter(ctx, describe)
-  assert.equal(adapter.getSnapshot(), true, 'a registered tab reports integrated, so the dock stays hidden')
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'a registered tab and controller own the surface, so the dock stays hidden')
   assert.deepEqual(types.map(type => [type.id, type.kind, type.title()]), [['dsh-external-agent-swarm', 'agent-swarm', 'Agent Swarm']],
     'the tab type carries the implementation id, the kind navigation names, and its chip title')
   assert.deepEqual(types[0].guide.map(entry => [entry.order, entry.title(), entry.description()]),
     [[80, 'Agent Swarm', 'Missions, workers and evidence for this conversation']],
-    'and one guide capsule, which is the only route to a page type from the UI')
+    'and one guide capsule, which lets the host offer the page type from its UI')
   assert.deepEqual(seats.map(seat => [seat.slot, seat.key, typeof seat.component]), [['sidebar.right.pane.tab', 'dsh-external-agent-swarm', 'function']],
     'the body sits in the keyed seat under that same id')
-  // The host starts with an empty right pane, so the adapter opens its tab once
-  // when it registers: a registered tab nobody opens is invisible.
-  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'],
-    'registering reveals the pane and selects the tab once')
-  opened.length = 0
+  assert.deepEqual(opened, [], 'registration preserves the host pane state without selecting a tab')
   assert.equal(adapter.open(), true)
-  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'], 'open() reveals the pane and the tab through the host services')
+  assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'an explicit open delegates reveal to the controller without writing layout')
   adapter.dispose()
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal releases the type and the seat')
@@ -584,6 +581,7 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   opened.length = 0
   const noRegistry = createRightSidebarAdapter(slotOnly, describe)
   assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing and the dock renders')
+  assert.equal(noRegistry.open(), false, 'an explicit request is left to the fallback when no native registry exists')
   assert.deepEqual(opened, [], 'and it never reveals a pane that does not exist')
   assert.deepEqual(seats, [], 'and the body seat is never registered into an undeclared slot')
   noRegistry.dispose()
@@ -599,20 +597,18 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
   assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs', 'sidebarRight'\]/, 'and only while the slot service, registry and controller are present')
-  assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
+  assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page')
   assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
-  assert.match(source, /getSnapshot: \(\) => current\?\.opened \?\? false/, 'and integration means the pane really shows the tab, not merely that a type was registered')
 })
 
-test('right sidebar adapter: a refused reveal keeps the dock and retries until a session surface exists', async () => {
+test('right sidebar adapter: an explicit refused reveal stays native until its session surface exists', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   // The 0.1.5 host answers a write with no mounted session surface by throwing
-  // (`sidebarRight: no session surface is mounted`). The adapter used to set its
-  // one-shot flag BEFORE that call, so the throw ended the only attempt while the
-  // successful registration hid the dock: the owner saw an empty right pane on
-  // 5196. The attempt is now contained, retried on a bounded schedule, resumed by
-  // the session the surface belongs to, and the dock stays until the tab is open.
+  // (`sidebarRight: no session surface is mounted`). Only explicit intent creates
+  // a retry request; registration and ordinary session signals remain passive.
+  // Native ownership covers a pending request so it cannot open a second dock.
   const types = [], opened = []
-  let mounted = false
+  let mounted = false, attempts = 0
   const registry = { register(definition) { types.push(definition); return () => { types.splice(types.indexOf(definition), 1) } } }
   const slots = {
     inject(name, factory) { const release = factory(); return () => release?.() },
@@ -632,6 +628,7 @@ test('right sidebar adapter: a refused reveal keeps the dock and retries until a
     get: name => name === 'sidebarRight'
       ? {
         openTab: (kind, options) => {
+          attempts++
           if (!mounted) throw new Error('sidebarRight: no session surface is mounted')
           opened.push(`${kind}:${JSON.stringify(options)}`)
         },
@@ -641,20 +638,31 @@ test('right sidebar adapter: a refused reveal keeps the dock and retries until a
   }
   const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null })
   const adapter = createRightSidebarAdapter(ctx, describe)
-  assert.equal(adapter.getSnapshot(), false, 'a refused reveal is not integration: the dock keeps carrying the panel')
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'registry/controller readiness owns the surface before any reveal')
+  for (const listener of sessions.listeners) listener()
+  assert.equal(attempts, 0, 'registration and session signals make no navigation attempt')
+  assert.equal(adapter.open(), true, 'the native integration owns the request while the surface is unmounted')
+  assert.equal(attempts, 1)
+  assert.equal(adapter.getSnapshot(), true)
   assert.deepEqual(opened, [], 'the host refused the write, so no tab was opened')
-  // A conversation reaches the screen: the session signal re-arms the attempt.
+  // A conversation reaches the screen: its signal retries the pending request.
   mounted = true
   for (const listener of sessions.listeners) listener()
-  assert.equal(adapter.getSnapshot(), true, 'the adapter opens the tab as soon as the host can accept the write')
+  assert.equal(attempts, 2)
   assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'and it opens exactly once')
+  for (const listener of sessions.listeners) listener()
+  t.mock.timers.tick(120_000)
+  assert.equal(attempts, 2, 'a completed request cannot reveal again through signals or old timers')
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal releases the retry schedule with the registration')
 })
 
-test('right sidebar adapter: a host that never mounts a session surface is left quietly retrying, then disposed', async () => {
+test('right sidebar adapter: an explicit request retries without session signals and stops on disposal', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const registry = { register() { return () => {} } }
   const slots = { inject(name, factory) { const release = factory(); return () => release?.() }, register() { return () => {} } }
+  let attempts = 0
   const ctx = {
     inject(names, factory) {
       const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }
@@ -663,13 +671,20 @@ test('right sidebar adapter: a host that never mounts a session surface is left 
       const release = factory(scope)
       return { dispose: async () => { await release?.dispose?.() } }
     },
-    get: name => name === 'sidebarRight' ? { openTab: () => { throw new Error('sidebarRight: no session surface is mounted') } } : undefined,
+    get: name => name === 'sidebarRight' ? { openTab: () => { attempts++; throw new Error('sidebarRight: no session surface is mounted') } } : undefined,
     effect: fn => { fn() },
   }
   const adapter = createRightSidebarAdapter(ctx, () => ({ id: 'x', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null }))
-  assert.equal(adapter.getSnapshot(), false, 'nothing integrates while the write keeps being refused')
-  assert.equal(adapter.open(), false, 'and open() reports the truth instead of claiming a pane that is not there')
-  await new Promise(resolve => setTimeout(resolve, 60))
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'readiness does not require the host surface to be mounted')
+  assert.equal(attempts, 0, 'idle registration never requests navigation')
+  assert.equal(adapter.open(), true, 'the native controller owns a refused request')
+  assert.equal(attempts, 1)
+  t.mock.timers.tick(500)
+  assert.equal(attempts, 2, 'the request can retry on hosts without session notifications')
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal stops the bounded retry schedule')
+  t.mock.timers.tick(120_000)
+  assert.equal(attempts, 2)
+  assert.equal(adapter.open(), false)
 })

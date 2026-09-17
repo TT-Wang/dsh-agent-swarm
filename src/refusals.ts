@@ -290,6 +290,9 @@ export interface GuardTerminalContext {
   taskId?: string
   memberId?: string
   detail?: string
+  /** A receipt or local fault identity must not churn with unrelated board work. */
+  questionId?: string
+  localKey?: string
 }
 
 const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
@@ -430,7 +433,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // the executable exit most — still emits the terminal.
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
-  const fingerprint = rt.fingerprint(missionId)
+  const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
   const key = guardTerminalKey(chain, terminal.code, fingerprint)
   if (hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return terminal
   try {
@@ -448,7 +451,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
       // root. Guard pair: guard-terminal x writer-busy, x the board-level witness
       // (both are recorded for the same fingerprint; the subject is what tells the
       // two apart without reparsing prose).
-      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key })
+      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key, questionId: context.questionId })
     })
   } catch (error) {
     // A busy writer must not turn an escalation into an unhandled rejection.

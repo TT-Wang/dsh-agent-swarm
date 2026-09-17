@@ -428,6 +428,12 @@ export function reconcileDeliverableIgnores(workspace: string, objective: string
 /** Every admission reconciliation that needs only the task text, scope and workspace. */
 export function reconcileTaskAdmission(task: TaskAdmissionInput, workspace: string, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
   const diagnostics = reconcileObjectiveScope(task.objective, task.scope, location)
+  const named = new Set(diagnostics.map(item => item.path))
+  for (const path of deliverablePaths('', task.acceptance ?? [])) {
+    if (withinScope(path, task.scope) || named.has(path)) continue
+    diagnostics.push({ code: 'objective_write_outside_scope', severity: 'advisory', location, path,
+      message: `Acceptance names output ${JSON.stringify(path)} outside task scope ${JSON.stringify(task.scope)}. If this is a deliverable, include its relative path within the authorized scope before execution; read-only references do not require expansion.` })
+  }
   diagnostics.push(...reconcileDeliverableIgnores(workspace, task.objective, task.acceptance ?? [], location))
   // R12-F9, admission-time half: the terminal element of the admission chain.
   // It fires only when the caller supplies the task's dependency set, so a call

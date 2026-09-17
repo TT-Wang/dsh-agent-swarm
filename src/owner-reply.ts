@@ -40,7 +40,8 @@ interface Booking {
   from: string
   taskId?: string
   content: string
-  deliveredAt: number
+  deliveredAt?: number
+  consumedAt?: number
 }
 
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
@@ -102,12 +103,28 @@ export class OwnerReplyGuard {
    */
   private startTurn(sessionId: string, data?: unknown): void {
     const at = typeof (data as { createdAt?: unknown } | undefined)?.createdAt === 'number' ? (data as { createdAt: number }).createdAt : Date.now()
-    const booked = new Map<string, Booking>()
+    const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
+    const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
+    // Several admitted messages (including the generated context snapshot) can
+    // arrive in one step. Merge bookings until turn/end instead of replacing
+    // the question booked by the preceding relay.
+    const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of this.rt.openAsks(mission.id, 'owner')) {
-        if (delivery.deliveredAt === undefined || delivery.deliveredAt > at) continue
+        const consumedNow = delivery.id === consumedId
+        if (consumedNow && delivery.consumedAt === undefined) {
+          this.rt.commit(mission.id, () => {
+            const current = this.rt.store.get('deliveries', delivery.id)
+            if (current === undefined || current.consumedAt !== undefined) return
+            current.consumedAt = at
+            this.rt.store.put('deliveries', current)
+          })
+        }
+        const seenAt = consumedNow ? at : delivery.consumedAt ?? delivery.deliveredAt
+        if (seenAt === undefined || seenAt > at) continue
         booked.set(delivery.id, {
           missionId: mission.id, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt,
+          consumedAt: consumedNow ? at : delivery.consumedAt,
           ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
         })
       }
@@ -146,6 +163,7 @@ export class OwnerReplyGuard {
       emitGuardTerminal(this.rt, booking.missionId, 'owner_reply', {
         detail: `question ${deliveryId} from ${booking.from} still has no answer after ${spent} nudge(s)`,
         memberId: booking.from,
+        questionId: deliveryId,
         ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }),
       })
       return
@@ -153,7 +171,8 @@ export class OwnerReplyGuard {
     this.rt.commit(booking.missionId, () => {
       this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
         deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
-        deliveredAt: booking.deliveredAt, nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
+        deliveredAt: delivery.deliveredAt ?? booking.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? booking.consumedAt ?? null,
+        nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
       })
       delivery.replyNudges = spent + 1
       this.rt.store.put('deliveries', delivery)
@@ -161,7 +180,7 @@ export class OwnerReplyGuard {
       // row together so restart cannot spend a nudge without retaining it.
       this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
         this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
-        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}` })
+        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }
 }

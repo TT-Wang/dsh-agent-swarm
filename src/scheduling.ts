@@ -231,9 +231,11 @@ export class Scheduling {
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
+            if (this.passReleased(pass)) return false
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             continue
           }
+          if (this.passReleased(pass)) return false
           this.rt.startFailures.delete(member.id)
           this.rt.clearProviderOutage(missionId, member.id)
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
@@ -296,6 +298,7 @@ export class Scheduling {
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
+            this.rt.assertAdmission(task, member)
             await this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId))
             await this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
@@ -309,6 +312,8 @@ export class Scheduling {
             if (!this.rt.isolationAllows(missionId, member)) continue
             this.rt.assign(fresh, member)
           } catch (error) {
+            // A watchdog-released pass owns neither successes nor failures.
+            if (this.passReleased(pass)) return false
             // Admission control already wrote the durable refusal; the task stays
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
@@ -350,6 +355,7 @@ export class Scheduling {
             })
           }
           } catch (error) {
+            if (this.passReleased(pass)) return false
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             this.escalateGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail: String(error) })
             continue
@@ -511,20 +517,29 @@ export class Scheduling {
   }
 
   ready(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (task.status !== 'pending' || (task.preparationFailure?.retryAt ?? 0) > Date.now()) return false
-    if (task.assigneeId === undefined || task.assigneeId === member.id) return this.capable(task, member, tasks)
-    if (!canBorrowTask(task)) return false
+    return this.readinessBlocker(task, member, tasks) === undefined
+  }
+
+  /** The same readiness decision supplies a concrete refusal without another policy model. */
+  readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
+    if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
+    if ((task.preparationFailure?.retryAt ?? 0) > Date.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
+    if (task.assigneeId === undefined || task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
+    if (!canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
     const all = tasks ?? this.rt.store.list('tasks', task.missionId)
-    if (!assignmentAllows(task, member.id, all) || !this.capable(task, member, all)) return false
+    if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is reserved as an independent reviewer and cannot borrow this source task`
+    const incapable = this.capabilityBlocker(task, member, all)
+    if (incapable !== undefined) return incapable
     // Keep useful context on the preferred member when it can take this work
     // now. A busy, stopping, retired or non-independent preference cannot reserve
     // an untouched task while another member is idle. This adds no reservation.
     const preferred = this.rt.store.get('members', task.assigneeId)
-    return preferred === undefined || memberPhaseOf(preferred) === 'stopped'
+    const availableForBorrowing = preferred === undefined || memberPhaseOf(preferred) === 'stopped'
       || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
       || pendingStopOwner(all, preferred.id)
       || this.startBlocker(preferred) !== undefined
       || !this.capable(task, preferred, all)
+    return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
   }
 
   /**
@@ -536,12 +551,21 @@ export class Scheduling {
    * never assign a verification to the author of the source it reviews.
    */
   capable(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(task.missionId, dep, tasks))) return false
+    return this.capabilityBlocker(task, member, tasks) === undefined
+  }
+
+  private capabilityBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
+    const waiting = task.dependencies.find(dep => !this.rt.dependencySatisfied(task.missionId, dep, tasks))
+    if (waiting !== undefined) {
+      const effective = this.rt.effectiveDependency(task.missionId, waiting, tasks)
+      return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
+    }
     if (task.reviewOf) {
       const source = this.rt.task(task.missionId, task.reviewOf)
-      if (source.status !== 'submitted' || this.rt.authorIds(source).has(member.id)) return false
+      if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
+      if (this.rt.authorIds(source).has(member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
     }
-    return true
+    return undefined
   }
 
   /**
@@ -761,9 +785,10 @@ export class Scheduling {
    * `releases`/`worstRelease` record and the owner escalation that names the
    * wedged pass and the live work the release preserved.
    *
-   * The in-memory chain entry is dropped as well: the abandoned body is fenced
-   * by `passReleased`, and a later `kick` must not queue behind a promise that
-   * never settles.
+   * This revokes state-write authority, not an in-flight adapter's side effects.
+   * The operation queue retains that physical owner until it actually returns.
+   * Later callers get a bounded refusal while the independent watchdog and
+   * outbox keep reporting the blocker.
    */
   private recordRelease(missionId: string, pass: SchedulingPass, previous: ReleasedPassFields, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
     const now = Date.now()
@@ -782,12 +807,9 @@ export class Scheduling {
     closed.releasedAt = now
     closed.releases = (previous.releases ?? 0) + 1
     closed.worstRelease = widerRelease(previous.worstRelease, release)
-    // Release both halves of the guard: the durable row stops gating and the
-    // in-memory chain no longer queues later ticks behind a promise that never
-    // settles. A newer pass that has already registered its own chain entry is
-    // never clobbered (its `exclusive` finally compares identity).
+    // Never erase the physical operation tail: a released pass may still be
+    // inside prepareTask, and the next pass must not switch that same checkout.
     this.releasedPasses.add(pass.runId)
-    this.rt.queues.delete(missionId)
     this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
     this.escalateSchedulingStall(missionId, {
       pass: closed, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow,
@@ -858,7 +880,7 @@ export class Scheduling {
   passReleased(pass: SchedulingPass | undefined): boolean {
     if (pass === undefined) return false
     const row = this.rt.store.get('passes', this.passKey(pass.missionId))
-    if (row !== undefined && releasedPassFields(row).releasedRunId === pass.runId) return true
+    if (row !== undefined && (row.runId !== pass.runId || releasedPassFields(row).releasedRunId === pass.runId)) return true
     return this.releasedPasses.has(pass.runId)
   }
 
@@ -867,8 +889,8 @@ export class Scheduling {
    * queue and outside the pass it watches. A pass still `running` past the
    * declared bound is declared stalled: the durable stall event is committed,
    * the owner notice is delivered by an unqueued flush, and the guard is
-   * released (both the durable row and the in-memory serialization chain) so the
-   * next tick is not swallowed.
+   * revoked durably. The queue keeps any in-flight physical operation fenced;
+   * subsequent calls return a bounded refusal until that operation returns.
    *
    * R16-D: the release is bounded even when the mission still has live work. A
    * live lease or an in-flight quiescence may be progress, so the pass is not

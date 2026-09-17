@@ -90,6 +90,9 @@ export interface NotifyOptions {
   /** Full facts and their original identities when one notice presents a batch. */
   facts?: string[]
   aggregatedIdentities?: NonNullable<Delivery['notice']>['aggregatedIdentities']
+  /** Exact receipt / failed transport behind this action, including wake summaries. */
+  questionId?: string
+  deliveryFailureId?: string
 }
 
 /**
@@ -103,6 +106,8 @@ export interface NoticeFactRecord {
   subjects: string[]
   trigger: string
   reason: string
+  questionId?: string
+  deliveryFailureId?: string
   /** R17-G3: the notice family the dedup key is prefixed with. */
   family?: string
   /** R17-G8: the host's claimed signal, recorded once (CAS) per delivery. */
@@ -589,7 +594,7 @@ export class Notices {
       decisionRefusals.record({ at: Date.now(), missionId, family: family ?? 'unknown', subjects: [...attributed], reason: refusal, stage: 'emission' })
       return
     }
-    const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', ...(family === undefined ? {} : { family }),
+    const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId, ...(family === undefined ? {} : { family }),
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }) }
     const dedupe = options.dedupe ?? true
     // No-silent-state witness W2: every owner-decision notice is durable under
@@ -634,7 +639,7 @@ export class Notices {
         class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
       }, ...(fact?.aggregatedIdentities ?? [])], at, {
         class: noticeClass, dedupKey, from, subjects: fact?.subjects ?? [],
-        trigger: fact?.trigger ?? noticeClass, reason: fact?.reason ?? '', createdAt: at,
+        trigger: fact?.trigger ?? noticeClass, reason: fact?.reason ?? '', createdAt: at, questionId: fact?.questionId, deliveryFailureId: fact?.deliveryFailureId,
       })
       return undefined
     }
@@ -642,7 +647,7 @@ export class Notices {
     const delivery: Delivery = {
       id: id('msg'), missionId, from, to: 'owner', kind: noticeClass === 'escalation' ? 'escalation' : 'control',
       content, createdAt: at,
-      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities }) } as NonNullable<Delivery['notice']>,
+      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId }) } as NonNullable<Delivery['notice']>,
       ...deliveryExtra,
     }
     const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
@@ -704,23 +709,22 @@ export class Notices {
   }
 
   /**
-   * R17-G8: subscribe to the host's claimed signal (`agent/inbox/claimed`) and
-   * map the relay message's `source.deliveryId` to the durable delivery row. The
-   * adapter composes the relay source (`harness-workers.ts`), and the host fires
-   * the event when the owner's inbox item is claimed, so consumption is recorded
-   * from the host's own signal rather than inferred from transport. A host
-   * without the event or without a context simply records nothing there, while
-   * `recordConsumption` stays the one write path.
+   * Record admitted context, after pre-step filtering. Inbox claim alone is
+   * insufficient: a stopped mission's queued message can be claimed and then
+   * discarded without ever reaching the owner's model context.
    */
   attach(workers: WorkerAdapter): void {
     if (this.unsubscribeClaimed !== undefined) return
-    const ctx = hostContextOf(workers) as { on?: (name: string, handler: (payload: unknown) => void) => () => void } | undefined
+    const ctx = hostContextOf(workers) as { on?: (name: string, handler: (session: { header: { id: string } }, event: { type: string; data: unknown }) => void) => () => void } | undefined
     if (ctx === undefined || typeof ctx.on !== 'function') return
     try {
-      this.unsubscribeClaimed = ctx.on('agent/inbox/claimed', (payload: unknown) => {
-        const source = (payload as { message?: { source?: { kind?: unknown; deliveryId?: unknown } } } | undefined)?.message?.source
+      this.unsubscribeClaimed = ctx.on('session/event', (session, event) => {
+        if (event.type !== 'user/message') return
+        const source = (event.data as { source?: { kind?: unknown; deliveryId?: unknown } } | undefined)?.source
         if (source === undefined || source.kind !== 'swarm' || typeof source.deliveryId !== 'string') return
-        this.recordConsumption(source.deliveryId, { source: 'agent/inbox/claimed' })
+        const delivery = this.rt.store.get('deliveries', source.deliveryId)
+        if (delivery?.to !== 'owner' || this.rt.store.get('missions', delivery.missionId)?.ownerSessionId !== String(session.header.id)) return
+        this.recordConsumption(source.deliveryId, { source: 'user/message' })
       })
     } catch { this.unsubscribeClaimed = undefined }
   }
@@ -732,7 +736,7 @@ export class Notices {
   }
 
   /**
-   * R17-G8: record real consumption from the host's claimed signal. The write is
+   * R17-G8: record real consumption from the host's admitted message. The write is
    * a compare-and-swap inside the mission transaction: a delivery is consumed
    * once, and a second signal (a replay, a second pump) cannot move the
    * timestamp. Delivered, consumed and resolved stay three separate facts.
@@ -741,7 +745,7 @@ export class Notices {
     const delivery = this.rt.store.get('deliveries', deliveryId)
     if (delivery === undefined || delivery.notice === undefined) return false
     const at = options.at ?? Date.now()
-    const source = options.source ?? 'agent/inbox/claimed'
+    const source = options.source ?? 'user/message'
     let recorded = false
     this.rt.commit(delivery.missionId, () => {
       const fresh = this.rt.store.get('deliveries', deliveryId)
@@ -1010,6 +1014,8 @@ export class Notices {
     if (delivery.notice?.aggregatedFacts !== undefined) {
       return [...new Set(delivery.notice.aggregatedFacts.flatMap(fact => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, fact))))]
     }
+    const stopFailures = this.stopFailureSubjects(mission.id, delivery)
+    if (stopFailures !== undefined) return stopFailures
     return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
       if (subject === missionSubject(mission)) {
         if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
@@ -1029,7 +1035,25 @@ export class Notices {
    */
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean {
     if (ownerDeliveryMoot(mission, delivery)) return false
+    if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
+    const stopFailures = this.stopFailureSubjects(mission.id, delivery)
+    if (stopFailures !== undefined) return mission.status !== 'completed' && stopFailures.length > 0
     const fact = noticeRow(delivery)
+    // A receipt-linked action expires when that exact question is settled;
+    // task or mission progress is neither necessary nor sufficient to settle it.
+    const legacyQuestionKey = fact?.dedupKey.startsWith('owner-reply-missing:') ? fact.dedupKey.slice('owner-reply-missing:'.length, fact.dedupKey.lastIndexOf(':')) : undefined
+    const questionId = fact?.questionId ?? legacyQuestionKey
+    if (questionId !== undefined) {
+      const question = this.rt.store.get('deliveries', questionId)
+      if (question?.missionId !== mission.id || question.to !== 'owner' || question.replyExpected !== true || question.answeredBy !== undefined) return false
+    }
+    if (fact?.deliveryFailureId !== undefined) {
+      const failed = this.rt.store.get('deliveries', fact.deliveryFailureId)
+      if (failed?.missionId !== mission.id || failed.deliveryFailure === undefined) return false
+      if (!this.rt.store.list('deliveries', mission.id).some(row => row.to === failed.to && row.deliveredAt === undefined
+        && row.deliveryFailure?.reason === failed.deliveryFailure!.reason && row.deliveryFailure.at >= failed.deliveryFailure!.at)) return false
+    }
+    if (fact?.trigger === 'mission/budget-warning' && !this.currentBudgetWarnings(mission, fact).some(Boolean)) return false
     if (fact === undefined || fact.class === 'completion' || fact.class === 'progress') return true
     if (fact.aggregatedFacts !== undefined) return this.relevantSummaryFacts(mission, delivery).length > 0
     const family = noticeFamily(delivery)
@@ -1071,6 +1095,51 @@ export class Notices {
     return true
   }
 
+  /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
+  private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
+    const prefix = 'guard-terminal:attempt_lease:attempt_terminal:stop:'
+    const key = delivery.notice?.dedupKey
+    if (!key?.startsWith(prefix)) return undefined
+    const tasks = this.rt.store.list('tasks', missionId)
+    return (delivery.subjects ?? []).filter(subject => {
+      const task = taskFromSubject(subject, tasks)
+      const marker = task?.resumeAfterStop
+      if (task === undefined || marker?.epoch !== task.epoch || marker.failure === undefined) return false
+      const digest = createHash('sha256').update(marker.failure.message).digest('hex')
+      return key === `${prefix}${task.id}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${digest}`
+    })
+  }
+
+  /** Re-render only structured batches, leaving their original ledger intact. */
+  ownerDeliveryContent(mission: Mission, delivery: Delivery): string {
+    const fact = noticeRow(delivery)
+    if (fact?.aggregatedFacts !== undefined) {
+      const facts = this.relevantSummaryFacts(mission, delivery).flatMap(part => this.summaryFactText(delivery, part))
+      return renderNoticeFacts('Current owner facts; superseded actions remain in the durable record.', facts, mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+    }
+    if (fact?.trigger === 'mission/budget-warning' && fact.facts !== undefined) {
+      const flags = this.currentBudgetWarnings(mission, fact)
+      if (flags.some(current => !current)) return renderNoticeFacts('Current resource review; superseded limits remain in the durable record.',
+        fact.facts.filter((_text, index) => index >= flags.length || flags[index]), mission.id, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+    }
+    return delivery.content
+  }
+
+  /** Budget warning identities encode their allocation; no body parsing. */
+  private currentBudgetWarnings(mission: Mission, fact: { reason?: string }): boolean[] {
+    const prefix = `budget-review:${mission.id}:`
+    return (fact.reason ?? '').split('\n').map(key => {
+      if (!key.startsWith(prefix)) return true // Legacy facts remain readable.
+      const match = /^(.*):(maxTokens|maxSteps|maxDurationMs|maxTasks|maxFindings):([\d.e+-]+):([\d.e+-]+)$/.exec(key.slice(prefix.length))
+      if (match === null) return true
+      const [, owner, dimension, limit] = match
+      if (owner === 'mission') return (mission.budget as unknown as Record<string, number>)[dimension!] === Number(limit)
+      const task = this.rt.store.get('tasks', owner!)
+      return task?.missionId === mission.id && !TERMINAL_STATES.has(task.status)
+        && (task as unknown as Record<string, unknown>)[dimension!] === Number(limit)
+    })
+  }
+
   /** Reuse the ordinary notice policy; legacy text-only summaries stay untouched. */
   private relevantSummaryFacts(mission: Mission, delivery: Delivery): NonNullable<NoticeRow['aggregatedFacts']> {
     return (delivery.notice?.aggregatedFacts ?? []).filter(fact => this.ownerDeliveryRelevant(mission, this.summaryFactDelivery(mission.id, delivery.id, fact)))
@@ -1082,13 +1151,16 @@ export class Notices {
       kind: fact.class === 'escalation' ? 'escalation' : 'control', content: '',
       subjects: fact.subjects, createdAt: fact.createdAt,
       notice: { class: fact.class, dedupKey: fact.dedupKey, sentAt: fact.createdAt, queuedAt: fact.createdAt,
-        trigger: fact.trigger, reason: fact.reason } as NonNullable<Delivery['notice']>,
+        trigger: fact.trigger, reason: fact.reason, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId } as NonNullable<Delivery['notice']>,
     }
   }
 
   /** Constituents reference the existing text array so exact reads do not duplicate it. */
   private summaryFactText(delivery: Delivery, fact: NonNullable<NoticeRow['aggregatedFacts']>[number]): string[] {
-    return (noticeRow(delivery)?.facts ?? []).slice(fact.factStart, fact.factStart + fact.factCount)
+    const text = (noticeRow(delivery)?.facts ?? []).slice(fact.factStart, fact.factStart + fact.factCount)
+    if (fact.trigger !== 'mission/budget-warning') return text
+    const flags = this.currentBudgetWarnings(this.rt.mission(delivery.missionId), fact)
+    return text.filter((_text, index) => index >= flags.length || flags[index])
   }
 
   /**
@@ -1527,6 +1599,31 @@ export class Notices {
     }
   }
 
+  /** The same durable failure covers missing recipients, transport errors and retries. */
+  private recordDeliveryFailure(missionId: string, delivery: Delivery, reason: string): void {
+    const member = this.rt.store.get('members', delivery.to)
+    this.rt.commit(missionId, () => {
+      const current = this.rt.store.get('deliveries', delivery.id)
+      if (current === undefined || current.deliveredAt !== undefined || current.deliveryFailure?.reason === reason) return
+      current.deliveryFailure = { reason, at: Date.now() }
+      this.rt.store.put('deliveries', current)
+      this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: delivery.to === 'owner' ? 'owner-delivery-failed' : 'worker-delivery-failed', deliveryId: delivery.id, to: delivery.to, reason })
+      if (delivery.to !== 'owner') {
+        // One local incident for a member/error, even when many messages
+        // are queued. A recovered queue makes this notice obsolete; a new
+        // failed delivery afterwards establishes a fresh incident.
+        const anchor = this.rt.store.list('deliveries', missionId).filter(row => row.to === delivery.to
+          && row.deliveredAt === undefined && row.deliveryFailure?.reason === reason)
+          .sort((a, b) => a.deliveryFailure!.at - b.deliveryFailure!.at)[0]!
+        this.notify(missionId, `Messages to ${member?.name ?? delivery.to} (${delivery.to}) are queued but cannot be delivered: ${reason}. Inspect that member's current task and stop/recovery state; repair or reassign its work to an available member. Increasing the task budget will not repair this transport failure.`,
+          this.rt.noticeSubjectsFor(missionId, { memberId: delivery.to }), {
+            noticeClass: 'blocker', trigger: 'worker-delivery-failed', reason,
+            dedupKey: `worker-delivery-failed:${anchor.id}:${reasonDigest(reason)}`, deliveryFailureId: anchor.id,
+          })
+      }
+    })
+  }
+
   async flushOutbox(missionId: string): Promise<void> {
     if (this.rt.shuttingDown) return
     for (const queued of this.rt.store.list('deliveries', missionId)) {
@@ -1550,15 +1647,20 @@ export class Notices {
       const member = delivery.to === 'owner'
         ? { id: 'owner', missionId, name: 'owner', role: 'owner', sessionId: mission.ownerSessionId, workspace: mission.workspace, status: 'idle' as const, subscriptions: [] }
         : this.rt.store.get('members', delivery.to)
-      if (!member || member.status === 'stopped') continue
+      if (!member || member.status === 'stopped') {
+        this.recordDeliveryFailure(missionId, delivery, !member
+          ? `Recipient ${delivery.to} is missing from the durable member roster`
+          : `Recipient ${delivery.to} is stopped`)
+        this.recordOutboxStarvation(missionId, delivery)
+        continue
+      }
       // S2: one never-settling adapter `deliver` must not stop every other
       // notice. Each attempt is claimed per delivery and bounded; an attempt
       // that does not settle is abandoned, recorded durably on the mission row,
       // and retried by a later pump (adapter acceptance is idempotent).
       if (this.delivering.has(delivery.id)) continue
-      if (delivery.to === 'owner' && delivery.notice?.aggregatedFacts !== undefined && delivery.notice.handoffAt === undefined) {
-        const facts = this.relevantSummaryFacts(mission, delivery).flatMap(fact => this.summaryFactText(delivery, fact))
-        delivery.content = renderNoticeFacts('Current owner facts; superseded actions remain in the durable record.', facts, missionId, delivery.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
+      if (delivery.to === 'owner' && delivery.notice !== undefined && delivery.notice.handoffAt === undefined) {
+        delivery.content = this.ownerDeliveryContent(mission, delivery)
         delivery.notice.handoffAt = Date.now()
         this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery))
       }
@@ -1601,13 +1703,7 @@ export class Notices {
         // A host failure did not deliver this message. Keep its identity queued
         // and record a durable fault once per distinct error, including after reload.
         const reason = error instanceof Error ? error.message : String(error)
-        this.rt.commit(missionId, () => {
-          const current = this.rt.store.get('deliveries', delivery.id) as (Delivery & { deliveryFailure?: { reason: string; at: number } }) | undefined
-          if (current === undefined || current.deliveredAt !== undefined || current.deliveryFailure?.reason === reason) return
-          current.deliveryFailure = { reason, at: Date.now() }
-          this.rt.store.put('deliveries', current)
-          this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: delivery.to === 'owner' ? 'owner-delivery-failed' : 'worker-delivery-failed', deliveryId: delivery.id, to: delivery.to, reason })
-        })
+        this.recordDeliveryFailure(missionId, delivery, reason)
         this.recordOutboxStarvation(missionId, delivery)
       }
       finally { if (bound !== undefined) clearTimeout(bound); this.delivering.delete(delivery.id) }

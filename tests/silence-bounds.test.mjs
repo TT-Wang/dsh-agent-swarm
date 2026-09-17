@@ -172,19 +172,21 @@ test('R16-D2 pair: a released pass is fenced durably and its own run is announce
   assert.equal(f.runtime.scheduling.passReleased(wedged), true, 'the durable row fences the released body')
   f.runtime.releasedPasses.clear()
   assert.equal(f.runtime.scheduling.passReleased(wedged), true, 'the fence survives a cleared in-memory Set')
+  const nativeStarts = workers.started.length
   // Pair 2: the notice dedup key. One released run is named once, by its own run
-  // id; the later wedges of the same unchanged board are not re-announced, while
-  // the durable release count keeps rising.
+  // id. Queued successors cannot start another physical operation until the
+  // hung native call returns, while the off-pass watchdog keeps naming it.
   await sleep(500)
   const wedgedEvents = f.staleEvents('mission/stalled').filter(item => item.data.wedged === true)
   assert.equal(wedgedEvents.filter(item => item.data.runId === wedged.runId).length, 1, 'the released run is witnessed exactly once')
   assert.equal(f.notices().filter(delivery => typeof delivery.content === 'string' && delivery.content.includes(`run ${wedged.runId}`)).length, 1,
     'the released run is announced to the owner exactly once')
   assert.equal(wedgedEvents.length, 1, `an unchanged board is not re-announced by later releases: ${JSON.stringify(wedgedEvents.map(item => item.data.runId))}`)
-  // The later wedges of the same unchanged board keep the release record and
-  // never erase it: the row still names a released run and its widening record.
+  // A queued successor is not another physical hang. Keep the release witness
+  // without requiring fabricated repeated starts merely to raise its count.
   const row = f.passRow()
-  assert.ok(row.releases >= 2, `the durable row counts every release, including the deduped ones (${row.releases})`)
+  assert.ok(row.releases >= 1, `the durable row retains the original release (${row.releases})`)
+  assert.equal(workers.started.length, nativeStarts, 'new pass rows never overlap the still-running native startup')
   assert.ok(row.worstRelease.gapMs >= 200, `the accumulated record keeps the widest release (${row.worstRelease.gapMs}ms)`)
   assert.equal(typeof row.worstRelease.runId, 'string', 'the durable row still names a released run')
   assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'and the preserved work is untouched')

@@ -126,7 +126,6 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.reviewPathNotices.clear()
     f.runtime.reviewPathReported.clear()
     f.runtime.integrationGapWarned.clear()
-    f.runtime.autoReviewAdmissions.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()
     const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
@@ -140,7 +139,7 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
   } finally { await f.cleanup() }
 })
 
-test('S5: a withdrawn automatic review is not re-admitted after the in-memory cache is cleared', async () => {
+test('S5: a withdrawn automatic review is not re-admitted when its admission falls outside the observation window', async () => {
   const f = await setup({ config: { tickMs: 10 } })
   try {
     // Keep the independent reviewer live: the automatic review needs one, and the
@@ -153,14 +152,13 @@ test('S5: a withdrawn automatic review is not re-admitted after the in-memory ca
     const reviewId = admitted.data.taskId
     // The runtime signature is cancel(actor, missionId, { taskId, reason }).
     f.runtime.cancel(f.owner, f.mission.id, { taskId: reviewId, reason: 'owner withdrew the automatic review' })
-    // The durable `task/review-admitted` event is the gate; clearing the cache
-    // must not admit a second review for the same source.
-    f.runtime.autoReviewAdmissions.clear()
+    // The durable exact admission lookup is independent of the UI window.
+    f.runtime.config.maxEvents = 1
     const blocked = await eventually(() => events(f.runtime, f.mission.id, 'task/review-blocked').at(-1),
       'a withdrawn automatic review must be reported, not silently re-admitted', 8_000)
     assert.match(String(blocked.data.reason), /withdrawn/, 'the durable gate names the withdrawn review')
     assert.equal(events(f.runtime, f.mission.id, 'task/review-admitted').length, 1,
-      'no second automatic review is admitted after the cache is lost')
+      'no second automatic review is admitted outside the observation window')
     assert.equal(f.runtime.store.list('tasks', f.mission.id).filter(item => item.reviewOf === task.id).length, 1,
       'exactly one review task exists for the source')
   } finally { await f.cleanup() }

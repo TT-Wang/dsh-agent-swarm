@@ -385,7 +385,7 @@ export interface Task {
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
   budgetResume?: { pauseId: string; attemptId: string; epoch: number }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
-  resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number }
+  resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
   closeout?: { nudges: number; at: number }
   /**
@@ -401,6 +401,8 @@ export interface Task {
   /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
+  /** Captured reviewer-authored record; never a dependency deliverable or independent verdict on its own contents. */
+  reviewArtifact?: Artifact
   /**
    * Authenticated proposer key (`owner` or a member id). Set at admission so
    * the per-member proposal allowance is counted from durable records and can
@@ -540,12 +542,16 @@ export interface NoticeEnvelope {
   sentAt: number
   queuedAt: number
   claimedAt?: number
+  /** Receipt or failed delivery whose current state decides whether this notice still applies. */
+  questionId?: string
+  deliveryFailureId?: string
   /** Original notice identities carried by a wake summary, independent of its transport identity. */
   aggregatedIdentities?: Array<{ class: NoticeClass; dedupKey: string; from: string; contentDigest: string }>
   /** Structured constituents let a queued wake summary recheck each original obligation. */
   aggregatedFacts?: Array<{
     class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
     subjects: string[]; trigger: string; reason: string; createdAt: number
+    questionId?: string; deliveryFailureId?: string
   }>
   /** First transport handoff freezes the rendered summary across uncertain retries. */
   handoffAt?: number
@@ -581,6 +587,9 @@ export interface Delivery {
   topic?: string
   createdAt: number
   deliveredAt?: number
+  /** Actual host message consumption, independent of transport acknowledgement timing. */
+  consumedAt?: number
+  deliveryFailure?: { reason: string; at: number }
   taskId?: string
   attemptId?: string
   /**

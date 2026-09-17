@@ -280,3 +280,58 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
   assert.equal(view.openAsks.asks[0].deliveryId, ask.id)
   assert.equal(view.openAsks.asks[0].from, f.member.id)
 })
+
+
+test('owner receipt books actual consumption before transport acknowledgement and survives context messages', async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
+  const question = f.deliveries().find(row => row.replyExpected)
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  t.after(() => guard.dispose())
+  assert.equal(question.deliveredAt, undefined)
+  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'swarm', deliveryId: question.id } })
+  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } })
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  assert.equal(f.events('owner/reply-missing').length, 1)
+  assert.equal(f.events('owner/reply-missing')[0].data.deliveredAt, null)
+  assert.ok(f.events('owner/reply-missing')[0].data.consumedAt)
+  assert.ok(f.runtime.store.get('deliveries', question.id).consumedAt)
+  assert.equal(f.runtime.store.get('deliveries', question.id).deliveredAt, undefined, 'consumption never forges a transport acknowledgement')
+})
+
+for (const summarized of [false, true]) test(`answered receipts invalidate queued nudges and terminal escalation${summarized ? ' within a wake summary' : ''}`, async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  const question = await f.ask()
+  if (summarized) {
+    f.runtime.notices.wakeBudget = 1
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`]))
+  }
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  t.after(() => guard.dispose())
+  for (let i = 0; i < 2; i++) {
+    guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
+    guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  }
+  const reminders = f.deliveries().filter(row => row.notice?.questionId === question.id || row.notice?.aggregatedFacts?.some(fact => fact.questionId === question.id))
+  assert.ok(reminders.length)
+  assert.ok(reminders.every(row => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
+  assert.ok(reminders.every(row => !f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(reminders.every(row => !f.workers.deliveries.some(sent => sent.id === row.id)), 'no answered reminder reaches transport')
+})
+
+
+test('pre-upgrade receipt nudges expire by their existing structured question key', async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  const question = await f.ask()
+  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'legacy nudge', [`mission:${f.mission.id}`], { dedupKey: `owner-reply-missing:${question.id}:1` }))
+  const nudge = f.deliveries().find(row => row.notice?.dedupKey === `owner-reply-missing:${question.id}:1`)
+  assert.equal(nudge.notice.questionId, undefined)
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), true)
+  f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), false)
+})

@@ -342,10 +342,13 @@ export class RuntimeGates {
     const inFlight = members.filter(member => memberPhaseOf(member) !== 'stopped'
       && (this.rt.workers.currentActivity?.(member.id) ?? member.activity)?.kind === 'model')
     const tasks = this.rt.store.list('tasks', mission.id)
-    const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; task?: Task }> = [
+    const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
+    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !['accepted', 'cancelled'].includes(task.status) && !pairedSources.has(task.id)).length
+    const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
       { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
       { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
       { dimension: 'maxDurationMs', used: executionElapsed(mission), limit: mission.budget.maxDurationMs, inFlight: 0 },
+      { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },
     ]
     for (const task of tasks) {
       if (['accepted', 'cancelled'].includes(task.status)) continue
@@ -357,12 +360,12 @@ export class RuntimeGates {
     let missionProgress: string | undefined
     for (const item of dimensions) {
       if (!(item.limit > 0)) continue
-      const projected = item.used + item.inFlight
+      const projected = item.used + item.inFlight + (item.reviewSlots ?? 0)
       const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
       const gate = `${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
       if (crossed === undefined || crossed <= (this.rt.mission(mission.id).budgetWarned?.[gate] ?? 0)) continue
-      // A recommendation must actually increase the estimate. The owner still
-      // reviews it; no runtime path applies this value automatically.
+      // This is only the numeric floor that restores threshold headroom, never
+      // an estimate of the resources needed to finish the mission.
       const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
       const suggestedLimit = Number.isSafeInteger(recommendation) ? recommendation : undefined
       const scope = item.task === undefined ? 'Mission' : `Task ${item.task.id} (${item.task.title})`
@@ -371,10 +374,12 @@ export class RuntimeGates {
         : `status ${item.task.status}; ${item.task.evidenceIds.length} evidence records; artifact ${item.task.artifact?.commit ?? 'not submitted'}`
       const data = { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
         remaining: Math.max(0, item.limit - item.used), inFlightEstimate: item.inFlight, projected,
-        ...(suggestedLimit === undefined ? {} : { suggestedLimit }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
+        projectionBasis: item.dimension === 'maxTokens' ? 'settled-plus-current-model-requests' : item.reviewSlots !== undefined ? 'admitted-plus-unpaired-reviews' : 'settled-plus-in-flight',
+        ...(item.reviewSlots === undefined ? {} : { pendingReviewSlots: item.reviewSlots, remainingAfterReviews: Math.max(0, item.limit - projected) }),
+        ...(suggestedLimit === undefined ? {} : { suggestedLimit, suggestedLimitBasis: 'threshold-headroom-only' }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
       warnings.push({ gate, threshold: crossed, key: `budget-review:${mission.id}:${gate}:${crossed}`, data,
         subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
-        content: `${scope}: ${item.dimension} settled ${item.used}/${item.limit}, remaining ${data.remaining}; in-flight estimate ${item.inFlight}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Suggested ${item.dimension}: ${suggestedLimit}.`} Progress: ${progress}.${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
+        content: `${scope}: ${item.dimension} ${item.reviewSlots === undefined ? 'settled' : 'admitted'} ${item.used}/${item.limit}, remaining ${data.remaining}; ${item.reviewSlots === undefined ? `in-flight estimate ${item.inFlight}` : `${item.reviewSlots} known review slots still needed`}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Threshold-headroom floor for ${item.dimension}: ${suggestedLimit}; decide the actual allowance from remaining work.`} Progress: ${progress}.${item.dimension === 'maxTokens' ? ' Token projection covers current requests only, not the cost of completing remaining tasks.' : ''}${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
     if (!warnings.length) return
     // One owner wake for this pass; each dimension keeps its durable event and

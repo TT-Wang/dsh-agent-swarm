@@ -430,7 +430,10 @@ interface MissionWorkspace { version: 1; missionId: string; source: string; base
 const INTEGRATION_CONFLICT_FILE = '.swarm-integration-conflicts.json'
 interface IntegrationConflict { dependencyId: string; commit: string; paths: string[] }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; preservedCommit?: string; recovery?: TaskRecovery
-  dependencyCommits?: string[]; integrationConflicts?: IntegrationConflict[] }
+  dependencyCommits?: string[]; integrationConflicts?: IntegrationConflict[]; preservationPaths?: string[] }
+function validRecoveryPath(name: string): boolean {
+  return name.length > 0 && !path.isAbsolute(name) && !/[\u0000-\u001f]/.test(name) && !name.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
+}
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 /**
@@ -1050,6 +1053,7 @@ export class Workspaces {
       if (task.preservedCommit !== undefined && !commitId(task.preservedCommit)) throw new Error('Invalid persisted preservation commit')
       if (task.dependencyCommits !== undefined && (!Array.isArray(task.dependencyCommits) || !task.dependencyCommits.every(commitId))) throw new Error('Invalid persisted dependency commits')
       if (task.integrationConflicts !== undefined && (!Array.isArray(task.integrationConflicts) || !task.integrationConflicts.every(item => isRecord(item) && typeof item.dependencyId === 'string' && commitId(item.commit) && Array.isArray(item.paths) && item.paths.every(p => typeof p === 'string' && !path.isAbsolute(p) && !p.split('/').includes('..'))))) throw new Error('Invalid persisted integration conflicts')
+      if (task.preservationPaths !== undefined && (!Array.isArray(task.preservationPaths) || !task.preservationPaths.every(name => typeof name === 'string' && validRecoveryPath(name)))) throw new Error('Invalid persisted recovery paths')
       const saved = task.recovery
       let recovery: TaskRecovery | undefined
       if (saved !== undefined) {
@@ -1059,6 +1063,7 @@ export class Workspaces {
       record.task = { taskId: task.taskId, epoch: task.epoch as number, baseCommit: task.baseCommit,
         ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}),
         ...(typeof task.preservedCommit === 'string' ? { preservedCommit: task.preservedCommit } : {}),
+        ...(task.preservationPaths === undefined ? {} : { preservationPaths: task.preservationPaths as string[] }),
         ...(task.dependencyCommits === undefined ? {} : { dependencyCommits: task.dependencyCommits as string[] }),
         ...(task.integrationConflicts === undefined ? {} : { integrationConflicts: task.integrationConflicts as unknown as IntegrationConflict[] }),
         ...(recovery === undefined ? {} : { recovery }) }
@@ -1159,6 +1164,7 @@ export class Workspaces {
         signal.throwIfAborted()
 
         const record = await this.memberRecord(member)
+        const preservationPaths = this.taskRecoveryPaths(task)
         if (task.reviewOf !== undefined) {
           if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
           await this.validateArtifact(member, reviewSource.artifact, signal)
@@ -1169,12 +1175,19 @@ export class Workspaces {
         const sameReview = reviewSource === undefined || record.task?.baseCommit === reviewSource.artifact?.commit
         const desiredDependencies = dependencies.flatMap(dependency => dependency.artifact === undefined ? [] : [dependency.artifact.commit]).sort()
         const sameDependencies = JSON.stringify([...(record.task?.dependencyCommits ?? [])].sort()) === JSON.stringify(desiredDependencies)
-        if (sameReview && sameDependencies && ownsRecovery && record.task?.taskId === task.id && record.task.epoch === task.epoch) return
+        if (sameReview && sameDependencies && ownsRecovery && record.task?.taskId === task.id && record.task.epoch === task.epoch) {
+          if (JSON.stringify(record.task.preservationPaths ?? []) !== JSON.stringify(preservationPaths)) {
+            record.task.preservationPaths = preservationPaths
+            await this.saveTaskWorkspace(record)
+          }
+          return
+        }
         if (sameReview && sameDependencies && ownsRecovery && record.task?.taskId === task.id) {
           if (record.task.epoch > task.epoch) throw new Error('Task attempt is older than the prepared workspace')
           // Same-task recovery keeps both committed and uncommitted progress. The
           // runtime must stop the previous attempt before preparing its replacement.
           record.task.epoch = task.epoch
+          record.task.preservationPaths = preservationPaths
           await this.saveTaskWorkspace(record)
           return
         }
@@ -1184,8 +1197,9 @@ export class Workspaces {
           // Dispatch only reaches this member after the old execution stopped.
           // Preserve all ordinary WIP, including out-of-scope work, separately
           // from accepted artifacts before removing anything from this checkout.
-          if (dirty || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
+          if (dirty || record.task.preservationPaths?.length || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
             await this.preserveWorkspace(record, signal, { allowSuperseded: true })
+            await this.assertNoIgnoredOverwrite(member.workspace, record.task.preservedCommit!, signal, record.task.preservationPaths)
             await this.git(member.workspace, ['reset', '--hard', record.task.preservedCommit!], signal)
             previousHead = record.task.preservedCommit!
           }
@@ -1207,7 +1221,8 @@ export class Workspaces {
         try {
           const startingCommit = recompose ? reviewCommit ?? mission.baseCommit : recovery?.commit ?? reviewCommit ?? mission.baseCommit
           await this.ensureSourceCommit(member.missionId, mission.source, startingCommit, signal)
-          await this.git(member.workspace, ['checkout', '--detach', startingCommit], signal)
+          await this.assertNoIgnoredOverwrite(member.workspace, startingCommit, signal)
+          await this.git(member.workspace, ['checkout', '--no-overwrite-ignore', '--detach', startingCommit], signal)
           if ((recovery === undefined || recompose) && reviewCommit === undefined) for (const dependency of dependencies) {
             if (dependency.status !== 'accepted') throw new Error(`Dependency ${dependency.id} is not accepted`)
             if (dependency.artifact === undefined) {
@@ -1216,7 +1231,8 @@ export class Workspaces {
             }
             await this.validateArtifact(member, dependency.artifact, signal)
             dependencyCommits.push(dependency.artifact.commit)
-            try { await this.git(member.workspace, ['merge', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
+            await this.assertNoIgnoredOverwrite(member.workspace, dependency.artifact.commit, signal)
+            try { await this.git(member.workspace, ['merge', '--no-overwrite-ignore', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
             catch (error) {
               // Only integration tasks receive conflicts. The host makes the
               // composition (including conflict markers) an immutable baseline,
@@ -1248,7 +1264,7 @@ export class Workspaces {
             } finally { await rm(patchPath, { force: true }) }
           }
           if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
-          record.task = { taskId: task.id, epoch: task.epoch, baseCommit,
+          record.task = { taskId: task.id, epoch: task.epoch, baseCommit, preservationPaths,
             ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
             ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
           await this.saveTaskWorkspace(record)
@@ -1260,6 +1276,7 @@ export class Workspaces {
           // Entry required a clean owned checkout; rollback restores exactly that
           // state and leaves all captured commits reachable through swarm refs.
           await this.git(member.workspace, ['merge', '--abort']).catch(() => undefined)
+          await this.assertNoIgnoredOverwrite(member.workspace, previousHead)
           await this.git(member.workspace, ['reset', '--hard', previousHead])
           throw error
         }
@@ -1322,17 +1339,60 @@ export class Workspaces {
       if (record.task === undefined) return
       if (record.task.taskId !== task.id) {
         if (options?.ifOwned === true) return
-        throw new Error('Cannot checkpoint a workspace owned by another task')
+        if (await this.hasDurableCheckpoint(member, task, signal)) return
+        throw Object.assign(new Error('[workspace_ownership_conflict] Cannot checkpoint a workspace owned by another task; no durable checkpoint proves the stopped task was saved. Preserve both task workspaces and inspect the task workspace records before retrying resume.'), { code: 'WORKSPACE_OWNERSHIP_CONFLICT' })
       }
+      // Older metadata has no path hints; the current task contract supplies them.
+      record.task.preservationPaths = this.taskRecoveryPaths(task)
       await this.preserveWorkspace(record, signal)
     })
+  }
+
+  private taskRecoveryPaths(task: Task): string[] {
+    const dependencies = this.dependencyNames()
+    return deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => validRecoveryPath(name)
+      && withinScope(name, task.scope) && !name.split('/').some(part => dependencies.has(part)))
+  }
+
+  /** A legacy failed claim may have moved the member after saving its old task.
+   * Stop has already joined the worker. Only the exact preceding epoch's saved
+   * checkpoint permits release; never snapshot or modify the member's new work. */
+  private async hasDurableCheckpoint(member: Member, task: Task, signal: AbortSignal): Promise<boolean> {
+    const saved = await readJson(this.taskPath(member.missionId, task.id))
+    if (!isRecord(saved) || saved.version !== 1 || saved.missionId !== member.missionId || saved.memberId !== member.id
+      || saved.workspace !== member.workspace || !isRecord(saved.task) || saved.task.taskId !== task.id
+      || saved.task.epoch !== task.epoch - 1 || !commitId(saved.task.baseCommit)) return false
+    const commit = saved.task.preservedCommit ?? saved.task.capturedCommit
+    if (!commitId(commit)) return false
+    const mission = await this.missionRecord(member.missionId)
+    const repo = await this.artifactRepo(member.missionId, mission.source, signal)
+    try {
+      await this.git(repo, ['cat-file', '-e', `${commit}^{commit}`], signal)
+      await this.git(repo, ['merge-base', '--is-ancestor', saved.task.baseCommit, commit], signal)
+    } catch { signal.throwIfAborted(); return false }
+    return true
+  }
+
+  /** Git resets can erase ignored obstacles; check compact ignored prefixes
+   * against the target tree. Explicit snapshot paths are safe only while
+   * installing the just-captured private snapshot of this quiescent checkout. */
+  private async assertNoIgnoredOverwrite(workspace: string, commit: string, signal?: AbortSignal, capturedPaths: readonly string[] = []): Promise<void> {
+    const ignored = (await this.git(workspace, ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '--no-empty-directory', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+    if (!ignored.length) return
+    const targetPaths = (await this.git(workspace, ['ls-tree', '-rz', '--name-only', '--full-tree', commit], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+    const captured = new Set(capturedPaths)
+    const collisions = targetPaths.filter(name => !captured.has(name) && ignored.some(hidden => {
+      const prefix = hidden.replace(/\/$/, '')
+      return name === prefix || name.startsWith(`${prefix}/`) || prefix.startsWith(`${name}/`)
+    }))
+    if (collisions.length) throw new PolicyError('workspace_ignored_collision', 'conflict_error', `Ignored files would be overwritten at ${collisions.slice(0, 8).map(name => JSON.stringify(name)).join(', ')}. Their contents remain in place. Preserve or move these local files outside the affected paths, then resume the same task; they were not captured as artifacts.`)
   }
 
   private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<void> {
     const task = record.task
     if (task === undefined) throw new Error('Cannot preserve a workspace without task ownership')
     const snapshot = await captureGitSnapshot(record.workspace, path.join(this.missionDir(record.missionId), 'preservation'),
-      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal)
+      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal, task.preservationPaths)
     const nonce = randomUUID()
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)

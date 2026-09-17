@@ -25,21 +25,24 @@
  * enumerated, but no label claimed for them and no runtime test written, because
  * the runtime reaches them only through an injected adapter.
  *
- * The two labels, defined operationally:
+ * The labels, defined operationally:
  *  - `derivable`: the gate consults durable state before it acts, so clearing
  *    the collection cannot make the gate wrong. The test re-reads the store.
  *  - `cache-only`: clearing the collection cannot change a durable outcome or
  *    produce a wrong durable transition; the worst case is duplicated idempotent
  *    work or a lost in-process notification. The test clears it and shows the
  *    durable result is unchanged.
+ *  - `in-flight`: physical operations are still owned by this process. They
+ *    must settle before their serialization entry can be released; durable CAS
+ *    does not undo Git effects and is not a substitute for this ownership.
  *
  * Existing policy gates retain these labels and their behavior tests. New
  * recovery entries also distinguish native lifecycle ownership and an audit
  * buffer that has not yet become durable; neither is relabelled as a harmless
  * cache. Registration follows the binding name, so a new persistent collection
  * cannot hide behind an edited occurrence count.
- * The five fixes are structural, not re-labelling — the mission queue no longer
- * chains past the declared bound, the launch's cancellation is re-read from the
+ * The mission queue refuses waiters past its declared bound while retaining
+ * the in-flight operation; the launch's cancellation is re-read from the
  * durable start row before activation, the consecutive-failure count lives on
  * the member row, every deferred body re-derives from durable state, and the
  * pass watchdog stamps `releasedRunId` on the durable pass row.
@@ -183,12 +186,11 @@ const CENSUS = [
   ["src/runtime.ts",3,"Set","const UNSET_VARIABLE_OPTIONS = new Set(['-v', '--'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/runtime.ts",4,"Set","const ENV_CHDIR_OPTIONS = new Set(['-C', '--chdir'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/runtime.ts",5,"Set","private readonly listeners = new Set<(missionId: string) => void>()","gate","cache-only","in-process change fan-out; a lost notification changes no durable state and a subscriber re-reads on its next request"],
-  ["src/runtime.ts",6,"Map","readonly queues = new Map<string, Promise<unknown>>()","gate","cache-only","S5c: the chain is an in-process ordering cache. `exclusive` waits for a predecessor only up to the declared bound (stallPassTimeoutMs) and then starts the next operation, so a wedged body can no longer swallow it, and two bodies that overlap after the bound cannot lose an update because every commit is a single-writer transaction and every task write is a compare-and-swap on the task revision (SwarmStore.putTask). Clearing it removes ordering only, never a durable outcome (probe below)"],
+  ["src/runtime.ts",6,"Map","readonly queues = new Map<string, Promise<unknown>>()","gate","in-flight","Physical operations remain serialized until their promises settle; bounded waiters are refused without releasing a still-running predecessor. The watchdog and notices run outside the queue. This ownership cannot safely be cleared while adapter I/O is live; restart recovery comes from task/workspace records."],
   ["src/runtime.ts",7,"Set","private readonly operations = new Set<Promise<unknown>>()","gate","cache-only","S5c: the drain registry orders shutdown; the deferred body is registered by `defer` and runs regardless, so clearing the registry does not cancel it and its durable write still lands (probe below). Every deferred body the runtime schedules re-derives its work from durable state (the pass row, the budget `stopping` claim, the durable outbox), so losing the drain lets dispose() return earlier but cannot make a durable transition wrong"],
   ["src/runtime.ts",8,"Map","private readonly startControllers = new Map<string, AbortController>()","gate","derivable","S5c: the abort handle is an accelerator. `failStart` records the failed request durably and `launchDraft` re-reads that row immediately before it activates the mission, so a cancelled launch cannot come active even when the registry is lost or raced (probe below)"],
   ["src/runtime.ts",9,"Map","readonly startFailures = new Map<string, number>()","gate","derivable","S5c: the count is read from and written to the durable member row (`startFailures` field) and cleared there by the same successful start that clears the provider outage; the Map is the in-process mirror, so a lost map or a restart continues the count instead of resetting the route budget (probe below)"],
   ["src/runtime.ts",10,"Map","private readonly observeCursors = new Map<string, DeliveredCursor>()","gate","cache-only","delivered-position context cache; loss re-sends one bounded focused view and a cursor can never exceed the durable log"],
-  ["src/runtime.ts",11,"Map","private readonly autoReviewAdmissions = new Map<string, string>()","gate","derivable","the durable task/review-admitted event is read first; the map is only a fallback for an admission whose event write failed"],
   ["src/runtime.ts",12,"Set","private readonly reviewPathReported = new Set<string>()","gate","derivable","the durable task/review-missing event for the exact submission is re-read before the set is trusted"],
   ["src/runtime.ts",13,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",14,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -344,7 +346,7 @@ test('S5 census: persistent collection identities have a recovery classification
   for (const entry of GATES) {
     const id = `${entry[0]}:${bindingName(entry[3])}`
     assert.ok(found.has(id), `${id}: a registered policy gate disappeared; review its behavior test`)
-    assert.ok(['derivable', 'cache-only'].includes(entry[5]), `${id}: existing policy gates retain their tested labels`)
+    assert.ok(['derivable', 'cache-only', 'in-flight'].includes(entry[5]), `${id}: policy and physical ownership require an explicit tested label`)
   }
   for (const [id, entry] of Object.entries(RECOVERY_COLLECTIONS)) {
     assert.ok(found.has(id), `${id}: stale recovery registration`)
@@ -390,43 +392,25 @@ const GATE_TESTS = {
   },
   'src/runtime.ts:6': async t => {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 50 } })
+    const gate = deferred()
+    const keepAlive = setInterval(() => {}, 1000)
+    let pending
     try {
-      // Live work plus a wedged queued body: before S5c the next mission
-      // operation chained behind the promise that never settles and was
-      // swallowed (the Row-13 shape). The assertion is deliberately inverted
-      // from the predecessor's probe, so a regression to a swallowing chain
-      // fails this test.
       const task = f.propose({ title: 'Live work under a wedged queue' })
       await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      void f.runtime.exclusive(f.mission.id, () => new Promise(() => {}))
+      pending = f.runtime.exclusive(f.mission.id, async () => { await gate.promise; return 'settled' })
       assert.ok(f.runtime.queues.size > 0, 'the wedged body holds a chain entry')
-      const ran = await Promise.race([
-        f.runtime.exclusive(f.mission.id, async () => 'ran'),
-        new Promise(resolve => setTimeout(() => resolve('SWALLOWED'), 1_000)),
-      ])
-      assert.equal(ran, 'ran', 'a predecessor wedged past the declared bound must not swallow the next mission operation')
-
-      // The loss on a non-empty collection: clearing the ordering cache removes
-      // serialization only. The gated body still runs and its durable write
-      // still lands, and the mission's durable attempt is untouched.
-      const gate = deferred()
-      const pending = f.runtime.exclusive(f.mission.id, async () => {
-        await gate.promise
-        const mission = f.runtime.mission(f.mission.id)
-        mission.updatedAt += 1
-        f.runtime.commit(f.mission.id, () => f.runtime.store.put('missions', mission))
-        return 'gated'
-      })
-      assert.ok(f.runtime.queues.size > 0, 'the loss must be exercised on a non-empty collection')
-      const revision = f.runtime.store.revision()
-      f.runtime.queues.clear()   // the loss
+      let ran = false
+      await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ran = true }), /mission_operation_pending/)
+      await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ran = true }), /mission_operation_pending/)
+      assert.equal(ran, false, 'neither a timeout nor its cleanup authorizes overlapping physical effects')
+      assert.equal(await f.runtime.exclusive('unrelated-queue', async () => 'available'), 'available')
       gate.resolve()
-      assert.equal(await pending, 'gated', 'clearing the ordering cache does not cancel the body it was ordering')
-      assert.ok(f.runtime.store.revision() > revision, 'the gated body still committed its durable write')
-      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the durable attempt is untouched by the lost ordering cache')
+      assert.equal(await pending, 'settled')
+      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'timeouts do not revoke the durable attempt')
       const rejected = await f.runtime.exclusive(f.mission.id, () => { throw new Error('probe rejection') }).then(() => 'resolved', error => `rejected:${error.message}`)
       assert.equal(rejected, 'rejected:probe rejection', 'a rejected body does not swallow the chain')
-    } finally { await f.cleanup() }
+    } finally { gate.resolve(); await pending; clearInterval(keepAlive); await f.cleanup() }
   },
   'src/runtime.ts:7': async t => {
     // The loss on a non-empty collection: clear the drain registry while a
@@ -535,34 +519,6 @@ const GATE_TESTS = {
       const cursor = f.runtime.observeCursors.get(f.author.id)
       assert.ok(cursor.eventSeq <= durableEvents.at(-1).seq, 'a cursor can never exceed the durable log, so presence cannot hide an event')
     } finally { await f.cleanup() }
-  },
-  'src/runtime.ts:11': async t => {
-    // The durable `task/review-admitted` event is the gate: a withdrawn review
-    // still blocks with the map cleared, and a phantom map entry cannot block.
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Withdrawn review' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'the automatic review is admitted')
-      f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S5: withdraw the automatic review' })
-      assert.ok(f.runtime.autoReviewAdmissions.size > 0, 'the automatic admission is cached; the loss must be exercised on a non-empty collection')
-      f.runtime.autoReviewAdmissions.clear()   // the loss
-      const blocked = await eventually(() => events(f.runtime, f.mission.id, 'task/review-blocked').at(-1),
-        'the withdrawal blocker is re-derived from the durable admission event')
-      assert.match(blocked.data.reason, /withdrawn/, 'the gate follows the durable event, not the lost map')
-    } finally { await f.cleanup() }
-    const phantom = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = phantom.propose({ title: 'Phantom map entry' })
-      phantom.runtime.autoReviewAdmissions.set(task.id, 'task_phantom')
-      const claimed = await phantom.runtime.claim(phantom.actor(phantom.author), phantom.mission.id, task.id)
-      await phantom.runtime.submit(phantom.actor(phantom.author), phantom.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => phantom.runtime.store.list('tasks', phantom.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'a map entry with no durable admission cannot block a legitimate automatic review')
-      assert.notEqual(review.id, 'task_phantom')
-    } finally { await phantom.cleanup() }
   },
   'src/runtime.ts:12': async t => {
     const f = await setup({ config: { tickMs: 10 } })

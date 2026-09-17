@@ -6,7 +6,8 @@ import { join, isAbsolute } from 'node:path'
 import { authorizeWorkspace, loadWorkspaceGrants, type WorkspaceGrant } from './authorization.ts'
 import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
-import { HarnessWorkers } from './harness-workers.ts'
+import { HarnessWorkers, installOwnerDeliveryFilter } from './harness-workers.ts'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS } from './workspaces.ts'
 import { registerTools, SWARM_PROMPT } from './tools.ts'
 import { RoleScoper } from './roles.ts'
@@ -78,8 +79,8 @@ export interface Config {
   traceSpillRetentionDays: number
   /**
    * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
-   * left unanswered and instructs with the exact call; `block` additionally
-   * refuses the owner's next step while the receipt stays open.
+   * left unanswered and instructs with the exact call. Legacy `block` is an
+   * alias: the owner's control channel always remains available to answer.
    */
   ownerReplyGuard: 'nudge' | 'block'
   /** Nudges spent on one unanswered owner question before the guard terminal; default 2. */
@@ -176,6 +177,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
   ctx.provide('swarm', runtime)
+  const pruneOwnerInbox = installOwnerDeliveryFilter(ctx, (sessionId, deliveryId) => {
+    const delivery = runtime.store.get('deliveries', deliveryId)
+    if (delivery === undefined || delivery.to !== 'owner') return undefined
+    const mission = runtime.store.get('missions', delivery.missionId)
+    if (mission?.ownerSessionId !== sessionId) return undefined
+    return runtime.ownerDeliveryRelevant(mission, delivery) ? runtime.ownerDeliveryContent(mission, delivery) : false
+  })
+  ctx.effect(() => runtime.subscribe(missionId => {
+    const mission = runtime.store.get('missions', missionId)
+    const owner = mission === undefined ? undefined : ctx.agents.get(SessionId(mission.ownerSessionId))
+    if (owner !== undefined) pruneOwnerInbox(owner)
+  }), 'swarm.owner-inbox-relevance')
   // R17-G9: the pre-append invariant pilot. The companion registers through the
   // host's `ctx.invariants` facility (the same one twelve host packages use), so
   // an owner-facing decision naming a subject whose lineage still has a live path

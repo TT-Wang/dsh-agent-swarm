@@ -9,11 +9,17 @@ export interface AssignmentCandidate {
   resumeAfterStop?: unknown
   budgetResume?: unknown
   reviewOf?: string
+  priorOwnerIds?: readonly string[]
+  checkpoint?: unknown
 }
 
 /** Recovery and handoff own their workspace; only untouched pending work may move. */
 export function canBorrowTask(task: AssignmentCandidate): boolean {
-  return task.assignmentMode === 'preferred' && task.status === 'pending' && task.epoch === 0
+  // New admissions record an explicit empty ownership history. Epoch also
+  // fences preparation/policy edits and does not imply that execution began.
+  // Old rows without ownership history retain the conservative epoch guard.
+  const untouched = task.priorOwnerIds === undefined ? task.epoch === 0 : task.priorOwnerIds.length === 0
+  return task.assignmentMode === 'preferred' && task.status === 'pending' && untouched && task.checkpoint === undefined
     && task.attempt === undefined && task.resumeAfterStop === undefined && task.budgetResume === undefined
 }
 

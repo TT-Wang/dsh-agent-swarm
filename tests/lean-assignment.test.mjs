@@ -134,7 +134,7 @@ test('borrowing cannot consume an explicitly pinned independent reviewer', async
 
 test('attempted work, budget resumes and stop transitions cannot be borrowed', async t => {
   const f = await fixture(t); await occupy(f)
-  for (const extra of [{ epoch: 1 }, { attempt: { ownerId: f.preferred.id } }, { budgetResume: { epoch: 0 } }, { resumeAfterStop: { epoch: 0 } }]) {
+  for (const extra of [{ epoch: 1, priorOwnerIds: [f.preferred.id] }, { epoch: 1, priorOwnerIds: undefined }, { attempt: { ownerId: f.preferred.id } }, { budgetResume: { epoch: 0 } }, { resumeAfterStop: { epoch: 0 } }]) {
     const task = { ...f.propose(), ...extra }
     f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', task))
     assert.equal(canBorrowTask(task), false)

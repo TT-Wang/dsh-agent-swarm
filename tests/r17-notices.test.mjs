@@ -170,22 +170,22 @@ test('R17-G8: consumption is recorded from the host claimed signal with a CAS; d
   assert.equal('claimedAt' in row.notice, false, 'and gone from the durable row')
 })
 
-test('R17-G8: the host claimed signal itself records consumption end to end', async t => {
+test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
   const f = await fixture(t)
   f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
   assert.ok(notice)
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  // The adapter composes the relay source on the inbox message (kind, mission,
-  // sender, deliveryId); the host fires `agent/inbox/claimed` with that message
-  // when the owner claims it. Emitting the real event must record consumption.
-  f.ctx.emit('agent/inbox/claimed', { message: { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }, turn: 1 })
+  const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
+  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
+  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
+  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   const row = f.runtime.store.get('deliveries', notice.id)
   assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')
+  assert.equal(row.notice.consumptionSource, 'user/message')
   // A replayed signal cannot move it (compare-and-swap).
   const recorded = row.notice.consumedAt
-  f.ctx.emit('agent/inbox/claimed', { message: { source: { kind: 'swarm', deliveryId: notice.id } }, turn: 2 })
+  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
 })
 
@@ -316,22 +316,22 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   assert.equal(notice.notice.reason, recorded.data.reason, 'the recorded reason is the durable event payload, not a test constant')
 })
 
-test('R17-G8: the host claimed signal itself records consumption end to end', async t => {
+test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
   const f = await fixture(t)
   f.emit('host signal probe', [`mission:${f.mission.id}`], { trigger: 'test/host-signal', reason: 'probe' })
   const notice = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('test/host-signal:'))
   assert.ok(notice)
   await eventually(() => f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined ? true : undefined, 'the outbox delivers the notice')
-  // The adapter composes the relay source on the inbox message (kind, mission,
-  // sender, deliveryId); the host fires `agent/inbox/claimed` with that message
-  // when the owner claims it. Emitting the real event must record consumption.
-  f.ctx.emit('agent/inbox/claimed', { message: { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }, turn: 1 })
+  const message = { source: { kind: 'swarm', form: 'relay', missionId: f.mission.id, senderMemberId: 'runtime', deliveryId: notice.id, deliveryKind: 'control' } }
+  f.ctx.emit('agent/inbox/claimed', { message, turn: 1 })
+  assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, undefined, 'claim can still be rejected before model admission')
+  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   const row = f.runtime.store.get('deliveries', notice.id)
   assert.ok(Number.isSafeInteger(row.notice.consumedAt), 'the host signal recorded consumption')
-  assert.equal(row.notice.consumptionSource, 'agent/inbox/claimed')
+  assert.equal(row.notice.consumptionSource, 'user/message')
   // A replayed signal cannot move it (compare-and-swap).
   const recorded = row.notice.consumedAt
-  f.ctx.emit('agent/inbox/claimed', { message: { source: { kind: 'swarm', deliveryId: notice.id } }, turn: 2 })
+  f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
 })
 

@@ -1,5 +1,5 @@
 /** Durable collaboration policy. Worker lifecycle and filesystem effects belong to the adapter. */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
@@ -11,7 +11,7 @@ import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSub
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
-import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, type MissionBoardMember } from './projection.ts'
+import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
 export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard } from './gates.ts'
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
@@ -22,7 +22,7 @@ import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { assertScopeSelectors, formatDiagnostic, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { assignmentAllows } from './assignment.ts'
+import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
@@ -613,16 +613,18 @@ export class SwarmRuntime {
    *   - the unreviewed-submission grace: age of the durable `task/submitted`
    *     event (`unreviewedStall`; the old `unreviewedSince` timer is removed);
    *   - a withdrawn automatic review: durable `task/review-admitted` events
-   *     (`withdrawnAutomaticReview`, `autoReviewAdmissions` as fallback cache);
+   *     and deterministic task identity (`withdrawnAutomaticReview`);
    *   - a recorded missing review: durable `task/review-missing` event per
    *     submission (`missingReviewRecorded`);
    *   - notice dedup: the durable delivery ledger keyed by class + dedup key
    *     (`parkedNotices`, `reviewPathNotices`, `integrationGapWarned`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
-   *   - `queues`, `releasedPasses`, `idleSignals` (durable `Task.idleSignal`),
+   *   - `releasedPasses`, `idleSignals` (durable `Task.idleSignal`),
    *     `startFailures`, `budgetStops`, `operations`, `startControllers`,
    *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
+   *  physical ownership: `queues` retains in-flight operations until they settle.
+   *  It is not a disposable cache while adapter I/O can still affect a checkout.
    *
    * There is deliberately no in-memory `scheduled` Set: the Row-13 incident was
    * that Set swallowing the tick timer's only liveness action while the pass it
@@ -630,7 +632,7 @@ export class SwarmRuntime {
    */
   readonly store: SwarmStore
   private readonly listeners = new Set<(missionId: string) => void>()
-  readonly queues = new Map<string, Promise<unknown>>()
+  readonly queues = new Map<string, Promise<unknown> & { operation: { id: string } }>()
   /**
    * S5: the scheduling guard is a durable per-mission `passes` row (S1), re-read
    * from the store on every kick. There is deliberately no in-memory `scheduled`
@@ -664,13 +666,11 @@ export class SwarmRuntime {
   closed = false
   shuttingDown = false
   /**
-   * F2: automatic review admissions per submitted source, and the exact
-   * owner-notice already sent for an unreviewable one. The map keeps the
-   * runtime from admitting a second automatic review after the owner withdrew
-   * the first; the set keeps a persistent blocker from waking the owner on
+   * Exact owner notices already sent for an unreviewable source. Automatic
+   * review admissions are read directly from durable task events; the set
+   * keeps a persistent blocker from waking the owner on
    * every tick.
    */
-  private readonly autoReviewAdmissions = new Map<string, string>()
   
   /** Missing-review records already written, keyed by mission:source:submission seq. */
   private readonly reviewPathReported = new Set<string>()
@@ -712,9 +712,10 @@ export class SwarmRuntime {
   private readonly notices = new Notices(this)
   notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): void { return this.notices.notify(missionId, content, subjects, options) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
+  ownerDeliveryContent(mission: Mission, delivery: Delivery): string { return this.notices.ownerDeliveryContent(mission, delivery) }
   /**
-   * R17-G8: record real consumption for one owner delivery from the host's
-   * claimed signal (the adapter maps `agent/inbox/claimed` to the delivery id).
+   * Record consumption only when the host admits the relay into user/message,
+   * after native pre-step filtering, using the exact delivery id.
    * Compare-and-swap inside the mission transaction; delivered, consumed and
    * resolved stay three facts.
    */
@@ -1084,16 +1085,9 @@ export class SwarmRuntime {
     }
   }
   /**
-   * S5c: one serialized presentation of a mission's operations. The chain is an
-   * in-process ordering cache, not the mission's gate. A predecessor that has
-   * not settled inside the declared bound is treated as wedged — it is usually
-   * inside an adapter call (`workers.start`, `captureArtifact`, `verifyArtifact`)
-   * — and the next operation starts instead of being swallowed by a promise that
-   * may never settle (the Row-13 shape, which the pass watchdog only releases
-   * for a wedged *pass* with no live work). Two bodies that overlap after the
-   * bound cannot lose an update: every commit is a synchronous single-writer
-   * transaction and every task write is a compare-and-swap on the task's own
-   * revision (`SwarmStore.putTask`), so the worst case is a refused stale write.
+   * Serialize workspace effects as well as store writes. A bounded wait may
+   * refuse a caller, but cannot release its still-running predecessor: task CAS
+   * cannot undo a checkout already performed by overlapping preparations.
    */
   async exclusive<T>(missionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(missionId)
@@ -1105,14 +1099,25 @@ export class SwarmRuntime {
     // interleave per-member workspace preparation, and mission/member/delivery
     // rows have no compare-and-swap to lose an update safely.
     let release!: () => void
-    const current = new Promise<void>(resolve => { release = resolve })
+    const released = new Promise<void>(resolve => { release = resolve })
+    // Waiters share the identity of the physical head, not their own queue
+    // slot. Only a body that actually starts changes it, so unrelated writes
+    // cannot repeat the same warning and a later hang gets its own notice.
+    const operation = previous?.operation ?? { id: id('operation') }
+    const current = Object.assign(previous === undefined ? released : previous.catch(() => {}).then(() => released), { operation })
     this.queues.set(missionId, current)
+    void current.then(() => { if (this.queues.get(missionId) === current) this.queues.delete(missionId) })
     try {
       if (previous !== undefined) await this.boundedQueueWait(previous)
+      operation.id = id('operation')
       return await fn()
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('[mission_operation_pending]')) {
+        emitGuardTerminal(this, missionId, 'workspace', { localKey: `mission-operation-pending:${operation.id}`, detail: error.message })
+      }
+      throw error
     } finally {
       release()
-      if (this.queues.get(missionId) === current) this.queues.delete(missionId)
     }
   }
   /** Wait for the mission-queue predecessor, but never past the declared bound. */
@@ -1121,7 +1126,10 @@ export class SwarmRuntime {
     try {
       await Promise.race([
         previous.catch(() => {}),
-        new Promise<void>(resolve => { timer = setTimeout(resolve, this.stallPassTimeoutMs); timer.unref() }),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('[mission_operation_pending] A previous mission operation is still in flight; this request made no changes. Inspect the pending operation with swarm_observe and retry after it returns. Other missions and owner controls remain available.')), this.stallPassTimeoutMs)
+          timer.unref()
+        }),
       ])
     } finally { if (timer !== undefined) clearTimeout(timer) }
   }
@@ -1653,7 +1661,7 @@ export class SwarmRuntime {
       // must be reachable for exactly the blocked case it was written for: two
       // admitted replacements would make lineage ambiguous and stall every
       // dependent once both are accepted.
-      const replacement = tasks.find(task => task.replaces?.includes(previousId) && task.status !== 'cancelled')
+      const replacement = taskGraphIndex(tasks).replacementDescendants(previousId).find(task => task.status !== 'cancelled')
       // W12: cancellation is terminal for the withdrawn record, not for the
       // obligation it carried. A cancelled task admits exactly one live repair,
       // exactly like blocked work, so a dependent's lineage can resolve again.
@@ -1683,7 +1691,7 @@ export class SwarmRuntime {
     // D1: every admitted task carries its own step/finding ceiling; the runtime
     // blocks the task at that limit instead of letting it drain the mission budget.
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
-    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
+    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
@@ -1695,6 +1703,7 @@ export class SwarmRuntime {
       this.store.event(missionId, 'task/proposed', key, task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
+    this.warnBudget(this.mission(missionId))
     this.warnIntegrationGap(mission, task)
     this.kick(missionId)
     return task
@@ -1800,7 +1809,8 @@ export class SwarmRuntime {
   
   
   
-  assign(task: Task, member: Member): Task {
+  /** Check before any workspace mutation, and again immediately before assignment. */
+  assertAdmission(task: Task, member: Member): { candidate: ReturnType<SwarmRuntime['admissionDecision']>['candidate']; decision: ReturnType<SwarmRuntime['admissionDecision']>['decision']; latencyMs: number } {
     if (pendingStopOwner(this.store.list('tasks', task.missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
     member = this.store.get('members', member.id) ?? member
     const mission = this.mission(task.missionId)
@@ -1812,7 +1822,13 @@ export class SwarmRuntime {
       this.recordRefusal(candidate, decision, latencyMs)
       throw new AdmissionRefusedError(decision)
     }
-    if (task.assignmentMode === 'preferred' && task.epoch === 0) task.plannedAssigneeId = member.id
+    return { candidate, decision, latencyMs }
+  }
+  assign(task: Task, member: Member): Task {
+    member = this.store.get('members', member.id) ?? member
+    const mission = this.mission(task.missionId)
+    const { candidate, decision, latencyMs } = this.assertAdmission(task, member)
+    if (canBorrowTask(task)) task.plannedAssigneeId = member.id
     task.epoch++
     task.attempt = { id: id('attempt'), epoch: task.epoch, ownerId: member.id, leaseUntil: Math.min(Date.now() + this.config.leaseMs, mission.deadline) }
     if (task.reviewOf) task.attempt.sourceCommit = this.task(task.missionId, task.reviewOf).artifact?.commit
@@ -1848,7 +1864,9 @@ export class SwarmRuntime {
       if (!member) throw new Error('[owner_cannot_claim] Only a member can claim work: Inspect `taskId` with `swarm_observe`, or decide the mission with `swarm_control` and its `action`.')
       const task = this.task(missionId, taskId)
       if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
-      if (!this.ready(task, member)) throw new Error('Task is not ready for this member')
+      const blocker = this.scheduling.readinessBlocker(task, member)
+      if (blocker !== undefined) throw new Error(`Task is not ready for this member: ${blocker}`)
+      this.assertAdmission(task, member)
       await this.assertWorkspaceAuthorized(this.mission(missionId))
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
       this.active(actor, missionId)
@@ -1946,7 +1964,7 @@ export class SwarmRuntime {
    * competing verdict, challenge or cancellation fails closed instead of being
    * overwritten.
    */
-  async verify(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; verdict: 'accept' | 'reject'; reason: string }): Promise<Task> {
+  async verify(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; verdict: 'accept' | 'reject'; reason: string; deliverables?: string[] }): Promise<Task> {
     const prepared = await this.exclusive(missionId, async () => {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind !== 'verification' || !task.reviewOf) throw new Error('[not_a_verification_task] This is not a verification task. Call `swarm_verify` with `taskId` and `verdict`, then retry.')
@@ -1968,7 +1986,12 @@ export class SwarmRuntime {
       const evidenceRevision = JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))
       // Re-validate before the verification checkout is created.
       await this.assertWorkspaceAuthorized(this.mission(missionId))
-      return { member, source, artifact, evidenceRevision, checksRevision: JSON.stringify(source.checks) }
+      if (input.deliverables !== undefined) requireStrings(input.deliverables, 'deliverables')
+      const reviewArtifact = input.deliverables?.length
+        ? await this.workers.captureArtifact(member, task, input.deliverables)
+        : undefined
+      this.ownAttempt(actor, missionId, task.id, input.attemptId)
+      return { member, source, artifact, reviewArtifact, evidenceRevision, checksRevision: JSON.stringify(source.checks) }
     })
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.
     const checks = await this.declaredChecks.run(prepared.member, prepared.source, prepared.artifact, actor.signal)
@@ -2023,6 +2046,7 @@ export class SwarmRuntime {
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
           task.status = 'blocked'; task.output = this.bounded(reason)
+          if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
           task.reviewedCommit = artifact.commit
           task.verificationRecovery = { sourceTaskId: source.id, commit: artifact.commit, reason, at: Date.now() }
           this.store.put('tasks', task)
@@ -2038,6 +2062,7 @@ export class SwarmRuntime {
         runIds.push(...this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks))
         source.status = passed ? 'accepted' : 'blocked'
         task.status = passed ? 'accepted' : 'blocked'; task.output = this.bounded(rejection); task.reviewedCommit = artifact.commit
+        if (prepared.reviewArtifact !== undefined) task.reviewArtifact = prepared.reviewArtifact
         this.store.put('tasks', source); this.store.put('tasks', task)
         // Every other review of this source is moot: pending ones can never
         // start, running ones would burn tokens until lease expiry, and parked
@@ -2157,9 +2182,10 @@ export class SwarmRuntime {
     const participant = this.participant(actor, missionId)
     // Owner replies remain a control channel during resumable pauses. Retain
     // their full payload in the normal outbox; transport itself waits for resume.
-    const ownerQuestion = participant.owner && input.replyTo !== undefined
-      ? this.answerableQuestion(missionId, participant.key, input.replyTo) : undefined
+    const question = input.replyTo === undefined ? undefined : this.answerableQuestion(missionId, participant.key, input.replyTo)
+    const ownerQuestion = participant.owner ? question : undefined
     const content = this.bounded(input.content)
+    if (question !== undefined && input.dismiss !== true && input.to !== question.from) throw new PolicyError('reply_recipient_mismatch', 'validation_error', `This reply must address ${question.from}, the member that asked question ${question.id}; correct to before retrying. The receipt is unchanged.`)
     if (ownerQuestion !== undefined && input.dismiss !== true) {
       const same = this.store.list('deliveries', missionId).find(delivery => delivery.inReplyTo === ownerQuestion.id
         && delivery.from === participant.key && delivery.to === input.to && delivery.kind === input.kind
@@ -2184,7 +2210,6 @@ export class SwarmRuntime {
     if (input.dismiss === true && input.replyTo === undefined) {
       throw new Error('[reply_target_required] dismiss closes the question named by `replyTo`, and none was passed: pass `replyTo` with the question delivery id (read the open receipts with `swarm_observe` and its `missionId`) and the reason in `content`, or send the answer normally.')
     }
-    const question = input.replyTo === undefined ? undefined : this.answerableQuestion(missionId, key, input.replyTo)
     if (input.dismiss === true) {
       const reason = this.bounded(input.content)
       this.commit(missionId, () => this.receipt(missionId, question!, key, 'dismissed', reason))
@@ -2459,7 +2484,7 @@ export class SwarmRuntime {
     this.bounded(input.reason)
     for (const runId of input.toolRunIds) { const run = this.store.get('tool_runs', runId); if (!run || run.missionId !== missionId) throw new Error('Unknown counterevidence tool run') }
     evidence.status = 'challenged'; evidence.challenges.push({ authorId: key, reason: input.reason, toolRunIds: input.toolRunIds })
-    const interrupted = new Set<string>()
+    const interrupted: Task[] = []
     this.commit(missionId, () => {
       this.store.put('evidence', evidence)
       const source = this.task(missionId, evidence.taskId)
@@ -2475,8 +2500,13 @@ export class SwarmRuntime {
           if (invalidated.has(dependent.id) || (!dependsOnInvalidated(dependent) && !(dependent.reviewOf && invalidated.has(dependent.reviewOf)))) continue
           invalidated.add(dependent.id); changed = true
           if (dependent.status === 'cancelled' || dependent.status === 'pending') continue
-          if (dependent.attempt && dependent.status === 'running') interrupted.add(dependent.attempt.ownerId)
+          const priorStop = dependent.resumeAfterStop?.epoch === dependent.epoch ? dependent.resumeAfterStop : undefined
+          const stopOwner = priorStop?.memberId ?? (dependent.status === 'running' ? dependent.attempt?.ownerId : undefined)
           dependent.epoch++; this.dropAttempt(dependent); dependent.status = dependent.kind === 'verification' ? 'cancelled' : 'blocked'
+          if (stopOwner !== undefined || priorStop !== undefined) {
+            dependent.resumeAfterStop = { epoch: dependent.epoch, reason: 'invalidated', memberId: stopOwner, at: Date.now() }
+            interrupted.push(dependent)
+          }
           dependent.output = `Prerequisite ${source.id} was challenged; inspect the new evidence and propose a replacement.`
           this.store.put('tasks', dependent)
           this.store.event(missionId, 'task/invalidated', 'runtime', { taskId: dependent.id, sourceTaskId: source.id, evidenceId: evidence.id })
@@ -2487,7 +2517,7 @@ export class SwarmRuntime {
       // invalidated are named by the `task/invalidated` events, not merged into it.
       this.notify(missionId, `Evidence ${evidence.id} challenged: ${input.reason}`, this.interpretation(missionId).subjectsOf([source]), { from: key })
     })
-    if (interrupted.size) this.defer(async () => { await Promise.all([...interrupted].map(memberId => this.workers.stop(memberId))) })
+    for (const dependent of interrupted) this.attempts.resumeStoppedAttempt(missionId, dependent)
     this.kick(missionId)
     return evidence
   }
@@ -2626,21 +2656,20 @@ export class SwarmRuntime {
   }
   /** An automatic review admitted earlier for this source, once the owner has withdrawn it. */
   private withdrawnAutomaticReview(missionId: string, sourceId: string): string | undefined {
-    // S5: the durable `task/review-admitted` event is the gate; the in-memory map
-    // is only a cache for an admission whose event write failed. Losing the map
-    // therefore cannot admit a second automatic review after a withdrawal.
-    const events = this.store.events(missionId, this.config.maxEvents)
-    let admitted: string | undefined
-    for (const event of events) {
-      if (event.type !== 'task/review-admitted') continue
-      const data = event.data as { taskId?: string; reviewOf?: string } | undefined
-      if (data?.reviewOf === sourceId && data.taskId !== undefined) admitted = data.taskId
-    }
-    const admittedId = admitted ?? this.autoReviewAdmissions.get(sourceId)
+    // Control facts never use the presentation event window. The deterministic
+    // row also survives a failed post-admission event write and process restart.
+    const source = this.task(missionId, sourceId)
+    const event = this.store.latestTaskEvent(missionId, sourceId, 'task/review-admitted', 'reviewOf')
+    const admitted = (event?.data as { taskId?: string } | undefined)?.taskId
+    const current = this.store.get('tasks', this.automaticReviewId(source))
+    const admittedId = current?.id ?? admitted
     if (admittedId === undefined) return undefined
     const review = this.store.get('tasks', admittedId)
     if (review === undefined || review.status !== 'cancelled') return undefined
     return `the automatically admitted review ${admittedId} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
+  }
+  private automaticReviewId(source: Task): string {
+    return `task_auto_review_${createHash('sha256').update(`${source.missionId}:${source.id}:${source.artifact?.commit ?? ''}`).digest('hex').slice(0, 32)}`
   }
   /** The concrete reason the runtime cannot admit an independent review right now. */
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
@@ -2664,14 +2693,13 @@ export class SwarmRuntime {
         kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
         reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, priority: source.priority,
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
-      })
+      }, this.automaticReviewId(source))
     } catch (error) {
       // Admission can still refuse (budget race, ignored deliverable). The
       // submission stands; the owner is told exactly what to admit instead.
       this.notifyReviewBlocked(mission, source, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
-    this.autoReviewAdmissions.set(source.id, review.id)
     // The review already exists and its task/proposed event is durable; a busy
     // writer must not turn a successful admission into a false blocker notice.
     try {
@@ -2688,7 +2716,7 @@ export class SwarmRuntime {
    * is fenced immediately, its lease released and its worker freed. Accepted
    * work is immutable and must be repaired with a replacement instead.
    */
-  cancel(actor: Actor, missionId: string, input: { taskId: string; reason: string }): Task {
+  cancel(actor: Actor, missionId: string, input: { taskId: string; reason: string }): Task & { strandedDependents?: string[] } {
     if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
     actor.signal?.throwIfAborted()
     const { mission, owner, key } = this.participant(actor, missionId)
@@ -2740,7 +2768,7 @@ export class SwarmRuntime {
     })
     if (task.resumeAfterStop !== undefined) this.attempts.resumeStoppedAttempt(missionId, task)
     this.kick(missionId)
-    return task
+    return { ...task, ...(strandedDependents.length ? { strandedDependents } : {}) }
   }
   subscribeTopics(actor: Actor, missionId: string, topics: string[]): Member {
     const { member } = this.active(actor, missionId)
@@ -3082,7 +3110,8 @@ export class SwarmRuntime {
     for (const mission of missions) {
       const tasks = this.store.list('tasks', mission.id)
       for (const task of tasks) {
-        if (task.artifact === undefined) continue
+        const captured = task.kind === 'verification' ? task.reviewArtifact : task.artifact
+        if (captured === undefined) continue
         const review = tasks.filter(candidate => candidate.reviewOf === task.id && candidate.status !== 'cancelled')
           .sort((left, right) => left.createdAt - right.createdAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))[0]
         rows.push({
@@ -3090,7 +3119,8 @@ export class SwarmRuntime {
           missionAcceptance: mission.acceptance,
           taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status,
           acceptance: task.acceptance,
-          artifact: { commit: task.artifact.commit, baseCommit: task.artifact.baseCommit, changedPaths: task.artifact.changedPaths },
+          artifact: { commit: captured.commit, baseCommit: captured.baseCommit, changedPaths: captured.changedPaths },
+          ...(task.kind === 'verification' ? { artifactRole: 'review-record', reviewedCommit: task.reviewedCommit } : {}),
           ...(review === undefined ? {} : { review: { taskId: review.id, status: review.status,
             verdict: review.status === 'accepted' ? 'verified' : review.status === 'blocked' ? 'refuted' : 'pending',
             ...(review.output === undefined ? {} : { reason: excerpt(review.output, 400) }) } }),
@@ -3367,7 +3397,7 @@ export class SwarmRuntime {
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
-      ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}) })
+      ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}) })
     const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
@@ -3467,8 +3497,9 @@ export class SwarmRuntime {
       }
     }
     const evidence = this.store.list('evidence', missionId)
+    const deliveryHealth = memberDeliveryHealth(this.store.list('deliveries', missionId))
     const rows: OwnerRows = {
-      members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status, ...(item.activity ? { activity: item.activity.kind } : {}), accountedTokens: item.accountedTokens ?? 0, requests: item.usage?.requests ?? 0 })),
+      members: members.map(item => ({ id: item.id, name: item.name, role: item.role, status: item.status, ...(item.activity ? { activity: item.activity.kind } : {}), ...(deliveryHealth.has(item.id) ? { deliveryHealth: deliveryHealth.get(item.id) } : {}), accountedTokens: item.accountedTokens ?? 0, requests: item.usage?.requests ?? 0 })),
       board: full ? tasks.map(task => taskRecord(task, 6000)) : tasks.map(taskRef),
       evidence: (full ? evidence : evidence.filter(item => item.status === 'challenged' || item.status === 'refuted')).map(item => evidenceRef(item, full)),
     }
@@ -3623,17 +3654,26 @@ export class SwarmRuntime {
   
   
   /** Amend execution policy without replacing the task or resetting its accumulated work. */
-  controlTask(actor: Actor, missionId: string, taskId: string, action: 'amend' | 'resume', changes: TaskAmendment, reason: string): Task {
+  controlTask(actor: Actor, missionId: string, taskId: string, action: 'amend' | 'resume', changes: TaskAmendment, reason: string): Task & { dependencyChanges?: { previous: string[]; current: string[]; added: string[]; removed: string[] } } {
     actor.signal?.throwIfAborted()
     const { mission, owner } = this.participant(actor, missionId)
     if (!owner || this.isWorkerSession(actor.sessionId)) throw new PolicyError('task_owner_required', 'authorization_error', 'Only the primary user session may amend task execution')
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
-    if (terminal(mission) || mission.status === 'staged') throw new PolicyError('mission_not_running', 'conflict_error', 'Task policy requires a launched, nonterminal mission')
     if (!['amend', 'resume'].includes(action)) throw new PolicyError('task_action_invalid', 'validation_error', 'Task control supports amend or resume')
     this.bounded(reason)
     const allowed = ['scope', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
     if (changes === null || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !allowed.includes(key))) throw new PolicyError('task_amendment_invalid', 'validation_error', 'Unknown task amendment field')
+    const cleanup = this.store.get('tasks', taskId)
+    const cleanupOnly = action === 'resume' && Object.keys(changes).length === 0 && cleanup?.missionId === missionId
+      && cleanup.resumeAfterStop?.epoch === cleanup.epoch
+    if (mission.status === 'staged' || (terminal(mission) && !cleanupOnly)) throw new PolicyError('mission_not_running', 'conflict_error', 'Task policy requires a launched, nonterminal mission')
     const task = this.task(missionId, taskId)
+    // Retry preservation after an explicit repair without reopening terminal work.
+    if (action === 'resume' && Object.keys(changes).length === 0 && task.resumeAfterStop?.epoch === task.epoch
+      && (terminal(mission) || ['accepted', 'cancelled'].includes(task.status))) {
+      this.attempts.resumeStoppedAttempt(missionId, task, { force: true })
+      return task
+    }
     if (['accepted', 'cancelled'].includes(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
     if (this.store.list('tasks', missionId).some(row => row.status !== 'cancelled' && row.replaces?.includes(task.id))) throw new PolicyError('task_replaced', 'conflict_error', 'Task has a live replacement; amend that task instead')
     // A submitted artifact may acquire additional checks without changing its
@@ -3685,6 +3725,11 @@ export class SwarmRuntime {
       if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
     }
     if (resumes && (next.recoveryCount ?? 0) >= (next.maxRecoveryAttempts ?? this.config.maxTasksPerMember)) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
+    // An explicit owner recovery keeps the stop barrier but records the desired
+    // pending state now, so a still-running checkpoint cannot forget the resume.
+    if (resumes && next.status === 'blocked' && next.artifact === undefined && next.resumeAfterStop?.reason === 'invalidated') {
+      next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
+    }
     if (taskCeilingBlock(next) === undefined) delete next.ceiling
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
     const activeOwner = task.attempt?.ownerId
@@ -3701,9 +3746,9 @@ export class SwarmRuntime {
       this.store.put('tasks', next)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])) })
     })
-    this.attempts.resumeStoppedAttempt(missionId, next)
+    this.attempts.resumeStoppedAttempt(missionId, next, { force: action === 'resume' })
     if (mission.status === 'active') this.kick(missionId)
-    return next
+    return { ...next, ...(changes.dependencies === undefined ? {} : { dependencyChanges: { previous: task.dependencies, current: next.dependencies, added: next.dependencies.filter(id => !task.dependencies.includes(id)), removed: task.dependencies.filter(id => !next.dependencies.includes(id)) } }) }
   }
   amendScope(actor: Actor, missionId: string, scope: string[], reason: string): Mission {
     const { mission, owner } = this.participant(actor, missionId)
@@ -3807,7 +3852,7 @@ export class SwarmRuntime {
         opening?.controller.abort(new Error(`Mission ${mission.status}`))
       }
     }
-    for (const task of this.store.list('tasks', missionId)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(missionId, task)
+    for (const task of this.store.list('tasks', missionId)) if (task.resumeAfterStop?.epoch === task.epoch) this.attempts.resumeStoppedAttempt(missionId, task, { force: action === 'resume' })
     if (mission.status !== 'active') this.defer(async () => {
       await Promise.all(this.store.list('members', missionId).map(async member => {
         // Tasks with a marker own their stop and checkpoint; never run a stale

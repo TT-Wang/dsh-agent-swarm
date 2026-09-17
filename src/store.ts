@@ -684,8 +684,9 @@ export class SwarmStore {
     return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
   }
   /** Durable task fact lookup, independent of the presentation event window. */
-  latestTaskEvent(missionId: string, taskId: string, type: string): SwarmEvent | undefined {
-    const row = this.db.prepare("SELECT * FROM events WHERE mission_id=? AND type=? AND json_extract(data,'$.taskId')=? ORDER BY seq DESC LIMIT 1").get(missionId, type, taskId)
+  latestTaskEvent(missionId: string, taskId: string, type: string, key: 'taskId' | 'reviewOf' = 'taskId'): SwarmEvent | undefined {
+    const field = key === 'reviewOf' ? '$.reviewOf' : '$.taskId'
+    const row = this.db.prepare(`SELECT * FROM events WHERE mission_id=? AND type=? AND json_extract(data,'${field}')=? ORDER BY seq DESC LIMIT 1`).get(missionId, type, taskId)
     return row === undefined ? undefined : { seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }
   }
   /** Trace-only window; unrelated coordination events cannot evict parent spans. */

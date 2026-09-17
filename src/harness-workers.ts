@@ -32,6 +32,38 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+/**
+ * Keep lifecycle policy in the runtime, but apply it at the native consumer
+ * boundary too: transport acknowledgement can precede consumption by a turn.
+ * Returning an empty admitted batch lets Harness finish a completed turn while
+ * still continuing unrelated tool-result work; cancelling the owner would not.
+ */
+export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: string, deliveryId: string) => string | false | undefined): (agent: Agent) => void {
+  const stale = (agent: Agent, message: UserMessage): boolean => message.source.kind === 'swarm'
+    && project(String(agent.id), message.source.deliveryId) === false
+  const prune = (agent: Agent): void => {
+    for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) if (stale(agent, message)) agent.inbox.remove(message.id)
+  }
+  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+    prune(agent)
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
+    const admitted = decision.messages.filter(message => !stale(agent, message)
+      // A changed generated context is not an independent user request. Let it
+      // be regenerated for the next genuine turn instead of reviving this one.
+      && !(onlyStale && message.source.kind === 'plugin' && message.source.plugin === '@deepseek-ai/dsh-system-prompt'))
+    return { ...decision, messages: admitted.map(message => {
+      if (message.source.kind !== 'swarm') return message
+      const content = project(String(agent.id), message.source.deliveryId)
+      if (typeof content !== 'string') return message
+      const source = message.source
+      return freezeMessage({ ...message, content: [{ type: 'text', text: `[Swarm ${source.deliveryKind}; missionId ${source.missionId}; from ${source.senderMemberId}; delivery ${source.deliveryId}]\n${content}` }] })
+    }) }
+  })
+  return prune
+}
+
 export interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number

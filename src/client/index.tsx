@@ -19,7 +19,7 @@ import { SidebarDock } from './SidebarDock.tsx'
 import { createRightSidebarAdapter, createSidebarAdapter } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
 import { DisposalRegistry } from './lifecycle.ts'
-import { CopyContext, en, zh } from './locale.tsx'
+import { CopyContext, en, zh, useCopy } from './locale.tsx'
 import { openWorker } from './navigation.ts'
 import { WorkerHistory, type HistoryPage } from './history.ts'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX } from '../types.ts'
@@ -27,6 +27,16 @@ import type { Member } from '../types.ts'
 
 export const name = 'agent-swarm-client'
 export const inject = ['uiConversation', 'slots', 'sessions', 'connection', 'locale', 'modelDirectories']
+
+function SidebarLauncher({ wide, onOpen }: { wide: boolean; onOpen(): void }) {
+  const copy = useCopy()
+  return <button type="button" data-swarm-native-launcher data-wide={wide}
+    aria-label={copy('Open swarm sidebar')} title={copy('Open swarm sidebar')} onClick={onOpen}>
+    <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+      <rect x="2.5" y="3.5" width="15" height="13" rx="2.5"/><path d="M11.5 4v12M5.5 7h3M5.5 10h3M5.5 13h2"/>
+    </svg>{wide && <span>{copy('Agent Swarm')}</span>}
+  </button>
+}
 
 /** Native history cards and a docked sidebar; the host owns transport trust. */
 export function apply(ctx: Context): void {
@@ -89,13 +99,14 @@ export function apply(ctx: Context): void {
   }
   // Surface preference: the host's own right sidebar first (0.1.5 line, the same
   // pane Files uses), then Better Sidebar when a profile mounts it, then the
-  // standalone dock. Native integration also requires a successful reveal by
-  // the current provider, so its removal or a refused reveal restores fallback.
+  // standalone dock. Registration owns the surface without opening it; the
+  // native controller reveals it only for a command or explicit navigation.
   const native = createRightSidebarAdapter(ctx, () => ({
     id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80,
     label: () => copy('Agent Swarm'),
     description: () => copy('Missions, workers and evidence for this conversation'),
     component: ({ scope, visible }) => <Pane sessionId={scope.sessionId} active={visible} />,
+    launcher: props => <Localized><SidebarLauncher {...props} /></Localized>,
   }))
   const sidebar = createSidebarAdapter(ctx, () => ({
     id: 'agent-swarm', title: () => copy('Agent Swarm'), single: true, order: 80,
