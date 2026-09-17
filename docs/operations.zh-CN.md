@@ -163,7 +163,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 验证会针对精确的提交工件执行任务声明的命令。agent 的成功声明不能豁免失败命令，但检查通过也不意味着命令覆盖了全部需求。默认将被忽略的依赖目录复制到验证检出中；它们是已安装的工具链状态，不是全新的 CI 安装。显式启用链接模式可能允许沿链接读取源项目。
 
-复制模式支持本身为符号链接的依赖目录，并重定位目录内部的链接。指向外部普通可执行文件的链接，例如虚拟环境中的 Python 解释器，会物化为复制的可执行文件，仍可能依赖系统库。损坏链接、指向源项目其他内容的链接，以及指向外部目录或非可执行数据的链接，会被拒绝并给出修复提示。请使用自包含依赖；若宿主明确接受外部读取，需同时配置 `verificationDependencyMode: link` 和 `allowDependencyLinkReads: true`。
+复制模式支持本身为符号链接的依赖目录，并重定位目录内部的链接。指向外部普通可执行文件的链接，例如虚拟环境中的 Python 解释器，会物化为复制的可执行文件，仍可能依赖系统库。损坏链接、指向源项目其他内容的链接，以及指向外部目录或非可执行数据的链接无法物化：不会运行任何声明检查，该次复核记为基础设施失败（`(verification preparation)`，退出码 125）并被延迟，输出中给出修复方式（`verificationDependencyMode: "link"` 加 `allowDependencyLinkReads: true`，或调整 `verificationDependencyDirs`）；宿主配置好后用 `swarm_control` 恢复。请使用自包含依赖；若宿主明确接受外部读取，需同时配置 `verificationDependencyMode: link` 和 `allowDependencyLinkReads: true`。
 
 快照以当前 Git 暂存区确定文件范围：已取消跟踪且现在被忽略的文件，即使 HEAD 曾经跟踪，也不会纳入。捕获后会再次比较私有暂存区和当前文件内容，对检测到的编辑竞争重试；这仍不是并发多文件编辑下的原子快照。
 

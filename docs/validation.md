@@ -9,6 +9,70 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-19 workflow audit and fixes (2026-09-18)
+
+A third audit (round-19: three read-only branches, each independently re-verified, then every
+finding re-derived and reproduced on this host against snapshot `73627e4`) reported five high and
+seven medium findings. Four high and two medium were confirmed or partially confirmed and are fixed
+here; H-5 (the frozen worker worktree cannot build) is a worker-environment limit the host does not
+share (the five named end-to-end files pass 34/34 on the host), and H-4 (a read-only branch task with
+no capturable report path) is a mission-layout mistake against the documented scope contract, not a
+code defect. Every fix carries a regression that fails on the pre-fix head `c788c47`; an
+adversarial review of the first integration (three lenses) then tightened H-1 and closed the
+coverage gaps it named.
+
+- **H-1 uncaptured deliverable gate** (`tests/r19-deliverable-gate.test.mjs`). A research task whose
+  text named an ignored report (this repository's `docs/.gitignore` is `*`) was accepted with an
+  artifact that omitted it when the member left `swarm_submit.deliverables` empty; nothing in submit,
+  verify or `completionError` gated the advisory `artifact.uncapturedPaths`, so the mission became
+  eligible and the owner was told every deliverable was independently accepted. The signal is now
+  precise: `captureArtifact` lists a named path only when it is in scope, not a directory token,
+  ignored by Git, present as a regular file in the member worktree and not declared, and
+  `swarm_submit` refuses that list for every task kind with `[deliverable_uncaptured]`, offering
+  both repairs (list the file if it is an output, remove it if it is not) while the attempt stays
+  running. Names the member never wrote, tracked inputs named after a write verb, and directory
+  tokens are never obligations, so the review's dead-end and secret-capture scenarios cannot occur;
+  rows accepted before the gate are named in the completion notice instead of blocking completion.
+- **H-2/M-d dependency materialisation** (`tests/r19-dependency-materialisation.test.mjs`). The copy
+  of a source repository's `node_modules` refused any symlink resolving outside the dependency
+  directory with a codeless `Error` that the declared-check classifier could not recognise, so on a
+  workspace symlink farm every `swarm_verify` with checks threw before the first command. Both
+  refusals are now the typed `DependencyMaterialisationError`, classified as an infrastructure
+  failure (`(verification preparation)` row, exit 125) that defers the review with the two documented
+  ways out in its output; materialisation runs before the check slot is acquired, so a slow or refused
+  copy holds no slot and counts against no check deadline.
+- **H-3 recovery fallback** (`tests/r19-recovery-fallback.test.mjs`). When a cross-owner recovery could
+  not capture the previous owner's worktree, the replacement started from the last checkpoint or the
+  task base and the fallback was recorded only in an in-memory list with no production reader; a
+  host-restart re-pend followed by a start-failure re-route or an owner `assigneeId` amend lost the
+  uncommitted work silently. `recoverTask` now snapshots the old worktree into the preservation refs
+  first and the replacement inherits it; the fallback is a durable `task/recovery-fallback` event, an
+  owner notice and a `task.recovery` projection in `swarm_observe`. The second silent channel the
+  audit named, a failed verification cleanup, is surfaced the same way.
+- **M-a check-syntax attribution** (R18-5/R18-5b in `tests/r18-workflow-fixes.test.mjs`). The
+  launch-boundary preflight read the adapter's compact result as if it were aligned with the declared
+  checks, so a broken check at any index above 0 was refused naming `checks[0]`. The adapter contract
+  is now located (`CheckSyntaxIssue { index, message }`) and the refusal names each offending
+  `tasks[<key>].checks[<j>]` with its own quoted command and diagnostic.
+- **M-b task-ceiling park** (R18-4/R18-4b/R18-4c/R18-4d). `blockTaskCeiling` parked the member and
+  ran the `resource` stop barrier, whose completion set the member active again on the assumption of
+  a later barrier that nothing installs, so the member read idle, further steps were admitted and
+  charged, and the raise never consumed a park. The park is the durable member row and survives its
+  own barrier and a host restart; `controlTask` consumes it when the owner raises the ceiling.
+  R18-4c now discriminates the barrier-alone case (the release with the ceiling still held leaves the
+  member parked and a further step refused), and R18-4d/R18-4e cover the park, its refusal and its
+  raise across a host restart. `tests/refusal-inventory.mjs` now walks registered coded `Error`
+  subclasses, so the two `DependencyMaterialisationError` refusals are inventoried again.
+
+- `npm run typecheck` and `npm run build`: passed (backend and browser bundles).
+- Full behavioral suite: **1,279 tests, 1,279 passing, 0 skipped, 0 failing** in a parallel run on the integrated head (`05faf7f`, harness 0.1.6-alpha.2 linked).
+- Smokes: `npm run test:bundle` 7/7; `npm run test:harness`, `npm run test:profile` and `DSH_HARNESS_ROOT=~/code/deepseek-harness-016 npm run test:pack` (real 0.1.6-alpha.2 Loader composition, installed-bundle profile, clean-checkout pack of 239 files) passed after `tests/fixtures/model-visible.expected.json` was refreshed for the new assignment-instruction sentence; the composition smoke now awaits the Loader unload before asserting worker disposal, a race the packed layout lost by a few milliseconds and the source layout won.
+- Residuals recorded in [known-limitations.md](known-limitations.md): task text that names no
+  literal path still submits an empty artifact; a materialisation failure copies the tree twice
+  before it defers and concurrent copies are no longer bounded by `checkConcurrency`; a replacement
+  inherits out-of-scope changes it must revert; M-c (cancelled task rows count toward `maxTasks`) is
+  unchanged.
+
 ## Round-18 workflow audit (2026-09-17)
 
 A second deep audit of the four workflow questions (does a mission run through, is each member's
