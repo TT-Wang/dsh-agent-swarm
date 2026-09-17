@@ -1792,8 +1792,19 @@ export class Workspaces {
         files.push({ path: name, blob: match[2]!, bytes: Number(match[3]) })
       }
       // Heuristically named paths are hints, not permission to capture ignored
-      // content. Return the omission at submission while it is cheap to repair.
-      const uncapturedPaths = ignoredDeliverablePaths(member.workspace, deliverablePaths(task.objective ?? '', task.acceptance ?? [])).map(hit => hit.path).filter(name => !outputs.includes(name))
+      // content. R19 H-1: the omission returned here is the submit gate's
+      // signal, so it is precise: an in-scope, ignored, undeclared name that is
+      // a regular file in this worktree. A fresh worktree holds only tracked
+      // files and dependency directories, so an ignored input such as `.env` is
+      // absent unless the member created it, while a report the member wrote
+      // is present. Directory tokens, dependency content and out-of-scope names
+      // (already advisory at admission) are never obligations.
+      const hinted = deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !outputs.includes(name))
+      const uncapturedPaths: string[] = []
+      for (const hit of ignoredDeliverablePaths(member.workspace, hinted)) {
+        const info = await lstat(path.join(member.workspace, hit.path)).catch(() => undefined)
+        if (info?.isFile()) uncapturedPaths.push(hit.path)
+      }
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
       delete record.task.preservedCommit

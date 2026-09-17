@@ -249,10 +249,22 @@ export const NOTICE_TEMPLATES = {
   },
   'coverage-complete': {
     trigger: 'task/accepted',
-    build: (input: { missionTitle: string }) =>
-      `Mission ${input.missionTitle} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`,
+    build: (input: { missionTitle: string; tasks?: readonly Pick<Task, 'id' | 'status' | 'artifact'>[] }) =>
+      `Mission ${input.missionTitle} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.${uncapturedArtifactNote(input.tasks ?? [])}`,
   },
 } as const
+/**
+ * R19 H-1: one sentence naming every accepted row whose stored artifact still
+ * lists `uncapturedPaths`. `submit()` refuses such an artifact, so the row was
+ * accepted before that gate or through a foreign adapter; accepted rows are
+ * immutable, so completion is not held on it and the owner is told instead.
+ * Empty when no accepted row carries the omission.
+ */
+export function uncapturedArtifactNote(tasks: readonly Pick<Task, 'id' | 'status' | 'artifact'>[]): string {
+  const legacy = tasks.filter(task => task.status === 'accepted' && task.artifact?.uncapturedPaths?.length)
+  if (!legacy.length) return ''
+  return ` Accepted ${legacy.length === 1 ? 'task' : 'tasks'} ${legacy.map(task => `${task.id} (${JSON.stringify(task.artifact!.uncapturedPaths)})`).join(', ')} named ignored files the artifact did not capture; they exist only in the member worktree, so inspect it or admit a follow-up task that declares them before relying on that deliverable.`
+}
 /** R17-G2: the template key of one emitted notice, or undefined when the family is not reviewed. */
 export function noticeTemplateKey(delivery: Pick<Delivery, 'notice'>): keyof typeof NOTICE_TEMPLATES | undefined {
   const key = delivery.notice?.dedupKey ?? ''
@@ -1530,7 +1542,7 @@ export class Notices {
       this.rt.store.put('missions', mission)
       // R15-A1: the deliverable's lineage is the subject (every accepted task),
       // never an anonymous mission-scoped sentence.
-      this.notify(mission.id, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
+      this.notify(mission.id, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: view.mission.title, tasks: view.tasks }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
         { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered' })
     })
   }
