@@ -188,16 +188,20 @@ export class Attempts {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
               // F2: a park is a durable state of its own, not a stale flag of the
               // stopped attempt. `blockTaskCeiling` parks the member and then runs
-              // this same barrier, so an unconditional 'active' undid the park a
-              // moment after it was committed. `reason: 'resource'` is that very
-              // resume (the ceiling was raised and this task returns to work), so it
-              // clears the park; a `handoff` barrier belongs to a DIFFERENT task and
-              // must leave a park — the member's own wait, or a ceiling-bound task
-              // that still holds one — in place.
+              // this same barrier under `reason: 'resource'` to stop and checkpoint
+              // the exhausted handle; the park must outlive the barrier while the
+              // task is still at its ceiling, or the member reads idle, its next
+              // steps are admitted and charged, and the dispatch hatch is lost.
+              // The park is consumed when the owner raises the ceiling: here when
+              // the raise landed while this barrier was in flight (the ceiling row
+              // is already gone), otherwise by `controlTask` once the stop has
+              // confirmed. A `handoff` barrier belongs to a DIFFERENT task and must
+              // leave a park — the member's own wait, or a ceiling-bound task that
+              // still holds one — in place.
               const parked = memberPhaseOf(member) === 'parked'
               member.status = 'idle'
               if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
-              else if ((!parked || reason === 'resource') && state.memberId !== undefined && (reason === 'handoff' || reason === 'resource')) member.phase = 'active'
+              else if (state.memberId !== undefined && ((reason === 'handoff' && !parked) || (reason === 'resource' && fresh.ceiling === undefined))) member.phase = 'active'
               this.rt.store.put('members', member)
             }
             this.rt.store.put('tasks', fresh)
