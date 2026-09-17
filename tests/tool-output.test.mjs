@@ -109,7 +109,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
     const locations = plan.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${plan.tasks.indexOf(task)}].checks[${index}]` })))
     const issues = await workspaces.checkSyntaxPreflight(locations.map(entry => entry.command), workspace)
-    if (issues.length) throw new Error(`[check_syntax_invalid] ${locations.filter((_, index) => issues[index] !== undefined).map((entry, index) => `${entry.location} has invalid shell syntax: ${issues[index]}`).join('\n')}`)
+    if (issues.length) throw new Error(`[check_syntax_invalid] ${issues.map(({ index, message }) => `${locations[index].location} has invalid shell syntax in ${JSON.stringify(locations[index].command)}: ${message}`).join('\n')}`)
     launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot
   }, snapshot: () => snapshot }
   const definitions = new Map()

@@ -10,7 +10,7 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Member, Mission, Task, WorkspaceBaseline } from './types.js'
 export type { CheckEnvelope }
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
@@ -784,14 +784,16 @@ export class Workspaces {
    * shell syntax error was admitted, launched and executed by a whole task and
    * review cycle before failing at verification, where the same plan was refused
    * immediately on the prelaunch path. `checks` are already validated non-empty
-   * command strings; this only answers "does `/bin/sh` parse this".
+   * command strings; this only answers "does `/bin/sh` parse this". Each issue
+   * carries the command's position, so the caller can name the declared location
+   * without assuming an input-aligned result.
    */
-  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]> {
-    const issues: string[] = []
-    for (const command of checks) {
+  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]> {
+    const issues: CheckSyntaxIssue[] = []
+    for (const [index, command] of checks.entries()) {
       signal?.throwIfAborted()
       const result = await runProcess(['/bin/sh', '-n', '-c', command], { cwd, signal, timeoutMs: HOST_GIT_TIMEOUT_MS, maxBytes: 4096, subprocess: this.options.subprocess })
-      if (result.exitCode !== 0) issues.push(result.output.trim() || `exit ${result.exitCode}`)
+      if (result.exitCode !== 0) issues.push({ index, message: result.output.trim() || `exit ${result.exitCode}` })
     }
     return issues
   }

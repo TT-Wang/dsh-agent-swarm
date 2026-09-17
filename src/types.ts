@@ -949,6 +949,8 @@ export interface WorkerCallbacks {
    */
   providerOutage?(memberId: string, outage: ProviderOutage): void
 }
+/** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
+export interface CheckSyntaxIssue { index: number; message: string }
 /** Worker handles and all effectful execution remain owned by the adapter. */
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
@@ -975,9 +977,11 @@ export interface WorkerAdapter {
   /**
    * Parse every declared check without executing it, so a plan whose check is a
    * shell syntax error is refused before any worker, worktree or model step
-   * exists. Returns one message per unparsable command, in plan order.
+   * exists. The result is located, not input-aligned: one entry per unparsable
+   * command, in plan order, whose `index` is that command's position in
+   * `checks`; a command that parses has no entry, so callers pair by `index`.
    */
-  checkSyntaxPreflight?(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]>
+  checkSyntaxPreflight?(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
   isIdle(memberId: string): boolean
   captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact>
   /** Preserve any owned WIP after stop without treating it as an accepted artifact. */

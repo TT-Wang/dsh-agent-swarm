@@ -24,7 +24,7 @@ import { noticeFamily } from './notices.ts'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
-import type { Artifact, CheckEnvelope, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -932,7 +932,7 @@ export class HarnessWorkers implements WorkerAdapter {
    * fresh session for the new identity exactly as a first admission does.
    */
   /** Parse-only preflight over the plan's declared checks; no worker or worktree exists yet. */
-  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]> {
+  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]> {
     return await this.workspaces.checkSyntaxPreflight(checks, cwd, signal)
   }
   async invalidateComposition(missionId: string, memberId: string): Promise<void> {
