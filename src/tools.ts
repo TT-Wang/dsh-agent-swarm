@@ -259,11 +259,20 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   const checksSchema: JsonSchemaNode = { ...strings, description: 'Nonempty real repository acceptance commands for implementation and integration. The host runs them in a clean checkout of the committed artifact (source dependency directories such as node_modules are copied by default) and validates changed paths separately; never use a dummy pass or uncommitted git diff.' }
   const planProperties: Record<string, JsonSchemaNode> = {
     title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema,
-    members: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { key: string, name: { ...string, description: 'Optional custom display name; omit to use a stable host-assigned human name. Put responsibilities in role.' }, role: string, provider: string, model: string, reasoningEffort: { type: 'string', description: 'Omit to inherit this conversation; lower it for mechanical work, keep it for analysis and review.' }, maxOutputTokens: integer }, required: ['key', 'role'] } },
+    members: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { key: string, name: { ...string, description: 'Optional custom display name; omit to use a stable host-assigned human name. Put responsibilities in role.' }, role: string, provider: string, model: string, reasoningEffort: { type: 'string', description: 'Omit to inherit this conversation; lower it for mechanical work, keep it for analysis and review.' }, maxOutputTokens: { ...integer, description: 'Per-request output-token allowance for this worker. Required by swarm_launch, where the primary chooses it for each member.' } }, required: ['key', 'role'] } },
     workstreams: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { key: string, title: string, objective: string }, required: ['key', 'title', 'objective'] } },
     tasks: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
       key: string, workstreamKey: string, title: string, objective: string, kind: kindSchema,
-      scope: scopeSchema, acceptance: strings, checks: checksSchema, assigneeKey: string, assignmentMode: assignmentModeSchema, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' },
+      scope: scopeSchema, acceptance: strings, checks: checksSchema, assigneeKey: string, assignmentMode: assignmentModeSchema, dependencies: dependenciesSchema, reviewOf: reviewSchema, priority: integer,
+      // The runtime refuses an undefined recovery limit (and an undefined check
+      // timeout for a task that declares checks) on any mission with a saved
+      // start request, which includes every mission this session launched from
+      // /agent-swarm. The parameter names are therefore part of the contract, not
+      // an inference the caller has to make from the refusal.
+      maxRecoveryAttempts: { ...integer, description: 'Allowed automatic recovery attempts for this task. Required when this mission came from a saved start request (a /agent-swarm launch), including for replacement proposals on that mission; omit only for an owner-assembled swarm_create mission.' },
+      maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings,
+      checkTimeoutMs: { ...integer, description: 'Per-check timeout in milliseconds. Required when an automatic mission declares checks, because the runtime extends the verifier lease by it; reviews inherit their source\'s checks and timeout.' },
+      experiment: { type: 'boolean' },
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; pair each deliverable with a verification task via reviewOf. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
@@ -296,13 +305,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }
     })
     const plan = validatePlan({ ...a, workspace: request.workspace, members })
-    // Parse only: reject invalid shell syntax before worker creation, without executing a check.
-    const syntaxIssues: string[] = []
-    for (const [taskIndex, task] of plan.tasks.entries()) for (const [checkIndex, command] of (task.checks ?? []).entries()) {
-      const syntax = await runProcess(['/bin/sh', '-n', '-c', command], { cwd: request.workspace, signal: actor.signal, timeoutMs: 10000, maxBytes: 2000, subprocess: () => ctx.get('subprocess') })
-      if (syntax.exitCode !== 0) syntaxIssues.push(`tasks[${taskIndex}].checks[${checkIndex}] has invalid shell syntax: ${syntax.output.trim()}`)
-    }
-    if (syntaxIssues.length) throw new Error(`[check_syntax_invalid] ${syntaxIssues.join('\n')}\nPrefer the existing repository check commands; repair every command in the \`checks\` array and retry the complete plan with the same \`requestId\`.`)
+    // The parse-only check preflight runs at the shared launch boundary
+    // (`launchDraft`), so the prelaunch path and the staged path refuse the same
+    // plan at the same point instead of only one of them catching it.
     return runtime.startPlan(actor, requestId, plan, optionalInteger(a, 'planningEpoch'))
   })
   const taskBudgetSchema: JsonSchemaNode = { type: 'object', additionalProperties: false, properties: { maxSteps: positiveInteger, maxFindings: positiveInteger, maxRecoveryAttempts: positiveInteger, checkTimeoutMs: positiveInteger } }
@@ -406,7 +411,17 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       if (a.requestId !== undefined && (a.taskId !== undefined || a.changes !== undefined)) throw new Error('[control_target_conflict] Remove `taskId` and `changes` when controlling a prelaunch `requestId`, then retry.')
       if (a.requestId !== undefined) return runtime.controlStart(actor, text(a, 'requestId'), a.action as 'retry' | 'stop' | 'extend', text(a, 'reason'), optionalInteger(a, 'timeoutMs'))
       if (a.taskId !== undefined) return runtime.controlTask(actor, text(a, 'missionId'), text(a, 'taskId'), a.action as 'resume' | 'amend', a.changes === undefined ? {} : object(a.changes) as TaskAmendment, text(a, 'reason'))
-      if (a.action === 'amend') return runtime.amendScope(actor, text(a, 'missionId'), array(object(a.changes), 'scope'), text(a, 'reason'))
+      // The mission-scope amend is the one `amend` form with no taskId, and the
+      // only field it accepts is `changes.scope`. `changes` is optional in the
+      // schema because every other action omits it, so this branch must name the
+      // one shape it needs instead of letting a generic argument guard report
+      // "Expected an object" (and, on the browser path, an internal error).
+      if (a.action === 'amend') {
+        const changes = a.changes === undefined ? undefined : object(a.changes)
+        if (changes !== undefined && Object.keys(changes).some(key => key !== 'scope')) throw new Error('[mission_scope_fields_invalid] Mission-scope amend accepts only `changes.scope`: remove the other `changes` fields, or pass `taskId` to `swarm_control` to amend one task, then retry.')
+        if (changes === undefined || changes.scope === undefined) throw new Error('[mission_scope_required] Amend without `taskId` revises mission scope: pass `changes` with a nonempty `scope` array, or pass `taskId` to amend one task\'s fields. Retry `swarm_control` with one of those shapes.')
+        return runtime.amendScope(actor, text(a, 'missionId'), array(changes, 'scope'), text(a, 'reason'))
+      }
       return runtime.control(actor, text(a, 'missionId'), a.action as 'pause' | 'resume' | 'stop' | 'complete' | 'coordinator', text(a, 'reason'), a.coordinatorId as string | undefined)
     })
   register('swarm_cancel', 'Owner only: withdraw one admitted-but-mistaken task. Pending, blocked, submitted and running tasks become terminally cancelled; a running attempt is fenced and its worker released. Refuses accepted work, which is immutable and needs a replacement. Records a durable task/cancelled event with the reason; replay is idempotent.',

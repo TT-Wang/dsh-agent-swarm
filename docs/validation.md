@@ -9,6 +9,38 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-18 workflow audit (2026-09-17)
+
+A second deep audit of the four workflow questions (does a mission run through, is each member's
+environment complete, do handoffs preserve work, does the merged delivery lose anything) surveyed
+`src/` again and fixed seven defects; each has a regression in
+`tests/r18-workflow-fixes.test.mjs` that fails on the pre-fix head. The measured set: delivery
+coverage now follows the composition (`covers` no longer counts a withdrawn carrier's plan, so a
+mission behind a repaired middle task cannot complete with an accepted implementation omitted); a
+staged-plan member edit drops the stale adapter composition instead of bricking the member; handoff
+refuses a review target that could never own it; the stop barrier keeps a `handoff` park and still
+clears the `resource` resume; the parse-only check preflight runs at the shared launch boundary, so
+the staged path refuses a shell-syntax-error check before any work exists; mission-scope amend names
+its own required shape on the tool and RPC paths; the member scratch root moved inside the worktree
+(sandbox-writable, excluded like toolchain state) with the round-16 layout tolerated on resume.
+
+- `npm run typecheck` and `npm run build`: passed (backend and browser bundles).
+- Full behavioral suite: **1,248 tests, 1,248 passing, 0 skipped, 0 failing** in a serial, unloaded
+  run (`/tmp/r18-final.txt`). An earlier run of the same tree under load reported one failure in
+  `tests/artifact-policy.test.mjs` ("captured review report survives deferred checks and
+  reassignment without locking recovery"), which passes three consecutive times in isolation; that
+  is the pre-existing load sensitivity recorded in
+  [known-limitations.md](known-limitations.md), not a regression from this round.
+- `DSH_HARNESS_ROOT=/Users/tongtao/code/deepseek-harness-015 node scripts/smoke-pack.mjs`: clean-source
+  prepack (**239** published files) and the real **0.1.5-rc.1** Loader composition passed, covering
+  registered model tools, peer proposals, real bash, evidence, independent verification, integration,
+  automatic completion, owner-independent restart recovery and unload.
+- The composition-fidelity check (`Workspaces.droppedDependencyPaths`) is verified directly against a
+  composed tree that keeps the wrong side, not through a repository merge driver: on the measured
+  `git version 2.50.1` a custom `merge=<driver>` attribute did not engage for a conflicting
+  single-line edit, so that trigger stays a named residual in
+  [known-limitations.md](known-limitations.md).
+
 ## Consolidation and context efficiency (2026-09-15)
 
 All ten follow-up consolidation items are implemented in the current 0.7.0
