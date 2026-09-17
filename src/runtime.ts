@@ -25,7 +25,7 @@ import { assertScopeSelectors, formatDiagnostic, isNoopCheck, liveReviewFor, loa
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
-import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
+import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { missingDeliverablePaths, requireArtifactChecks } from './artifact-policy.ts'
@@ -3327,26 +3327,17 @@ export class SwarmRuntime {
       // error was admitted, launched, executed by a member and submitted before
       // the failure surfaced at verification. No worker, worktree or model step
       // exists yet at this point.
-      const declaredChecks = input.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${task.key}].checks[${index}]` })))
+      const declaredChecks = declaredPlanChecks(input.tasks)
       if (declaredChecks.length && this.workers.checkSyntaxPreflight !== undefined) {
         actor.signal?.throwIfAborted()
-        // The adapter result is located (each entry carries the position of the
-        // command it refuses), so pair by that index: reading it as aligned with
-        // `declaredChecks` blamed the valid checks[0] for a broken checks[1] and
-        // cross-paired several failures. The command is quoted too, because the
-        // parser's own diagnostic does not echo it on every shell.
+        // The adapter result is located; `checkSyntaxDetail` pairs each issue
+        // with the check it refuses by that index.
         const issues = await this.workers.checkSyntaxPreflight(declaredChecks.map(check => check.command), input.workspace, actor.signal)
         // A concrete string, never a template: the browser sanitizer classifies
         // refusals by matching an anchored allowlist against the authored text, and
         // an interpolated message cannot be proven against it
         // (tests/rpc-refusal-classification.test.mjs).
-        if (issues.length) {
-          const detail = issues.map(issue => {
-            const check = declaredChecks[issue.index]!
-            return `${check.location} has invalid shell syntax in ${JSON.stringify(check.command)}: ${issue.message}`
-          }).join('\n')
-          throw new Error('[check_syntax_invalid] ' + detail + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
-        }
+        if (issues.length) throw new Error('[check_syntax_invalid] ' + checkSyntaxDetail(declaredChecks, issues) + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
       }
       assertCurrent()
       draft.status = 'launching'; draft.revision++; draft.updatedAt = Date.now(); delete draft.error

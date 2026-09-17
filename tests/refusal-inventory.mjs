@@ -5,9 +5,10 @@
  * an imperative next step whose named tool and parameter resolve in the real
  * tool schema. This module enumerates the refusal call sites of a TypeScript
  * source file by walking the source itself — every `throw new Error(...)` whose
- * argument is a message, and every object literal that carries a `code` string
- * together with a `message` or `reason` — so a new refusal cannot be added
- * without appearing in the inventory.
+ * argument is a message, every `throw new <Name>(<code>, …)` of a registered
+ * coded Error subclass (`CODED_ERROR_CLASSES`), and every object literal that
+ * carries a `code` string together with a `message` or `reason` — so a new
+ * refusal cannot be added without appearing in the inventory.
  *
  * Nothing here is a hand-picked list of samples: `refusalSites` is the walker,
  * `assessRefusal` is the contract, and `toolSchemaIndex` captures the schema the
@@ -286,8 +287,24 @@ export const CODE_TOKEN_ALL = /\[([a-z][a-z0-9_]{2,63})\]/g
 export const IMPERATIVE_ACTIONS = /\b(?:retry|resubmit|re-?propose|re-?run|re-?submit|cancel|withdraw|replace|correct|repair|raise|lower|reduce|increase|set|pass|supply|provide|add|remove|omit|name|use|choose|declare|keep|split|narrow|widen|inspect|call|fix|follow|wait|stop|end|assign|resume|propose|admit|list|update|adjust|drop|move|fill|run|verify|preserve|respect)\b/i
 
 /**
+ * Error subclasses that take the diagnostic code as their first constructor
+ * argument and render it as the `[code]` token in front of the message they are
+ * given, so the throw site itself carries no token. R19-H2 moved the two
+ * dependency materialisation refusals from `throw new Error('[code] …')` into
+ * such a class and they left the inventory unnoticed. `message` is the index of
+ * the constructor argument that carries the message text. `PolicyError` is not
+ * registered: its second argument is the category, and its sites are outside
+ * this inventory today.
+ */
+export const CODED_ERROR_CLASSES = {
+  DependencyMaterialisationError: { message: 1 },
+}
+
+/**
  * Enumerate every refusal site in one source file.
  * Returns `{ kind, file, line, code, property, expression, expressionKind, text, codes, tools, params, substitutions, guard, guardName }`.
+ * `kind` is `throw` for `throw new Error(...)`, `coded-throw` for a registered
+ * coded Error subclass, and `message` for a coded object literal.
  */
 export function refusalSites(source, file) {
   const masked = maskSource(source)
@@ -298,6 +315,17 @@ export function refusalSites(source, file) {
     const close = findMatching(source, open)
     const expression = (close === -1 ? source.slice(open + 1) : source.slice(open + 1, close)).trim().replace(/!$/, '')
     sites.push(describe({ kind: 'throw', file, source, masked, index: match.index, expression }))
+  }
+  const codedPattern = new RegExp(`throw new (${Object.keys(CODED_ERROR_CLASSES).join('|')})\\(`, 'g')
+  for (let match = codedPattern.exec(masked); match !== null; match = codedPattern.exec(masked)) {
+    const open = match.index + match[0].length - 1
+    const close = findMatching(source, open)
+    if (close === -1) continue
+    const args = topLevelSegments(source, open + 1, close).map(([from, to]) => source.slice(from, to).trim())
+    const code = /^'([a-z][a-z0-9_]*)'$/.exec(args[0] ?? '')?.[1]
+    const expression = args[CODED_ERROR_CLASSES[match[1]].message] ?? ''
+    // The class renders the token; the site's text is assessed as the class renders it.
+    sites.push(describe({ kind: 'coded-throw', errorClass: match[1], file, source, masked, index: match.index, code, expression, prefix: code === undefined ? '' : `[${code}] ` }))
   }
   // The `code:` key is code, but its string value is masked; search the
   // original source and require the key itself to sit at a code position.
@@ -319,7 +347,7 @@ export function refusalSites(source, file) {
 function describe(base) {
   const expression = base.expression.trim()
   const info = classifyExpression(expression)
-  const text = info.text
+  const text = info.text === null ? null : `${base.prefix ?? ''}${info.text}`
   const fn = base.kind === 'throw' ? enclosingFunction(base.source, base.masked, base.index) : undefined
   return {
     ...base,

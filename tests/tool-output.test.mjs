@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { checkSyntaxDetail, declaredPlanChecks } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
 import { Workspaces } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
@@ -101,15 +102,16 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   // The preflight itself now runs at the shared launch boundary
   // (`SwarmRuntime.launchDraft`), so the tool hands the validated plan to
   // `startPlan`; this stub keeps the same assertion the tool-level check made by
-  // running the real parse-only probe before it counts a launch. `checks` are
-  // parsed with /bin/sh -n and never executed.
+  // running the real parse-only probe before it counts a launch, and pairs its
+  // result with the production helpers launchDraft uses (R18-5b proves that
+  // boundary end to end). `checks` are parsed with /bin/sh -n and never executed.
   const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
     checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
   t.after(() => workspaces.dispose())
   const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
-    const locations = plan.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${plan.tasks.indexOf(task)}].checks[${index}]` })))
-    const issues = await workspaces.checkSyntaxPreflight(locations.map(entry => entry.command), workspace)
-    if (issues.length) throw new Error(`[check_syntax_invalid] ${issues.map(({ index, message }) => `${locations[index].location} has invalid shell syntax in ${JSON.stringify(locations[index].command)}: ${message}`).join('\n')}`)
+    const declared = declaredPlanChecks(plan.tasks)
+    const issues = await workspaces.checkSyntaxPreflight(declared.map(check => check.command), workspace)
+    if (issues.length) throw new Error(`[check_syntax_invalid] ${checkSyntaxDetail(declared, issues)}`)
     launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot
   }, snapshot: () => snapshot }
   const definitions = new Map()
@@ -125,7 +127,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   assert.equal(launches, 1)
   await assert.rejects(access(join(workspace, 'result.txt')), { code: 'ENOENT' })
   input.tasks[0].checks = ['echo pass | ! read -r c']
-  await assert.rejects(definitions.get('swarm_launch').execute(input, execution), /tasks\[0\]\.checks\[0\].*invalid shell syntax/)
+  await assert.rejects(definitions.get('swarm_launch').execute(input, execution), /tasks\[t\]\.checks\[0\] has invalid shell syntax in "echo pass \| ! read -r c"/)
   assert.equal(launches, 1)
 })
 

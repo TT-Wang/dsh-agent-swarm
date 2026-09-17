@@ -8,7 +8,8 @@
  *  - every code this branch added is present exactly once and compliant;
  *  - every current control-path file is scanned, without freezing historical
  *    implementation counts or conflating host lifecycle errors with model exits;
- *  - the inherited allowlist stays empty, so a stale exemption cannot appear.
+ *  - the inherited allowlist stays empty, so a stale exemption cannot appear;
+ *  - a refusal thrown through a coded Error subclass stays in the inventory.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -28,6 +29,15 @@ const ANNOTATED = {
     'workspace_not_repository_root', 'workspace_not_owned', 'verification_source_required', 'review_source_not_verification',
     'workspace_uncommitted', 'workspace_baseline_missing',
   ],
+}
+/**
+ * Codes thrown through an Error subclass that takes the code as its first
+ * argument (R19-H2 moved these two out of `throw new Error('[code] …')`). They
+ * are pinned by presence: the inventory must still walk them, whether or not
+ * their next step yet satisfies the parameter contract.
+ */
+const CODED_CLASS_REFUSALS = {
+  'src/workspaces.ts': ['dependency_directory_unavailable', 'dependency_copy_escape'],
 }
 /** Enumerate the whole split control path; named diagnostic contracts below are stable across added lifecycle guards. */
 const INVENTORY_SOURCES = [...Object.keys(ANNOTATED), 'src/attempts.ts', 'src/notices.ts', 'src/refusals.ts', 'src/gates.ts', 'src/declared-checks.ts', 'src/workspace-admission.ts', 'src/scheduling.ts']
@@ -65,4 +75,15 @@ test('S3: the split control path is fully scanned and no diagnostic is exempted 
   assert.deepEqual(applied.stale, [], 'no stale exemption may hide a regression')
   assert.equal(applied.checked.length, sites.length, 'every current site is assessed without exemptions')
   assert.deepEqual(ALLOWLIST, [])
+})
+
+test('S3: a refusal thrown through a coded Error subclass stays in the inventory', () => {
+  for (const [file, codes] of Object.entries(CODED_CLASS_REFUSALS)) {
+    const sites = refusalSites(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), file)
+    for (const code of codes) {
+      const matches = sites.filter(site => site.kind === 'coded-throw' && site.code === code)
+      assert.equal(matches.length, 1, `${file}: ${code} is inventoried exactly once through its error class`)
+      assert.deepEqual(matches[0].codes, [code], 'the class renders the code token the site declares')
+    }
+  }
 })

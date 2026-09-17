@@ -1,7 +1,7 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
 import { assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
-import { nextWorkerName, type PlanInput, type PlanTask } from './types.ts'
+import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Plan entries must be objects')
@@ -28,6 +28,30 @@ function keyed(value: unknown, label: string): Map<string, Record<string, unknow
     result.set(item.key, item)
   }
   return result
+}
+
+/** One declared check with the plan location the launch preflight cites. */
+export interface DeclaredPlanCheck { command: string; location: string }
+
+/** The checks a plan declares, flattened in task order, each with its `tasks[<key>].checks[<index>]` location. */
+export function declaredPlanChecks(tasks: readonly Pick<PlanTask, 'key' | 'checks'>[]): DeclaredPlanCheck[] {
+  return tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${task.key}].checks[${index}]` })))
+}
+
+/**
+ * The lines of the launch syntax refusal, one per refused check. The preflight
+ * result is located (each issue carries the index of the command it refuses in
+ * the list it was given), so lines pair by that index, never by position in the
+ * result: reading it as aligned with the declared list blamed a valid checks[0]
+ * for a broken checks[1] and cross-paired several failures. The command is
+ * quoted too, because the parser's own diagnostic does not echo it on every
+ * shell.
+ */
+export function checkSyntaxDetail(declared: readonly DeclaredPlanCheck[], issues: readonly CheckSyntaxIssue[]): string {
+  return issues.map(issue => {
+    const check = declared[issue.index]!
+    return `${check.location} has invalid shell syntax in ${JSON.stringify(check.command)}: ${issue.message}`
+  }).join('\n')
 }
 
 /** Fail before any workers or worktrees are created. Returns a detached canonical plan. */
