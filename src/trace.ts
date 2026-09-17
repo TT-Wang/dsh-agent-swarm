@@ -968,6 +968,7 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'provider/outage': 'Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent',
   'provider/recovered': 'A quiescent provider route answered successfully again; the outage marker is cleared',
   'task/restart-repended': 'Host restart re-pended a running task without spending recovery credit; the task and epoch are named',
+  'task/recovery-fallback': 'Cross-owner recovery could not capture the previous owner\'s workspace; names the commit the replacement started from and whether the uncaptured work was preserved into it',
   'task/check-envelope': 'Measured declared-check envelope after a verification: limit, active, queued, wait and run times',
   'store/snapshot': 'Periodic VACUUM INTO snapshot written beside the owner state file',
   'store/restore-requested': 'Owner staged one validated snapshot restore for the next host start',

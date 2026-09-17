@@ -26,7 +26,7 @@ import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { missingDeliverablePaths, requireArtifactChecks } from './artifact-policy.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
@@ -843,6 +843,7 @@ export class SwarmRuntime {
       guard: (memberId, tool) => this.guard(memberId, tool),
       failure: (memberId, error) => this.onFailure(memberId, error),
       providerOutage: (memberId, outage) => this.onProviderOutage(memberId, outage),
+      recoveryFallback: info => this.onRecoveryFallback(info),
     })
   }
   /**
@@ -3438,7 +3439,8 @@ export class SwarmRuntime {
     const evidenceRef = (evidence: Evidence, full = false) => ({ id: evidence.id, taskId: evidence.taskId, authorId: evidence.authorId, claim: full ? evidence.claim : excerpt(evidence.claim, 400), outcome: evidence.outcome, status: evidence.status, toolRunIds: evidence.toolRunIds,
       ...(evidence.challenges.length ? { challenges: full ? evidence.challenges : evidence.challenges.length } : {}), ...(evidence.supersedes.length ? { supersedes: evidence.supersedes } : {}) })
     const taskRef = (task: Task) => ({ id: task.id, title: task.title, kind: task.kind, status: task.status, ...(task.assigneeId ? { assigneeId: task.assigneeId } : {}), ...(task.assignmentMode ? { assignmentMode: task.assignmentMode } : {}), ...(task.attempt ? { attemptOwner: task.attempt.ownerId } : {}),
-      ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}) })
+      ...(task.reviewOf ? { reviewOf: task.reviewOf } : {}), ...(task.dependencies.length ? { dependencies: task.dependencies } : {}), ...(task.replaces?.length ? { replaces: task.replaces } : {}), ...(task.artifact ? { artifact: task.artifact.commit } : {}), ...(task.reviewArtifact ? { reviewArtifact: task.reviewArtifact.commit } : {}),
+      ...(task.recovery ? { recovery: task.recovery } : {}) })
     const taskRecord = (task: Task, outputLimit: number) => ({ ...task, ...(task.output !== undefined ? { output: excerpt(task.output, outputLimit) } : {}), ...(task.handoff !== undefined ? { handoff: excerpt(task.handoff, outputLimit) } : {}) })
     const evidenceOf = (task: Task, full = false) => task.evidenceIds.map(evidenceId => this.store.get('evidence', evidenceId)).filter((item): item is Evidence => item !== undefined).map(item => evidenceRef(item, full))
     const runsWindow = (filter: { memberId?: string; taskId?: string; attemptId?: string }, limit: number, afterSeq?: number) => {
@@ -4151,6 +4153,34 @@ export class SwarmRuntime {
       // R15-A1: a member failure with no assigned task still names the member's
       // unfinished work; the mission root is the fallback, never silence.
       this.notify(member.missionId, message, this.noticeSubjectsFor(member.missionId, { memberId: member.id }))
+    })
+  }
+  /**
+   * H-3: a cross-owner recovery could not capture the previous owner's workspace
+   * as an artifact. This used to reach only an in-memory list nobody read: the
+   * replacement started from a fallback commit while the log, the owner and
+   * `swarm_observe` said nothing. It is now a durable task fact: the summary on
+   * the task row (the assignment and observe projections carry it), one event,
+   * and one owner notice, whether the WIP was carried by a preservation snapshot
+   * or left behind in the old worktree. Fired from inside the preparing
+   * dispatch, which re-reads the task after preparation, so the revision bump
+   * here is never overwritten by the pre-preparation row.
+   */
+  onRecoveryFallback(info: RecoveryFallback): void {
+    if (this.closed) return
+    const names = (memberId: string) => this.store.get('members', memberId)?.name ?? memberId
+    const previous = names(info.previousOwnerId)
+    const content = info.preserved
+      ? `${names(info.memberId)} inherited ${previous}'s uncaptured work on ${info.taskId} from preservation snapshot ${info.commit} (${info.reason}). It includes the out-of-scope changes the artifact refused; the new owner must revert or move them before submitting.`
+      : `${info.taskId} restarted on ${names(info.memberId)} from ${info.commit} without ${previous}'s uncaptured work (${info.reason}). That work exists only in ${previous}'s worktree until it is preserved.`
+    this.commit(info.missionId, () => {
+      const task = this.store.get('tasks', info.taskId)
+      if (task === undefined || task.missionId !== info.missionId) return
+      task.recovery = { epoch: info.epoch, previousOwnerId: info.previousOwnerId, commit: info.commit, preserved: info.preserved, reason: info.reason, at: Date.now() }
+      this.store.put('tasks', task)
+      this.store.event(info.missionId, 'task/recovery-fallback', 'runtime', { taskId: info.taskId, epoch: info.epoch, from: info.previousOwnerId, to: info.memberId, commit: info.commit, preserved: info.preserved, reason: info.reason })
+      // A carried snapshot asks nothing of the owner; a left-behind worktree may.
+      this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
     })
   }
   /**

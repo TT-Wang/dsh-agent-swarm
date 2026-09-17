@@ -355,23 +355,31 @@ test('handoff checkpoints partial work, and a later handoff back uses the latest
   assert.deepEqual(artifact.changedPaths, ['src/answer.txt'])
 })
 
-test('handoff scope failure preserves previous owner files and re-creates a clean baseline for the new owner', async t => {
-  const { temp, head, workspaces, mission, member, task } = await fixture(t)
+test('handoff scope failure preserves previous owner files and carries them to the new owner as a preservation snapshot', async t => {
+  const reports = []
+  const { temp, head, workspaces, mission, member, task } = await fixture(t, { onRecoveryFallback: info => reports.push(info) })
   const peer = { id: 'member-peer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-peer') }
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'outside.txt'), 'out of scope partial edit\n')
-  // W9: a previous owner's uncapturable workspace can no longer dead-end the
-  // task. The partial work stays in place and the new owner starts from the
-  // recorded base with a durable recovery record instead of a permanent block.
+  // W9/H-3: a previous owner's uncapturable workspace can no longer dead-end the
+  // task, and its partial work is not left behind either: the worktree stays in
+  // place, its snapshot goes into the preservation refs, and the new owner starts
+  // from that snapshot with a durable recovery record.
   await workspaces.prepareTask(peer, { ...task, epoch: 3 }, [])
   assert.equal(await readFile(path.join(member.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is never modified')
-  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'original\n', 'the new owner starts from the recorded base')
-  assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD'), head)
-  assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner baseline is clean')
+  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the new owner inherits the uncaptured work')
+  const snapshot = await git(peer.workspace, 'rev-parse', 'HEAD')
+  assert.notEqual(snapshot, head, 'the new owner starts from the preservation snapshot, not the bare base')
+  assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD^'), head, 'the snapshot sits on the recorded base')
+  assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner checkout is clean')
   assert(workspaces.recoveryFallbacks().some(entry => entry.includes(task.id) && /outside task scope/.test(entry)), 'the fallback is recorded for the host')
+  assert.equal(reports.length, 1, 'the fallback is reported once to the host callback')
+  assert.deepEqual({ ...reports[0], reason: undefined }, { missionId: mission.id, taskId: task.id, epoch: 3, memberId: peer.id, previousOwnerId: member.id, commit: snapshot, preserved: true, reason: undefined })
+  assert.match(reports[0].reason, /outside task scope/)
   const record = JSON.parse(await readFile(path.join(temp, 'worktrees', mission.id, 'tasks', `${task.id}.json`), 'utf8'))
   assert.equal(record.memberId, peer.id, 'the recovered record names the new owner')
-  assert.equal(record.task.recovery.commit, head, 'the durable recovery record names the fallback commit')
+  assert.equal(record.task.recovery.commit, snapshot, 'the durable recovery record names the inherited snapshot')
+  assert.equal(record.task.recovery.preserved, true)
 })
 
 test('reviewer reads the submitted exact commit while its edits cannot change the source artifact', async t => {

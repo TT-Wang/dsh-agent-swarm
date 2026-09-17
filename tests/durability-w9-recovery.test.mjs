@@ -3,9 +3,12 @@
  * the task, but a different member then has to prepare that task. Pre-fix that
  * recovery called `captureArtifact` on the previous owner's dirty workspace,
  * threw on the out-of-scope partial work, and `schedule()` marked the task
- * `blocked` forever. The fix re-creates a clean baseline from the last durable
- * checkpoint (or the recorded task base) while leaving the previous owner's
- * worktree untouched, and records the fallback durably.
+ * `blocked` forever. The fix left the previous owner's worktree untouched and
+ * re-created a clean baseline from the last durable checkpoint (or the recorded
+ * task base). H-3 (round 19) goes further: that worktree is snapshotted into the
+ * preservation refs and the replacement starts from the snapshot, so the
+ * uncaptured work travels with the task, and the fallback is a durable event,
+ * an owner notice and a `task.recovery` summary instead of a host-memory line.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -63,8 +66,10 @@ async function fixture(t) {
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
   const workers = new RealWorkers()
+  // Production shape (src/harness-workers.ts): the fallback report reaches the bound runtime callbacks.
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+    onRecoveryFallback: info => workers.callbacks?.recoveryFallback?.(info) })
   workers.workspaces = workspaces
   const runtime = new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20,
     maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
@@ -82,7 +87,7 @@ async function fixture(t) {
   return { root, source, workspaces, workers, runtime, owner, mission, stream, author, reviewer, actor, current, events }
 }
 
-test('W9: a cross-member recovery from a dirty workspace re-creates a clean baseline instead of blocking', async t => {
+test('W9: a cross-member recovery from a dirty workspace carries its preserved snapshot to the new owner instead of blocking', async t => {
   const f = await fixture(t)
   const task = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
@@ -126,17 +131,31 @@ test('W9: a cross-member recovery from a dirty workspace re-creates a clean base
   assert.match(fallback, /outside task scope/, 'the fallback names the real reason')
   assert.match(fallback, new RegExp(f.author.id), 'the fallback names the previous owner')
   assert.match(fallback, new RegExp(task.id), 'the fallback names the task')
-  assert.match(fallback, new RegExp(base), 'the fallback names the recorded baseline it started from')
   assert.deepEqual(f.events('task/blocked'), [], 'preparation never dead-ends the task')
   const reviewerWorkspace = f.runtime.store.get('members', f.reviewer.id).workspace
-  assert.equal(await git(reviewerWorkspace, 'rev-parse', 'HEAD'), base, 'the recovered attempt starts at the recorded task base')
-  assert.equal(await git(reviewerWorkspace, 'status', '--porcelain'), '', 'the recovered baseline is clean')
+  // H-3: the uncapturable worktree is snapshotted into the preservation refs and
+  // the replacement starts from that snapshot, so the out-of-scope partial edit
+  // travels with the task instead of staying behind in the old worktree.
+  const snapshot = await git(reviewerWorkspace, 'rev-parse', 'HEAD')
+  assert.notEqual(snapshot, base, 'the recovered attempt inherits the preserved snapshot, not the bare base')
+  assert.equal(await git(reviewerWorkspace, 'rev-parse', 'HEAD^'), base, 'the inherited snapshot sits on the recorded task base')
+  assert.match(fallback, new RegExp(snapshot), 'the fallback names the preserved snapshot the replacement inherited')
+  assert.equal(await git(reviewerWorkspace, 'status', '--porcelain'), '', 'the inherited checkout is clean')
+  assert.equal(await readFile(join(reviewerWorkspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the replacement inherits the uncaptured work')
   assert.equal(await readFile(join(authorWorkspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is preserved untouched')
   const recordPath = join(f.root, 'worktrees', f.mission.id, 'tasks', `${task.id}.json`)
   const record = JSON.parse(await readFile(recordPath, 'utf8'))
   assert.equal(record.memberId, f.reviewer.id)
-  assert.equal(record.task.recovery.commit, base, 'the durable record names the fallback baseline')
+  assert.equal(record.task.recovery.commit, snapshot, 'the durable record names the inherited snapshot')
   assert.equal(record.task.recovery.previousOwnerId, f.author.id)
+  assert.equal(record.task.recovery.preserved, true)
+  // The fallback is a durable, owner-visible fact, not only a host-memory line (H-3).
+  assert.ok(f.events('task/recovery-fallback').length >= 1, 'the fallback is recorded in the mission log')
+  assert.equal(f.current(task.id).recovery?.previousOwnerId, f.author.id, 'the task row carries the recovery summary')
+  // The inherited snapshot carries the out-of-scope edit the artifact refused; a
+  // real replacement decides what to do with it. Here it is dropped so the
+  // submission below stays within scope.
+  await rm(join(reviewerWorkspace, 'outside.txt'))
   // The recovered attempt can still make progress and be submitted. The runtime may
   // legitimately re-pend and re-prepare the task while this test does real git work
   // (preparation under load, then the W18 bounded recovery), which bumps the attempt

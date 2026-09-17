@@ -113,6 +113,7 @@ const meaningfulEvents: Record<string, string> = {
   'escalation/raised': 'A worker escalated to the owner', 'task/proposal-refused': 'Work proposal refused',
   'provider/outage': 'Provider route paused', 'provider/recovered': 'Provider route recovered',
   'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
+  'task/recovery-fallback': 'Task recovered from an uncaptured workspace',
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 /**
@@ -131,7 +132,7 @@ function brief(value: unknown): string | undefined { return typeof value === 'st
 function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
 const reasonFirst = new Set(['task/verification-deferred', 'task/amended', 'mission/scope-amended', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
-  'task/review-blocked', 'mission/workspace-revoked'])
+  'task/review-blocked', 'mission/workspace-revoked', 'task/recovery-fallback'])
 /** A bounded preview of a changed check list; the Activity view carries the full summary. */
 function checkPreview(value: unknown): string | undefined {
   if (!Array.isArray(value)) return undefined

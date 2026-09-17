@@ -10,7 +10,7 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckEnvelope, Member, Mission, Task, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckEnvelope, Member, Mission, RecoveryFallback, Task, WorkspaceBaseline } from './types.js'
 export type { CheckEnvelope }
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
@@ -87,8 +87,10 @@ export interface WorkspaceOptions {
   onCleanupFailure?(info: { checkout: string; error: string }): void
   /**
    * Called when a cross-owner recovery cannot capture the previous owner's
-   * workspace and re-creates a clean baseline instead (W9). The dirty worktree
-   * is left untouched; this reports the fallback for host-side observability.
+   * workspace as an artifact (W9). The dirty worktree is left untouched; its
+   * WIP is carried to the replacement by a preservation snapshot when that
+   * succeeds (H-3), and the report says which. The adapter forwards it to the
+   * runtime, which records the event, the owner notice and the task summary.
    */
   onRecoveryFallback?(info: RecoveryFallback): void
   /**
@@ -378,10 +380,9 @@ export class CheckSemaphore {
       totalWaitMs: this.totalWaitMs, maxWaitMs: this.maxWaitMs, totalRunMs: this.totalRunMs, maxRunMs: this.maxRunMs }
   }
 }
-/** Durable record of a recovery that could not capture the previous owner's partial work. */
-export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; previousOwnerId: string; commit: string; reason: string }
+export type { RecoveryFallback } from './types.js'
 /** Persisted on the task workspace record so the fallback survives restarts. */
-interface TaskRecovery { commit: string; previousOwnerId: string; reason: string; at: number }
+interface TaskRecovery { commit: string; previousOwnerId: string; preserved: boolean; reason: string; at: number }
 /** Reject a symlink whose target string alone leaves its owning workspace (fast pre-commit check). */
 function assertContainedSymlink(workspace: string, relative: string, target: string): void {
   if (!target || target.includes('\0') || path.isAbsolute(target)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
@@ -1116,8 +1117,9 @@ export class Workspaces {
       const saved = task.recovery
       let recovery: TaskRecovery | undefined
       if (saved !== undefined) {
-        if (!isRecord(saved) || !commitId(saved.commit) || typeof saved.previousOwnerId !== 'string' || typeof saved.reason !== 'string' || !Number.isSafeInteger(saved.at)) throw new Error('Invalid persisted recovery fallback')
-        recovery = { commit: saved.commit, previousOwnerId: saved.previousOwnerId, reason: saved.reason, at: saved.at as number }
+        if (!isRecord(saved) || !commitId(saved.commit) || typeof saved.previousOwnerId !== 'string' || typeof saved.reason !== 'string' || !Number.isSafeInteger(saved.at) || (saved.preserved !== undefined && typeof saved.preserved !== 'boolean')) throw new Error('Invalid persisted recovery fallback')
+        // Records written before H-3 never carried a snapshot.
+        recovery = { commit: saved.commit, previousOwnerId: saved.previousOwnerId, preserved: saved.preserved === true, reason: saved.reason, at: saved.at as number }
       }
       record.task = { taskId: task.taskId, epoch: task.epoch as number, baseCommit: task.baseCommit,
         ...(typeof task.capturedCommit === 'string' ? { capturedCommit: task.capturedCommit } : {}),
@@ -1573,14 +1575,24 @@ export class Workspaces {
       try {
         return { ...await this.captureArtifact({ ...member, id: value.memberId, workspace: value.workspace }, { ...task, epoch: prior.task.epoch }), ...composition }
       } catch (error) {
-        // W9: the previous owner's workspace cannot be captured (out-of-scope,
-        // dirty or otherwise). Never dead-end the task permanently: leave that
-        // worktree exactly as it is, fall back to the last durable checkpoint or
-        // the recorded task base, and record the fallback durably so the next
-        // attempt starts from a clean baseline instead of blocking forever.
-        const commit = commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit
-        const recovery: TaskRecovery = { commit, previousOwnerId: value.memberId, reason: error instanceof Error ? error.message : String(error), at: Date.now() }
-        this.recordRecoveryFallback(member.missionId, task.id, task.epoch, recovery)
+        // W9: the previous owner's workspace cannot be captured as an artifact
+        // (out-of-scope, dirty or otherwise). Never dead-end the task permanently
+        // and never drop that work silently: leave the worktree exactly as it is
+        // and snapshot it into the preservation refs the way the stop barrier
+        // does (H-3), so the replacement inherits every uncaptured change and
+        // decides what to keep. Only when even that fails does the replacement
+        // start from the last durable checkpoint or the recorded task base. The
+        // fallback is reported either way; the runtime makes it durable and
+        // owner-visible instead of leaving it in this process's memory.
+        const captureFailure = error instanceof Error ? error.message : String(error)
+        let preservationFailure: string | undefined
+        try { await this.operation(value.memberId, signal => this.preserveWorkspace(prior, signal, { allowSuperseded: true })) }
+        catch (preservationError) { preservationFailure = preservationError instanceof Error ? preservationError.message : String(preservationError) }
+        const preserved = preservationFailure === undefined && commitId(prior.task.preservedCommit) ? prior.task.preservedCommit : undefined
+        const commit = preserved ?? (commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit)
+        const reason = preserved !== undefined ? captureFailure : `${captureFailure}; preservation failed: ${preservationFailure ?? 'no snapshot commit was recorded'}`
+        const recovery: TaskRecovery = { commit, previousOwnerId: value.memberId, preserved: preserved !== undefined, reason, at: Date.now() }
+        this.recordRecoveryFallback(member, task, recovery)
         return { commit, baseCommit: value.task.baseCommit, recovery, ...composition }
       }
     }
@@ -1596,11 +1608,12 @@ export class Workspaces {
   }
 
   /** Bounded, host-visible record of a W9 recovery fallback; never masks the recovery. */
-  private recordRecoveryFallback(missionId: string, taskId: string, epoch: number, recovery: TaskRecovery): void {
-    const message = `Recovery fallback for ${taskId} (epoch ${epoch}): could not capture ${recovery.previousOwnerId}'s workspace (${recovery.reason}); started from ${recovery.commit}`
+  private recordRecoveryFallback(member: Member, task: Task, recovery: TaskRecovery): void {
+    const outcome = recovery.preserved ? `${member.id} inherited its preserved WIP snapshot ${recovery.commit}` : `started from ${recovery.commit}`
+    const message = `Recovery fallback for ${task.id} (epoch ${task.epoch}): could not capture ${recovery.previousOwnerId}'s workspace (${recovery.reason}); ${outcome}`
     this.recoveryIssues.push(message)
     if (this.recoveryIssues.length > 50) this.recoveryIssues.splice(0, this.recoveryIssues.length - 50)
-    try { this.options.onRecoveryFallback?.({ missionId, taskId, epoch, previousOwnerId: recovery.previousOwnerId, commit: recovery.commit, reason: recovery.reason }) }
+    try { this.options.onRecoveryFallback?.({ missionId: member.missionId, taskId: task.id, epoch: task.epoch, memberId: member.id, previousOwnerId: recovery.previousOwnerId, commit: recovery.commit, preserved: recovery.preserved, reason: recovery.reason }) }
     catch { /* reporting must not mask recovery */ }
   }
 
