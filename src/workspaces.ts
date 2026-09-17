@@ -1911,7 +1911,7 @@ export class Workspaces {
         if (info?.isFile()) present.push(spelled)
       }
       const uncapturedPaths = ignoredDeliverablePaths(member.workspace, present, reason => {
-        throw new Error(`[deliverable_gate_unavailable] ${reason}. The ignored-deliverable gate could not run, so this submission was not recorded; retry \`swarm_submit\` once git answers in the member worktree.`)
+        throw new Error('[deliverable_gate_unavailable] ' + reason + '. The ignored-deliverable gate could not run, so this submission was not recorded; retry `swarm_submit` once git answers in the member worktree.')
       }).map(hit => hit.path)
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
