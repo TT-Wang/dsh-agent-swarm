@@ -32,6 +32,17 @@ const INVENTORY_BYTES = 16 * 1024 * 1024
  * this list; `[]` disables materialisation.
  */
 export const DEFAULT_VERIFICATION_DEPENDENCY_DIRS: readonly string[] = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
+/**
+ * F3: the per-member scratch directory name INSIDE a member worktree. The worker
+ * adapter points `TMPDIR`/`TMP`/`TEMP` at it, so a member's temporary state has
+ * to be writable under its own `workspace-write` sandbox (a sibling of the
+ * worktree is not) while still never dirtying a deliverable. It is treated
+ * exactly like a dependency directory — invisible to `status`, kept out of
+ * checkpoints and artifacts — but it is never materialised into a verification
+ * checkout, because it holds a live session's temporary files rather than an
+ * installed toolchain.
+ */
+export const SWARM_SCRATCH_DIRNAME = '.swarm-scratch'
 export interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
@@ -767,6 +778,25 @@ export class Workspaces {
   cleanupFailures(): readonly string[] { return [...this.cleanupIssues] }
 
   /**
+   * Parse every declared check's shell syntax without executing it, through the
+   * same host subprocess seam the checks themselves use. This is the preflight
+   * `swarm_launch` ran and the staged-plan path did not: a plan whose check is a
+   * shell syntax error was admitted, launched and executed by a whole task and
+   * review cycle before failing at verification, where the same plan was refused
+   * immediately on the prelaunch path. `checks` are already validated non-empty
+   * command strings; this only answers "does `/bin/sh` parse this".
+   */
+  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]> {
+    const issues: string[] = []
+    for (const command of checks) {
+      signal?.throwIfAborted()
+      const result = await runProcess(['/bin/sh', '-n', '-c', command], { cwd, signal, timeoutMs: HOST_GIT_TIMEOUT_MS, maxBytes: 4096, subprocess: this.options.subprocess })
+      if (result.exitCode !== 0) issues.push(result.output.trim() || `exit ${result.exitCode}`)
+    }
+    return issues
+  }
+
+  /**
    * W9 recoveries that could not capture the previous owner's workspace and
    * re-created a clean baseline instead, oldest first (bounded). The previous
    * owner's worktree is never modified by such a fallback.
@@ -775,6 +805,12 @@ export class Workspaces {
 
   private missionDir(missionId: string): string { return path.join(this.root, segment(missionId)) }
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
+  /**
+   * F3: the owned worktree of one member. The one derivation of that path, so the
+   * worker adapter's scratch root and this manager's ownership check agree by
+   * construction instead of by a duplicated `path.join`.
+   */
+  workspacePath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), 'members', segment(memberId)) }
   private memberPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.workspace.json`) }
   private taskPath(missionId: string, taskId: string): string { return path.join(this.missionDir(missionId), 'tasks', `${segment(taskId)}.json`) }
   /** Per-mission private artifact repository: refs live outside the shared source repo. */
@@ -1113,18 +1149,31 @@ export class Workspaces {
   }
 
   /**
+   * F3: the only writer of a member's scratch root is the live member session
+   * (the adapter points its `TMPDIR` there). Every path inside it is toolchain
+   * state — never work, never a deliverable — so it is excluded exactly like a
+   * dependency directory. It is NOT added to `dependencyNames`, so it is never
+   * materialised into a verification checkout.
+   */
+  private isScratchPath(relative: string): boolean {
+    return relative.split('/').includes(SWARM_SCRATCH_DIRNAME)
+  }
+
+  /**
    * The shortest prefix of `relative` that names a dependency directory
-   * (`node_modules` or a configured name) and exists as a directory or symlink,
-   * or undefined when the path is real work. `git status --untracked-files=all`
-   * lists the files inside an untracked directory and never the directory name,
-   * so the check must walk ancestors (advisory A2). A regular file that merely
-   * shares a dependency name is ordinary work and is still refused.
+   * (`node_modules` or a configured name) or the member scratch root, and exists
+   * as a directory or symlink, or undefined when the path is real work.
+   * `git status --untracked-files=all` lists the files inside an untracked
+   * directory and never the directory name, so the check must walk ancestors
+   * (advisory A2). A regular file that merely shares a dependency name is
+   * ordinary work and is still refused.
    */
   private async dependencyPrefix(workspace: string, relative: string): Promise<string | undefined> {
     const names = this.dependencyNames()
     const parts = relative.split('/').filter(part => part !== '')
     for (let index = 1; index <= parts.length; index++) {
-      if (!names.has(parts[index - 1]!)) continue
+      const part = parts[index - 1]!
+      if (!names.has(part) && part !== SWARM_SCRATCH_DIRNAME) continue
       const prefix = parts.slice(0, index).join('/')
       const info = await lstat(path.join(workspace, prefix)).catch(() => undefined)
       if (info !== undefined && (info.isSymbolicLink() || info.isDirectory())) return prefix
@@ -1232,8 +1281,19 @@ export class Workspaces {
             await this.validateArtifact(member, dependency.artifact, signal)
             dependencyCommits.push(dependency.artifact.commit)
             await this.assertNoIgnoredOverwrite(member.workspace, dependency.artifact.commit, signal)
-            try { await this.git(member.workspace, ['merge', '--no-overwrite-ignore', '--no-edit', '--no-ff', dependency.artifact.commit], signal) }
-            catch (error) {
+            try {
+              await this.git(member.workspace, ['merge', '--no-overwrite-ignore', '--no-edit', '--no-ff', dependency.artifact.commit], signal)
+              // F2: a clean exit is not proof that the dependency's content
+              // arrived. `git merge` honours the SOURCE REPOSITORY's own config and
+              // `.gitattributes` (`merge=ours`, a custom merge driver), which can
+              // exit 0 while keeping this side, and a conflict resolved to one side
+              // drops the other the same way. Ancestry checks still pass afterwards
+              // (the merge commit has both parents), so without this comparison a
+              // dependency's whole delta could vanish from the composition with no
+              // conflict recorded and no trace in `changedPaths`.
+              const dropped = await this.droppedDependencyPaths(member.workspace, dependency.artifact.commit, signal)
+              if (dropped.length) conflicts.push(await this.recordIntegrationConflict(member.workspace, task, { dependencyId: dependency.id, commit: dependency.artifact.commit }, `Dependency ${dependency.id} content is missing after a clean merge (${dropped.slice(0, 8).map(name => JSON.stringify(name)).join(', ')}); the source repository's merge configuration or a one-sided conflict resolution discarded it`, signal))
+            } catch (error) {
               // Only integration tasks receive conflicts. The host makes the
               // composition (including conflict markers) an immutable baseline,
               // retaining both parents so workers need only edit normal files.
@@ -1293,6 +1353,39 @@ export class Workspaces {
     if (task.kind !== 'integration' || paths.length === 0) throw new Error(failure)
     await this.git(workspace, ['add', '--all', '--', '.'], signal)
     return { ...source, paths }
+  }
+
+  /**
+   * F2: paths whose content the dependency commit changed but the current merge
+   * result does not carry. Compares the dependency's own changed paths against the
+   * working tree, so a merge that exits 0 while discarding a side (a repository
+   * merge driver, an "ours" strategy, a one-sided resolution) is detected instead
+   * of being recorded as a successful composition. A path the dependency deleted
+   * is satisfied by absence; a path a later dependency legitimately re-modified is
+   * not reported, because only paths this commit touched are compared and a
+   * deliberate re-modification is exactly what a conflict record or a worker edit
+   * covers. Untracked and ignored paths never appear in the diff.
+   */
+  async droppedDependencyPaths(workspace: string, commit: string, signal: AbortSignal): Promise<string[]> {
+    const parent = await this.git(workspace, ['rev-parse', `${commit}^`], signal).catch(() => undefined)
+    if (parent === undefined) return []
+    const changed = (await this.git(workspace, ['diff', '--name-status', '--no-renames', '-z', parent, commit, '--'], signal, undefined, INVENTORY_BYTES))
+      .split('\0').filter(Boolean)
+    const missing: string[] = []
+    for (let index = 0; index + 1 < changed.length; index += 2) {
+      const status = changed[index]!
+      const name = changed[index + 1]!
+      if (status.startsWith('D')) {
+        // The dependency deleted it: absence is correct, surviving content is the loss.
+        if (await lstat(path.join(workspace, name)).then(() => true, () => false)) missing.push(name)
+        continue
+      }
+      const expected = await this.git(workspace, ['rev-parse', `${commit}:${name}`], signal).catch(() => undefined)
+      if (expected === undefined) continue
+      const actual = await this.git(workspace, ['hash-object', '--', name], signal).catch(() => undefined)
+      if (actual !== expected) missing.push(name)
+    }
+    return missing
   }
 
   /**
@@ -1560,6 +1653,12 @@ export class Workspaces {
     for (const name of candidates) {
       const prefix = await this.dependencyPrefix(workspace, name)
       if (prefix === undefined) continue
+      // F3: the member scratch root is toolchain state like a dependency link.
+      // It is untracked by construction (the adapter points TMPDIR at it), so it
+      // is excluded from the changed set, unstaged if an earlier capture staged
+      // it, and kept out of the commit; unlike a dependency it is never a
+      // candidate for materialisation into a verification checkout.
+      if (this.isScratchPath(prefix)) { links.add(prefix); continue }
       if (!await this.git(workspace, ['cat-file', '-e', `HEAD:${prefix}`], signal).then(() => true, () => false)) links.add(prefix)
     }
     return links

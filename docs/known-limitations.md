@@ -389,3 +389,79 @@ and all 48 cases in those five files pass when the same files are run alone. A s
 unloaded run of the complete suite is the number published in `docs/validation.md`; the five cases
 are wall-clock-bound (a scheduling tick or a declared-check timeout lands inside the measured
 window), and no assertion was changed to make them pass.
+
+## Round-18 workflow audit and fixes (2026-09-17)
+
+A second deep pass over the same four questions the round-12 audit asked (does the workflow run
+through, is each member's environment complete, do handoffs preserve work, and does the merged
+delivery lose anything) found and fixed seven defects. The regressions live in
+`tests/r18-workflow-fixes.test.mjs`; each fails on the pre-fix head.
+
+- **Delivery coverage now follows the composed artifact, not a withdrawn carrier's plan.**
+  `taskGraphIndex().covers` is the predicate `completionError`, the completion control and the
+  client's delivery target all share. It used to expand every cancelled/blocked intermediate's own
+  `dependencies`, while `prepareTask` merges only the lineage ENDPOINT of each declared dependency
+  and a repair (`replaces`) never inherits the replaced task's dependencies. A linear pipeline
+  `A → X(deps[A]) → I(integration deps[X])` whose middle task was cancelled and repaired by `Z`
+  (`replaces[X]`, no dependencies — the repair shape `swarm_propose` itself advertises) therefore
+  reported `covers(I, A) = true` although `I` merged only `Z`: the mission could complete and apply
+  an artifact that silently omitted `A`, with no owner-visible signal (`warnIntegrationGap` returns
+  early once any integration exists). The predicate now counts an identity only when the carrier's
+  accepted endpoint subsumes it through replacement lineage, and otherwise recurses into the
+  endpoint's own declared dependencies. A repair that does not re-declare the content-carrying edge
+  now blocks completion with the existing "unique accepted integration" refusal instead of
+  delivering incomplete work.
+- **A staged-plan member edit no longer bricks the member.** `repairDraftAdmissions` rotates a
+  changed member's `sessionId` (its durable worker identity) but left the adapter's persisted
+  composition (`<workspacesRoot>/<mission>/<member>.worker.json`) naming the old one. The adapter
+  composes afresh only when that file is ABSENT and refuses a sessionId mismatch, so after any
+  member-field edit the member could never start again — not even after the owner reverted the edit,
+  because the rotation had already happened. The launch path now drops the stale composition
+  (`WorkerAdapter.invalidateComposition`, after the old handle stopped) before committing the new
+  identity.
+- **`swarm_handoff` refuses a review target that could never own it.** Every other assignment path
+  (propose, `swarm_control` amend, claim and the dispatcher) refuses an author of the reviewed
+  source; handoff only checked that the target existed. Handing a review to its source's author left
+  it bound to that member, unclaimable by everyone, pending forever and blocking completion while
+  the dispatcher reported the member as "eligible". The independence rule is now shared.
+- **The stop barrier no longer discards a durable park.** `resumeStoppedAttempt` set every released
+  member `active`, which undid the park `blockTaskCeiling` commits moments earlier to protect the
+  budget (and a member's own `swarm_wait`) for a barrier that belongs to a different task. A
+  `handoff` barrier now leaves a park in place; the `resource` resume that follows a raised ceiling
+  still clears it.
+- **The parse-only check preflight runs on every launch path.** The `/bin/sh -n` probe existed only
+  in the `swarm_launch` tool handler, so the staged plan path (`swarm_stage` → launch) admitted,
+  launched and executed a whole task with a shell-syntax-error check before failing at verification.
+  It now runs at the shared launch boundary (`SwarmRuntime.launchDraft`), before any worker,
+  worktree or model step exists.
+- **Mission-scope amend is reachable and names its own shape.** `swarm_control` declares `changes`
+  optional (every other action omits it) but the handler, and the browser `control` RPC, reported a
+  generic "Expected an object" for the documented mission-scope amend. Both now name the one shape
+  that action needs (`changes.scope`, or `taskId` for a task amendment) with a stable code.
+- **The member scratch root is writable and stays out of the work.** The persona tells each member to
+  keep temporary state in a "private scratch root", but that root was a sibling of the worktree,
+  which no `workspace-write` rule covers (the sandbox grants the session's workspace root, `/tmp` and
+  `os.tmpdir()`), so a member following its own instructions got EPERM and fell back to the shared
+  temp roots the private root exists to replace. The root now lives at
+  `<member worktree>/.swarm-scratch` and is excluded exactly like a dependency directory (never
+  part of `status`, a checkpoint or an artifact) while never being materialised into a verification
+  checkout. Residual: because the root is inside the member's retained worktree, its temporary state
+  now survives stop/completion with that worktree and is never collected; a mission whose members
+  write large temporary trees there should be cleaned up with the worktree. A composition persisted
+  by the round-16 layout (the old sibling root) is recognized on resume and rewritten with the
+  current root, so upgrading does not refuse an in-flight member; a root that is neither is still
+  refused.
+- **Composition fidelity is checked, not assumed.** After each dependency merge the host compares
+  every path that dependency commit changed against the composed working tree
+  (`Workspaces.droppedDependencyPaths`); a path whose content is missing is recorded as an
+  integration conflict instead of passing as a successful composition. This closes the class where a
+  merge exits 0 while keeping one side (a repository-configured merge driver, a one-sided conflict
+  resolution). **Residual:** the driver case could not be reproduced on the measured git
+  (`git version 2.50.1`, where a custom `merge=<driver>` attribute did not engage for a conflicting
+  single-line edit), so the check is verified directly against a composed tree that keeps the wrong
+  side, not through a driver-driven end-to-end scenario.
+- **Automatic-mission proposal contract is named.** `swarm_propose` on a mission with a saved start
+  request requires `maxRecoveryAttempts` (and `checkTimeoutMs` for a task that declares checks), but
+  the schema required neither and gave them no description while `swarm_launch` did. Both refusals
+  now carry stable codes naming the parameter, and the shared plan schema describes when each is
+  required.

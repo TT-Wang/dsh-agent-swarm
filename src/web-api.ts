@@ -386,8 +386,14 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
             return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
           }
           if (action === 'amend') {
-            const changes = object(body.changes)
-            await exposed(() => runtime.amendScope(actor, missionId, changes.scope as string[], text(body, 'reason')), actionableMessage)
+            // Only `changes.scope` is valid without a taskId (see the tool
+            // surface). Name the required shape instead of surfacing a generic
+            // "Expected a JSON object" or an unhandled TypeError.
+            const changes = body.changes === undefined ? undefined : object(body.changes)
+            if (changes !== undefined && Object.keys(changes).some(key => key !== 'scope')) throw new RequestError('Mission-scope amend accepts only changes.scope: remove the other changes fields, or pass taskId to amend one task')
+            if (changes === undefined || changes.scope === undefined) throw new RequestError('Amend without taskId revises mission scope: pass changes.scope as a nonempty string array, or pass taskId to amend one task')
+            const scope = stringArray(changes, 'scope')
+            await exposed(() => runtime.amendScope(actor, missionId, scope, text(body, 'reason')), actionableMessage)
             return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
           }
           if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new RequestError('Unknown mission control action')

@@ -186,9 +186,18 @@ export class Attempts {
           delete fresh.resumeAfterStop
           this.rt.commit(missionId, () => {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
+              // F2: a park is a durable state of its own, not a stale flag of the
+              // stopped attempt. `blockTaskCeiling` parks the member and then runs
+              // this same barrier, so an unconditional 'active' undid the park a
+              // moment after it was committed. `reason: 'resource'` is that very
+              // resume (the ceiling was raised and this task returns to work), so it
+              // clears the park; a `handoff` barrier belongs to a DIFFERENT task and
+              // must leave a park — the member's own wait, or a ceiling-bound task
+              // that still holds one — in place.
+              const parked = memberPhaseOf(member) === 'parked'
               member.status = 'idle'
               if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
-              else if (state.memberId !== undefined && (reason === 'handoff' || reason === 'resource')) member.phase = 'active'
+              else if ((!parked || reason === 'resource') && state.memberId !== undefined && (reason === 'handoff' || reason === 'resource')) member.phase = 'active'
               this.rt.store.put('members', member)
             }
             this.rt.store.put('tasks', fresh)

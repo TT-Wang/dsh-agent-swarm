@@ -11,11 +11,11 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
-import { readFile, mkdir, lstat, open, readdir, realpath } from 'node:fs/promises'
+import { readFile, mkdir, lstat, open, readdir, realpath, rm } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { Workspaces, writePrivateJson } from './workspaces.js'
+import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspaces.js'
 import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
@@ -196,6 +196,13 @@ interface Resident {
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error) }
 const DEFAULT_CACHE_READ_WEIGHT = 0.1
 const DEFAULT_ACTIVITY_HEARTBEAT_MS = 1000
+/**
+ * F3: the scratch directory name inside a member worktree (`SWARM_SCRATCH_DIRNAME`
+ * in src/workspaces.ts). It is declared once there and reused here, so the
+ * adapter that points `TMPDIR` at the root and the manager that must treat that
+ * root as toolchain state cannot drift apart.
+ */
+const SCRATCH_DIRNAME = SWARM_SCRATCH_DIRNAME
 /** Invalid configuration never silently reverts to 1:1 cache charging. */
 function cacheReadWeight(value: number | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : DEFAULT_CACHE_READ_WEIGHT
@@ -224,7 +231,7 @@ function durableResult(result: { isError: boolean; content: unknown; error?: unk
   return { isError: result.isError, content: result.content, ...(result.error === undefined ? {} : { error: result.error }), ...(result.meta === undefined ? {} : { meta: result.meta }) }
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
-function parseComposition(value: unknown, spec: WorkerSpec, environment: SessionEnvironment): Composition {
+function parseComposition(value: unknown, spec: WorkerSpec, environment: SessionEnvironment, legacyTmpdir?: string): Composition {
   if (!isRecord(value) || value.version !== 1 || value.sessionId !== spec.member.sessionId || value.missionId !== spec.mission.id || value.memberId !== spec.member.id || value.workspace !== spec.member.workspace || typeof value.persona !== 'string' || (value.preset !== undefined && typeof value.preset !== 'string') || !isRecord(value.options)) throw new Error('Worker composition metadata is invalid or belongs to a different worker')
   const raw = value.options
   if ((raw.provider !== undefined && typeof raw.provider !== 'string') || (raw.model !== undefined && typeof raw.model !== 'string') || (raw.reasoningEffort !== undefined && (typeof raw.reasoningEffort !== 'string' || raw.reasoningEffort.length === 0)) || (raw.maxTokens !== undefined && (!Number.isSafeInteger(raw.maxTokens) || Number(raw.maxTokens) < 1))) throw new Error('Invalid persisted worker model options')
@@ -249,7 +256,7 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
   // from another member (or one whose root moved) is refused rather than
   // silently handing one member another's scratch tree; compositions written
   // before this field existed are completed from the freshly computed value.
-  assertCompositionScratch(value, environment.TMPDIR)
+  assertCompositionScratch(value, environment.TMPDIR, legacyTmpdir)
   return { version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace, options, ...(selection === undefined ? {} : { selection }), persona: value.persona, environment, ...(typeof value.preset === 'string' ? { preset: value.preset } : {}), ...(typeof value.usageGeneration === 'number' ? { usageGeneration: value.usageGeneration } : {}) }
 }
 
@@ -258,10 +265,25 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
  * An older composition without the field is completed from the freshly computed
  * environment by the caller, so this is the resume-time fence against a copied
  * or stale composition handing one member another member's scratch tree.
+ *
+ * Round 18: the round-16 layout put that root at `<missionDir>/scratch/<member>`,
+ * a sibling of the worktrees that the member's own `workspace-write` sandbox
+ * refuses. A composition persisted by that build is recognized by its own shape
+ * (it must still name THIS member inside the same mission directory) and
+ * accepted, so upgrading the plugin does not refuse every in-flight member; the
+ * caller re-composes with the current root.
  */
-export function assertCompositionScratch(value: unknown, expectedTmpdir: string): void {
+export function assertCompositionScratch(value: unknown, expectedTmpdir: string, legacyTmpdir?: string): void {
   const composed = isRecord(value) ? value.environment : undefined
-  if (composed !== undefined && (!isRecord(composed) || composed.TMPDIR !== expectedTmpdir)) throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+  if (composed === undefined) return
+  if (!isRecord(composed) || typeof composed.TMPDIR !== 'string') throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+  if (composed.TMPDIR === expectedTmpdir) return
+  if (legacyTmpdir !== undefined && composed.TMPDIR === legacyTmpdir) return
+  throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+}
+/** The round-16 scratch root of one (mission, member) pair, tolerated on resume only. */
+export function legacyScratchRoot(workspaces: Workspaces, missionId: string, memberId: string): string {
+  return path.join(path.dirname(workspaces.metadataPath(missionId, memberId)), 'scratch', memberId)
 }
 
 /**
@@ -518,14 +540,21 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   /**
-   * F3: the deterministic scratch root of one (mission, member) pair. It sits
-   * under the owned mission directory, a sibling of the member worktrees, so
-   * scratch state can never dirty a deliverable, and the identity is validated
-   * by the owned `Workspaces` path helper, so the root can never escape the
-   * owned root or collide with another member's.
+   * F3: the deterministic scratch root of one (mission, member) pair.
+   *
+   * It lives INSIDE the member's own worktree (under `.swarm-scratch/`, a path
+   * component the owned `Workspaces` recognizes as toolchain state and keeps out
+   * of `status`, checkpoints and artifacts). It used to be a sibling of the
+   * worktrees, which no `workspace-write` sandbox rule covers: the member's
+   * session grants writes under its workspace root, `/tmp` and `os.tmpdir()`
+   * only, so the persona's private scratch root was refused with EPERM and the
+   * member was pushed back onto the shared temp roots this root exists to
+   * replace. The identity is still derived from the owned path helpers, so the
+   * root can never escape the owned mission directory or collide with another
+   * member's.
    */
   scratchRoot(missionId: string, memberId: string): string {
-    return path.join(path.dirname(this.workspaces.metadataPath(missionId, memberId)), 'scratch', memberId)
+    return path.join(this.workspaces.workspacePath(missionId, memberId), SCRATCH_DIRNAME)
   }
   /**
    * F3: the environment the adapter composes for one member's session. The root
@@ -644,7 +673,11 @@ export class HarnessWorkers implements WorkerAdapter {
   private async composition(spec: WorkerSpec, signal: AbortSignal): Promise<Composition> {
     const metadataPath = this.workspaces.metadataPath(spec.mission.id, spec.member.id)
     const environment = await this.sessionEnvironment(spec.mission.id, spec.member.id)
-    try { return parseComposition(JSON.parse(await readFile(metadataPath, 'utf8')) as unknown, spec, environment) }
+    // A composition persisted by the round-16 layout names the old sibling
+    // scratch root; it is accepted (this member, this mission) and rewritten with
+    // the current root, so upgrading never refuses an in-flight member.
+    const legacyTmpdir = legacyScratchRoot(this.workspaces, spec.mission.id, spec.member.id)
+    try { return parseComposition(JSON.parse(await readFile(metadataPath, 'utf8')) as unknown, spec, environment, legacyTmpdir) }
     catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
     }
@@ -885,6 +918,32 @@ export class HarnessWorkers implements WorkerAdapter {
     if (resident === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
+  }
+  /**
+   * WS-1: the durable member identity changed (a staged-plan repair rotated its
+   * sessionId), so the persisted composition for this member belongs to the
+   * replaced identity. `parseComposition` refuses a sessionId mismatch and only
+   * an absent file is composed afresh, so without this the member can never
+   * start again — not even after the owner reverts the edit, because the
+   * rotation already happened. The caller has stopped and aborted the old handle
+   * first; this only removes the stale metadata, and the next start composes a
+   * fresh session for the new identity exactly as a first admission does.
+   */
+  /** Parse-only preflight over the plan's declared checks; no worker or worktree exists yet. */
+  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]> {
+    return await this.workspaces.checkSyntaxPreflight(checks, cwd, signal)
+  }
+  async invalidateComposition(missionId: string, memberId: string): Promise<void> {
+    const resident = this.residents.get(memberId)
+    if (resident !== undefined && resident.stopping === undefined && !resident.abort.signal.aborted) {
+      // The caller stopped this member first, so a live entry here is an
+      // already-fenced one. Cancel it and drop the entry rather than refusing
+      // the repair: the identity it was built for no longer exists, and leaving
+      // the stale metadata in place would brick the member permanently.
+      resident.abort.abort(new Error('Worker identity replaced by a saved-plan repair'))
+      this.residents.delete(memberId)
+    }
+    await rm(this.workspaces.metadataPath(missionId, memberId), { force: true })
   }
   private compactIfRequested(resident: Resident): void {
     const threshold = this.options.boundaryCompactionTokens ?? 250000

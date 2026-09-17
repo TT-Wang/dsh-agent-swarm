@@ -964,6 +964,20 @@ export interface WorkerAdapter {
   currentActivity?(memberId: string): WorkerActivity | undefined
   /** A unit of work closed for this member; the adapter may compact its history when idle and over its pressure threshold. */
   compactAtBoundary?(memberId: string): void
+  /**
+   * The durable worker identity changed (a staged-plan repair rotated the
+   * member's sessionId), so the adapter's persisted composition for that member
+   * must not be reused. Called after the previous handle has stopped; the next
+   * start composes a fresh session for the new identity instead of refusing a
+   * composition that belongs to the replaced one.
+   */
+  invalidateComposition?(missionId: string, memberId: string): Promise<void>
+  /**
+   * Parse every declared check without executing it, so a plan whose check is a
+   * shell syntax error is refused before any worker, worktree or model step
+   * exists. Returns one message per unparsable command, in plan order.
+   */
+  checkSyntaxPreflight?(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<string[]>
   isIdle(memberId: string): boolean
   captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact>
   /** Preserve any owned WIP after stop without treating it as an accepted artifact. */

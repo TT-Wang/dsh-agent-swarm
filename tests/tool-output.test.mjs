@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { registerTools } from '../lib/tools.js'
+import { Workspaces } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
 function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget); return definitions }
@@ -97,11 +98,21 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   t.after(() => rm(workspace, { recursive: true, force: true }))
   let launches = 0
   const snapshot = { mission: { id: 'mission-one' } }
-  const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) { launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot }, snapshot: () => snapshot }
+  // The preflight itself now runs at the shared launch boundary
+  // (`SwarmRuntime.launchDraft`), so the tool hands the validated plan to
+  // `startPlan`; this stub keeps the same assertion the tool-level check made by
+  // running the real parse-only probe before it counts a launch. `checks` are
+  // parsed with /bin/sh -n and never executed.
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
+    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  t.after(() => workspaces.dispose())
+  const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
+    const locations = plan.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${plan.tasks.indexOf(task)}].checks[${index}]` })))
+    const issues = await workspaces.checkSyntaxPreflight(locations.map(entry => entry.command), workspace)
+    if (issues.length) throw new Error(`[check_syntax_invalid] ${locations.filter((_, index) => issues[index] !== undefined).map((entry, index) => `${entry.location} has invalid shell syntax: ${issues[index]}`).join('\n')}`)
+    launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot
+  }, snapshot: () => snapshot }
   const definitions = new Map()
-  // The launch path probes every declared check's shell syntax through the host
-  // managed-process seam, so this stub host supplies the real provider — the
-  // assertion below is that the probe runs without executing the check.
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) }, get: name => name === 'subprocess' ? subprocessSeam() : undefined }, runtime, budget)
   const input = { requestId: 'request-one', title: 'Goal', objective: 'Deliver the goal', scope: ['result.txt'], acceptance: ['works'], budget: { ...budget, maxTokens: 12345 },
     members: [{ key: 'a', name: 'A', role: 'delivery', maxOutputTokens: 1024 }, { key: 'b', name: 'B', role: 'review', maxOutputTokens: 2048 }],

@@ -100,14 +100,36 @@ export function taskGraphIndex(tasks: readonly Task[]) {
   const dependencyMet = (id: string): boolean => effective(id)?.status === 'accepted'
   // Reviews always name the exact submitted source; replacement lineage is only for ordinary dependencies.
   const reviewSource = (task: Pick<Task, 'reviewOf'>): Task | undefined => task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
+  /**
+   * Delivered-artifact coverage: is `sourceId`'s accepted content physically in
+   * the artifact composed for `task`?
+   *
+   * The composition itself (`prepareTask`) merges, for every DECLARED dependency
+   * of a task, that dependency's lineage ENDPOINT commit — a repair replaces its
+   * predecessor's content (its `replaces` set is the owner's assertion that it
+   * subsumes it), it never inherits the predecessor's own dependencies. The
+   * predicate follows exactly those edges:
+   *
+   *  - the endpoint itself covers it, and so does every identity the endpoint
+   *    subsumes through an accepted replacement (`identities`, which keeps the
+   *    whole convergent obligation set: a legacy fork whose branches converge on
+   *    one accepted repair is one dependency in practice);
+   *  - beyond that, only the endpoint's OWN declared dependencies carry content.
+   *
+   * It used to expand `identities(id)` and then recurse into each identity's
+   * dependencies, so a cancelled intermediate's plan counted as delivered content
+   * even when the repair that replaced it never merged what that plan produced:
+   * an integration behind a repaired task could complete and deliver an artifact
+   * that silently omitted an accepted implementation (round 18, F1).
+   */
   const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
     if (seen.has(task.id)) return false
     seen.add(task.id)
     return task.dependencies.some(id => {
-      const chain = lineage(id)
+      const endpoint = effective(id)
       // An ambiguous/unfinished carrier cannot establish delivered artifact coverage.
-      if (chain.at(-1)?.status !== 'accepted') return false
-      return [...identities(id)].some(parentId => parentId === sourceId || (byId.has(parentId) && covers(byId.get(parentId)!, sourceId, seen)))
+      if (endpoint === undefined || endpoint.status !== 'accepted') return false
+      return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
   return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants }

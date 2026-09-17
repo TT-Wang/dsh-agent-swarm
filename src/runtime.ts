@@ -1589,8 +1589,8 @@ export class SwarmRuntime {
             maxFindings: input.maxFindings == null ? origin?.ceilingProvenance?.maxFindings : input.ceilingProvenance?.maxFindings,
           } }
       }
-      if (input.maxRecoveryAttempts === undefined) throw new Error('Automatic tasks require a recovery limit chosen by the primary agent')
-      if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new Error('Automatic task checks require a timeout chosen by the primary agent')
+      if (input.maxRecoveryAttempts === undefined) throw new Error('[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
+      if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new Error('[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
     requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(input.acceptance, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new Error('Unknown task kind')
@@ -2526,6 +2526,12 @@ export class SwarmRuntime {
     const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
     this.bounded(input.summary)
     if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown new owner')
+    // F1: a review may only move to a member who can actually own it. Every other
+    // assignment path (propose, controlTask, claim and the dispatcher) refuses an
+    // author of the reviewed source, so a handoff that skipped the check left the
+    // review bound to a member who can never claim it: pending forever, blocking
+    // completion, with no notice naming the cause.
+    if (input.to !== undefined && task.reviewOf !== undefined && this.authorIds(this.task(missionId, task.reviewOf)).has(input.to)) throw new Error('[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: Date.now() }
@@ -3241,6 +3247,13 @@ export class SwarmRuntime {
           reasoningEffort: next.reasoningEffort, maxOutputTokens: next.maxOutputTokens, phase: 'active' })
         if (changed) latest.sessionId = id('swarm-session')
       } else latest.phase = 'stopped'
+      // WS-1: a rotated sessionId is a new worker identity. The adapter's
+      // persisted composition is keyed to the old one and only an ABSENT file is
+      // composed afresh, so the stale metadata must be dropped here — after the
+      // old handle has stopped and before the next start — or this member can
+      // never start again, even if the owner reverts the edit.
+      if (latest.sessionId !== previousSessionId) await this.workers.invalidateComposition?.(mission.id, latest.id)
+      assertStaged()
       this.commit(mission.id, () => {
         this.store.put('members', latest)
         this.store.event(mission!.id, 'member/plan-repaired', 'owner', { memberId: latest.id, revision: draft.revision, previousSessionId, sessionId: latest.sessionId, retired: !next })
@@ -3300,6 +3313,27 @@ export class SwarmRuntime {
       const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input)
       draft.input = input
       draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
+      // P4: the parse-only check preflight runs on EVERY launch path, at the one
+      // boundary both `/agent-swarm` and the staged plan share. It used to live in
+      // the tool handler alone, so a staged plan whose check was a shell syntax
+      // error was admitted, launched, executed by a member and submitted before
+      // the failure surfaced at verification. No worker, worktree or model step
+      // exists yet at this point.
+      const declaredChecks = input.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${task.key}].checks[${index}]` })))
+      if (declaredChecks.length && this.workers.checkSyntaxPreflight !== undefined) {
+        actor.signal?.throwIfAborted()
+        const issues = await this.workers.checkSyntaxPreflight(declaredChecks.map(check => check.command), input.workspace, actor.signal)
+        const failed = declaredChecks.filter((_, index) => issues[index] !== undefined)
+        // A concrete string, never a template: the browser sanitizer classifies
+        // refusals by matching an anchored allowlist against the authored text, and
+        // an interpolated message cannot be proven against it
+        // (tests/rpc-refusal-classification.test.mjs).
+        if (failed.length) {
+          const detail = failed.map((check, index) => `${check.location} has invalid shell syntax: ${issues[index]}`).join('\n')
+          throw new Error('[check_syntax_invalid] ' + detail + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
+        }
+      }
+      assertCurrent()
       draft.status = 'launching'; draft.revision++; draft.updatedAt = Date.now(); delete draft.error
       draft.missionId ??= `mission_${draft.id}`
       this.commit(draft.id, () => this.store.put('drafts', draft))
