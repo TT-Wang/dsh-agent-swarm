@@ -3801,8 +3801,19 @@ export class SwarmRuntime {
     }
     this.assertEffectiveTaskGraph(missionId, { ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
+    // The ceiling park is consumed once the ceiling is retired and the exhausted
+    // attempt's stop has confirmed. `claim` records that attempt's owner as the
+    // assignee and a ceiling-blocked task admits no other assignment before this
+    // amendment, so the pre-amend assignee is the member the block parked. While
+    // the barrier is still in flight the old handle may still be stepping, so the
+    // park stays and the barrier's own completion consumes it instead.
+    const ceilingOwner = task.ceiling !== undefined && next.ceiling === undefined && next.resumeAfterStop?.epoch !== next.epoch && task.assigneeId !== undefined
+      ? this.store.get('members', task.assigneeId) : undefined
+    const unparked = ceilingOwner !== undefined && memberPhaseOf(ceilingOwner) === 'parked' ? ceilingOwner : undefined
+    if (unparked !== undefined) { unparked.phase = 'active'; delete unparked.activity }
     this.commit(missionId, () => {
       this.store.put('tasks', next)
+      if (unparked !== undefined) this.store.put('members', unparked)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])) })
     })
     this.attempts.resumeStoppedAttempt(missionId, next, { force: action === 'resume' })
@@ -3981,9 +3992,13 @@ export class SwarmRuntime {
   }
   /**
    * Durable per-task ceiling block. The task stops at its own limit, the owning
-   * member is parked (a new assignment supplies fresh input and unparks it) and
-   * the owner is told to repair or re-plan. Callers block before charging a
-   * mission step, so the blocked task never consumes the mission budget.
+   * member is parked and the owner is told to repair or re-plan. Callers block
+   * before charging a mission step, so the blocked task never consumes the
+   * mission budget. The park outlives the stop barrier this installs: it keeps
+   * refusing the handle's further steps uncharged and keeps the member
+   * dispatchable through the parked-member hatch, and it is consumed when the
+   * owner raises the ceiling (`controlTask`, or the barrier itself when the
+   * raise lands first) or fresh input reaches the member.
    */
   private blockTaskCeiling(mission: Mission, task: Task, ceiling: TaskCeiling): void {
     const ownerId = task.attempt?.ownerId
