@@ -308,7 +308,12 @@ export interface Artifact {
   changedPaths: string[]
   /** Explicit file outputs, read back from this commit (never the mutable worktree). */
   files?: Array<{ path: string; blob: string; bytes: number }>
-  /** Named outputs hidden by ignore rules and omitted from this submission. */
+  /**
+   * In-scope ignored files the task text names that exist in the member
+   * worktree but were not declared. Capture reports them and `submit()` refuses
+   * on them, so an accepted artifact never carries this field; a value on an
+   * accepted row predates that gate and is named in the completion notice.
+   */
   uncapturedPaths?: string[]
   /** Changed executable files, symlinks or submodules in either tree, including deletions. */
   executablePaths?: string[]
