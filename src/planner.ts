@@ -170,7 +170,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     } catch { /* A transient read/service failure must not veto agent creation; the timer retries durable pending work. */ }
   }
   const unsubscribe = runtime.subscribe(pump)
-  const removeCreated = ctx.on('agent/created', pump, { global: true })
+  const removeCreated = ctx.on('agent/created', (): undefined => { pump(); return undefined }, { global: true })
   const timer = setInterval(pump, Math.max(25, Math.min(runtime.config.tickMs, 1000)))
   timer.unref()
   ctx.effect(() => () => {

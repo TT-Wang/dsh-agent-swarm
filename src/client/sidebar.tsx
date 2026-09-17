@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ReactNode } from 'react'
+import { currentSessionId } from './navigation.ts'
 
 /** Public Better Sidebar 0.18 service subset. Kept structural so an optional
  * client integration does not pull its newer Harness peers into this plugin.
@@ -153,6 +154,8 @@ interface SlotRegistrar {
  * user reaches a page type that recognizes no resource address.
  */
 export interface RightSidebarGuideEntry {
+  /** Stable within the tab type; 0.1.6 requires it and rejects duplicates. */
+  id: string
   order: number
   title: () => string
   description?: () => string
@@ -177,12 +180,6 @@ interface RightTabRegistry {
  */
 interface RightSidebarController {
   openTab(kind: string, options?: Record<string, unknown>): void
-}
-
-/** The session list, restricted to the signal that a session surface can mount. */
-interface SessionList {
-  subscribe?(listener: () => void): () => void
-  getSnapshot?(): { current?: string }
 }
 
 /** How long a tab that could not open yet keeps trying (60 x 500ms). */
@@ -218,7 +215,7 @@ interface RightSidebarBodyProps {
  */
 export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightSidebarDescriptor): SidebarAdapter {
   const listeners = new Set<() => void>()
-  const sessions = (ctx as { sessions?: { list?: SessionList } }).sessions?.list
+  const sessions = (ctx as { sessions?: Context['sessions'] }).sessions
   let disposed = false
   let current: { retry(): void; open(): boolean; release(): void } | undefined
   const notify = () => { for (const listener of [...listeners]) listener() }
@@ -232,7 +229,7 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     const tab = descriptor()
     const releaseType = registry.register({
       id: tab.id, kind: tab.kind, title: () => tab.label(),
-      guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
+      guide: [{ id: 'open', order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
     })
     let releaseBody: (() => void) | undefined
     let releaseLauncher: (() => void) | undefined
@@ -260,11 +257,13 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     const attempt = (): boolean => {
       if (!live() || request === undefined) return true
       // A late mount for a different conversation cannot inherit this reveal.
-      if (request.sessionId !== undefined && request.sessionId !== sessions?.getSnapshot?.().current) {
+      if (request.sessionId !== undefined && request.sessionId !== currentSessionId(sessions)) {
         stopRetry()
         return true
       }
       try {
+        // Public navigation throws until a seat mounts. openTabIn is an internal
+        // tab action that silently no-ops before adoption, so it cannot acknowledge a reveal.
         controller.openTab(tab.kind, { revealIfOpened: true })
         stopRetry()
         return true
@@ -279,7 +278,7 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
         // to the current conversation; native sidebar state still owns geometry.
         const layout = ready.get('layout') as { selectPanel?(panel: null): void } | undefined
         layout?.selectPanel?.(null)
-        request = { sessionId: sessions?.getSnapshot?.().current }
+        request = { sessionId: currentSessionId(sessions) }
         attempts = 0
         if (!attempt()) timer = setInterval(() => {
           attempts += 1
@@ -302,8 +301,8 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     return entry.release
   }, 'agent-swarm: right sidebar tab'))
   let stopWatchingSessions: (() => void) | undefined
-  if (typeof sessions?.subscribe === 'function') {
-    try { stopWatchingSessions = sessions.subscribe(() => current?.retry()) }
+  if (typeof sessions?.list?.subscribe === 'function') {
+    try { stopWatchingSessions = sessions.list.subscribe(() => current?.retry()) }
     catch { stopWatchingSessions = undefined }
   }
   const dispose = () => {

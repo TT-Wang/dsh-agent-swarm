@@ -108,7 +108,13 @@ async function nativeFixture(t, component = () => null, options = {}) {
     })
     scope.provide('sessions', { list: {
       subscribe(listener) { sessionListeners.add(listener); return () => sessionListeners.delete(listener) },
-      getSnapshot: () => ({ current: currentSession }),
+      getSnapshot: () => options.sessionContract === 'retained' ? {
+        ids: ['background', ...(currentSession === undefined ? [] : [currentSession])],
+        byId: {
+          background: { retainedBy: { worker: 1, mainView: 0 } },
+          ...(currentSession === undefined ? {} : { [currentSession]: { retainedBy: { mainView: 1 } } }),
+        },
+      } : { current: currentSession },
     } })
     scope.provide('layout', {
       openRightbar(...args) { layoutCalls.push(args) },
@@ -128,8 +134,8 @@ async function nativeFixture(t, component = () => null, options = {}) {
     return provider
   }
   const registry = await mountRegistry()
-  const mount = async openTab => {
-    const provider = ctx.plugin({ name: `native-sidebar-controller-${++generation}`, apply(scope) { scope.provide('sidebarRight', { openTab }) } })
+  const mount = async controller => {
+    const provider = ctx.plugin({ name: `native-sidebar-controller-${++generation}`, apply(scope) { scope.provide('sidebarRight', typeof controller === 'function' ? { openTab: controller } : controller) } })
     await provider
     return provider
   }
@@ -324,6 +330,49 @@ test('an explicit native request owns the fallback while waiting for its session
   assert.equal(attempts, 3, 'success consumes the request and cancels all retry activity')
 })
 
+for (const sessionContract of ['current', 'retained']) {
+  test(`an unadopted ${sessionContract} session cannot silently consume an explicit reveal`, async t => {
+    t.mock.timers.enable({ apis: ['setInterval'] })
+    const f = await nativeFixture(t, undefined, { sessionContract })
+    let mounted = false, attempts = 0, targetedAttempts = 0, collapsed = true
+    const opened = []
+    // Both native host versions expose openTabIn for internal tab actions. Its
+    // void return proves nothing: before store adoption it deliberately no-ops.
+    await f.mount({
+      openTabIn(sessionId, kind, options) {
+        targetedAttempts++
+        if (mounted) { opened.push([sessionId, kind, options]); collapsed = false }
+      },
+      openTab(kind, options) {
+        attempts++
+        if (!mounted) throw new Error('sidebarRight: no session surface is mounted')
+        opened.push(['viewer', kind, options]); collapsed = false
+      },
+    })
+    await settle(() => f.adapter.getSnapshot())
+    f.signalSessions()
+    t.mock.timers.tick(120_000)
+    assert.equal(attempts, 0, 'readiness and session signals preserve the collapsed pane')
+    assert.equal(collapsed, true)
+    assert.equal(f.adapter.open(), true, 'native integration retains ownership while the surface mounts')
+    assert.equal(attempts, 1)
+    t.mock.timers.tick(500)
+    assert.equal(attempts, 2, 'a refused reveal keeps its retry alive despite the silent targeted API')
+    assert.deepEqual(opened, [])
+    mounted = true
+    t.mock.timers.tick(500)
+    assert.equal(attempts, 3)
+    assert.deepEqual(opened, [['viewer', 'agent-swarm', { revealIfOpened: true }]])
+    assert.equal(collapsed, false)
+    assert.equal(targetedAttempts, 0, 'explicit navigation uses the public mounted-seat contract')
+    collapsed = true
+    f.signalSessions()
+    t.mock.timers.tick(120_000)
+    assert.equal(attempts, 3, 'successful navigation consumes the request')
+    assert.equal(collapsed, true, 'a subsequent manual collapse survives old signals and timers')
+  })
+}
+
 test('native retry exhaustion needs a fresh explicit request, not a session notification', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] })
   const f = await nativeFixture(t)
@@ -392,10 +441,10 @@ test('native pending requests end with their controller, registry or adapter lif
   assert.equal(f.sessionListeners.size, 0)
 })
 
-for (const notify of [true, false]) {
-  test(`a pending native request is dropped on session switch${notify ? ' notification' : ' before its next timer retry'}`, async t => {
+for (const sessionContract of ['current', 'retained']) for (const notify of [true, false]) {
+  test(`a pending native request is dropped on ${sessionContract} session switch${notify ? ' notification' : ' before its next timer retry'}`, async t => {
     t.mock.timers.enable({ apis: ['setInterval'] })
-    const f = await nativeFixture(t)
+    const f = await nativeFixture(t, undefined, { sessionContract })
     let attempts = 0, mounted = false
     await f.mount(() => {
       attempts++

@@ -112,7 +112,7 @@ flowchart TD
 Agent Swarm 当前以源码插件形式提供。你需要：
 
 - **Node.js `^22.19.0 || >=24.0.0`、Git，以及 macOS 或 Linux。** 任务在本地 Git 仓库中执行。
-- **已构建的受支持 DeepSeek Harness。** 默认适配 `0.1.5-rc.1`，另外支持 `0.1.3-alpha.2` 和 `0.1.2-rc.1`；准确版本见[兼容矩阵](compatibility.json)。
+- **已构建的受支持 DeepSeek Harness。** 最新支持 `0.1.6-alpha.2`，另外支持 `0.1.5-rc.1`、`0.1.3-alpha.2` 和 `0.1.2-rc.1`；准确版本见[兼容矩阵](compatibility.json)。用 `DSH_SOURCE` 指定检出，否则启动脚本先取 `~/.dsh/source/current`。
 - **可用的 Harness 模型配置。** 凭据由宿主管理；除非计划指定其他模型路由，成员默认沿用主会话模型。
 
 ```sh
@@ -133,7 +133,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 打开 Harness 输出的已认证启动链接，在会话中选择模型，输入 `/agent-swarm` 加上自然语言目标即可。该命令已注册到原生命令补全中。
 
-在受支持的 `0.1.5-rc.1` 宿主上，Agent Swarm 位于 Files 旁的原生右侧栏，默认折叠。发送 `/agent-swarm` 加自然语言目标后会自动展开；也可以随时点击左侧导航底部的 Agent Swarm 按钮重新打开。较早的受支持版本优先使用 Better Sidebar，否则使用插件自身的停靠面板。界面支持中英文和深浅主题。
+在受支持的 `0.1.5-rc.1` 与 `0.1.6-alpha.2` 宿主上，Agent Swarm 位于原生右侧栏，默认折叠；0.1.6 上也可从右侧栏 Start 页的卡片打开。发送 `/agent-swarm` 加自然语言目标后会自动展开；也可以随时点击左侧导航底部的 Agent Swarm 按钮重新打开。较早的受支持版本优先使用 Better Sidebar，否则使用插件自身的停靠面板。界面支持中英文和深浅主题。
 
 Bundle 安装、升级、启动恢复与配置详见[使用与运维指南](docs/operations.zh-CN.md)。
 

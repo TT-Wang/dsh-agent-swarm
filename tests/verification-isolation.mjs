@@ -90,7 +90,7 @@ test('host prerequisite: the real provider fully enforces workspace-write', asyn
   t.after(async () => { await rm(scratch, { recursive: true, force: true }) })
   // confinedCheckArgv is the production path: it throws unless the host
   // reports full enforcement, so reaching runProcess proves enforcement.
-  const argv = confinedCheckArgv(sandbox, ['/bin/sh', '-c', 'true'], scratch)
+  const argv = await confinedCheckArgv(sandbox, ['/bin/sh', '-c', 'true'], scratch)
   const probe = await runProcess(argv, { subprocess: subprocessSeam, cwd: scratch, timeoutMs: 30000, maxBytes: 32000 })
   assert.equal(probe.exitCode, 0, `the host cannot apply the real sandbox (nested-sandbox worker hosts are excluded by design): ${probe.output}`)
 })

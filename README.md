@@ -106,7 +106,7 @@ For the implementation contracts and their origins, see [design notes](docs/desi
 Agent Swarm currently ships as a source plugin. You need:
 
 - **Node.js `^22.19.0 || >=24.0.0`, Git, and macOS or Linux.** Work happens in local Git repositories.
-- **A built, supported DeepSeek Harness checkout.** The default target is `0.1.5-rc.1`; `0.1.3-alpha.2` and `0.1.2-rc.1` are also listed in the [exact compatibility matrix](compatibility.json).
+- **A built, supported DeepSeek Harness checkout.** The newest supported release is `0.1.6-alpha.2`; `0.1.5-rc.1`, `0.1.3-alpha.2` and `0.1.2-rc.1` are also listed in the [exact compatibility matrix](compatibility.json). Point `DSH_SOURCE` at the checkout you mean — the launcher otherwise takes `~/.dsh/source/current` first.
 - **A working model configuration in Harness.** Credentials stay with the host. Workers inherit the primary conversation's model unless the plan selects another route.
 
 ```sh
@@ -127,7 +127,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 Open the authenticated launch URL printed by Harness, choose a model in a conversation, and enter `/agent-swarm` followed by your goal. The command appears in native autocomplete.
 
-On the supported `0.1.5-rc.1` host, Agent Swarm lives in the native right sidebar beside Files. The sidebar starts collapsed; send `/agent-swarm` with your goal to open it automatically, or use the persistent Agent Swarm button at the bottom of the left navigation to open it again. Earlier supported hosts use Better Sidebar when available, or the plugin's dock. The UI supports English, Chinese, light and dark themes.
+On the supported `0.1.5-rc.1` and `0.1.6-alpha.2` hosts, Agent Swarm lives in the native right sidebar; on 0.1.6 it is also available from the sidebar’s Start page. The sidebar starts collapsed; send `/agent-swarm` with your goal to open it automatically, or use the persistent Agent Swarm button at the bottom of the left navigation to open it again. Earlier supported hosts use Better Sidebar when available, or the plugin's dock. The UI supports English, Chinese, light and dark themes.
 
 For bundle installation, upgrades, startup recovery and configuration, see the [operations guide](docs/operations.md).
 
