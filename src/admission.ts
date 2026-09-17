@@ -389,16 +389,23 @@ export interface IgnoredPath { path: string; source: string; line: number; patte
  * pattern and would falsely reject an un-ignored deliverable). The verbose run
  * only supplies the source, line and pattern for the paths already known to be
  * hidden, and is silent when the workspace is not a git work tree or git is
- * unavailable.
+ * unavailable. That silence is right for an advisory admission hint; the
+ * capture gate that relies on this list passes `onFailure` so a run that did
+ * not complete (git missing, exit 128, timeout) is surfaced instead of reading
+ * as "nothing is ignored".
  */
-export function ignoredDeliverablePaths(workspace: string, paths: readonly string[]): IgnoredPath[] {
+export function ignoredDeliverablePaths(workspace: string, paths: readonly string[], onFailure?: (reason: string) => void): IgnoredPath[] {
   const candidates = [...new Set(paths.map(path => path.replace(/^\.\//, '')).filter(path => path && !path.endsWith('/') && !isAbsolute(path) && !path.includes('*') && !path.split('/').some(part => part === '..')))]
   if (!candidates.length) return []
   const input = candidates.map(candidate => `${candidate}\0`).join('')
   const run = (args: string[]) => spawnSync('git', ['-C', workspace, 'check-ignore', '--stdin', ...args], { input, encoding: 'utf8', timeout: 5000, maxBuffer: 1048576 })
   const ignored = run(['-z'])
   // Exit 1 means no candidate is ignored; 128 means git or a work tree is unavailable. Neither is an admission failure.
-  if (ignored.error || ignored.status !== 0) return []
+  if (ignored.error !== undefined || ignored.status === null || ignored.status > 1) {
+    onFailure?.(`git check-ignore did not complete in ${workspace}: ${ignored.error !== undefined ? ignored.error.message : ignored.status === null ? `terminated by ${ignored.signal ?? 'timeout'}` : `exit ${ignored.status}${String(ignored.stderr ?? '').trim() ? ` (${String(ignored.stderr).trim()})` : ''}`}`)
+    return []
+  }
+  if (ignored.status !== 0) return []
   const hidden = new Set(String(ignored.stdout).split('\0').filter(Boolean))
   if (!hidden.size) return []
   const verbose = run(['-v', '-z'])

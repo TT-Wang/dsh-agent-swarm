@@ -310,9 +310,11 @@ export interface Artifact {
   files?: Array<{ path: string; blob: string; bytes: number }>
   /**
    * In-scope ignored files the task text names that exist in the member
-   * worktree but were not declared. Capture reports them and `submit()` refuses
-   * on them, so an accepted artifact never carries this field; a value on an
-   * accepted row predates that gate and is named in the completion notice.
+   * worktree (under their on-disk spelling) but were not declared. Capture
+   * reports them; `submit()` and, for a review report capture, `verify()`
+   * refuse on them, so neither an accepted artifact nor a stored
+   * `reviewArtifact` carries this field; a value on an accepted row predates
+   * that gate and is named in the completion notice.
    */
   uncapturedPaths?: string[]
   /** Changed executable files, symlinks or submodules in either tree, including deletions. */
