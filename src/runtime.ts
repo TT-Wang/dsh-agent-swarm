@@ -2002,6 +2002,13 @@ export class SwarmRuntime {
         ? await this.workers.captureArtifact(member, task, input.deliverables)
         : undefined
       this.ownAttempt(actor, missionId, task.id, input.attemptId)
+      // R19-C F3: the review report has the same gate as a submission. Capture
+      // lists an in-scope ignored file the review text names when it is present
+      // in the reviewer worktree and undeclared; refuse before the declared
+      // checks run and while the attempt is live, with the same two repairs, so
+      // a stored `reviewArtifact` never silently omits the report it names.
+      const uncaptured = reviewArtifact?.uncapturedPaths ?? []
+      if (uncaptured.length) throw new PolicyError('deliverable_uncaptured', 'validation_error', `[deliverable_uncaptured] The review task names ignored files in your worktree this verification did not capture: ${uncaptured.map(name => JSON.stringify(name)).join(', ')}. Ignored files are captured only when declared. If they are outputs of this review, retry \`swarm_verify\` with \`deliverables\`: ${JSON.stringify(uncaptured)}; if they are not, remove them from your worktree and retry \`swarm_verify\`.`)
       return { member, source, artifact, reviewArtifact, evidenceRevision, checksRevision: JSON.stringify(source.checks) }
     })
     // M1a seam 5/7: the declared-check execution path is src/declared-checks.ts.

@@ -963,9 +963,14 @@ export class Workspaces {
    */
   private gitTimeout(): number { return Math.max(this.options.checkTimeoutMs, HOST_GIT_TIMEOUT_MS) }
 
-  private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
+  /** One git invocation with the host's fixed identity and environment; the caller judges the exit code. */
+  private async gitResult(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes): Promise<Awaited<ReturnType<typeof runProcess>>> {
     const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('GIT_')))
-    const result = await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.gitTimeout(), maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, subprocess: this.options.subprocess, ...(signal === undefined ? {} : { signal }) })
+    return await runProcess(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'user.name=Agent Swarm', '-c', 'user.email=swarm@localhost', ...args], { cwd, timeoutMs: this.gitTimeout(), maxBytes, env: { ...env, ...overrides, GIT_OPTIONAL_LOCKS: '0', GIT_NO_REPLACE_OBJECTS: '1' }, subprocess: this.options.subprocess, ...(signal === undefined ? {} : { signal }) })
+  }
+
+  private async git(cwd: string, args: string[], signal?: AbortSignal, overrides?: Record<string, string>, maxBytes = this.options.maxCheckOutputBytes, raw = false): Promise<string> {
+    const result = await this.gitResult(cwd, args, signal, overrides, maxBytes)
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} failed (${result.exitCode}): ${result.output.trim()}`)
     if (result.truncated) throw new Error(`git ${args[0]} output exceeded the configured limit; refusing incomplete artifact inspection`)
     return raw || args.includes('-z') ? result.output : result.output.trim()
@@ -1353,6 +1358,10 @@ export class Workspaces {
             } finally { await rm(patchPath, { force: true }) }
           }
           if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
+          // R19-C F1: a recovered checkout tracks the hinted ignored files its
+          // snapshot force-included; put them back to untracked+ignored on disk
+          // so the submit gate sees them exactly as the previous owner's did.
+          if (recovery !== undefined) await this.untrackPreservedHints(member.workspace, baseCommit, preservationPaths, signal)
           record.task = { taskId: task.id, epoch: task.epoch, baseCommit, preservationPaths,
             ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
             ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
@@ -1471,9 +1480,89 @@ export class Workspaces {
   }
 
   private taskRecoveryPaths(task: Task): string[] {
-    const dependencies = this.dependencyNames()
     return deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => validRecoveryPath(name)
-      && withinScope(name, task.scope) && !name.split('/').some(part => dependencies.has(part)))
+      && withinScope(name, task.scope) && !this.toolchainName(name))
+  }
+
+  /**
+   * A path with a dependency directory name or the member scratch root as any
+   * component is toolchain state by name alone (F4). `dependencyLinks` only
+   * sees the untracked, not-ignored entries of a worktree, so a hinted or
+   * declared `node_modules/x/README.md` inside an IGNORED dependency directory
+   * would otherwise read as an obligation, and be force-captured when declared.
+   */
+  private toolchainName(relative: string): boolean {
+    const dependencies = this.dependencyNames()
+    return relative.split('/').some(part => dependencies.has(part)) || this.isScratchPath(relative)
+  }
+
+  /**
+   * The spelling the filesystem stores for `relative`, walking one component at
+   * a time: the exact entry when it exists, otherwise the unique entry that
+   * matches it case-insensitively (F2). A case-folding filesystem (the macOS
+   * default) answers `lstat("docs/Report.md")` for a file stored as
+   * `docs/report.md`, but git records an added file under its stored spelling
+   * and a literal pathspec in the text's spelling matches nothing, so both the
+   * gate and a declaration have to name the stored spelling. Undefined when a
+   * component is missing, when an ancestor is a symlink or when an ancestor is
+   * a nested repository or submodule: none of those can hold a deliverable of
+   * this repository (outputs refuse symlink ancestors, snapshots refuse nested
+   * repositories) and `git check-ignore` exits 128 for such a path instead of
+   * answering, so the gate must never ask about it. The caller still inspects
+   * the final entry.
+   */
+  private async onDiskSpelling(workspace: string, relative: string): Promise<string | undefined> {
+    const resolved: string[] = []
+    const parts = relative.split('/')
+    for (const [index, part] of parts.entries()) {
+      const entries = await readdir(path.join(workspace, ...resolved)).catch(() => undefined)
+      if (entries === undefined) return undefined
+      const lower = part.toLowerCase()
+      const match = entries.includes(part) ? part : entries.filter(entry => entry.toLowerCase() === lower)
+      if (Array.isArray(match) ? match.length !== 1 : false) return undefined
+      resolved.push(Array.isArray(match) ? match[0]! : match)
+      if (index === parts.length - 1) break
+      const info = await lstat(path.join(workspace, ...resolved)).catch(() => undefined)
+      if (info === undefined || !info.isDirectory()) return undefined
+      if (await lstat(path.join(workspace, ...resolved, '.git')).then(() => true, () => false)) return undefined
+    }
+    return resolved.join('/')
+  }
+
+  /**
+   * R19-C F1: restore the submit gate's view of a recovered checkout. The
+   * preservation snapshot force-includes every hinted ignored file so a report
+   * draft survives a handoff, and this worktree was just checked out (or
+   * rebased) AT that snapshot, so those files are TRACKED here. `git
+   * check-ignore` never reports a tracked path, `captureArtifact` would list
+   * nothing, and an undeclared submission would publish a member-created
+   * `.env` into the immutable artifact. Every hinted path that is in the index,
+   * ignored by pattern and absent from the task base is removed from the index
+   * only: the file stays on disk for the new owner, capture flags it unless it
+   * is declared, and a declared output is force-added exactly as it was for the
+   * previous owner. A tracked ignored path the base already carries (a declared
+   * dependency output, a force-added source file) is real content and stays.
+   */
+  private async untrackPreservedHints(workspace: string, baseCommit: string, hints: readonly string[], signal: AbortSignal): Promise<void> {
+    if (!hints.length) return
+    const tracked = new Set((await this.git(workspace, ['ls-files', '--cached', '-z', '--', ...hints.map(name => `:(literal)${name}`)], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
+    const candidates = hints.filter(name => tracked.has(name))
+    if (!candidates.length) return
+    // `-z` needs `--stdin`, which the process seam does not offer; hints are
+    // ASCII path tokens without quotes, backslashes or control characters, so
+    // with `core.quotePath=false` the newline-separated answer is exact.
+    const check = await this.gitResult(workspace, ['-c', 'core.quotePath=false', 'check-ignore', '--no-index', '--', ...candidates], signal, undefined, INVENTORY_BYTES)
+    if (check.exitCode !== 0 && check.exitCode !== 1) throw new Error(`git check-ignore failed (${check.exitCode}): ${check.output.trim()}`)
+    if (check.truncated) throw new Error('git check-ignore output exceeded the configured limit; refusing incomplete recovery inspection')
+    const ignored = new Set(check.exitCode === 0 ? check.output.split('\n').filter(Boolean) : [])
+    const forced: string[] = []
+    for (const name of candidates) {
+      if (!ignored.has(name)) continue
+      const inBase = await this.git(workspace, ['cat-file', '-e', `${baseCommit}:${name}`], signal).then(() => true, () => false)
+      signal.throwIfAborted()
+      if (!inBase) forced.push(name)
+    }
+    if (forced.length) await this.git(workspace, ['rm', '--cached', '--force', '--quiet', '--', ...forced.map(name => `:(literal)${name}`)], signal)
   }
 
   /** A legacy failed claim may have moved the member after saving its old task.
@@ -1749,16 +1838,23 @@ export class Workspaces {
       const linkList = [...links]
       const dependencyContent = (name: string): boolean => linkList.some(link => name === link || name.startsWith(`${link}/`))
       if (!Array.isArray(deliverables) || deliverables.some(name => typeof name !== 'string')) throw new Error('[invalid_deliverables] deliverables must be an array of relative file paths')
-      const outputs = [...new Set(deliverables)]
+      const declared = [...new Set(deliverables)]
       // Explicit outputs may override ignore rules, never scope, Git metadata,
       // dependency exclusions or symlink containment. Do not force-add a folder.
-      for (const name of outputs) {
-        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name)) throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata and dependency directories. Correct \`deliverables\` with \`swarm_submit\`.`)
+      // F4: a name inside a dependency directory or the scratch root is refused
+      // even when that directory is ignored and so invisible to `dependencyLinks`.
+      // F2: each output is then carried under its on-disk spelling, which is the
+      // spelling git records for it and the one `ls-tree` finds below.
+      const outputs: string[] = []
+      for (const name of declared) {
+        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name) || this.toolchainName(name)) throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata, dependency and scratch directories. Correct \`deliverables\` with \`swarm_submit\`.`)
         const parts = name.split('/')
         for (let depth = 1; depth <= parts.length; depth++) {
           const info = await lstat(path.join(member.workspace, ...parts.slice(0, depth))).catch(() => undefined)
           if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
         }
+        const spelled = await this.onDiskSpelling(member.workspace, name) ?? name
+        if (!outputs.includes(spelled)) outputs.push(spelled)
       }
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
@@ -1799,14 +1895,24 @@ export class Workspaces {
       // a regular file in this worktree. A fresh worktree holds only tracked
       // files and dependency directories, so an ignored input such as `.env` is
       // absent unless the member created it, while a report the member wrote
-      // is present. Directory tokens, dependency content and out-of-scope names
-      // (already advisory at admission) are never obligations.
-      const hinted = deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !outputs.includes(name))
-      const uncapturedPaths: string[] = []
-      for (const hit of ignoredDeliverablePaths(member.workspace, hinted)) {
-        const info = await lstat(path.join(member.workspace, hit.path)).catch(() => undefined)
-        if (info?.isFile()) uncapturedPaths.push(hit.path)
+      // is present. Directory tokens, dependency content, scratch and dependency
+      // names (F4) and out-of-scope names (already advisory at admission) are
+      // never obligations. F2: a hint is resolved to its on-disk spelling before
+      // it is compared with the declared outputs or named in the refusal, so a
+      // case-folding filesystem cannot make the text's spelling and the file's
+      // two different obligations. R19-C: a check-ignore run that did not
+      // complete is a refusal, never a silently open gate.
+      const hinted = deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !this.toolchainName(name))
+      const present: string[] = []
+      for (const name of hinted) {
+        const spelled = await this.onDiskSpelling(member.workspace, name)
+        if (spelled === undefined || outputs.includes(spelled) || present.includes(spelled)) continue
+        const info = await lstat(path.join(member.workspace, spelled)).catch(() => undefined)
+        if (info?.isFile()) present.push(spelled)
       }
+      const uncapturedPaths = ignoredDeliverablePaths(member.workspace, present, reason => {
+        throw new Error(`[deliverable_gate_unavailable] ${reason}. The ignored-deliverable gate could not run, so this submission was not recorded; retry \`swarm_submit\` once git answers in the member worktree.`)
+      }).map(hit => hit.path)
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
       delete record.task.preservedCommit
