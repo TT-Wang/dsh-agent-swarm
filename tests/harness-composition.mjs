@@ -395,6 +395,13 @@ try {
   const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'swarm' || entry.options.name === '@dsh-external/dsh-agent-swarm')
   assert(entry, 'swarm must be owned by a real Loader entry')
   await entry.update({ disabled: true })
+  // Disabling an entry only STARTS its fiber's disposal (the Loader calls
+  // `fiber.dispose()` without awaiting it), while the worker handles are torn
+  // down inside that disposal: `swarm_control stop` defers each member's stop
+  // and the plugin's own disposer drains them. Wait for the unload to settle
+  // exactly as boot waits for activation; only then is "nothing remains" the
+  // unload's result rather than a race the stop happened to win.
+  await ctx.loader.await()
   assert(!ctx.tools.schemas(ownerHandle.agent).some(schema => schema.name.startsWith('swarm_')), 'unload must unregister all swarm tools')
   assert.equal(ctx.agents.list().filter(agent => agent.id !== ownerId).length, 0, 'unload must dispose worker handles')
   process.stdout.write('Real Harness Loader composition passed: model tools, peer proposals, real bash, evidence, independent verification, integration, completion, owner-independent restart recovery, and unload.\n')
