@@ -16,7 +16,9 @@
  *     budget-protection park `blockTaskCeiling` had just committed.
  *  5. The parse-only check preflight existed only on the prelaunch path, so a
  *     staged plan with a shell-syntax-error check launched and burned a full
- *     execution cycle before failing at verification.
+ *     execution cycle before failing at verification. Round 19: the refusal
+ *     also blamed the wrong check, reading the adapter's compact result as if
+ *     it were aligned with the declared list (5b).
  *  6. `swarm_control` mission-scope amend was unreachable: the schema makes
  *     `changes` optional for every action, and the handler reported a generic
  *     argument error instead of the one shape this action needs.
@@ -259,12 +261,85 @@ test('R18-5: both launch paths refuse a check with invalid shell syntax, before 
   runtime.pumpOutbox = () => {}
   t.after(async () => { await runtime.dispose(); await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
   // The adapter-level preflight is what the launch boundary calls; assert it directly
-  // (it runs the plan's checks through /bin/sh -n only).
-  const issues = await workspaces.checkSyntaxPreflight(['node --test ;;('], directory)
+  // (it runs the plan's checks through /bin/sh -n only). Its result is located, not
+  // input-aligned: one entry per unparsable command carrying its position in
+  // `checks`, so a valid command leaves no hole for the boundary to misread.
+  const issues = await workspaces.checkSyntaxPreflight(['node --test', 'node --test ;;('], directory)
   assert.equal(issues.length, 1, 'an unparsable command is reported without executing it')
-  assert.match(issues[0], /syntax error/)
+  assert.equal(issues[0].index, 1, 'the entry names the position of the broken command')
+  assert.match(issues[0].message, /syntax error/)
   assert.deepEqual(await workspaces.checkSyntaxPreflight(['node --test'], directory), [], 'a valid command passes')
   void runtime
+})
+
+test('R18-5b: the syntax refusal names the broken check and pairs each location with its own diagnostic', async t => {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-syntax-attribution-')))
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
+    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  // The launch boundary consults the adapter's parse-only probe; this stub hands
+  // it to the real host seam so the refusal carries /bin/sh's own diagnostics.
+  class SyntaxWorkers extends StubWorkers {
+    checkSyntaxPreflight(checks, cwd, signal) { return workspaces.checkSyntaxPreflight(checks, cwd, signal) }
+  }
+  const workers = new SyntaxWorkers()
+  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
+    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100 }, workers)
+  runtime.kick = () => {}
+  runtime.pumpOutbox = () => {}
+  t.after(async () => { await runtime.dispose(); await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const owner = { sessionId: 'r18-syntax-owner' }
+  // Satisfies the automatic-plan policy too, so one plan drives both launch paths.
+  const plan = checks => ({
+    title: 'Staged plan', objective: 'Deliver', workspace: directory, scope: ['src/'], acceptance: ['done'], budget: { ...BUDGET },
+    members: [{ key: 'a', role: 'implementation', maxOutputTokens: 1000 }, { key: 'b', role: 'verification', maxOutputTokens: 1000 }],
+    workstreams: [{ key: 'w', title: 'Main', objective: 'Deliver' }],
+    tasks: [
+      { key: 't', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks, assigneeKey: 'a', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 },
+      { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review the feature', kind: 'verification', scope: ['src/'], acceptance: ['done'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 1 },
+    ],
+  })
+  const viaDraft = checks => {
+    const draft = runtime.createDraft(owner, plan(checks))
+    return runtime.launchDraft(owner, draft.id, draft.revision)
+  }
+  let requests = 0
+  const viaStart = checks => {
+    const id = `start_r18_syntax_${++requests}`
+    runtime.store.transaction(() => runtime.store.put('starts', { id, ownerSessionId: owner.sessionId, commandId: id, goal: 'Deliver',
+      workspace: directory, status: 'planning', createdAt: Date.now(), updatedAt: Date.now() }))
+    return runtime.startPlan(owner, id, plan(checks))
+  }
+  /** The refused locations, one line each, in the order the refusal lists them. */
+  const refused = async launch => {
+    const error = await launch.then(() => assert.fail('the plan launched past the preflight'), error => error)
+    assert.match(error.message, /^\[check_syntax_invalid\] tasks\[/)
+    return error.message.replace(/^\[check_syntax_invalid\] /, '').split('\n').filter(line => line.startsWith('tasks['))
+  }
+  const names = lines => lines.map(line => line.slice(0, line.indexOf(' ')))
+  const [semicolons] = await workspaces.checkSyntaxPreflight(['node --test ;;('], directory)
+  const [paren] = await workspaces.checkSyntaxPreflight(['node --test )'], directory)
+  const diagnostic = issue => issue.message.split('\n')[0]
+  for (const launch of [viaDraft, viaStart]) {
+    // Only checks[1] is broken. Before the fix the boundary read the compact
+    // adapter result as index-aligned and blamed checks[0], the valid command.
+    const single = await refused(launch(['node --test', 'node --test ;;(']))
+    assert.deepEqual(names(single), ['tasks[t].checks[1]'], `the broken command is named and the valid one is not:\n${single.join('\n')}`)
+    assert.ok(single[0].includes(JSON.stringify('node --test ;;(')), 'the refusal quotes the offending command')
+    assert.ok(single[0].includes(diagnostic(semicolons)), 'the location carries its own diagnostic')
+    // Two broken commands at positions 1 and 3: each location keeps its own
+    // command and diagnostic instead of the cross-paired [0]/[1] rendering.
+    assert.notEqual(diagnostic(semicolons), diagnostic(paren), 'the two probes are told apart by their own diagnostics')
+    const pair = await refused(launch(['node --test', 'node --test ;;(', 'node --test', 'node --test )']))
+    assert.deepEqual(names(pair), ['tasks[t].checks[1]', 'tasks[t].checks[3]'], `both broken commands are named once:\n${pair.join('\n')}`)
+    assert.ok(pair[0].includes(JSON.stringify('node --test ;;(')) && pair[0].includes(diagnostic(semicolons)), 'checks[1] keeps its command and diagnostic')
+    assert.ok(pair[1].includes(JSON.stringify('node --test )')) && pair[1].includes(diagnostic(paren)), 'checks[3] keeps its command and diagnostic')
+    assert.ok(!pair[0].includes(diagnostic(paren)) && !pair[1].includes(diagnostic(semicolons)), 'diagnostics are not cross-paired')
+  }
+  assert.deepEqual(runtime.store.list('missions'), [], 'no mission exists before the refusal on either path')
+  assert.equal(workers.idle.size, 0, 'no worker started on either path')
+  const failedStart = runtime.store.get('starts', `start_r18_syntax_${requests}`)
+  assert.equal(failedStart.status, 'failed', 'the automatic request records the refusal for the owner')
+  assert.match(String(failedStart.error), /\[check_syntax_invalid\] tasks\[t\]\.checks\[1\]/)
 })
 
 test('R18-6: mission-scope amend is reachable and names its own required shape', async t => {

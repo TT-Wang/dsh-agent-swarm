@@ -3330,14 +3330,21 @@ export class SwarmRuntime {
       const declaredChecks = input.tasks.flatMap(task => (task.checks ?? []).map((command, index) => ({ command, location: `tasks[${task.key}].checks[${index}]` })))
       if (declaredChecks.length && this.workers.checkSyntaxPreflight !== undefined) {
         actor.signal?.throwIfAborted()
+        // The adapter result is located (each entry carries the position of the
+        // command it refuses), so pair by that index: reading it as aligned with
+        // `declaredChecks` blamed the valid checks[0] for a broken checks[1] and
+        // cross-paired several failures. The command is quoted too, because the
+        // parser's own diagnostic does not echo it on every shell.
         const issues = await this.workers.checkSyntaxPreflight(declaredChecks.map(check => check.command), input.workspace, actor.signal)
-        const failed = declaredChecks.filter((_, index) => issues[index] !== undefined)
         // A concrete string, never a template: the browser sanitizer classifies
         // refusals by matching an anchored allowlist against the authored text, and
         // an interpolated message cannot be proven against it
         // (tests/rpc-refusal-classification.test.mjs).
-        if (failed.length) {
-          const detail = failed.map((check, index) => `${check.location} has invalid shell syntax: ${issues[index]}`).join('\n')
+        if (issues.length) {
+          const detail = issues.map(issue => {
+            const check = declaredChecks[issue.index]!
+            return `${check.location} has invalid shell syntax in ${JSON.stringify(check.command)}: ${issue.message}`
+          }).join('\n')
           throw new Error('[check_syntax_invalid] ' + detail + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
         }
       }
