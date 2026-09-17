@@ -28,7 +28,7 @@ import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
-import { requireArtifactChecks } from './artifact-policy.ts'
+import { missingDeliverablePaths, requireArtifactChecks } from './artifact-policy.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
 // on the Node worktree module at runtime.
@@ -1934,6 +1934,13 @@ export class SwarmRuntime {
         if (current !== undefined && current.status === 'blocked' && current.resumeAfterStop?.epoch === current.epoch) throw new Error(`${stale}; the task is being reassigned after a stop. Observe the current assignment and submit again after reassignment. (${detail})`)
         throw new Error(`${stale}; observe the task and submit again after reassignment (${detail})`)
       }
+      // R19 H-1: an ignored report the task text names is captured only when
+      // declared, and the advisory `uncapturedPaths` alone let the omission
+      // reach acceptance. A research task has no check or artifact gate after
+      // this point, so its named outputs must also exist. Refuse while the
+      // attempt is live and the member can still write or declare the path.
+      const missing = task.kind === 'research' ? missingDeliverablePaths(task, artifact) : missingDeliverablePaths(task, artifact, artifact.uncapturedPaths ?? [])
+      if (missing.length) throw new PolicyError('deliverable_uncaptured', 'validation_error', `[deliverable_uncaptured] The task names outputs this submission did not capture: ${missing.map(name => JSON.stringify(name)).join(', ')}. Ignored files are captured only when declared, and a named file that does not exist yet must be written first. Retry \`swarm_submit\` with \`deliverables\`: ${JSON.stringify(missing)}; a named input you only read may be declared the same way.`)
       requireArtifactChecks(task, artifact)
       task.artifact = artifact; task.output = input.output; task.status = 'submitted'
       // F2: decide the review path before committing, so the missing-review
@@ -3638,6 +3645,15 @@ export class SwarmRuntime {
     if (uncovered.length) {
       const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
       return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
+    }
+    // R19 H-1: research covers a criterion with no artifact content requirement,
+    // so an accepted research task whose text names an output must carry it.
+    // submit() gates host captures; this catches artifacts that never passed
+    // that gate (rows accepted before the gate, foreign adapters).
+    for (const task of deliverables) {
+      if (task.kind !== 'research') continue
+      const missing = missingDeliverablePaths(task, task.artifact)
+      if (missing.length) return `Accepted research task ${task.id} names deliverables its artifact does not contain: ${JSON.stringify(missing)}`
     }
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
       try { this.selectDeliveryTarget(mission.id, tasks) }

@@ -1,7 +1,19 @@
 /** Acceptance policy over host-recorded changes, independent of a model's task label. */
 import { posix } from 'node:path'
-import { requireHostChecks } from './admission.ts'
+import { deliverablePaths, requireHostChecks } from './admission.ts'
+import { withinScope } from './scope.ts'
 import type { Artifact, Task } from './types.ts'
+
+/**
+ * Named outputs the artifact neither changed nor declared. `named` defaults to
+ * every path the task text names as a write target. Names outside the task
+ * scope are not obligations: capture can never include them, and admission
+ * already reports them as advisory read-only references (R19 H-1).
+ */
+export function missingDeliverablePaths(task: Pick<Task, 'objective' | 'acceptance' | 'scope'>, artifact: Pick<Artifact, 'changedPaths' | 'files'> | undefined, named: readonly string[] = deliverablePaths(task.objective ?? '', task.acceptance ?? [])): string[] {
+  const present = new Set([...(artifact?.changedPaths ?? []), ...(artifact?.files ?? []).map(file => file.path)])
+  return named.filter(name => withinScope(name, task.scope) && !present.has(name))
+}
 
 // Known report formats retain the lightweight research path. This classifies
 // files, not arbitrary program semantics; reviewers still judge check coverage.
