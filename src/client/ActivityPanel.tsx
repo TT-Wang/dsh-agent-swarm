@@ -15,6 +15,7 @@ import { BaselineNotice, DeliveryPanel } from './DeliveryPanel.tsx'
 import type { ConnectionState } from './progress.ts'
 import { mergeStartResponse, requestStartControl, type StartAction } from './start-controls.ts'
 import { RequestDeadlineError } from './request-deadline.ts'
+import { currentSessionId } from './navigation.ts'
 
 export const OPEN_MONITOR = 'agent-swarm:open-monitor'
 interface PendingOperation { context: string; generation: number; action: string }
@@ -45,7 +46,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const sessionState = useSyncExternalStore(sessions.list.subscribe, sessions.list.getSnapshot, sessions.list.getSnapshot)
   const state = useSyncExternalStore(monitor.subscribe, monitor.getSnapshot, monitor.getSnapshot)
   const transcript = useSyncExternalStore(history.subscribe, history.getSnapshot, history.getSnapshot)
-  const owner = sessionId === undefined ? sessionState.current : sessionId as SessionId
+  const owner = (sessionId === undefined ? currentSessionId(sessions) : sessionId) as SessionId | undefined
   const [selection, setSelection] = useState(''), [localDraft, setLocalDraft] = useState<DraftPlan>(), [localMission, setLocalMission] = useState<Snapshot>()
   const [error, setError] = useState(''), [busyOperation, setBusyOperation] = useState<PendingOperation>(), [stopArmed, setStopArmed] = useState(false), [editorOpen, setEditorOpen] = useState(false)
   const [editorMounted, setEditorMounted] = useState(false)
@@ -114,9 +115,11 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const start = selectedStart && (['planning', 'launching', 'failed'].includes(selectedStart.status) || (selectedStart.status === 'stopped' && !snapshot)) ? selectedStart : undefined
   useEffect(() => { setStartUnconfirmed(false) }, [state.updatedAt, context])
   const directory = useMemo(() => {
-    if (!owner || (!sessionId && sessionState.currentAddress)) return undefined
+    // A selected subagent address (0.1.5 `currentAddress`) has no model directory of its own; 0.1.6 panes always name their session.
+    const currentAddress = (sessionState as { currentAddress?: unknown }).currentAddress
+    if (!owner || (!sessionId && currentAddress)) return undefined
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
-  }, [owner, sessionId, modelDirectories, sessionState.currentAddress])
+  }, [owner, sessionId, modelDirectories, sessionState])
   const choose = (value: string) => { history.close(); setSelection(value); setError(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }
   const control = async (action: 'pause' | 'resume' | 'stop' | 'complete') => {
     if (!owner || !snapshot || !data?.writable || connection !== 'connected') return

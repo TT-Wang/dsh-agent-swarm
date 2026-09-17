@@ -20,7 +20,7 @@ import { createRightSidebarAdapter, createSidebarAdapter } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
 import { DisposalRegistry } from './lifecycle.ts'
 import { CopyContext, en, zh } from './locale.tsx'
-import { openWorker } from './navigation.ts'
+import { currentSessionId, openWorker } from './navigation.ts'
 import { WorkerHistory, type HistoryPage } from './history.ts'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX } from '../types.ts'
 import type { Member } from '../types.ts'
@@ -66,11 +66,12 @@ export function apply(ctx: Context): void {
   function Pane({ sessionId, active = true, onClose }: { sessionId?: string; active?: boolean; onClose?: () => void }) {
     const monitor = useMemo(() => disposals.add(new SwarmMonitor(request)), [request])
     const history = useMemo(() => disposals.add(new WorkerHistory(async (workerSessionId, beforeSeq) => {
-      const owner = sessionId ?? ctx.sessions.list.getSnapshot().current
+      const owner = sessionId ?? currentSessionId(ctx.sessions)
       if (!owner) throw new Error('Select a conversation to read its worker history.')
       return request<HistoryPage>('worker-history', { sessionId: owner, workerSessionId, maxMessages: 30, ...(beforeSeq === undefined ? {} : { beforeSeq }) })
     })), [sessionId])
-    const current = useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot, ctx.sessions.list.getSnapshot).current
+    useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot, ctx.sessions.list.getSnapshot)
+    const current = currentSessionId(ctx.sessions)
     const pending = useSyncExternalStore(historyRequests.subscribe, historyRequests.getSnapshot, historyRequests.getSnapshot)
     useEffect(() => () => disposals.release(monitor), [monitor])
     useEffect(() => () => disposals.release(history), [history])
@@ -83,7 +84,7 @@ export function apply(ctx: Context): void {
     }, [active, pending, sessionId, current, history])
     return <Localized><ActivityPanel sessions={ctx.sessions} modelDirectories={ctx.modelDirectories} monitor={monitor} history={history} sessionId={sessionId} active={active} onClose={onClose}
       onOpenWorker={member => {
-        try { if (openWorker(ctx.sessions, member.sessionId)) return } catch { /* A completed row can leave the live list. */ }
+        try { if (openWorker(ctx, member.sessionId)) return } catch { /* A completed row can leave the live list. */ }
         history.open(member.sessionId, member.name)
       }} /></Localized>
   }
@@ -95,7 +96,7 @@ export function apply(ctx: Context): void {
     id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80,
     label: () => copy('Agent Swarm'),
     description: () => copy('Missions, workers and evidence for this conversation'),
-    component: ({ scope, visible }) => <Pane sessionId={scope.sessionId} active={visible} />,
+    component: ({ scope, visible }) => <Pane key={scope.sessionId} sessionId={scope.sessionId} active={visible} />,
   }))
   const sidebar = createSidebarAdapter(ctx, () => ({
     id: 'agent-swarm', title: () => copy('Agent Swarm'), single: true, order: 80,
@@ -107,8 +108,8 @@ export function apply(ctx: Context): void {
   }
   registerSwarmCommandUi(ctx, { openSidebar, copy })
   const viewWorker = (member: Member) => {
-    try { if (openWorker(ctx.sessions, member.sessionId)) return } catch { /* Fall back to persisted history. */ }
-    const owner = ctx.sessions.list.getSnapshot().current
+    try { if (openWorker(ctx, member.sessionId)) return } catch { /* Fall back to persisted history. */ }
+    const owner = currentSessionId(ctx.sessions)
     if (!owner) return
     historyRequest = { owner, member }
     for (const listener of historyListeners) listener()

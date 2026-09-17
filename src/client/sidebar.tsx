@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ReactNode } from 'react'
+import { currentSessionId } from './navigation.ts'
 
 /** Public Better Sidebar 0.18 service subset. Kept structural so an optional
  * client integration does not pull its newer Harness peers into this plugin.
@@ -152,6 +153,8 @@ interface SlotRegistrar {
  * user reaches a page type that recognizes no resource address.
  */
 export interface RightSidebarGuideEntry {
+  /** Stable within the tab type; 0.1.6 requires it and rejects duplicates. */
+  id: string
   order: number
   title: () => string
   description?: () => string
@@ -176,6 +179,8 @@ interface RightTabRegistry {
  */
 interface RightSidebarController {
   openTab(kind: string, options?: Record<string, unknown>): void
+  /** 0.1.5+: open for one session; a no-op (not a throw) until that session's surface exists. */
+  openTabIn?(sessionId: string, kind: string, options?: Record<string, unknown>): void
 }
 
 /** The session list, restricted to the signal that a session surface can mount. */
@@ -240,7 +245,7 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     const tab = descriptor()
     const releaseType = registry.register({
       id: tab.id, kind: tab.kind, title: () => tab.label(),
-      guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
+      guide: [{ id: 'open', order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
     })
     let releaseBody: () => void
     try {
@@ -261,6 +266,15 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
         const layout = ready.get('layout') as unknown as LayoutReveal | undefined
         layout?.openRightbar?.(true, false)
       } catch { /* Layout optional; the tab still opens below. */ }
+      // openTab throws until a session surface is mounted; openTabIn addresses the session the main view
+      // shows and merely no-ops while its surface is still being minted, so try it first.
+      if (typeof controller.openTabIn === 'function') {
+        let sessionId: string | undefined
+        try { const sessions = ready.get('sessions') as Context['sessions'] | undefined; if (sessions !== undefined) sessionId = currentSessionId(sessions) } catch { /* No sessions face: openTab decides. */ }
+        if (sessionId !== undefined) {
+          try { controller.openTabIn(sessionId, tab.kind, { revealIfOpened: true }); return true } catch { /* Fall through to openTab. */ }
+        }
+      }
       try { controller.openTab(tab.kind, { revealIfOpened: true }); return true }
       catch { return false }
     }

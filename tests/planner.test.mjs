@@ -6,12 +6,37 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
-import { Inbox } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { Workspaces } from '../lib/workspaces.js'
+
+/**
+ * The slice of an Agent inbox the planner's owner fixtures exercise. 0.1.3 exported a runtime Inbox from
+ * dsh-agent; 0.1.6 keeps it inside the loop (ReactLoopInbox), so the fixture models the contract itself:
+ * every insertion is the durable `agent/inbox/spliced` record the planner reads back to decide whether a
+ * recovery notice was already delivered (src/planner.ts), and the queues mirror what the record says.
+ */
+function fakeInbox(session) {
+  const queues = { 'next-turn': [], 'next-step': [] }
+  return {
+    get nextTurn() { return queues['next-turn'] },
+    get nextStep() { return queues['next-step'] },
+    append(target, message) {
+      const event = session.append('agent/inbox/spliced', { target, start: queues[target].length, inserted: [message] })
+      queues[target].push(...event.data.inserted)
+    },
+    remove(id) {
+      for (const [target, queue] of Object.entries(queues)) {
+        const at = queue.findIndex(message => message.id === id)
+        if (at < 0) continue
+        session.append('agent/inbox/spliced', { target, start: at, removedCount: 1, inserted: [], outcome: 'canceled' })
+        queue.splice(at, 1)
+      }
+    },
+  }
+}
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 const budget = { maxTokens: 10000, maxSteps: 50, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 10, maxExperiments: 1 }
 async function eventually(read) {
@@ -33,7 +58,7 @@ async function fixture(t, options = {}) {
   const pending = Promise.withResolvers()
   const idleGates = [pending]
   const messages = []
-  const inbox = new Inbox(session, { inserted() {}, discarded() {}, claimed() {} })
+  const inbox = fakeInbox(session)
   const agent = { id: session.id, session, inbox, options: { provider: 'current', model: 'current-model' },
     send(message, target) { inbox.append(target, message); messages.push(message) },
     followup(message) { this.send(message, 'next-turn') }, whenIdle() { return idleGates.at(-1).promise },
@@ -200,7 +225,7 @@ test('one owner with a hung flush cannot block another owner recovery notice', a
   const [request] = f.runtime.starts({ sessionId: f.agent.id })
   f.runtime.failStart({ sessionId: f.agent.id }, request.id, 'first owner needs recovery', 1)
   const session = await f.ctx.sessions.create(SessionId('other-planner-owner'), { meta: { cwd: f.root } })
-  const inbox = new Inbox(session, { inserted() {}, discarded() {}, claimed() {} })
+  const inbox = fakeInbox(session)
   const received = []
   const other = { id: session.id, session, inbox, send(message, target) { inbox.append(target, message); received.push(message) } }
   f.agents.set(other.id, other)

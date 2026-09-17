@@ -5,6 +5,7 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | Harness release | Exact source commit |
 | --- | --- |
 | `0.1.5-rc.1` | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
+| `0.1.6-alpha.2` | `ddefc45fbc7f8e46dd73185e68295696d1297887` |
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
@@ -608,3 +609,30 @@ The behavioral tests import the built `lib/` output. `npm test` builds first; a 
 `npm run test:web` and `npm run test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host, without other large suites or browsers in parallel, and re-run a timeout before treating it as a product defect.
 
 Raw local logs, traces, screenshots, credentials and preview state are excluded from the public repository. Remaining operational boundaries are in [known-limitations.md](known-limitations.md).
+
+## 0.1.6-alpha.2 baseline (2026-09-17)
+
+Host: `~/code/deepseek-harness-016` at release tag `dsh-v0.1.6-alpha.2` (`ddefc45fbc`), built from source. The
+plugin checkout was linked to it with `DSH_SOURCE=… npm run link:dsh` after `compatibility.json` gained the release.
+
+What the release changed for this plugin, and what was done about it:
+
+| Host change | Effect here | Change |
+|---|---|---|
+| `SandboxProvider.confine()` resolves asynchronously | `confinedCheckArgv` returned a promise's fields | `VerificationSandbox.confine` accepts either shape; `confinedCheckArgv` awaits (its two tests await / reject) |
+| `agent/created` is a serial hook returning `undefined \| Promise<undefined>` | two `void`-typed listeners failed typecheck | both return `undefined` explicitly; they stay synchronous, as the serial contract requires |
+| client Sessions are multi-instance: `SessionListState.current` / `currentAddress` and `sessions.open()` removed | eight client sites read the selection; worker navigation was a no-op | `currentSessionId()` reads the main view's `retainedBy.mainView` count (falls back to `current` on older hosts); `openWorker` navigates through `uiWorkspace.openSession` when `sessions.open` is absent; panes prefer their own `sessionId` |
+| right-sidebar guide entries require a stable `id` (duplicates throw) | the capsule shipped `entryId: undefined` | `id: 'open'` on the guide entry; `openTabIn(sessionId, kind)` is tried before the throwing `openTab` |
+| `Inbox` is no longer a runtime export of `dsh-agent` | `tests/planner.test.mjs` could not import it | the owner fixture writes the same durable `agent/inbox/spliced` record both real inboxes write |
+| `snapshotEvents` / `eventAt` / `ownEvents` deprecated | seven call sites | unchanged for this release (still implemented); migration scheduled |
+
+| Check | 0.1.6-alpha.2 (`ddefc45fbc`) |
+|---|---|
+| `tsc -p tsconfig.json` / `tsc -p tsconfig.client.json` | exit 0 / exit 0 |
+| `npm run build` | exit 0 |
+| `node --test tests/*.test.mjs` | 1179 tests, 1178 passed in the parallel run; the one failure (R15-D1) and two earlier ones (R15-D2, R16-A4) are timing-bound "hung worker" cases that pass on every isolated re-run |
+| isolated preview (`scripts/start-preview.mjs`, `DSH_SOURCE` = the 0.1.6 checkout) | boots with no `did not activate` row and no startup diagnostics file |
+| `POST /api/agent-swarm/state` without the browser credential | 401 (route mounted; the retired `/agent-swarm` channel answers 405, as on 0.1.5) |
+| right sidebar with a workspace selected | the Start page lists an **Agent Swarm** capsule beside Workspace files, New terminal and Browser; the fallback dock is not rendered |
+
+Not exercised on this host: a full mission (member sessions, verification checkouts, the delivery flow).

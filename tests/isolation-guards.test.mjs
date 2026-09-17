@@ -133,15 +133,15 @@ test('F-C1: delivery materializes a chain that stays inside the repository', asy
   assert.equal(await readlink(path.join(source, 'src', 'chain')), '../a')
 })
 
-test('F-29: a declared check runs only when the host reports full enforcement', () => {
+test('F-29: a declared check runs only when the host reports full enforcement', async () => {
   const calls = []
   const full = { confine: (argv, policy) => { calls.push({ argv, policy }); return { argv: ['wrapped', ...argv], enforcement: 'full' } } }
-  assert.deepEqual(confinedCheckArgv(full, ['/bin/sh', '-c', 'true'], '/checkout'), ['wrapped', '/bin/sh', '-c', 'true'])
+  assert.deepEqual(await confinedCheckArgv(full, ['/bin/sh', '-c', 'true'], '/checkout'), ['wrapped', '/bin/sh', '-c', 'true'])
   assert.deepEqual(calls[0].policy, { mode: 'workspace-write', workspaceRoot: '/checkout' }, 'the check is confined to the verification checkout, not the source')
   for (const enforcement of ['partial', 'none', undefined]) {
     let ran = false
     const refusing = { confine: argv => { ran = true; return { argv, enforcement } } }
-    assert.throws(() => confinedCheckArgv(refusing, ['/bin/sh', '-c', 'true'], '/checkout'), /full sandbox enforcement/, String(enforcement))
+    await assert.rejects(() => confinedCheckArgv(refusing, ['/bin/sh', '-c', 'true'], '/checkout'), /full sandbox enforcement/, String(enforcement))
     assert.equal(ran, true, 'the provider is consulted, never bypassed')
   }
 })

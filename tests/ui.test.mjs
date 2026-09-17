@@ -229,11 +229,19 @@ test('live monitor fences switched-session responses and aborts all work on disp
 
 test('worker navigation opens its independent native session and rejects missing list entries', async () => {
   const opened = []
-  const sessions = { list: { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }, open: sessionId => opened.push(sessionId) }
-  assert.equal(openWorker(sessions, 'worker'), true)
+  const list = { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }
+  // 0.1.2-0.1.5: the sessions face navigates.
+  const legacy = { sessions: { list, open: sessionId => opened.push(sessionId) }, get: () => undefined }
+  assert.equal(openWorker(legacy, 'worker'), true)
   assert.deepEqual(opened, ['worker'])
-  assert.equal(openWorker(sessions, 'missing'), false, 'missing live row delegates to read-only native history')
+  assert.equal(openWorker(legacy, 'missing'), false, 'missing live row delegates to read-only native history')
   assert.equal(opened.length, 1)
+  // 0.1.6: sessions.open is gone; navigation belongs to the workspace UI service.
+  const navigated = []
+  const modern = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
+  assert.equal(openWorker(modern, 'worker'), true)
+  assert.deepEqual(navigated, ['worker'])
+  assert.equal(openWorker({ sessions: { list }, get: () => undefined }, 'worker'), false, 'no navigation service: fall back to persisted history')
 })
 
 test('draft defaults preserve independent verification and line editing; sidebar leaves room for conversation', () => {
@@ -599,7 +607,7 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
   assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs', 'sidebarRight'\]/, 'and only while the slot service, registry and controller are present')
-  assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
+  assert.match(source, /guide: \[\{ id: 'open', order: tab\.order \?\? 80/, 'and names itself on the guide page with the stable entry id 0.1.6 requires')
   assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
   assert.match(source, /getSnapshot: \(\) => current\?\.opened \?\? false/, 'and integration means the pane really shows the tab, not merely that a type was registered')
 })

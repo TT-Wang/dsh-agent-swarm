@@ -327,7 +327,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           if (!Number.isSafeInteger(waitMs) || Number(waitMs) < 0 || Number(waitMs) > 20_000) throw new RequestError('waitMs must be an integer from 0 through 20000')
           const visibleScopes = () => new Set([sessionId, ...runtime.visibleMissions(actor).map(mission => mission.id)])
           if (after !== undefined) await waitForStateChange(runtime.store, Number(after), visibleScopes, AbortSignal.any([signal, lifetime.signal]), Number(waitMs), wake => {
-            const observe = ({ agent }: { agent: { id: string } }) => { if (agent.id === sessionId) wake() }
+            const observe = ({ agent }: { agent: { id: string } }): undefined => { if (agent.id === sessionId) wake(); return undefined }
             const created = ctx.on('agent/created', observe, { global: true })
             const disposed = ctx.on('agent/disposed', observe, { global: true })
             return () => { created(); disposed() }
@@ -436,9 +436,11 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
     }
   }
   // Three host generations, one route shape. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5: the connection
-  // service resolves `webServer` on a context that injects `credentials` alone,
-  // and Cordis refuses that property access, so the route is never registered.
+  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5 onward, 0.1.6
+  // included: `rpc.handle` registers the route under the CONNECTION plugin's own
+  // fiber, and from 0.1.5 that fiber injects `credentials` alone (0.1.3 injected
+  // `webServer` too), so Cordis refuses its `webServer` access and the route is
+  // never registered — silently, because the failure lands in a child fiber.
   // The shared `/api` interceptor is not an option either — that channel admits
   // exactly one interceptor and another plugin holds it. What is left is what the
   // host itself documents for plugin endpoints: one exact route per endpoint on
@@ -455,6 +457,14 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
   const reply = (rpcId: string, result: ConnectionRpcResult<unknown>): Response => new Response(
     JSON.stringify({ type: 'server-response', rpcId: RpcId(rpcId), result } satisfies ServerResponse),
     { status: 200, headers: { 'content-type': 'application/json' } })
+  // A throw here fails only this inject child and Cordis reports it through the logger alone, so the
+  // outcome is written down either way: it is the line to look for when the panel answers 404 or 405.
+  try { mountRoutes() } catch (error) {
+    try { ctx.logger.error('agent-swarm: web routes failed to mount on %s: %s', SWARM_RPC_CHANNEL, String(error)) } catch { /* The throw below still reports it. */ }
+    throw error
+  }
+  try { ctx.logger.info('agent-swarm: web routes mounted on %s (%d endpoints)', SWARM_RPC_CHANNEL, SWARM_WEB_ENDPOINTS.length) } catch { /* Logging must never veto the mount. */ }
+  function mountRoutes(): void {
   for (const endpoint of SWARM_WEB_ENDPOINTS) {
     const method = `${SWARM_RPC_PREFIX}${endpoint}`
     releases.push(ctx.connection.fetch.register({
@@ -481,5 +491,6 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
         return reply(rpcId, await handler(endpoint, envelope.payload, request.signal))
       },
     }))
+  }
   }
 }

@@ -79,8 +79,10 @@ export interface HarnessWorkerOptions {
 }
 /** The confinement surface a declared verification check must pass through. */
 export interface VerificationSandbox {
-  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): { argv: string[]; enforcement: 'full' | 'partial' }
+  /** 0.1.5 returned the confinement synchronously; 0.1.6 resolves it (the backend probe became async). Both are accepted. */
+  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
 }
+export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
 /**
  * F-29: run a declared check only under FULL host enforcement. A partial
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
@@ -88,8 +90,8 @@ export interface VerificationSandbox {
  * check cannot write into the source checkout. Refusing here is fail-closed:
  * the check never runs unconfined and the caller records a check failure.
  */
-export function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): string[] {
-  const confined = sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
+export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): Promise<string[]> {
+  const confined = await sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
   if (confined.enforcement !== 'full') throw new Error(`Artifact verification requires full sandbox enforcement: the host provider reports ${JSON.stringify(confined.enforcement)} enforcement for workspace-write, so a declared check could write outside the verification checkout. Refusing to run it.`)
   return confined.argv
 }
