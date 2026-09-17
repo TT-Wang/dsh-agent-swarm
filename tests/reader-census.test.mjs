@@ -24,7 +24,7 @@
  * client label, which is what makes the absence meaningful rather than a
  * rename.
  *
- * COUNTS ON THIS ARTIFACT (measured, not quotas): 24 tools, 89 event kinds,
+ * COUNTS ON THIS ARTIFACT (measured, not quotas): 24 tools, 90 event kinds,
  * 44 examined payload fields. The historical 24/92/… figures are not the
  * baseline; nothing below was deleted to move a number.
  */
@@ -148,6 +148,7 @@ const EVENT_CENSUS = [
   ["provider/recovered", "keep", "ui", "src/client/progress.ts", "A quiescent provider route answered successfully again; the outage marker is cleared"],
   ["task/restart-repended", "keep", "ui", "src/client/progress.ts", "Host restart re-pended a running task without spending recovery credit; the task and epoch are named"],
   ["task/recovery-fallback", "keep", "ui", "src/client/progress.ts", "Cross-owner recovery could not capture the previous owner's workspace; names the fallback commit and whether the uncaptured work was preserved into it"],
+  ["task/verification-cleanup-failed", "keep", "ui", "src/client/progress.ts", "A disposable verification checkout could not be removed after its checks ran; names the checkout and the removal failure so the owner can find and delete the leftover, the verdict is unaffected"],
   ["task/check-envelope", "keep", "audit", "src/trace.ts", "Measured declared-check envelope after a verification: limit, active, queued, wait and run times"],
   ["store/snapshot", "keep", "audit", "src/trace.ts", "Periodic VACUUM INTO snapshot written beside the owner state file"],
   ["store/restore-requested", "keep", "audit", "src/trace.ts", "Owner staged one validated snapshot restore for the next host start"],

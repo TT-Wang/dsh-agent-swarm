@@ -26,7 +26,7 @@ import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { orderedTasks, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { missingDeliverablePaths, requireArtifactChecks } from './artifact-policy.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
@@ -844,6 +844,7 @@ export class SwarmRuntime {
       failure: (memberId, error) => this.onFailure(memberId, error),
       providerOutage: (memberId, outage) => this.onProviderOutage(memberId, outage),
       recoveryFallback: info => this.onRecoveryFallback(info),
+      verificationCleanupFailure: info => this.onVerificationCleanupFailure(info),
     })
   }
   /**
@@ -4187,6 +4188,12 @@ export class SwarmRuntime {
    * or left behind in the old worktree. Fired from inside the preparing
    * dispatch, which re-reads the task after preparation, so the revision bump
    * here is never overwritten by the pre-preparation row.
+   *
+   * A re-preparation (the replacement's own start failed, the task was
+   * re-pended and re-routed) re-trips capture on the same untouched worktree
+   * and reports the same fallback again under a new attempt epoch. The summary
+   * already on the task row identifies that fact (previous owner and commit),
+   * so it is not recorded or announced a second time.
    */
   onRecoveryFallback(info: RecoveryFallback): void {
     if (this.closed) return
@@ -4198,11 +4205,35 @@ export class SwarmRuntime {
     this.commit(info.missionId, () => {
       const task = this.store.get('tasks', info.taskId)
       if (task === undefined || task.missionId !== info.missionId) return
+      if (task.recovery?.previousOwnerId === info.previousOwnerId && task.recovery.commit === info.commit) return
       task.recovery = { epoch: info.epoch, previousOwnerId: info.previousOwnerId, commit: info.commit, preserved: info.preserved, reason: info.reason, at: Date.now() }
       this.store.put('tasks', task)
       this.store.event(info.missionId, 'task/recovery-fallback', 'runtime', { taskId: info.taskId, epoch: info.epoch, from: info.previousOwnerId, to: info.memberId, commit: info.commit, preserved: info.preserved, reason: info.reason })
       // A carried snapshot asks nothing of the owner; a left-behind worktree may.
       this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: info.preserved ? 'progress' : 'decision', trigger: 'task/recovery-fallback', reason: info.reason })
+    })
+  }
+  /**
+   * H-3 follow-up: a disposable verification checkout could not be removed
+   * after its declared checks ran. The same silent channel as the recovery
+   * fallback: `Workspaces` kept it in `cleanupFailures()` and production wired
+   * no callback, so a tree left under the mission's `verification/` directory
+   * or a stale worktree registration in the source repository reached nobody.
+   * The check results were already returned and the verdict is decided from
+   * them; this records one durable event and one owner notice naming the
+   * checkout and the removal failure, so the leftover is something the owner
+   * can find and remove.
+   */
+  onVerificationCleanupFailure(info: VerificationCleanupFailure): void {
+    if (this.closed) return
+    const task = this.store.get('tasks', info.taskId)
+    if (task === undefined || task.missionId !== info.missionId) return
+    // The fallback removal may already have reclaimed the tree; only the owner
+    // can tell, so the notice names what to look for rather than asserting it.
+    const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand; if that directory or its worktree registration in the source repository is still present, delete it and run \`git worktree prune\` there.`
+    this.commit(info.missionId, () => {
+      this.store.event(info.missionId, 'task/verification-cleanup-failed', 'runtime', { taskId: info.taskId, memberId: info.memberId, checkout: info.checkout, reason: info.reason })
+      this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
     })
   }
   /**

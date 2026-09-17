@@ -114,6 +114,7 @@ const meaningfulEvents: Record<string, string> = {
   'provider/outage': 'Provider route paused', 'provider/recovered': 'Provider route recovered',
   'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
   'task/recovery-fallback': 'Task recovered from an uncaptured workspace',
+  'task/verification-cleanup-failed': 'Verification checkout could not be removed',
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 /**
@@ -173,6 +174,8 @@ function eventDetail(type: string, data: Record<string, unknown>, task: Task | u
   if (type === 'provider/outage') return [brief(data.class), typeof data.status === 'number' ? `HTTP ${data.status}` : undefined].filter(present).join(' · ') || task?.title
   if (type === 'task/restart-repended') return [reason, recoveryCredit(data)].filter(present).join(' · ') || task?.title
   if (type === 'isolation/temp-rendezvous') return brief(data.path) ?? task?.title
+  // The leftover checkout is what the owner has to find; the task itself was verified.
+  if (type === 'task/verification-cleanup-failed') return [brief(data.checkout), reason].filter(present).join(' · ') || task?.title
   if (reasonFirst.has(type)) return reason ?? task?.title ?? evidence?.claim
   return task?.title ?? reason ?? evidence?.claim ?? brief(data.title) ?? brief(data.claim)
 }
@@ -211,9 +214,11 @@ export function acceptanceSummary(snapshot: Snapshot): { accepted: number; total
 
 /**
  * The latest owner-facing reason per task from durable recovery/control events.
- * The W9 preparation failure, checkpoints, close-outs and git denials carry the
- * only actionable explanation; the board surfaces it on the card instead of
- * leaving it in the raw event stream (F-14/F-35).
+ * The W9 preparation failure, checkpoints, close-outs, git denials and the H-3
+ * cross-owner recovery fallback (`task/recovery-fallback`, the capture refusal
+ * and whether the WIP was preserved) carry the only actionable explanation; the
+ * board surfaces it on the card instead of leaving it in the raw event stream
+ * (F-14/F-35).
  */
 export function taskReasons(snapshot: Snapshot): Map<string, string> {
   const reasons = new Map<string, string>()

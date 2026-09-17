@@ -942,6 +942,14 @@ export interface WorkerSpec {
  * base with the WIP left behind.
  */
 export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; memberId: string; previousOwnerId: string; commit: string; preserved: boolean; reason: string }
+/**
+ * H-3 follow-up: a disposable verification checkout the host could not remove
+ * after `taskId`'s declared checks ran under `memberId`. `reason` is the
+ * removal failure; the tree may still sit under the mission's `verification/`
+ * directory or as a stale worktree registration in the source repository. The
+ * check results were already returned; this never changes the verdict.
+ */
+export interface VerificationCleanupFailure { missionId: string; taskId: string; memberId: string; checkout: string; reason: string }
 export interface WorkerCallbacks {
   /** Optional for adapters without live execution observation. */
   activity?(memberId: string, activity?: WorkerActivity): void
@@ -966,6 +974,12 @@ export interface WorkerCallbacks {
    * runtime records the durable event, the owner notice and the task summary.
    */
   recoveryFallback?(info: RecoveryFallback): void
+  /**
+   * H-3 follow-up: a verification checkout could not be removed after its
+   * checks ran. The adapter's `Workspaces` reports it; the runtime records the
+   * durable event and the owner notice. The verdict is never affected.
+   */
+  verificationCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
    * unavailable). The adapter classifies; the runtime emits the durable event,
