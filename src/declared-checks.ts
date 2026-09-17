@@ -148,7 +148,12 @@ export class DeclaredChecks {
       if (signal?.aborted) throw error
       const code = error instanceof Error && 'code' in error ? String(error.code) : ''
       const timeout = error instanceof Error && error.name === 'ProcessTimeoutError'
-      if (!timeout && !['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
+      // R19-H2: a dependency directory the host could not materialise into the
+      // clean checkout carries no errno code, but no declared command has run
+      // either: it is the environment, not the artifact, so it defers like a
+      // coded I/O failure instead of escaping the review as a bare throw.
+      const materialisation = error instanceof Error && error.name === 'DependencyMaterialisationError'
+      if (!timeout && !materialisation && !['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
       return [{ command: '(verification preparation)', exitCode: timeout ? 124 : 125,
         failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
     }
