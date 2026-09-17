@@ -398,6 +398,16 @@ export interface Task {
   idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
   checkpoint?: { commit: string; at: number }
+  /**
+   * H-3: the last cross-owner recovery that could not capture the previous
+   * owner's workspace as an artifact. `preserved` means the replacement attempt
+   * inherited that worktree's WIP (in-scope and out-of-scope alike) from the
+   * preservation snapshot `commit`; otherwise it started from the last durable
+   * checkpoint or the task base and the WIP is still only in the previous
+   * owner's worktree. Written together with the `task/recovery-fallback` event
+   * and the owner notice, and projected by `swarm_observe`.
+   */
+  recovery?: { epoch: number; previousOwnerId: string; commit: string; preserved: boolean; reason: string; at: number }
   /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
@@ -924,6 +934,14 @@ export interface WorkerSpec {
   /** Exact owner session used only to seed initial composition; resume must be owner-independent. */
   ownerSessionId: string
 }
+/**
+ * H-3: one cross-owner recovery whose `captureArtifact` refused the previous
+ * owner's worktree. `preserved` says whether the replacement (`memberId`)
+ * inherited that worktree's WIP through a preservation snapshot (`commit` is
+ * then the snapshot) or started from the last durable checkpoint or the task
+ * base with the WIP left behind.
+ */
+export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; memberId: string; previousOwnerId: string; commit: string; preserved: boolean; reason: string }
 export interface WorkerCallbacks {
   /** Optional for adapters without live execution observation. */
   activity?(memberId: string, activity?: WorkerActivity): void
@@ -942,6 +960,12 @@ export interface WorkerCallbacks {
   /** Synchronous final guard on all tools, including alternate dispatch surfaces. */
   guard(memberId: string, toolName: string): string | undefined
   failure(memberId: string, error: string): void
+  /**
+   * H-3: a cross-owner recovery could not capture the previous owner's
+   * workspace as an artifact. The adapter's `Workspaces` reports it; the
+   * runtime records the durable event, the owner notice and the task summary.
+   */
+  recoveryFallback?(info: RecoveryFallback): void
   /**
    * R11-01: a classified provider outage (quota, rate limit, provider
    * unavailable). The adapter classifies; the runtime emits the durable event,

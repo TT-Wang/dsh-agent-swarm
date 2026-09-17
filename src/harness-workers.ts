@@ -383,6 +383,10 @@ export class HarnessWorkers implements WorkerAdapter {
       // start so the provider's mount order never decides whether a mission can run.
       subprocess: () => ctx.get('subprocess'),
       ...(options.grants === undefined ? {} : { grants: options.grants }),
+      // H-3: a recovery fallback is an owner-visible durable fact, not a host
+      // log line; the bound runtime records it (read at call time: the callbacks
+      // are bound after construction).
+      onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info),
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')
         if (sandbox === undefined) throw new Error('Artifact verification requires a Harness sandbox provider')

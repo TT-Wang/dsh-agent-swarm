@@ -147,6 +147,7 @@ const EVENT_CENSUS = [
   ["provider/outage", "keep", "ui", "src/client/progress.ts", "Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent"],
   ["provider/recovered", "keep", "ui", "src/client/progress.ts", "A quiescent provider route answered successfully again; the outage marker is cleared"],
   ["task/restart-repended", "keep", "ui", "src/client/progress.ts", "Host restart re-pended a running task without spending recovery credit; the task and epoch are named"],
+  ["task/recovery-fallback", "keep", "ui", "src/client/progress.ts", "Cross-owner recovery could not capture the previous owner's workspace; names the fallback commit and whether the uncaptured work was preserved into it"],
   ["task/check-envelope", "keep", "audit", "src/trace.ts", "Measured declared-check envelope after a verification: limit, active, queued, wait and run times"],
   ["store/snapshot", "keep", "audit", "src/trace.ts", "Periodic VACUUM INTO snapshot written beside the owner state file"],
   ["store/restore-requested", "keep", "audit", "src/trace.ts", "Owner staged one validated snapshot restore for the next host start"],
