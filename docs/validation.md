@@ -76,7 +76,7 @@ coverage gaps it named.
   subclasses, so the two `DependencyMaterialisationError` refusals are inventoried again.
 
 - `npm run typecheck` and `npm run build`: passed (backend and browser bundles).
-- Full behavioral suite: **1,279 tests, 1,279 passing, 0 skipped, 0 failing** in a parallel run on the integrated head (`05faf7f`, harness 0.1.6-alpha.2 linked).
+- Full behavioral suite: **1,285 tests, 1,285 passing, 0 skipped, 0 failing** in a parallel run on the integrated head (`3a1569a`, harness 0.1.6-alpha.2 linked).
 - Smokes: `npm run test:bundle` 7/7; `npm run test:harness`, `npm run test:profile` and `DSH_HARNESS_ROOT=~/code/deepseek-harness-016 npm run test:pack` (real 0.1.6-alpha.2 Loader composition, installed-bundle profile, clean-checkout pack of 239 files) passed after `tests/fixtures/model-visible.expected.json` was refreshed for the new assignment-instruction sentence; the composition smoke now awaits the Loader unload before asserting worker disposal, a race the packed layout lost by a few milliseconds and the source layout won.
 - Residuals recorded in [known-limitations.md](known-limitations.md): task text that names no
   literal path still submits an empty artifact; a materialisation failure copies the tree twice
