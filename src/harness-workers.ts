@@ -387,6 +387,9 @@ export class HarnessWorkers implements WorkerAdapter {
       // log line; the bound runtime records it (read at call time: the callbacks
       // are bound after construction).
       onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info),
+      // Same channel for a verification checkout the host could not remove:
+      // Workspaces kept it in memory and nobody was wired to read it.
+      onCleanupFailure: info => this.callbacks?.verificationCleanupFailure?.(info),
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')
         if (sandbox === undefined) throw new Error('Artifact verification requires a Harness sandbox provider')

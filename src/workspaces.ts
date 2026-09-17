@@ -10,7 +10,7 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 export type { CheckEnvelope }
 
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
@@ -82,9 +82,11 @@ export interface WorkspaceOptions {
   allowDependencyLinkReads?: boolean
   /**
    * Called when a disposable verification checkout cannot be removed. Cleanup
-   * failure is recorded here and never masks the check results.
+   * failure is recorded here and never masks the check results. The adapter
+   * forwards it to the runtime, which records the event and the owner notice
+   * (H-3 follow-up); without that wiring it reached only `cleanupFailures()`.
    */
-  onCleanupFailure?(info: { checkout: string; error: string }): void
+  onCleanupFailure?(info: VerificationCleanupFailure): void
   /**
    * Called when a cross-owner recovery cannot capture the previous owner's
    * workspace as an artifact (W9). The dirty worktree is left untouched; its
@@ -380,7 +382,7 @@ export class CheckSemaphore {
       totalWaitMs: this.totalWaitMs, maxWaitMs: this.maxWaitMs, totalRunMs: this.totalRunMs, maxRunMs: this.maxRunMs }
   }
 }
-export type { RecoveryFallback } from './types.js'
+export type { RecoveryFallback, VerificationCleanupFailure } from './types.js'
 /** Persisted on the task workspace record so the fallback survives restarts. */
 interface TaskRecovery { commit: string; previousOwnerId: string; preserved: boolean; reason: string; at: number }
 /** Reject a symlink whose target string alone leaves its owning workspace (fast pre-commit check). */
@@ -1901,7 +1903,7 @@ export class Workspaces {
         return results
       } finally {
         release?.()
-        await this.cleanupVerification(mission.source, checkout)
+        await this.cleanupVerification(member, task, mission.source, checkout)
       }
     }, signal)
   }
@@ -1928,7 +1930,7 @@ export class Workspaces {
    * `git worktree prune` drops a stale registration. Failures are recorded for
    * the host and are never thrown.
    */
-  private async cleanupVerification(source: string, checkout: string): Promise<void> {
+  private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
     let failure: unknown
     try {
       await this.worktreeGit(source, ['worktree', 'remove', '--force', checkout])
@@ -1941,7 +1943,7 @@ export class Workspaces {
     try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
     catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
     try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-    this.recordCleanupIssue(checkout, failure)
+    this.recordCleanupIssue(member, task, checkout, failure)
   }
 
   /** Restore owner permissions on an unreadable tree so removal can finish. */
@@ -1964,11 +1966,12 @@ export class Workspaces {
     await rm(directory, { recursive: true, force: true })
   }
 
-  private recordCleanupIssue(checkout: string, failure: unknown): void {
-    const message = `Verification checkout cleanup failed for ${checkout}: ${failure instanceof Error ? failure.message : String(failure)}`
+  private recordCleanupIssue(member: Member, task: Task, checkout: string, failure: unknown): void {
+    const reason = failure instanceof Error ? failure.message : String(failure)
+    const message = `Verification checkout cleanup failed for ${checkout}: ${reason}`
     this.cleanupIssues.push(message)
     if (this.cleanupIssues.length > 50) this.cleanupIssues.splice(0, this.cleanupIssues.length - 50)
-    try { this.options.onCleanupFailure?.({ checkout, error: message }) } catch { /* reporting must not mask results */ }
+    try { this.options.onCleanupFailure?.({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */

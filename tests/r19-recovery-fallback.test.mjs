@@ -15,12 +15,18 @@
  *
  * End-to-end through SwarmRuntime with a PRODUCTION-SHAPED Workers adapter
  * (checkpointTask wired, exactly like HarnessWorkers) and Workspaces
- * constructed as src/harness-workers.ts constructs it, with the callback the
+ * constructed as src/harness-workers.ts constructs it, with the callbacks the
  * adapter now forwards.
+ *
+ * Follow-ups (E, F): a repeated report of the same fallback (same previous
+ * owner, same commit) is not a second event or notice, and the sibling silent
+ * channel, a verification checkout the host could not remove, is a durable
+ * `task/verification-cleanup-failed` event and an owner notice while the
+ * verdict itself still completes.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile, stat } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, realpath, rm, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
@@ -41,15 +47,28 @@ async function git(cwd, ...args) {
 }
 const exists = file => stat(file).then(() => true, () => false)
 
-/** Production-shaped: every Workers method HarnessWorkers forwards to Workspaces, including checkpointTask and the recovery-fallback callback. */
+/**
+ * The production seam with `git worktree remove` refused for verification
+ * checkouts only: the disposable tree stays registered and present after the
+ * checks ran, which is the cleanup failure the adapter must report. Every other
+ * command (member worktrees, capture, the checks themselves) runs unchanged.
+ */
+const refusingVerificationRemoval = () => {
+  const real = subprocessSeam()
+  const refused = argv => argv[0] === 'git' && argv.includes('worktree') && argv.includes('remove') && argv.some(arg => arg.includes('/verification/'))
+  return { spawn: spec => real.spawn(refused(spec.argv) ? { ...spec, argv: ['/bin/sh', '-c', 'echo "fatal: simulated: worktree remove refused" >&2; exit 128'] } : spec) }
+}
+
+/** Production-shaped: every Workers method HarnessWorkers forwards to Workspaces, including checkpointTask and both Workspaces report callbacks. */
 class ProdShapeWorkers {
   idle = new Set()
   failStart = new Map()
-  constructor(root) {
-    // Same option shape as src/harness-workers.ts: the fallback report reaches
-    // the bound runtime callbacks, nothing else is wired.
-    this.workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
-      onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info) })
+  constructor(root, subprocess = subprocessSeam) {
+    // Same option shape as src/harness-workers.ts: the fallback and cleanup
+    // reports reach the bound runtime callbacks, nothing else is wired.
+    this.workspaces = new Workspaces({ subprocess, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+      onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info),
+      onCleanupFailure: info => this.callbacks?.verificationCleanupFailure?.(info) })
   }
   bind(callbacks) { this.callbacks = callbacks }
   async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
@@ -66,7 +85,7 @@ class ProdShapeWorkers {
 }
 const makeRuntime = (root, workers) => new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-r19-h3-')))
   const source = join(root, 'source')
   await mkdir(join(source, 'src'), { recursive: true })
@@ -74,7 +93,7 @@ async function fixture(t) {
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workers = new ProdShapeWorkers(root)
+  const workers = new ProdShapeWorkers(root, options.subprocess)
   const runtime = makeRuntime(root, workers)
   const owner = { sessionId: 'r19-h3-owner' }
   const mission = runtime.create(owner, { title: 'H3', objective: 'recovery fallback is preserved and surfaced', workspace: source, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -87,7 +106,7 @@ async function fixture(t) {
   f.current = rt => taskId => rt.store.get('tasks', taskId)
   f.events = rt => rt.store.events(mission.id, 500)
   f.taskRecord = taskId => readFile(join(root, 'worktrees', mission.id, 'tasks', `${taskId}.json`), 'utf8').then(JSON.parse)
-  f.propose = () => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
+  f.propose = (overrides = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...overrides })
   /** Author claims, then leaves in-scope and out-of-scope WIP in its worktree. */
   f.claimWithWip = async task => {
     await runtime.claim(f.actor(author), mission.id, task.id)
@@ -240,4 +259,60 @@ test('D. preservation impossible: the replacement starts from the task base and 
   assertSurfaced(s, { taskId: task.id, from: f.author.id, to: f.reviewer.id, preserved: false, commit: base })
   assert.match(s.events[0].data.reason, /preservation failed/, 'the event says why the WIP could not be carried')
   assert.match(s.notices[0].content ?? JSON.stringify(s.notices[0].notice), /worktree/, 'the notice tells the owner where the work still is')
+})
+
+test('E. a second recovery of the same previous owner and commit records no second event or notice', async t => {
+  // A re-preparation (the replacement's own start failed, or the same task was
+  // re-pended and re-routed) re-trips capture on the same untouched worktree
+  // and reports the same fallback again, under a new attempt epoch.
+  const f = await fixture(t)
+  const task = f.propose()
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const base = await git(f.source, 'rev-parse', 'HEAD')
+  const info = { missionId: f.mission.id, taskId: task.id, epoch: 1, memberId: f.reviewer.id, previousOwnerId: f.author.id, commit: base, preserved: false, reason: 'outside task scope: outside.txt; preservation failed: no snapshot commit was recorded' }
+  f.runtime.onRecoveryFallback(info)
+  f.runtime.onRecoveryFallback({ ...info, epoch: 2 })
+  const s = surfacing(f.runtime, f.mission.id, task.id, f.owner)
+  assertSurfaced(s, { taskId: task.id, from: f.author.id, to: f.reviewer.id, preserved: false, commit: base })
+  assert.equal(s.notices.length, 1, 'the repeated fallback is not a new owner fact')
+  assert.equal(s.recovery.epoch, 1, 'the recorded summary is the first report')
+  // A different snapshot is a new fact: the WIP was carried this time.
+  const snapshot = await git(f.source, 'rev-parse', 'HEAD')
+  f.runtime.onRecoveryFallback({ ...info, epoch: 3, commit: `${snapshot.slice(0, -1)}${snapshot.endsWith('0') ? '1' : '0'}`, preserved: true, reason: 'outside task scope: outside.txt' })
+  const after = surfacing(f.runtime, f.mission.id, task.id, f.owner)
+  assert.equal(after.events.length, 2, 'a fallback onto a different commit is recorded')
+  assert.equal(after.notices.length, 2)
+  assert.equal(after.recovery.epoch, 3)
+})
+
+test('F. a verification checkout that cannot be removed is a durable event and an owner notice; the verdict stands', async t => {
+  const f = await fixture(t, { subprocess: refusingVerificationRemoval })
+  const source = f.propose({ checks: ['test -f src/answer.txt && echo checked'] })
+  const claim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await writeFile(join(f.runtime.store.get('members', f.author.id).workspace, 'src', 'answer.txt'), 'answer\n')
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claim.attempt.id, output: 'ready for review' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Review', objective: 'Review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], checks: ['test -f src/answer.txt && echo checked'], assigneeId: f.reviewer.id })
+  const reviewClaim = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const verdict = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: 'accept', reason: 'Independent review' })
+  assert.equal(verdict.status, 'accepted', 'the cleanup failure never masks the check result')
+  assert.equal(f.current(f.runtime)(source.id).status, 'accepted')
+  const failures = f.workers.workspaces.cleanupFailures()
+  assert.equal(failures.length, 1, failures.join('\n'))
+  assert.match(failures[0], /worktree remove refused/)
+  const verification = join(f.root, 'worktrees', f.mission.id, 'verification')
+  assert.deepEqual(await readdir(verification), [], 'the fallback removal still reclaimed the checkout')
+  const events = f.events(f.runtime).filter(event => event.type === 'task/verification-cleanup-failed')
+  assert.equal(events.length, 1, 'exactly one durable cleanup-failure event')
+  const [event] = events
+  assert.equal(event.actor, 'runtime')
+  assert.equal(event.data.taskId, source.id, 'the event names the task whose checks ran')
+  assert.equal(event.data.memberId, f.reviewer.id, 'and the verifying member')
+  assert.ok(typeof event.data.checkout === 'string' && event.data.checkout.startsWith(`${verification}/`), `the event names the checkout: ${event.data.checkout}`)
+  assert.match(event.data.reason, /worktree remove refused/, 'the event carries the removal failure')
+  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.from === 'runtime' && delivery.notice?.trigger === 'task/verification-cleanup-failed')
+  assert.equal(notices.length, 1, 'one owner notice')
+  assert.match(notices[0].content, /could not be removed/)
+  assert.match(notices[0].content, /worktree remove refused/)
+  assert.ok(notices[0].content.includes(event.data.checkout), 'the notice names the checkout the owner has to look at')
+  assert.ok(notices[0].notice.subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
 })

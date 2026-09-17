@@ -113,6 +113,7 @@ export const zh: Record<string, string> = {
   'Provider route paused': '提供方服务中断，任务已暂停', 'Provider route recovered': '提供方服务已恢复',
   'Task re-pended after host restart': '主机重启后子任务重新排队', 'Members shared a temp path': '成员共享了临时路径',
   'recovery-fallback': '恢复回退', 'Task recovered from an uncaptured workspace': '子任务从未能捕获的工作区恢复',
+  'verification-cleanup-failed': '验证检出清理失败', 'Verification checkout could not be removed': '验证检出目录无法移除',
   'Project snapshot': '项目快照', 'existing changed files included': '个已有改动文件已纳入',
   'Your branch, staged changes and source files were preserved.': '创建快照时保留了你的分支、暂存状态和源文件。',
   'Collaboration result': '协作成果', 'View changes': '查看修改', 'Apply result': '应用结果',
