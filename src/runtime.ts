@@ -1742,23 +1742,6 @@ export class SwarmRuntime {
     try { return this.workers.checkEnvelope?.() as DeclaredCheckEnvelope | undefined }
     catch { return undefined } // reporting the environment must never break a delivery or a verdict
   }
-  /**
-   * ENV: the environment facts one attempt's self-run was recorded under. The
-   * attempt's own host-recorded tool runs are the evidence; when it ran nothing,
-   * the ambient facts a self-run would inherit here are the fallback. ENV-R: the
-   * facts on a row are the environment the recorded command gives itself (its
-   * assignments, `env -i`, `unset`), so a reviewer that really ran with
-   * `HOME=<temp>` is compared with that HOME and not with the ambient one.
-   */
-  private selfRunEnvironmentEvidence(missionId: string, memberId: string, taskId: string, attemptId: string): { environment: CheckEnvironment; source: 'tool-run' | 'host-ambient'; at: number } | undefined {
-    const runs = this.store.list('tool_runs', missionId).filter(run => run.memberId === memberId && run.taskId === taskId && run.attemptId === attemptId)
-    for (const run of [...runs].reverse()) {
-      const facts = (run as ToolRunWithEnvironment).checkEnvironment
-      if (facts !== undefined) return { environment: facts, source: 'tool-run', at: run.createdAt }
-    }
-    const ambient = this.declaredCheckEnvelope()?.selfRunEnvironment
-    return ambient === undefined ? undefined : { environment: ambient, source: 'host-ambient', at: Date.now() }
-  }
   /** ENV: the declared envelope delivered with one attempt's assignment, from the durable delivery. */
   private deliveredCheckEnvironment(missionId: string, taskId: string, attemptId: string): CheckEnvironment | undefined {
     for (const delivery of this.store.list('deliveries', missionId)) {
@@ -1773,23 +1756,24 @@ export class SwarmRuntime {
   }
   /**
    * ENV: compare the envelope delivered to one verification attempt with the
-   * environment that attempt's self-run reports. An attempt with no delivered
-   * envelope and no self-run evidence has nothing to compare, and the verdict
-   * proceeds as before.
+   * environment the host recorded on that artifact's declared checks. Both sides
+   * are host-measured: the runtime constructs the envelope and runs the declared
+   * checks itself, so nothing here is inferred from a member's command text. An
+   * attempt with no delivered envelope, or with no host check outcome that
+   * carries an environment, has nothing to compare and the verdict proceeds as
+   * before.
    */
-  private checkEnvironmentReproduction(missionId: string, memberId: string, taskId: string, attemptId: string, checks?: ReadonlyArray<{ environment?: CheckEnvironment }>):
-    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'tool-run' | 'host-ambient' | 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+  private checkEnvironmentReproduction(missionId: string, taskId: string, attemptId: string, checks: ReadonlyArray<{ environment?: CheckEnvironment }>):
+    { envelope: CheckEnvironment; selfRun: CheckEnvironment; source: 'host-check'; at: number; comparison: CheckEnvironmentComparison } | undefined {
+    if (checks.length === 0) return undefined
     const envelope = this.deliveredCheckEnvironment(missionId, taskId, attemptId) ?? this.declaredCheckEnvelope()?.environment
     if (envelope === undefined) return undefined
     // Declared host checks are the supporting executions. A later unrelated
     // diagnostic cannot substitute its environment for those immutable-artifact checks.
-    const measured = checks?.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
-      ?? checks?.find(check => check.environment !== undefined)?.environment
-    const evidence = checks !== undefined && checks.length > 0
-      ? measured === undefined ? undefined : { environment: measured, source: 'host-check' as const, at: Date.now() }
-      : this.selfRunEnvironmentEvidence(missionId, memberId, taskId, attemptId)
-    if (evidence === undefined) return undefined
-    return { envelope, selfRun: evidence.environment, source: evidence.source, at: evidence.at, comparison: compareCheckEnvironments(envelope, evidence.environment) }
+    const measured = checks.find(check => check.environment !== undefined && compareCheckEnvironments(envelope, check.environment).blocking.length > 0)?.environment
+      ?? checks.find(check => check.environment !== undefined)?.environment
+    if (measured === undefined) return undefined
+    return { envelope, selfRun: measured, source: 'host-check', at: Date.now(), comparison: compareCheckEnvironments(envelope, measured) }
   }
   /**
    * ENV: the check environment facts an assignment delivery carries. Public so
@@ -2048,14 +2032,13 @@ export class SwarmRuntime {
         return found?.attribution === undefined ? {} : { attribution: found.attribution }
       }
       const failureAttribution = outcomes.find(check => check.attribution !== undefined)?.attribution
-      // ENV: the envelope delivered to this attempt must be reproducible by the
-      // attempt's own self-run. A blocking divergence is durable before it is
-      // reported, so a later reader sees the environments, not only the refusal.
-      const reproduction = this.checkEnvironmentReproduction(missionId, member.id, task.id, input.attemptId)
-      const supportingReproduction = outcomes.length > 0 ? this.checkEnvironmentReproduction(missionId, member.id, task.id, input.attemptId, outcomes) : reproduction
+      // ENV: the envelope delivered to this attempt must be reproduced by the
+      // host checks that support it. A blocking divergence is durable before it
+      // is reported, so a later reader sees the environments, not only the refusal.
+      const reproduction = this.checkEnvironmentReproduction(missionId, task.id, input.attemptId, outcomes)
       if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
         this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
-          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch', diagnosticOnly: outcomes.length > 0,
+          taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
           envelope: reproduction.envelope, selfRun: reproduction.selfRun, selfRunSource: reproduction.source, selfRunAt: reproduction.at,
           blocking: reproduction.comparison.blocking, advisory: reproduction.comparison.advisory,
           ...(failureAttribution === undefined ? {} : { attribution: failureAttribution }),
@@ -2065,10 +2048,9 @@ export class SwarmRuntime {
       // mismatch is recorded above). An acceptance, though, is refused rather
       // than validating an artifact under an environment the host check cannot
       // reproduce.
-      if (passed && supportingReproduction !== undefined && supportingReproduction.comparison.blocking.length > 0) {
+      if (passed && reproduction !== undefined && reproduction.comparison.blocking.length > 0) {
         this.commit(missionId, () => { this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks) })
-        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(supportingReproduction.comparison,
-          supportingReproduction.source === 'host-check' ? 'recorded on the declared host checks' : supportingReproduction.source === 'tool-run' ? "recorded on this attempt's host-recorded tool runs" : 'the ambient host environment'))
+        throw new CheckEnvironmentMismatchError(this.checkEnvironmentMismatchMessage(reproduction.comparison, 'recorded on the declared host checks'))
       }
       // F3-A: a rejection must carry the real failure, not only the reviewer's
       // prose. A judgement rejection with no failing check keeps the prose.
@@ -4084,18 +4066,6 @@ export class SwarmRuntime {
     const task = this.store.list('tasks', member.missionId).find(t => t.status === 'running' && t.attempt?.ownerId === memberId)
     if (!task?.attempt) return undefined
     const run: ToolRunWithEnvironment = { ...input, id: id('run'), missionId: member.missionId, memberId, taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now() }
-    // ENV-R: the environment this execution ran under. The command text is the
-    // durable evidence of what the command gives itself (`HOME=… cmd`,
-    // `export …`, `env -i`, `unset …`), so the row records THAT environment, not
-    // the host-ambient sample a command that overrode HOME never ran with.
-    const ambient = this.declaredCheckEnvelope()?.selfRunEnvironment
-    if (ambient !== undefined) {
-      const source = selfRunEnvironmentSource(recordedCommand(input.arguments))
-      run.checkEnvironment = selfRunEnvironmentFacts(ambient, source)
-      // Provenance: a reader can tell a command-derived environment from the
-      // ambient fallback without re-parsing the command text.
-      if (source.cleared || source.operations.length > 0) run.checkEnvironmentSource = { from: 'command', ...source }
-    }
     // F8: a recorded run may extend the attempt lease, but a stored lease must
     // never outlive the mission deadline (the same clamp every other renewal uses).
     task.attempt.leaseUntil = Math.min(this.mission(member.missionId).deadline, Date.now() + this.config.leaseMs)
