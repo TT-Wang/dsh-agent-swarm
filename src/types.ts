@@ -323,6 +323,7 @@ export interface Artifact {
 /** Owner revisions keep the obligation and history; submitted artifacts stay immutable. */
 export interface TaskAmendment {
   scope?: string[]
+  outputs?: string[]
   dependencies?: string[]
   checks?: string[]
   assigneeId?: string | null
@@ -341,6 +342,14 @@ export interface Task {
   dependencies: string[]
   scope: string[]
   acceptance: string[]
+  /**
+   * The repository-relative files this task must produce, declared by whoever
+   * planned it instead of inferred from the objective prose. An empty array is
+   * a declaration ("this task writes no file"); absent means the row predates
+   * the field or came from a manual assembly that omitted it, and the
+   * consumers fall back to the `deliverablePaths` text heuristic for it.
+   */
+  outputs?: string[]
   checks: string[]
   status: TaskStatus
   priority: number
@@ -810,6 +819,8 @@ export interface PlanTask {
   kind: TaskKind
   scope: string[]
   acceptance: string[]
+  /** Declared deliverable files; see `Task.outputs`. */
+  outputs?: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
   /** Per-task step ceiling; admission derives a bounded default when the plan omits it. */
@@ -910,6 +921,8 @@ export interface ProposeTaskInput {
   dependencies?: string[]
   scope: string[]
   acceptance: string[]
+  /** Declared deliverable files; see `Task.outputs`. A replacement inherits the replaced task's when it omits them. */
+  outputs?: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
   /** Per-task step ceiling; admission derives a bounded default when the proposal omits it. */

@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
+import { assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
 
 function record(value: unknown): asserts value is Record<string, unknown> {
@@ -77,9 +77,6 @@ export function validatePlan(value: unknown): PlanInput {
     if (!Number.isSafeInteger(value.budget[name]) || Number(value.budget[name]) < (name === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${name}`)
   }
   if (value.budget.deadlineAt !== undefined && (!Number.isSafeInteger(value.budget.deadlineAt) || Number(value.budget.deadlineAt) < 1)) throw new Error('Invalid budget deadlineAt: use a positive safe integer Unix timestamp in milliseconds')
-  // Mission-level write directives and named deliverables reconcile before any task is admitted.
-  for (const diagnostic of reconcileObjectiveScope(String(value.objective), value.scope as string[], 'objective')) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
-  for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), String(value.objective), value.acceptance as string[], 'objective')) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
   const members = keyed(value.members, 'Members'), streams = keyed(value.workstreams, 'Workstreams'), tasks = keyed(value.tasks, 'Tasks')
   if (members.size > Number(value.budget.maxWorkers)) throw new Error('Roster exceeds worker budget')
   if (tasks.size > Number(value.budget.maxTasks) || streams.size > Number(value.budget.maxTasks)) throw new Error('Plan exceeds task/workstream budget')
@@ -120,6 +117,9 @@ export function validatePlan(value: unknown): PlanInput {
       assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[])
     })
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
+    // A plan states its deliverables; nothing downstream has to read them out of
+    // the objective prose. Empty is legal and means "writes no file".
+    inspectAdmission(() => { if (task.outputs !== undefined) task.outputs = assertDeclaredOutputs(task.outputs, Array.isArray(task.scope) ? task.scope as string[] : [], at) })
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new Error(`${at}.maxRecoveryAttempts must be a positive safe integer`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new Error(`${at}.checkTimeoutMs must be a positive integer within the platform timer range`) })
     if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key), scripts))
@@ -129,10 +129,7 @@ export function validatePlan(value: unknown): PlanInput {
       Object.assign(task, ceilings)
     })
     if (typeof task.objective === 'string') {
-      const taskScope = Array.isArray(task.scope) ? task.scope as string[] : []
       const taskAcceptance = Array.isArray(task.acceptance) ? task.acceptance as string[] : []
-      for (const diagnostic of reconcileObjectiveScope(task.objective, taskScope, `${at}.objective`)) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
-      for (const diagnostic of reconcileDeliverableIgnores(String(value.workspace), task.objective, taskAcceptance, at)) if (diagnostic.severity !== 'advisory') admissionIssues.push(formatDiagnostic(diagnostic))
       // R12-F9 at plan admission: a task with no content-carrying edge whose own
       // text assumes prior work would be prepared from the bare baseline and
       // surprise its member at submit. Same guard as propose(), same exits.
@@ -175,8 +172,8 @@ export function validatePlan(value: unknown): PlanInput {
       ...(raw.budget.deadlineAt === undefined ? {} : { deadlineAt: raw.budget.deadlineAt }) },
     members: raw.members.map(({ key, name, role, provider, model, reasoningEffort, maxOutputTokens }) => ({ key, name, role, provider, model, reasoningEffort, maxOutputTokens })),
     workstreams: raw.workstreams.map(({ key, title, objective }) => ({ key, title, objective })),
-    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf }) =>
-      ({ key, workstreamKey, title, objective, kind, scope, acceptance, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf })),
+    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf }) =>
+      ({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf })),
   }
   orderedTasks(plan.tasks)
   return plan

@@ -4,6 +4,9 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
+// Declared outputs are checked against the same toolchain names the workspace
+// engine excludes from capture; both sides must never drift apart.
+import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
 import type { TaskCeiling, TaskCeilingDimension, TaskCeilingProvenance } from './types.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
@@ -378,6 +381,46 @@ export function deliverablePaths(objective: string, acceptance: readonly string[
     for (const path of writeDirectivePaths(text, { strict: false })) add(path)
   }
   return found
+}
+
+/**
+ * Why one declared output is unusable, or undefined when it is exact. The rules
+ * are the capture gate's own (`Workspaces.captureArtifact`), stated at
+ * admission: literal in-scope file, no directory, no glob, no traversal, no Git
+ * metadata, no dependency or scratch directory. Declaring the path is what makes
+ * it exact — the `deliverablePaths` heuristic could only guess these from prose.
+ */
+function declaredOutputFault(output: unknown, scope: readonly string[]): string | undefined {
+  if (typeof output !== 'string' || !output.trim()) return 'is not a nonempty path string'
+  if (output.endsWith('/')) return 'ends in "/", so it names a directory rather than one file'
+  if (/[*?[\]]/.test(output)) return 'contains a glob character, and only literal paths can be captured'
+  if (isAbsolute(output) || output.startsWith('/') || output.includes('\\')) return 'is not a repository-relative path'
+  if (/[ -]/.test(output)) return 'contains a control character'
+  const parts = output.split('/')
+  if (parts.some(part => part === '' || part === '.')) return 'has an empty or "." path segment'
+  if (parts.includes('..')) return 'has a ".." segment, which could escape the repository'
+  if (parts.some(part => part.toLowerCase() === '.git')) return 'names Git metadata'
+  // The same names the workspace engine treats as toolchain state by name alone,
+  // so a declared output can never force-capture an installed dependency.
+  const toolchain = parts.find(part => part === SWARM_SCRATCH_DIRNAME || DEFAULT_VERIFICATION_DEPENDENCY_DIRS.includes(part))
+  if (toolchain !== undefined) return `lies under ${JSON.stringify(toolchain)}, a dependency or scratch directory that is never captured as work`
+  if (!withinScope(output, scope)) return `is outside the task scope ${JSON.stringify([...scope])}`
+  return undefined
+}
+
+/**
+ * The one exact check of a task's declared outputs, shared by plan validation,
+ * `propose` and the owner amendment. It returns the detached list the caller
+ * stores, so no call site can admit an entry it did not validate.
+ */
+export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string): string[] {
+  if (!Array.isArray(outputs)) throw new Error(`[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`)
+  for (const output of outputs) {
+    const fault = declaredOutputFault(output, scope)
+    if (fault === undefined) continue
+    throw new Error(`[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`)
+  }
+  return [...outputs as string[]]
 }
 
 export interface IgnoredPath { path: string; source: string; line: number; pattern: string }

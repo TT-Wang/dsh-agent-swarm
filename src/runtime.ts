@@ -21,7 +21,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { assertScopeSelectors, formatDiagnostic, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { assertDeclaredOutputs, assertScopeSelectors, formatDiagnostic, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -1599,6 +1599,16 @@ export class SwarmRuntime {
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'task.scope', mission.scope)
+    // A repair carries the obligation it replaces: omitting `outputs` inherits
+    // the replaced task's declaration, so a replacement cannot quietly drop a
+    // deliverable the original promised. They are still checked against this
+    // task's own scope below, because a repair may narrow that scope.
+    if (input.outputs === undefined) {
+      const inherited = (input.replaces ?? []).map(previousId => this.store.get('tasks', previousId))
+        .find(previous => previous?.missionId === missionId && previous.outputs !== undefined)?.outputs
+      if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
+    }
+    if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
     // D1: reconcile the objective's write directives with the task scope and the
     // named deliverables with the effective ignore rules at the production
     // admission point, so a plan error is rejected here instead of at submit.
@@ -1695,6 +1705,10 @@ export class SwarmRuntime {
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
     const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
+    // Absent stays absent: only a declaration is stored, so a row without the
+    // field keeps falling back to the text heuristic instead of reading as
+    // "this task writes nothing".
+    if (input.outputs !== undefined) task.outputs = [...input.outputs]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
     if (input.maxRecoveryAttempts !== undefined) task.maxRecoveryAttempts = input.maxRecoveryAttempts
@@ -2715,6 +2729,10 @@ export class SwarmRuntime {
         workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,
         objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
         kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
+        // The host-admitted review reads an artifact and records a verdict; it
+        // owes no file. Declaring that is what keeps the source task's own
+        // deliverable names from reading as this review's obligations.
+        outputs: [],
         reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, priority: source.priority,
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
       }, this.automaticReviewId(source))
@@ -3715,7 +3733,7 @@ export class SwarmRuntime {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (!['amend', 'resume'].includes(action)) throw new PolicyError('task_action_invalid', 'validation_error', 'Task control supports amend or resume')
     this.bounded(reason)
-    const allowed = ['scope', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
+    const allowed = ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
     if (changes === null || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !allowed.includes(key))) throw new PolicyError('task_amendment_invalid', 'validation_error', 'Unknown task amendment field')
     const cleanup = this.store.get('tasks', taskId)
     const cleanupOnly = action === 'resume' && Object.keys(changes).length === 0 && cleanup?.missionId === missionId
@@ -3735,7 +3753,10 @@ export class SwarmRuntime {
     const strengthenSubmittedChecks = task.status === 'submitted' && action === 'amend'
       && Object.keys(changes).length === 1 && Array.isArray(changes.checks)
       && task.checks.filter(check => !isNoopCheck(check)).every(check => changes.checks!.includes(check))
-    const structural = !strengthenSubmittedChecks && ['scope', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
+    // `outputs` is the capture obligation itself, so it is fenced exactly like
+    // the scope it must sit inside: a submitted artifact's obligations cannot be
+    // rewritten after the fact.
+    const structural = !strengthenSubmittedChecks && ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
     if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', 'Submitted artifact policy is immutable; repair rejected work through a replacement')
     if (task.status === 'blocked' && task.evidenceIds.some(key => this.store.get('evidence', key)?.status === 'refuted') && !task.verificationRecovery) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
     const next: Task = { ...task }
@@ -3751,6 +3772,9 @@ export class SwarmRuntime {
       requireStrings(changes.scope, 'scope'); next.scope = normalizeScopeSelectors(changes.scope)
       assertScopeSelectors(next.scope, 'scope', mission.scope)
     }
+    // After the scope amendment, so a combined change is checked against the
+    // scope this task ends up with, never the one it is leaving.
+    if (changes.outputs !== undefined) next.outputs = assertDeclaredOutputs(changes.outputs, next.scope, 'task')
     if (changes.dependencies !== undefined) {
       if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
       next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]

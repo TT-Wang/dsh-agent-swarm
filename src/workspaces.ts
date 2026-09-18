@@ -1479,8 +1479,14 @@ export class Workspaces {
     })
   }
 
+  /**
+   * The files this task owes, so a quiescent draft of one survives a handoff.
+   * A declared `outputs` is exact and needs no guessing; a row without the field
+   * (a legacy task, or a manually assembled mission that omitted it) still falls
+   * back to reading them out of the objective and acceptance text.
+   */
   private taskRecoveryPaths(task: Task): string[] {
-    return deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => validRecoveryPath(name)
+    return (task.outputs ?? deliverablePaths(task.objective ?? '', task.acceptance ?? [])).filter(name => validRecoveryPath(name)
       && withinScope(name, task.scope) && !this.toolchainName(name))
   }
 
@@ -1901,8 +1907,10 @@ export class Workspaces {
       // it is compared with the declared outputs or named in the refusal, so a
       // case-folding filesystem cannot make the text's spelling and the file's
       // two different obligations. R19-C: a check-ignore run that did not
-      // complete is a refusal, never a silently open gate.
-      const hinted = deliverablePaths(task.objective ?? '', task.acceptance ?? []).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !this.toolchainName(name))
+      // complete is a refusal, never a silently open gate. R20: a task that
+      // declares `outputs` states this list exactly, and only a row without the
+      // field is still read out of the objective and acceptance text.
+      const hinted = (task.outputs ?? deliverablePaths(task.objective ?? '', task.acceptance ?? [])).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !this.toolchainName(name))
       const present: string[] = []
       for (const name of hinted) {
         const spelled = await this.onDiskSpelling(member.workspace, name)
