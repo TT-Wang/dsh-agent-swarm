@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmStore } from '../lib/store.js'
-import { TraceRecorder, TracePayloadStore, ReplayTruncationError, orchestratorCommands, traceMetrics, readEventHistory, traceIdFor, traceparentFor, spanOperation, digestText } from '../lib/trace.js'
+import { TraceRecorder, ReplayTruncationError, orchestratorCommands, traceMetrics, readEventHistory, traceIdFor, traceparentFor, spanOperation, digestText } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 const ref = { digest: digestText('{}'), bytes: 2, stored: false }
@@ -16,9 +16,8 @@ const span = (number, step, extra = {}) => {
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'swarm-r12-trace-'))
   const store = new SwarmStore(join(root, 'state.sqlite'))
-  const payloads = new TracePayloadStore(join(root, 'payloads'))
   t.after(async () => { store.close(); await rm(root, { recursive: true, force: true }) })
-  return { store, payloads }
+  return { store }
 }
 
 test('M1-T1: restart seeds bounded trace rows despite more than 20,000 newer ordinary events', async t => {
@@ -30,7 +29,7 @@ test('M1-T1: restart seeds bounded trace rows despite more than 20,000 newer ord
     f.store.event('m', 'trace/span', 'worker', claimed)
     for (let i = 0; i < 20_010; i++) f.store.event('m', 'member/activity', 'worker', { index: i })
   })
-  const recorder = new TraceRecorder(f.store, f.payloads); await recorder.startupSweep
+  const recorder = new TraceRecorder(f.store)
   assert.equal(recorder.parentFor({ step: 'swarm_publish', missionId: 'm', taskId: 'task', attemptId: 'attempt' }), claimed.spanId)
   assert.deepEqual(recorder.spansFor('m').map(span => span.spanId), [proposed.spanId, claimed.spanId])
   assert.equal(recorder.windowFor('m').truncated, false)
@@ -48,7 +47,7 @@ test('M1-T1: older scoped parents remain correct beyond the span window and metr
   })
   const reads = [], original = f.store.traceEvents.bind(f.store)
   f.store.traceEvents = (...args) => { reads.push(args); return original(...args) }
-  const recorder = new TraceRecorder(f.store, f.payloads); await recorder.startupSweep
+  const recorder = new TraceRecorder(f.store)
   assert.equal(recorder.parentFor({ step: 'swarm_publish', missionId: 'm', taskId: 'source', attemptId: 'old-attempt' }), claimed.spanId)
   assert.equal(recorder.parentFor({ step: 'swarm_verify', missionId: 'm', taskId: 'review', reviewOfTaskId: 'source' }), submitted.spanId)
   assert.equal(recorder.parentFor({ step: 'swarm_claim', missionId: 'm', taskId: 'source' }), submitted.spanId)
