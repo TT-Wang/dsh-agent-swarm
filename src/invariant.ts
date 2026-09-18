@@ -22,15 +22,13 @@
  * before the write instead of after it. `src/index.ts` supplies the mapping from a
  * relayed message to that predicate, so this module knows nothing about the store.
  *
- * REFUSALS ARE A MEASUREMENT. Every refusal is recorded in {@link decisionRefusals}
- * with its stage (`emission`: refused before anything durable was written;
- * `append`: the host refused the session append before publication), so the round
- * can report a count instead of a silent no-op. The adapter acknowledges an
- * append-refused delivery (src/harness-workers.ts) so the durable outbox cannot
- * retry a decision the invariant will refuse again.
+ * WHAT A REFUSAL DOES. A refused candidate is never written: the emission site
+ * returns before anything durable exists, and the host refuses the session append
+ * before publication. The adapter acknowledges an append-refused delivery
+ * (src/harness-workers.ts) so the durable outbox cannot retry a decision the
+ * invariant will refuse again.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { DecisionRefusal } from './types.ts'
 
 /** Full package name the companion reserves in the host invariant registry. */
 export const SWARM_INVARIANT_PACKAGE = '@dsh-external/dsh-agent-swarm'
@@ -47,21 +45,6 @@ export const inject = ['invariants']
 export const swarmInvariantStatus: { registered: boolean; packageName: string } = {
   registered: false, packageName: SWARM_INVARIANT_PACKAGE,
 }
-
-/** The process-local refusal measurement: the count the round reports, oldest first. */
-export class DecisionRefusalLog {
-  private readonly entries: DecisionRefusal[] = []
-  /** Record one refused candidate (never throws; a refusal is a measurement). */
-  record(refusal: DecisionRefusal): void { this.entries.push(refusal) }
-  /** Every refusal recorded in this process, oldest first. */
-  list(): readonly DecisionRefusal[] { return [...this.entries] }
-  /** How many candidates were refused. */
-  count(): number { return this.entries.length }
-  /** Test seam: drop the recorded refusals. */
-  clear(): void { this.entries.length = 0 }
-}
-/** The one refusal log: written by the emission site and by the host invariant. */
-export const decisionRefusals = new DecisionRefusalLog()
 
 /** The slice of a relayed host message the invariant inspects; structural, no host import. */
 export interface RelayedMessage {
@@ -133,7 +116,6 @@ export function installSwarmInvariant(ctx: Context, judge: RelayJudge): void {
         for (const message of relayedSwarmMessages(args[1])) {
           const refusal = judge(message)
           if (refusal === undefined) continue
-          decisionRefusals.record({ at: Date.now(), ...refusal, stage: 'append' })
           try {
             fail(`refusing an owner-facing ${refusal.family} decision naming ${refusal.subjects.join(', ') || 'unknown subject'}: ${refusal.reason}`)
           } catch (error) {

@@ -740,22 +740,6 @@ export interface DecisionCandidate {
   subjects: readonly string[]
 }
 /**
- * R17-G9: one refused decision, recorded as a measurement. A refusal is never a
- * silent no-op: the emission-time refusal records `emission` (nothing durable was
- * written), the host pre-append invariant records `append` (the host session
- * append was refused before publication).
- */
-export interface DecisionRefusal {
-  at: number
-  missionId: string
-  family: string
-  subjects: string[]
-  reason: string
-  stage: 'emission' | 'append'
-  /** The durable delivery the append-stage refusal named, when one exists. */
-  deliveryId?: string
-}
-/**
  * S6: critical-path accounting for one mission, projected next to its total
  * spend. `length` is the number of tasks in the longest chain of dependent
  * steps, so a worker that does not shorten the longest branch earns nothing;

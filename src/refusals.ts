@@ -276,13 +276,6 @@ export interface GuardTerminal {
   code: string
   message: string
   exits: DecisionExit[]
-  /**
-   * The other guard chains this terminal can co-fire with on the same board.
-   * Every severe defect of 2026-09-10 was two individually-correct rules
-   * multiplying into a trap, so the pair is named here and the pair test in
-   * `tests/guard-terminals.test.mjs` exercises at least two of them.
-   */
-  coFires: GuardChainId[]
 }
 
 /** Free text a caller knows at emission time; never a condition on the escalation. */
@@ -309,25 +302,6 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   // L2: the owner was asked a question and closed the turn in prose, so the
   // answer never reached the asker. The chain names the receipt, not the model.
   owner_reply: 'owner_reply_missing',
-}
-
-/**
- * The co-firing guards of each chain, as observed on the 2026-09-10 host: a
- * clean-tree workspace guard fired together with the review-capture guard and
- * bricked a member, and "Member has uncommitted commits" fired together with
- * the attempt-preservation guard with no exit at all.
- */
-const GUARD_TERMINAL_CO_FIRES: Record<GuardChainId, GuardChainId[]> = {
-  budget: ['dispatch_preconditions', 'workspace'],
-  workspace: ['attempt_lease', 'review_admission', 'dispatch_preconditions'],
-  attempt_lease: ['workspace', 'task_ceiling', 'dispatch_preconditions'],
-  task_ceiling: ['dispatch_preconditions', 'budget'],
-  review_admission: ['workspace', 'dispatch_preconditions'],
-  dispatch_preconditions: ['workspace', 'attempt_lease', 'task_ceiling', 'budget', 'review_admission'],
-  admission: ['workspace', 'dispatch_preconditions'],
-  // A missing owner reply co-fires with nothing: the board is untouched, and the
-  // ask's own delivery row is the witness.
-  owner_reply: [],
 }
 
 const described = (context: GuardTerminalContext, fallback: string): string => context.detail ?? fallback
@@ -394,7 +368,7 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
       { tool: 'swarm_control', parameter: 'action', instruction: 'complete or stop the mission' },
     ],
   }
-  return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain], coFires: [...GUARD_TERMINAL_CO_FIRES[chain]] }
+  return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain] }
 }
 
 /** The durable dedup key of one terminal decision request: one per chain and board state. */
@@ -444,7 +418,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
       rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
         taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null,
-        coFires: terminal.coFires, fingerprint, ownerNotified: true,
+        fingerprint, ownerNotified: true,
       })
       // R15-A1: the guard chain names the subject it terminated for: the task it
       // was asked about, else the member's own unfinished work, else the mission
