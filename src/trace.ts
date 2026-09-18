@@ -903,6 +903,7 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   // shared constants now, so this row is required, not optional.
   'task/stale-revision-refused': 'A task write presented a revision another accepted write had moved past; the durable revision was named and the write refused',
   'task/quiescence-recovered': 'Parked task recovered after host restart',
+  'attempt/fenced': 'A control decision fenced a running attempt: epoch bumped, outgoing owner recorded, stop obligation installed',
   'evidence/published': 'Unverified claim published with host-recorded run ids',
   'evidence/challenged': 'Claim challenged with counterevidence',
   'evidence/verified': 'Verdict verified the claim and names the retired reviews',

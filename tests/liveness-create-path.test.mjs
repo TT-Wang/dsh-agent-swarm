@@ -123,14 +123,16 @@ test('a submitted task with no live review is reported stalled with its exact ta
   assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active')
 })
 
-test('a create-path stall notice names the parked work, and admitting the follow-up wakes the parked member', async t => {
+test('a create-path stall notice names the parked work, and admitting the follow-up wakes its member', async t => {
   const f = await fixture(t)
   const parked = f.propose({ title: 'Ceiling-bound work', maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, parked.id)
   await f.workers.callbacks.beforeStep(f.author.id)
-  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the parked member takes no step without fresh input')
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the ceiling-bound member takes no further step')
   assert.equal(f.current(parked.id).status, 'blocked')
-  assert.equal(f.runtime.store.get('members', f.author.id).status, 'waiting')
+  // R20: the host no longer parks the member; the stop the fenced handle owes is
+  // what refuses its steps, and the member itself reads idle between attempts.
+  assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle')
   // Nothing is dispatchable: the create-path mission must wake the owner.
   const stall = await eventually(() => f.control(/Mission stalled/)[0], 'a parked create-path mission is reported stalled')
   assert.match(stall.delivery.content, new RegExp(parked.id))
@@ -143,13 +145,12 @@ test('a create-path stall notice names the parked work, and admitting the follow
   const running = await eventually(() => f.current(repair.id).status === 'running' ? f.current(repair.id) : undefined,
     'the follow-up task must be assigned to the parked member')
   assert.equal(running.attempt.ownerId, f.author.id)
-  // R17-G7: the park is durable intent, so it still stands until the assignment
-  // supplies fresh input; the live `working` status follows the attempt as soon
-  // as that input lifts the park (the derivation, not a status write).
-  assert.ok(['working', 'waiting'].includes(f.runtime.store.get('members', f.author.id).status), 'the member has a confirmed stopped predecessor and a new assignment')
+  // R17-G7: the live status is derived from the phase and the attempt, never
+  // written, so the new attempt alone makes its owner `working`.
+  assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'the member has a confirmed stopped predecessor and a new assignment')
   const assignment = f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id)
   assert.ok(assignment, 'the wake is a durable assignment delivery')
   assert.equal(assignment.member.id, f.author.id)
-  assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'fresh input lets the woken member take its next step')
-  assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'with fresh input the park lifts and the derived status follows the live attempt')
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'the woken member takes its next step')
+  assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'and the derived status follows the live attempt')
 })

@@ -75,6 +75,8 @@ export const zh: Record<string, string> = {
   'published': '已发布', 'applied': '已应用', 'conflicts': '冲突', 'snapshot': '快照', 'recorded': '已记录',
   'queued': '已排队', 'heartbeat': '心跳', 'failure': '失败', 'budget-exhausted': '预算耗尽', 'budget-updated': '预算已更新',
   'ceiling-exhausted': '执行上限已耗尽', 'preparation-failed': '准备失败',
+  // R20: the uniform attempt closer every control path writes.
+  'fenced': '已隔离',
   // Remaining round-2/round-4 event vocabulary (verifier run_4253a2eb).
   'rejected': '已驳回', 'recovered': '已恢复', 'budget-warning': '预算警告', 'budget-quiesced': '预算暂停',
   'budget-resumed': '预算已恢复', 'budget-resume-skipped': '已跳过预算恢复', 'added': '已加入', 'subscribed': '已订阅',
@@ -95,6 +97,7 @@ export const zh: Record<string, string> = {
   'Task ready to close out': '子任务可以收尾', 'Task close-out limit reached': '子任务收尾次数已达上限',
   'Task lease expiring': '子任务租约即将到期', 'Task recovered after quiescence': '子任务在静止后已恢复',
   'Task ceiling reached': '子任务超出执行上限', 'Task preparation failed': '子任务准备失败',
+  'Task work was stopped': '子任务的工作已被停止',
   'Task resumed after budget pause': '子任务在预算暂停后已恢复', 'Task resume skipped': '已跳过子任务恢复',
   'Worker added': '成员已加入', 'Worker subscriptions updated': '成员订阅已更新',
   // R11-08: review-path, check-change and workspace-authorization labels.

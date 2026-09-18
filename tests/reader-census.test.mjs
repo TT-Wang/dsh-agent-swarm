@@ -85,6 +85,7 @@ const EVENT_CENSUS = [
   ["task/cancelled-at-completion", "keep", "ui", "src/client/progress.ts", "Historical automatic withdrawals remain visible; completion no longer emits them"],
   ["task/lease-expired", "keep", "ui", "src/client/progress.ts", "Attempt lease expired and the owner was released"],
   ["task/ceiling-exhausted", "keep", "ui", "src/client/progress.ts", "Task exhausted its own step or finding ceiling and blocked without charging the mission budget"],
+  ["attempt/fenced", "keep", "replay", "src/trace.ts", "The uniform closer every control path writes through Attempts.fenceForStop, so the replay decoder can close the attempt a mission pause, stop, challenge or workspace revocation ended"],
   ["task/checkpointed", "keep", "ui", "src/client/progress.ts", "Workspace checkpoint captured before reassignment"],
   ["task/checkpoint-failed", "keep", "ui", "src/client/progress.ts", "Checkpoint capture failed; workspace preserved, recovery refuses a dirty tree"],
   ["task/closeout-nudged", "keep", "ui", "src/client/progress.ts", "Idle worker nudged to finish its open attempt"],
