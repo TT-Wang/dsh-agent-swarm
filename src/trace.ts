@@ -857,8 +857,14 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
  * Event vocabulary the read path recognizes. Every type the round-2 review found
  * unsurfaced (F-14) is named here, together with the verdict and retired-review
  * events (F-12) and the trace rows themselves.
+ *
+ * The literal is frozen with `as const` so `EventKind` below is exactly its key
+ * set: the compiler refuses an unregistered kind at the emit site, which is what
+ * a runtime vocabulary and a source scanner could only report after the fact.
+ * `satisfies` keeps every value a description without widening the keys back to
+ * `string`.
  */
-export const EVENT_VOCABULARY: Record<string, string> = {
+export const EVENT_VOCABULARY = {
   'task/verification-deferred': 'Check infrastructure needs repair; exact submitted source and verification evidence preserved',
   'task/amended': 'Owner revised task execution policy while retaining task identity and acceptance',
   'mission/scope-amended': 'Owner revised execution scope within the human workspace authorization',
@@ -931,8 +937,8 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   'tool/recorded': 'Host tool run recorded for evidence and audit',
   // Round 9-C: the remaining types the runtime emits, including the four added
   // by the liveness/review/check fixes. `eventVocabularyReport` must never
-  // report an emitted type as unrecognized; tests/event-vocabulary.test.mjs
-  // re-derives this set from src/ and fails if a new emitter is unregistered.
+  // report an emitted type as unrecognized; an unregistered emitter is now a
+  // compile error at its call site rather than a scanner finding.
   'admission/limit': 'Owner set an admission limit rule; recorded with its level, key and limit',
   'admission/refused': 'Admission refused a task or member against a limit; recorded once per refusal row',
   'member/effort-downgraded': 'Provider rejected the requested reasoning effort; the member runs without it',
@@ -977,7 +983,15 @@ export const EVENT_VOCABULARY: Record<string, string> = {
   // R11-15: the shared temp roots are a cross-member channel; this row records
   // two members naming the same temp path inside the rendezvous window.
   'isolation/temp-rendezvous': 'Two members named the same shared temp path inside the rendezvous window; the path and both members are recorded',
-}
+} as const satisfies Record<string, string>
+/** Every kind a writer may emit. A new kind is one row above, not five registrations. */
+export type EventKind = keyof typeof EVENT_VOCABULARY
+/**
+ * Decoding is open where writing is closed: a row written by an older version
+ * carries a kind this build no longer registers, so the lookup widens the frozen
+ * literal instead of narrowing the key it is given.
+ */
+const DESCRIPTIONS: Record<string, string | undefined> = EVENT_VOCABULARY
 export interface EventVocabularyReport {
   recognized: string[]
   unrecognized: string[]
@@ -986,7 +1000,7 @@ export interface EventVocabularyReport {
 export function eventVocabularyReport(events: readonly SwarmEvent[]): EventVocabularyReport {
   const counts = new Map<string, number>()
   for (const event of events) counts.set(event.type, (counts.get(event.type) ?? 0) + 1)
-  const types = [...counts.entries()].map(([type, count]) => ({ type, count, ...(EVENT_VOCABULARY[type] === undefined ? {} : { description: EVENT_VOCABULARY[type] }) }))
+  const types = [...counts.entries()].map(([type, count]) => ({ type, count, ...(DESCRIPTIONS[type] === undefined ? {} : { description: DESCRIPTIONS[type] }) }))
   return {
     recognized: types.filter(item => item.description !== undefined).map(item => item.type),
     unrecognized: types.filter(item => item.description === undefined).map(item => item.type),
