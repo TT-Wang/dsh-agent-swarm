@@ -1,7 +1,16 @@
 import { createContext, useContext } from 'react'
+import { EVENT_PANEL_LABELS } from '../events.ts'
+
+/**
+ * Compact-panel labels are declared with their kind in `src/events.ts`, so a new
+ * kind carries its own translation. They are merged in here because the
+ * catalogue, not the registry, is what `useCopy` reads.
+ */
+const panelCopy = Object.fromEntries(Object.values(EVENT_PANEL_LABELS).map(panel => [panel.en, panel.zh]))
 
 /** English strings are stable keys; only plugin-owned copy is translated. */
 export const zh: Record<string, string> = {
+  ...panelCopy,
   'Current status unconfirmed': '当前状态待确认', 'Execution activity': '执行现场', 'Recorded execution': '上次执行记录',
   'Updates unconfirmed': '等待同步', 'Receiving activity signals': '持续收到运行信号', 'Waiting for activity confirmation': '等待运行信号确认',
   'observed working': '已确认活跃', 'previously working': '上次执行中', 'pending review': '待复核',
@@ -29,8 +38,8 @@ export const zh: Record<string, string> = {
   'Recorded state': '记录时的状态', 'Last observed state': '上次观察到的状态',
   'Current execution is unconfirmed until updates resume.': '恢复接收更新后才能确认当前执行情况。',
   'Last synchronized': '最后同步于', 'Task execution status is unconfirmed.': '任务当前执行状态待确认。',
-  'Preparing collaboration': '正在准备协作', 'Mission paused': '任务已暂停', 'Mission needs attention': '任务需要处理',
-  'Mission stopped': '任务已停止', 'Collaboration completed': '协作已完成', 'Task in progress': '任务进行中',
+  'Preparing collaboration': '正在准备协作', 'Mission needs attention': '任务需要处理',
+  'Task in progress': '任务进行中',
   'Waiting for the next observed activity.': '等待下一条实际活动记录。', 'Waiting for acceptance': '等待验收',
   'Submitted work is waiting for independent review.': '已提交的工作正在等待独立审查。', 'Preparing the final result': '正在准备最终交付',
   'Waiting for worker activity': '等待成员开始活动', 'No current worker activity has been observed.': '暂未观察到成员的当前活动。',
@@ -40,23 +49,9 @@ export const zh: Record<string, string> = {
   'Accepted tasks and their evidence are available in the details.': '已验收任务及其证据可在详情中查看。',
   'Changes to your project': '应用到项目', 'Applied': '已应用',
   'plan-repaired': '计划已修复', 'amended': '已修订', 'scope-amended': '范围已修订', 'admissions-repaired': '已准入资源已修复',
-  'Verification needs environment repair': '验证需要修复执行环境', 'verification-deferred': '验证等待环境修复',
+  'verification-deferred': '验证等待环境修复',
   'Plan preflight notes': '计划预检提示',
   'Fixed deadline': '固定截止时间', 'Fixed deadline (optional)': '固定截止时间（可选）',
-  'Project snapshot saved': '已保存项目快照', 'Collaboration started': '协作已启动', 'Task plan amended': '任务计划已修订', 'Mission scope amended': '任务范围已修订',
-  'Worker configuration repaired': '成员配置已修复', 'Saved plan repaired': '已保存的计划已修复',
-  'Task started': '子任务开始执行',
-  'Work submitted for review': '工作已提交审查', 'Work accepted': '工作已验收', 'Review requested changes': '审查要求修改',
-  'Task needs attention': '子任务需要处理', 'Dependent work needs another review': '依赖此结果的工作需要重新审查',
-  'Task handoff started': '开始交接任务', 'Task handoff completed': '任务交接已完成', 'Task execution expired': '任务执行已到期',
-  'A finding was recorded': '记录了一项发现', 'A finding was challenged': '一项发现受到质疑', 'Mission resumed': '任务已继续',
-  'Resource limit reached': '达到资源上限', 'Worker reported a failure': '成员报告执行失败', 'Worker could not start': '成员未能启动',
-  'Result applied to project': '成果已应用到项目', 'Result needs conflict resolution': '成果需要处理合并冲突',
-  'Task cancelled': '子任务已取消', 'Task cancelled at completion': '子任务在完成时被取消',
-  'Task workspace checkpointed': '已保存子任务工作区检查点', 'Task workspace checkpoint failed': '子任务工作区检查点保存失败',
-  'Worker asked to close out': '已要求成员收尾', 'Abandoned task workspace recovered': '已恢复被放弃的子任务工作区',
-  'Task close-out failed': '子任务收尾失败', 'Worker git write denied': '成员的 Git 写入被拒绝',
-  'Mission stalled': '任务已停滞', 'A finding was verified': '一项发现已核实', 'A finding was refuted': '一项发现已被推翻',
   'active': '进行中', 'paused': '已暂停', 'blocked': '受阻', 'stopped': '已停止', 'completed': '已完成', 'staged': '待启动',
   'draft': '草稿', 'launching': '启动中', 'failed': '失败', 'accepted': '已验收', 'running': '执行中', 'working': '工作中',
   'waiting': '等待中', 'idle': '空闲', 'submitted': '已提交', 'pending': '待执行', 'cancelled': '已取消', 'verified': '已验证',
@@ -89,31 +84,15 @@ export const zh: Record<string, string> = {
   'grant-loaded': '已加载授权', 'workspace-bound': '已绑定工作目录', 'workspace-revoked': '工作目录授权已撤销',
   'pause': '暂停', 'resume': '继续', 'stop': '停止', 'complete': '完成',
   'admission': '准入', 'limit': '上限', 'refused': '已拒绝', 'effort-rejected': '推理强度被拒绝',
-  'trace': '追踪', 'span': '跨度', 'verdict': '裁决',
-  'A redundant review was retired': '已退役多余的审查', 'Worker reasoning effort downgraded': '成员的推理强度已降级',
-  'Mission recovered': '任务已恢复', 'Budget warning': '预算警告',
-  'Task ready to close out': '子任务可以收尾', 'Task close-out limit reached': '子任务收尾次数已达上限',
-  'Task lease expiring': '子任务租约即将到期', 'Task recovered after quiescence': '子任务在静止后已恢复',
-  'Task ceiling reached': '子任务超出执行上限', 'Task preparation failed': '子任务准备失败',
-  'Task resumed after budget pause': '子任务在预算暂停后已恢复', 'Task resume skipped': '已跳过子任务恢复',
-  'Worker added': '成员已加入', 'Worker subscriptions updated': '成员订阅已更新',
+  'trace': '追踪', 'span': '跨度', 'verdict': '裁决', 'stale-revision-refused': '修订版本过期被拒绝',
   // R11-08: review-path, check-change and workspace-authorization labels.
-  'Submitted work has no review': '已提交的工作尚无审查', 'Independent review admitted': '已自动准入独立审查',
-  'Submitted work cannot be reviewed': '已提交的工作无法审查', 'A declared check changed': '声明的检查已变更',
-  'Worker could not resume after restart': '成员重启后未能恢复', 'Task failed to start': '子任务启动失败',
-  'Task re-routed to another member': '子任务已改派给其他成员', 'Mission coordinator set': '已设置任务协调者',
-  'Authorized workspace root loaded': '已加载授权工作目录根', 'Mission bound to an authorized workspace': '任务已绑定到授权工作目录',
-  'Mission workspace authorization revoked': '任务工作目录授权已撤销',
   // T3 integration: the arena-protocol, host-cap and isolation event tokens and
   // labels the merged branches emit (R11-01/02/07/14/15/17/19).
   'escalation': '升级', 'raised': '已发起', 'isolation': '隔离', 'temp-rendezvous': '临时目录会合',
   'provider': '提供方', 'outage': '服务中断', 'store': '存储', 'restore-requested': '已请求恢复', 'restored': '已恢复',
   'check-envelope': '检查并发区间', 'proposal-refused': '提议被拒绝', 'restart-repended': '重启后重新排队',
-  'A worker escalated to the owner': '成员已向主对话发起升级', 'Work proposal refused': '工作提议被拒绝',
-  'Provider route paused': '提供方服务中断，任务已暂停', 'Provider route recovered': '提供方服务已恢复',
-  'Task re-pended after host restart': '主机重启后子任务重新排队', 'Members shared a temp path': '成员共享了临时路径',
-  'recovery-fallback': '恢复回退', 'Task recovered from an uncaptured workspace': '子任务从未能捕获的工作区恢复',
-  'verification-cleanup-failed': '验证检出清理失败', 'Verification checkout could not be removed': '验证检出目录无法移除',
+  'recovery-fallback': '恢复回退',
+  'verification-cleanup-failed': '验证检出清理失败',
   'Project snapshot': '项目快照', 'existing changed files included': '个已有改动文件已纳入',
   'Your branch, staged changes and source files were preserved.': '创建快照时保留了你的分支、暂存状态和源文件。',
   'Collaboration result': '协作成果', 'View changes': '查看修改', 'Apply result': '应用结果',
@@ -123,7 +102,7 @@ export const zh: Record<string, string> = {
   'changed files': '个改动文件', 'No changes': '没有改动',
   'Diff display is truncated. The retained result contains the complete changes.': '差异显示已截断，保留的协作成果中包含完整修改。',
   'Agent Swarm request': '协作任务请求', 'Starting collaboration…': '正在启动协作…', 'Collaboration requested': '已请求协作',
-  'Planning collaboration…': '正在规划协作…', 'Starting workers…': '正在启动成员…', 'Collaboration could not start': '协作未能启动',
+  'Planning collaboration…': '正在规划协作…', 'Starting workers…': '正在启动成员…',
   'Choosing roles, tasks and checks automatically using this conversation’s model.': '正在沿用当前对话模型，自动安排成员、子任务和验证。',
   'Start from the conversation input:': '在对话输入框中发送：', 'Describe what you want to accomplish': '描述你想完成的任务',
   'Roles, tasks and verification are set up automatically.': '成员、任务分工和验证会自动设置。',
@@ -219,8 +198,6 @@ export const zh: Record<string, string> = {
   'No task can make further progress': '没有子任务还能继续推进',
   // L1/L2 receipt vocabulary: the answer link, the deliberate close and the
   // owner-side miss. Every path segment of the emitted types is a catalogue key.
-  'A question was answered': '问题已获答复', 'A question was closed without an answer': '问题已标记为不答复',
-  'A question to the owner is still unanswered': '主对话有一条问题尚未答复',
   'owner': '主对话', 'answered': '已答复', 'dismissed': '已标记不答复', 'reply-missing': '缺少答复',
 }
 export const en = Object.fromEntries(Object.keys(zh).map(key => [key, key]))

@@ -177,7 +177,7 @@ function formatSpan(ms: number): string {
  * logs its own runtime wrote. A frozen array, not a Set: it is a lookup
  * vocabulary, and the S5 in-memory census classifies every collection in src/.
  */
-const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.includes(type)
+const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.some(kind => kind === type)
 
 export class Scheduling {
   /**

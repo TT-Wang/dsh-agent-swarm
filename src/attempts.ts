@@ -387,9 +387,9 @@ export class Attempts {
       // The durable witness is the no-silent-state W2 row `notify` records on
       // the mission, together with the durable owner delivery itself — this
       // runtime's witness for an owner notice. A dedicated
-      // `task/operation-silent` event type would need its `EVENT_VOCABULARY`
-      // row in src/trace.ts, outside this task's write scope; that exact change
-      // is named as a hand-off in the submission.
+      // `task/operation-silent` event type would need its own registry row in
+      // src/events.ts, outside this task's write scope; that exact change is
+      // named as a hand-off in the submission.
       // R15-A1: the silent operation names its own task. Guard pair: F1 operation
       // silence x lease expiry x the board-level stall — the subject is this task's
       // identity, so a healthy sibling's notices never consume the clock of this

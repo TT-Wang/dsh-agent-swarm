@@ -15,7 +15,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SchedulingPass, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
-import type { EventKind } from './trace.ts'
+import type { EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 

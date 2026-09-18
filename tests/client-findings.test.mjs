@@ -5,7 +5,6 @@
  * side of F-12/F-13 (durable verdict naming, retained event window).
  */
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import React from 'react'
@@ -19,6 +18,7 @@ import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DraftEditor, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 import { graphLayout } from '../lib/types/client/DependencyGraph.js'
+import { EVENTS } from '../lib/events.js'
 
 const render = (component, props, chinese = false) => {
   const element = React.createElement(component, props)
@@ -26,51 +26,14 @@ const render = (component, props, chinese = false) => {
 }
 
 /**
- * The emitted event vocabulary, re-derived from `src/*.ts` exactly like
- * `tests/event-vocabulary.test.mjs`: a new emitter that is neither labeled by
- * the compact projection nor named in `OMITTED` fails the F-14/F-33 guards.
+ * The registry is the list. A kind carries either a compact-panel label or the
+ * reason the panel omits it, so the F-14/F-33 guards below iterate the rows
+ * themselves instead of re-deriving an emitted set from source text: a new kind
+ * cannot be added without making that choice, and the choice is what is checked.
  */
-const SRC = new URL('../src/', import.meta.url)
-const DYNAMIC_EVENTS = ['mission/pause', 'mission/stop', 'mission/complete', 'mission/resume', 'mission/coordinator',
-  'delivery/applied', 'delivery/conflicts']
-function emittedEventTypes() {
-  const emitted = new Set()
-  for (const file of readdirSync(SRC)) {
-    if (!file.endsWith('.ts')) continue
-    const text = readFileSync(new URL(file, SRC), 'utf8')
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*'([^']+)'/g)) emitted.add(match[1])
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*[^,?]+\?\s*'([^']+)'\s*:\s*'([^']+)'/g)) {
-      emitted.add(match[1]); emitted.add(match[2])
-    }
-  }
-  return [...new Set([...emitted, ...DYNAMIC_EVENTS])].sort()
-}
-/** Emitted types deliberately kept off the compact panel, each with its owner-facing surface. */
-const OMITTED = {
-  'member/activity': 'lease-liveness heartbeat; the activity projection already shows it',
-  'tool/recorded': 'per-tool counter; the transcript and evidence provenance own it',
-  'trace/span': 'trace payload; the trace/replay surface owns it',
-  'message/queued': 'transport; the delivery panel owns it',
-  'mission/created': 'the mission header and status show creation',
-  'plan/edited': 'draft-scoped; never in a mission snapshot',
-  'plan/staged': 'draft-scoped; never in a mission snapshot',
-  'task/proposed': 'the pending task card appears on the board',
-  'workstream/created': 'board structure, not progress',
-  'member/stopped': 'the team disclosure shows member status',
-  'member/waiting': 'the activity projection shows the parked member',
-  'admission/limit': 'owner notice; no task event',
-  'admission/refused': 'owner notice; no task event',
-  'evidence/verdict': 'normalized duplicate of evidence/verified|refuted',
-  'automatic/requested': 'planning start; automatic/completed|failed carry the outcome',
-  'member/effort-rejected': 'paired with member/failed (Worker could not start)',
-  'mission/budget-quiesced': 'follow-up to mission/budget-exhausted',
-  'mission/budget-updated': 'accounting; the metrics show the new ceilings',
-  // T3 integration: install-scoped and metrics rows the merged branches emit.
-  'store/snapshot': 'install-scoped VACUUM INTO row; never in a mission snapshot (the store audit owns it)',
-  'store/restore-requested': 'install-scoped owner tool result; the restore happens at the next host start',
-  'store/restored': 'install-scoped startup row; emitted before any mission exists',
-  'task/check-envelope': 'measured check envelope; the verification verdict and check-failure rows carry the owner-facing outcome',
-}
+const REGISTERED = Object.keys(EVENTS)
+const omitReason = kind => 'omit' in EVENTS[kind].panel ? EVENTS[kind].panel.omit : undefined
+
 /** One isolated durable event so a projection test cannot pass on another event's label. */
 function eventOnlySnapshot(type, data = {}) {
   const snapshot = uiSnapshot()
@@ -154,19 +117,22 @@ test('F-14: the compact panel surfaces every recovery/control event type and pre
   assert.match(binding, /path: \/granted/)
   assert.match(binding, /blockedTasks: t2/)
 
-  // R11-08 vocabulary guard: every emitted type is either labeled by the
-  // compact projection or explicitly omitted here. A new emitter with no
-  // classification fails this suite instead of staying silently invisible.
-  const allEmitted = emittedEventTypes()
-  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
-  for (const type of allEmitted) {
+  // R11-08 vocabulary guard, now over the registry: every registered kind is
+  // either labeled by the compact projection or carries the reason the panel
+  // omits it. A new kind with no panel decision fails to compile; a kind whose
+  // decision the projection contradicts fails here.
+  assert.ok(REGISTERED.length >= 70, `the registry must carry the runtime kinds, saw ${REGISTERED.length}`)
+  for (const type of REGISTERED) {
     const surfaced = recentProgress(eventOnlySnapshot(type), 20)
-    if (OMITTED[type]) {
+    const omitted = omitReason(type)
+    if (omitted) {
+      assert.ok(omitted.length > 8, `${type}: an omit decision must say why`)
       assert.deepEqual(surfaced, [], `${type} is declared omitted from the compact panel but produced a label`)
       continue
     }
-    assert.equal(surfaced.length, 1, `${type} is emitted but has no compact label; add one or name it in OMITTED with a reason`)
+    assert.equal(surfaced.length, 1, `${type} carries a panel label but the compact projection does not surface it`)
     const label = surfaced[0].label
+    assert.equal(label, EVENTS[type].panel.en, `${type}: the panel renders a label the registry does not declare`)
     assert.ok(zh[label], `the compact label for ${type} has no zh translation: ${label}`)
     assert.ok(render(LiveWorkOverview, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
       `the compact panel does not translate ${label} for ${type}`)
@@ -174,9 +140,12 @@ test('F-14: the compact panel surfaces every recovery/control event type and pre
   // The R11-08 families and the promoted workspace-audit types are labeled.
   for (const type of ['task/review-missing', 'task/review-admitted', 'task/review-blocked', 'task/check-changed',
     'workspace/grant-loaded', 'mission/workspace-bound', 'mission/workspace-revoked']) {
-    assert.ok(!OMITTED[type], `${type} must be labeled, not omitted`)
+    assert.equal(omitReason(type), undefined, `${type} must be labeled, not omitted`)
     assert.equal(recentProgress(eventOnlySnapshot(type), 20).length, 1, `${type} must surface on the compact panel`)
   }
+  // The one label that is not a registry kind: a historical card may still hold
+  // `attempt/started` rows, and the client decodes them.
+  assert.equal(recentProgress(eventOnlySnapshot('attempt/started'), 20)[0].label, 'Task started')
 })
 
 test('R11-08: the review-path, check-change and restart-recovery payloads are the compact detail', () => {
@@ -344,13 +313,12 @@ test('F-33: zh translates dynamic verdict, kind and event vocabulary', () => {
   const translated = render(SwarmBoard, { snapshot: vocabularySnapshot, initialView: 'activity' }, true)
   assert.doesNotMatch(translated, /task \/ rejected|mission \/ recovered|budget-warning|member \/ added|subscribed|lease-expiring|closeout-ready|closeout-exhausted|budget-resumed|budget-resume-skipped|quiescence-recovered|workstream \/ created|member \/ activity|resume-failed|automatic \/ requested|review-retired|effort-downgraded|budget-quiesced|preparation-failed/)
 
-  // Derived vocabulary guard: every path segment of every emitted type has a
-  // zh token and the Activity view renders the translation, so a new emitter
-  // with an untranslated token fails the suite instead of rendering English.
-  const allEmitted = emittedEventTypes()
-  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
-  for (const type of allEmitted) for (const token of type.split('/')) assert.ok(zh[token], `zh token ${token} missing for ${type}`)
-  for (const type of allEmitted) {
+  // Derived vocabulary guard: every path segment of every registered kind has a
+  // zh token and the Activity view renders the translation, so a new kind with
+  // an untranslated token fails the suite instead of rendering English.
+  assert.ok(REGISTERED.length >= 70, `the registry must carry the runtime kinds, saw ${REGISTERED.length}`)
+  for (const type of REGISTERED) for (const token of type.split('/')) assert.ok(zh[token], `zh token ${token} missing for ${type}`)
+  for (const type of REGISTERED) {
     const cell = (render(SwarmBoard, { snapshot: eventOnlySnapshot(type), initialView: 'activity' }, true)
       .match(/<div class="sw-event-type">([\s\S]*?)<\/div>/) ?? [])[1]
     assert.ok(cell, `the Activity view did not render ${type}`)
