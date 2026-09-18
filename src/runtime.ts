@@ -3139,6 +3139,13 @@ export class SwarmRuntime {
         if (captured === undefined) continue
         const review = tasks.filter(candidate => candidate.reviewOf === task.id && candidate.status !== 'cancelled')
           .sort((left, right) => left.createdAt - right.createdAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))[0]
+        // A blocked review is not a refutation. Only `verify()` records the commit
+        // the review actually read, and only its deferred branch leaves a
+        // `verificationRecovery` obligation behind, so a review blocked by a
+        // preparation failure, its own ceiling, a fence or an unreproducible check
+        // environment used to be published across missions as a verdict against an
+        // artifact no reviewer had judged.
+        const refuted = review?.status === 'blocked' && review.reviewedCommit !== undefined && review.verificationRecovery === undefined
         rows.push({
           missionId: mission.id, missionTitle: mission.title, missionStatus: mission.status,
           missionAcceptance: mission.acceptance,
@@ -3147,7 +3154,7 @@ export class SwarmRuntime {
           artifact: { commit: captured.commit, baseCommit: captured.baseCommit, changedPaths: captured.changedPaths },
           ...(task.kind === 'verification' ? { artifactRole: 'review-record', reviewedCommit: task.reviewedCommit } : {}),
           ...(review === undefined ? {} : { review: { taskId: review.id, status: review.status,
-            verdict: review.status === 'accepted' ? 'verified' : review.status === 'blocked' ? 'refuted' : 'pending',
+            verdict: review.status === 'accepted' ? 'verified' : refuted ? 'refuted' : 'pending',
             ...(review.output === undefined ? {} : { reason: excerpt(review.output, 400) }) } }),
         })
       }

@@ -64,7 +64,8 @@ async function fixture(t) {
     scope: ['src/', 'docs/'], acceptance: ['done'], budget: { ...BUDGET } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
-  return { directory, runtime, workers, owner, mission, stream, author, holdStop, actor: member => ({ sessionId: member.sessionId }) }
+  const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  return { directory, runtime, workers, owner, mission, stream, author, reviewer, holdStop, actor: member => ({ sessionId: member.sessionId }) }
 }
 const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title, objective: title,
   kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
@@ -202,4 +203,25 @@ test('R20-7: cancelling a ceiling-blocked task after its barrier settled leaves 
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the member can take the step that claims its next task')
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, next.id)
   assert.equal(claimed.attempt.ownerId, f.author.id)
+})
+
+test('R20-8: the cross-mission registry reports a refutation only when the review reached a verdict', async t => {
+  const f = await fixture(t)
+  const source = propose(f, 'Reviewable work', { assigneeId: f.author.id })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Review the work',
+    objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id,
+    scope: ['src/'], acceptance: ['done'], checks: [], maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.workers.callbacks.beforeStep(f.reviewer.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.reviewer.id), false, 'the review blocks at its own step ceiling')
+  await barrierSettled(f, review)
+  assert.equal(current(f, review).status, 'blocked', 'the review is blocked, and no reviewer ever judged the artifact')
+  assert.equal(current(f, review).reviewedCommit, undefined, 'because it never reached the verdict transaction')
+
+  const row = f.runtime.artifacts(f.owner).artifacts.find(item => item.taskId === source.id)
+  assert.equal(row.review.taskId, review.id)
+  assert.equal(row.review.status, 'blocked')
+  assert.equal(row.review.verdict, 'pending', 'a review blocked short of a verdict is not a refutation of the artifact')
 })
