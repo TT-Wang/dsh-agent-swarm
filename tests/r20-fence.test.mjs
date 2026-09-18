@@ -147,3 +147,38 @@ test('R20-4: replay accepts the log a failed worker start writes', async t => {
   assert.deepEqual(replayed.unresolved, [], 'the attempt the start failure dropped reached a closing event')
   assert.equal(replayed.commands.filter(command => command.kind === 'dispatch').length, 2)
 })
+
+test('R20-5: a fence in flight refuses every further step of the outgoing handle, uncharged', async t => {
+  const f = await fixture(t)
+  const releaseStop = f.holdStop()
+  const task = propose(f, 'Cancelled mid-flight', { assigneeId: f.author.id })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the claimed attempt steps normally')
+
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Withdraw the work' })
+  await until(() => f.workers.stopped.includes(f.author.id), 'the cancel barrier asked the adapter to stop the handle')
+  const charged = f.runtime.mission(f.mission.id).usedSteps
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the outgoing handle takes no further step while its stop is in flight')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and the refused step is never charged to the mission')
+  releaseStop()
+  await barrierSettled(f, task)
+})
+
+test('R20-6: fresh input does not buy a step from a handle whose ceiling barrier is in flight', async t => {
+  const f = await fixture(t)
+  const releaseStop = f.holdStop()
+  const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the first step is admitted')
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the second step blocks at the task ceiling')
+  await until(() => f.workers.stopped.includes(f.author.id), 'the ceiling barrier asked the adapter to stop the exhausted handle')
+
+  const charged = f.runtime.mission(f.mission.id).usedSteps
+  // The adapter's recovery inbox preserves rejected input across the stop, so a
+  // step bought with `hasFreshInput` is a step the fenced handle never had to
+  // spend: the member sees the same input on its next turn.
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), false, 'fresh input does not bypass the fence')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and nothing is charged for it')
+  releaseStop()
+  await barrierSettled(f, bound)
+})

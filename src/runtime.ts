@@ -3953,6 +3953,15 @@ export class SwarmRuntime {
     const mission = this.mission(member.missionId)
     if (mission.status !== 'active') throw new Error(`Mission is ${mission.status}`)
     if (mission.budgetPause) return false
+    // D1: the step brake. A fence this member still owes a stop for means its
+    // handle has already lost the attempt and is waiting to be killed, so every
+    // further step of that turn is refused before anything is charged — whatever
+    // caused the fence, which is why it sits above the ceiling check rather than
+    // beside it. `hasFreshInput` must not lift it: the adapter's recovery inbox
+    // preserves rejected input across the stop, so the member sees that input on
+    // its next turn instead of buying a mission step with it. A refusal, never a
+    // throw: the turn ends, the barrier finishes, the work is preserved.
+    if (pendingStopOwner(this.store.list('tasks', mission.id), memberId)) return false
     if (memberPhaseOf(member) === 'parked' && !hasFreshInput) return false
     // D1: a task that exhausted its own step/finding ceiling blocks itself before
     // the next step is charged, so the mission budget is never drained by it.
