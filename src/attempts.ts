@@ -201,22 +201,14 @@ export class Attempts {
           delete fresh.resumeAfterStop
           this.rt.commit(missionId, () => {
             for (const member of released) if (memberPhaseOf(member) !== 'stopped') {
-              // F2: a park is a durable state of its own, not a stale flag of the
-              // stopped attempt. `blockTaskCeiling` parks the member and then runs
-              // this same barrier under `reason: 'resource'` to stop and checkpoint
-              // the exhausted handle; the park must outlive the barrier while the
-              // task is still at its ceiling, or the member reads idle, its next
-              // steps are admitted and charged, and the dispatch hatch is lost.
-              // The park is consumed when the owner raises the ceiling: here when
-              // the raise landed while this barrier was in flight (the ceiling row
-              // is already gone), otherwise by `controlTask` once the stop has
-              // confirmed. A `handoff` barrier belongs to a DIFFERENT task and must
-              // leave a park — the member's own wait, or a ceiling-bound task that
-              // still holds one — in place.
-              const parked = memberPhaseOf(member) === 'parked'
-              member.status = 'idle'
+              // R20: the barrier no longer decides a member's phase. `parked` is
+              // the member's own `swarm_wait` intent and nothing else, so there is
+              // no host park left for this release to preserve or consume — the
+              // step brake in `beforeStep` refuses a fenced handle's steps while
+              // the barrier is in flight, which is the whole window the park used
+              // to cover. A terminal mission still ends the membership here,
+              // because that is the barrier's own decision, not a released flag.
               if (this.rt.isMissionTerminal(mission)) member.phase = 'stopped'
-              else if (state.memberId !== undefined && ((reason === 'handoff' && !parked) || (reason === 'resource' && fresh.ceiling === undefined))) member.phase = 'active'
               this.rt.store.put('members', member)
             }
             this.rt.store.put('tasks', fresh)
@@ -497,7 +489,8 @@ export class Attempts {
       open.idleSignal = { attemptId: open.attempt.id, at: Date.now() }
       this.rt.store.put('tasks', open)
     } else this.idleSignals.delete(memberId)
-    member.status = 'idle'
+    // No member status is written: it is derived from the phase and the live
+    // attempts on every read (src/projection.ts) and the store strips it.
     delete member.activity
     this.rt.commit(member.missionId, () => {
       this.rt.store.put('members', member)

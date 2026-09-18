@@ -17,8 +17,14 @@
  *     (M-b): the ceiling's own `resource` barrier still cleared that park, so
  *     the member read idle, further steps of the turn were admitted and
  *     charged, the dispatch hatch was lost, and no raise ever consumed it.
- *     4c pins that the barrier alone never unparks, 4d/4e that the park and
- *     its raise survive a host restart, settled or with the barrier in flight.
+ *     Round 20 replaced the host park with the step brake in `beforeStep`: a
+ *     member that still owes a stop takes no further step, whatever fenced it.
+ *     `parked` now means only the member's own `swarm_wait`, so 4 keeps the
+ *     assertion that a barrier never lifts that intent and its ceiling half now
+ *     pins the refusal where the exhausted handle actually lives — between the
+ *     block and the confirmed stop. 4c pins that the raise landing mid-barrier
+ *     still returns the task, 4d/4e that the block and its raise survive a host
+ *     restart, 4e additionally that the recovered fence still refuses a step.
  *  5. The parse-only check preflight existed only on the prelaunch path, so a
  *     staged plan with a shell-syntax-error check launched and burned a full
  *     execution cycle before failing at verification. Round 19: the refusal
@@ -96,6 +102,30 @@ async function barrierSettled(f, task) {
   const deadline = Date.now() + 2000
   while (Date.now() < deadline && current(f, task).resumeAfterStop !== undefined) await new Promise(resolve => setTimeout(resolve, 10))
   assert.equal(current(f, task).resumeAfterStop, undefined, 'the stop barrier settled')
+}
+/**
+ * Hold the adapter's stop so the window between a fence and its confirmed stop
+ * is observable. The returned release is also armed on a bounded timer and on
+ * test teardown, so a failed assertion inside the window reports itself instead
+ * of wedging the runner on a barrier that never completes.
+ */
+function holdStop(f, t) {
+  let release
+  const arm = () => release?.()
+  t.after(arm)
+  f.workers.stop = async memberId => {
+    f.workers.stopped.push(memberId)
+    f.workers.idle.delete(memberId)
+    await new Promise(resolve => { release = resolve; setTimeout(resolve, 5000).unref() })
+  }
+  return arm
+}
+/** Wait until the barrier has asked the adapter to stop that handle `count` times. */
+async function stopRequested(f, memberId, count) {
+  const deadline = Date.now() + 2000
+  const stops = () => f.workers.stopped.filter(id => id === memberId).length
+  while (Date.now() < deadline && stops() < count) await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(stops(), count, 'the barrier asked the adapter to stop the fenced handle')
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +265,12 @@ test('R18-3: handoff refuses a review target that could never own it', async t =
   void current
 })
 
-test('R18-4: a handoff barrier leaves a durable park in place, and the ceiling park survives its own barrier', async t => {
+test('R18-4: a stop barrier never lifts a member\'s own park, and a ceiling-fenced handle takes no charged step', async t => {
   const f = await fixture(t)
   const task = propose(f, 'Ceiling-bound work', { assigneeId: f.author.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-  // The member is parked — by its own swarm_wait, or by a ceiling-bound task.
+  // The member is parked by its own swarm_wait — since round 20 the only thing
+  // `parked` means.
   const parked = f.runtime.store.get('members', f.author.id)
   parked.phase = 'parked'
   f.runtime.store.transaction(() => f.runtime.store.put('members', parked))
@@ -252,42 +283,48 @@ test('R18-4: a handoff barrier leaves a durable park in place, and the ceiling p
   assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked',
     'a handoff barrier for another task never resurrects a parked member')
 
-  // The production path: the second step of a one-step task blocks it, parks
-  // the owner and runs the stop barrier under `reason: 'resource'`. Before the
-  // fix that barrier set the member `active` a moment after the park was
-  // committed, so the member read idle, the next step of the same turn was
-  // admitted and charged, and the parked-member dispatch hatch was lost.
+  // The production path: the second step of a one-step task blocks it and fences
+  // the owner's handle under `reason: 'resource'`. Before the round-19 fix the
+  // barrier cleared the park a moment after it was committed, so the next step of
+  // the same turn was admitted and charged. Round 20 keeps that guarantee without
+  // the park: the stop the handle still owes is what refuses its further steps,
+  // over exactly the window in which the handle is waiting to be killed.
+  const release = holdStop(f, t)
   const bound = propose(f, 'Bound work', { assigneeId: f.second.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.second), f.mission.id, bound.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.second.id), undefined, 'the first step is admitted')
   assert.equal(await f.workers.callbacks.beforeStep(f.second.id), false, 'the second step blocks at the ceiling')
   const charged = f.runtime.mission(f.mission.id).usedSteps
-  await barrierSettled(f, bound)
-  assert.ok(f.workers.stopped.includes(f.second.id), 'the barrier stopped the exhausted handle')
   const blocked = current(f, bound)
   assert.equal(blocked.status, 'blocked')
   assert.equal(blocked.ceiling?.code, 'task_ceiling_exhausted')
-  assert.equal(f.runtime.store.get('members', f.second.id).phase, 'parked', 'the resource barrier leaves the ceiling park in place')
-  assert.equal(memberStatus(f, f.second.id), 'waiting', 'the parked member is reported as waiting, not idle')
+  assert.equal(blocked.resumeAfterStop?.reason, 'resource', 'the fence records the stop the handle still owes')
+  await stopRequested(f, f.second.id, 1)
   assert.equal(await f.workers.callbacks.beforeStep(f.second.id), false, 'a further step of the same turn is refused')
-  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'the refused step is never charged to the mission')
-  f.workers.isIdle = () => false
+  assert.equal(await f.workers.callbacks.beforeStep(f.second.id, true), false, 'and fresh input buys no step either')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'the refused steps are never charged to the mission')
+  release()
+  await barrierSettled(f, bound)
+  assert.ok(f.workers.stopped.includes(f.second.id), 'the barrier stopped the exhausted handle')
+  assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted', 'the task stays blocked at its own ceiling')
+  assert.equal(f.runtime.store.get('members', f.second.id).phase, 'active', 'the host never parks the member itself')
+  assert.equal(memberStatus(f, f.second.id), 'idle')
   assert.equal(f.runtime.scheduling.startBlocker(f.runtime.store.get('members', f.second.id)), undefined,
-    'the parked-member dispatch hatch stays open while the handle is not idle')
+    'and the stopped handle is dispatchable for other work')
 })
 
-test('R18-4b: raising the ceiling consumes the park and returns the task to its member', async t => {
+test('R18-4b: raising the ceiling returns the task to its member', async t => {
   const f = await fixture(t)
   const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
   await barrierSettled(f, bound)
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked', 'precondition: the park survived the barrier')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'precondition: the block left no host park behind')
   const raised = f.runtime.controlTask(f.owner, f.mission.id, bound.id, 'amend', { maxSteps: 60 }, 'Raise the ceiling')
   assert.equal(raised.status, 'pending')
   assert.equal(raised.ceiling, undefined)
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the raise consumes the ceiling park')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'and the raise has no park to consume')
   assert.equal(memberStatus(f, f.author.id), 'idle')
   const again = await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   assert.equal(again.attempt.ownerId, f.author.id)
@@ -296,75 +333,59 @@ test('R18-4b: raising the ceiling consumes the park and returns the task to its 
   assert.equal(current(f, bound).usedSteps, 2)
 })
 
-test('R18-4c: a raise that lands while the ceiling barrier is in flight is consumed when the stop confirms', async t => {
+test('R18-4c: a raise that lands while the ceiling barrier is in flight still returns the task when the stop confirms', async t => {
   const f = await fixture(t)
-  let releaseStop
-  const holdStop = () => {
-    const held = new Promise(resolve => { releaseStop = resolve })
-    f.workers.stop = async memberId => { f.workers.stopped.push(memberId); await held }
-  }
-  const stops = () => f.workers.stopped.filter(memberId => memberId === f.author.id).length
-  const stopRequested = async count => {
-    const deadline = Date.now() + 2000
-    while (Date.now() < deadline && stops() < count) await new Promise(resolve => setTimeout(resolve, 10))
-    assert.equal(stops(), count, 'the barrier asked the adapter to stop the exhausted handle')
-    assert.equal(current(f, bound).resumeAfterStop?.reason, 'resource', 'the stop barrier is still pending')
-  }
-  holdStop()
+  let release = holdStop(f, t)
   const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
-  await stopRequested(1)
-  // The barrier alone must not unpark. Confirmed while the task is still at its
-  // ceiling, it leaves the park in place and the handle's further steps refused
-  // and uncharged; before M-b this very completion set the member `active`.
-  releaseStop()
-  await barrierSettled(f, bound)
-  assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted')
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked', 'a confirmed stop at the ceiling does not unpark the member')
-  assert.equal(memberStatus(f, f.author.id), 'waiting')
+  await stopRequested(f, f.author.id, 1)
+  assert.equal(current(f, bound).resumeAfterStop?.reason, 'resource', 'the stop barrier is still pending')
+  // The window the round-19 park existed for: the handle is fenced but not yet
+  // killed. Its further steps are refused and uncharged, now by the fence itself.
   const charged = f.runtime.mission(f.mission.id).usedSteps
-  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'a further step is still refused after the barrier')
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'a further step of the fenced handle is refused')
   assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and never charged')
+  release()
+  await barrierSettled(f, bound)
+  assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted', 'a confirmed stop leaves the task at its ceiling')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'and leaves no host park on the member')
+  assert.equal(memberStatus(f, f.author.id), 'idle')
   // Re-arm the same barrier with the stop held again, so the raise lands while
   // it is in flight.
-  holdStop()
+  release = holdStop(f, t)
   const row = current(f, bound)
   row.resumeAfterStop = { epoch: row.epoch, reason: 'resource', memberId: f.author.id, at: Date.now() }
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', row))
   f.runtime.attempts.resumeStoppedAttempt(f.mission.id, current(f, bound))
-  await stopRequested(2)
+  await stopRequested(f, f.author.id, 2)
   const raised = f.runtime.controlTask(f.owner, f.mission.id, bound.id, 'amend', { maxSteps: 60 }, 'Raise the ceiling')
   assert.equal(raised.status, 'blocked', 'the old handle still owns the write barrier')
   assert.equal(raised.ceiling, undefined)
-  // Until the stop is confirmed the old handle may still be stepping: the park
-  // keeps refusing its steps, uncharged.
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked')
+  // Until the stop is confirmed the old handle may still be stepping: the
+  // outstanding fence keeps refusing its steps, uncharged, across the raise.
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
   assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged)
-  releaseStop()
+  release()
   await barrierSettled(f, bound)
   assert.equal(current(f, bound).status, 'pending')
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the barrier that follows the raise consumes the park')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active')
   assert.equal(memberStatus(f, f.author.id), 'idle')
 })
 
-/** The ceiling park after a host restart: still refusing steps, still consumed by the raise. */
-async function assertParkRecovered(f, bound) {
+/** The ceiling block after a host restart: still blocked, still returned by the raise. */
+async function assertCeilingRecovered(f, bound) {
   const blocked = current(f, bound)
   assert.equal(blocked.status, 'blocked')
   assert.equal(blocked.ceiling?.code, 'task_ceiling_exhausted')
   assert.equal(blocked.resumeAfterStop, undefined)
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked', 'the park is durable across the restart')
-  assert.equal(memberStatus(f, f.author.id), 'waiting')
-  const charged = f.runtime.mission(f.mission.id).usedSteps
-  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the recovered park still refuses a step')
-  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and never charges it')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the restart carries no host park across')
+  assert.equal(memberStatus(f, f.author.id), 'idle')
   const raised = f.runtime.controlTask(f.owner, f.mission.id, bound.id, 'amend', { maxSteps: 60 }, 'Raise the ceiling')
   assert.equal(raised.status, 'pending')
   assert.equal(raised.ceiling, undefined)
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the raise consumes the recovered park')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active')
   assert.equal(memberStatus(f, f.author.id), 'idle')
   const again = await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   assert.equal(again.attempt.ownerId, f.author.id)
@@ -373,39 +394,53 @@ async function assertParkRecovered(f, bound) {
   assert.equal(current(f, bound).usedSteps, 2)
 }
 
-test('R18-4d: the ceiling park survives a host restart and is still consumed by the raise', async t => {
+test('R18-4d: the ceiling block survives a host restart and is still returned by the raise', async t => {
   const f = await fixture(t)
   const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
   await barrierSettled(f, bound)
-  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'parked', 'precondition: the park survived the barrier')
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'precondition: the settled barrier left no host park')
   await f.reopen()
-  await assertParkRecovered(f, bound)
+  await assertCeilingRecovered(f, bound)
 })
 
-test('R18-4e: a ceiling barrier interrupted by a host restart is re-run on reopen and still leaves the park', async t => {
+test('R18-4e: a ceiling barrier interrupted by a host restart is re-run on reopen and still refuses the handle', async t => {
   const f = await fixture(t)
-  let releaseStop
-  const held = new Promise(resolve => { releaseStop = resolve })
-  f.workers.stop = async memberId => { f.workers.stopped.push(memberId); await held }
+  const release = holdStop(f, t)
   const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
   await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
-  const deadline = Date.now() + 2000
-  while (Date.now() < deadline && !f.workers.stopped.includes(f.author.id)) await new Promise(resolve => setTimeout(resolve, 10))
+  await stopRequested(f, f.author.id, 1)
   assert.equal(current(f, bound).resumeAfterStop?.reason, 'resource', 'the stop barrier is still pending')
+  // The fresh adapter the restart creates holds its stop too, so the recovered
+  // barrier is observable in flight instead of racing the assertions below.
+  let releaseAfterRestart
+  const originalStop = StubWorkers.prototype.stop
+  StubWorkers.prototype.stop = async function reopenedStop(memberId) {
+    this.stopped.push(memberId); this.idle.delete(memberId)
+    await new Promise(resolve => { releaseAfterRestart = resolve; setTimeout(resolve, 5000).unref() })
+  }
+  t.after(() => { StubWorkers.prototype.stop = originalStop; releaseAfterRestart?.() })
   // The host goes down while the stop is pending: it confirms during shutdown,
   // so the barrier never completes and its durable marker survives.
   const disposing = f.runtime.dispose()
-  releaseStop()
+  release()
   await disposing
   await f.reopen()
+  await stopRequested(f, f.author.id, 1)
+  // The fence is durable, so the handle the restart could not kill is still
+  // refused — and still uncharged — before the recovered barrier settles.
+  const charged = f.runtime.mission(f.mission.id).usedSteps
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the recovered fence still refuses a step')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and never charges it')
+  releaseAfterRestart?.()
+  StubWorkers.prototype.stop = originalStop
   await barrierSettled(f, bound)
   assert.ok(f.workers.stopped.includes(f.author.id), 'recovery re-ran the durable barrier through the fresh adapter')
-  await assertParkRecovered(f, bound)
+  await assertCeilingRecovered(f, bound)
 })
 
 test('R18-5: both launch paths refuse a check with invalid shell syntax, before any work exists', async t => {

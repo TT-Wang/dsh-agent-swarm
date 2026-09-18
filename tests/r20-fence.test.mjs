@@ -182,3 +182,24 @@ test('R20-6: fresh input does not buy a step from a handle whose ceiling barrier
   releaseStop()
   await barrierSettled(f, bound)
 })
+
+test('R20-7: cancelling a ceiling-blocked task after its barrier settled leaves the member dispatchable', async t => {
+  const f = await fixture(t)
+  const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
+  await f.workers.callbacks.beforeStep(f.author.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the second step blocks at the task ceiling')
+  await barrierSettled(f, bound)
+  assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted')
+
+  // The barrier has settled, so it can no longer release anyone: the withdrawal
+  // is the last decision that could, and it left the member stranded.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: bound.id, reason: 'The ceiling is not worth raising' })
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the member is not left waiting on a withdrawn task')
+  assert.equal(memberStatus(f, f.author.id), 'idle')
+  assert.equal(f.runtime.scheduling.startBlocker(f.runtime.store.get('members', f.author.id)), undefined, 'and it is dispatchable again')
+  const next = propose(f, 'Follow-up work', { assigneeId: f.author.id })
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the member can take the step that claims its next task')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, next.id)
+  assert.equal(claimed.attempt.ownerId, f.author.id)
+})

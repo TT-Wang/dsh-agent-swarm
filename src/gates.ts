@@ -499,8 +499,8 @@ export class RuntimeGates {
         }
         task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.rt.config.leaseMs)
         this.rt.store.putTask(task)
-        const member = this.rt.store.get('members', task.attempt.ownerId)
-        if (member && member.status !== 'stopped') { member.status = 'working'; this.rt.store.put('members', member) }
+        // The resumed attempt is what makes its owner `working`; the status is
+        // derived from that on every read, so there is nothing to write here.
         for (const delivery of this.rt.store.list('deliveries', mission.id)) {
           if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
             delivery.deliveredAt = Date.now(); this.rt.store.put('deliveries', delivery)

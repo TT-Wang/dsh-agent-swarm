@@ -2577,7 +2577,9 @@ export class SwarmRuntime {
       if (attempt !== undefined) {
         const owner = this.store.get('members', attempt.ownerId)
         if (owner !== undefined && memberPhaseOf(owner) !== 'stopped') {
-          owner.phase = 'active'; delete owner.activity
+          // Only the activity of the retired attempt: a member's own park is its
+          // own intent and a retirement of somebody else's review never lifts it.
+          delete owner.activity
           this.store.put('members', owner); released.add(owner.id)
         }
       }
@@ -2750,7 +2752,9 @@ export class SwarmRuntime {
     const releaseMember = (memberId: string): Member | undefined => {
       const member = this.store.get('members', memberId)
       if (member === undefined || memberPhaseOf(member) === 'stopped') return undefined
-      member.phase = 'active'; delete member.activity
+      // Only the activity of the withdrawn attempt: a member parked by its own
+      // `swarm_wait` stays parked through the withdrawal of somebody's task.
+      delete member.activity
       return member
     }
     const strandedDependents: string[] = []
@@ -3793,19 +3797,12 @@ export class SwarmRuntime {
     }
     this.assertEffectiveTaskGraph(missionId, { ...next, status: 'pending' }, this.store.list('tasks', missionId).filter(row => row.id !== taskId))
     next.handoff = `${next.handoff ?? ''}\nOwner ${action}: ${reason}`.trim()
-    // The ceiling park is consumed once the ceiling is retired and the exhausted
-    // attempt's stop has confirmed. `claim` records that attempt's owner as the
-    // assignee and a ceiling-blocked task admits no other assignment before this
-    // amendment, so the pre-amend assignee is the member the block parked. While
-    // the barrier is still in flight the old handle may still be stepping, so the
-    // park stays and the barrier's own completion consumes it instead.
-    const ceilingOwner = task.ceiling !== undefined && next.ceiling === undefined && next.resumeAfterStop?.epoch !== next.epoch && task.assigneeId !== undefined
-      ? this.store.get('members', task.assigneeId) : undefined
-    const unparked = ceilingOwner !== undefined && memberPhaseOf(ceilingOwner) === 'parked' ? ceilingOwner : undefined
-    if (unparked !== undefined) { unparked.phase = 'active'; delete unparked.activity }
+    // R20: raising a ceiling no longer has a host park to consume. The exhausted
+    // handle is refused by the step brake until its stop confirms, and `parked`
+    // now means only the member's own `swarm_wait`, which an owner amendment of
+    // one task has no business clearing.
     this.commit(missionId, () => {
       this.store.put('tasks', next)
-      if (unparked !== undefined) this.store.put('members', unparked)
       this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])) })
     })
     this.attempts.resumeStoppedAttempt(missionId, next, { force: action === 'resume' })
@@ -3987,14 +3984,18 @@ export class SwarmRuntime {
     this.warnBudget(mission)
   }
   /**
-   * Durable per-task ceiling block. The task stops at its own limit, the owning
-   * member is parked and the owner is told to repair or re-plan. Callers block
-   * before charging a mission step, so the blocked task never consumes the
-   * mission budget. The park outlives the stop barrier this installs: it keeps
-   * refusing the handle's further steps uncharged and keeps the member
-   * dispatchable through the parked-member hatch, and it is consumed when the
-   * owner raises the ceiling (`controlTask`, or the barrier itself when the
-   * raise lands first) or fresh input reaches the member.
+   * Durable per-task ceiling block. The task stops at its own limit and the owner
+   * is told to repair or re-plan. Callers block before charging a mission step,
+   * so the blocked task never consumes the mission budget.
+   *
+   * R20: this used to park the owning member as well, to keep refusing the
+   * exhausted handle's steps until the stop barrier below had killed it. The
+   * step brake in `beforeStep` refuses them from the stop marker this installs,
+   * which is the same window and covers every other fence cause too, so the park
+   * is gone: it was a second meaning for `parked` that only this path wrote, and
+   * a cancel landing after the barrier settled could no longer clear it, leaving
+   * the member waiting forever on work the owner had withdrawn. The member's own
+   * row is written only to drop the activity of the attempt just fenced.
    */
   private blockTaskCeiling(mission: Mission, task: Task, ceiling: TaskCeiling): void {
     const ownerId = task.attempt?.ownerId
@@ -4005,7 +4006,7 @@ export class SwarmRuntime {
     this.dropAttempt(task); delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
     if (ownerId !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: ownerId, reason: 'resource', at: Date.now() }
     task.output = `${task.output ?? ''}\n${ceiling.reason}`.trim()
-    if (member !== undefined && memberPhaseOf(member) !== 'stopped') { member.phase = 'parked'; delete member.activity }
+    if (member !== undefined && memberPhaseOf(member) !== 'stopped') delete member.activity
     this.commit(mission.id, () => {
       this.store.put('tasks', task)
       if (member !== undefined) this.store.put('members', member)
