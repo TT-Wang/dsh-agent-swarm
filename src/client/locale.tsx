@@ -121,7 +121,7 @@ export const zh: Record<string, string> = {
   'Reasoning': '推理强度', 'Use owner model': '沿用主对话模型', 'Provider default': '提供商默认值',
   'Reload models': '重新加载模型', 'Remove': '删除', 'Workstreams': '工作流', 'Add workstream': '添加工作流',
   'Tasks': '子任务', 'Add task': '添加子任务', 'Kind': '类型', 'Assignee': '负责人', 'Unassigned': '未分配',
-  'Prerequisites': '前置任务', 'Review source': '审查来源', 'None': '无', 'Checks': '验证命令',
+  'Prerequisites': '前置任务', 'Review source': '审查来源', 'None': '无', 'Checks': '验证命令', 'Outputs': '产出文件',
   'Launch starts workers after the complete saved plan is validated.': '启动前将验证完整的已保存计划，然后启动工作智能体。',
   'Work board': '任务看板', 'Evidence': '证据', 'Activity': '活动', 'Dependency graph': '依赖关系图',
   'All workstreams': '全部工作流', 'Ready': '可执行', 'In progress': '进行中', 'Awaiting acceptance': '待验收',
