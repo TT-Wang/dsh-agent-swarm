@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
-import { pendingStopOwner } from './attempts.ts'
+import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
@@ -647,7 +647,7 @@ export class Scheduling {
    * old worker handle acknowledges the stop, then it re-pends. Every scheduler
    * and completion decision treats it as live work.
    */
-  quiescencePending(task: Task): boolean { return task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch }
+  quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
 
   /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
   selectDeliveryTarget(_missionId: string, tasks: Task[]): Task {
@@ -991,7 +991,7 @@ export class Scheduling {
     // past its declared bound (or carries no recorded start), the escalation
     // states that row-supported fact — the pass's release is exactly what makes
     // the stop unbounded.
-    const stopFacts = unreached.filter(task => task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch)
+    const stopFacts = unreached.filter(task => task.status === 'blocked' && stopPending(task))
       .map(task => {
         const stop = task.resumeAfterStop
         return stop?.at === undefined

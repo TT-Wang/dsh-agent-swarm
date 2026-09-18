@@ -87,6 +87,7 @@ const meaningfulEvents: Record<string, string> = {
   'task/closeout-ready': 'Task ready to close out', 'task/closeout-exhausted': 'Task close-out limit reached',
   'task/lease-expiring': 'Task lease expiring', 'task/quiescence-recovered': 'Task recovered after quiescence',
   'task/ceiling-exhausted': 'Task ceiling reached',
+  'attempt/fenced': 'Task work was stopped',
   'task/preparation-failed': 'Task preparation failed',
   'task/budget-resumed': 'Task resumed after budget pause', 'task/budget-resume-skipped': 'Task resume skipped',
   'member/added': 'Worker added', 'member/subscribed': 'Worker subscriptions updated',

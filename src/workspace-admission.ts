@@ -9,6 +9,7 @@
  */
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { stopPending } from './attempts.ts'
 import { isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -458,11 +459,21 @@ export class WorkspaceAdmission {
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
-        task.status = 'blocked'; task.output = reason; task.epoch++; this.rt.store.put('tasks', task)
+        // A running task here holds a live attempt and a live handle. Setting the
+        // status and bumping the epoch by hand left the attempt on the row, left
+        // its owner out of `priorOwnerIds`, installed no stop marker and never
+        // stopped the worker: the shared fence does all four. `invalidated`,
+        // because revocation is terminal for this host process and the barrier
+        // re-pends every other reason.
+        this.rt.attempts.fenceForStop(task, { status: 'blocked', reason: 'invalidated', cause: 'workspace-revoked' })
+        task.output = reason; this.rt.store.put('tasks', task)
         this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
       }
       this.rt.store.event(missionId, 'mission/workspace-revoked', 'runtime', { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot, reason, blockedTasks: blocked.map(task => task.id) })
     })
+    // The marker is an obligation, not a record: without this poke the fenced
+    // handle keeps running against a workspace the human withdrew.
+    for (const task of blocked) if (stopPending(task)) this.rt.attempts.resumeStoppedAttempt(missionId, task)
     // S4b: every caller of `fenceWorkspace` (the dispatch catch, the authorization
     // re-checks in src/runtime.ts) now reaches the shared coded workspace
     // terminal, not only the dispatch path. The emission is deduplicated per

@@ -27,11 +27,26 @@ import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './t
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
+/** Why a fenced task still owes a stop, as the durable marker records it. */
+export type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
+
+/**
+ * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
+ * A marker at an older epoch belongs to a fence a later epoch already replaced,
+ * so it obliges nothing. This one comparison was written out at roughly twenty
+ * call sites across the runtime, the attempt accounting, the scheduling pass and
+ * the notices; naming it is what lets a reader see that they all ask the same
+ * question rather than four similar ones.
+ */
+export function stopPending(task: Pick<Task, 'epoch' | 'resumeAfterStop'>): boolean {
+  return task.resumeAfterStop?.epoch === task.epoch
+}
+
 /** A fenced handle must finish stopping before that member can own new work. */
 export function pendingStopOwner(tasks: readonly Task[], memberId: string): boolean {
   return tasks.some(task => {
-    const marker = task.resumeAfterStop
-    if (marker?.epoch !== task.epoch) return false
+    if (!stopPending(task)) return false
+    const marker = task.resumeAfterStop!
     if (marker.memberId !== undefined) return marker.memberId === memberId
     // An unresolved legacy owner is a conservative stop of every mission
     // handle; reserve every member until the complete scan confirms quiescence.
@@ -212,7 +227,7 @@ export class Attempts {
           if (recoveryExhausted && mission.status === 'active' && fresh.status !== 'cancelled') emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: fresh.id, memberId: state.memberId, detail: `${reason === 'lease-expired' ? 'lease expiry exhausted' : 'idle close-out reached'} the recovery limit (${fresh.recoveryCount ?? 0}/${fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember}) and left the task blocked` })
         })
         if (this.stopRetries.get(task.id) === state) this.stopRetries.delete(task.id)
-        if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && peer.resumeAfterStop?.epoch === peer.epoch) this.resumeStoppedAttempt(missionId, peer)
+        if (state.memberId === undefined) for (const peer of this.rt.store.list('tasks', missionId)) if (peer.id !== task.id && stopPending(peer)) this.resumeStoppedAttempt(missionId, peer)
         if (this.rt.mission(missionId).status === 'active') this.rt.kick(missionId)
       } catch (error) {
         state.retries++
@@ -278,19 +293,49 @@ export class Attempts {
     if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]
     delete task.attempt
   }
-  /** Cancel synchronously while retaining any outstanding stop/checkpoint obligation. */
-  cancelForStop(task: Task): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
+  /**
+   * The one write that fences a running attempt, whatever decided to stop it.
+   *
+   * Stopping work in flight is five things that only mean anything together:
+   * the epoch bump that invalidates the outstanding lease, the `dropAttempt`
+   * that records the outgoing owner in `priorOwnerIds` (the basis of reviewer
+   * independence), the attempt-scoped markers that describe an attempt which no
+   * longer exists, the stop marker a live handle still owes, and one durable
+   * closer event. Each control path used to assemble them by hand and they
+   * disagreed: `fenceWorkspace` blocked a running task while leaving its attempt
+   * and its handle alive, and mission pause/stop and challenge closed attempts
+   * with no closer event at all, so the replay decoder refused logs this runtime
+   * had just written.
+   *
+   * The caller keeps what is its own: its authorization check, its domain event,
+   * its member updates and its asynchronous `resumeStoppedAttempt` poke.
+   *
+   * A marker already at the task's epoch means an earlier fence is still in
+   * flight. That barrier keeps its epoch and its owner instead of being
+   * abandoned and re-run, and it keeps its reason too — a `handoff` must not
+   * downgrade a `resource` stop — except that `invalidated` replaces it, because
+   * the barrier re-pends every other reason and invalidated work must stay
+   * blocked.
+   *
+   * Call inside a mission transaction: the closer event and the caller's task
+   * write are one durable transition.
+   */
+  fenceForStop(task: Task, options: { status: Task['status']; reason?: StopReason; cause: string }): { previousStatus: Task['status']; attempt: Task['attempt']; stopOwner: string | undefined } {
     const previousStatus = task.status
     const attempt = task.attempt
-    const priorStop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
+    const priorStop = stopPending(task) ? task.resumeAfterStop : undefined
+    const reason = options.reason ?? 'handoff'
     // Submitted work may retain an author who now owns another task. Only an
     // active attempt or an existing stop marker can identify a handle to stop.
     const stopOwner = priorStop?.memberId ?? (previousStatus === 'running' ? attempt?.ownerId : undefined)
-    task.status = 'cancelled'
+    task.status = options.status
     if (priorStop === undefined) task.epoch++
     this.dropAttempt(task)
-    delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
-    if (stopOwner !== undefined && priorStop === undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: stopOwner, reason: 'handoff', at: Date.now() }
+    delete task.budgetResume; delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied; delete task.leaseWarned
+    if (priorStop === undefined) {
+      if (stopOwner !== undefined) task.resumeAfterStop = { epoch: task.epoch, memberId: stopOwner, reason, at: Date.now() }
+    } else if (reason === 'invalidated' && priorStop.reason !== 'invalidated') task.resumeAfterStop = { ...priorStop, reason }
+    this.rt.store.event(task.missionId, 'attempt/fenced', 'runtime', { taskId: task.id, attemptId: attempt?.id ?? null, cause: options.cause })
     return { previousStatus, attempt, stopOwner }
   }
   /**
@@ -546,7 +591,7 @@ export class Attempts {
         for (const listed of this.rt.store.list('tasks', missionId)) {
           if (this.rt.shuttingDown) return false
           let task = this.rt.store.get('tasks', listed.id)
-          if (task !== undefined && task.resumeAfterStop?.epoch === task.epoch) {
+          if (task !== undefined && stopPending(task)) {
             this.resumeStoppedAttempt(missionId, task)
             continue
           }
