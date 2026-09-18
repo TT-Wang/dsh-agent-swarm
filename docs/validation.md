@@ -9,6 +9,58 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-20 simplifications (2026-09-18)
+
+A whole-repository review looked for problems solved by inference and patch accretion where a
+declaration, a type or a single writer would do. It proposed 83 candidates; the 22 with the largest
+impact were each challenged by a reviewer instructed to defend the existing design. Six were
+confirmed outright, sixteen survived in a narrower form and none was judged necessary as built. The
+first three accepted results land here; each also closes defects the review reproduced on the
+pre-change head.
+
+- **One writer for a fenced attempt** (`tests/r20-fence.test.mjs`). Stopping a running attempt has to
+  bump the epoch, drop the attempt so the outgoing owner is recorded in `priorOwnerIds`, clear the
+  attempt-scoped markers, install the stop obligation and emit a closer. Fourteen sites did this by
+  hand and disagreed. `Attempts.fenceForStop` is now the only code that does it, and the control
+  paths route through it. Two reproduced consequences are closed: a revoked workspace left the
+  attempt on the row with no owner recorded and no handle stopped, and a mission pause wrote a log
+  its own replay decoder rejected as truncated. The uniform closer is the new durable event
+  `attempt/fenced`.
+- **One meaning for a parked member** (same file). `MemberPhase` 'parked' meant both the member's own
+  `swarm_wait` and a host park installed when a task hit its ceiling. A step brake in `beforeStep`
+  now refuses every further step of a handle that still owes a stop, whatever fenced it, before the
+  step is charged and without fresh input lifting it. The host park is gone, so 'parked' is written
+  only by `wait()`. This closes two reproduced defects: fresh input during a ceiling barrier bought
+  a charged step and erased the park, and cancelling a ceiling-blocked task after its barrier had
+  settled left the member waiting forever.
+- **The event kind is a type** (`src/events.ts`). `SwarmStore.event` took any string, so a new kind
+  had to be registered in five places and the convention was policed by a runtime vocabulary, two
+  source-text scanners and a hundred-row reader census. One registry row per kind now carries the
+  description and the panel decision, `EventKind` is its key set, and an unregistered kind is a
+  compile error. Decoding stays open: a row written by an older version still decodes and reports as
+  undescribed. The scanners and the census rows the type now guarantees are deleted; the converse
+  check, that every registered kind without `historical: true` has a writer, is kept.
+- **A task declares the files it must produce** (`tests/r20-declared-outputs.test.mjs`). Tasks carried
+  objective, scope, acceptance and checks but nothing naming their outputs, so five consumers
+  inferred that list from the objective prose with a write-verb regex that every round since round 4
+  has patched. `outputs` is now a declared field, required-present in `swarm_launch` and
+  `swarm_propose` and amendable through `swarm_control`, validated by one exact rule: a literal
+  relative file path inside the task's own scope, with no directory, glob, `..` segment, `.git`
+  component or dependency directory, refused with `[output_outside_scope]`. This change is additive:
+  workspace recovery and artifact capture read the declared field and fall back to the heuristic only
+  for a row that does not carry it, so a declaring task's deliverable list is exact while legacy rows
+  behave exactly as before. Plan validation also stopped spawning `git check-ignore` for advisories
+  it computed and discarded.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: **1,295 tests, 1,295 passing, 0 skipped, 0 failing** on the integrated head (`e84383b`, harness 0.1.6-alpha.2 linked), against 1,285 on the pre-change head.
+- `npm run test:bundle` 7/7; `npm run test:replay` (the D6 replay gate, including its eight fault
+  injections) and `npm run test:harness`, `npm run test:pack` and `npm run test:profile` against the
+  real 0.1.6-alpha.2 Loader all passed, with no model-visible snapshot drift.
+- Not part of this gate: `npm run test:web` fails on the team-roster assertion in
+  `scripts/smoke-web.mjs`. Verified identical on the unchanged pre-change head, so it predates this
+  work; it is recorded in [known-limitations.md](known-limitations.md) rather than fixed here.
+
 ## Round-19 workflow audit and fixes (2026-09-18)
 
 A third audit (round-19: three read-only branches, each independently re-verified, then every
