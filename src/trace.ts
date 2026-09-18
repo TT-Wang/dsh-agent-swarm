@@ -29,6 +29,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
+import { EVENT_VOCABULARY, type EventKind } from './events.ts'
 import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
 import { PolicyError } from './policy-error.ts'
 
@@ -854,131 +855,11 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
 }
 
 /**
- * Event vocabulary the read path recognizes. Every type the round-2 review found
- * unsurfaced (F-14) is named here, together with the verdict and retired-review
- * events (F-12) and the trace rows themselves.
+ * The read path's view of the registry in `src/events.ts`. The rows live there
+ * because that module imports nothing and both tsconfigs compile it, so the
+ * client renders the same registry the host writes.
  */
-export const EVENT_VOCABULARY: Record<string, string> = {
-  'task/verification-deferred': 'Check infrastructure needs repair; exact submitted source and verification evidence preserved',
-  'task/amended': 'Owner revised task execution policy while retaining task identity and acceptance',
-  'mission/scope-amended': 'Owner revised execution scope within the human workspace authorization',
-  'task/plan-repaired': 'Unused staged task policy repaired with its previous revision preserved',
-  'member/plan-repaired': 'Staged member configuration repaired after stop acknowledgement',
-  'plan/admissions-repaired': 'Saved plan reconciled with retained mission and resource identities',
-  'mission/created': 'Mission admitted with its initial scope and budget',
-  'mission/recovered': 'Host restarted and recovered the mission from durable state',
-  'mission/budget-updated': 'Owner changed the resource ceilings without resetting usage',
-  'mission/stalled': 'No schedulable work remains and every live worker is idle',
-  'automatic/completed': 'Runtime completed an automatic mission after independent acceptance',
-  'workspace/snapshot': 'Member workspace baseline snapshot recorded',
-  'member/added': 'Worker admitted with its isolated worktree',
-  'member/failed': 'Worker could not be created',
-  'member/resume-failed': 'Worker could not resume after restart',
-  'member/stopped': 'Worker handle stopped',
-  'member/activity': 'Worker activity heartbeat for lease liveness',
-  'workstream/created': 'Workstream admitted',
-  'task/proposed': 'Task admitted under a workstream',
-  'task/claimed': 'Attempt dispatched: ownership, attempt id and lease recorded',
-  'task/submitted': 'Artifact captured and submitted for independent review',
-  'task/accepted': 'Independent verification accepted the source artifact',
-  'task/rejected': 'Independent verification rejected the source artifact',
-  'task/blocked': 'Task blocked with the reason that must be repaired',
-  'task/cancelled': 'Owner withdrew admitted work; dependents named as stranded',
-  'task/cancelled-at-completion': 'Unschedulable leftover cancelled at mission completion',
-  'task/lease-expired': 'Attempt lease expired and the owner was released',
-  'task/ceiling-exhausted': 'Task exhausted its step allocation and preserved work for owner-directed continuation',
-  'task/checkpointed': 'Workspace checkpoint captured before reassignment',
-  'task/checkpoint-failed': 'Checkpoint capture failed; workspace preserved, recovery refuses a dirty tree',
-  'task/closeout-nudged': 'Idle worker nudged to finish its open attempt',
-  'task/closeout-abandoned': 'Idle close-out exhausted: checkpoint captured and the task re-pended',
-  'task/closeout-failed': 'Idle close-out could not capture a checkpoint',
-  'task/handoff-started': 'Ownership revoked; reassignment waits for the previous worker to stop',
-  'task/handoff-ready': 'Previous worker stopped and the handed-off task is schedulable again',
-  'task/review-retired': 'Sibling review retired because its source can never reach a verdict',
-  'task/invalidated': 'Dependent work invalidated by a challenged prerequisite',
-  'task/git-write-denied': 'Sandbox refused a worker git write; the supported exit is named',
-  'task/budget-resume-skipped': 'Budget-resume marker was stale and skipped',
-  // S5c: emitted by `SwarmStore.putTask` through the exported constant
-  // `STALE_TASK_REFUSAL_EVENT` (src/store.ts). The vocabulary check resolves
-  // shared constants now, so this row is required, not optional.
-  'task/stale-revision-refused': 'A task write presented a revision another accepted write had moved past; the durable revision was named and the write refused',
-  'task/quiescence-recovered': 'Parked task recovered after host restart',
-  'attempt/fenced': 'A control decision fenced a running attempt: epoch bumped, outgoing owner recorded, stop obligation installed',
-  'evidence/published': 'Unverified claim published with host-recorded run ids',
-  'evidence/challenged': 'Claim challenged with counterevidence',
-  'evidence/verified': 'Verdict verified the claim and names the retired reviews',
-  'evidence/refuted': 'Verdict refuted the claim and names the retired reviews',
-  'evidence/verdict': 'Normalized verdict row: evidence id, verdict and retired reviews',
-  'trace/span': 'One orchestration step span with digests of its input and output',
-  'message/queued': 'Directed message or topic broadcast queued durably',
-  'message/answered': 'The addressed recipient bound an answer to a question delivery id (L1 receipt)',
-  'message/dismissed': 'The addressed recipient closed a question delivery without an answer, recording the reason (L1 receipt)',
-  'owner/reply-missing': 'An owner turn ended with a delivered question still unanswered: the receipt was not bound by any tool call in that turn (L2)',
-  // Every remaining type the runtime emits (F-14). The read path must name them
-  // so an operator can reconstruct a decision instead of seeing an unknown row.
-  'automatic/requested': 'Automatic planning request admitted with its goal and workspace',
-  'automatic/failed': 'Automatic planning or launch failed with the recorded reason',
-  'member/failure': 'Worker operation failed with the recorded error',
-  'member/subscribed': 'Worker topic subscriptions replaced',
-  'member/waiting': 'Worker parked itself until fresh peer input arrives',
-  'mission/budget-exhausted': 'Aggregate budget exhausted; mission paused pending quiescence and a raise',
-  'mission/budget-quiesced': 'Every worker stopped after budget exhaustion; attempts preserved for resume',
-  'mission/budget-warning': 'Approaching-limit threshold crossed for one budget dimension',
-  'plan/edited': 'Saved draft plan edited with a new revision',
-  'plan/launched': 'Saved draft plan activated as an active mission',
-  'plan/staged': 'Draft plan staged without creating workers or worktrees',
-  'task/budget-resumed': 'Preserved attempt resumed after the budget raise',
-  'task/lease-expiring': 'Attempt lease is approaching expiry with no live operation',
-  'tool/recorded': 'Host tool run recorded for evidence and audit',
-  // Round 9-C: the remaining types the runtime emits, including the four added
-  // by the liveness/review/check fixes. `eventVocabularyReport` must never
-  // report an emitted type as unrecognized; tests/event-vocabulary.test.mjs
-  // re-derives this set from src/ and fails if a new emitter is unregistered.
-  'admission/limit': 'Owner set an admission limit rule; recorded with its level, key and limit',
-  'admission/refused': 'Admission refused a task or member against a limit; recorded once per refusal row',
-  'member/effort-downgraded': 'Provider rejected the requested reasoning effort; the member runs without it',
-  'member/effort-rejected': 'Provider rejected the effort retry; admission failed and the member was stopped',
-  'task/check-changed': 'A replaced or re-submitted task declared a different check than the stored record',
-  'task/closeout-ready': 'Idle close-out re-pended the task after a checkpoint instead of abandoning it',
-  'task/closeout-exhausted': 'Idle close-out reached the recovery limit and left the task blocked',
-  'task/preparation-failed': 'Task preparation failed; the reason and recovery credit were recorded',
-  'task/reassigned': 'A failed attempt was re-routed to another live member',
-  'task/review-admitted': 'The runtime admitted an independent verification for a submitted task with no review',
-  'task/review-blocked': 'A submitted task has no review and no eligible reviewer; the reason is recorded',
-  'task/review-missing': 'A submitted task was detected without a review on the scheduler tick',
-  'task/start-failed': 'Worker start failed; the attempt was recovered or re-routed with the reason',
-  'mission/pause': 'Owner paused the mission',
-  'mission/stop': 'Owner stopped the mission',
-  'mission/complete': 'Owner completed the mission',
-  'mission/resume': 'Owner resumed the mission',
-  'mission/coordinator': 'Owner set the mission coordinator',
-  'delivery/applied': 'Owner applied an accepted result to the source checkout',
-  'delivery/conflicts': 'Owner applied a result that conflicted; no source write was kept',
-  // User-authorized per-mission workspace: the human authorization surface and
-  // its durable binding/revocation audit.
-  'workspace/grant-loaded': 'One human-configured authorizedWorkspaces root loaded at plugin start, or named as unresolvable',
-  'mission/workspace-bound': 'Mission bound to its resolved workspace and the matched authorized root',
-  'mission/workspace-revoked': 'Mission fenced: its workspace is no longer inside a human-authorized root',
-  // Round 11 arena protocols: the typed owner escalation and the bounded
-  // per-member proposal allowance refusal (both recorded before the owner
-  // notice that carries the decision).
-  'escalation/raised': 'A member raised a typed durable owner escalation with its mission-state fingerprint',
-  'task/proposal-refused': 'A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified',
-  // Round 11 host caps: provider-outage routing, store snapshot, per-task
-  // restart and the measured check envelope (D2/D6/D8).
-  'provider/outage': 'Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent',
-  'provider/recovered': 'A quiescent provider route answered successfully again; the outage marker is cleared',
-  'task/restart-repended': 'Host restart re-pended a running task without spending recovery credit; the task and epoch are named',
-  'task/recovery-fallback': 'Cross-owner recovery could not capture the previous owner\'s workspace; names the commit the replacement started from and whether the uncaptured work was preserved into it',
-  'task/verification-cleanup-failed': 'A disposable verification checkout could not be removed after its declared checks ran; names the checkout and the removal failure, the verdict is unaffected',
-  'task/check-envelope': 'Measured declared-check envelope after a verification: limit, active, queued, wait and run times',
-  'store/snapshot': 'Periodic VACUUM INTO snapshot written beside the owner state file',
-  'store/restore-requested': 'Owner staged one validated snapshot restore for the next host start',
-  'store/restored': 'Plugin composition applied a staged snapshot restore before opening the store',
-  // R11-15: the shared temp roots are a cross-member channel; this row records
-  // two members naming the same temp path inside the rendezvous window.
-  'isolation/temp-rendezvous': 'Two members named the same shared temp path inside the rendezvous window; the path and both members are recorded',
-}
+export { EVENT_VOCABULARY, type EventKind }
 export interface EventVocabularyReport {
   recognized: string[]
   unrecognized: string[]
@@ -1112,7 +993,7 @@ const required = (data: Record<string, unknown>, key: string, seq: number): stri
 }
 /** Events that close a dispatched attempt; anything else leaves the attempt unresolved. */
 /** The one declared set (`src/types.ts`): every event that fences a running attempt. */
-const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)
+const ATTEMPT_CLOSERS: ReadonlySet<string> = new Set(ATTEMPT_FENCING_EVENTS)
 export interface ReplayResult {
   commands: ReplayCommand[]
   keys: string[]

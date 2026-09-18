@@ -250,9 +250,9 @@ test('S5c: the durable stale-revision refusal type is registered and recognized 
   const log = f.store.events(f.mission.id, 500)
   const recorded = log.filter(event => event.type === STALE_TASK_REFUSAL_EVENT)
   assert.equal(recorded.length, 1, 'the refusal is in the real mission log')
-  // The type is emitted through an exported constant, which the vocabulary
-  // scanner now resolves (tests/event-vocabulary.test.mjs); this test pins the
-  // end-to-end consequence on a real mission log.
+  // The type is emitted through an exported constant, which `EventKind` checks
+  // exactly like a literal; this test pins the end-to-end consequence on a real
+  // mission log.
   assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string', 'the vocabulary names the emitted type')
   const report = eventVocabularyReport(log)
   assert.deepEqual(report.unrecognized, [], 'no event in the real mission log is unrecognized')

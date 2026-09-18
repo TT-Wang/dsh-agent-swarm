@@ -245,7 +245,7 @@ const CENSUS = [
   ["src/trace.ts",6,"Set","const known = new Set(spans.map(span => span?.spanId))","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",7,"Map","const counts = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",8,"Map","const tasks = new Map<string, string>(), members = new Map<string, string>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS: ReadonlySet<string> = new Set(ATTEMPT_FENCING_EVENTS)","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/trace.ts",10,"Map","const open = new Map<string, { taskId: string; memberId: string }>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   // R17-G12: the roster lookup inside `nextWorkerName`. It is rebuilt from the
   // mission's durable member rows at every admission and discarded with the
@@ -815,9 +815,8 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   // `STALE_TASK_REFUSAL_EVENT`. S5r pinned the resulting gap (the static emitter
   // scan could not see it, and `eventVocabularyReport` reported the durable row
   // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
-  // point: `src/trace.ts` registers the row and the scanner in
-  // tests/event-vocabulary.test.mjs resolves exported constants, so the type is
-  // enforced exactly like a literal emission.
+  // point: the registry names the row, and because `store.event` takes
+  // `EventKind`, a constant emission is checked exactly like a literal one.
   const { EVENT_VOCABULARY } = await import('../lib/trace.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')

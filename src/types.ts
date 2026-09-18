@@ -1,4 +1,5 @@
 /** Durable swarm records and the execution adapter shared by runtime and Harness. */
+import type { EventKind } from './events.ts'
 export type MissionStatus = 'staged' | 'active' | 'paused' | 'blocked' | 'completed' | 'stopped'
 export type TaskKind = 'research' | 'implementation' | 'verification' | 'integration'
 export type TaskStatus = 'pending' | 'running' | 'submitted' | 'accepted' | 'blocked' | 'cancelled'
@@ -695,7 +696,7 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
   'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
 ]
 
-export const ATTEMPT_FENCING_EVENTS: readonly string[] = [
+export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every control path now writes through
   // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
   // with only their own domain event, so a log this runtime wrote was refused as

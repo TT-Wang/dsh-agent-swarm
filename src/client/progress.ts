@@ -1,3 +1,4 @@
+import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
@@ -60,62 +61,22 @@ export function activityDuration(startedAt: number, now: number): { minutes: num
 }
 
 export interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
+/**
+ * Compatibility label: no writer in this repository's history emits
+ * `attempt/started` (the live kind is `task/claimed`), but a historical card may
+ * still hold rows with it, so the decoder outlives the writer that stopped
+ * emitting. It is the one label that is not a registry kind.
+ */
+const LEGACY_EVENT_LABELS = { 'attempt/started': 'Task started' } as const satisfies Record<string, string>
+/**
+ * The compact panel's labels, derived from the one registry: a kind carries its
+ * label beside its description, or it carries the reason the panel omits it.
+ * There is no second list to keep in step, so a new kind cannot be invisible
+ * here by accident.
+ */
 const meaningfulEvents: Record<string, string> = {
-  'task/verification-deferred': 'Verification needs environment repair',
-  'task/amended': 'Task plan amended', 'mission/scope-amended': 'Mission scope amended',
-  'task/plan-repaired': 'Task plan amended', 'member/plan-repaired': 'Worker configuration repaired',
-  'plan/admissions-repaired': 'Saved plan repaired',
-  'workspace/snapshot': 'Project snapshot saved', 'plan/launched': 'Collaboration started',
-  // Compatibility label: no writer in this repository's history emits
-  // `attempt/started` (the live kind is `task/claimed`), but a historical card
-  // may still hold rows with it — see tests/reader-census.test.mjs, decision
-  // `keep (compatibility)`.
-  'task/claimed': 'Task started', 'attempt/started': 'Task started', 'task/submitted': 'Work submitted for review',
-  'task/accepted': 'Work accepted', 'task/rejected': 'Review requested changes', 'task/blocked': 'Task needs attention',
-  'task/invalidated': 'Dependent work needs another review', 'task/handoff-started': 'Task handoff started',
-  'task/handoff-ready': 'Task handoff completed', 'task/lease-expired': 'Task execution expired',
-  // Round-2 recovery and owner-control events (F-14): these were emitted but invisible on the compact panel.
-  'task/cancelled': 'Task cancelled', 'task/cancelled-at-completion': 'Task cancelled at completion',
-  'task/checkpointed': 'Task workspace checkpointed', 'task/checkpoint-failed': 'Task workspace checkpoint failed',
-  'task/closeout-nudged': 'Worker asked to close out', 'task/closeout-abandoned': 'Abandoned task workspace recovered',
-  'task/closeout-failed': 'Task close-out failed', 'task/git-write-denied': 'Worker git write denied',
-  'mission/stalled': 'Mission stalled',
-  'evidence/published': 'A finding was recorded', 'evidence/challenged': 'A finding was challenged',
-  'evidence/verified': 'A finding was verified', 'evidence/refuted': 'A finding was refuted',
-  'task/review-retired': 'A redundant review was retired', 'member/effort-downgraded': 'Worker reasoning effort downgraded',
-  'mission/recovered': 'Mission recovered', 'mission/budget-warning': 'Budget warning',
-  'task/closeout-ready': 'Task ready to close out', 'task/closeout-exhausted': 'Task close-out limit reached',
-  'task/lease-expiring': 'Task lease expiring', 'task/quiescence-recovered': 'Task recovered after quiescence',
-  'task/ceiling-exhausted': 'Task ceiling reached',
-  'attempt/fenced': 'Task work was stopped',
-  'task/preparation-failed': 'Task preparation failed',
-  'task/budget-resumed': 'Task resumed after budget pause', 'task/budget-resume-skipped': 'Task resume skipped',
-  'member/added': 'Worker added', 'member/subscribed': 'Worker subscriptions updated',
-  // L1/L2 receipts: an answer bound to a question, a deliberate dismissal, and a
-  // question an owner turn left unanswered.
-  'message/answered': 'A question was answered', 'message/dismissed': 'A question was closed without an answer',
-  'owner/reply-missing': 'A question to the owner is still unanswered',
-  'mission/pause': 'Mission paused', 'mission/resume': 'Mission resumed', 'mission/stop': 'Mission stopped',
-  'mission/complete': 'Collaboration completed', 'automatic/completed': 'Collaboration completed',
-  'mission/budget-exhausted': 'Resource limit reached', 'member/failure': 'Worker reported a failure',
-  'member/failed': 'Worker could not start', 'automatic/failed': 'Collaboration could not start',
-  'delivery/applied': 'Result applied to project', 'delivery/conflicts': 'Result needs conflict resolution',
-  // R11-08: the review-path, check-change and workspace-authorization families
-  // were emitted but invisible on the compact panel.
-  'task/review-missing': 'Submitted work has no review', 'task/review-admitted': 'Independent review admitted',
-  'task/review-blocked': 'Submitted work cannot be reviewed', 'task/check-changed': 'A declared check changed',
-  // Restart/re-route recovery: a member or task that could not resume is not silent.
-  'member/resume-failed': 'Worker could not resume after restart', 'task/start-failed': 'Task failed to start',
-  'task/reassigned': 'Task re-routed to another member', 'mission/coordinator': 'Mission coordinator set',
-  // The promoted authorized-workspace feature's durable audit events.
-  'workspace/grant-loaded': 'Authorized workspace root loaded', 'mission/workspace-bound': 'Mission bound to an authorized workspace',
-  'mission/workspace-revoked': 'Mission workspace authorization revoked',
-  // T3 integration: the arena-protocol and host-cap emitters (R11-01/07/14/15/17).
-  'escalation/raised': 'A worker escalated to the owner', 'task/proposal-refused': 'Work proposal refused',
-  'provider/outage': 'Provider route paused', 'provider/recovered': 'Provider route recovered',
-  'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
-  'task/recovery-fallback': 'Task recovered from an uncaptured workspace',
-  'task/verification-cleanup-failed': 'Verification checkout could not be removed',
+  ...LEGACY_EVENT_LABELS,
+  ...Object.fromEntries(Object.entries(EVENT_PANEL_LABELS).map(([kind, panel]) => [kind, panel.en])),
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 /**
@@ -133,7 +94,7 @@ const DETAIL_EXCERPT = 400
 function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, DETAIL_EXCERPT) : undefined }
 function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
-const reasonFirst = new Set(['task/verification-deferred', 'task/amended', 'mission/scope-amended', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
+const reasonFirst: ReadonlySet<string> = new Set<EventKind>(['task/verification-deferred', 'task/amended', 'mission/scope-amended', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
   'task/review-blocked', 'mission/workspace-revoked', 'task/recovery-fallback'])
 /** A bounded preview of a changed check list; the Activity view carries the full summary. */
 function checkPreview(value: unknown): string | undefined {
@@ -312,7 +273,7 @@ export interface SidebarStateView {
 }
 
 const submissionEventTypes = new Set(['task/submitted'])
-const recoveryEventTypes = new Set(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
+const recoveryEventTypes: ReadonlySet<string> = new Set<EventKind | keyof typeof LEGACY_EVENT_LABELS>(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
 
 /** Newest persisted event for one task among `types`, or undefined. */
 function lastEventAt(snapshot: Snapshot, taskId: string, types: ReadonlySet<string>): number | undefined {
