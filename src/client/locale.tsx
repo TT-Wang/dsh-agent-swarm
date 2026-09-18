@@ -84,7 +84,7 @@ export const zh: Record<string, string> = {
   'grant-loaded': '已加载授权', 'workspace-bound': '已绑定工作目录', 'workspace-revoked': '工作目录授权已撤销',
   'pause': '暂停', 'resume': '继续', 'stop': '停止', 'complete': '完成',
   'admission': '准入', 'limit': '上限', 'refused': '已拒绝', 'effort-rejected': '推理强度被拒绝',
-  'trace': '追踪', 'span': '跨度', 'verdict': '裁决', 'stale-revision-refused': '修订版本过期被拒绝',
+  'trace': '追踪', 'span': '跨度', 'verdict': '裁决', 'stale-revision-refused': '修订版本过期被拒绝', 'fenced': '已隔离',
   // R11-08: review-path, check-change and workspace-authorization labels.
   // T3 integration: the arena-protocol, host-cap and isolation event tokens and
   // labels the merged branches emit (R11-01/02/07/14/15/17/19).
