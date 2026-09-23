@@ -1141,7 +1141,7 @@ export class HarnessWorkers implements WorkerAdapter {
       }
     }
   }
-  captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables) }
+  captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables, options) }
   inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> { return this.workspaces.inspectArtifact(member, artifact, signal) }
   /** R11-19: the owned Workspaces' measured declared-check envelope. */
   checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }

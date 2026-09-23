@@ -8,7 +8,7 @@ import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } fr
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
-import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
+import { deliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
@@ -1711,7 +1711,16 @@ export class Workspaces {
     }, signal)
   }
 
-  async captureArtifact(member: Member, task: Task, deliverables: string[] = []): Promise<Artifact> {
+  /**
+   * Commit the member worktree as an immutable artifact. The captured files are
+   * the whole-tree add of non-ignored changes plus, force-added past ignore
+   * rules, the listed `deliverables` and the task's declared `outputs` (a row
+   * without the field declares none). `requireOutputs` is the submit and verify
+   * rule: every declared output must then exist as a regular file, or the call
+   * is refused with `[output_missing]`. A checkpoint omits it and carries only
+   * the declared outputs already written.
+   */
+  async captureArtifact(member: Member, task: Task, deliverables: string[] = [], options: { requireOutputs?: boolean } = {}): Promise<Artifact> {
     return await this.operation(member.id, async signal => {
       const record = await this.memberRecord(member)
       if (record.task?.taskId !== task.id || record.task.epoch !== task.epoch) throw new Error('[workspace_baseline_missing] Task has no matching prepared workspace baseline Retry the task with `swarm_claim` and its `taskId`.')
@@ -1736,7 +1745,8 @@ export class Workspaces {
       const linkList = [...links]
       const dependencyContent = (name: string): boolean => linkList.some(link => name === link || name.startsWith(`${link}/`))
       if (!Array.isArray(deliverables) || deliverables.some(name => typeof name !== 'string')) throw new Error('[invalid_deliverables] deliverables must be an array of relative file paths')
-      const declared = [...new Set(deliverables)]
+      const listed = [...new Set(deliverables)]
+      const owed = [...new Set(task.outputs ?? [])]
       // Explicit outputs may override ignore rules, never scope, Git metadata,
       // dependency exclusions or symlink containment. Do not force-add a folder.
       // F4: a name inside a dependency directory or the scratch root is refused
@@ -1744,15 +1754,33 @@ export class Workspaces {
       // F2: each output is then carried under its on-disk spelling, which is the
       // spelling git records for it and the one `ls-tree` finds below.
       const outputs: string[] = []
-      for (const name of declared) {
-        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name) || this.toolchainName(name)) throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata, dependency and scratch directories. Correct \`deliverables\` with \`swarm_submit\`.`)
+      const missing: string[] = []
+      for (const name of [...new Set([...listed, ...owed])]) {
+        const declared = owed.includes(name)
+        // A checkpoint carries a declared output once it is written and never
+        // refuses on one still owed; only submit and verify require it.
+        const optional = declared && !listed.includes(name) && options.requireOutputs !== true
+        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name) || this.toolchainName(name)) {
+          if (optional) continue
+          throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata, dependency and scratch directories. Correct \`deliverables\` with \`swarm_submit\`.`)
+        }
         const parts = name.split('/')
-        for (let depth = 1; depth <= parts.length; depth++) {
+        let regular = true
+        for (let depth = 1; regular && depth <= parts.length; depth++) {
           const info = await lstat(path.join(member.workspace, ...parts.slice(0, depth))).catch(() => undefined)
-          if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
+          if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) regular = false
+        }
+        if (!regular) {
+          if (optional) continue
+          if (declared) { missing.push(name); continue }
+          throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
         }
         const spelled = await this.onDiskSpelling(member.workspace, name) ?? name
         if (!outputs.includes(spelled)) outputs.push(spelled)
+      }
+      if (missing.length) {
+        const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
+        throw new PolicyError('output_missing', 'validation_error', `[output_missing] The task declares ${missing.map(name => JSON.stringify(name)).join(', ')} in \`outputs\`, but ${missing.length === 1 ? 'it is not a regular file' : 'they are not regular files'} in your worktree, so this ${tool === 'swarm_verify' ? 'verification' : 'submission'} was not recorded and your attempt stays running. Write ${missing.length === 1 ? 'the file' : 'each file'} and retry \`${tool}\` with the same \`taskId\`, or, if the task no longer produces ${missing.length === 1 ? 'it' : 'them'}, escalate with \`swarm_escalate\` so the owner amends \`outputs\` with \`swarm_control\`.`)
       }
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
@@ -1787,38 +1815,12 @@ export class Workspaces {
         if (!match) throw new PolicyError('deliverable_not_captured', 'conflict_error', `${JSON.stringify(name)} is not a regular file in the captured commit; correct the file and retry \`swarm_submit\` with \`deliverables\`.`)
         files.push({ path: name, blob: match[2]!, bytes: Number(match[3]) })
       }
-      // Heuristically named paths are hints, not permission to capture ignored
-      // content. R19 H-1: the omission returned here is the submit gate's
-      // signal, so it is precise: an in-scope, ignored, undeclared name that is
-      // a regular file in this worktree. A fresh worktree holds only tracked
-      // files and dependency directories, so an ignored input such as `.env` is
-      // absent unless the member created it, while a report the member wrote
-      // is present. Directory tokens, dependency content, scratch and dependency
-      // names (F4) and out-of-scope names (already advisory at admission) are
-      // never obligations. F2: a hint is resolved to its on-disk spelling before
-      // it is compared with the declared outputs or named in the refusal, so a
-      // case-folding filesystem cannot make the text's spelling and the file's
-      // two different obligations. R19-C: a check-ignore run that did not
-      // complete is a refusal, never a silently open gate. R20: a task that
-      // declares `outputs` states this list exactly, and only a row without the
-      // field is still read out of the objective and acceptance text.
-      const hinted = (task.outputs ?? deliverablePaths(task.objective ?? '', task.acceptance ?? [])).filter(name => withinScope(name, task.scope) && !name.endsWith('/') && !dependencyContent(name) && !this.toolchainName(name))
-      const present: string[] = []
-      for (const name of hinted) {
-        const spelled = await this.onDiskSpelling(member.workspace, name)
-        if (spelled === undefined || outputs.includes(spelled) || present.includes(spelled)) continue
-        const info = await lstat(path.join(member.workspace, spelled)).catch(() => undefined)
-        if (info?.isFile()) present.push(spelled)
-      }
-      const uncapturedPaths = ignoredDeliverablePaths(member.workspace, present, reason => {
-        throw new Error('[deliverable_gate_unavailable] ' + reason + '. The ignored-deliverable gate could not run, so this submission was not recorded; retry `swarm_submit` once git answers in the member worktree.')
-      }).map(hit => hit.path)
       await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
       record.task.capturedCommit = commit
       delete record.task.preservedCommit
       await this.saveTaskWorkspace(record)
       return { commit, baseCommit, workspace: member.workspace, changedPaths,
-        ...(files.length ? { files } : {}), ...(uncapturedPaths.length ? { uncapturedPaths } : {}), ...(executablePaths.length ? { executablePaths } : {}) }
+        ...(files.length ? { files } : {}), ...(executablePaths.length ? { executablePaths } : {}) }
     })
   }
 

@@ -1096,7 +1096,12 @@ export interface WorkerAdapter {
    */
   checkSyntaxPreflight?(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
   isIdle(memberId: string): boolean
-  captureArtifact(member: Member, task: Task, deliverables?: string[]): Promise<Artifact>
+  /**
+   * Capture the member worktree plus `deliverables` and the task's declared
+   * `outputs`; with `requireOutputs` (submit and verify) a declared output that
+   * is not a regular file is refused with `[output_missing]`.
+   */
+  captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact>
   /** Preserve any owned WIP after stop without treating it as an accepted artifact. */
   checkpointTask?(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
   /** Read authoritative immutable Git facts, including fields absent from older stored records. */
