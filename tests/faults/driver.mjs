@@ -62,7 +62,7 @@ if (phase === 'f4-crash') {
   const integration = f.runtime.propose(f.owner, f.mission.id, {
     outputs: [], workstreamId: f.stream.id, title: 'Integrate both implementations', objective: 'Assemble the deliverable',
     kind: 'integration', dependencies: [first.id, second.id], scope: ['**'], acceptance: ['fault recovery is proven from durable state'],
-    checks: ['true'], assigneeId: f.author.id,
+    checks: ['test -s src/answer.txt'], assigneeId: f.author.id,
   })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, integration.id)
   assert.equal(claimed.status, 'running', 'the crashed host owns a running integration attempt')

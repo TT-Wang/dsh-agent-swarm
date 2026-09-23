@@ -1,4 +1,10 @@
-/** F14: a worker attempts a git commit in its worktree. A typed error names swarm_submit; submission still captures the workspace. */
+/**
+ * F14: a worker attempts a git commit in its worktree. A typed error names swarm_submit; submission still captures the workspace.
+ *
+ * Since 69211b9 the typed error is a durable control delivery to the worker, not
+ * a guard refusal: the denial no longer disables the worker's workspace tools
+ * (src/runtime.ts toolRun, "without disabling unrelated workspace tools").
+ */
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
@@ -6,7 +12,7 @@ import { makeRepo, Workspaces, WorkspaceWorkers, setup, events, eventually, git,
 import { subprocessSeam } from '../subprocess-seam.mjs'
 
 await runScenario({
-  id: 'F14', title: 'A denied worker git write returns a typed error and never blocks artifact publication', invariants: ['I14'],
+  id: 'F14', title: 'A denied worker git write delivers a typed error and never blocks artifact publication or workspace tools', invariants: ['I14'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f14')
     const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
@@ -32,15 +38,16 @@ await runScenario({
       assert.equal(denial.data.taskId, task.id)
       assert.equal(denial.data.attemptId, claimed.attempt.id)
       assert.match(denial.data.command, /git commit/)
-      const guard = workers.callbacks.guard(f.author.id, 'bash')
-      assert.match(guard, /swarm_submit/, 'I14: the typed error names the supported artifact path')
-      assert.match(guard, /index\.lock|EPERM|git metadata/, 'I14: the typed error names the denial')
-      assert.doesNotMatch(guard, /^fatal:/, 'I14: the raw sandbox error is not the whole message')
+      assert.equal(workers.callbacks.guard(f.author.id, 'bash'), undefined, 'I14: the denial never disables workspace tools')
       assert.equal(workers.callbacks.guard(f.author.id, 'swarm_submit'), undefined, 'I14: submission stays available')
-      const queued = f.runtime.store.list('deliveries', f.mission.id).find(item => item.kind === 'control' && item.to === f.author.id && /swarm_submit/.test(item.content))
-      assert(queued, 'the actionable notice is durably queued for the worker')
-      assert.match(queued.content, /(cannot|could not) write git metadata/)
-      const notice = await eventually(() => workers.deliveries.find(item => item.kind === 'control' && /swarm_submit/.test(item.content)), 'the notice reaches the worker')
+      const typed = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.kind === 'control' && item.to === f.author.id && /git metadata/.test(item.content))
+      assert.equal(typed.length, 1, 'the typed error is durably queued for the worker exactly once')
+      const [queued] = typed
+      assert.match(queued.content, /swarm_submit/, 'I14: the typed error names the supported artifact path')
+      assert.match(queued.content, /(cannot|could not) write git metadata/, 'I14: the typed error names the denial')
+      assert.match(queued.content, /index\.lock|EPERM/, 'I14: the typed error names the denial')
+      assert.doesNotMatch(queued.content, /^fatal:/, 'I14: the raw sandbox error is not the whole message')
+      const notice = await eventually(() => workers.deliveries.find(item => item.kind === 'control' && item.memberId === f.author.id && item.content === queued.content), 'the typed error reaches the worker')
       assert.match(notice.content, /swarm_submit/)
       // Recovery: submission never depends on a worker-side commit.
       const member = f.runtime.store.get('members', f.author.id)

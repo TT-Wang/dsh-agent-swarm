@@ -5,15 +5,20 @@
  * fails. Pre-fix the scheduler marked the member `stopped` and blocked the task
  * with zero recovery credit and no re-route, so the work was permanently
  * unschedulable. The contract asserted here is the established recovery policy:
- * exactly one recovery credit per start failure, re-pend while the limit is not
- * exhausted, and after `k` consecutive failures re-route to another capable live
- * member with a durable `task/reassigned` event.
+ * re-pend on every start failure, and after `k` consecutive failures retire the
+ * route and re-route to another capable live member with a durable
+ * `task/reassigned` event.
+ *
+ * 69211b9 changed the credit rule on purpose: route startup is infrastructure
+ * recovery, so a start failure spends no task recovery credit (it used to spend
+ * exactly one). The bound is the route's `k` consecutive failures instead
+ * (tests/start-failure-recovery.test.mjs, "preserves task credit").
  */
 import assert from 'node:assert/strict'
 import { setup, events, eventually, runScenario, taskOf } from './harness.mjs'
 
 await runScenario({
-  id: 'F18', title: 'A worker-start failure spends bounded recovery credit and re-routes after k consecutive failures', invariants: ['I18'],
+  id: 'F18', title: 'A worker-start failure preserves task recovery credit and re-routes after k consecutive failures', invariants: ['I18'],
   body: async () => {
     const f = await setup({ config: { tickMs: 20, maxTasksPerMember: 100 } })
     try {
@@ -34,7 +39,11 @@ await runScenario({
       assert.equal(reassigned.data.consecutiveFailures, 3)
       assert.match(reassigned.data.reason, /injected provider outage at worker start/)
       const current = taskOf(f.runtime, task.id)
-      assert.equal(current.recoveryCount, 3, 'I18: exactly one recovery credit per start failure')
+      assert.equal(current.recoveryCount ?? 0, 0, 'I18: a start failure spends no task recovery credit')
+      const failed = events(f.runtime, f.mission.id, 'task/start-failed').filter(event => event.data.taskId === task.id)
+      assert.deepEqual(failed.map(event => event.data.consecutiveFailures), [1, 2, 3], 'I18: the route is bounded by k consecutive failures')
+      assert.deepEqual(failed.map(event => event.data.status), ['pending', 'pending', 'pending'], 'every start failure re-pends the task')
+      assert.equal(f.runtime.store.get('members', f.author.id).phase, 'stopped', 'I18: the failing route is retired at k')
       assert.equal(current.status, 'running', 'the re-routed task is dispatched to the live member')
       assert.equal(current.attempt.ownerId, f.reviewer.id)
       assert.equal(current.assigneeId, f.reviewer.id)

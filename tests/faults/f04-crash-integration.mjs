@@ -2,8 +2,7 @@
 import assert from 'node:assert/strict'
 import { mkdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { makeRepo, runNode, runScenario } from './harness.mjs'
-import { tempDirectory } from '../temp-root.mjs'
+import { PROJECT, makeRepo, runNode, runScenario } from './harness.mjs'
 
 await runScenario({
   id: 'F4', title: 'A SIGKILL during integration recovers without a half-applied artifact and promote still needs a green gate', invariants: ['I7'],
@@ -30,11 +29,15 @@ await runScenario({
     assert.equal(state.artifact, null, 'I7: no artifact is trusted after the crash')
     assert.equal(state.appliedDelivery, null, 'I7: no delivery is recorded as applied')
     assert.equal(state.partial, before.partial, 'I7: the partial integration workspace is preserved')
-    // Promotion still requires a recorded green gate for the exact commit.
-    const lab = await tempDirectory('swarm-faults-lab-')
-    const promoted = await runNode(['scripts/round.mjs', 'promote', '--commit', 'HEAD', '--lab', lab])
-    assert.equal(promoted.code, 2, 'I7: promote refuses without a recorded gate')
-    assert.match(promoted.stderr, /no recorded green gate/, 'I7: the refusal names the missing gate')
+    // Promotion still requires a recorded green gate for the exact commit. The
+    // real round script runs from a scratch git checkout with an empty lab, so
+    // the refusal does not depend on this tree having a HEAD (from a git archive
+    // export promote exited 1 before it could refuse).
+    const promotable = await makeRepo('swarm-faults-f4-promote', { 'scripts/round.mjs': await readFile(join(PROJECT, 'scripts/round.mjs'), 'utf8') })
+    const promoted = await runNode([join(promotable.source, 'scripts/round.mjs'), 'promote', '--commit', 'HEAD', '--lab', join(promotable.root, 'lab')])
+    await rm(promotable.root, { recursive: true, force: true })
+    assert.equal(promoted.code, 2, `I7: promote refuses without a recorded gate: ${promoted.stderr.slice(0, 400)}`)
+    assert.match(promoted.stderr, new RegExp(`no recorded green gate for ${promotable.head.slice(0, 12)}`), 'I7: the refusal names the missing gate of that exact commit')
     return { crashed: before.attemptId, recoveredStatus: state.status, recoveredEvents: state.recoveredEvents, promoteExit: promoted.code }
     } finally { await rm(root, { recursive: true, force: true }) }
   },
