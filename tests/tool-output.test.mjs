@@ -367,3 +367,83 @@ test('a representative valid call of every swarm tool passes its schema check an
     assert.ok(calls.length > 0, `${name} reached the runtime (${error?.message ?? 'ok'})`)
   }
 })
+
+/*
+ * JSON null on an optional property is an omission (d81a3fb accepted these
+ * calls with null meaning "unset"); only a field that declares null in its
+ * schema keeps it, because there null means something (changes.assigneeId).
+ */
+test('a null optional property is an omission at every nesting level, and a declared-nullable field keeps its null', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const call = (tool, args, sessionId = f.owner.sessionId) => definitions.get(tool).execute(Object.freeze(args), as(sessionId))
+    // The arguments the Harness hands a tool are frozen; the stored row equals
+    // the one the same call leaves with the property omitted.
+    const proposal = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Audit', objective: 'Audit the code', kind: 'research', scope: ['**'], acceptance: f.mission.acceptance, outputs: [] }
+    const row = id => { const { id: _id, createdAt: _at, ...rest } = f.runtime.store.get('tasks', id); return rest }
+    const omitted = row((await call('swarm_propose', proposal)).result.id)
+    for (const key of ['priority', 'experiment', 'replaces', 'maxSteps', 'maxFindings', 'assigneeId', 'reviewOf', 'dependencies', 'checks', 'assignmentMode', 'checkTimeoutMs', 'maxRecoveryAttempts']) {
+      assert.deepEqual(row((await call('swarm_propose', { ...proposal, [key]: null })).result.id), omitted, `propose ${key}: null is stored as omitted`)
+    }
+    const stream = (await call('swarm_workstream', { missionId: f.mission.id, title: 'W2', objective: 'O2', coordinatorId: null })).result
+    assert.equal(Object.hasOwn(f.runtime.store.get('workstreams', stream.id), 'coordinatorId'), false)
+    await call('swarm_message', { missionId: f.mission.id, to: 'owner', kind: 'finding', content: 'noted', topic: null, dismiss: null, replyTo: null }, f.author.sessionId)
+    const sent = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.from === f.author.id)
+    assert.equal(sent.length, 1); assert.equal(Object.hasOwn(sent[0], 'topic'), false)
+    for (const extra of [{ detail: null }, { vocabulary: null }, { trace: null }, { cursor: null }]) await call('swarm_observe', { missionId: f.mission.id, ...extra })
+    // Nested: budget.deadlineAt null keeps the recorded deadline, as omitting it does.
+    const deadlineAt = Date.now() + 3_600_000
+    f.runtime.updateBudget(f.owner, f.mission.id, { ...f.mission.budget, deadlineAt }, 'set a deadline')
+    await call('swarm_budget', { missionId: f.mission.id, reason: 'raise', budget: { ...f.mission.budget, maxTokens: 900_000, deadlineAt: null } })
+    assert.deepEqual([f.runtime.store.get('missions', f.mission.id).budget.maxTokens, f.runtime.store.get('missions', f.mission.id).budget.deadlineAt], [900_000, deadlineAt])
+    // A member's publish and handoff.
+    const task = f.propose({ title: 'Work' })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.workers.callbacks.toolRun(f.author.id, { tool: 'bash', arguments: { command: 'ls' }, result: { exitCode: 0 }, isError: false })
+    const runId = f.runtime.observe(f.actor(f.author), f.mission.id).toolRuns[0].id
+    const evidence = (await call('swarm_publish', { missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, claim: 'c', outcome: 'supported', toolRunIds: [runId], supersedes: null }, f.author.sessionId)).result
+    assert.deepEqual(f.runtime.store.get('evidence', evidence.id).supersedes, [])
+    await call('swarm_handoff', { missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, to: null, summary: 'Checkpointed' }, f.author.sessionId)
+    const handed = f.runtime.store.get('tasks', task.id)
+    assert.equal(Object.hasOwn(handed, 'assigneeId'), false, 'to: null releases to the ready queue, as omitting it does')
+    assert.equal(handed.plannedAssigneeId, f.author.id)
+    // changes.assigneeId declares null: it is kept and releases the binding.
+    const bound = f.propose({ title: 'Bound' })
+    const nullableSchema = definitions.get('swarm_control').parameters.properties.changes.properties.assigneeId
+    assert.deepEqual(nullableSchema.oneOf, [{ type: 'string' }, { type: 'null' }]); assert.match(nullableSchema.description, /null or an empty string releases/)
+    await call('swarm_control', { missionId: f.mission.id, taskId: bound.id, action: 'amend', reason: 'release', changes: { assigneeId: null, maxSteps: null } })
+    assert.equal(f.runtime.store.get('tasks', bound.id).assigneeId, undefined, 'changes.assigneeId null still releases')
+    assert.equal(f.runtime.store.get('tasks', bound.id).maxSteps, bound.maxSteps, 'changes.maxSteps null is an omission')
+    // Mission control with null optional fields; a null required field is still refused.
+    await call('swarm_control', { missionId: f.mission.id, action: 'pause', reason: 'r', coordinatorId: null, changes: null, timeoutMs: null, taskId: null, requestId: null })
+    assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'paused')
+    const schemaIndex = await toolSchemaIndex()
+    await assert.rejects(call('swarm_claim', { missionId: f.mission.id, taskId: null }, f.author.sessionId), refusedBySchema(schemaIndex, 'swarm_claim', '`taskId` must be a string'))
+    await assert.rejects(call('swarm_control', { missionId: f.mission.id, taskId: bound.id, action: 'amend', reason: 'r', changes: { assigneeId: 7 } }),
+      refusedBySchema(schemaIndex, 'swarm_control', '`changes`.`assigneeId` must be a string or null'))
+  } finally { await f.cleanup() }
+})
+
+test('a null optional plan field is an omission inside launch and stage tasks and members', async () => {
+  const launched = [], staged = []
+  const definitions = new Map()
+  const runtime = { config: {}, starts: () => [{ id: 'request_1', workspace: '/workspace' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, createDraft(_actor, plan) { staged.push(plan); return { id: 'draft_1', revision: 1, status: 'draft' } }, snapshot: () => undefined }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const workspace = await realpath(tmpdir())
+  const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1, maxSteps: null, maxFindings: null, priority: null, experiment: null, reviewOf: null, dependencies: null, checks: null }
+  const plan = { title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget: { ...budget, deadlineAt: null },
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000, name: null, provider: null }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }], tasks: [task] }
+  const exec = { agent: { id: 'owner', session: { header: { cwd: workspace } } }, signal: new AbortController().signal }
+  await definitions.get('swarm_launch').execute(Object.freeze({ ...plan, requestId: 'request_1', planningEpoch: null }), exec)
+  await definitions.get('swarm_stage').execute(Object.freeze({ ...plan, workspace }), exec)
+  for (const [where, received] of [['launch', launched[0].tasks[0]], ['stage', staged[0].tasks[0]]]) {
+    for (const key of ['maxSteps', 'maxFindings', 'priority', 'experiment', 'reviewOf', 'dependencies', 'checks']) assert.notEqual(received[key], null, `${where} ${key}`)
+  }
+  assert.equal(launched[0].tasks[0].ceilingProvenance.maxSteps.source, 'default', 'a null ceiling takes the admission default')
+  assert.equal(launched[0].budget.deadlineAt, undefined)
+  assert.equal(typeof launched[0].members[0].name, 'string', 'a null name takes the host-assigned name')
+  assert.equal(Object.hasOwn(staged[0].budget, 'deadlineAt'), false)
+})
