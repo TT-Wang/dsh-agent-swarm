@@ -464,6 +464,16 @@ test('plan refusals reach the browser by type at the validator and at the launch
   assert.equal(launch.result.error.code, 'bad-request', launch.text)
   assert.equal(launch.result.error.message, 'Title must be nonempty text of at most 16000 characters')
   assert.deepEqual(launch.result.error.details, { issues: [], policyCode: 'plan_text_invalid', category: 'validation_error' })
+  // Several undeclared tasks reach the browser as one [outputs_required]
+  // refusal with that policy code, not as plan_invalid with a token per task.
+  const { outputs: _outputs, ...build } = f.input.tasks[0]
+  const undeclared = { ...f.input, members: [...f.input.members, { key: 'reviewer', name: 'Reviewer', role: 'verification' }],
+    tasks: [build, { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the build', kind: 'verification', scope: ['src/'], acceptance: ['works'], reviewOf: 'build', assigneeKey: 'reviewer' }] }
+  const stagedUndeclared = (await f.rpc('create-draft', { sessionId: f.ownerId, input: undeclared })).result.value.draft
+  const refusedLaunch = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: stagedUndeclared.id, revision: stagedUndeclared.revision })
+  assert.equal(refusedLaunch.result.error.code, 'bad-request', refusedLaunch.text)
+  assert.deepEqual(refusedLaunch.result.error.details, { issues: [], policyCode: 'outputs_required', category: 'validation_error' })
+  assert.equal(refusedLaunch.result.error.message, '[outputs_required] tasks[0] (build).outputs, tasks[1] (review).outputs are required to launch. Set `outputs` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
   assert.deepEqual(f.runtime.store.list('missions'), [], 'a refused launch admits nothing')
 })
 

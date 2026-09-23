@@ -298,6 +298,13 @@ test('plan refusals are one typed admission refusal carrying every diagnostic, w
   assert.equal(priority.code, 'plan_priority_invalid')
   assert.equal(priority.message, 'tasks[0] (review).priority must be 0–100')
   assert.equal(errorTypeFor(priority), errorTypeFor(new Error(priority.message)))
+  // Several issues that share one code keep that code rather than plan_invalid.
+  const twice = plan(workspace)
+  twice.tasks[0].priority = 101
+  twice.tasks[1].priority = 102
+  const shared = refusal(twice)
+  assert.equal(shared.code, 'plan_priority_invalid')
+  assert.equal(shared.message, 'tasks[0] (review).priority must be 0–100\ntasks[1] (code).priority must be 0–100')
 })
 
 test('a task scope entry that is not a string is one diagnostic among the others, not a TypeError that drops them', async t => {
@@ -476,11 +483,25 @@ test('R24: a staged draft may omit outputs, but launch refuses each task that do
   assert.doesNotThrow(() => validatePlan(f.input), 'staging leaves outputs optional')
   const draft = f.runtime.createDraft(f.owner, f.input)
   assert.ok(draft.input.tasks.every(task => task.outputs === undefined), 'the staged draft keeps the omission')
+  const schemaIndex = await toolSchemaIndex()
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
     assert.ok(error instanceof AdmissionError)
     assert.equal(error.category, 'validation_error')
     assert.deepEqual(error.diagnostics.map(item => [item.code, item.location]),
       [['outputs_required', 'tasks[0] (review).outputs'], ['outputs_required', 'tasks[1] (code).outputs']], 'one diagnostic names each task')
+    // Every diagnostic shares one code, so the refusal keeps it and renders one
+    // token listing every location instead of `plan_invalid` with one per task.
+    assert.equal(error.code, 'outputs_required')
+    assert.equal(error.message, '[outputs_required] tasks[0] (review).outputs, tasks[1] (code).outputs are required to launch. Set `outputs` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
+    assert.deepEqual(assessText(error.message, schemaIndex), [], 'the combined refusal satisfies the refusal contract')
+    return true
+  })
+  // Beside another issue the plan is `plan_invalid`, and the undeclared tasks are still one line with one token.
+  const mixed = structuredClone(f.input)
+  mixed.tasks[0].priority = 101
+  assert.throws(() => validatePlan(mixed, { launch: true }), error => {
+    assert.equal(error.code, 'plan_invalid')
+    assert.equal(error.message, 'tasks[0] (review).priority must be 0–100\n[outputs_required] tasks[0] (review).outputs, tasks[1] (code).outputs are required to launch. Set `outputs` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
     return true
   })
   assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
@@ -488,7 +509,6 @@ test('R24: a staged draft may omit outputs, but launch refuses each task that do
 
   const single = structuredClone(f.input)
   single.tasks[0].outputs = []
-  const schemaIndex = await toolSchemaIndex()
   assert.throws(() => validatePlan(single, { launch: true }), error => {
     assert.equal(error.code, 'outputs_required')
     assert.equal(error.message, '[outputs_required] tasks[1] (code).outputs is required to launch. Set `outputs` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')

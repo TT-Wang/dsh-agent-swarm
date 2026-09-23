@@ -78,6 +78,19 @@ export interface PlanValidationOptions {
   dependencyDirs?: readonly string[]
 }
 
+/**
+ * The launch refusal for every task that declares no `outputs`: one
+ * diagnostic per task, rendered as ONE `[outputs_required]` sentence that lists
+ * every location, so a plan missing several declarations is still refused with
+ * a single code the caller can act on.
+ */
+function outputsRequired(locations: readonly string[]): { category: PolicyErrorCategory; diagnostics: AdmissionDiagnostic[]; message: string } {
+  const single = (location: string) => `[outputs_required] ${location} is required to launch. Set \`outputs\` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.`
+  const message = locations.length === 1 ? single(locations[0]!)
+    : `[outputs_required] ${locations.join(', ')} are required to launch. Set \`outputs\` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.`
+  return { category: 'validation_error', diagnostics: locations.map(location => ({ code: 'outputs_required', location, message: single(location) })), message }
+}
+
 /** Fail before any workers or worktrees are created. Returns a detached canonical plan. */
 export function validatePlan(value: unknown, options: PlanValidationOptions = {}): PlanInput {
   record(value)
@@ -140,6 +153,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
   })
   for (const stream of streams.values()) inspectAdmission(() => { text(stream.title, `workstreams[${stream.key}].title`); text(stream.objective, `workstreams[${stream.key}].objective`) })
   let experiments = 0
+  // Tasks a launch refuses for declaring no `outputs`, reported together below.
+  const undeclared: string[] = []
   for (const [index, task] of [...tasks.values()].entries()) {
     const at = `tasks[${index}] (${String(task.key)})`
     inspectAdmission(() => { text(task.title, `${at}.title`); text(task.objective, `${at}.objective`) })
@@ -160,7 +175,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
     const stringScope = Array.isArray(task.scope) && task.scope.every(selector => typeof selector === 'string')
     inspectAdmission(() => {
       if (task.outputs === undefined) {
-        if (options.launch) throw new AdmissionError('outputs_required', 'validation_error', `[outputs_required] ${at}.outputs is required to launch. Set \`outputs\` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.`, `${at}.outputs`)
+        if (options.launch) undeclared.push(`${at}.outputs`)
         return
       }
       if (stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at, { dependencyDirs: options.dependencyDirs })
@@ -207,13 +222,19 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
   }
+  if (undeclared.length) admissionIssues.push(outputsRequired(undeclared))
   if (experiments > Number(value.budget.maxExperiments)) inspectAdmission(() => { throw new AdmissionError('plan_experiments_exceed_budget', 'budget_error', 'Plan exceeds experiment budget', 'tasks') })
   if (admissionIssues.length) {
     // One refusal carrying every diagnostic; its message is the issues' text,
-    // joined exactly as before the refusal was typed.
+    // joined exactly as before the refusal was typed. When every diagnostic
+    // shares one code the refusal keeps that code instead of `plan_invalid`,
+    // and its `[code]` token leads the text once rather than once per issue.
     const diagnostics = admissionIssues.flatMap(issue => issue.diagnostics)
     const category = CATEGORY_PRECEDENCE.find(candidate => admissionIssues.some(issue => issue.category === candidate))!
-    throw new AdmissionError(diagnostics.length === 1 ? diagnostics[0]!.code : 'plan_invalid', category, admissionIssues.map(issue => issue.message).join('\n'), 'plan', diagnostics)
+    const shared = new Set(diagnostics.map(diagnostic => diagnostic.code)).size === 1
+    const token = `[${diagnostics[0]!.code}] `
+    const messages = admissionIssues.map((issue, index) => shared && index > 0 && issue.message.startsWith(token) ? issue.message.slice(token.length) : issue.message)
+    throw new AdmissionError(shared ? diagnostics[0]!.code : 'plan_invalid', category, messages.join('\n'), 'plan', diagnostics)
   }
   const raw = JSON.parse(JSON.stringify(value)) as PlanInput
   const plan: PlanInput = {
