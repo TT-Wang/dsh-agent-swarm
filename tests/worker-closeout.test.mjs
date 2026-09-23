@@ -185,6 +185,11 @@ test('an owner cancel during the lease-expiry checkpoint is never overwritten by
   const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Owner withdraws while the checkpoint is in flight' })
   assert.equal(cancelled.status, 'cancelled')
   release.resolve()
+  // The cancel's stop barrier stops the worker asynchronously; wait for that
+  // rather than for a fixed 50 ms, which a loaded parallel run can outlast.
+  // The pause after it gives the released checkpoint time to try its transition,
+  // so the negative assertions below still mean something.
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the cancel stops the released worker')
   await new Promise(resolve => setTimeout(resolve, 50))
   const final = f.current(task.id)
   assert.equal(final.status, 'cancelled', 'the in-flight checkpoint must not overwrite the owner cancel')
