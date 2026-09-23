@@ -298,22 +298,33 @@ for (const repaired of [true, false]) {
     const handed = delivery => (delivery.notice.coveredBy === undefined ? delivery : f.runtime.store.get('deliveries', delivery.notice.coveredBy))?.deliveredAt !== undefined
     const stallRoot = await eventually(() => f.stallRoots().find(handed), 'the stall-root decision reaches the owner')
     assert.ok(stallRoot.subjects.includes(`${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`), 'the rejecting review is a listed dependent')
-    // Reminders of this stall-root: their own rows or wake-budget constituents.
-    const prefix = `obligation-followup:${stallRoot.id}:`
-    const reminders = () => f.notices().flatMap(delivery => [
-      ...(delivery.notice?.dedupKey?.startsWith(prefix) ? [{ delivery, subjects: delivery.subjects }] : []),
-      ...(delivery.notice?.aggregatedFacts ?? []).filter(part => part.dedupKey.startsWith(prefix)).map(part => ({ delivery, subjects: part.subjects })),
-    ])
+    const reviewSubject = `${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`
+    // Every owner fact: its own row, or each wake-budget constituent.
+    const facts = () => f.notices().flatMap(delivery => delivery.notice?.aggregatedFacts === undefined
+      ? [{ delivery, dedupKey: delivery.notice?.dedupKey ?? '', subjects: delivery.subjects ?? [], createdAt: delivery.createdAt }]
+      : delivery.notice.aggregatedFacts.map(part => ({ delivery, dedupKey: part.dedupKey, subjects: part.subjects, createdAt: part.createdAt })))
+    const remindersOf = original => facts().filter(fact => fact.dedupKey.startsWith(`obligation-followup:${original.id}:`))
+    const reminders = () => remindersOf(stallRoot)
     if (repaired) {
+      const proposedAt = Date.now()
       const repair = f.propose('Repair', { replaces: [source.id] })
       await eventually(() => f.runtime.store.get('tasks', repair.id).status === 'running', 'the repair runs')
       await sleep(1200)
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')
       assert.deepEqual(reminders().map(item => item.subjects), [], 'no stall-root reminder while the repair runs')
+      // 12b12a6: the W3 stall's reminders and the fall-through still named the
+      // rejecting review (a blocked verdict record) while the repair ran.
+      const naming = facts().filter(fact => fact.createdAt >= proposedAt && /^(obligation-followup|fallthrough):/.test(fact.dedupKey) && fact.subjects.includes(reviewSubject))
+      assert.deepEqual(naming.map(fact => fact.dedupKey.split(':')[0]), [], 'no reminder or fall-through names the rejecting review while the repair runs')
       return
     }
     const reminder = await eventually(() => reminders().find(item => item.delivery.deliveredAt !== undefined), 'a stall-root reminder reaches the owner', 3000)
     assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
+    // The W3 board stall lists the review too; its reminders judge the same rule.
+    const stall = f.notices().find(delivery => delivery.notice?.dedupKey?.startsWith('mission/stalled:'))
+    assert.ok(stall?.subjects.includes(reviewSubject), 'the W3 stall lists the rejecting review')
+    await eventually(() => remindersOf(stall).length >= f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded', 5000)
+    assert.deepEqual(remindersOf(stall).map(fact => fact.subjects), remindersOf(stall).map(() => [rootSubject]), 'the W3 reminders name the root only')
   })
 }
 

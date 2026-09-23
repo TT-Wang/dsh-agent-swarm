@@ -463,6 +463,12 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     return submission === undefined || submission.age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
   if (task.status === 'blocked') {
+    // A blocked verdict record is not outstanding on its own while its source
+    // speaks for it: a live replacement carries the repair, or the source is a
+    // stall root whose notice lists this record as a dependent. Naming the
+    // record again (a W3 reminder, a fall-through) repeats the root's decision.
+    if (task.reviewOf !== undefined && (replacementCoverage(tasks).has(task.reviewOf)
+      || stallRootsFor(rt, tasks).some(root => root.id === task.reviewOf))) return true
     const stop = task.resumeAfterStop?.epoch === task.epoch ? task.resumeAfterStop : undefined
     // R15-A3: an absent `at` is UNBOUNDED, so it is not legitimate waiting. The
     // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
