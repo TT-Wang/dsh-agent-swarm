@@ -480,6 +480,30 @@ test('mission authority, lifecycle and budget refusals reach the browser by thei
   assert.equal(String(detail), `ObserveDetailRefusedError: ${detail.message}`)
 })
 
+test('task admission refusals reach the browser by their policy code, with the legacy wording', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const research = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  const pending = f.runtime.propose(owner, mission.id, research)
+  const before = f.runtime.store.list('tasks', mission.id)
+  const refused = async (input, message, policyCode, category) => {
+    const response = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input })
+    assert.equal(response.result.error.code, 'bad-request', response.text)
+    assert.equal(response.result.error.message, message)
+    assert.deepEqual(response.result.error.details, { issues: [], policyCode, category })
+    assert.equal(category, errorTypeFor(new Error(message)), `${policyCode} keeps the trace category its text had`)
+  }
+  await refused({ ...research, kind: 'verification' }, 'Verification requires reviewOf', 'verification_review_source_required', 'validation_error')
+  await refused({ ...research, reviewOf: pending.id }, 'Only verification tasks may set reviewOf', 'review_source_not_verification', 'tool_error')
+  await refused({ ...research, replaces: [pending.id] },
+    `replaces ${pending.id}: that task is pending, and only blocked or cancelled work can be replaced; wait for its verdict or use swarm_handoff/challenge`,
+    'replacement_source_not_blocked', 'tool_error')
+  await refused({ ...research, maxRecoveryAttempts: 0 }, 'maxRecoveryAttempts must be a positive safe integer', 'task_recovery_limit_invalid', 'validation_error')
+  assert.deepEqual(f.runtime.store.list('tasks', mission.id), before, 'a refused proposal admits nothing')
+})
+
 test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }

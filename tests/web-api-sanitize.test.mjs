@@ -25,6 +25,7 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
+import { PolicyError } from '../lib/policy-error.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -209,20 +210,35 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
   const f = await fixture(t)
   // Byte-for-byte messages agreed with the governance task (member_9e7abaca).
   const w8 = 'Member Builder cannot start: provider "public-provider" model "model-one" does not support reasoning effort "high". Clearing reasoningEffort and retrying also failed: Error: route rejected. Admit a replacement member without reasoningEffort, or with an effort this provider/model supports.'
-  f.runtime.addMember = () => { throw new Error(w8) }
+  f.runtime.addMember = () => { throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', w8) }
   const member = await f.rpc('add-member', { sessionId: f.ownerId, missionId: 'mission-x', input: { name: 'Builder', role: 'implementation' } })
   assert.equal(member.result.ok, false)
   assert.equal(member.result.error.code, 'bad-request')
   assert.equal(member.result.error.message, w8, 'the W8 refusal is not sanitized')
+  assert.deepEqual(member.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
+  // F7 from the real runtime: a deterministic retry of a withdrawn record is a typed refusal.
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const input = { workstreamId: stream.id, title: 'Withdrawn', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  f.runtime.propose(owner, mission.id, input, 'task_1')
+  f.runtime.cancel(owner, mission.id, { taskId: 'task_1', reason: 'Withdrawn' })
   const f7 = 'Task task_1 was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.'
-  f.runtime.propose = () => { throw new Error(f7) }
+  let readmitted
+  try { f.runtime.propose(owner, mission.id, input, 'task_1') } catch (error) { readmitted = error }
+  assert.ok(readmitted instanceof PolicyError, 'the runtime types the F7 refusal')
+  assert.equal(readmitted.message, f7)
+  f.runtime.propose = () => { throw readmitted }
   const propose = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
   assert.equal(propose.result.ok, false)
   assert.equal(propose.result.error.code, 'bad-request')
   assert.equal(propose.result.error.message, f7, 'the F7 refusal is not sanitized')
-  // The allowlist is still fail-closed: the same prefix with host detail appended is sanitized.
-  f.runtime.propose = () => { throw new Error(`${f7} /private/var/secret/swarm.sqlite`) }
-  const leaked = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
-  assert.equal(leaked.result.error.code, 'internal-error')
-  assert.doesNotMatch(leaked.text, /private|secret|sqlite/)
+  assert.deepEqual(propose.result.error.details, { issues: [], policyCode: 'task_cancelled_readmission', category: 'tool_error' })
+  // Fail closed: the same text on a plain Error, or the typed refusal with host detail appended, is sanitized.
+  for (const failure of [new Error(f7), new PolicyError('task_cancelled_readmission', 'tool_error', `${f7} /private/var/secret/swarm.sqlite`)]) {
+    f.runtime.propose = () => { throw failure }
+    const leaked = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
+    assert.equal(leaked.result.error.code, 'internal-error')
+    assert.doesNotMatch(leaked.text, /private|secret|sqlite|cancelled by the owner/)
+  }
 })

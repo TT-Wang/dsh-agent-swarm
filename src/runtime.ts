@@ -1072,7 +1072,7 @@ export class SwarmRuntime {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('worker_cannot_own_mission', 'authorization_error', 'Workers cannot create independent missions or budgets')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
-    if (!isAbsolute(input.workspace)) throw new Error('workspace must be an absolute path')
+    if (!isAbsolute(input.workspace)) throw new PolicyError('workspace_not_absolute', 'validation_error', 'workspace must be an absolute path')
     requireStrings(input.scope, 'scope'); requireStrings(input.acceptance, 'acceptance')
     const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
@@ -1115,13 +1115,13 @@ export class SwarmRuntime {
       if (!owner) throw new PolicyError('member_owner_required', 'authorization_error', 'Only the mission owner can add workers; send a bounded collaborator request')
       if (input.name !== undefined) requireText(input.name, 'name'); requireText(input.role, 'role')
       for (const field of ['provider', 'model', 'reasoningEffort'] as const) if (input[field] !== undefined) requireText(input[field]!, field)
-      if (input.provider && !input.model) throw new Error('A selected provider requires a selected model')
-      if (input.maxOutputTokens !== undefined && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1)) throw new Error('maxOutputTokens must be a positive safe integer')
+      if (input.provider && !input.model) throw new PolicyError('member_model_required', 'validation_error', 'A selected provider requires a selected model')
+      if (input.maxOutputTokens !== undefined && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 1)) throw new PolicyError('member_output_tokens_invalid', 'validation_error', 'maxOutputTokens must be a positive safe integer')
       // M9 residual: topic matching is exact array membership. A bare string
       // would silently become String.includes substring semantics, so the
       // runtime validates its own boundary instead of trusting the caller.
-      if (input.subscriptions !== undefined && (!Array.isArray(input.subscriptions) || input.subscriptions.some(topic => typeof topic !== 'string' || !topic.trim()))) throw new Error('subscriptions must be a string array')
-      if (this.store.list('starts', missionId).length && input.maxOutputTokens === undefined) throw new Error('Automatic workers require maxOutputTokens chosen by the primary agent')
+      if (input.subscriptions !== undefined && (!Array.isArray(input.subscriptions) || input.subscriptions.some(topic => typeof topic !== 'string' || !topic.trim()))) throw new PolicyError('member_subscriptions_invalid', 'validation_error', 'subscriptions must be a string array')
+      if (this.store.list('starts', missionId).length && input.maxOutputTokens === undefined) throw new PolicyError('member_output_tokens_required', 'tool_error', 'Automatic workers require maxOutputTokens chosen by the primary agent')
       const prior = admittedId ? this.store.get('members', admittedId) : undefined
       if (prior) {
         if (prior.missionId !== missionId || (input.name !== undefined && prior.name !== input.name) || memberPhaseOf(prior) === 'stopped') throw new PolicyError('member_identity_conflict', 'conflict_error', 'Member admission identity conflict')
@@ -1198,7 +1198,7 @@ export class SwarmRuntime {
               this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
               this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
             })
-            throw new Error(`Member ${name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
+            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
           }
         }
         member.phase = 'stopped'
@@ -1229,7 +1229,7 @@ export class SwarmRuntime {
       if (prior.missionId !== missionId) throw new PolicyError('task_identity_conflict', 'conflict_error', 'Task identity conflict')
       // F7: launchDraft retries with deterministic ids. A withdrawn record must
       // never be silently re-admitted, or a mission can activate with dead work.
-      if (prior.status === 'cancelled') throw new Error(`Task ${prior.id} was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.`)
+      if (prior.status === 'cancelled') throw new PolicyError('task_cancelled_readmission', 'tool_error', `Task ${prior.id} was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.`)
       // Round 9-C: a re-submission that changes a check the task already
       // declared is recorded durably. The stored record keeps its original
       // check, so a retry can never silently swap it for a weaker or
@@ -1313,19 +1313,19 @@ export class SwarmRuntime {
     const dependencies = [...new Set(normalizeReviewDependencies(input.kind, input.reviewOf, input.dependencies))]
     for (const dependency of dependencies) {
       const effective = this.effectiveDependency(missionId, dependency, tasks)
-      if (effective.status === 'cancelled' || effective.status === 'blocked') throw new Error(`Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
+      if (effective.status === 'cancelled' || effective.status === 'blocked') throw new PolicyError('dependency_not_live', 'tool_error', `Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
     if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && memberPhaseOf(m) !== 'stopped')) throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown assignee')
     if (input.assignmentMode !== undefined && input.assignmentMode !== 'preferred' && input.assignmentMode !== 'pinned') throw new Error('[assignment_mode_invalid] Set `assignmentMode` to preferred or pinned with `swarm_propose`, then retry.')
     if (input.assignmentMode !== undefined && input.assigneeId === undefined) throw new Error('[assignment_member_required] Supply `assigneeId` with `assignmentMode` in `swarm_propose`, then retry.')
     if (input.kind === 'verification') {
-      if (!input.reviewOf) throw new Error('Verification requires reviewOf')
+      if (!input.reviewOf) throw new PolicyError('verification_review_source_required', 'validation_error', 'Verification requires reviewOf')
       const source = this.task(missionId, input.reviewOf)
-      if (source.kind === 'verification') throw new Error('Verification cannot review another verification task')
-      if (source.status === 'cancelled' || source.status === 'accepted') throw new Error(`reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
+      if (source.kind === 'verification') throw new PolicyError('verification_review_source_invalid', 'tool_error', 'Verification cannot review another verification task')
+      if (source.status === 'cancelled' || source.status === 'accepted') throw new PolicyError('review_source_not_submitted', 'tool_error', `reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
       const authors = this.authorIds(source)
-      if (input.assigneeId !== undefined && authors.has(input.assigneeId)) throw new Error(`assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
-    } else if (input.reviewOf) throw new Error('Only verification tasks may set reviewOf')
+      if (input.assigneeId !== undefined && authors.has(input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
+    } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
     // declared check. Acceptance is already required verbatim above; a check
     // change is recorded durably so an owner can see that the new check no
@@ -1334,7 +1334,7 @@ export class SwarmRuntime {
     const checkChanges: Array<{ replaces: string[]; sourceTaskId: string; previousChecks: string[]; checks: string[] }> = []
     for (const previousId of input.replaces ?? []) {
       const previous = this.task(missionId, previousId)
-      if (previous.kind === 'verification') throw new Error(`replaces ${previousId}: that is a verification task. Repair its reviewed source ${previous.reviewOf ?? ''} instead; when that repair is submitted the runtime detects the missing review and admits an independent verification task automatically once the mission has task budget and a live member who did not author the repair`)
+      if (previous.kind === 'verification') throw new PolicyError('replacement_source_verification', 'budget_error', `replaces ${previousId}: that is a verification task. Repair its reviewed source ${previous.reviewOf ?? ''} instead; when that repair is submitted the runtime detects the missing review and admits an independent verification task automatically once the mission has task budget and a live member who did not author the repair`)
       // Resolve existing live replacements before the status check. The guard
       // must be reachable for exactly the blocked case it was written for: two
       // admitted replacements would make lineage ambiguous and stall every
@@ -1346,14 +1346,14 @@ export class SwarmRuntime {
       if (previous.status !== 'blocked' && previous.status !== 'cancelled') {
         const repairable = previous.status === 'pending' || previous.status === 'running' || previous.status === 'submitted'
         const rule = repairable ? 'only blocked or cancelled work can be replaced' : 'only blocked work can be replaced'
-        throw new Error(`replaces ${previousId}: that task is ${previous.status}, and ${rule}${replacement ? `; it is already replaced by ${replacement.id} (${replacement.status})` : repairable ? '; wait for its verdict or use swarm_handoff/challenge' : ''}`)
+        throw new PolicyError('replacement_source_not_blocked', 'tool_error', `replaces ${previousId}: that task is ${previous.status}, and ${rule}${replacement ? `; it is already replaced by ${replacement.id} (${replacement.status})` : repairable ? '; wait for its verdict or use swarm_handoff/challenge' : ''}`)
       }
-      if (replacement !== undefined) throw new Error(`replaces ${previousId}: that task is ${previous.status}, and is already replaced by ${replacement.id} (${replacement.status}); wait for its verdict, withdraw it with swarm_cancel, or repair that replacement instead of admitting a second one`)
-      if (previous.status !== 'cancelled' && stopPending(previous)) throw new Error(`replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
-      if (previous.kind !== input.kind) throw new Error(`replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
+      if (replacement !== undefined) throw new PolicyError('replacement_already_live', 'tool_error', `replaces ${previousId}: that task is ${previous.status}, and is already replaced by ${replacement.id} (${replacement.status}); wait for its verdict, withdraw it with swarm_cancel, or repair that replacement instead of admitting a second one`)
+      if (previous.status !== 'cancelled' && stopPending(previous)) throw new PolicyError('replacement_source_reassigning', 'lease_error', `replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
+      if (previous.kind !== input.kind) throw new PolicyError('replacement_kind_mismatch', 'tool_error', `replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
       const missing = previous.acceptance.filter(item => !input.acceptance.includes(item))
-      if (missing.length) throw new Error(`replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
-      if (dependencies.includes(previousId)) throw new Error(`replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
+      if (missing.length) throw new PolicyError('replacement_acceptance_dropped', 'tool_error', `replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
+      if (dependencies.includes(previousId)) throw new PolicyError('replacement_depends_on_source', 'tool_error', `replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
       const nextChecks = Array.isArray(input.checks) ? input.checks as string[] : []
       if (previous.checks.length > 0 && !sameChecks(nextChecks, previous.checks)) {
         checkChanges.push({ replaces: [previousId], sourceTaskId: previousId, previousChecks: [...previous.checks], checks: [...nextChecks] })
@@ -1364,8 +1364,8 @@ export class SwarmRuntime {
     // behind a neutral name. Plan validation (src/plans.ts) keeps the name
     // patterns because it has no workspace manifest.
     requireHostChecks(input.kind, input.checks, 'task', input.title, loadPackageScripts(mission.workspace))
-    if (input.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(input.maxRecoveryAttempts) || input.maxRecoveryAttempts < 1)) throw new Error('maxRecoveryAttempts must be a positive safe integer')
-    if (input.checkTimeoutMs !== undefined && (!Number.isSafeInteger(input.checkTimeoutMs) || input.checkTimeoutMs < 1 || input.checkTimeoutMs > 2147483647)) throw new Error('checkTimeoutMs must be a positive integer within the platform timer range')
+    if (input.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(input.maxRecoveryAttempts) || input.maxRecoveryAttempts < 1)) throw new PolicyError('task_recovery_limit_invalid', 'validation_error', 'maxRecoveryAttempts must be a positive safe integer')
+    if (input.checkTimeoutMs !== undefined && (!Number.isSafeInteger(input.checkTimeoutMs) || input.checkTimeoutMs < 1 || input.checkTimeoutMs > 2147483647)) throw new PolicyError('task_check_timeout_invalid', 'validation_error', 'checkTimeoutMs must be a positive integer within the platform timer range')
     // D1: every admitted task carries its own step/finding ceiling; the runtime
     // blocks the task at that limit instead of letting it drain the mission budget.
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
@@ -2411,7 +2411,7 @@ export class SwarmRuntime {
     if (terminal(mission)) throw new PolicyError('mission_terminal', 'conflict_error', 'Mission is terminal; create a new mission to continue')
     this.bounded(input.reason)
     const task = this.task(missionId, input.taskId)
-    if (task.status === 'accepted') throw new Error(`Task ${task.id} is accepted; accepted work is immutable. Propose a replacement instead.`)
+    if (task.status === 'accepted') throw new PolicyError('task_accepted_immutable', 'tool_error', `Task ${task.id} is accepted; accepted work is immutable. Propose a replacement instead.`)
     // Cancellation is terminal and idempotent: a replay never mutates or re-audits it.
     if (task.status === 'cancelled') return task
     const released = new Set<string>()
@@ -2506,7 +2506,7 @@ export class SwarmRuntime {
     requireText(input.commandId, 'commandId')
     if (input.commandId.length > 200) throw new Error('commandId exceeds 200 characters')
     const goal = this.bounded(input.goal).trim()
-    if (!isAbsolute(input.workspace)) throw new Error('workspace must be an absolute path')
+    if (!isAbsolute(input.workspace)) throw new PolicyError('workspace_not_absolute', 'validation_error', 'workspace must be an absolute path')
     const budget = input.budget === undefined ? undefined : validatedBudget(input.budget)
     const prior = this.starts(actor).find(request => request.commandId === input.commandId)
     if (prior) {

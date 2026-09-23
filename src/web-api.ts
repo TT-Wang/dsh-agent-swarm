@@ -64,24 +64,10 @@ class RequestError extends Error {
  */
 const actionableMessages: readonly RegExp[] = [
   // Runtime task and attempt refusals.
-  /^Task .* is accepted; accepted work is immutable/,
   /^A task prerequisite is no longer accepted/,
   /^Stale or unauthorized task attempt/,
   /^Attempt lease exceeds the supported clock range$/,
   /^Content exceeds \d+ characters$/,
-  /^Automatic workers require maxOutputTokens chosen by the primary agent$/,
-  /^Verification (?:requires reviewOf|cannot review another verification task)$/,
-  /^Only verification tasks may set reviewOf$/,
-  /^(?:reviewOf|replaces|Dependency|assigneeId) /,
-  /^(?:maxRecoveryAttempts|maxOutputTokens) must be a positive safe integer$/,
-  /^checkTimeoutMs must be a positive integer within the platform timer range$/,
-  /^subscriptions must be a string array$/,
-  /^workspace must be an absolute path$/,
-  /^A selected provider requires a selected model$/,
-  /^Choose an explicit provider and model/,
-  // T2 W8/F7 refusals (messages confirmed byte-for-byte with the governance task).
-  /^Member .+ cannot start: provider .+ does not support reasoning effort/,
-  /^Task .+ was cancelled by the owner; a cancelled record cannot be re-admitted/,
   // Completion and delivery preconditions.
   /^Complete independent acceptance before applying results$/,
   /^This historical mission has no saved delivery baseline/,
