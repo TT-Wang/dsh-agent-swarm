@@ -47,6 +47,29 @@ test('all model plan entry points require their chosen budget; automatic schema 
   assert.equal(properties.budget.properties.maxTokens.default, undefined)
 })
 
+test('swarm_propose leaves acceptance optional for a repair to inherit; every plan entry point still requires it', () => {
+  const definitions = tools()
+  const propose = definitions.get('swarm_propose').parameters
+  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'])
+  assert.deepEqual(propose.properties.acceptance.items, { type: 'string' }, 'the property stays declared as a string array')
+  assert.match(propose.properties.acceptance.description, /Required unless replaces is given/)
+  assert(propose.properties.replaces, 'replaces carries the inheritance')
+  assert(definitions.get('swarm_create').parameters.required.includes('acceptance'))
+  for (const name of ['swarm_launch', 'swarm_stage']) {
+    assert(definitions.get(name).parameters.required.includes('acceptance'), `${name} mission acceptance`)
+    assert(definitions.get(name).parameters.properties.tasks.items.required.includes('acceptance'), `${name} task acceptance`)
+  }
+})
+
+test('repair guidance says a repair inherits acceptance instead of asking the model to copy it', async () => {
+  const { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT } = await import('../lib/tools.js')
+  const surfaces = { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT, swarm_propose: tools().get('swarm_propose').description }
+  for (const [where, text] of Object.entries(surfaces)) {
+    assert.doesNotMatch(text, /unchanged acceptance|acceptance verbatim|retain original acceptance/i, `${where} no longer asks for a copy`)
+  }
+  for (const where of ['OWNER_PROMPT', 'WORKER_PROMPT', 'swarm_propose']) assert.match(surfaces[where], /replaces[^.]*inherit[^.]*acceptance/, `${where} states the inheritance once`)
+})
+
 test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {
   const definitions = tools()
   // M9(b): optionalInteger rejects negatives, so every cursor declares minimum 0.

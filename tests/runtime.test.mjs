@@ -248,8 +248,10 @@ test('an independently accepted repair retires blocked obligations and can conve
   const original=f.propose(); const oldReview=await submitAndReview(original,true)
   const oldVerdict=structuredClone(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===oldReview.id))
   assert.equal(oldVerdict.status,'blocked')
-  assert.throws(()=>f.propose(f.actorA,{replaces:[original.id],acceptance:['unrelated']}),/original obligations/)
-  const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id]});await submitAndReview(repaired)
+  // The repair inherits the replaced obligations; a new criterion is appended, never substituted.
+  const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id],acceptance:['unrelated','works']})
+  assert.deepEqual(repaired.acceptance,[...original.acceptance,'unrelated'],'replaced criteria first, in order, without duplicates')
+  await submitAndReview(repaired)
   const repairedBoard=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(repairedBoard.tasks.find(t=>t.id===original.id).status,'cancelled')
   const retiredReview=repairedBoard.tasks.find(t=>t.id===oldReview.id)
