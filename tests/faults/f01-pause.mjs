@@ -7,6 +7,8 @@
  * `Task.resumeAfterStop`"). The old handle's stop is held on a gate, so a
  * barrier that re-pends before the stop settles, or stops the handle only
  * after the re-pend, leaves the task pending while the gate is still closed.
+ * The planned assignee is the reviewer, second in dispatch rotation, so a pause
+ * that loses the assignment hands the resumed task to the author instead.
  */
 import assert from 'node:assert/strict'
 import { setup, eventually, events, taskOf, runScenario } from './harness.mjs'
@@ -20,8 +22,8 @@ await runScenario({
     let release
     const gate = new Promise(resolve => { release = resolve })
     try {
-      const planned = f.author
-      const task = f.propose()
+      const planned = f.reviewer
+      const task = f.propose({ assigneeId: planned.id })
       const claimed = await f.runtime.claim(f.actor(planned), f.mission.id, task.id)
       assert.equal(claimed.status, 'running', 'the attempt is live before the fault')
       const attemptA = claimed.attempt.id
