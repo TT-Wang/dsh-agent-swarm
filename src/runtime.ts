@@ -1831,7 +1831,7 @@ export class SwarmRuntime {
           const authorId = source.attempt?.ownerId ?? source.assigneeId
           const author = authorId === undefined ? undefined : this.store.get('members', authorId)
           if (author !== undefined && memberPhaseOf(author) !== 'stopped') this.store.put('deliveries', { id: id('msg'), missionId, from: member.id, to: author.id, kind: 'control', createdAt: Date.now(),
-            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"], keeping its acceptance verbatim and its kind (${source.kind}). Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
+            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"] and the same kind (${source.kind}); the replacement inherits its acceptance. Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
         }
       })
       // Retired reviewers carry durable stop/checkpoint markers; retirement
@@ -3479,7 +3479,7 @@ export class SwarmRuntime {
     // historical author and re-pend work that can never change. A resume while a
     // stop is still pending is the advertised cleanup retry, which keeps the
     // blocked outcome, so it stays allowed.
-    if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] and keeping its acceptance verbatim, or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
+    if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
