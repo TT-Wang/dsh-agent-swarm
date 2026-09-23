@@ -1825,7 +1825,15 @@ export class Workspaces {
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     return await this.operation(member.id, async signal => {
       await this.memberRecord(member)
-      await this.validateArtifact(member, artifact, signal)
+      try { await this.validateArtifact(member, artifact, signal) }
+      catch (error) {
+        // Only the host's own git deadline (HOST_GIT_TIMEOUT_MS) proving the
+        // artifact is a timeout row: no command has run. Any other failure here
+        // (a non-ancestor, a missing commit) refuses the artifact by a throw,
+        // and cancellation stays cancellation.
+        if (!(error instanceof ProcessTimeoutError) || signal.aborted) throw error
+        return [unexecutedCheck('(verification preparation)', error)]
+      }
       const mission = await this.missionRecord(member.missionId)
       // Revocation fencing: the verification checkout is created only after the
       // persisted mission manifest still authorizes its recorded root.
