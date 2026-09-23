@@ -71,3 +71,17 @@ test('a --serve-only run labels its report serve-only, never as the full scenari
   assert.equal(report.scenario, 'serve-only')
   assert.deepEqual(report.checks, [])
 })
+
+test('the command smoke gives the host a manual default below the generated allowance, so a clamp to it fails the budget assertion', async t => {
+  const s = await scene(t)
+  const run = await s.serveOnly('smoke-command-web.mjs', { DSH_SMOKE_KEEP: '1' })
+  assert.equal(run.code, 0, run.stderr)
+  const patch = JSON.parse(readFileSync(join(run.ready.root, 'smoke.patch.yml'), 'utf8'))
+  const { defaultBudget } = patch.find(row => row.id === 'dsh-external-agent-swarm').config
+  assert.ok(defaultBudget, 'the command smoke configures the plugin\'s manual default')
+  // The allowance the scripted owner generates (tests/fixtures/web-scripted-llm.mjs), which the smoke asserts exactly.
+  const generated = { maxTokens: 120_000, maxSteps: 60, maxWorkers: 2, maxDurationMs: 180_000, maxTasks: 8, maxExperiments: 2 }
+  const clamped = Object.fromEntries(Object.entries(generated).map(([key, value]) => [key, Math.min(value, defaultBudget[key])]))
+  assert.notDeepEqual(clamped, generated, 'a launch that clamps the generated allowance to the manual default must fail the smoke\'s deepEqual')
+  assert.notEqual(defaultBudget.maxTokens, generated.maxTokens, 'and replacing it with the manual default must fail its notEqual')
+})
