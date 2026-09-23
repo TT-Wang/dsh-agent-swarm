@@ -486,6 +486,7 @@ export class SwarmRuntime {
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.store = new SwarmStore(config.statePath, storeOptions)
+    this.subscribe(missionId => this.scheduling.recordCommit(missionId))
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
       idle: memberId => this.onIdle(memberId),

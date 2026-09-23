@@ -162,16 +162,17 @@ export class Scheduling {
   /**
    * The async context of the scheduling body that is queued or running
    * (`runBody`, entered by `kick`). A commit made inside it is the body's own,
-   * whatever await or helper it came through; the commit listener below stamps
+   * whatever await or helper it came through; `recordCommit` stamps
    * `committedAt` on that body's record.
    */
   private readonly body = new AsyncLocalStorage<SchedulingPass>()
 
-  constructor(private readonly rt: SwarmRuntime) {
-    rt.subscribe(missionId => {
-      const pass = this.body.getStore()
-      if (pass !== undefined && pass.missionId === missionId && this.passes.get(missionId) === pass) pass.committedAt = Date.now()
-    })
+  constructor(private readonly rt: SwarmRuntime) {}
+
+  /** Commit listener, registered by the runtime: stamp the committing body's own progress. */
+  recordCommit(missionId: string): void {
+    const pass = this.body.getStore()
+    if (pass !== undefined && pass.missionId === missionId && this.passes.get(missionId) === pass) pass.committedAt = Date.now()
   }
 
   /** Run one scheduling body, its queue wait included, in its own async context. */
