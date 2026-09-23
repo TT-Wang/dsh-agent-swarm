@@ -179,6 +179,8 @@ test('the output_missing refusal is in the refusal inventory and satisfies its c
   const typed = sites.filter(site => site.code === 'output_missing')
   assert.deepEqual(typed.map(site => [site.kind, site.errorClass, site.codes]), [['coded-throw', 'PolicyError', ['output_missing']]], 'one capture-time refusal serves submit and verify')
   assert.deepEqual(assessRefusal(typed[0], { ...schemaIndex, diagnosticProducers: diagnosticProducers([sites]) }), [], typed[0].text)
+  const runtimeSites = refusalSites(await readFile(new URL('../src/runtime.ts', import.meta.url), 'utf8'), 'src/runtime.ts')
+  assert.deepEqual(runtimeSites.filter(site => site.code === 'deliverable_uncaptured'), [], 'neither submit nor verify keeps the gate on hinted names')
 })
 
 for (const kind of ['research', 'implementation']) {
@@ -207,6 +209,35 @@ for (const kind of ['research', 'implementation']) {
     assert.equal(snapshot.completion.eligible, true, snapshot.completion.reason)
   })
 }
+
+test('a declared review output is captured in reviewArtifact.files without being listed, and one never written is refused with the review attempt live', async t => {
+  const f = await fixture(t)
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Audit the scheduler', outputs: ['docs/report.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Report\n')
+  await f.readEvidence(f.author, task, 'docs/report.md')
+  assert.equal((await f.submit(f.author, task)).status, 'submitted')
+  const review = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ kind: 'verification', reviewOf: task.id, scope: ['**'], objective: 'Review the report', outputs: ['docs/review.md'] }).id)
+  await writeFile(path.join(f.reviewer.workspace, 'docs', 'other.md'), 'other notes\n')
+  await f.readEvidence(f.reviewer, review, 'docs/report.md')
+  const verify = deliverables => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: review.attempt.id, verdict: 'accept', reason: 'Read the immutable artifact', ...(deliverables === undefined ? {} : { deliverables }) })
+  for (const deliverables of [undefined, ['docs/other.md']]) {
+    await assert.rejects(verify(deliverables), error => {
+      outputMissing(error, ['docs/review.md'], 'swarm_verify')
+      assert.doesNotMatch(error.message, /docs\/other\.md/, 'a listed deliverable that exists is not an omission')
+      return true
+    })
+    assert.equal(f.taskRow(review.id).status, 'running', 'the refusal keeps the review attempt live')
+    assert.equal(f.taskRow(review.id).attempt.id, review.attempt.id)
+    assert.equal(f.taskRow(review.id).reviewArtifact, undefined)
+    assert.equal(f.taskRow(task.id).status, 'submitted', 'no verdict was recorded')
+  }
+  await writeFile(path.join(f.reviewer.workspace, 'docs', 'review.md'), 'looks fine\n')
+  const verified = await verify(['docs/other.md'])
+  assert.equal(verified.status, 'accepted')
+  assert.deepEqual(verified.reviewArtifact.files.map(file => file.path), ['docs/other.md', 'docs/review.md'])
+  assert.equal(await f.show(verified.reviewArtifact.commit, 'docs/review.md'), 'looks fine')
+  assert.equal(f.taskRow(task.id).status, 'accepted')
+})
 
 test('an undeclared ignored file is never captured, even a member-created .env the objective names', async t => {
   const f = await fixture(t)
