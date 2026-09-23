@@ -411,7 +411,9 @@ for (const repaired of [true, false]) {
     if (repaired) {
       const proposedAt = clock.now()
       const repair = f.propose('Repair', { replaces: [source.id] })
+      // A body still open from the verdict coalesces this kick; the next tick runs it.
       await f.runtime.settle(f.mission.id)
+      await f.runtime.tick()
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair runs')
       await reminderIntervals(4)
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')

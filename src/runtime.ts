@@ -668,10 +668,17 @@ export class SwarmRuntime {
     for (let pending = started(); pending.length > 0; pending = started()) await Promise.allSettled(pending)
   }
   /**
-   * Resolves once the mission's scheduling body, and any body already kicked
-   * after it, has settled and no deferred operation (a worker start, a stop
-   * barrier, an outbox pump) is in flight. Deferred operations carry no
-   * mission, so it waits for every one. It never kicks a body itself.
+   * Resolves once the mission's queue is empty and no deferred operation (a
+   * scheduling body, a worker start, a stop barrier, an outbox pump) is in
+   * flight. Deferred operations carry no mission, so it waits for every one.
+   * It never kicks a body, so it is not quiescence: a kick made while a body
+   * is open is coalesced into that body and dropped, and the next tick runs
+   * that work (the timer's, or `tick()`). Call `tick()` after it to reach the
+   * state the timer would. Never await it from inside a scheduling body or an
+   * adapter call a body awaits: it waits for that body, which waits for it,
+   * until the body's own bound (the worker start timeout) aborts it. That call
+   * is not refused, because telling the body's own async chain from any other
+   * caller would need async context, which the runtime deliberately does not keep.
    */
   async settle(missionId: string): Promise<void> {
     for (;;) {

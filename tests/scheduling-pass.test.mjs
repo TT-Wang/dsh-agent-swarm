@@ -897,3 +897,35 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     assert.equal(unreviewed(), true, 'it is one once the grace has elapsed on the clock')
   } finally { await f.cleanup() }
 })
+
+test('settle() is not quiescence: a kick coalesced into an open body is run by the next tick, as the timer would run it', async () => {
+  // The body sweeps the author, then the reviewer, whose start the test holds.
+  // T2 for the author is proposed while that body is open and past the author,
+  // so its kick is coalesced into the body and dropped.
+  class HeldReviewerWorkers extends FakeWorkers {
+    hold
+    async start(spec) {
+      this.started.push(spec.member.id)
+      const hold = this.hold
+      if (hold === undefined || spec.member.id !== hold.memberId || hold.entered.done) return
+      hold.entered.done = true
+      hold.entered.resolve()
+      await hold.release.promise
+    }
+  }
+  const workers = new HeldReviewerWorkers()
+  const f = await setup({ workers, clock: new FakeClock() })
+  try {
+    await f.runtime.settle(f.mission.id)
+    workers.autoIdle = true
+    workers.hold = { memberId: f.reviewer.id, entered: Promise.withResolvers(), release: Promise.withResolvers() }
+    const t1 = f.propose({ title: 'T1 for the reviewer', assigneeId: f.reviewer.id })
+    await workers.hold.entered.promise
+    const t2 = f.propose({ title: 'T2 for the author' })
+    workers.hold.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    assert.deepEqual([t1, t2].map(task => taskOf(f.runtime, task.id).status), ['running', 'pending'], 'settle() returns with the coalesced kick undone')
+    await f.runtime.tick()
+    assert.equal(taskOf(f.runtime, t2.id).status, 'running', 'the next tick runs it')
+  } finally { await f.cleanup() }
+})
