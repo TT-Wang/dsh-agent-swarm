@@ -257,7 +257,10 @@ export class RefusalRegistry {
  * property test in `tests/guard-terminals.test.mjs` all speak one vocabulary.
  * The R12-F9 dependency-assumption guard is not a chain: it refuses at the call
  * that writes a dependency set (plan validation, propose, the owner amendment),
- * so no admitted task reaches dispatch in that state.
+ * so no task admitted by this build reaches dispatch in that state. A row whose
+ * dependencies an owner amended to [] under d81a3fb or earlier can: the restart
+ * hold that caught it is deleted, and dispatch takes it from the bare mission
+ * baseline (docs/known-limitations.md).
  * Every message carries a stable `[diagnostic_code]`, an imperative next step
  * and backticked parameters that resolve in the real tool schema — the refusal
  * lint (`tests/refusal-inventory.mjs`) is run over every one of them.
