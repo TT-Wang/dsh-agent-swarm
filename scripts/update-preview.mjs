@@ -207,6 +207,7 @@ async function runWorker(statePath) {
     if (url) { record({ status: 'running', pid: child.pid, launchUrl: url }); log(`restart complete: ${url}`) }
     else { record({ status: 'failed' }); log('restart failed: inspect server.log; snapshot backup at ' + state.backup) }
   } catch (error) {
+    record({ status: 'failed', error: String(error?.message ?? error) })
     log(`restart worker error: ${String(error && error.stack ? error.stack : error)}`)
   } finally {
     rmSync(statePath, { force: true })

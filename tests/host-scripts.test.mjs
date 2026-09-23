@@ -228,6 +228,9 @@ test('the restart worker checks the port again: a program that took it during th
   assert.ok(running(taker), `the program that took the port is never signalled\n${restartLog}`)
   assert.match(restartLog, new RegExp(`port ${s.port} is held by process ${taker.pid} \\(.+\\), which is not the dsh host of ${s.root}`))
   assert.doesNotMatch(restartLog, /stopping host|started host/)
+  const server = readJson(join(s.root, 'server.json'))
+  assert.equal(server.status, 'failed')
+  assert.match(server.error, new RegExp(`held by process ${taker.pid} `))
 })
 
 test('a forked child that inherited the socket is part of its parent\'s host: round names the parent and update-preview stops both', { skip: noLsof }, async t => {
@@ -286,4 +289,24 @@ test('update-preview boots the Harness the running host was launched from, not a
   writeFileSync(serverPath, JSON.stringify(legacy))
   const unrecorded = await update()
   assert.equal(unrecorded.summary.harness, harness, 'a record without a Harness needs no --harness while its host runs')
+})
+
+test('a restart whose new host cannot start records failed with the reason, not a lasting restarting', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
+  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log')
+  // A supervisor takes the port back the moment the old host exits, so startHost refuses after the stop.
+  const supervisor = createServer()
+  hand.once('exit', () => supervisor.listen(s.port, '127.0.0.1'))
+  try {
+    writeFileSync(join(s.root, 'server.json'), JSON.stringify({ status: 'running', pid: hand.pid, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness }))
+    const update = await s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '0'])
+    assert.equal(update.code, 0, update.stderr)
+    await until(() => !readdirSync(s.root).some(name => name.startsWith('.update-preview-')), 'the detached restart worker')
+    const restartLog = readFileSync(join(s.root, 'restart.log'), 'utf8')
+    assert.match(restartLog, new RegExp(`stopping host ${hand.pid}\\n.*restart worker error: Error: port ${s.port} is held by process ${process.pid}`, 's'))
+    const server = readJson(join(s.root, 'server.json'))
+    assert.equal(server.status, 'failed', restartLog)
+    assert.equal(server.error, `port ${s.port} is held by process ${process.pid}; stop it before starting a host`)
+  } finally { supervisor.close() }
 })
