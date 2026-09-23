@@ -1,4 +1,11 @@
-/** F1: owner pauses mid-attempt, then resumes. The task re-pends without spending a recovery credit. */
+/**
+ * F1: owner pauses mid-attempt, then resumes. The task re-pends without spending a recovery credit.
+ *
+ * Since 69211b9 a pause fences the attempt through the stop barrier: the task is
+ * `blocked` with a stop marker until the old handle's stop is confirmed, and only
+ * that confirmation re-pends it (design.md, "Task quiescence lives on
+ * `Task.resumeAfterStop`").
+ */
 import assert from 'node:assert/strict'
 import { setup, eventually, events, taskOf, runScenario } from './harness.mjs'
 
@@ -14,10 +21,17 @@ await runScenario({
       const creditsBefore = taskOf(f.runtime, task.id).recoveryCount ?? 0
       // Injection: the owner pauses while the attempt is running.
       f.runtime.control(f.owner, f.mission.id, 'pause', 'F1: owner pauses mid-attempt')
-      const paused = taskOf(f.runtime, task.id)
-      assert.equal(paused.status, 'pending', 'the paused task re-pends')
-      assert.equal(paused.attempt, undefined, 'the paused attempt is fenced')
-      assert.equal(paused.epoch, claimed.epoch + 1, 'the epoch fences the interrupted attempt')
+      const fenced = taskOf(f.runtime, task.id)
+      assert.equal(fenced.attempt, undefined, 'the paused attempt is fenced')
+      assert.equal(fenced.epoch, claimed.epoch + 1, 'the epoch fences the interrupted attempt')
+      assert.deepEqual(fenced.resumeAfterStop && { epoch: fenced.resumeAfterStop.epoch, memberId: fenced.resumeAfterStop.memberId }, { epoch: fenced.epoch, memberId: f.author.id }, 'the fence owes the old handle a stop')
+      const paused = await eventually(() => {
+        const current = taskOf(f.runtime, task.id)
+        return current.status === 'pending' ? current : undefined
+      }, 'the paused task re-pends once the old handle has stopped')
+      assert(f.workers.stopped.includes(f.author.id), 'the re-pend follows a confirmed stop of the old handle')
+      assert.equal(paused.resumeAfterStop, undefined, 'the stop marker is released')
+      assert.equal(paused.epoch, claimed.epoch + 1, 'the barrier keeps the fenced epoch')
       assert.equal(paused.recoveryCount ?? 0, creditsBefore, 'I1: pause spends no recovery credit')
       assert.equal(events(f.runtime, f.mission.id, 'mission/pause').length, 1, 'the pause is durable')
       assert.equal(events(f.runtime, f.mission.id, 'task/claimed').length, 1, 'the interrupted claim is preserved')
