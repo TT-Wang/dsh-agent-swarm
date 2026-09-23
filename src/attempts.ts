@@ -12,6 +12,7 @@ import { hasNotice } from './arena.ts'
 import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { memberPhaseOf } from './projection.ts'
+import { PolicyError } from './policy-error.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -269,7 +270,7 @@ export class Attempts {
    * the mission deadline so a stored lease can never outlive the mission.
    */
   fenceAttempt(mission: Mission, task: Task, windowMs: number): void {
-    if (!task.attempt) throw new Error('Task has no active attempt')
+    if (!task.attempt) throw new PolicyError('task_attempt_missing', 'lease_error', 'Task has no active attempt')
     const leaseUntil = Math.min(mission.deadline, Date.now() + Math.max(this.rt.config.leaseMs, windowMs))
     if (!Number.isSafeInteger(leaseUntil)) throw new Error('Attempt lease exceeds the supported clock range')
     task.attempt.leaseUntil = leaseUntil

@@ -199,7 +199,9 @@ test('the cancel RPC withdraws one task for the owner and refuses other sessions
   // Unknown tasks fail with an authored policy message, not a raw store error.
   const unknown = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: 'invented', reason: 'x' })
   assert.equal(unknown.result.error.code, 'bad-request')
-  assert.match(unknown.result.error.message, /Task is not in this mission/)
+  assert.equal(unknown.result.error.message, 'Task is not in this mission')
+  // Typed, so its visibility no longer depends on the allowlist matching its prose.
+  assert.deepEqual(unknown.result.error.details, { issues: [], policyCode: 'task_not_in_mission', category: 'validation_error' })
 })
 
 test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t => {

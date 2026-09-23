@@ -878,7 +878,7 @@ export class SwarmRuntime {
   }
   task(missionId: string, taskId: string): Task {
     const task = this.store.get('tasks', taskId)
-    if (!task || task.missionId !== missionId) throw new Error('Task is not in this mission')
+    if (!task || task.missionId !== missionId) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
     return task
   }
   /**
@@ -889,7 +889,7 @@ export class SwarmRuntime {
    */
   private lineage(missionId: string, dependencyId: string, tasks = this.store.list('tasks', missionId), graph = taskGraphIndex(tasks)): Task[] {
     const chain = graph.lineage(dependencyId)
-    if (!chain.length) throw new Error('Task is not in this mission')
+    if (!chain.length) throw new PolicyError('task_not_in_mission', 'validation_error', 'Task is not in this mission')
     return chain
   }
   /** Effective prerequisites for workspace preparation; one accepted repair covering several originals is merged once. */
@@ -1225,7 +1225,7 @@ export class SwarmRuntime {
     const { mission, key, owner } = this.active(actor, missionId, admittedId !== undefined)
     const prior = admittedId ? this.store.get('tasks', admittedId) : undefined
     if (prior) {
-      if (prior.missionId !== missionId) throw new Error('Task identity conflict')
+      if (prior.missionId !== missionId) throw new PolicyError('task_identity_conflict', 'conflict_error', 'Task identity conflict')
       // F7: launchDraft retries with deterministic ids. A withdrawn record must
       // never be silently re-admitted, or a mission can activate with dead work.
       if (prior.status === 'cancelled') throw new Error(`Task ${prior.id} was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.`)
@@ -1530,7 +1530,7 @@ export class SwarmRuntime {
       const task = this.task(missionId, taskId)
       if (pendingStopOwner(this.store.list('tasks', missionId), member.id)) throw new Error('Worker is waiting for its previous attempt to stop')
       const blocker = this.scheduling.readinessBlocker(task, member)
-      if (blocker !== undefined) throw new Error(`Task is not ready for this member: ${blocker}`)
+      if (blocker !== undefined) throw new PolicyError('task_not_ready', 'conflict_error', `Task is not ready for this member: ${blocker}`)
       this.assertAdmission(task, member)
       await this.assertWorkspaceAuthorized(this.mission(missionId))
       await this.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.effectiveDependencies(missionId, task), task.reviewOf ? this.task(missionId, task.reviewOf) : undefined)
@@ -1538,7 +1538,7 @@ export class SwarmRuntime {
       const fresh = this.task(missionId, taskId)
       if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId
         || fresh.plannedAssigneeId !== task.plannedAssigneeId || fresh.assignmentMode !== task.assignmentMode
-        || !this.ready(fresh, member)) throw new Error('Task changed while preparing its workspace')
+        || !this.ready(fresh, member)) throw new PolicyError('task_changed_during_preparation', 'conflict_error', 'Task changed while preparing its workspace')
       const result = this.assign(fresh, member)
       this.kick(missionId)
       return result

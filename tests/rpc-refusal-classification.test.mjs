@@ -59,9 +59,9 @@ const classified = message => ACTIONABLE.some(pattern => pattern.test(message))
 
 test('the sanitizer allowlist is extracted from the source and classifies the authored refusal', () => {
   assert.ok(ACTIONABLE.length > 0, 'the source allowlist must not be empty')
-  assert.ok(classified('Task is not in this mission'), 'the cancel RPC refusal is RPC-actionable')
-  assert.ok(!classified('[task_not_in_mission] Task is not in this mission. Correct `taskId` and retry.'),
-    'the annotated form of that refusal is NOT classified: annotating it downgrades the RPC')
+  assert.ok(classified('Session is not a participant in this mission'), 'a legacy participant refusal is RPC-actionable')
+  assert.ok(!classified('[mission_participant_required] Session is not a participant in this mission. Correct `missionId` and retry.'),
+    'the annotated form of that refusal is NOT classified: annotating a legacy Error downgrades the RPC')
 })
 
 test('no refusal the sanitizer classifies carries a diagnostic prefix, and no annotated refusal is a template', () => {

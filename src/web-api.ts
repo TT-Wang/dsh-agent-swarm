@@ -91,7 +91,6 @@ const actionableMessages: readonly RegExp[] = [
   /^Workers cannot create independent missions or budgets$/,
   /^Swarm runtime is (?:closed|shutting down)$/,
   /^Discard unused drafts before creating more$/,
-  /^Task (?:is not in this mission|is not ready for this member|changed while preparing its workspace|has no active attempt|identity conflict)$/,
   /^Task .* is accepted; accepted work is immutable/,
   /^A task prerequisite is no longer accepted/,
   /^Stale or unauthorized task attempt/,
