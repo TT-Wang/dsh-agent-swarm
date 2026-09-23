@@ -65,6 +65,13 @@ test('evidence must reference actual executions from the publishing attempt',asy
   assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,input),/host-recorded/)
   await f.workers.callbacks.toolRun(f.a.id,{tool:'bash',arguments:{command:'test'},result:{exitCode:1},isError:false})
   const runs=f.runtime.observe(f.actorA,f.mission.id).toolRuns
+  // The exported runtime API has no tool schema in front of it: an unknown or
+  // missing outcome is refused, typed, instead of being stored and verified.
+  for (const outcome of ['maybe', undefined, 'Supported']) {
+    assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,{...input,outcome,toolRunIds:[runs[0].id]}),
+      error=>error.name==='PolicyError'&&error.code==='invalid_evidence_outcome'&&error.category==='validation_error'&&/^\[invalid_evidence_outcome\] Evidence `outcome` must be supported, disproved or inconclusive/.test(error.message))
+  }
+  assert.equal(f.runtime.store.list('evidence',f.mission.id).length,0,'a refused outcome stores no evidence')
   const evidence=f.runtime.publish(f.actorA,f.mission.id,{...input,toolRunIds:[runs[0].id]})
   assert.equal(evidence.status,'unverified'); assert.equal(evidence.outcome,'disproved')
   assert.equal(f.runtime.observe(f.actorB,f.mission.id).toolRuns.length,0)

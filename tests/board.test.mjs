@@ -184,10 +184,16 @@ test('the after cursor pages the board without gaps or repeats', async t => {
   assert.equal(newest.page.remaining, 4)
 })
 
-test('invalid posts are rejected: bound, citations, foreign member and reply target', async t => {
-  // An unknown kind is refused by swarm_post's own schema enum before the
-  // runtime is called (see the tool test below); the runtime checks the rest.
+test('invalid posts are rejected: kind, bound, citations, foreign member and reply target', async t => {
+  // swarm_post's own schema enum refuses an unknown kind first on the tool path
+  // (see the tool test below); the exported runtime API refuses it by itself.
   const f = await fixture(t, { maxMessageChars: 64 })
+  for (const kind of ['GOSSIP', undefined, 'ask']) {
+    assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind, body: 'not a kind' }),
+      error => error.name === 'PolicyError' && error.code === 'post_kind_invalid' && error.category === 'validation_error' && /^\[post_kind_invalid\] A post `kind` must be one of ASK, ANSWER, IDEA, ALERT, ARTIFACT, HANDOFF\./.test(error.message))
+  }
+  assert.throws(() => f.runtime.board(f.aliceActor, f.mission.id, { kind: 'GOSSIP' }), error => error.code === 'board_kind_invalid' && /^\[board_kind_invalid\]/.test(error.message))
+  assert.equal(f.runtime.board(f.aliceActor, f.mission.id, {}).page.matching, 0, 'no refused post was stored')
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: '   ' }), /content is required/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'x'.repeat(65) }), /exceeds 64 characters/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'cite', evidenceIds: ['evidence_missing'] }), /Unknown evidence in this mission/)

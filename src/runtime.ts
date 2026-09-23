@@ -42,6 +42,15 @@ async function abortableStart<T>(operation: Promise<T>, signal: AbortSignal): Pr
   try { return await Promise.race([operation, interrupted]) }
   finally { signal.removeEventListener('abort', abort) }
 }
+/**
+ * Closed board kind vocabulary. The tool path's schema enum refuses a free-form
+ * kind first ([tool_arguments_invalid]); the exported runtime API and the
+ * browser RPC reach `post`/`board` without it, so the runtime keeps its own check.
+ */
+const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
+/** Closed evidence outcome vocabulary; an unknown or missing outcome would be stored and later verified. */
+const EVIDENCE_OUTCOMES: readonly string[] = ['supported', 'disproved', 'inconclusive']
+
 /** Board delta reads are bounded to this page size unless the caller asks for less. */
 const BOARD_PAGE_MAX = 100
 const BOARD_PAGE_DEFAULT = 20
@@ -1267,6 +1276,11 @@ export class SwarmRuntime {
     const proposed = input.acceptance ?? []
     if (!input.replaces?.length || !Array.isArray(proposed) || proposed.length > 0) requireStrings(proposed, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
+    // The tool path's schema types these first; the browser propose RPC and the
+    // exported runtime API reach here without it, and a stored string priority
+    // or experiment makes the client reject the whole mission snapshot.
+    if (input.priority !== undefined && !Number.isSafeInteger(input.priority)) throw new PolicyError('task_priority_invalid', 'validation_error', '[task_priority_invalid] `priority` must be an integer. Pass `priority` as an integer with `swarm_propose`, or omit it for the default, then retry.')
+    if (input.experiment !== undefined && typeof input.experiment !== 'boolean') throw new PolicyError('task_experiment_invalid', 'validation_error', '[task_experiment_invalid] `experiment` must be a boolean. Pass `experiment` as true or false with `swarm_propose`, or omit it, then retry.')
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'task.scope', mission.scope)
@@ -1594,6 +1608,7 @@ export class SwarmRuntime {
     const ceiling = taskCeilingBlock(task)
     if (ceiling !== undefined) { this.blockTaskCeiling(this.mission(missionId), task, ceiling); throw new Error(ceiling.reason) }
     this.bounded(input.claim)
+    if (!EVIDENCE_OUTCOMES.includes(input.outcome)) throw new PolicyError('invalid_evidence_outcome', 'validation_error', '[invalid_evidence_outcome] Evidence `outcome` must be supported, disproved or inconclusive; it describes the hypothesis, not task success. Correct `outcome` and retry `swarm_publish`.')
     this.validateRuns(missionId, member.id, task, input.toolRunIds)
     const lineage = this.replacementLineage(missionId, task)
     for (const previous of input.supersedes ?? []) {
@@ -2042,6 +2057,7 @@ export class SwarmRuntime {
    */
   post(actor: Actor, missionId: string, input: PostInput): Post {
     const { key } = this.active(actor, missionId)
+    if (!POST_KINDS.includes(input.kind)) throw new PolicyError('post_kind_invalid', 'validation_error', '[post_kind_invalid] A post `kind` must be one of ASK, ANSWER, IDEA, ALERT, ARTIFACT, HANDOFF. Correct `kind` and retry `swarm_post`.')
     const body = this.bounded(input.body)
     if (input.to !== undefined) {
       if (input.to === 'me') throw new Error('Recipient "me" is a board read filter, not a post target')
@@ -2105,6 +2121,7 @@ export class SwarmRuntime {
     }
     if (query.after !== undefined && (!Number.isSafeInteger(query.after) || query.after < 0)) throw new Error('after must be a nonnegative integer')
     if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit < 1)) throw new Error('limit must be a positive integer')
+    if (query.kind !== undefined && !POST_KINDS.includes(query.kind)) throw new PolicyError('board_kind_invalid', 'validation_error', '[board_kind_invalid] The board `kind` filter must be one of ASK, ANSWER, IDEA, ALERT, ARTIFACT, HANDOFF. Correct `kind` or omit it, and retry `swarm_board`.')
     if (query.taskId !== undefined) this.task(missionId, query.taskId)
     if (query.to !== undefined && query.to !== 'me' && query.to !== 'owner') {
       const target = this.store.get('members', query.to)
