@@ -60,14 +60,12 @@ test('propose admits a per-task ceiling on every task and rejects invalid or ove
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.length, 2, 'a rejected ceiling admits no task')
 })
 
-test('propose reconciles objective write directives with the task scope at the production call site', async t => {
+test('propose never refuses a task for the paths its objective names', async t => {
   const f = await setup(t)
   assert.doesNotThrow(() => f.propose({ objective: 'Add a file under `docs/` describing the change' }))
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.length, 1)
   const admitted = f.propose({ objective: 'Implement `src/value.ts` and add `src/value-helper.ts`' })
   assert.equal(admitted.objective, 'Implement `src/value.ts` and add `src/value-helper.ts`')
-  assert.doesNotThrow(() => f.propose({ title: 'Prohibited', objective: 'Implement the change. Do not edit `docs/legacy.md`.' }))
-  assert.doesNotThrow(() => f.propose({ title: 'Factual', objective: 'Implement the change; the reproduction is committed at `docs/repro.mjs`.' }))
 })
 
 test('beforeStep blocks a task at its own step ceiling without charging the mission budget', async t => {

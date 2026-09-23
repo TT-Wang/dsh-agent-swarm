@@ -124,17 +124,9 @@ test('objective prose that names paths neither refuses a plan nor yields a path 
   input.tasks[1].objective = 'Add a file under `docs/` describing the change and implement it.'
   assert.doesNotThrow(() => validatePlan(input))
   assert.deepEqual(planAdvisories(input).filter(item => item.code !== 'check_preflight'), [], 'objective prose yields no path hint')
-  const inScope = plan('/workspace')
-  inScope.tasks[1].objective = 'Add `src/value.cjs` and implement the change.'
-  assert.equal(validatePlan(inScope).tasks[1].objective, inScope.tasks[1].objective)
-  const prohibited = plan('/workspace')
-  prohibited.tasks[1].objective = 'Implement the change. Do not edit `docs/legacy.md` or `src/other.ts`.'
-  assert.doesNotThrow(() => validatePlan(prohibited), 'a prohibition is not a write directive')
-  const factual = plan('/workspace')
-  factual.tasks[1].objective = 'Implement the change; the pre-fix reproduction is committed at `docs/repro.mjs`.'
-  assert.doesNotThrow(() => validatePlan(factual), 'a factual statement is not a write directive')
   const mission = plan('/workspace', { objective: 'Add `docs/design-notes.md` and deliver verified code' })
-  assert.doesNotThrow(() => validatePlan(mission), 'mission-level language is advisory too')
+  assert.doesNotThrow(() => validatePlan(mission), 'mission-level prose is not read for paths either')
+  assert.deepEqual(planAdvisories(mission).filter(item => item.code !== 'check_preflight'), [])
 })
 
 test('check admission inspects actual commands without a project-specific name veto', () => {
