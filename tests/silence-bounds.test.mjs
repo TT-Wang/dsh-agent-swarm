@@ -12,9 +12,12 @@
  *     unrelated lease lived, so the tick timer's only liveness action was
  *     swallowed with no bound. R16-D bounds it: past
  *     `stallPassReleaseBoundMs` (= `stallPassTimeoutMs` + `stallPassLiveGraceMs`)
- *     the pass is released even with live work, the release is recorded durably
- *     on the row, the abandoned body stays fenced, and the escalation names both
- *     the wedged pass and the live work the release preserved.
+ *     the pass is named even with live work, the durable event records the
+ *     bound and the live work, and the escalation names both the wedged pass and
+ *     the live work it preserved. The pass guard is now the in-memory record of
+ *     the body the mission queue holds: no body runs beside a wedged one, so
+ *     there is no release to record and no fence to keep; the body releases the
+ *     guard when its own bounded await settles.
  *  2. An attempt whose durable progress passed its declared bound escalates with
  *     its own subject (`taskId@epoch`) and member, from the queue-external tick,
  *     so a wedged pass cannot hide it. The clock is durable rows only: a lease
@@ -24,7 +27,8 @@
  * each pair has a test below that exercises the PAIR, not one side:
  *  - bounded release x off-pass wedged classification x the notice dedup key
  *    (R16-D1, R16-D2);
- *  - release x `livePass`/`kick` x the fence (R16-D3, supersede path);
+ *  - the naming x `livePass`/`kick` (R16-D3: a control-path kick neither
+ *    supersedes nor duplicates a wedged body);
  *  - attempt bound x F1 operation silence and x the lease renewal that
  *    legitimately keeps a producing attempt alive (R16-D4, R16-D6);
  *  - attempt bound x the W6 idle close-out, which must not double-report the
@@ -86,26 +90,26 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   return {
     directory, runtime, workers, owner, mission, stream, addMember, actorFor, propose, notices, staleEvents,
     passKey: runtime.scheduling.passKey(mission.id),
-    passRow: () => runtime.store.get('passes', runtime.scheduling.passKey(mission.id)),
+    pass: () => runtime.scheduling.passes.get(mission.id),
     escalations: prefix => notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith(prefix)),
   }
 }
 
-/** Open a pass and wedge it in `workers.start`, then return the wedged row. */
+/** Open a pass and wedge it in `workers.start`, then return the wedged pass record. */
 async function wedgeNextPass(f, workers) {
   // Arm only once the board is quiet: the pass opened by the last `kick` must
-  // have finished, so the NEXT pass is the one that hangs.
-  await eventually(() => f.passRow()?.status !== 'running' ? true : undefined, 'the current pass must finish before the wedge is armed')
+  // have settled, so the NEXT pass is the one that hangs.
+  await eventually(() => f.pass() === undefined ? true : undefined, 'the current pass must finish before the wedge is armed')
   workers.options.hangStart = true
   f.runtime.kick(f.mission.id)
   const wedged = await eventually(() => {
-    const row = f.passRow()
-    return row?.status === 'running' && f.runtime.scheduling.passWedged(f.mission.id) ? row : undefined
+    const pass = f.pass()
+    return pass !== undefined && f.runtime.scheduling.passWedged(f.mission.id) ? pass : undefined
   }, 'a pass must wedge past its declared bound')
   return wedged
 }
 
-test('R16-D1: a pass wedged on live work is released inside its declared live-work bound, and both subjects are named', async t => {
+test('R16-D1: a pass wedged on live work is named inside its declared live-work bound, and both subjects are named', async t => {
   const workers = new Workers({ idle: () => false })
   const f = await scenario(t, { workers, config: { stallPassTimeoutMs: 120, stallPassLiveGraceMs: 120 } })
   const builder = await f.addMember('Builder')
@@ -117,12 +121,11 @@ test('R16-D1: a pass wedged on live work is released inside its declared live-wo
   const pending = f.propose('Waiting behind the wedge', { assigneeId: builder.id })
 
   const wedged = await wedgeNextPass(f, workers)
-  // The release must land inside the declared bound, not whenever the sibling
+  // The naming must land inside the declared bound, not whenever the sibling
   // lease happens to lapse (it never does inside this test). The durable event
-  // is the stable record of it: the row is already overwritten by the next pass
-  // carrying the release forward.
-  const event = await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.runId).at(-1),
-    'the wedged pass must be released while the sibling lease is still live', 3000)
+  // is the record of it.
+  const event = await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.operationId).at(-1),
+    'the wedged pass must be named while the sibling lease is still live', 3000)
   const age = event.data.releaseGapMs
   assert.ok(age >= 240, `the release waits for the whole declared live-work bound (released after ${age}ms)`)
   assert.ok(age <= 240 + 4 * f.runtime.config.tickMs, `the release is bounded by the declared live-work bound, not by the lease (released after ${age}ms)`)
@@ -132,104 +135,92 @@ test('R16-D1: a pass wedged on live work is released inside its declared live-wo
   assert.equal(after.attempt.id, held.attempt.id, 'the sibling attempt was not stopped, dropped or reassigned')
   assert.equal(after.attempt.leaseUntil, held.attempt.leaseUntil, 'no lease was changed by the release')
   assert.equal(f.runtime.store.get('tasks', pending.id).status, 'pending', 'the work the wedged pass never reached is still there to dispatch')
-  // R16-D1(b): the release is recorded durably with the bound it was measured
+  // R16-D1(b): the naming is recorded durably with the bound it was measured
   // against, and the live work that held it.
   assert.equal(event.data.reason, `scheduling pass did not return within its 120ms bound and advanced no durable state`)
-  assert.equal(f.passRow().releasedRunId, wedged.runId, 'the durable row names the released run')
-  assert.ok(f.passRow().releases >= 1, 'the durable row counts the release')
-  assert.equal(f.passRow().worstRelease.heldByLiveWork, true, 'the accumulated record names the live work that held it')
-  assert.equal(f.passRow().worstRelease.boundMs, 240, 'the release was measured against the live-work bound')
   assert.deepEqual(event.data.liveSubjects, [`${sibling.id}@${held.epoch}`], 'the held-by subject is the live sibling')
   assert.equal(event.data.releasedWhileLive, true)
   assert.equal(event.data.releaseBoundMs, 240)
   assert.equal(event.data.releasedAt, wedged.startedAt + age)
   // R16-D1(c): the durable event and the owner notice name the wedged pass and
   // the preserved work.
-  const notice = f.notices().find(delivery => typeof delivery.content === 'string' && delivery.content.includes('live-work bound') && delivery.content.includes(wedged.runId))
+  const notice = f.notices().find(delivery => typeof delivery.content === 'string' && delivery.content.includes('live-work bound') && delivery.content.includes(wedged.operationId))
   assert.ok(notice, `the owner notice names the release and the bound: ${JSON.stringify(f.notices().map(delivery => delivery.content.slice(0, 80)))}`)
   assert.match(notice.content, /preserved untouched/, 'the notice states the work was preserved')
   assert.match(notice.content, new RegExp(`${sibling.id}@${held.epoch} held by ${builder.id}`), 'the notice names the subject and the member holding it')
   assert.ok(notice.subjects.includes(`${sibling.id}@${held.epoch}`), 'the notice carries the held-by subject in its durable row')
   assert.ok(notice.subjects.includes(`${pending.id}@${f.runtime.store.get('tasks', pending.id).epoch}`), 'and the work the pass never reached')
-  // R16-D1(d): the guard is free, so a later tick opens a new pass instead of
-  // being swallowed by the wedged body.
-  const next = await eventually(() => f.passRow()?.runId !== wedged.runId ? f.passRow() : undefined, 'a later pass must open after the release', 3000)
-  assert.notEqual(next.runId, wedged.runId, 'the guard was released, not held by the sibling lease')
+  // R16-D1(d): the named body no longer owns generation: the mission publishes
+  // as wedged, not as inside a live pass, while the sibling lease still lives.
+  // No second body is queued behind the one the queue still owns.
+  assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'the sibling lease does not keep the named pass live')
+  assert.equal(f.pass(), wedged, 'no later tick queued a second body behind the wedged one')
 })
 
-test('R16-D2 pair: a released pass is fenced durably and its own run is announced exactly once', async t => {
+test('R16-D2 pair: a wedged pass is announced exactly once and no second body overlaps it', async t => {
   const workers = new Workers({ idle: () => false })
   const f = await scenario(t, { workers, config: { stallPassTimeoutMs: 120, stallPassLiveGraceMs: 120 } })
   const builder = await f.addMember('Builder')
   const sibling = f.propose('Healthy sibling', { assigneeId: builder.id })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, sibling.id)
   const wedged = await wedgeNextPass(f, workers)
-  // The durable event is the stable record of the release: the row is already
-  // overwritten by the next pass, which carries the release forward.
-  await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.runId).at(-1),
-    'the wedged pass must be released', 3000)
-  // Pair 1: the fence. The abandoned body is stopped by the durable record even
-  // though the in-memory fast path is cleared (the S5c verifier reproduction).
-  assert.equal(f.runtime.scheduling.passReleased(wedged), true, 'the durable row fences the released body')
-  f.runtime.releasedPasses.clear()
-  assert.equal(f.runtime.scheduling.passReleased(wedged), true, 'the fence survives a cleared in-memory Set')
+  const event = await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.operationId).at(-1),
+    'the wedged pass must be named', 3000)
+  assert.ok(event.data.releaseGapMs >= 200, `the event keeps the whole wedge measured at its naming (${event.data.releaseGapMs}ms)`)
   const nativeStarts = workers.started.length
-  // Pair 2: the notice dedup key. One released run is named once, by its own run
-  // id. Queued successors cannot start another physical operation until the
-  // hung native call returns, while the off-pass watchdog keeps naming it.
+  // Pair 1: the mission queue. The wedged body is the only body: no later tick
+  // queues another one behind it, and none starts a physical operation beside
+  // the hung native call.
+  // Pair 2: the notice dedup key. One wedged body is named once, by its own
+  // operation id, while the off-pass watchdog keeps running.
   await sleep(500)
   const wedgedEvents = f.staleEvents('mission/stalled').filter(item => item.data.wedged === true)
-  assert.equal(wedgedEvents.filter(item => item.data.runId === wedged.runId).length, 1, 'the released run is witnessed exactly once')
-  assert.equal(f.notices().filter(delivery => typeof delivery.content === 'string' && delivery.content.includes(`run ${wedged.runId}`)).length, 1,
-    'the released run is announced to the owner exactly once')
-  assert.equal(wedgedEvents.length, 1, `an unchanged board is not re-announced by later releases: ${JSON.stringify(wedgedEvents.map(item => item.data.runId))}`)
-  // A queued successor is not another physical hang. Keep the release witness
-  // without requiring fabricated repeated starts merely to raise its count.
-  const row = f.passRow()
-  assert.ok(row.releases >= 1, `the durable row retains the original release (${row.releases})`)
-  assert.equal(workers.started.length, nativeStarts, 'new pass rows never overlap the still-running native startup')
-  assert.ok(row.worstRelease.gapMs >= 200, `the accumulated record keeps the widest release (${row.worstRelease.gapMs}ms)`)
-  assert.equal(typeof row.worstRelease.runId, 'string', 'the durable row still names a released run')
+  assert.equal(wedgedEvents.filter(item => item.data.runId === wedged.operationId).length, 1, 'the wedged body is witnessed exactly once')
+  assert.equal(f.notices().filter(delivery => typeof delivery.content === 'string' && delivery.content.includes(`run ${wedged.operationId}`)).length, 1,
+    'the wedged body is announced to the owner exactly once')
+  assert.equal(wedgedEvents.length, 1, `an unchanged board is not re-announced: ${JSON.stringify(wedgedEvents.map(item => item.data.runId))}`)
+  assert.equal(f.pass(), wedged, 'no second body was queued behind the wedged one')
+  assert.equal(workers.started.length, nativeStarts, 'no pass body overlaps the still-running native startup')
   assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'and the preserved work is untouched')
 })
 
-test('R16-D3 pair: a pass that supersedes a wedged row releases and names it without the watchdog', async t => {
-  // The tick timer opens every 1000ms and the fabricated row is already 5s past
-  // the release bound, so the watchdog cannot be the releaser here: the release
-  // must come from `openPass` itself, or the guard would be silently overwritten
-  // by the row write (the between-ticks window a control-path `kick` can hit).
+test('R16-D3 pair: a control-path kick neither supersedes nor duplicates a wedged body, and the watchdog names it', async t => {
+  // The tick timer runs every 1000ms and the fabricated body is already 5s past
+  // its live-work bound: the between-ticks window a control-path `kick` can hit.
+  // The kick must leave the wedged body in place (the queue could not run a
+  // second one before it settles), and the watchdog names it.
   const workers = new Workers({ idle: () => false })
   const f = await scenario(t, { workers, config: { tickMs: 1000, stallPassTimeoutMs: 1000, stallPassLiveGraceMs: 0 } })
   const builder = await f.addMember('Builder')
   const sibling = f.propose('Healthy sibling', { assigneeId: builder.id })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, sibling.id)
   const held = f.runtime.store.get('tasks', sibling.id)
-  // The wedged row, in exactly the shape the watchdog sees: running, this
-  // instance, past the release bound.
+  // The wedged body's record, in exactly the shape the watchdog sees: held on
+  // the mission queue, past the live-work bound.
+  await eventually(() => f.pass() === undefined ? true : undefined, 'the passes the claim kicked must settle')
   const wedged = {
-    id: f.passKey, runId: 'run_wedged_probe', instanceId: f.runtime.instanceId, missionId: f.mission.id,
-    status: 'running', startedAt: Date.now() - 5000, revisionBefore: f.runtime.store.revision(),
+    id: f.passKey, operationId: 'operation_wedged_probe', missionId: f.mission.id,
+    startedAt: Date.now() - 5000, revisionBefore: f.runtime.store.revision(),
     fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
   }
-  f.runtime.store.transaction(() => f.runtime.store.put('passes', wedged))
-  assert.equal(f.runtime.scheduling.livePass(f.mission.id), undefined, 'past the release bound the row is no longer a guard')
+  f.runtime.scheduling.passes.set(f.mission.id, wedged)
+  t.after(() => f.runtime.scheduling.closePass(f.mission.id, wedged))
+  assert.equal(f.runtime.scheduling.livePass(f.mission.id), undefined, 'past the live-work bound the body no longer owns generation')
   assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'but it is still the wedged subject')
   f.runtime.kick(f.mission.id)
-  const row = f.passRow()
-  assert.notEqual(row.runId, wedged.runId, 'a new pass opened')
-  assert.equal(row.releasedRunId, wedged.runId, 'the superseded row was released, not silently overwritten')
-  assert.equal(row.releases, 1, 'the release is counted durably')
-  assert.equal(row.status, 'running', 'and the new pass owns the guard')
-  assert.equal(f.runtime.scheduling.passReleased(wedged), true, 'the superseded body is fenced')
+  assert.equal(f.pass(), wedged, 'the kick neither superseded nor duplicated the wedged body')
+  f.runtime.scheduling.checkSchedulingPasses()
   assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'the live work is preserved')
   assert.equal(f.runtime.store.get('tasks', sibling.id).attempt.id, held.attempt.id)
-  const event = f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.runId)
-  assert.equal(event.length, 1, 'the supersede path names the wedged pass durably')
+  const event = f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.operationId)
+  assert.equal(event.length, 1, 'the watchdog names the wedged pass durably')
   assert.equal(event[0].data.releaseBoundMs, 1000, 'against the declared bound in force')
-  assert.equal(event[0].data.releasedWhileLive, true, 'and names the live work present at the release')
-  const notice = f.notices().find(delivery => typeof delivery.content === 'string' && delivery.content.includes(`run ${wedged.runId}`))
-  assert.ok(notice, 'and the owner is told which pass execution was released')
+  assert.equal(event[0].data.releasedWhileLive, true, 'and names the live work present at the naming')
+  const notice = f.notices().find(delivery => typeof delivery.content === 'string' && delivery.content.includes(`run ${wedged.operationId}`))
+  assert.ok(notice, 'and the owner is told which pass execution is wedged')
   assert.match(notice.content, /released the mission's scheduling guard/)
+  f.runtime.scheduling.checkSchedulingPasses()
+  assert.equal(f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.operationId).length, 1, 'a later tick does not name the same body again')
 })
 
 test('R16-D4: an attempt with no durable progress past its bound escalates with its own subject and member', async t => {
@@ -329,12 +320,12 @@ test('R16-D7 pair: the attempt bound fires from the queue-external tick while th
   assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged')
   const escalation = await eventually(() => f.escalations('attempt-silent:').find(delivery => delivery.notice.dedupKey.startsWith(`attempt-silent:${claimed.attempt.id}:`)),
     'the tick names the attempt even though the in-pass recovery sweep cannot run', 3000)
-  assert.match(escalation.content, new RegExp(`scheduling pass ${wedged.runId} is wedged past its 120ms bound`),
+  assert.match(escalation.content, new RegExp(`scheduling pass ${wedged.operationId} is wedged past its 120ms bound`),
     'the notice names the wedged pass that cannot report it')
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'and the pass is still wedged: the release bound was not reached')
+  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'and the pass is still wedged: its body has not settled')
 })
 
-test('R16-D8: the silence projection reads both gaps, the release record and the unreported ends from the store alone', async t => {
+test('R16-D8: the silence projection reads both gaps, the wedge record and the unreported ends from the store alone', async t => {
   const workers = new Workers({ idle: () => false })
   const f = await scenario(t, { workers, config: { stallPassTimeoutMs: 100, stallPassLiveGraceMs: 100, attemptSilenceBoundMs: 200 } })
   const builder = await f.addMember('Builder')
@@ -353,25 +344,22 @@ test('R16-D8: the silence projection reads both gaps, the release record and the
   dropped.status = 'pending'; delete dropped.attempt; delete dropped.assigneeId
   f.runtime.store.put('tasks', dropped)
   const wedged = await wedgeNextPass(f, workers)
-  // The durable event is the stable record of the release; the row is already
-  // overwritten by the next pass carrying the release forward.
-  await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.runId).at(-1),
-    'the wedge is released inside its bound', 3000)
-  const released = f.passRow()
-  const releasedRecord = { releases: released.releases, worstRelease: released.worstRelease }
+  // The durable event is the record of the wedge.
+  const named = await eventually(() => f.staleEvents('mission/stalled').filter(item => item.data.wedged === true && item.data.runId === wedged.operationId).at(-1),
+    'the wedge is named inside its bound', 3000)
   const escalated = await eventually(() => f.escalations('attempt-silent:').find(delivery => delivery.notice.dedupKey.startsWith(`attempt-silent:${claimedHeld.attempt.id}:`)),
     'the silence is escalated', 3000)
 
   const report = silenceReport(f.runtime, f.mission.id)
   assert.equal(report.missionId, f.mission.id)
   assert.deepEqual(report.bounds, { passMs: 100, passReleaseMs: 200, attemptMs: 200 }, 'the declared bounds are reported with the numbers')
-  // Subject gap 1: the released wedged pass, against the bound it was released under.
+  // Subject gap 1: the wedged pass, against the bound it was named under.
   const passSubject = report.subjects.find(subject => subject.kind === 'scheduling-pass')
-  assert.ok(passSubject, `the release is a measured subject: ${JSON.stringify(report.subjects)}`)
-  assert.equal(passSubject.subject, `pass:${wedged.runId}`)
-  assert.equal(passSubject.boundMs, 200, 'measured against the live-work bound it was released under')
-  assert.equal(passSubject.gapMs, releasedRecord.worstRelease.gapMs)
-  assert.ok(passSubject.gapMs >= 200, `the released pass really exceeded its bound (${passSubject.gapMs}ms)`)
+  assert.ok(passSubject, `the wedge is a measured subject: ${JSON.stringify(report.subjects)}`)
+  assert.equal(passSubject.subject, `pass:${wedged.operationId}`)
+  assert.equal(passSubject.boundMs, 200, 'measured against the live-work bound it was named under')
+  assert.equal(passSubject.gapMs, named.data.releaseGapMs)
+  assert.ok(passSubject.gapMs >= 200, `the wedged pass really exceeded its bound (${passSubject.gapMs}ms)`)
   // Subject gap 2: the escalated attempt, against the attempt reporting bound.
   const attemptSubject = report.subjects.find(subject => subject.kind === 'attempt' && subject.subject === `${held.id}@${claimedHeld.epoch}`)
   assert.ok(attemptSubject, 'the attempt escalation is a measured subject')
@@ -394,6 +382,6 @@ test('R16-D8: the silence projection reads both gaps, the release record and the
   assert.equal(escalatedReport.escalations.length, 1)
   assert.equal(report.attemptsEndedUnreported, 1, 'exactly one attempt ended with no durable report or escalation')
   assert.ok(report.attemptsEnded >= 1)
-  assert.ok(report.passReleases.count >= releasedRecord.releases, 'the release count comes from the durable pass row')
-  assert.equal(report.passReleases.worst.runId, wedged.runId)
+  assert.equal(report.passReleases.count, 1, 'the wedge count comes from the durable stall events')
+  assert.equal(report.passReleases.worst.runId, wedged.operationId)
 })

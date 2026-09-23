@@ -5,11 +5,16 @@
  * The Round-13 defect: `Runtime.kick()` deduplicated a mission with the
  * in-memory `scheduled` Set, so a pass wedged in an adapter call swallowed the
  * tick timer's only liveness action and the mission produced zero durable events
- * for 120 minutes while the same process served another mission. These tests
- * assert the replacement mechanism from durable state only:
- *  - the guard is a durable per-mission `passes` row, re-read from the store;
- *  - a row older than the declared bound does not gate: the watchdog escalates,
- *    releases the guard and later ticks proceed;
+ * for 120 minutes while the same process served another mission. The pass guard
+ * is again in memory (`Scheduling.passes`: the one body queued or running on the
+ * mission's serial queue), with the two properties that incident lacked, and
+ * these tests assert them from durable state and from the adapter boundary:
+ *  - every await in the pass body is bounded, so a wedged body settles and
+ *    releases the record, and a later tick schedules normally;
+ *  - the tick watchdog reads the record's start time and names a body past its
+ *    bound while the body still holds the mission queue;
+ *  - while a body is held no second body is queued behind it, so a wedge is
+ *    named once and never followed by refused successor passes;
  *  - a live lease renewed by recorded operations is progress, never a stall;
  *  - clearing the in-memory caches changes no durable outcome (S5), because
  *    every gate either re-reads the store or is pure duplicate suppression.
@@ -19,98 +24,110 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
 
-const keyOf = missionId => `pass_${missionId}`
-const writePass = (f, fields) => {
-  const key = keyOf(f.mission.id)
-  const row = {
-    // The row carries this runtime instance's identity; a foreign row never gates.
-    id: key, runId: 'test-guard', instanceId: f.runtime.instanceId, missionId: f.mission.id, status: 'running', startedAt: Date.now(),
-    revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
-    ...fields,
-  }
-  f.runtime.store.transaction(() => f.runtime.store.put('passes', row))
-  return row
-}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+const wedgeEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
 
-test('S1/S5: the scheduling guard is a durable pass row re-read from the store, and an expired row cannot swallow a tick', async () => {
-  const f = await setup({ config: { tickMs: 20, stallPassTimeoutMs: 200, stallPasses: 50 } })
+/**
+ * The adapter boundary only: once armed, the next `start` hangs until the
+ * runtime aborts it at its declared start bound, as `HarnessWorkers.start` does.
+ */
+class WedgeStartWorkers extends FakeWorkers {
+  wedgeNext = false
+  wedgedAt
+  wedgeSettledAt
+  async start(spec, signal) {
+    this.started.push(spec.member.id)
+    if (!this.wedgeNext) return
+    this.wedgeNext = false
+    this.wedgedAt = Date.now()
+    try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
+    finally { this.wedgeSettledAt = Date.now() }
+  }
+}
+
+test('S1/S5: a body wedged past its bound is named while it holds the mission, and releases the guard when its own await settles', async () => {
+  const workers = new WedgeStartWorkers()
+  const f = await setup({ workers, config: { tickMs: 20, stallPassTimeoutMs: 200, stallPasses: 50, workerStartTimeoutMs: 900 } })
   try {
-    // The row exists, keyed per mission, with a per-run identity for fencing.
-    const opened = f.runtime.store.get('passes', keyOf(f.mission.id))
-    assert.ok(opened, 'a scheduling pass leaves a durable row')
-    assert.equal(opened.id, keyOf(f.mission.id), 'the row key is the guard identity')
-    assert.ok(typeof opened.runId === 'string' && opened.runId.length > 0, 'each pass run has its own identity')
-    assert.match(opened.fingerprintBefore, /^[0-9a-f]{32}$/, 'the pass records the durable-state digest it started from')
-
-    // A fresh running row holds the guard: no new pass is opened for the mission.
-    const fresh = writePass(f)
-    await sleep(120)
-    const held = f.runtime.store.get('passes', keyOf(f.mission.id))
-    assert.equal(held.runId, fresh.runId, 'a fresh durable pass row still gates scheduling')
-
-    // An expired row does NOT gate: the watchdog releases it, escalates and the
-    // next tick opens a new pass — the tick timer is never swallowed.
-    const stale = writePass(f, { runId: 'test-stale', startedAt: Date.now() - 60_000 })
-    const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
-      .filter(item => item.data.cause === 'scheduling-pass').at(-1),
-      'an expired pass row must be escalated by the watchdog', 4_000)
+    const scheduling = f.runtime.scheduling
+    const opened = []
+    const openPass = scheduling.openPass.bind(scheduling)
+    scheduling.openPass = missionId => { const pass = openPass(missionId); if (pass !== undefined) opened.push(pass); return pass }
+    workers.wedgeNext = true
+    const wedged = await eventually(() => workers.wedgedAt !== undefined ? scheduling.passes.get(f.mission.id) : undefined, 'a pass body must wedge in start', 4_000)
+    assert.equal(wedged.id, `pass_${f.mission.id}`, 'the mission pass keeps its stable name')
+    assert.ok(typeof wedged.operationId === 'string' && wedged.operationId.length > 0, 'each body has its own identity')
+    assert.match(wedged.fingerprintBefore, /^[0-9a-f]{32}$/, 'the pass records the durable-state digest it started from')
+    const event = await eventually(() => wedgeEvents(f).at(-1), 'the watchdog must name the body past its bound', 4_000)
     assert.match(String(event.data.reason), /did not return within its 200ms bound/)
-    assert.equal(event.data.wedged, true)
     assert.equal(event.data.boundMs, 200, 'the declared bound is named in the event')
-    assert.ok(event.data.runId !== stale.runId || event.data.passId === keyOf(f.mission.id))
-    const released = await eventually(() => {
-      const row = f.runtime.store.get('passes', keyOf(f.mission.id))
-      return row !== undefined && row.runId !== stale.runId ? row : undefined
-    }, 'a later tick must open a new pass after the release', 4_000)
-    assert.notEqual(released.runId, stale.runId, 'the released guard no longer blocks later ticks')
+    assert.equal(event.data.runId, wedged.operationId, 'the event names the wedged body')
+    assert.equal(workers.wedgeSettledAt, undefined, 'it was named while the body still held the mission')
+    assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'the mission publishes as wedged, not as inside a live pass')
+    assert.equal(scheduling.passes.get(f.mission.id), wedged, 'no later tick replaced the body the queue still owns')
+    const next = await eventually(() => opened.find(pass => pass !== wedged && pass.startedAt >= workers.wedgeSettledAt), 'a later tick must open a new pass once the wedged await settles', 4_000)
+    assert.ok(next.startedAt >= workers.wedgeSettledAt, 'the guard was released by the body settling')
+    assert.equal(opened.filter(pass => pass.startedAt < workers.wedgeSettledAt && pass !== wedged && pass.startedAt > wedged.startedAt).length, 0,
+      'no pass was opened while the wedged body was held')
+    assert.equal(wedgeEvents(f).length, 1, 'the wedge is named once')
   } finally { await f.cleanup() }
 })
 
-test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never abandoned; past that bound it is released with its live work preserved', async () => {
-  // R16-D changed the contract this test used to pin: "a pass with live work
-  // keeps its guard" was true for as long as ANY unrelated lease lived, which is
-  // exactly the unbounded release round 16 removes. The claim is now two-sided
-  // and both halves are asserted here: inside `stallPassReleaseBoundMs`
-  // (= stallPassTimeoutMs + stallPassLiveGraceMs, both declared) a live lease is
-  // progress and the guard is not abandoned and no stall is reported; past it
-  // the pass is released, named once, and the live work it was held by is
-  // preserved untouched. Nothing was deleted from the old assertions: the
-  // in-bound half is the same claim on the same fixture.
+test('S1: a wedged body is not followed by refused successor passes, so the owner hears the wedge once', async () => {
+  // Before, every tick past the bound opened another pass behind the wedged
+  // body; the mission queue refused each one at its own bound
+  // (`mission_operation_pending`) and the refusal became a second owner
+  // escalation for the same wedge. A successor could never run before the
+  // wedged body settled, so the skipped kick loses nothing.
+  const workers = new WedgeStartWorkers()
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 50, workerStartTimeoutMs: 700 } })
+  try {
+    workers.wedgeNext = true
+    await eventually(() => workers.wedgedAt !== undefined ? true : undefined, 'a pass body must wedge in start', 4_000)
+    await eventually(() => workers.wedgeSettledAt !== undefined ? true : undefined, 'the wedged start settles at its own bound', 4_000)
+    await sleep(100)
+    const refusals = events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'guard-terminal' && /mission_operation_pending/.test(String(item.data.detail)))
+    assert.deepEqual(refusals.map(item => item.data.detail), [], 'no successor pass was queued and refused behind the wedged body')
+    assert.equal(wedgeEvents(f).length, 1, 'the wedge itself is named exactly once')
+  } finally { await f.cleanup() }
+})
+
+test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never named; past that bound it is named with its live work preserved', async () => {
+  // Inside `stallPassReleaseBoundMs` (= stallPassTimeoutMs + stallPassLiveGraceMs,
+  // both declared) a live lease is progress: the pass stays live and no stall is
+  // reported. Past it the pass is named once, and the live work it was held by
+  // is preserved untouched. The record below stands for a body that has been
+  // inside an adapter await for 150ms of a declared 200ms live-work window.
   const f = await setup({ config: { tickMs: 20, stallPassTimeoutMs: 100, stallPasses: 2 } })
+  const scheduling = f.runtime.scheduling
+  let long
   try {
     const task = f.propose()
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     assert.equal(taskOf(f.runtime, task.id).status, 'running')
     const attemptId = taskOf(f.runtime, task.id).attempt.id
-    // Simulate a pass that has been inside an adapter await for longer than the
-    // first bound while a worker holds a live lease (recorded renewals = progress).
-    // The row is inside the live-work hold (age 150 of a declared 200), so it
-    // still gates: this is the retained S1 claim.
-    const long = writePass(f, { runId: 'test-live', startedAt: Date.now() - 150 })
-    await sleep(40)
-    const guarded = f.runtime.store.get('passes', keyOf(f.mission.id))
-    assert.equal(guarded.runId, long.runId, 'a pass inside its declared live-work bound keeps its guard')
-    assert.equal(guarded.status, 'running', 'the live pass is not marked stalled')
+    await eventually(() => scheduling.passes.get(f.mission.id) === undefined ? true : undefined, 'the passes the claim kicked must settle')
+    long = { id: scheduling.passKey(f.mission.id), operationId: 'operation_test_live', missionId: f.mission.id, startedAt: Date.now() - 150,
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0 }
+    scheduling.passes.set(f.mission.id, long)
+    await sleep(20)
+    assert.equal(scheduling.livePass(f.mission.id), long, 'a pass inside its declared live-work bound stays live')
     assert.deepEqual(events(f.runtime, f.mission.id, 'mission/stalled'), [],
       'a live attempt is progress: no false stall notice may be emitted inside the bound')
-    // Past the declared live-work bound the release is bounded, named and
-    // preserves the work: the half round 15 left open.
-    const row = await eventually(() => {
-      const current = f.runtime.store.get('passes', keyOf(f.mission.id))
-      return current !== undefined && current.releasedRunId === long.runId ? current : undefined
-    }, 'the wedged pass must be released inside its declared live-work bound', 4_000)
-    assert.notEqual(row.runId, long.runId, 'the released guard no longer blocks later ticks')
-    assert.equal(row.worstRelease.heldByLiveWork, true, 'the release names the live work that held it')
-    assert.equal(row.worstRelease.boundMs, 200, 'and the declared bound it was measured against')
-    const released = events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.wedged === true && item.data.runId === long.runId)
-    assert.equal(released.length, 1, 'the released run is named exactly once')
-    assert.equal(released[0].data.releasedWhileLive, true)
+    const named = await eventually(() => wedgeEvents(f).find(item => item.data.runId === long.operationId), 'the pass must be named once past its live-work bound', 4_000)
+    assert.equal(named.data.releasedWhileLive, true, 'the notice names the live work that held it')
+    assert.equal(named.data.releaseBoundMs, 200, 'and the declared bound it was measured against')
+    assert.ok(named.data.releaseGapMs >= 200, `named after the whole live-work bound (${named.data.releaseGapMs}ms)`)
+    assert.deepEqual(named.data.liveSubjects, [`${task.id}@${taskOf(f.runtime, task.id).epoch}`])
+    assert.equal(scheduling.livePass(f.mission.id), undefined, 'a named pass no longer owns generation')
+    assert.equal(scheduling.passWedged(f.mission.id), true, 'it is wedged until its body settles')
+    await sleep(100)
+    assert.equal(wedgeEvents(f).filter(item => item.data.runId === long.operationId).length, 1, 'the body is named exactly once')
     const held = taskOf(f.runtime, task.id)
-    assert.equal(held.status, 'running', 'the live lease survives its own release')
+    assert.equal(held.status, 'running', 'the live lease survives the naming')
     assert.equal(held.attempt.id, attemptId, 'and the attempt is not stopped, dropped or reassigned by it')
     assert.ok(held.attempt.leaseUntil > Date.now(), 'with a lease still in the future')
-  } finally { await f.cleanup() }
+  } finally { if (long !== undefined) scheduling.closePass(f.mission.id, long); await f.cleanup() }
 })
 
 test('S5: clearing every in-memory scheduling cache leaves the durable outcome unchanged', async () => {
@@ -122,7 +139,6 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.idleSignals.clear()
     f.runtime.startFailures.clear()
     f.runtime.budgetStops.clear()
-    f.runtime.releasedPasses.clear()
     f.runtime.reviewPathReported.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()

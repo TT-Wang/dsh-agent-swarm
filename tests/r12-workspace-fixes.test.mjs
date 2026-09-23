@@ -42,7 +42,7 @@ test('M2-1: no-progress and pass-timeout each record once on the same board', ()
   const rt = { store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
     isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} }
   const scheduling = new Scheduling(rt)
-  const info = { pass: { id: 'pass', runId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3, stalled: { unschedulable: [] } }, reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
+  const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3 }, unschedulable: [], reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
   for (const reason of ['no-progress', 'pass-timeout', 'no-progress', 'pass-timeout']) scheduling.escalateSchedulingStall('mission', { ...info, reason })
   assert.deepEqual(records.map(row => row.wedged), [false, true])
 })

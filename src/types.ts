@@ -1093,47 +1093,6 @@ export interface WorkerAdapter {
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void>
   dispose(): Promise<void>
 }
-/**
- * S1: one durable scheduling-pass record per mission (`pass_<missionId>`, the
- * row is overwritten by each pass). The scheduling guard is this row, re-read
- * from the store; the in-memory `scheduled` Set it replaces could swallow the
- * tick timer's only liveness action and leave a mission invisible for 120
- * minutes. A row whose status is `running` older than the configured bound is
- * *not* a guard: the watchdog releases it, commits the stall event and lets
- * later ticks proceed.
- */
-export interface SchedulingPass {
-  /** Stable row key (`pass_<missionId>`): the guard, re-read from the store. */
-  id: string
-  /** Identity of this pass execution; a released body is fenced by it, never by the stable key. */
-  runId: string
-  /** Runtime process that opened the pass. A row from another instance never gates. */
-  instanceId: string
-  missionId: string
-  status: 'running' | 'finished'
-  startedAt: number
-  finishedAt?: number
-  /** Store revisions around the pass body (the pass's own bookkeeping excluded). */
-  revisionBefore: number
-  revisionAfter?: number
-  /** Mission-scoped durable-state digest before and after the pass body. */
-  fingerprintBefore: string
-  fingerprintAfter?: string
-  /** Consecutive passes that changed no durable mission state and terminated nothing. */
-  noProgressPasses: number
-  /** Set when the pass neither advanced nor terminated within the declared bound. */
-  stalled?: { reason: 'pass-timeout' | 'no-progress'; at: number; boundMs: number; unschedulable: string[] }
-  /**
-   * S5r hand-off: the runId this pass released, recorded durably on the row
-   * instead of only in `Scheduling.releasedPasses`. `Scheduling.passReleased`
-   * must read this field (and the row's `releasedAt` age) rather than the
-   * in-memory Set, so clearing the Set cannot let an abandoned pass body resume.
-   * Writing it is a src/runtime.ts/src/scheduling.ts change outside the S5r
-   * scope; the field exists here so that change is mechanical.
-   */
-  releasedRunId?: string
-  releasedAt?: number
-}
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
@@ -1167,10 +1126,10 @@ export interface RuntimeConfig {
    */
   stallPasses?: number
   /**
-   * S1: bound on one scheduling pass before the runtime declares it wedged,
-   * escalates and releases the guard. Defaults to 30 × `tickMs`. A pass is only
-   * declared wedged when the mission has no live lease or in-flight quiescence:
-   * a lease renewed by recorded operations is progress, not a stall.
+   * S1: bound on one scheduling pass before the runtime declares it wedged and
+   * escalates it. Defaults to 30 × `tickMs`. While the mission has a live lease
+   * or an in-flight quiescence the escalation waits a further bounded window: a
+   * lease renewed by recorded operations is progress, not a stall.
    */
   stallPassTimeoutMs?: number
   /**
