@@ -45,7 +45,7 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
-import { Scheduling, guardActions, guardProgressActions } from '../lib/scheduling.js'
+import { guardActions, guardBoard, guardProgressActions } from './guard-model.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -196,15 +196,14 @@ test('pair: the board guard and the dispatch decision read the one derivation', 
 
   // While the durable park stands, the park wins over the attempt (the hatch and
   // the guard board agree): a parked owner still holds its work.
-  const scheduling = new Scheduling(f.runtime)
-  assert.equal(scheduling.guardBoard(f.mission.id).members.find(row => row.id === member.id).status, 'waiting')
+  assert.equal(guardBoard(f.runtime, f.mission.id).members.find(row => row.id === member.id).status, 'waiting')
 
   // The assignment is the fresh input that unparks the member; the status then
   // follows the live attempt through the same derivation.
   await f.workers.callbacks.beforeStep(member.id, true)
   assert.equal(f.memberRow(member).phase, 'active')
   assert.equal(f.memberRow(member).status, 'working')
-  const board = scheduling.guardBoard(f.mission.id)
+  const board = guardBoard(f.runtime, f.mission.id)
   assert.equal(board.members.find(row => row.id === member.id).status, 'working')
   assert.ok(guardProgressActions(board).some(action => action.kind === 'progress' && action.memberId === member.id), 'the guard board sees the live attempt as progress')
   assert.ok(guardActions(board).some(action => action.kind === 'progress' && action.memberId === member.id))
@@ -269,7 +268,7 @@ test('a mounted projection registry cannot change the read face: the derivation 
   // The hostile unit claims the member is parked. No consumer may believe it.
   wrong.missions[f.mission.id] = { missionId: f.mission.id, status: 'active', updatedAt: 0, members: [{ id: member.id, phase: 'parked', status: 'waiting' }] }
   assert.equal(f.runtime.memberBoard(f.mission.id).find(row => row.id === member.id).status, 'idle', 'memberBoard ignores the registry')
-  assert.equal(new Scheduling(f.runtime).guardBoard(f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the guard board ignores the registry')
+  assert.equal(guardBoard(f.runtime, f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the guard board ignores the registry')
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the snapshot (client read face) ignores the registry')
   assert.equal(f.runtime.observe(f.owner, f.mission.id).members.find(row => row.id === member.id).status, 'idle', 'the observe board ignores the registry')
   assert.equal(registrations, 0, 'the plugin registers no projection unit')
@@ -319,7 +318,7 @@ test('a phase-less legacy member row keeps its recorded intent: the live-store s
   // The reviewer's exact reproduction: the stopped member is not a participant
   // and cannot be dispatched.
   assert.throws(() => runtime.participant({ sessionId: 'legacy_session_0' }, MISSION), /not a participant/, 'a stopped legacy member stays out of the mission')
-  assert.equal(new Scheduling(runtime).guardBoard(MISSION).members.filter(row => row.status === 'stopped').length, 114, 'the guard model sees all 114 stopped')
+  assert.equal(guardBoard(runtime, MISSION).members.filter(row => row.status === 'stopped').length, 114, 'the guard model sees all 114 stopped')
   // The rule itself, including the parked intent.
   assert.equal(projection.memberPhaseOf({ status: 'stopped' }), 'stopped')
   assert.equal(projection.memberPhaseOf({ status: 'waiting' }), 'parked')

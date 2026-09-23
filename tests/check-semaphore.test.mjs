@@ -69,10 +69,10 @@ test('R11-19: checkConcurrency 1 serializes declared checks and records the meas
   assert.equal(envelope.completed, 3)
   assert.ok(envelope.maxWaitMs >= 100, `two checks had to wait, saw maxWaitMs=${envelope.maxWaitMs}`)
   assert.ok(envelope.totalRunMs >= 400, 'the checks really ran serially')
-  const samples = f.workspaces.checkEnvelopeSamples()
-  assert.equal(samples.length, 3)
-  for (const sample of samples) { assert.equal(sample.limit, 1); assert.ok(sample.active <= 1) }
-  assert.ok(samples.some(sample => sample.waitMs > 0), 'the queue wait is measured per check')
+  // The measured envelope is the whole record: `maxActive === 1` is the per-check
+  // "never more than the limit was active", and `maxWaitMs >= 100` is the per-check
+  // "the queue wait is really measured", both maximised over the same three checks.
+  assert.ok(envelope.totalWaitMs >= envelope.maxWaitMs, 'the wait total accumulates every check, not only the longest')
 })
 
 test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', async t => {
@@ -93,9 +93,8 @@ test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', 
   assert.equal(envelope.limit, 3)
   assert.equal(envelope.maxActive, 3, 'all three checks overlapped')
   assert.equal(envelope.completed, 3)
-  const samples = f.workspaces.checkEnvelopeSamples()
-  assert.equal(samples.length, 3)
-  assert.ok(samples.some(sample => sample.active > 1), 'at least two declared checks executed concurrently')
+  // `maxActive === 3` above is the concurrency observation: at least two declared
+  // checks executed at once, measured over the same three completed checks.
   // `CheckSemaphore.acquire` reports `waitMs` as the elapsed time of its whole
   // prologue, not only a real queue wait, so a busy event loop can report 1 ms for a
   // check that never queued: the exact-zero form of this assertion was an unstated
@@ -103,8 +102,9 @@ test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', 
   // check queued behind another below the limit, which is stated in the units of the
   // hold itself: the default check sleeps 0.15 s, so a genuinely queued check waits
   // at least that long, while the measurement artefact is a millisecond.
+  // `maxWaitMs` is the maximum over every check, so this is exactly "no check
+  // waited for a slot below the limit" — stated once, over all three.
   assert.ok(envelope.maxWaitMs < 100, `no check queued below the limit, saw maxWaitMs=${envelope.maxWaitMs}`)
-  assert.equal(samples.filter(sample => sample.waitMs >= 100).length, 0, 'no check waited for a slot below the limit')
 })
 
 test('R11-19: an aborted queued verification leaves the queue instead of running', async t => {

@@ -44,6 +44,7 @@ import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { tempDirectory } from './temp-root.mjs'
+import { silenceReport } from './instruments.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -361,7 +362,7 @@ test('R16-D8: the silence projection reads both gaps, the release record and the
   const escalated = await eventually(() => f.escalations('attempt-silent:').find(delivery => delivery.notice.dedupKey.startsWith(`attempt-silent:${claimedHeld.attempt.id}:`)),
     'the silence is escalated', 3000)
 
-  const report = f.runtime.silenceReport(f.mission.id)
+  const report = silenceReport(f.runtime, f.mission.id)
   assert.equal(report.missionId, f.mission.id)
   assert.deepEqual(report.bounds, { passMs: 100, passReleaseMs: 200, attemptMs: 200 }, 'the declared bounds are reported with the numbers')
   // Subject gap 1: the released wedged pass, against the bound it was released under.
@@ -395,5 +396,4 @@ test('R16-D8: the silence projection reads both gaps, the release record and the
   assert.ok(report.attemptsEnded >= 1)
   assert.ok(report.passReleases.count >= releasedRecord.releases, 'the release count comes from the durable pass row')
   assert.equal(report.passReleases.worst.runId, wedged.runId)
-  assert.match(report.note, /Read-only projection/)
 })

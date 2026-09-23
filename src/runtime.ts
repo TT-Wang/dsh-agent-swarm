@@ -6,7 +6,7 @@ import { Attempts, pendingStopOwner, stopPending } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, uncapturedArtifactNote, type NotifyOptions, type WakePrecision } from './notices.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, uncapturedArtifactNote, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -31,7 +31,7 @@ import { requireArtifactChecks } from './artifact-policy.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
 // on the Node worktree module at runtime.
-import type { CheckAttribution, CheckEnvironment, ObservedCheck } from './workspaces.ts'
+import type { CheckAttribution, CheckEnvironment } from './workspaces.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
@@ -227,11 +227,10 @@ export class CheckEnvironmentMismatchError extends Error {
     this.name = 'CheckEnvironmentMismatchError'
   }
 }
-/** ENV: the measured envelope plus the environment facts and observation the adapter attaches. */
+/** ENV: the measured envelope plus the environment facts the adapter attaches. */
 type DeclaredCheckEnvelope = CheckEnvelope & {
   environment?: CheckEnvironment
   selfRunEnvironment?: CheckEnvironment
-  observed?: ObservedCheck
 }
 const isDeclaredCheckEnvironment = (value: unknown): value is CheckEnvironment =>
   typeof value === 'object' && value !== null && 'home' in value && 'sandboxPolicy' in value && 'dependencyLinks' in value && 'checkCacheRoot' in value
@@ -419,8 +418,6 @@ export class SwarmRuntime {
   noticeKey(missionId: string): string { return this.notices.noticeKey(missionId) }
   private enqueueOwnerNotice(missionId: string, content: string, from: string, noticeClass: NoticeClass, extra: Partial<Delivery> = {}, dedupe = noticeClass === 'budget', dedupKeyOverride?: string): Delivery | undefined { return this.notices.enqueueOwnerNotice(missionId, content, from, noticeClass, extra, dedupe, dedupKeyOverride) }
   noticeLedger(actor: Actor, missionId: string, query: { limit?: number } = {}): unknown { return this.notices.noticeLedger(actor, missionId, query) }
-  /** R16-A: the owner-only wake-precision projection (decisions, false wakes, missed obligations). */
-  wakePrecision(actor: Actor, missionId: string): WakePrecision { return this.notices.wakePrecision(actor, missionId) }
   private bounded(text: string): string { return this.notices.bounded(text) }
   private ensureWitness(missionId: string, options: { offPass?: boolean; wedged?: boolean } = {}): void { return this.notices.ensureWitness(missionId, options) }
   notifyStall(mission: Mission, reason: string): void { return this.notices.notifyStall(this.interpretation(mission.id), reason) }
@@ -1277,10 +1274,11 @@ export class SwarmRuntime {
       if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
     }
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
-    // D1: reconcile the objective's write directives with the task scope and the
-    // named deliverables with the effective ignore rules at the production
-    // admission point, so a plan error is rejected here instead of at submit.
-    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task', {
+    // D1: the admission refusals (an assumed dependency, a dangling graph edge)
+    // at the production admission point, so a plan error is rejected here
+    // instead of at submit. The scope and ignore-rule hints are advisory and
+    // belong to the draft UI (`planAdvisories`); nothing here would read them.
+    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance: input.acceptance }, 'task', {
       // R12-F9: the guard needs the content-carrying edges (the declared
       // dependencies plus a review source, which `prepareTask` merges into the
       // worktree like a dependency) and the durable identities this mission
@@ -1290,7 +1288,6 @@ export class SwarmRuntime {
       replaces: input.replaces,
       knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
     })
-    const refused = reconciliation.filter(item => item.severity !== 'advisory')
     if (refused.length) throw new Error(refused.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')
@@ -3881,9 +3878,9 @@ export class SwarmRuntime {
   /**
    * H-3 follow-up: a disposable verification checkout could not be removed
    * after its declared checks ran. The same silent channel as the recovery
-   * fallback: `Workspaces` kept it in `cleanupFailures()` and production wired
-   * no callback, so a tree left under the mission's `verification/` directory
-   * or a stale worktree registration in the source repository reached nobody.
+   * fallback: before this wiring, a tree left under the mission's
+   * `verification/` directory or a stale worktree registration in the source
+   * repository reached nobody.
    * The check results were already returned and the verdict is decided from
    * them; this records one durable event and one owner notice naming the
    * checkout and the removal failure, so the leftover is something the owner
@@ -4038,12 +4035,6 @@ export class SwarmRuntime {
     if (raw === 0) return 0
     return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_ATTEMPT_SILENCE_BOUND_MS
   }
-  /**
-   * R16-D: the round's silence projection, read from the durable store alone
-   * (src/scheduling.ts#silenceReport). Read-only and ungated: it is the
-   * instrument the round's outcome report quotes, not an owner decision channel.
-   */
-  silenceReport(missionId: string): ReturnType<Scheduling['silenceReport']> { return this.scheduling.silenceReport(missionId) }
   /**
    * R16-D: the durable reporting bound verdict for the live attempt on one task
    * (`taskId@epoch` + member), or undefined when the attempt is inside its bound

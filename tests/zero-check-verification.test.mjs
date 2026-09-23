@@ -29,8 +29,9 @@ async function fixture(t) {
     async assertNoExecution() {
       assert.equal(checkout.mock.callCount(), 0, 'empty checks must not create a disposable worktree')
       assert.equal(dependencies.mock.callCount(), 0, 'empty checks must not materialize dependencies')
+      // The envelope is the whole measured record (limit/active/queued/completed
+      // and the wait and run totals): unchanged means nothing was measured either.
       assert.deepEqual(workspaces.checkEnvelope(), envelope, 'empty checks must not consume or record check capacity')
-      assert.deepEqual(workspaces.checkEnvelopeSamples(), [])
       await assert.rejects(access(join(repo.root, 'worktrees', mission.id, 'verification')), { code: 'ENOENT' })
     },
   }

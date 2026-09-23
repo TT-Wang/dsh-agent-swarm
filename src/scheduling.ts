@@ -7,19 +7,19 @@
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { dependencyAssumptions } from './admission.ts'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
-import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
+import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { ATTEMPT_FENCING_EVENTS, type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type SwarmEvent, type Task } from './types.ts'
+import { type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -62,8 +62,9 @@ export interface DispatchQuestion {
  * release-to-bound gap seen (with the bound it was measured against). The row is
  * the single durable carrier of these facts for the same reason as
  * `releasedRunId`: the once-per-pass overwrite would otherwise erase the only
- * record of a bounded release, and the silence projection (below) must not
- * depend on the retained event window.
+ * record of a bounded release. No src/ reader consumes `releases` or
+ * `worstRelease` beyond this carry-forward; the test-side silence projection
+ * (tests/instruments.mjs) reads them from the row.
  */
 interface ReleaseRecord {
   runId: string
@@ -108,58 +109,6 @@ export interface SilentAttempt {
   boundMs: number
 }
 
-/** R16-D: one subject whose silence was measured against the bound that applied to it. */
-export interface SubjectSilence {
-  subject: string
-  kind: 'scheduling-pass' | 'attempt'
-  gapMs: number
-  /** The declared bound it was measured against. */
-  boundMs: number
-  /** When the measurement was taken (release instant or escalation instant). */
-  at: number
-}
-
-/** R16-D: the durable per-attempt reporting record, for one attempt of the retained window. */
-export interface AttemptReport {
-  attemptId: string
-  taskId: string
-  epoch: number
-  memberId: string
-  claimedAt: number
-  /** When the attempt stopped being current; undefined while the task row still carries it. */
-  endedAt?: number
-  lastDurableAt: number
-  /** Longest interval between consecutive durable elements (or to `endedAt` / now). */
-  worstReportingGapMs: number
-  /** The current silence: `(endedAt ?? now) - lastDurableAt`. */
-  silentMs: number
-  /** Owner escalations naming this attempt, by dedup key. */
-  escalations: string[]
-  /** The attempt ended with nothing durable after its own dispatch (no report, no escalation). */
-  endedUnreported: boolean
-}
-
-/**
- * R16-D: the round's silence projection, read from the durable store alone.
- * Read-only: it changes no task, member, pass or delivery state.
- */
-export interface SilenceReport {
-  missionId: string
-  bounds: { passMs: number; passReleaseMs: number; attemptMs: number }
-  /** Every subject whose silence was measured, with the bound it was measured against. */
-  subjects: SubjectSilence[]
-  worstSubjectSilence: SubjectSilence | undefined
-  attempts: AttemptReport[]
-  worstAttemptReportingGap: { attemptId: string; taskId: string; gapMs: number } | undefined
-  attemptsEnded: number
-  /** Attempts that ended with no durable report or escalation after their own dispatch. */
-  attemptsEndedUnreported: number
-  attemptSilenceEscalations: number
-  /** The durable pass-row release record: how many wedges were released and the widest one. */
-  passReleases: { count: number; worst: ReleaseRecord | undefined }
-  note: string
-}
-
 /** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
 function formatSpan(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -167,17 +116,6 @@ function formatSpan(ms: number): string {
   const minutes = Math.floor(seconds / 60)
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
-
-/**
- * R16-D: the durable events after which a task no longer holds its attempt. The
- * vocabulary is declared ONCE in `src/types.ts` (`ATTEMPT_FENCING_EVENTS`) and
- * read here and by the replay decoder, which is what stops the two readers from
- * drifting: the hand-mirrored copy this function replaced had lost
- * `task/restart-repended` and `task/ceiling-exhausted`, so the replay refused
- * logs its own runtime wrote. A frozen array, not a Set: it is a lookup
- * vocabulary, and the S5 in-memory census classifies every collection in src/.
- */
-const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.some(kind => kind === type)
 
 export class Scheduling {
   /**
@@ -450,70 +388,6 @@ export class Scheduling {
    */
   escalateGuardTerminal(missionId: string, chain: GuardChainId, context: GuardTerminalContext = {}): GuardTerminal | undefined {
     return emitGuardTerminal(this.rt, missionId, chain, context)
-  }
-
-  /**
-   * The durable board as the guard-chain model sees it: the production view the
-   * terminal classification and the property test share. Every field is derived
-   * from a durable row (or a durable event), never from an in-memory gate.
-   */
-  guardBoard(missionId: string, mission?: Mission): GuardBoard {
-    const row = mission ?? this.rt.store.get('missions', missionId)
-    const tasks = this.rt.store.list('tasks', missionId)
-    const now = Date.now()
-    const revoked = this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')
-    return {
-      mission: {
-        status: row?.status ?? 'active',
-        workspace: revoked ? 'revoked' : 'authorized',
-        ...(row?.budgetPause === undefined ? {} : { budgetPaused: true }),
-      },
-      tasks: tasks.map(task => {
-        const exhaustion = taskCeilingExhaustion(task)
-        const source = task.reviewOf === undefined ? undefined : this.rt.task(missionId, task.reviewOf)
-        const reviewSourceLive = task.reviewOf === undefined
-          ? (task.status === 'submitted' ? this.reviewable(task, tasks) : undefined)
-          // A review whose named source is missing can never be dispatched: the
-          // scheduler's `capable` reads the source row, so a dangling review is
-          // reported as no live source rather than omitted.
-          : source !== undefined && source.status === 'submitted'
-        return {
-          id: task.id, status: task.status,
-          ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
-          ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
-          dependenciesSatisfied: task.dependencies.every(dependency => this.rt.dependencySatisfied(missionId, dependency, tasks)),
-          dependenciesDead: task.dependencies.some(dependency => this.rt.effectiveDependency(missionId, dependency, tasks).status === 'cancelled'),
-          ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
-          // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses,
-          // for every task the model reports progress on. A review task is live
-          // exactly while its source is submitted (`capable`); a submitted source
-          // is live exactly while `reviewable` finds a live independent review.
-          // Reporting a source as progress without consulting that predicate made
-          // the review_admission terminal unable to classify its canonical case.
-          ...(reviewSourceLive === undefined ? {} : { reviewSourceLive }),
-          ...(source === undefined ? {} : { authorMemberIds: [...this.rt.authorIds(source)] }),
-          preparationExhausted: task.status === 'blocked' && typeof task.output === 'string' && task.output.startsWith('Workspace or worker preparation failed'),
-          ...(task.dependencies.length === 0 && task.reviewOf === undefined
-            && dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: task.dependencies, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`).length > 0
-            ? { assumedContent: true } : {}),
-        }
-      }),
-      // R17-G6/G7: the member half of the guard board is READ from the runtime's
-      // derived member board — the registered host projection's current state
-      // when this process published one, otherwise the same single derivation —
-      // so the model-facing guard model is an instance of the projection being
-      // read, not a second interpretation of the rows. The stored mirror and its
-      // upgrade-only rule are gone: there is no row to fall behind the attempt,
-      // and no write here can churn F(S). Co-firing guards, named: the W6 idle
-      // close-out (which owns the attempt until it fences it), the parked-member
-      // hatch (`parked` wins over work in flight and keeps the member
-      // dispatchable), the dispatch decision (which asks `startBlocker` about the
-      // handle, never this status) and the coverage/stall notices, whose F(S) key
-      // no status write can move any more. A dead lease stays the guard model's
-      // own classification (`guardTerminalChain` reads the task rows and returns
-      // `attempt_lease`), so this status never has to encode lease liveness.
-      members: this.rt.memberBoard(missionId).map(member => ({ id: member.id, status: member.status })),
-    }
   }
 
   ready(task: Task, member: Member, tasks?: Task[]): boolean {
@@ -1217,149 +1091,6 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: the round's silence projection. Read from the durable store alone —
-   * the retained event window, the tool-run rows, the delivery rows, the current
-   * task rows and the one durable pass row — and it changes nothing.
-   *
-   * The two numbers the round quotes:
-   *  - the worst per-subject silent gap, each subject carrying the declared bound
-   *    it was measured against (a released scheduling pass against the pass
-   *    release bound; an escalated attempt against the attempt reporting bound);
-   *  - the worst per-attempt reporting gap, plus how many attempts ended with no
-   *    durable report or escalation at all.
-   *
-   * Definitions, stated so a reader can falsify them:
-   *  - an attempt's durable elements are its `task/claimed` dispatch (and the
-   *    assignment delivery written with it), every durable event naming its task
-   *    or attempt while it was current, every delivery naming them, and every
-   *    recorded tool run of the attempt;
-   *  - its reporting gap is the longest interval between consecutive elements,
-   *    closed at its end (or at read time while it is live);
-   *  - it ended unreported when it is no longer the task's current attempt and no
-   *    durable event or delivery after its dispatch ever named it — the dispatch
-   *    itself is not a report about the attempt.   *
-   * LIMITS, named rather than hidden: the attempt intervals come from the
-   * retained event window (`maxEvents`), so an attempt whose dispatch has aged
-   * out is not reconstructed; an attempt that ended with no closing event is
-   * dated at its last durable element; the attempt bound quoted is the bound in
-   * force at read time, not necessarily the one in force when an old escalation
-   * fired (the escalation's own `[witness: …]` token carries that one).
-   */
-  silenceReport(missionId: string): SilenceReport {
-    const now = Date.now()
-    const bounds = { passMs: this.rt.stallPassTimeoutMs, passReleaseMs: this.rt.stallPassReleaseBoundMs, attemptMs: this.rt.attemptSilenceBoundMs }
-    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
-    const deliveries = this.rt.store.list('deliveries', missionId)
-    const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))
-    type ElementKind = 'claim' | 'event' | 'delivery' | 'run'
-    interface Element { at: number; kind: ElementKind; isClaim: boolean }
-    interface Interval { attemptId: string; taskId: string; epoch: number; memberId: string; claimedAt: number; endedAt?: number; elements: Element[] }
-    const byAttempt = new Map<string, Interval>()
-    const open = new Map<string, Interval>()
-    const claimStart = (event: SwarmEvent): void => {
-      const data = event.data as { taskId?: unknown; attempt?: { id?: unknown; ownerId?: unknown; epoch?: unknown } } | undefined
-      const taskId = typeof data?.taskId === 'string' ? data.taskId : undefined
-      const attemptId = typeof data?.attempt?.id === 'string' ? data.attempt.id : undefined
-      const ownerId = typeof data?.attempt?.ownerId === 'string' ? data.attempt.ownerId : undefined
-      if (taskId === undefined || attemptId === undefined || ownerId === undefined) return
-      const prior = open.get(taskId)
-      // A re-dispatch is the durable close of the attempt it replaces.
-      if (prior !== undefined) prior.endedAt = Math.min(prior.endedAt ?? event.createdAt, event.createdAt)
-      const interval: Interval = { attemptId, taskId, epoch: typeof data?.attempt?.epoch === 'number' ? data.attempt.epoch : 0, memberId: ownerId, claimedAt: event.createdAt, elements: [{ at: event.createdAt, kind: 'claim', isClaim: true }] }
-      byAttempt.set(attemptId, interval)
-      open.set(taskId, interval)
-    }
-    for (const event of events) {
-      if (event.type === 'task/claimed') { claimStart(event); continue }
-      // The event is attributed to the open attempt of each task it names; a
-      // closer ends that attempt at this instant and takes it out of the open
-      // set, so a later event about the same task is never attributed to a
-      // closed attempt (a later delivery or run that names the attempt id is
-      // still attributed, because that identity is exact).
-      let closedTask: string | undefined
-      for (const [taskId, interval] of open) {
-        if (!this.identityIn(event.data, taskId, interval.attemptId)) continue
-        interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
-        if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
-      }
-      if (closedTask !== undefined) open.delete(closedTask)
-    }
-    for (const run of this.rt.store.toolRuns(missionId)) {
-      const interval = byAttempt.get(run.attemptId)
-      if (interval === undefined) continue
-      interval.elements.push({ at: run.createdAt, kind: 'run', isClaim: false })
-    }
-    for (const delivery of deliveries) {
-      const interval = delivery.attemptId === undefined ? open.get(delivery.taskId ?? '') : byAttempt.get(delivery.attemptId)
-      if (interval === undefined) continue
-      // The assignment delivery is written in the same transaction as the
-      // dispatch: it is the claim, not a report about the attempt.
-      interval.elements.push({ at: delivery.createdAt, kind: 'delivery', isClaim: delivery.kind === 'assignment' })
-    }
-    const escalations = new Map<string, string[]>()
-    for (const delivery of deliveries) {
-      const key = delivery.notice?.dedupKey
-      if (typeof key !== 'string') continue
-      const attemptId = /^(?:attempt-silent|operation-silent):([^:]+):/.exec(key)?.[1]
-      if (attemptId === undefined) continue
-      const list = escalations.get(attemptId) ?? []
-      list.push(key)
-      escalations.set(attemptId, list)
-    }
-    const reports: AttemptReport[] = []
-    const subjects: SubjectSilence[] = []
-    for (const interval of byAttempt.values()) {
-      const task = current.get(interval.taskId)
-      const stillCurrent = task?.status === 'running' && task.attempt?.id === interval.attemptId
-      const lastDurableAt = interval.elements.reduce((latest, element) => Math.max(latest, element.at), interval.claimedAt)
-      // No closer was recorded but the task no longer carries the attempt: the
-      // attempt ended at its last durable element, without a report.
-      const endedAt = interval.endedAt ?? (stillCurrent ? undefined : lastDurableAt)
-      const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)
-      const end = endedAt === undefined ? now : Math.max(endedAt, instants.at(-1) ?? endedAt)
-      let worstReportingGapMs = 0
-      let previousInstant = interval.claimedAt
-      for (const instant of instants) { worstReportingGapMs = Math.max(worstReportingGapMs, instant - previousInstant); previousInstant = instant }
-      worstReportingGapMs = Math.max(worstReportingGapMs, end - previousInstant)
-      const endedUnreported = endedAt !== undefined && !interval.elements.some(element => !element.isClaim && element.kind !== 'run')
-      const attemptEscalations = escalations.get(interval.attemptId) ?? []
-      reports.push({
-        attemptId: interval.attemptId, taskId: interval.taskId, epoch: interval.epoch, memberId: interval.memberId,
-        claimedAt: interval.claimedAt, ...(endedAt === undefined ? {} : { endedAt }), lastDurableAt,
-        worstReportingGapMs, silentMs: Math.max(0, end - lastDurableAt), escalations: attemptEscalations, endedUnreported,
-      })
-      for (const key of attemptEscalations) {
-        const delivery = deliveries.find(candidate => candidate.notice?.dedupKey === key)
-        const silentSince = Number(key.slice(key.lastIndexOf(':') + 1))
-        if (delivery === undefined || !Number.isSafeInteger(silentSince)) continue
-        subjects.push({ subject: delivery.subjects?.[0] ?? `${interval.taskId}@${interval.epoch}`, kind: 'attempt', gapMs: Math.max(0, delivery.createdAt - silentSince), boundMs: bounds.attemptMs, at: delivery.createdAt })
-      }
-    }
-    // The released scheduling passes: the durable pass row is the carrier (the
-    // once-per-pass overwrite erases per-run detail, so it accumulates the worst).
-    const passRow = this.rt.store.get('passes', this.passKey(missionId))
-    const passRelease = passRow === undefined ? undefined : releasedPassFields(passRow)
-    const worstRelease = passRelease?.worstRelease
-    if (worstRelease !== undefined) {
-      subjects.push({ subject: `pass:${worstRelease.runId}`, kind: 'scheduling-pass', gapMs: worstRelease.gapMs, boundMs: worstRelease.boundMs, at: worstRelease.releasedAt })
-    }
-    const worstSubjectSilence = subjects.reduce<SubjectSilence | undefined>((worst, item) =>
-      worst === undefined || item.gapMs > worst.gapMs || (item.gapMs === worst.gapMs && item.gapMs - item.boundMs > worst.gapMs - worst.boundMs) ? item : worst, undefined)
-    const worstAttempt = reports.reduce<{ attemptId: string; taskId: string; gapMs: number } | undefined>((worst, report) =>
-      worst === undefined || report.worstReportingGapMs > worst.gapMs ? { attemptId: report.attemptId, taskId: report.taskId, gapMs: report.worstReportingGapMs } : worst, undefined)
-    return {
-      missionId, bounds, subjects, worstSubjectSilence,
-      attempts: reports,
-      worstAttemptReportingGap: worstAttempt,
-      attemptsEnded: reports.filter(report => report.endedAt !== undefined).length,
-      attemptsEndedUnreported: reports.filter(report => report.endedUnreported).length,
-      attemptSilenceEscalations: subjects.filter(item => item.kind === 'attempt').length,
-      passReleases: { count: passRelease?.releases ?? 0, worst: worstRelease },
-      note: 'Read-only projection over the durable rows at read time. A subject silence is measured against the declared bound carried next to it: a released scheduling pass against the pass release bound it was released under, an escalated attempt against the attempt reporting bound in force at read time. The worst subject silence is the widest gap (ties: the widest overrun). The worst per-attempt reporting gap is the longest interval between durable elements attributable to one attempt, closed at its end or at read time. `attemptsEndedUnreported` counts attempts no longer current whose only durable element is their own dispatch. Limits: attempt intervals come from the retained event window, an attempt that ended with no closing event is dated at its last durable element, and a second release of an unchanged board is deduped into the first escalation (the pass row still counts it in `releases`).',
-    }
-  }
-
-  /**
    * F2: the board makes no progress except for submitted work. Unlike `stalled`,
    * a submitted task is not progress: an artifact whose review path is broken
    * can never reach a verdict by itself.
@@ -1377,202 +1108,4 @@ export class Scheduling {
     const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
     return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }
-}
-
-/* ------------------------------------------------------------------------- *
- * Round 14: the guard-chain board model.
- *
- * The kernel obligation is structural: every guard chain ends in an escalation
- * that has no conditions of its own, so a dead end is impossible. This model is
- * the shared vocabulary for that claim. `guardDispatchActions` and
- * `guardProgressActions` describe every action an earlier element of a chain can
- * still produce; `guardTerminalChain` names the chain whose earlier elements
- * have all answered "no"; `terminalEscalation` turns that into the coded,
- * actionable decision request `Scheduling.escalateGuardTerminal` emits.
- *
- * The model is pure: no store, no clock, no cache. `tests/guard-terminals.test.mjs`
- * enumerates generated board states (task status x attempt presence x workspace
- * state x member status x budget pause), walks the reachable subset through a
- * transition relation and asserts the property over every reachable non-terminal
- * state, so the guarantee is checked against the same functions the dispatch
- * path uses. The states the generator does not reach are named in that test.
- * ------------------------------------------------------------------------- */
-
-/** One generated board: the five dimensions the property test enumerates. */
-export interface GuardTask {
-  id: string
-  status: Task['status']
-  /** An attempt is attached to a running task; `leaseLive` is its lease state. */
-  attempt?: { leaseLive: boolean }
-  /** The task already spent its own step/finding ceiling (`taskCeilingExhaustion`). */
-  ceilingExhausted?: boolean
-  /** An ordinary dependency edge waits for acceptance; a dead edge never resolves. */
-  dependenciesSatisfied?: boolean
-  dependenciesDead?: boolean
-  /** This task reviews the named source; the source may have no live review left. */
-  reviewOf?: string
-  reviewSourceLive?: boolean
-  /** Members who authored the reviewed source and can never review it. */
-  authorMemberIds?: string[]
-  /** Preparation failures exhausted the task's recovery limit. */
-  preparationExhausted?: boolean
-  /**
-   * The task's own text assumes prior content that no dependency carries
-   * (R12-F9): the admission guard's terminal input.
-   */
-  assumedContent?: boolean
-}
-
-export interface GuardMember {
-  id: string
-  status: Member['status']
-  /** False only for a member the isolation invariant refuses. */
-  isolated?: boolean
-}
-
-export interface GuardBoard {
-  mission: {
-    status: Mission['status']
-    workspace: 'authorized' | 'revoked' | 'dirty' | 'unprovisioned'
-    budgetPaused?: boolean
-    budgetBlocked?: string
-  }
-  tasks: GuardTask[]
-  members: GuardMember[]
-}
-
-export interface GuardDispatchAction {
-  kind: 'dispatch'
-  chain: 'dispatch_preconditions'
-  taskId: string
-  memberId: string
-}
-
-/** Work already in flight: an action an earlier chain element is executing. */
-export interface GuardProgressAction {
-  kind: 'progress'
-  chain: GuardChainId
-  detail: string
-  taskId?: string
-  memberId?: string
-}
-
-export interface GuardEscalationAction {
-  kind: 'escalate'
-  chain: GuardChainId
-  code: string
-  message: string
-  exits: DecisionExit[]
-  taskId?: string
-}
-
-export type GuardAction = GuardDispatchAction | GuardProgressAction | GuardEscalationAction
-
-const isLiveMember = (member: GuardMember): boolean => member.status === 'idle' || member.status === 'waiting'
-
-/**
- * Every (task, member) pair an earlier element of the dispatch-precondition
- * chain can still act on. A task is dispatchable only when the whole chain
- * before the terminal answered "yes": the mission is active, the budget is not
- * paused or exhausted, the workspace is authorized, the task is pending, it has
- * not spent its own ceiling or its preparation recovery, its dependency lineage
- * is alive and satisfied, its review source is live when it is a review, and a
- * live member who did not author that source can take it.
- */
-export function guardDispatchActions(board: GuardBoard): GuardDispatchAction[] {
-  const mission = board.mission
-  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
-  const actions: GuardDispatchAction[] = []
-  for (const task of board.tasks) {
-    if (task.status !== 'pending' || task.ceilingExhausted === true || task.preparationExhausted === true || task.assumedContent === true) continue
-    if (task.dependenciesSatisfied === false || task.dependenciesDead === true) continue
-    if (task.reviewOf !== undefined && task.reviewSourceLive === false) continue
-    const member = board.members.find(candidate => isLiveMember(candidate) && candidate.isolated !== false
-      && !(task.authorMemberIds ?? []).includes(candidate.id))
-    if (member !== undefined) actions.push({ kind: 'dispatch', chain: 'dispatch_preconditions', taskId: task.id, memberId: member.id })
-  }
-  return actions
-}
-
-/**
- * Work already in flight. A live lease, a working member or a submitted source
- * whose review is still live is progress, so the board is not a dead end and no
- * terminal escalation is owed. This is deliberately derived from the board, not
- * from the terminal function, so the property test cannot be circular.
- *
- * "In flight" is only progress while the chains that gate it can still let it
- * land: an attempt whose workspace cannot produce an artifact, or whose mission
- * is paused or out of budget, is executing but can never reach its terminal
- * step — that is exactly the 2026-09-10 trap, and it must count as a dead end
- * rather than as liveness.
- */
-export function guardProgressActions(board: GuardBoard): GuardProgressAction[] {
-  const mission = board.mission
-  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
-  const actions: GuardProgressAction[] = []
-  for (const task of board.tasks) {
-    if (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseLive) {
-      actions.push({ kind: 'progress', chain: 'attempt_lease', taskId: task.id, detail: 'a running attempt holds a live lease' })
-    }
-    if (task.status === 'submitted' && task.reviewOf === undefined && task.reviewSourceLive !== false) {
-      actions.push({ kind: 'progress', chain: 'review_admission', taskId: task.id, detail: 'a submitted source has a live review path' })
-    }
-  }
-  for (const member of board.members) {
-    if (member.status === 'working') actions.push({ kind: 'progress', chain: 'dispatch_preconditions', memberId: member.id, detail: 'the member is working' })
-  }
-  return actions
-}
-
-/**
- * The chain whose earlier elements have all answered "no". Ordered so the
- * classification names the *first* chain that cannot progress: a board with an
- * exhausted budget and a revoked workspace is a budget decision first, because
- * no lease can be admitted until the ceiling moves.
- */
-export function guardTerminalChain(board: GuardBoard): GuardChainId {
-  const live = board.tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-  if (board.mission.budgetBlocked !== undefined || board.mission.budgetPaused === true) return 'budget'
-  if (live.length > 0 && board.mission.workspace !== 'authorized') return 'workspace'
-  if (board.tasks.some(task => task.status === 'running' && task.attempt !== undefined && !task.attempt.leaseLive)) return 'attempt_lease'
-  if (board.tasks.some(task => task.ceilingExhausted === true && task.status !== 'accepted' && task.status !== 'cancelled')) return 'task_ceiling'
-  if (board.tasks.some(task => task.assumedContent === true && task.status === 'pending')) return 'admission'
-  if (board.tasks.some(task => task.status === 'submitted' && task.reviewSourceLive === false)) return 'review_admission'
-  return 'dispatch_preconditions'
-}
-
-/**
- * The unconditional terminal element: total by construction. It takes a board
- * and always returns an escalation — the only branch that carries no earlier
- * failure is the generic "no executable action remains" one — so no caller can
- * reach a state where the chain has ended and nothing is emitted.
- */
-export function terminalEscalation(board: GuardBoard): GuardEscalationAction {
-  const chain = guardTerminalChain(board)
-  const task = board.tasks.find(candidate => candidate.status !== 'accepted' && candidate.status !== 'cancelled')
-  const member = board.members.find(candidate => candidate.status === 'working') ?? board.members[0]
-  const terminal = guardTerminal(chain, { ...(task === undefined ? {} : { taskId: task.id }), ...(member === undefined ? {} : { memberId: member.id }) })
-  return { kind: 'escalate', ...terminal, ...(task === undefined ? {} : { taskId: task.id }) }
-}
-
-/** Every action the model can see: dispatch, progress, or the unconditional terminal. */
-/**
- * True only for the mission statuses no actor can bring back: `completed` and
- * `stopped`. Everything else — including `blocked` (a budget stop) and `paused` —
- * still owes the owner an executable action, which is the whole point of the
- * terminal element (`emitGuardTerminal` bails only on a terminal mission).
- */
-export function guardMissionTerminal(board: GuardBoard): boolean {
-  return board.mission.status === 'completed' || board.mission.status === 'stopped'
-}
-
-export function guardActions(board: GuardBoard): GuardAction[] {
-  const dispatch = guardDispatchActions(board)
-  const progress = guardProgressActions(board)
-  // S4r-D5: the terminal is appended for every non-terminal mission status, not
-  // only for `active`. A budget-blocked mission (`status: 'blocked'`,
-  // `budgetPause` set) is exactly when the owner needs the coded exit, and the
-  // old predicate returned an empty action list for it.
-  if (dispatch.length > 0 || progress.length > 0 || guardMissionTerminal(board)) return [...dispatch, ...progress]
-  return [...dispatch, ...progress, terminalEscalation(board)]
 }

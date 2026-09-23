@@ -151,8 +151,23 @@ class EnvelopeWorkers {
     return await this.workspaces.captureArtifact(member, task)
   }
   async verifyArtifact(member, source, artifact, signal) {
-    this.verifications.push({ memberId: member.id, sourceTaskId: source.id, checks: source.checks })
-    return await this.workspaces.verifyArtifact(member, source, artifact, signal)
+    const record = { memberId: member.id, sourceTaskId: source.id, checks: source.checks, results: [] }
+    this.verifications.push(record)
+    record.results = await this.workspaces.verifyArtifact(member, source, artifact, signal)
+    return record.results
+  }
+  /**
+   * ENV: the most recent completed check, read from the `CheckResult` rows the
+   * host really returned (and that the runtime persists as `tool_runs`). A
+   * check's own environment and attribution live on its row; `Workspaces` keeps
+   * no second copy of them.
+   */
+  lastCheck() {
+    for (const verification of [...this.verifications].reverse()) {
+      const last = verification.results.at(-1)
+      if (last !== undefined) return last
+    }
+    return undefined
   }
   checkEnvelope() { return this.workspaces.checkEnvelope() }
   async dispose() { await this.workspaces.dispose() }
@@ -254,7 +269,7 @@ test('ENV: real host verification accepts dependency directories enumerated in G
   })
   assert.equal(accepted.status, 'accepted', 'passing host checks settle the review despite declaration/enumeration order')
   assert.equal(fixture.ready().status, 'accepted', 'the source verdict is persisted')
-  const dependencies = fixture.workspaces.checkEnvelope().observed.environment.dependencyLinks
+  const dependencies = fixture.workers.lastCheck().environment.dependencyLinks
   const measured = dependencies.materializedPaths
   assert.deepEqual(dependencies.dirs, DEFAULT_DEPENDENCY_DIRS, 'the configured candidates remain distinct from materialised paths')
   assert.deepEqual(measured, [...DEFAULT_DEPENDENCY_DIRS].sort(), 'the evidence retains the real Git enumeration order')
@@ -273,7 +288,7 @@ test('ENV: a partially installed dependency set preserves policy and verifies th
   })
   assert.equal(accepted.status, 'accepted', 'absent optional toolchain candidates do not create an environment mismatch')
   assert.equal(fixture.ready().status, 'accepted', 'the real host verdict settles the source')
-  const observed = fixture.workspaces.checkEnvelope().observed
+  const observed = fixture.workers.lastCheck()
   assert.equal(observed.attribution.command, 'test -s node_modules/fixture.txt', 'the host check read the materialised dependency')
   assert.deepEqual(observed.environment.dependencyLinks.dirs, DEFAULT_DEPENDENCY_DIRS, 'the policy still permits all five candidates')
   assert.deepEqual(observed.environment.dependencyLinks.materializedPaths, ['node_modules'], 'the execution records only the directory actually installed')
@@ -291,16 +306,16 @@ test('ENV: a completed check records the environment it ran under and its attrib
   assert.equal(results[0].exitCode, 1, 'the fixture check really fails')
   assert.equal(results[0].environment.sandboxPolicy.mode, 'workspace-write', 'the check carries the environment it ran under')
   assert.notEqual(results[0].environment.checkCacheRoot, undefined)
-  const envelope = fixture.workspaces.checkEnvelope()
-  assert.equal(envelope.observed.memberId, member.id)
-  assert.equal(envelope.observed.taskId, task.id)
-  assert.equal(envelope.observed.environment.checkCacheRoot, results[0].environment.checkCacheRoot, 'the observed facts are the run the semaphore produced')
-  assert.match(envelope.observed.environment.checkCacheRoot, /verification/, 'the observed scoped cache root is inside a real verification checkout')
-  // A later passing check replaces the observation: the envelope never carries a
-  // stale attribution from an earlier failing run.
+  assert.equal(results[0].attribution.command, FAILING_CHECK, 'the row names the check it attributes')
+  assert.deepEqual(results[0].attribution.failingTests, ['the-real-failure'], 'and the failure it attributed')
+  assert.match(results[0].environment.checkCacheRoot, /verification/, 'the scoped cache root is inside a real verification checkout')
+  assert.equal(fixture.workspaces.checkEnvelope().completed, 1, 'the run really passed through the semaphore')
+  // Each verification returns its own rows, so a later passing check cannot
+  // carry a stale attribution from an earlier failing run.
   const passing = await fixture.workspaces.verifyArtifact(member, { ...task, checks: ['test -d .'] }, artifact)
   assert.equal(passing[0].exitCode, 0)
-  assert.deepEqual(fixture.workspaces.checkEnvelope().observed.attribution.failingTests, [], 'the observation is the most recent check')
+  assert.deepEqual(passing[0].attribution.failingTests, [], 'the second run reports its own attribution')
+  assert.notEqual(passing[0].environment.checkCacheRoot, results[0].environment.checkCacheRoot, 'and its own verification checkout')
 })
 
 /* ------------------------------------------------------------------ *
@@ -366,10 +381,11 @@ test('ENV: a failed declared check is attributable from durable state ahead of t
   assert.ok(rejection, 'the rejection is durable')
   assert.deepEqual(rejection.data.checkFailures[0].attribution.failingTests, ['the-real-failure'], 'the durable verdict event carries the failing test')
   assert.ok(JSON.stringify(rejection.data.checkFailures[0]).indexOf('"attribution"') < JSON.stringify(rejection.data.checkFailures[0]).indexOf('"output"'))
-  const envelopeEvent = fixture.events().filter(event => event.type === 'task/check-envelope' && event.data?.observed !== undefined).at(-1)
+  // The measured envelope is durable too; the failing check's attribution lives
+  // on its own tool-run row and the verdict event above, not a second copy here.
+  const envelopeEvent = fixture.events().filter(event => event.type === 'task/check-envelope' && typeof event.data?.completed === 'number').at(-1)
   assert.ok(envelopeEvent, 'the measured envelope is durable')
-  assert.deepEqual(envelopeEvent.data.observed.attribution.failingTests, ['the-real-failure'], 'the envelope carries the failing test')
-  assert.ok(JSON.stringify(envelopeEvent.data.observed).indexOf('"attribution"') < JSON.stringify(envelopeEvent.data.observed).indexOf('"output"'), 'the envelope puts the attribution ahead of the output')
+  assert.equal(envelopeEvent.data.sourceTaskId, fixture.source.id, 'and names the task whose checks were measured')
 })
 
 /* ------------------------------------------------------------------ *

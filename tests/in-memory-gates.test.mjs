@@ -158,11 +158,8 @@ const CENSUS = [
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
   ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
   ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
-  ["src/notices.ts",11,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",12,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",13,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",14,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",15,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",11,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // L2 owner-reply guard: a plugin-side observer of host session events, not a
   // participant in the runtime's decision path. Every durable fact it reports
   // (the open receipt, its nudge count, the guard terminal) lives on the
@@ -219,16 +216,10 @@ const CENSUS = [
   ["src/scheduling.ts",1,"Set","readonly releasedPasses = new Set<string>()","gate","derivable","S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
   ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  // R16-D: the four function-local indexes and two inline dedups of
-  // `silenceReport` and `escalateSchedulingStall`. Every one is built from the
+  // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
   // durable rows inside one synchronous, read-only call and discarded with it;
-  // none is retained, none is read by a later call and none can gate one.
+  // it is not retained, not read by a later call and cannot gate one.
   ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",5,"Map","const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",6,"Map","const byAttempt = new Map<string, Interval>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",7,"Map","const open = new Map<string, Interval>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",8,"Map","const escalations = new Map<string, string[]>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",9,"Set","const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
