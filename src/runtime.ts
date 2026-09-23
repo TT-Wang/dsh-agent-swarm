@@ -4288,8 +4288,7 @@ export class SwarmRuntime {
    */
   private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.shuttingDown) return
-    // The body starts: its first progress, and the baseline from which its
-    // later stamps tell waiting from computing (the queue wait is not its own).
+    // The body starts: its first progress (the queue wait is not its own).
     progressed(pass)
     const mission = this.mission(missionId)
     if (mission.status !== 'active') { await this.flushOutbox(missionId, pass); return }

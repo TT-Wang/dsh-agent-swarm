@@ -8,7 +8,6 @@
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { performance } from 'node:perf_hooks'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
@@ -69,8 +68,8 @@ export interface DispatchQuestion {
  * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
  * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
  * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
- * and once one of its own awaits has waited past its bound it stops at the next
- * member boundary so the next body resumes from lease recovery (`dispatch`).
+ * and once past its bound it stops at the next member boundary so the next body
+ * resumes from lease recovery (`dispatch`).
  */
 export interface SchedulingPass {
   /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
@@ -104,14 +103,6 @@ export interface SchedulingPass {
    * that call, stamps the body's progress first (`SwarmRuntime.onRecoveryFallback`).
    */
   preparing?: string
-  /** The event loop's total idle time at the body's last stamp (`progressed`). */
-  idleMs?: number
-  /**
-   * The last stamp at which the event loop had sat idle since the body's
-   * previous stamp: the body was waiting on one of its own awaits, not
-   * computing. Past the bound it stops the body early (`dispatch`).
-   */
-  waitedAt?: number
   /** The member this body's sweep starts from: the one its predecessor stopped before. */
   sweepFrom?: string
   /**
@@ -175,19 +166,9 @@ function formatSpan(ms: number): string {
  * Nothing else stamps it: commits made by a worker turn the body woke inside an
  * adapter call are that turn's, not the body's. Without a record (a direct
  * `schedule` or `dispatch` call) it does nothing.
- *
- * It also records whether the body waited since its previous stamp: the event
- * loop only idles while the body is suspended in an await with nothing left to
- * run, so time spent computing (the body's own or an adapter's synchronous
- * work) never counts as waiting (`waitedAt`).
  */
 export function progressed(pass: SchedulingPass | undefined): void {
-  if (pass === undefined) return
-  const now = Date.now()
-  const idleMs = performance.eventLoopUtilization().idle
-  if (pass.idleMs !== undefined && idleMs > pass.idleMs) pass.waitedAt = now
-  pass.progressAt = now
-  pass.idleMs = idleMs
+  if (pass !== undefined) pass.progressAt = Date.now()
 }
 
 /**
@@ -229,20 +210,20 @@ export class Scheduling {
    * being active during an adapter await. It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
    *
-   * A body one of whose own awaits waited past its bound (`waitedAt`,
-   * `pastBound`) also returns false at the next member boundary, after sweeping
-   * at least one member, and records where it stopped (`stoppedBefore`). `kick`
-   * then queues the next body at once, which starts from lease recovery and
-   * sweeps from that member onwards, wrapping round to the ones before it. Each
-   * member's long awaits (a worker start up to `workerStartTimeoutMs`, task
-   * preparation, a close-out capture) therefore delay lease recovery, automatic
-   * completion and the budget check by at most one such await, not by their sum
-   * over every member. A body past its bound on computation alone (its own or
-   * an adapter's synchronous work) does not stop: another body would only add
-   * its own start-up work. The chain of early stops is bounded: a chained body's
-   * sweep ends before the member the chain started from (`chainFrom`), so the
-   * body that completes the rotation returns true, runs the pass-end steps
-   * (`ensureWitness`, `flushOutbox`) and the next body waits for the tick.
+   * A body past its bound (`pastBound`) also returns false at the next member
+   * boundary, after sweeping at least one member, and records where it stopped
+   * (`stoppedBefore`), whether it spent the time waiting in an await or
+   * computing. `kick` then queues the next body at once, which starts from
+   * lease recovery and sweeps from that member onwards, wrapping round to the
+   * ones before it. Each member's long awaits (a worker start up to
+   * `workerStartTimeoutMs`, task preparation, a close-out capture) therefore
+   * delay lease recovery, automatic completion and the budget check by at most
+   * one such await, not by their sum over every member. The chain of early
+   * stops is bounded, and that bound is what contains a body that is past its
+   * bound only by computing: a chained body's sweep ends before the member the
+   * chain started from (`chainFrom`), so the body that completes the rotation
+   * returns true, runs the pass-end steps (`ensureWitness`, `flushOutbox`) and
+   * the next body waits for the tick.
    * `pass` is the body's own record, handed down by `kick`; a direct call
    * without one never stamps progress and never stops early.
    */
@@ -259,7 +240,7 @@ export class Scheduling {
         const order = end > 0 ? rotation.slice(0, end) : rotation
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass?.waitedAt !== undefined && index > 0 && this.pastBound(pass, pass.waitedAt)) {
+          if (pass !== undefined && index > 0 && this.pastBound(pass)) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
             pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
