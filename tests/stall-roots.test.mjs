@@ -12,6 +12,7 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { waitsLegitimately } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
 import { tempDirectory } from './temp-root.mjs'
+import { FakeClock } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -379,9 +380,12 @@ for (const repaired of [true, false]) {
     // 5347f5b: delivery judged a stall-root by its root alone, but its reminders
     // judged every listed subject; the rejecting review (a listed dependent) is
     // never a live wait, so two "still unresolved" reminders reached the owner
-    // while the root's repair was already running.
-    const f = await fixture(t, { tickMs: 10 })
-    f.runtime.notices.obligationFollowupMs = 300
+    // while the root's repair was already running. The clock and the ticks are
+    // driven by hand: each reminder interval is one clock step and one tick.
+    const clock = new FakeClock()
+    const f = await fixture(t, { tickMs: 0, now: clock.now, stallPassTimeoutMs: 60_000 })
+    const followupMs = f.runtime.notices.obligationFollowupMs = 300
+    const reminderIntervals = async count => { for (let step = 0; step < count; step += 1) { clock.advance(followupMs); await f.runtime.tick() } }
     const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
     const source = f.propose('Rejected implementation')
     const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
@@ -390,10 +394,12 @@ for (const repaired of [true, false]) {
       title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
     const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
     await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+    await f.runtime.tick()
     const rootSubject = `${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`
     // Delivered itself, or (a rejected root) through the decision it is recorded against.
     const handed = delivery => (delivery.notice.coveredBy === undefined ? delivery : f.runtime.store.get('deliveries', delivery.notice.coveredBy))?.deliveredAt !== undefined
-    const stallRoot = await eventually(() => f.stallRoots().find(handed), 'the stall-root decision reaches the owner')
+    const stallRoot = f.stallRoots().find(handed)
+    assert.ok(stallRoot !== undefined, 'the stall-root decision reaches the owner')
     assert.ok(stallRoot.subjects.includes(`${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`), 'the rejecting review is a listed dependent')
     const reviewSubject = `${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`
     // Every owner fact: its own row, or each wake-budget constituent.
@@ -403,10 +409,11 @@ for (const repaired of [true, false]) {
     const remindersOf = original => facts().filter(fact => fact.dedupKey.startsWith(`obligation-followup:${original.id}:`))
     const reminders = () => remindersOf(stallRoot)
     if (repaired) {
-      const proposedAt = Date.now()
+      const proposedAt = clock.now()
       const repair = f.propose('Repair', { replaces: [source.id] })
-      await eventually(() => f.runtime.store.get('tasks', repair.id).status === 'running', 'the repair runs')
-      await sleep(1200)
+      await f.runtime.settle(f.mission.id)
+      assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair runs')
+      await reminderIntervals(4)
       assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')
       assert.deepEqual(reminders().map(item => item.subjects), [], 'no stall-root reminder while the repair runs')
       // 12b12a6: the W3 stall's reminders and the fall-through still named the
@@ -419,12 +426,14 @@ for (const repaired of [true, false]) {
     // reminders carry the root.
     const cover = f.runtime.store.get('deliveries', stallRoot.notice.coveredBy)
     assert.ok(cover !== undefined, 'the rejected root is recorded against the rejection decision')
-    const reminder = await eventually(() => remindersOf(cover).find(item => item.delivery.deliveredAt !== undefined), 'the rejection decision\'s reminder reaches the owner', 3000)
+    await reminderIntervals(f.runtime.notices.maxObligationFollowups + 1)
+    const reminder = remindersOf(cover).find(item => item.delivery.deliveredAt !== undefined)
+    assert.ok(reminder !== undefined, 'the rejection decision\'s reminder reaches the owner')
     assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
     // The W3 board stall lists the review too; its reminders judge the same rule.
     const stall = f.notices().find(delivery => delivery.notice?.dedupKey?.startsWith('mission/stalled:'))
     assert.ok(stall?.subjects.includes(reviewSubject), 'the W3 stall lists the rejecting review')
-    await eventually(() => remindersOf(stall).length >= f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded', 5000)
+    assert.equal(remindersOf(stall).length, f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded')
     assert.deepEqual(remindersOf(stall).map(fact => fact.subjects), remindersOf(stall).map(() => [rootSubject]), 'the W3 reminders name the root only')
     // 12b12a6: the covered row reminded on its own, beside the decision's
     // reminder, citing an "original delivery" the owner never received.

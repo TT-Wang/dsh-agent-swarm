@@ -24,7 +24,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { realpath, rm } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime, budget, MISSION_ACCEPTANCE } from './faults/harness.mjs'
+import { setup, eventually, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, budget, MISSION_ACCEPTANCE } from './faults/harness.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -186,15 +186,32 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   // naming that failed on its one tick (here a real SQLite writer lock held by a
   // second connection for exactly that tick) left the wedge unnamed for the rest
   // of the body's life: passState {passLive: false, wedged: true}, no event, no
-  // owner notice. The naming now counts only once it has committed.
-  const workers = new WedgeStartWorkers()
+  // owner notice. The naming now counts only once it has committed. The clock
+  // and the ticks are driven by hand, and the author's start stays wedged until
+  // the test releases it, so every tick below sees the body at a known age.
+  const bound = 10_000
+  const clock = new FakeClock()
+  class HeldStartWorkers extends FakeWorkers {
+    hold
+    async start(spec) {
+      this.started.push(spec.member.id)
+      const hold = this.hold
+      if (hold === undefined || hold.entered.done) return
+      hold.entered.done = true
+      hold.entered.resolve()
+      try { await hold.release.promise } finally { hold.settledAt = clock.now() }
+    }
+  }
+  const workers = new HeldStartWorkers()
   const dir = await realpath(await tempDirectory('swarm-pass-busy-'))
   const statePath = join(dir, 'swarm.sqlite')
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
-    stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: 1_500 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 0, now: clock.now, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+    stallPassTimeoutMs: bound, stallPasses: 1_000 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
+  const hold = { entered: Promise.withResolvers(), release: Promise.withResolvers() }
+  hold.release.promise.catch(() => {})
   try {
     await runtime.start()
     const owner = { sessionId: 'pass-owner' }
@@ -203,36 +220,40 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
     const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
     const wedges = () => events(runtime, mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
     const scheduling = runtime.scheduling
-    const check = scheduling.checkSchedulingPasses.bind(scheduling)
-    let locked
-    // The lock is keyed on the watchdog's own predicate at the tick's own
-    // instant, so the tick that first finds the body past its bound is exactly
-    // the one that runs under the lock.
-    scheduling.checkSchedulingPasses = (now = Date.now()) => {
-      const pass = scheduling.passes.get(mission.id)
-      if (locked !== undefined || pass === undefined || !scheduling.pastBound(pass, now)) return check(now)
-      const other = new DatabaseSync(statePath)
-      other.exec('BEGIN IMMEDIATE')
-      try { return check(now) } finally {
-        other.exec('ROLLBACK'); other.close()
-        locked = { events: wedges().length, escalatedAt: scheduling.passes.get(mission.id)?.escalatedAt }
-      }
-    }
-    workers.wedgeNext = true
+    await runtime.settle(mission.id)
+    workers.hold = hold
     const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
       kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: author.id })
-    await eventually(() => locked, 'the first naming tick must run under the writer lock', 4_000)
-    assert.deepEqual(locked, { events: 0, escalatedAt: undefined }, 'the locked naming committed nothing and did not count as a naming')
+    await hold.entered.promise
+    clock.advance(bound)
+    // The tick that first finds the body past its bound runs its watchdog under
+    // the lock, and only its watchdog.
+    const check = scheduling.checkSchedulingPasses.bind(scheduling)
+    scheduling.checkSchedulingPasses = now => {
+      const other = new DatabaseSync(statePath)
+      other.exec('BEGIN IMMEDIATE')
+      try { return check(now) } finally { other.exec('ROLLBACK'); other.close() }
+    }
+    await runtime.tick()
+    delete scheduling.checkSchedulingPasses
+    assert.deepEqual({ events: wedges().length, escalatedAt: scheduling.passes.get(mission.id)?.escalatedAt }, { events: 0, escalatedAt: undefined },
+      'the locked naming committed nothing and did not count as a naming')
     assert.ok(tickFailures.some(line => /WriterBusyError/.test(line)), `the naming commit failed on the busy writer: ${tickFailures.join(' | ')}`)
-    const event = await eventually(() => wedges()[0], 'a later tick must name the wedge once the writer is free', 4_000)
-    assert.equal(workers.wedgeSettledAt, undefined, 'the retry named the body while it was still wedged')
+    await runtime.tick()
+    const [event] = wedges()
+    assert.ok(event !== undefined, 'the next tick names the wedge once the writer is free')
+    assert.equal(hold.settledAt, undefined, 'the retry named the body while it was still wedged')
     assert.ok(runtime.store.list('deliveries', mission.id).some(item => item.to === 'owner' && item.content.includes(`run ${event.data.runId}`)), 'the owner notice committed with the event')
     workers.autoIdle = true
-    await eventually(() => taskOf(runtime, task.id).status === 'running' ? true : undefined, 'the task dispatches once the wedged start settles', 4_000)
-    await sleep(100)
+    hold.release.reject(new Error('Worker startup timed out'))
+    await runtime.settle(mission.id)
+    await runtime.tick()
+    assert.equal(taskOf(runtime, task.id).status, 'running', 'the task dispatches once the wedged start settles')
+    await runtime.tick()
     assert.equal(wedges().length, 1, 'the wedge is named exactly once')
   } finally {
     process.stderr.write = write
+    hold.release.reject(new Error('test ended'))
     await runtime.dispose()
     await rm(dir, { recursive: true, force: true })
   }
@@ -510,57 +531,79 @@ test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps commit
 })
 
 test('S1: a body past its bound stops at the next member boundary, so lease recovery waits for one long await, not for every member\'s', async () => {
-  // Three members whose first native start hangs until the declared start
-  // bound aborts it, and a healthy member X whose running task's lease expires
-  // meanwhile. Before, the named body swept every member and then flushed, so
-  // lease-expiry recovery (the first step of every body) waited for all three
-  // hung starts: about (N-1) start bounds after the lease expired. A body past
-  // its bound now stops at the next member boundary; the next body starts from
-  // lease recovery and sweeps from the member the previous one stopped before.
+  // Three members whose first native start hangs for four pass bounds, and a
+  // healthy member X whose running task's lease expires meanwhile. Before, the
+  // named body swept every member and then flushed, so lease-expiry recovery
+  // (the first step of every body) waited for all three hung starts: about
+  // (N-1) start bounds after the lease expired. A body past its bound now stops
+  // at the next member boundary; the next body starts from lease recovery and
+  // sweeps from the member the previous one stopped before.
   //
-  // The hangs are armed in the same synchronous step that proposes X, so one
-  // body claims X (its lease starts) and then enters A's hang; the lease
-  // expires half-way through B's hang, 200ms from either end of it. The
-  // recovery is measured against the end of the hang that was in flight when
-  // the lease expired: an early-stopping body recovers it at once, a full sweep
-  // only after C's whole start bound.
-  const startBoundMs = 400
-  const leaseMs = 600
+  // The clock is driven by hand and each hang ends when the test releases it,
+  // as the declared start bound would end it. The hangs are armed in the same
+  // synchronous step that proposes X, so one body claims X (its lease starts)
+  // and then enters A's hang; the lease expires half-way through B's hang. An
+  // early-stopping body has recovered the lease by the time the sweep reaches
+  // C's hang, at the instant B's hang ended; a full sweep has not.
+  const bound = 10_000
+  const hangMs = 4 * bound
+  const leaseMs = 1.5 * hangMs
+  const clock = new FakeClock()
   class HangFirstStartWorkers extends FakeWorkers {
-    armed = new Set()
-    hung = new Map()
-    async start(spec, signal) {
+    hangs = new Map()
+    arm(memberId) {
+      const hang = { entered: Promise.withResolvers(), release: Promise.withResolvers() }
+      hang.release.promise.catch(() => {})
+      this.hangs.set(memberId, hang)
+    }
+    async start(spec) {
       this.started.push(spec.member.id)
-      if (!this.armed.has(spec.member.id) || this.hung.has(spec.member.id)) return
-      const hang = { from: Date.now(), index: this.started.length - 1 }
-      this.hung.set(spec.member.id, hang)
-      try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
-      finally { hang.to = Date.now() }
+      const hang = this.hangs.get(spec.member.id)
+      if (hang === undefined || hang.index !== undefined) return
+      hang.index = this.started.length - 1
+      hang.from = clock.now()
+      hang.entered.resolve()
+      try { await hang.release.promise } finally { hang.to = clock.now() }
+    }
+    /** End a hung start as its start bound would: `ms` of clock time after it began. */
+    end(memberId, ms) {
+      clock.advance(ms)
+      this.hangs.get(memberId).release.reject(new Error('Worker startup timed out'))
     }
   }
   const workers = new HangFirstStartWorkers()
   workers.autoIdle = true
-  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, leaseMs, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: startBoundMs } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { leaseMs, stallPassTimeoutMs: bound, stallPasses: 1_000 } })
   try {
     const hanging = []
     for (const name of ['A', 'B', 'C']) hanging.push(await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 }))
-    await sleep(50)
-    for (const member of hanging) workers.armed.add(member.id)
-    const task = f.propose({ title: 'Task X' })
-    const { leaseUntil } = await eventually(() => taskOf(f.runtime, task.id).attempt, 'X is dispatched', 4_000)
-    const expired = await eventually(() => events(f.runtime, f.mission.id, 'task/lease-expired').find(item => item.data.taskId === task.id), 'the lease expiry is recovered', 10_000)
-    const settled = await eventually(() => hanging.every(member => workers.hung.get(member.id)?.to !== undefined) ? true : undefined, 'every member reaches its hung start', 6_000)
-    assert.equal(settled, true)
-    const inFlight = hanging.map(member => workers.hung.get(member.id)).find(hang => hang.from <= leaseUntil && leaseUntil <= hang.to)
-    assert.ok(inFlight !== undefined, `a hung start was in flight when the lease expired at ${leaseUntil}: ${JSON.stringify(hanging.map(member => workers.hung.get(member.id)))}`)
-    const latency = expired.createdAt - inFlight.to
-    assert.ok(latency <= startBoundMs / 2, `lease recovery ran ${latency}ms after the hang in flight at the expiry ended, not after a further start bound (${startBoundMs}ms)`)
+    await f.runtime.settle(f.mission.id)
     const [a, b, c] = hanging
-    assert.equal(workers.started[workers.hung.get(a.id).index + 1], b.id, 'the body after A\'s hung start sweeps first from B, the member the stopped body did not reach')
-    assert.equal(workers.started[workers.hung.get(b.id).index + 1], c.id, 'and the one after B\'s from C')
-    await eventually(() => hanging.every(member => workers.started.lastIndexOf(member.id) > workers.hung.get(member.id).index) ? true : undefined,
-      'every member is started again after its hung start settles', 4_000)
-  } finally { await f.cleanup() }
+    for (const member of hanging) workers.arm(member.id)
+    const task = f.propose({ title: 'Task X' })
+    await workers.hangs.get(a.id).entered.promise
+    const { leaseUntil } = taskOf(f.runtime, task.id).attempt
+    assert.equal(leaseUntil, workers.hangs.get(a.id).from + leaseMs, 'the body claimed X before it entered A\'s hang')
+    workers.end(a.id, hangMs)
+    await workers.hangs.get(b.id).entered.promise
+    assert.equal(workers.started[workers.hangs.get(a.id).index + 1], b.id, 'the body after A\'s hung start sweeps first from B, the member the stopped body did not reach')
+    workers.end(b.id, hangMs)
+    await workers.hangs.get(c.id).entered.promise
+    const hangB = workers.hangs.get(b.id)
+    assert.ok(hangB.from < leaseUntil && leaseUntil < hangB.to, 'the lease expired while B\'s start hung')
+    const expired = events(f.runtime, f.mission.id, 'task/lease-expired').find(item => item.data.taskId === task.id)
+    assert.ok(expired !== undefined, 'the lease was recovered before the sweep reached C\'s hung start, not after a further start bound')
+    assert.equal(expired.createdAt, hangB.to, 'at the instant the hang in flight at the expiry ended')
+    assert.equal(workers.started[hangB.index + 1], c.id, 'and the body after B\'s sweeps from C')
+    workers.end(c.id, hangMs)
+    await f.runtime.settle(f.mission.id)
+    await f.runtime.tick()
+    assert.deepEqual(hanging.filter(member => workers.started.lastIndexOf(member.id) <= workers.hangs.get(member.id).index).map(member => member.name), [],
+      'every member is started again after its hung start settles')
+  } finally {
+    for (const hang of workers.hangs.values()) hang.release.reject(new Error('test ended'))
+    await f.cleanup()
+  }
 })
 
 /** Record every scheduling body as it closes, with the pass-end steps it ran, and count the outbox flushes. */
