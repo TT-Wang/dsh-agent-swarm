@@ -3459,8 +3459,11 @@ export class SwarmRuntime {
       assertScopeSelectors(next.scope, 'scope', mission.scope)
     }
     // After the scope amendment, so a combined change is checked against the
-    // scope this task ends up with, never the one it is leaving.
+    // scope this task ends up with, never the one it is leaving. A scope
+    // amendment alone re-checks the outputs the task already declared: one
+    // left outside the new scope would refuse every later submit.
     if (changes.outputs !== undefined) next.outputs = assertDeclaredOutputs(changes.outputs, next.scope, 'task')
+    else if (changes.scope !== undefined && next.outputs !== undefined) assertDeclaredOutputs(next.outputs, next.scope, 'task', { scopeAmendment: true })
     if (changes.dependencies !== undefined) {
       if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
       next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]

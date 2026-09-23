@@ -300,16 +300,27 @@ function declaredOutputFault(output: unknown, scope: readonly string[]): string 
   return undefined
 }
 
+/** The context of one `assertDeclaredOutputs` call, which decides the refusal's exit. */
+export interface DeclaredOutputsOptions {
+  /**
+   * The outputs are the task's stored declaration, re-checked because the
+   * owner amended only its scope. The caller never passed `outputs`, so the
+   * exit names adding them to the same `swarm_control` amendment.
+   */
+  scopeAmendment?: boolean
+}
+
 /**
  * The one exact check of a task's declared outputs, shared by plan validation,
  * `propose` and the owner amendment. It returns the detached list the caller
  * stores, so no call site can admit an entry it did not validate.
  */
-export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string): string[] {
+export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string, options: DeclaredOutputsOptions = {}): string[] {
   if (!Array.isArray(outputs)) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`, `${location}.outputs`)
   for (const output of outputs) {
     const fault = declaredOutputFault(output, scope)
     if (fault === undefined) continue
+    if (options.scopeAmendment) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault} once this amendment applies, so every later submit would be refused. Pass \`changes\` with \`outputs\` that fit the new \`scope\` in the same \`swarm_control\` call, or keep a \`scope\` that contains every declared output, then retry.`, `${location}.outputs`)
     throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
   return [...outputs as string[]]

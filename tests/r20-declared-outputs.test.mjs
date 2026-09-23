@@ -170,6 +170,24 @@ test('R24: propose refuses a new task without outputs on every caller path; a re
   assert.deepEqual(f.runtime.store.get('tasks', repair.id).outputs, ['src/legacy.ts'])
 })
 
+test('R24: a scope amendment that would leave a declared output outside the task scope is refused unless the same call amends outputs', async t => {
+  const f = await runtimeFixture(t)
+  const task = f.propose('Report and patch', { kind: 'research', checks: [], scope: ['src/', 'docs/'], outputs: ['docs/report.md', 'src/patch.ts'] })
+  const amend = (changes, reason) => f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', changes, reason)
+  assert.throws(() => amend({ scope: ['src/'] }, 'narrow to the code'), error => {
+    outsideScope(error)
+    assert.match(error.message, /"docs\/report\.md"/, 'the refusal names the stranded output')
+    assert.match(error.message, /Pass `changes` with `outputs` .* same `swarm_control` call/)
+    return true
+  })
+  assert.deepEqual(f.runtime.store.get('tasks', task.id).scope, ['src/', 'docs/'], 'the refused amendment changed nothing')
+  // Amending outputs in the same call, or keeping every output inside the new scope, is admitted.
+  const narrowed = amend({ scope: ['src/'], outputs: ['src/patch.ts'] }, 'narrow to the code and drop the report')
+  assert.deepEqual([narrowed.scope, narrowed.outputs], [['src/'], ['src/patch.ts']])
+  const widened = amend({ scope: ['src/', 'docs/'] }, 'widen again')
+  assert.deepEqual([widened.scope, widened.outputs], [['src/', 'docs/'], ['src/patch.ts']])
+})
+
 test('R20: the host-created automatic review declares no outputs', async t => {
   const f = await runtimeFixture(t)
   // A second independent member makes the host-admitted review admissible, and
