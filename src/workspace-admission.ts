@@ -392,7 +392,7 @@ export class WorkspaceAdmission {
     if (!isContained(claimed, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claimed} [${WORKSPACE_AUTHORIZATION_CODE}]`)
     const grants = this.rt.config.grants
     if (this.rt.config.authorizeWorkspace === undefined || grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
-    const now = Date.now()
+    const now = this.rt.now()
     // A session authorization wins over a root that happens to contain the
     // session cwd: the human authorized that directory directly, so removing a
     // root must not fence it. The admission site computed this source.
@@ -446,7 +446,7 @@ export class WorkspaceAdmission {
     if (diagnostic === undefined) return
     // The scheduling body awaiting this check (`pass`) stamps its progress
     // before the fence commits, so the fence publishes as its own commit.
-    progressed(pass)
+    progressed(pass, this.rt.now())
     this.fenceWorkspace(mission.id, diagnostic)
     throw new WorkspaceRevokedError(diagnostic)
   }
@@ -519,7 +519,7 @@ export class WorkspaceAdmission {
   tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined {
     const paths = sharedTempPaths(input)
     if (!paths.length) return undefined
-    const now = Date.now()
+    const now = this.rt.now()
     let report: { path: string; first: TempMention; second: TempMention } | undefined
     for (const path of paths) {
       const fresh = (this.tempMentions.get(path) ?? []).filter(mention => now - mention.at <= TEMP_RENDEZVOUS_WINDOW_MS)

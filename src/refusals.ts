@@ -97,7 +97,7 @@ export class RefusalRegistry {
 
   /** Budget dimensions that must refuse a new lease; undefined when the mission can admit. */
   budgetBlocked(mission: Mission): string | undefined {
-    if (Date.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
+    if (this.rt.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
     if (mission.usedTokens >= mission.budget.maxTokens) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
     if (mission.usedSteps >= mission.budget.maxSteps) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
     return undefined
@@ -118,7 +118,7 @@ export class RefusalRegistry {
   }
 
   admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord {
-    const at = Date.now()
+    const at = this.rt.now()
     return {
       id: admissionRowId(candidate, decision.reason), missionId: candidate.missionId, memberId: candidate.memberId, taskId: candidate.taskId, epoch: candidate.epoch,
       reason: decision.reason, admitted: decision.admitted, taskClass: candidate.taskClass, scope: candidate.scope,
@@ -153,7 +153,7 @@ export class RefusalRegistry {
       this.rt.commit(candidate.missionId, () => this.upsertAdmission(record))
     } catch (error) {
       if (error instanceof WriterBusyError) {
-        queueWriterBusy(this.rt, { at: Date.now(), attempts: error.attempts, candidate, detail: error.message })
+        queueWriterBusy(this.rt, { at: this.rt.now(), attempts: error.attempts, candidate, detail: error.message })
         return
       }
       throw error
@@ -184,7 +184,7 @@ export class RefusalRegistry {
       try {
         this.rt.commit(missionId, () => {
           if ('candidate' in busy) {
-            const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, Date.now() - busy.at))
+            const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, this.rt.now() - busy.at))
             record.count = busy.count; record.firstAt = busy.at
             this.upsertAdmission(record)
           } else {
@@ -427,7 +427,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
     // The state is re-derived on the next pass, and the board-level witness path
     // still speaks for a stalled board, so no silence follows.
     if (error instanceof WriterBusyError) {
-      queueWriterBusy(rt, { at: Date.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
+      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
       return terminal
     }
     throw error

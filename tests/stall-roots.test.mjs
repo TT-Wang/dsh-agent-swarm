@@ -164,8 +164,7 @@ test('R14-F2v D2: a stop with no recorded start is a root, never silence', async
 
 test('pending stop waits remain bounded and use the same owner scope as dispatch fencing', t => {
   const now = Date.now()
-  t.mock.method(Date, 'now', () => now)
-  const rt = { stallPassTimeoutMs: 100, config: { tickMs: 25 }, unfinishedDependencies: () => [] }
+  const rt = { stallPassTimeoutMs: 100, config: { tickMs: 25 }, unfinishedDependencies: () => [], now: () => now }
   const pending = { id: 'next', missionId: 'mission', epoch: 0, status: 'pending', assigneeId: 'owner', dependencies: [] }
   const stop = (id, memberId, at, epoch = 1) => ({ id, missionId: 'mission', status: 'cancelled', epoch: 1,
     resumeAfterStop: { epoch, memberId, reason: 'handoff', ...(at === undefined ? {} : { at }) } })

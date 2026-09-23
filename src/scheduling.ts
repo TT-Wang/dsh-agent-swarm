@@ -173,8 +173,8 @@ function formatSpan(ms: number): string {
  * adapter call are that turn's, not the body's. Without a record (a direct
  * `schedule` or `dispatch` call) it does nothing.
  */
-export function progressed(pass: SchedulingPass | undefined): void {
-  if (pass !== undefined) pass.progressAt = Date.now()
+export function progressed(pass: SchedulingPass | undefined, now: number): void {
+  if (pass !== undefined) pass.progressAt = now
 }
 
 /**
@@ -182,8 +182,8 @@ export function progressed(pass: SchedulingPass | undefined): void {
  * progress (`progressed`), and only then does it act on the result, so the
  * commit of that result publishes as a running body's.
  */
-export function awaited<T>(pass: SchedulingPass | undefined, work: Promise<T>): Promise<T> {
-  return pass === undefined ? work : work.finally(() => progressed(pass))
+export function awaited<T>(pass: SchedulingPass | undefined, work: Promise<T>, now: () => number): Promise<T> {
+  return pass === undefined ? work : work.finally(() => progressed(pass, now()))
 }
 
 export class Scheduling {
@@ -243,17 +243,17 @@ export class Scheduling {
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
         const order = end > 0 ? rotation.slice(0, end) : rotation
-        let memberSince = Date.now()
+        let memberSince = this.rt.now()
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && Date.now() - memberSince >= this.rt.stallPassTimeoutMs) {
+          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
             pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
             return false
           }
-          memberSince = Date.now()
-          progressed(pass)
+          memberSince = this.rt.now()
+          progressed(pass, this.rt.now())
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.
@@ -266,7 +266,7 @@ export class Scheduling {
           // dispatching the other members.
           try {
           if (!this.rt.isolationAllows(missionId, member)) continue
-          try { await awaited(pass, this.rt.startWorker(mission, member, { pass })) }
+          try { await awaited(pass, this.rt.startWorker(mission, member, { pass }), this.rt.now) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
@@ -313,12 +313,12 @@ export class Scheduling {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
             this.rt.assertAdmission(task, member)
-            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId), pass))
+            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId), pass), this.rt.now)
             // The adapter reports a recovery fallback from inside this call
             // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
             // marked the member it prepares before it commits the report.
             if (pass !== undefined) pass.preparing = member.id
-            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)) }
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
             finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)
@@ -358,7 +358,7 @@ export class Scheduling {
             const limit = Math.max(1, Math.min(3, fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember))
             const retry = transient && attempts < limit
             fresh.preparationFailure = { reason, transient, attempts,
-              ...(retry ? { retryAt: Date.now() + Math.min(30_000, 1000 * 2 ** (attempts - 1)) } : {}) }
+              ...(retry ? { retryAt: this.rt.now() + Math.min(30_000, 1000 * 2 ** (attempts - 1)) } : {}) }
             fresh.output = `${reason}\n${retry ? 'The host will retry after bounded backoff.' : `Work remains preserved. Correct the reported condition, then resume this same task with swarm_control(action: "resume", taskId: "${fresh.id}", reason: "condition repaired").`}`
             fresh.epoch++
             fresh.status = retry ? 'pending' : 'blocked'
@@ -470,7 +470,7 @@ export class Scheduling {
   /** The same readiness decision supplies a concrete refusal without another policy model. */
   readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
     if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
-    if ((task.preparationFailure?.retryAt ?? 0) > Date.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
+    if ((task.preparationFailure?.retryAt ?? 0) > this.rt.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
     if (task.assigneeId === undefined || task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
     if (!canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
     const all = tasks ?? this.rt.store.list('tasks', task.missionId)
@@ -570,7 +570,7 @@ export class Scheduling {
     const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
     return unreviewed.every(task => {
       const event = this.rt.store.latestTaskEvent(missionId, task.id, 'task/submitted')
-      if (event !== undefined) return Date.now() - event.createdAt >= grace
+      if (event !== undefined) return this.rt.now() - event.createdAt >= grace
       // No durable submission record: the grace cannot have elapsed yet.
       return false
     })
@@ -631,7 +631,7 @@ export class Scheduling {
   livePass(missionId: string): SchedulingPass | undefined {
     const pass = this.passes.get(missionId)
     if (pass === undefined || pass.escalatedAt !== undefined) return undefined
-    const now = Date.now()
+    const now = this.rt.now()
     if (!this.pastBound(pass, now)) return pass
     // Past the declared pass bound the body is live only while the mission has
     // live work to progress AND the bounded live-work hold has not elapsed.
@@ -646,7 +646,7 @@ export class Scheduling {
    * them (it cancels no task, drops no attempt and changes no lease).
    */
   liveWorkHolders(missionId: string): Array<{ subject: string; memberId?: string }> {
-    const now = Date.now()
+    const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
       const live = this.quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
@@ -685,7 +685,7 @@ export class Scheduling {
    * this, so no instant exists at which one of them already acts on the bound
    * and another does not yet.
    */
-  pastBound(pass: SchedulingPass, now = Date.now()): boolean {
+  pastBound(pass: SchedulingPass, now = this.rt.now()): boolean {
     return now - pass.startedAt >= this.rt.stallPassTimeoutMs
   }
 
@@ -705,7 +705,7 @@ export class Scheduling {
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     const pass = this.passes.get(missionId)
     const bound = this.rt.stallPassTimeoutMs
-    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && Date.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
+    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.rt.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
     return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
 
@@ -719,7 +719,7 @@ export class Scheduling {
     if (this.rt.store.get('missions', missionId) === undefined) return undefined
     if (this.passes.has(missionId)) return undefined
     const pass: SchedulingPass = {
-      id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: Date.now(),
+      id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: this.rt.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
       noProgressPasses: this.noProgress.get(missionId) ?? 0,
     }
@@ -750,7 +750,7 @@ export class Scheduling {
    * The independent watchdog and outbox keep reporting the blocker.
    */
   private escalateWedge(missionId: string, pass: SchedulingPass, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): boolean {
-    const now = Date.now()
+    const now = this.rt.now()
     const fingerprintNow = this.rt.fingerprint(missionId)
     if (this.rt.store.get('missions', missionId)?.schedulingWedgeNotice === fingerprintNow) return false
     const boundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : this.rt.stallPassTimeoutMs
@@ -826,7 +826,7 @@ export class Scheduling {
    * lease-renewal path (the naming changes no task, attempt or lease). `now` is
    * the tick's one instant, read once for every body (`pastBound`).
    */
-  checkSchedulingPasses(now = Date.now()): void {
+  checkSchedulingPasses(now = this.rt.now()): void {
     if (this.rt.closed || this.rt.shuttingDown) return
     for (const [missionId, pass] of this.passes) {
       if (pass.escalatedAt !== undefined) continue
@@ -921,7 +921,7 @@ export class Scheduling {
         const stop = task.resumeAfterStop
         return stop?.at === undefined
           ? `${task.id} is blocked and its stop carries no recorded start, so the declared bound (${info.boundMs}ms) cannot be shown to hold`
-          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, Date.now() - stop.at)}ms, past its declared bound`
+          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
     const passes = info.pass.noProgressPasses
@@ -936,8 +936,8 @@ export class Scheduling {
       .flatMap(member => { const count = (member as Member & { startFailures?: number }).startFailures; return count === undefined ? [] : [`${member.id}:${count}`] })
     const identity = info.reason === 'pass-timeout' ? { trigger: 'scheduling-pass', reason: [info.reason, ...failures].join(' ') } : {}
     mission[noticeKey] = fingerprint
-    mission.updatedAt = Date.now()
-    mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
+    mission.updatedAt = this.rt.now()
+    mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
     let ownerNotified = false
     this.rt.commit(missionId, () => {
       this.rt.store.put('missions', mission)
@@ -1022,7 +1022,7 @@ export class Scheduling {
    * that wedged long enough for every lease to lapse is still detected.
    */
   hasLiveWork(missionId: string): boolean {
-    const now = Date.now()
+    const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
       this.quiescencePending(task)
       || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
@@ -1069,7 +1069,7 @@ export class Scheduling {
    * R16-D: one live attempt whose durable progress is past its declared bound.
    * `subject` is the attempt's task@epoch, the identity the escalation carries.
    */
-  silentAttempt(task: Task, mission: Mission, now = Date.now()): SilentAttempt | undefined {
+  silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
     const attempt = task.attempt
     if (attempt === undefined || task.status !== 'running') return undefined
     const boundMs = this.rt.attemptSilenceBoundMs

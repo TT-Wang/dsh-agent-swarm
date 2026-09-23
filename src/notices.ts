@@ -359,6 +359,8 @@ export interface LineageRuntime {
   readonly store: { list: (table: 'tasks', missionId: string) => Task[] }
   readonly config: { tickMs: number }
   readonly stallPassTimeoutMs: number
+  /** The runtime clock (`SwarmRuntime.now`). */
+  readonly now: () => number
   latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
   reviewable(task: Task, tasks: Task[]): boolean
@@ -392,7 +394,7 @@ export function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs'>, tasks: Task[]): Task[] {
+export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
   const replaced = replacementCoverage(tasks)
   return tasks.filter(task => {
@@ -406,7 +408,7 @@ export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs'>, ta
     // absent timestamp is UNBOUNDED — the bound cannot be shown to hold, so the
     // state escalates as a root rather than becoming silence (a pre-upgrade
     // durable row reaches exactly this state).
-    return at === undefined || Date.now() - at > rt.stallPassTimeoutMs
+    return at === undefined || rt.now() - at > rt.stallPassTimeoutMs
   })
 }
 
@@ -430,7 +432,7 @@ export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task
  * back-off forever. The witness therefore compares F(S) plus this one clock
  * fact, read from its own durable `at`; F(S) itself stays clock-free.
  */
-export function backoffExpiredSince(rt: Pick<LineageRuntime, 'config'>, tasks: readonly Task[], since: number, now = Date.now()): boolean {
+export function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: readonly Task[], since: number, now = rt.now()): boolean {
   return tasks.some(task => {
     const bound = backoffBound(rt, task)
     return bound !== undefined && since <= bound && bound < now
@@ -477,7 +479,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // "cannot judge" case must never be the silent one: `stallRootsFor` classifies
     // the same row as a root, and this classifier refusing it here keeps the two
     // in agreement instead of leaving the state both silent and unnamed.
-    if (stop !== undefined) return stop.at !== undefined && Date.now() - stop.at <= rt.stallPassTimeoutMs
+    if (stop !== undefined) return stop.at !== undefined && rt.now() - stop.at <= rt.stallPassTimeoutMs
     return rt.unfinishedDependencies(task.missionId, task, tasks).length > 0
   }
   if (task.status === 'pending') {
@@ -499,7 +501,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     if (failure !== undefined) {
       if (blockCauses(task, () => undefined, Number.POSITIVE_INFINITY).has('preparation-failed')) return false
       const bound = backoffBound(rt, task)
-      if (bound !== undefined && Date.now() <= bound) return true
+      if (bound !== undefined && rt.now() <= bound) return true
     }
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
@@ -508,11 +510,11 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
       && (candidate.id === task.id || candidate.resumeAfterStop.memberId === undefined
         || (memberId !== undefined && candidate.resumeAfterStop.memberId === memberId)))
     if (stops.length > 0) return stops.every(candidate => candidate.resumeAfterStop!.at !== undefined
-      && Date.now() - candidate.resumeAfterStop!.at! <= rt.stallPassTimeoutMs)
+      && rt.now() - candidate.resumeAfterStop!.at! <= rt.stallPassTimeoutMs)
     // Once the stop settles, another live attempt may take the selected member
     // first. Its bounded lease provides the next chance to run this ready work.
     return memberId !== undefined && tasks.some(candidate => candidate.status === 'running'
-      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= Date.now())
+      && candidate.attempt?.ownerId === memberId && candidate.attempt.leaseUntil >= rt.now())
   }
   return false
 }
@@ -601,7 +603,7 @@ export class Notices {
     // the fingerprint of the board it was emitted for, so the owner can verify
     // that no non-terminal state was silent. A terminal mission needs no witness.
     if ((options.stampWitness ?? true) && mission !== undefined && !this.rt.isMissionTerminal(mission)) {
-      mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
+      mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: this.rt.now() }
       this.rt.store.put('missions', mission)
     }
     return this.enqueueOwnerNotice(missionId, content, from, noticeClass, { subjects: attributed, fact }, dedupe, options.dedupKey) !== undefined
@@ -630,7 +632,7 @@ export class Notices {
     // kept only for the callers that still pass an explicit key.
     const dedupKey = dedupKeyOverride ?? (fact === undefined ? this.noticeKey(missionId) : factKey(missionId, fact))
     if (dedupe && hasNotice(this.rt.store.list('deliveries', missionId), { class: noticeClass, dedupKey, from })) return undefined
-    const at = Date.now()
+    const at = this.rt.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
     // fact is carried by the window's degraded summary instead of being dropped.
     // A covered fact is no wake, so it neither spends a slot nor joins a summary.
@@ -747,7 +749,7 @@ export class Notices {
   recordConsumption(deliveryId: string, options: { at?: number; source?: string } = {}): boolean {
     const delivery = this.rt.store.get('deliveries', deliveryId)
     if (delivery === undefined || delivery.notice === undefined) return false
-    const at = options.at ?? Date.now()
+    const at = options.at ?? this.rt.now()
     const source = options.source ?? 'user/message'
     let recorded = false
     this.rt.commit(delivery.missionId, () => {
@@ -876,7 +878,7 @@ export class Notices {
     this.followupObligations(view)
     if (mission.status !== 'active' || mission.budgetPause !== undefined) return
     const lastAt = view.lastTransitionAt
-    const elapsed = Math.max(0, Date.now() - lastAt)
+    const elapsed = Math.max(0, this.rt.now() - lastAt)
     const bound = options.boundMs ?? this.absenceBoundMs
     if (elapsed < bound) return
     // One long operation owns its existing activity bound. Starting another
@@ -920,7 +922,7 @@ export class Notices {
   private followupObligations(view: MissionInterpretation): void {
     const mission = view.mission
     if (!['active', 'blocked'].includes(mission.status)) return
-    const now = Date.now()
+    const now = this.rt.now()
     for (const delivery of this.rt.store.list('deliveries', mission.id)) {
       const fact = noticeRow(delivery)
       // A covered fact is never sent, so it has no reminders of its own: the
@@ -1256,7 +1258,7 @@ export class Notices {
     // The stamp is the instant the judgement began, not its end: a back-off
     // judged still waiting whose bound passes while the pass finishes has not
     // been judged expired, so it still bypasses the dedup on a later pass.
-    const judgedAt = Date.now()
+    const judgedAt = this.rt.now()
     if (!this.judgeBoard(view, options, stallRootNotices) || witness?.fingerprint !== fingerprint) return
     this.rt.commit(missionId, () => {
       const board = this.rt.store.get('missions', missionId)
@@ -1355,7 +1357,7 @@ export class Notices {
     // that lease bounds the wait exactly as in row 3, and its end (close-out, or
     // the row-4 expiry recovery) is the next chance to run the queued task.
     const nonTerminal = view.nonTerminal
-    if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= Date.now())) return true
+    if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= this.rt.now())) return true
     if (view.stalled) {
       this.notifyStall(view, this.rt.completionError(mission) ?? 'no task can make progress')
       return true
@@ -1377,7 +1379,7 @@ export class Notices {
         this.rt.commit(missionId, () => {
           const board = this.rt.store.get('missions', missionId)
           if (board !== undefined && !this.rt.isMissionTerminal(board)) {
-            board.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
+            board.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: this.rt.now() }
             this.rt.store.put('missions', board)
           }
         })
@@ -1417,7 +1419,7 @@ export class Notices {
       const cause = stop !== undefined
         ? (stop.at === undefined
           ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`
-          : `its stop has been awaited for ${Math.max(0, Date.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
+          : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
         : 'no live replacement exists anywhere in its lineage'
       const body = NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
@@ -1533,7 +1535,7 @@ export class Notices {
     // other witness, so a stall is fresh exactly when the board changed.
     const fingerprint = this.rt.fingerprint(mission.id)
     if (mission.stallNotice === fingerprint) return
-    mission.stallNotice = fingerprint; mission.updatedAt = Date.now()
+    mission.stallNotice = fingerprint; mission.updatedAt = this.rt.now()
     const detail = leftover.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
@@ -1548,7 +1550,7 @@ export class Notices {
       this.notify(mission.id, NOTICE_TEMPLATES.stall.build({ reason, detail, subjects: view.subjectsOf(stuck) }), view.subjectsOf(stuck),
         { trigger: NOTICE_TEMPLATES.stall.trigger, reason })
       // W3: the stall notice is the no-silent-state witness for this state.
-      mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
+      mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
       this.rt.store.put('missions', mission)
     })
   }
@@ -1629,7 +1631,7 @@ export class Notices {
   topicDelivery(missionId: string, from: string, topic: string, content: string): void {
     for (const member of this.rt.store.list('members', missionId)) {
       if (member.id !== from && member.status !== 'stopped' && (member.subscriptions.includes(topic) || member.subscriptions.includes('*'))) {
-        this.rt.store.put('deliveries', { id: id('msg'), missionId, from, to: member.id, topic, kind: 'finding', content, createdAt: Date.now() })
+        this.rt.store.put('deliveries', { id: id('msg'), missionId, from, to: member.id, topic, kind: 'finding', content, createdAt: this.rt.now() })
       }
     }
   }
@@ -1640,7 +1642,7 @@ export class Notices {
     this.rt.commit(missionId, () => {
       const current = this.rt.store.get('deliveries', delivery.id)
       if (current === undefined || current.deliveredAt !== undefined || current.deliveryFailure?.reason === reason) return
-      current.deliveryFailure = { reason, at: Date.now() }
+      current.deliveryFailure = { reason, at: this.rt.now() }
       this.rt.store.put('deliveries', current)
       this.rt.store.event(missionId, 'mission/stalled', 'runtime', { cause: delivery.to === 'owner' ? 'owner-delivery-failed' : 'worker-delivery-failed', deliveryId: delivery.id, to: delivery.to, reason })
       if (delivery.to !== 'owner') {
@@ -1676,7 +1678,7 @@ export class Notices {
       if (delivery.kind === 'assignment' && delivery.taskId) {
         const task = this.rt.task(missionId, delivery.taskId)
         if (task.attempt?.id !== delivery.attemptId || task.status !== 'running') {
-          delivery.deliveredAt = Date.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
+          delivery.deliveredAt = this.rt.now(); this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery)); continue
         }
       }
       // OWNER QUIET: a delivery the owner's own lifecycle decision made moot is
@@ -1701,10 +1703,10 @@ export class Notices {
       if (this.delivering.has(delivery.id)) continue
       if (delivery.to === 'owner' && delivery.notice !== undefined && delivery.notice.handoffAt === undefined) {
         delivery.content = this.ownerDeliveryContent(mission, delivery)
-        delivery.notice.handoffAt = Date.now()
+        delivery.notice.handoffAt = this.rt.now()
         this.rt.commit(missionId, () => this.rt.store.put('deliveries', delivery))
       }
-      this.delivering.set(delivery.id, Date.now())
+      this.delivering.set(delivery.id, this.rt.now())
       // An adapter may accept the message before its acknowledgement times out.
       // Detach a summary at its first handoff: retries keep this ID's content
       // immutable, and later facts get a fresh ID even after the attempt gate
@@ -1716,7 +1718,7 @@ export class Notices {
         const settled = await awaited(pass, Promise.race([
           this.rt.workers.deliver(member, delivery).then(() => true),
           new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.stallPassTimeoutMs) }),
-        ]))
+        ]), this.rt.now)
         if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
         // R17-G8: delivery is the transport fact. It is never relabelled as
         // consumption; the host's claimed signal records consumption separately
@@ -1724,7 +1726,7 @@ export class Notices {
         this.rt.commit(missionId, () => {
           const current = this.rt.store.get('deliveries', delivery.id)
           if (current !== undefined && current.deliveredAt === undefined) {
-            current.deliveredAt = Date.now()
+            current.deliveredAt = this.rt.now()
             this.rt.store.put('deliveries', current)
           }
           // Only acknowledge the failure this retry observed. New lifecycle,
@@ -1759,7 +1761,7 @@ export class Notices {
       const mission = this.rt.store.get('missions', missionId)
       if (mission === undefined) return
       const attempts = (mission.outboxStarved?.deliveryId === delivery.id ? mission.outboxStarved.attempts : 0) + 1
-      mission.outboxStarved = { deliveryId: delivery.id, attempts, at: Date.now() }
+      mission.outboxStarved = { deliveryId: delivery.id, attempts, at: this.rt.now() }
       this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
     } catch { /* Recording a starvation must never break the pump. */ }
   }
@@ -1785,7 +1787,7 @@ export class Notices {
     // declared bound, but a pump whose deliveries hang past the bound never
     // suppresses the next one — the flag ages out instead of starving the
     // outbox (the reviewer's D2).
-    const now = Date.now()
+    const now = this.rt.now()
     if (this.pumpingSince !== undefined && now - this.pumpingSince < this.rt.stallPassTimeoutMs) return
     this.pumpingSince = now
     this.rt.defer(async () => {

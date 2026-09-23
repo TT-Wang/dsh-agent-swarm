@@ -111,7 +111,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
       runtime.commit(request.missionId ?? request.id, () => {
         const latest = pending(request.id, epoch, kind)
         if (latest?.planningWarning === undefined || latest.planningWarning.deadline !== current.planningWarning?.deadline) return
-        latest.planningWarning.deliveredAt = Date.now()
+        latest.planningWarning.deliveredAt = runtime.now()
         runtime.store.put('starts', latest)
       })
     } else runtime.ackStartMessage(actor, request.id, epoch, kind)
@@ -128,7 +128,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
         // to an already running preparation as well as its next retry.
         const current = kind === 'planning' ? pending(request.id, request.planningEpoch ?? 1, kind) : undefined
         const remaining = current === undefined ? 0
-          : (current.planningDeadlineAt ?? current.updatedAt + (runtime.config.planningTimeoutMs ?? 600000)) - Date.now()
+          : (current.planningDeadlineAt ?? current.updatedAt + (runtime.config.planningTimeoutMs ?? 600000)) - runtime.now()
         if (remaining > 0) {
           timer = setTimeout(expire, Math.min(remaining, 2147483647))
           timer.unref()

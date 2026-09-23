@@ -1098,7 +1098,14 @@ export interface WorkerAdapter {
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
+  /** Tick timer period; 0 runs no timer, so a test drives `SwarmRuntime.tick()` by hand. */
   tickMs: number
+  /**
+   * The runtime clock. Every wall-clock read that decides runtime behaviour
+   * (leases, bounds, back-offs, silence, stall and wedge ages, wake budgets,
+   * follow-up timing, event `createdAt`) reads it; defaults to `Date.now`.
+   */
+  now?: () => number
   /** Prelaunch watchdog fallback; the owner can extend it with a reason. */
   planningTimeoutMs?: number
   /** Bound for native worker startup; independent of model/task execution budgets. */
