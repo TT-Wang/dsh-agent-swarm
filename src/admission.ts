@@ -506,9 +506,9 @@ export function reconcileDeliverableIgnores(workspace: string, objective: string
 
 /**
  * The admission refusals that need only the task text and its edges: the
- * dependency-assumption guard and the graph validator. Advisory hints (writes
- * outside scope, ignored deliverables) are the draft UI's (`planAdvisories`);
- * the propose path refuses only on these, so it computes only these.
+ * dependency-assumption guard and the graph validator. Advisory hints (the
+ * check preflight) are the draft UI's (`planAdvisories`); the propose path
+ * refuses only on these, so it computes only these.
  */
 export function reconcileTaskAdmission(task: DependencyAssumptionInput, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
   const diagnostics: AdmissionDiagnostic[] = []

@@ -1,6 +1,6 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileDeliverableIgnores, reconcileObjectiveScope, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
 
@@ -226,14 +226,15 @@ export function orderedTasks(tasks: PlanTask[]): PlanTask[] {
   return result
 }
 
-/** Advisory preflight over the actual target project; never changes plan authority. */
+/**
+ * Advisory preflight over the actual target project; never changes plan
+ * authority. Output paths are not guessed from the objective prose here: a task
+ * declares them in `outputs`, which admission checks exactly.
+ */
 export function planAdvisories(plan: PlanInput): AdmissionDiagnostic[] {
   const scripts = loadPackageScripts(plan.workspace)
-  const diagnostics = [...reconcileObjectiveScope(plan.objective, plan.scope, 'objective'),
-    ...reconcileDeliverableIgnores(plan.workspace, plan.objective, plan.acceptance, 'objective')]
+  const diagnostics: AdmissionDiagnostic[] = []
   for (const task of plan.tasks) {
-    diagnostics.push(...reconcileObjectiveScope(task.objective, task.scope, `tasks[${task.key}].objective`),
-      ...reconcileDeliverableIgnores(plan.workspace, task.objective, task.acceptance, `tasks[${task.key}]`))
     for (const [index, command] of (task.checks ?? []).entries()) {
       const { preflight } = classifyCheck(command, scripts)
       if (preflight) diagnostics.push({ code: 'check_preflight', severity: 'advisory', location: `tasks[${task.key}].checks[${index}]`, message: preflight })

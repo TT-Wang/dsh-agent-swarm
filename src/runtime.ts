@@ -1301,8 +1301,8 @@ export class SwarmRuntime {
     const inheritedCriteria = input.replaces?.length ? inheritedAcceptance(acceptance, input.acceptance) : []
     // D1: the admission refusals (an assumed dependency, a dangling graph edge)
     // at the production admission point, so a plan error is rejected here
-    // instead of at submit. The scope and ignore-rule hints are advisory and
-    // belong to the draft UI (`planAdvisories`); nothing here would read them.
+    // instead of at submit. The check preflight hints are advisory and belong
+    // to the draft UI (`planAdvisories`); nothing here would read them.
     const refused = reconcileTaskAdmission({ objective: input.objective, acceptance }, 'task', {
       // R12-F9: the guard needs the content-carrying edges (the declared
       // dependencies plus a review source, which `prepareTask` merges into the

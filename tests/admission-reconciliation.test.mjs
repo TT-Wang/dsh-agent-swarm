@@ -125,7 +125,7 @@ test('objective write heuristics remain advisory while scope stays explicit', ()
   const input = plan('/workspace')
   input.tasks[1].objective = 'Add a file under `docs/` describing the change and implement it.'
   assert.doesNotThrow(() => validatePlan(input))
-  assert.ok(planAdvisories(input).some(item => item.code === 'objective_write_outside_scope' && item.severity === 'advisory'))
+  assert.deepEqual(planAdvisories(input).filter(item => item.code !== 'check_preflight'), [], 'objective prose yields no path hint')
   const diagnostics = reconcileObjectiveScope('Add a file under `docs/` describing the change.', ['src/'], 'tasks[1].objective')
   assert.deepEqual(diagnostics.map(item => [item.code, item.path]), [['objective_write_outside_scope', 'docs/']])
   const inScope = plan('/workspace')
@@ -160,7 +160,7 @@ test('ignored named paths advise without blocking input analysis or ignore repai
   const ignored = docsPlan()
   ignored.tasks[1].objective = 'Write `docs/review-round4.md` with the round summary.'
   assert.doesNotThrow(() => validatePlan(ignored))
-  assert.ok(planAdvisories(ignored).some(item => item.code === 'deliverable_path_ignored' && item.severity === 'advisory'))
+  assert.deepEqual(planAdvisories(ignored).filter(item => item.code !== 'check_preflight'), [], 'an ignored path named in prose yields no hint')
   const clean = docsPlan()
   clean.tasks[1].objective = 'Write `docs/notes.md` with the round summary.'
   assert.doesNotThrow(() => validatePlan(clean))
