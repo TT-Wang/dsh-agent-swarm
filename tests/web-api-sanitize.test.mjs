@@ -259,3 +259,22 @@ test('a refusal text on a plain Error grants no visibility: only the typed refus
     assert.deepEqual(typed.result.error.details, { issues: [], policyCode: 'probe_refusal', category: 'tool_error' })
   }
 })
+
+test('a typed refusal naming an absolute host path under any system root is an internal error', async t => {
+  const f = await fixture(t)
+  const control = { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' }
+  for (const hostPath of ['/Volumes/External/secret.db', '/srv/swarm/secret.db', '/mnt/disk/secret.db', '/data/swarm/secret.db', '/root/.ssh/secret',
+    '/Library/Application Support/secret', '/System/Volumes/Data/secret', '/Applications/Secret.app', '/proc/1/environ', '/run/secrets/token',
+    '/media/usb/secret', '/snap/bin/secret', '/nix/store/secret', '/dev/shm/secret', '/sys/kernel/secret', '/boot/secret', '/bin/secret',
+    '/sbin/secret', '/lib/secret.so', '/lib64/secret.so', '/workspace/secret', '/workspaces/secret', '~/.dsh/secret', 'C:\\Users\\secret']) {
+    f.runtime.control = () => { throw new PolicyError('probe_refusal', 'conflict_error', `Cannot open "${hostPath}" for this mission`) }
+    const response = await f.rpc('control', control)
+    assert.equal(response.result.error.code, 'internal-error', `${hostPath} is host detail`)
+    assert.doesNotMatch(response.text, /secret/i)
+  }
+  // The same names inside a relative repository path are not host detail.
+  f.runtime.control = () => { throw new PolicyError('probe_refusal', 'conflict_error', 'tests/data/fixture.json and src/lib/run/x.ts are outside the task scope') }
+  const relative = await f.rpc('control', control)
+  assert.equal(relative.result.error.code, 'bad-request', relative.text)
+  assert.equal(relative.result.error.details.policyCode, 'probe_refusal')
+})

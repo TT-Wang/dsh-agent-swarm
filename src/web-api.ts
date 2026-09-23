@@ -56,9 +56,12 @@ class RequestError extends Error {
 }
 /**
  * Host-derived detail never reaches the browser, whatever the failure's type:
- * absolute host paths, SQLite text and NUL bytes (SURFACE-R3-01 / F-08).
+ * absolute host paths, SQLite text and NUL bytes (SURFACE-R3-01 / F-08). The
+ * roots of the second group are also common repository directory names, so
+ * they count only where an absolute path starts (`/data/x`, `"/mnt/x"`), not
+ * inside a relative one (`tests/data/x`); `~/` and a drive root count likewise.
  */
-const unsafeDetail = /(?:\bSQLITE\b|\/Users\/|\/private\/|\/var\/|\/tmp\/|\/home\/|\/etc\/|\/opt\/|\/usr\/|\0)/i
+const unsafeDetail = /(?:\bSQLITE\b|\/Users\/|\/private\/|\/var\/|\/tmp\/|\/home\/|\/etc\/|\/opt\/|\/usr\/|\0|(?<![\w.-])(?:\/(?:Volumes|srv|mnt|data|root|Library|System|Applications|proc|run|media|snap|nix|dev|sys|boot|bin|sbin|lib|lib64|workspace|workspaces)\/|~\/|[a-z]:\\))/i
 class InternalFailure extends Error {
   constructor(readonly cause: unknown) { super('Swarm request failed unexpectedly') }
 }
