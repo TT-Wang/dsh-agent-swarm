@@ -618,3 +618,36 @@ test('a stray out-of-scope file in a reviewer or author worktree is a typed refu
   assert.equal(verified.status, 'accepted')
   assert.deepEqual(verified.reviewArtifact.files.map(file => file.path), ['docs/review.md'])
 })
+
+test('a declared ignored draft written under a different case survives a handoff under its stored spelling and is captured by the replacement', { skip: (await caseInsensitiveTemp()) ? false : 'the temp filesystem is case-sensitive' }, async t => {
+  // S6c: the declared spelling answers lstat, but a literal pathspec in it matches nothing.
+  const f = await fixture(t)
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Write docs/Report.md', outputs: ['docs/Report.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Draft by the first owner\n')
+  await f.readEvidence(f.author, task, 'docs/report.md')
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  assert.ok((await f.refsCarrying('docs/report.md', 'refs/preservation/')).length >= 1, 'the preservation snapshot carries the draft under its stored spelling')
+  const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
+  assert.equal(await readFile(path.join(f.peer.workspace, 'docs', 'report.md'), 'utf8'), '# Draft by the first owner\n', 'the draft reaches the replacement')
+  const submitted = await f.submit(f.peer, recovered)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path), ['docs/report.md'])
+  assert.equal(await f.show(submitted.artifact.commit, 'docs/report.md'), '# Draft by the first owner')
+})
+
+test('a snapshot hint that is present but not recorded fails the snapshot instead of dropping the file', { skip: (await caseInsensitiveTemp()) ? false : 'the temp filesystem is case-sensitive' }, async t => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-hint-')))
+  const { source, git } = await repository(root)
+  t.after(async () => { await rm(root, { recursive: true, force: true }) })
+  await writeFile(path.join(source, 'docs', 'report.md'), '# Draft\n')
+  const snapshotGit = async (args, env = {}) => {
+    const result = await runProcess(['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 16 * 1024 * 1024, env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), ...env } })
+    assert.equal(result.exitCode, 0, result.output)
+    return args.includes('-z') ? result.output : result.output.trim()
+  }
+  // `git add --force docs/Report.md` exits 0 and records nothing for the stored docs/report.md.
+  await assert.rejects(captureGitSnapshot(source, path.join(root, 'snapshots'), snapshotGit, undefined, ['docs/Report.md']), /"docs\/Report\.md" is present in the worktree but was not recorded in the snapshot/)
+  const snapshot = await captureGitSnapshot(source, path.join(root, 'snapshots'), snapshotGit, undefined, ['docs/report.md'])
+  assert.equal(await git(source, 'show', `${snapshot.snapshotCommit}:docs/report.md`), '# Draft')
+})

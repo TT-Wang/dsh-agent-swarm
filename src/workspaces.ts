@@ -1178,8 +1178,8 @@ export class Workspaces {
           // Preserve all ordinary WIP, including out-of-scope work, separately
           // from accepted artifacts before removing anything from this checkout.
           if (dirty || record.task.preservationPaths?.length || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
-            await this.preserveWorkspace(record, signal, { allowSuperseded: true })
-            await this.assertNoIgnoredOverwrite(member.workspace, record.task.preservedCommit!, signal, record.task.preservationPaths)
+            const preserved = await this.preserveWorkspace(record, signal, { allowSuperseded: true })
+            await this.assertNoIgnoredOverwrite(member.workspace, record.task.preservedCommit!, signal, preserved)
             await this.git(member.workspace, ['reset', '--hard', record.task.preservedCommit!], signal)
             previousHead = record.task.preservedCommit!
           }
@@ -1438,16 +1438,18 @@ export class Workspaces {
    * ignored by pattern, absent from the task base (added since it) and not a
    * declared output is removed from the index only: the file stays on disk,
    * untracked and ignored, and is captured only once a declaration names it. A
-   * declared output (under its declared or its on-disk spelling) stays tracked,
-   * and an ignored path the base already carries is real content.
+   * declared output stays tracked, and an ignored path the base already carries
+   * is real content. Only the declared spelling stays tracked: a draft preserved
+   * under a different stored case goes back to untracked on disk, where capture
+   * finds it through its on-disk spelling if that spelling is in scope, and
+   * refuses it with the rename repair if not, instead of tracking an
+   * out-of-scope spelling the member could never rename away.
    */
   private async untrackUndeclaredIgnored(workspace: string, baseCommit: string, outputs: readonly string[], signal: AbortSignal): Promise<void> {
     const ignored = (await this.git(workspace, ['ls-files', '--cached', '--ignored', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
     if (!ignored.length) return
     const added = new Set((await this.git(workspace, ['diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', baseCommit, 'HEAD', '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
-    const declared = [...outputs]
-    for (const name of outputs) declared.push(await this.onDiskSpelling(workspace, name) ?? name)
-    const stray = ignored.filter(name => added.has(name) && !declared.includes(name))
+    const stray = ignored.filter(name => added.has(name) && !outputs.includes(name))
     for (let offset = 0; offset < stray.length; offset += 64) {
       await this.git(workspace, ['rm', '--cached', '--force', '--quiet', '--', ...stray.slice(offset, offset + 64).map(name => `:(literal)${name}`)], signal)
     }
@@ -1487,11 +1489,26 @@ export class Workspaces {
     if (collisions.length) throw new PolicyError('workspace_ignored_collision', 'conflict_error', `Ignored files would be overwritten at ${collisions.slice(0, 8).map(name => JSON.stringify(name)).join(', ')}. Their contents remain in place. Preserve or move these local files outside the affected paths, then resume the same task; they were not captured as artifacts.`)
   }
 
-  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<void> {
+  /**
+   * Snapshot the member worktree into the preservation refs and return the
+   * recovery paths it force-included, each in the spelling the filesystem
+   * stores. A declared output written in a different letter case answers
+   * `lstat` on a case-folding filesystem, but git matches a literal pathspec in
+   * the declared spelling against nothing and records nothing (S6c), so the
+   * snapshot is asked for the stored spelling, and verifies it recorded it.
+   */
+  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<string[]> {
     const task = record.task
     if (task === undefined) throw new Error('Cannot preserve a workspace without task ownership')
+    const includePaths: string[] = []
+    for (const name of task.preservationPaths ?? []) {
+      const present = await lstat(path.join(record.workspace, name)).then(() => true, () => false)
+      const spelled = present ? await this.onDiskSpelling(record.workspace, name) : undefined
+      const chosen = spelled !== undefined && validRecoveryPath(spelled) && !this.toolchainName(spelled) ? spelled : name
+      if (!includePaths.includes(chosen)) includePaths.push(chosen)
+    }
     const snapshot = await captureGitSnapshot(record.workspace, path.join(this.missionDir(record.missionId), 'preservation'),
-      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal, task.preservationPaths)
+      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal, includePaths)
     const nonce = randomUUID()
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
@@ -1510,6 +1527,7 @@ export class Workspaces {
       await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
       if (ownsTask) await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace)
     })
+    return includePaths
   }
 
   /**
@@ -1567,7 +1585,7 @@ export class Workspaces {
         // owner-visible instead of leaving it in this process's memory.
         const captureFailure = error instanceof Error ? error.message : String(error)
         let preservationFailure: string | undefined
-        try { await this.operation(value.memberId, signal => this.preserveWorkspace(prior, signal, { allowSuperseded: true })) }
+        try { await this.operation(value.memberId, async signal => { await this.preserveWorkspace(prior, signal, { allowSuperseded: true }) }) }
         catch (preservationError) { preservationFailure = preservationError instanceof Error ? preservationError.message : String(preservationError) }
         const preserved = preservationFailure === undefined && commitId(prior.task.preservedCommit) ? prior.task.preservedCommit : undefined
         const commit = preserved ?? (commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit)
