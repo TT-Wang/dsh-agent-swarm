@@ -541,10 +541,16 @@ test('each non-file shape of a declared output gets its own cause and exit in on
 })
 
 test('a declared output outside the scope the owner narrowed is refused as an owner amendment, not as a deliverables correction', async t => {
-  // stuck.mjs A / s3e-scope.mjs: the amendment narrows scope without touching outputs.
+  // stuck.mjs A / s3e-scope.mjs: the scope no longer contains a declared output.
+  // The owner amendment that would narrow it is refused at the call; a row
+  // stored before that check (or written by an older build) still reaches
+  // capture, which refuses it as an owner amendment.
   const f = await fixture(t)
   const proposed = f.propose({ objective: 'Audit the scheduler', outputs: ['docs/report.md'] })
-  f.runtime.controlTask(f.owner, f.mission.id, proposed.id, 'amend', { scope: ['notes/'] }, 'keep the task out of docs')
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, proposed.id, 'amend', { scope: ['notes/'] }, 'keep the task out of docs'),
+    error => error.code === 'output_outside_scope')
+  const narrowed = { ...f.taskRow(proposed.id), scope: ['notes/'] }
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', narrowed))
   const task = await f.runtime.claim(f.actor(f.author), f.mission.id, proposed.id)
   await writeFile(path.join(f.author.workspace, 'notes', 'summary.md'), 'summary\n')
   await f.readEvidence(f.author, task, 'notes/summary.md')
