@@ -801,7 +801,7 @@ export class SwarmRuntime {
     } finally { if (timer !== undefined) clearTimeout(timer) }
   }
   commit<T>(missionId: string, fn: () => T): T {
-    if (this.closed) throw new Error('Swarm runtime is closed')
+    if (this.closed) throw new PolicyError('runtime_closed', 'conflict_error', 'Swarm runtime is closed')
     this.commitDepth += 1
     let result: T
     try { result = this.store.transaction(() => {
@@ -868,7 +868,7 @@ export class SwarmRuntime {
     return { mission, member, key: member.id, owner: false }
   }
   active(actor: Actor, missionId: string, allowStaged = false) {
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     actor.signal?.throwIfAborted()
     const participant = this.participant(actor, missionId)
       if (participant.mission.status !== 'active' && !(allowStaged && participant.owner && participant.mission.status === 'staged')) throw new Error(`Mission is ${participant.mission.status}`)
@@ -1068,7 +1068,7 @@ export class SwarmRuntime {
   
   /** Create a mission with explicitly bounded resources and scope. */
   create(actor: Actor, input: CreateMissionInput, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new Error('Workers cannot create independent missions or budgets')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (!isAbsolute(input.workspace)) throw new Error('workspace must be an absolute path')
@@ -1838,7 +1838,7 @@ export class SwarmRuntime {
    * surface can never point recovery at an arbitrary file.
    */
   requestRestore(actor: Actor, snapshot?: string): PendingRestore {
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (!this.store.list('missions').some(mission => mission.ownerSessionId === actor.sessionId)) throw new Error('Only the mission owner may stage a store restore')
     const snapshotDir = `${this.config.statePath}.snapshots`
     const snapshotPath = snapshot === undefined ? SwarmStore.latestSnapshot(this.config.statePath, snapshotDir) : join(snapshotDir, snapshot)
@@ -1857,7 +1857,7 @@ export class SwarmRuntime {
    */
   message(actor: Actor, missionId: string, input: MessageInput): { queued: boolean; answered?: string; dismissed?: string } {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const participant = this.participant(actor, missionId)
     // Owner replies remain a control channel during resumable pauses. Retain
     // their full payload in the normal outbox; transport itself waits for resume.
@@ -2403,7 +2403,7 @@ export class SwarmRuntime {
    * work is immutable and must be repaired with a replacement instead.
    */
   cancel(actor: Actor, missionId: string, input: { taskId: string; reason: string }): Task & { strandedDependents?: string[] } {
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     actor.signal?.throwIfAborted()
     const { mission, owner, key } = this.participant(actor, missionId)
     if (!owner) throw new Error('Only the mission owner can cancel admitted work')
@@ -2492,7 +2492,7 @@ export class SwarmRuntime {
   }
   private ownedStart(actor: Actor, requestId: string): AutoStart {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const request = this.store.get('starts', requestId)
     if (!request || request.ownerSessionId !== actor.sessionId || this.isWorkerSession(actor.sessionId)) throw new Error('Automatic request is not owned by this user session')
     return request
@@ -2500,7 +2500,7 @@ export class SwarmRuntime {
   /** Admit once before any planning model call. Human command identity survives retries. */
   requestStart(actor: Actor, input: RequestStartInput): AutoStart {
     actor.signal?.throwIfAborted()
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.isWorkerSession(actor.sessionId)) throw new Error('Workers cannot create independent missions or budgets')
     requireText(input.commandId, 'commandId')
     if (input.commandId.length > 200) throw new Error('commandId exceeds 200 characters')
@@ -3620,7 +3620,7 @@ export class SwarmRuntime {
     return undefined
   }
   private async beforeStep(memberId: string, hasFreshInput = false): Promise<void | false> {
-    if (this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const member = this.store.get('members', memberId)
     if (!member) throw new Error('Unknown worker')
     const mission = this.mission(member.missionId)
@@ -4105,7 +4105,7 @@ export class SwarmRuntime {
   }
   /** One bounded startup per member, shared by admission, recovery and dispatch. */
   startWorker(mission: Mission, member: Member, options: { admission?: boolean; signal?: AbortSignal } = {}): Promise<void> {
-    if (this.closed || this.shuttingDown) return Promise.reject(new Error('Swarm runtime is shutting down'))
+    if (this.closed || this.shuttingDown) return Promise.reject(new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down'))
     if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) return Promise.reject(new Error('Worker is waiting for its previous attempt to stop'))
     const existing = this.workerStarts.get(member.id)
     const superseded = existing !== undefined && options.admission && (existing.admissionSignal !== options.signal || (!existing.nativePending && existing.retryAfter !== undefined))
@@ -4143,7 +4143,7 @@ export class SwarmRuntime {
           if (!options.admission && !options.signal?.aborted && this.workerStarts.get(member.id)?.controller === controller) this.onStartFailure(mission, member, error)
           throw error
         }
-        if (this.closed || this.shuttingDown) throw new Error('Swarm runtime is shutting down')
+        if (this.closed || this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
         const live = this.store.get('members', member.id)
         const status = this.store.get('missions', mission.id)?.status
         if ((status !== 'active' && !(options.admission && status === 'staged')) || live === undefined || memberPhaseOf(live) === 'stopped') {
@@ -4210,8 +4210,8 @@ export class SwarmRuntime {
   private async disposeRuntime(): Promise<void> {
     this.shuttingDown = true
     if (this.timer) clearInterval(this.timer)
-    for (const controller of this.startControllers.values()) controller.abort(new Error('Swarm runtime is shutting down'))
-    for (const { controller } of this.workerStarts.values()) controller.abort(new Error('Swarm runtime is shutting down'))
+    for (const controller of this.startControllers.values()) controller.abort(new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down'))
+    for (const { controller } of this.workerStarts.values()) controller.abort(new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down'))
     let workerError: unknown
     try { await this.workers.dispose() } catch (error) { workerError = error }
     try {

@@ -89,7 +89,6 @@ const actionableMessages: readonly RegExp[] = [
   /^Workstream (?:identity conflict|admission budget exhausted)$/,
   /^Worker (?:name already exists|already owns an open task|membership is inactive)$/,
   /^Workers cannot create independent missions or budgets$/,
-  /^Swarm runtime is (?:closed|shutting down)$/,
   /^Discard unused drafts before creating more$/,
   /^Task .* is accepted; accepted work is immutable/,
   /^A task prerequisite is no longer accepted/,

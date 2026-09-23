@@ -701,6 +701,17 @@ test('launch refusals reach the browser by their policy code, with the legacy wo
   assert.equal(f.runtime.store.get('drafts', draft.id).status, 'launching', 'a refused launch changes nothing')
 })
 
+test('a shutting-down runtime refuses control RPCs with a typed conflict', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  f.runtime.shuttingDown = true
+  const refused = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: 'any', reason: 'x' })
+  assert.equal(refused.result.error.code, 'bad-request', refused.text)
+  assert.equal(refused.result.error.message, 'Swarm runtime is shutting down')
+  assert.deepEqual(refused.result.error.details, { issues: [], policyCode: 'runtime_shutting_down', category: 'conflict_error' })
+})
+
 test('mission owner refusals carry authorization even when the wording has no legacy match', async t => {
   const f = await fixture(t)
   const mission = f.runtime.create({ sessionId: f.ownerId }, { ...f.input, workspace: f.workspace })
