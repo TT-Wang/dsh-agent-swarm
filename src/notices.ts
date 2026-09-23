@@ -220,7 +220,7 @@ export const NOTICE_TEMPLATES = {
   'stall-root': {
     trigger: 'task/blocked',
     build: (input: { rootId: string; title: string; epoch: number; cause: string; dependents: readonly string[]; recordedReason?: string }) =>
-      `Task ${input.rootId} (${input.title}, epoch ${input.epoch}) is a stall root: it is blocked and ${input.cause}${input.dependents.length ? `; ${input.dependents.length} task(s) depend on it (${input.dependents.join(', ')})` : ''}${input.recordedReason === undefined ? '' : `. Recorded reason: ${input.recordedReason}`}. Inspect the recorded cause: extend this task's allocation with swarm_budget, amend its unsubmitted policy or resume it after environment repair with swarm_control(taskId: "${input.rootId}"). Rejected implementations require swarm_propose with replaces: ["${input.rootId}"] and unchanged acceptance. Use swarm_cancel to withdraw mistaken work.`,
+      `Task ${input.rootId} (${input.title}, epoch ${input.epoch}) is a stall root: it is blocked and ${input.cause}${input.dependents.length ? `; ${input.dependents.length} task(s) depend on it (${input.dependents.join(', ')})` : ''}${input.recordedReason === undefined ? '' : `. Recorded reason: ${input.recordedReason}`}. Inspect the recorded cause: extend this task's allocation with swarm_budget, amend its unsubmitted policy or resume it after environment repair with swarm_control(taskId: "${input.rootId}"). Rejected implementations require swarm_propose with replaces: ["${input.rootId}"]; the repair inherits its acceptance. Use swarm_cancel to withdraw mistaken work.`,
   },
   fallthrough: {
     trigger: 'mission/stalled',

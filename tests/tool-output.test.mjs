@@ -63,11 +63,27 @@ test('swarm_propose leaves acceptance optional for a repair to inherit; every pl
 
 test('repair guidance says a repair inherits acceptance instead of asking the model to copy it', async () => {
   const { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT } = await import('../lib/tools.js')
+  const { NOTICE_TEMPLATES } = await import('../lib/notices.js')
+  const { guardTerminal } = await import('../lib/refusals.js')
+  const { dependencyAssumptionDiagnostic } = await import('../lib/admission.js')
   const surfaces = { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT, swarm_propose: tools().get('swarm_propose').description }
   for (const [where, text] of Object.entries(surfaces)) {
     assert.doesNotMatch(text, /unchanged acceptance|acceptance verbatim|retain original acceptance/i, `${where} no longer asks for a copy`)
   }
   for (const where of ['OWNER_PROMPT', 'WORKER_PROMPT', 'swarm_propose']) assert.match(surfaces[where], /replaces[^.]*inherit[^.]*acceptance/, `${where} states the inheritance once`)
+  // The owner's stall-root notice, the dispatch terminal and the missing
+  // dependency diagnostic carry the same repair path; none may ask for
+  // acceptance to be copied, in any wording.
+  const repairPaths = {
+    'stall-root notice': NOTICE_TEMPLATES['stall-root'].build({ rootId: 'task_root', title: 'Rejected work', epoch: 2, cause: 'no live replacement exists anywhere in its lineage', dependents: ['task_next'], recordedReason: 'rejected by review' }),
+    'dispatch_terminal': guardTerminal('dispatch_preconditions').message,
+    'dependency_assumption_missing': dependencyAssumptionDiagnostic('the earlier artifact', 'objective', 'resume from the earlier artifact', 'task "Repair"').message,
+  }
+  for (const [where, text] of Object.entries(repairPaths)) {
+    assert.doesNotMatch(text, /verbatim|unchanged acceptance|retain original acceptance/i, `${where} no longer asks for a copy`)
+    assert.match(text, /swarm_propose/, `${where} names the repair tool`)
+    assert.match(text, /replaces[^.]*inherits its acceptance/, `${where} states the inheritance`)
+  }
 })
 
 test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {

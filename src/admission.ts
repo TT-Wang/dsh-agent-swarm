@@ -593,7 +593,7 @@ export function dependencyAssumptionDiagnostic(named: string, field: string, cla
     code: 'dependency_assumption_missing',
     location,
     path: named,
-    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\` while keeping its acceptance criteria verbatim.`,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\`; the repair inherits its acceptance.`,
   }
 }
 
