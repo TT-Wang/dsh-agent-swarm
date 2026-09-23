@@ -919,6 +919,9 @@ export class Notices {
     }
     const stopFailures = this.stopFailureSubjects(mission.id, delivery)
     if (stopFailures !== undefined) return stopFailures
+    // A stall-root decision is outstanding exactly while its root still is one;
+    // the dependents it lists (a rejecting review) never keep it open.
+    if (noticeFamily(delivery) === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
     return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
       if (subject === missionSubject(mission)) {
         if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
@@ -972,21 +975,15 @@ export class Notices {
       const subjects = delivery.subjects ?? fact.subjects ?? []
       // Old unattributed rows cannot be judged from their text alone.
       if (subjects.length === 0) return true
+      if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, tasks).length > 0
       // A batch asserts the condition for every named subject. If one changes,
       // the transition publisher emits the remaining subjects as a fresh fact.
-      // A stall-root decision asserts it of its root alone (the subject its key
-      // names): the dependents it lists are consequences, never roots, so judging
-      // them as roots made every stall root with a dependent undeliverable.
-      const rootPrefix = `stall-root:${mission.id}:`
-      const judged = family !== 'stall-root' ? subjects
-        : [fact.dedupKey.startsWith(rootPrefix) ? fact.dedupKey.slice(rootPrefix.length) : subjects[0]!]
-      return judged.every(subject => {
+      return subjects.every(subject => {
         if (subject === missionSubject(mission)) return true
         const task = taskFromSubject(subject, tasks)
         if (task === undefined || TERMINAL_STATES.has(task.status)) return false
         if (family === 'review-blocked') return task.status === 'submitted' && !this.rt.reviewable(task, tasks)
         if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
-        if (family === 'stall-root') return stallRootsFor(this.rt, tasks).some(root => root.id === task.id)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
       })
@@ -1002,6 +999,23 @@ export class Notices {
       })) return false
     }
     return true
+  }
+
+  /**
+   * The one rule that judges a stall-root decision (its own row or a wake-budget
+   * constituent), for delivery-time relevance and obligation follow-ups alike: it
+   * asserts its claim of the root its key names, never of the dependents it lists.
+   * Those are consequences, not roots; judging them as roots made every stall
+   * root with a dependent undeliverable, and judging them as waits kept a
+   * rejected root's reminders alive while its repair ran (the rejecting review is
+   * a listed dependent). Returns the root subject while it is still a stall root.
+   */
+  private openStallRoot(missionId: string, delivery: Pick<Delivery, 'subjects' | 'notice'>, tasks: Task[]): string[] {
+    const rootPrefix = `stall-root:${missionId}:`
+    const key = delivery.notice?.dedupKey ?? ''
+    const root = key.startsWith(rootPrefix) ? key.slice(rootPrefix.length) : (delivery.subjects ?? noticeRow(delivery)?.subjects)?.[0]
+    const task = root === undefined ? undefined : taskFromSubject(root, tasks)
+    return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
   }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */

@@ -216,6 +216,45 @@ test('a real review rejection names its stall root exactly once, with exactly on
   assert.ok(deliveries[0].deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
 })
 
+for (const repaired of [true, false]) {
+  test(`stall-root reminders judge the root the key names: ${repaired ? 'none while the repair runs' : 'one arrives when no repair is proposed'}`, async t => {
+    // 5347f5b: delivery judged a stall-root by its root alone, but its reminders
+    // judged every listed subject; the rejecting review (a listed dependent) is
+    // never a live wait, so two "still unresolved" reminders reached the owner
+    // while the root's repair was already running.
+    const f = await fixture(t, { tickMs: 10 })
+    f.runtime.notices.obligationFollowupMs = 300
+    const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+    const source = f.propose('Rejected implementation')
+    const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+    await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+      title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+    const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+    await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+    const rootSubject = `${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`
+    const stallRoot = await eventually(() => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined),
+      'the stall-root decision reaches the owner')
+    assert.ok(stallRoot.subjects.includes(`${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`), 'the rejecting review is a listed dependent')
+    // Reminders of this stall-root: their own rows or wake-budget constituents.
+    const prefix = `obligation-followup:${stallRoot.id}:`
+    const reminders = () => f.notices().flatMap(delivery => [
+      ...(delivery.notice?.dedupKey?.startsWith(prefix) ? [{ delivery, subjects: delivery.subjects }] : []),
+      ...(delivery.notice?.aggregatedFacts ?? []).filter(part => part.dedupKey.startsWith(prefix)).map(part => ({ delivery, subjects: part.subjects })),
+    ])
+    if (repaired) {
+      const repair = f.propose('Repair', { replaces: [source.id] })
+      await eventually(() => f.runtime.store.get('tasks', repair.id).status === 'running', 'the repair runs')
+      await sleep(1200)
+      assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')
+      assert.deepEqual(reminders().map(item => item.subjects), [], 'no stall-root reminder while the repair runs')
+      return
+    }
+    const reminder = await eventually(() => reminders().find(item => item.delivery.deliveredAt !== undefined), 'a stall-root reminder reaches the owner', 3000)
+    assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
+  })
+}
+
 test('a pending task in preparation back-off is a bounded live wait, and a named fall-through once the bound passes without a retry', async t => {
   // Before, any `preparationFailure` made a pending task "not legitimately
   // waiting", so the host's own transient back-off woke the owner through the
