@@ -10,7 +10,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { PolicyError } from '../lib/policy-error.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
@@ -87,6 +87,29 @@ test('typed refusal sites retain authored codes, categories, and messages indepe
     assert.equal(errorTypeFor(refusal), site.category, `${site.location}: category does not depend on an English regex`)
     assert.equal(errorTypeFor(new PolicyError(site.code, site.category, '请按当前状态重试。')), site.category)
   }
+})
+
+test('a refusal code is typed with one category wherever it is raised', () => {
+  const sites = []
+  for (const file of readdirSync(new URL('../src/', import.meta.url)).filter(name => name.endsWith('.ts')).map(name => `src/${name}`)) {
+    const tree = sourceTree(readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'), file)
+    const visit = node => {
+      if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && ['PolicyError', 'AdmissionError'].includes(node.expression.text)) {
+        const [code, category] = node.arguments ?? []
+        if (code && category && ts.isStringLiteralLike(code) && ts.isStringLiteralLike(category)) {
+          sites.push({ code: code.text, category: category.text, location: `${file}:${tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1}` })
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+  }
+  assert.ok(sites.length > 100, `the typed refusal sites are walked (found ${sites.length})`)
+  const categories = new Map()
+  for (const site of sites) categories.set(site.code, [...(categories.get(site.code) ?? []), site])
+  const split = [...categories].filter(([, found]) => new Set(found.map(site => site.category)).size > 1)
+    .map(([code, found]) => `${code}: ${found.map(site => `${site.category} at ${site.location}`).join(', ')}`)
+  assert.deepEqual(split, [], 'a caller branching on the code sees one category')
 })
 
 test('a typed refusal is recorded exactly as the plain Error it was typed from', () => {

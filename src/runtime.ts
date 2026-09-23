@@ -1079,7 +1079,7 @@ export class SwarmRuntime {
     assertScopeSelectors(input.scope, 'scope')
     const budget = validatedBudget(input.budget)
     const now = Date.now()
-    if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'tool_error', 'Mission duration exceeds the supported clock range')
+    if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'validation_error', 'Mission duration exceeds the supported clock range')
     const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, executionTime: { usedMs: 0 }, deadline: Math.min(budget.deadlineAt ?? Number.MAX_SAFE_INTEGER, now + budget.maxDurationMs) }
     if (this.store.get('missions', mission.id)) throw new PolicyError('mission_identity_conflict', 'conflict_error', 'Mission already exists')
     this.commit(mission.id, () => {
@@ -1135,7 +1135,7 @@ export class SwarmRuntime {
       // assignment order; the pool is the bound, and its exhaustion is a named
       // refusal that names the caller's own exit rather than an anonymous failure.
       const name = input.name ?? nextWorkerName(members.map(member => member.name))
-      if (name === undefined) throw new Error('[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
+      if (name === undefined) throw new PolicyError('worker_name_pool_exhausted', 'budget_error', '[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
       if (members.some(m => m.name === name)) throw new PolicyError('worker_name_conflict', 'conflict_error', 'Worker name already exists')
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
@@ -1198,7 +1198,12 @@ export class SwarmRuntime {
               this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
               this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
             })
-            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
+            // The adapter's rejection text can name gateway hosts and internal
+            // route codes, so it stays in the durable events above. The refusal
+            // is built from the route this runtime holds, in the adapter's
+            // canonical shape, so a canonical rejection renders the same bytes.
+            const route = (field: string, value: string | undefined) => `${field} ${value === undefined ? '(inherited)' : `"${value}"`}`
+            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${route('provider', member.provider)} ${route('model', member.model)} does not support reasoning effort "${rejection.requested ?? requested}". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
           }
         }
         member.phase = 'stopped'
@@ -3017,8 +3022,11 @@ export class SwarmRuntime {
         // The adapter result is located; `checkSyntaxDetail` pairs each issue
         // with the check it refuses by that index.
         const issues = await this.workers.checkSyntaxPreflight(declaredChecks.map(check => check.command), input.workspace, actor.signal)
-        // Typed, so the browser sees it by its code; the RPC boundary still
-        // hides it when the detail names a host path.
+        // Typed for the trace and for the owner's tool and automatic-start
+        // paths, which carry it in full. Its detail quotes the shell's own
+        // diagnostic, which starts with "/bin/sh:", so the RPC boundary always
+        // takes it for host detail: the browser's launch-draft answers
+        // internal-error and the host logs the refusal.
         if (issues.length) throw new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] ' + checkSyntaxDetail(declaredChecks, issues) + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
       }
       assertCurrent()

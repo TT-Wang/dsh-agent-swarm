@@ -100,6 +100,19 @@ test('W8: a route that still rejects the cleared effort refuses admission with a
   assert.equal(stored.status, 'stopped', 'a member that cannot start is not left live')
 })
 
+test('a mission duration beyond the clock range is one validation_error at create and at budget update', async t => {
+  const f = await setup(t)
+  const duration = error => {
+    assert.equal(error.code, 'mission_duration_invalid')
+    assert.equal(error.category, 'validation_error')
+    assert.equal(error.message, 'Mission duration exceeds the supported clock range')
+    return true
+  }
+  assert.throws(() => f.runtime.create(f.owner, { title: 'Long', objective: 'Too long', workspace: '/source', scope: ['src/'], acceptance: ['works'],
+    budget: { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER } }), duration)
+  assert.throws(() => f.runtime.updateBudget(f.owner, f.mission.id, { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER }), duration)
+})
+
 test('D9: the owner withdraws a submitted task, records the previous status and retires its review', async t => {
   const f = await setup(t)
   const builder = await f.addMember({ name: 'Builder', role: 'implementation' })

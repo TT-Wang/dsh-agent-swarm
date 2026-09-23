@@ -299,6 +299,54 @@ test('plan refusals are one typed admission refusal carrying every diagnostic, w
   assert.equal(errorTypeFor(priority), errorTypeFor(new Error(priority.message)))
 })
 
+test('a task scope entry that is not a string is one diagnostic among the others, not a TypeError that drops them', async t => {
+  const refusal = input => { try { validatePlan(input) } catch (error) { return error } assert.fail('the plan must be refused') }
+  // Before batch 2 this plan was refused with three joined lines, the middle one
+  // the TypeError that matching outputs against a non-string selector raised.
+  // Outputs are now matched only against a scope of strings, so that line is
+  // gone and the scope and priority diagnostics are the whole refusal.
+  const expected = 'tasks[0] (review).scope must be nonempty text of at most 16000 characters\ntasks[0] (review).priority must be 0–100'
+  for (const scope of [[{ path: 'src/' }], [null], ['src/', 7]]) {
+    const input = plan(tmpdir())
+    Object.assign(input.tasks[0], { scope, outputs: ['src/a.ts'], priority: 500 })
+    const error = refusal(input)
+    assert.ok(error instanceof AdmissionError, `${JSON.stringify(scope)}: ${error}`)
+    assert.equal(error.message, expected)
+    assert.equal(error.code, 'plan_invalid')
+    assert.equal(error.category, 'validation_error')
+    assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.code), ['plan_text_invalid', 'plan_priority_invalid'])
+  }
+  // A scope that is not an array is refused by its own diagnostic too; outputs
+  // are no longer reported as outside the empty scope `[]` beside it.
+  for (const scope of ['src/', undefined]) {
+    const input = plan(tmpdir())
+    Object.assign(input.tasks[0], { scope, outputs: ['src/a.ts'], priority: 500 })
+    assert.equal(refusal(input).message, 'tasks[0] (review).scope must be a nonempty string array\ntasks[0] (review).priority must be 0–100')
+  }
+  // The staged draft path refuses with the same text and saves nothing.
+  const f = await fixture(t)
+  Object.assign(f.input.tasks[0], { scope: [{ path: 'src/' }], outputs: ['src/a.ts'], priority: 500 })
+  assert.throws(() => f.runtime.createDraft(f.owner, f.input), error => error instanceof AdmissionError && error.message === expected)
+  assert.deepEqual(f.runtime.drafts(f.owner), [])
+})
+
+test('a check that fails without an authored refusal is collected with the plan issues instead of aborting them', () => {
+  // No plan input reaches this path any more, so a throwing accessor stands in
+  // for a check that fails with a plain TypeError partway through validation.
+  const input = plan(tmpdir())
+  input.tasks[0].priority = 500
+  Object.defineProperty(Object.prototype, 'checkTimeoutMs', { configurable: true, get() { throw new TypeError('checkTimeoutMs probe failed') } })
+  let error
+  try { validatePlan(input) } catch (caught) { error = caught } finally { delete Object.prototype.checkTimeoutMs }
+  assert.ok(error instanceof AdmissionError, `the plan issues survive the plain failure: ${error}`)
+  assert.equal(error.message, 'checkTimeoutMs probe failed\ntasks[0] (review).priority must be 0–100\ncheckTimeoutMs probe failed')
+  assert.equal(error.code, 'plan_invalid')
+  assert.equal(error.category, 'validation_error')
+  assert.deepEqual(error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location]),
+    [['plan_invalid', 'plan'], ['plan_priority_invalid', 'tasks[0] (review).priority'], ['plan_invalid', 'plan']])
+  assert.equal(error.message, error.diagnostics.map(diagnostic => diagnostic.message).join('\n'))
+})
+
 test('missing plan keys identify the exact field and explain how to repair references', () => {
   for (const field of ['members', 'workstreams', 'tasks']) {
     const input = plan('/workspace')

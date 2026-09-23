@@ -8,7 +8,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
 import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceGrantSnapshot } from './authorization.ts'
-import { TaskGraphAdmissionError } from './admission.ts'
+import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
@@ -62,6 +62,8 @@ class RequestError extends Error {
  * inside a relative one (`tests/data/x`); `~/` and a drive root count likewise.
  */
 const unsafeDetail = /(?:\bSQLITE\b|\/Users\/|\/private\/|\/var\/|\/tmp\/|\/home\/|\/etc\/|\/opt\/|\/usr\/|\0|(?<![\w.-])(?:\/(?:Volumes|srv|mnt|data|root|Library|System|Applications|proc|run|media|snap|nix|dev|sys|boot|bin|sbin|lib|lib64|workspace|workspaces)\/|~\/|[a-z]:\\))/i
+/** A stable public policy code. */
+const POLICY_CODE = /^[a-z][a-z0-9_]{0,79}$/
 class InternalFailure extends Error {
   constructor(readonly cause: unknown) { super('Swarm request failed unexpectedly') }
 }
@@ -72,7 +74,9 @@ class InternalFailure extends Error {
  * unexpected: the host logs its full detail and the browser receives a stable
  * `internal-error` message, so no wording makes a failure visible. `true`
  * marks a validator whose every failure echoes the caller's own input; its
- * failures stay visible even when that input names a host path.
+ * failures stay visible even when that input names a host path. Elsewhere an
+ * admission refusal whose text names host detail is answered with a fixed
+ * repair text naming only its diagnostics' codes and locations.
  */
 async function exposed<T>(operation: () => Promise<T> | T, userActionable = false): Promise<T> {
   try { return await operation() } catch (error) {
@@ -80,7 +84,7 @@ async function exposed<T>(operation: () => Promise<T> | T, userActionable = fals
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
     if (error instanceof PolicyError) {
       // A type is not permission to expose host paths or unbounded details.
-      if (message.length > 0 && message.length <= 4000 && !unsafeDetail.test(message) && /^[a-z][a-z0-9_]{0,79}$/.test(error.code)) {
+      if (message.length > 0 && message.length <= 4000 && !unsafeDetail.test(message) && POLICY_CODE.test(error.code)) {
         throw new RequestError(message, { code: error.code, category: error.category })
       }
       // A graph refusal whose task identities carry host detail has a fixed repair text.
@@ -89,11 +93,29 @@ async function exposed<T>(operation: () => Promise<T> | T, userActionable = fals
       }
       // A validator's own-input echo stays scrub-exempt whatever its type.
       if (userActionable && message !== '') throw new RequestError(message)
+      // An admission refusal that echoes the caller's own absolute-looking
+      // value keeps a fixed repair text built from its diagnostics' codes and
+      // locations alone, so the caller can still correct the named field.
+      if (error instanceof AdmissionError && unsafeDetail.test(message)) {
+        const repair = hostFreeRepair(error.diagnostics)
+        if (repair !== undefined) throw new RequestError(repair, POLICY_CODE.test(error.code) ? { code: error.code, category: error.category } : undefined)
+      }
       throw new InternalFailure(error)
     }
     if (userActionable && message !== '') throw new RequestError(message)
     throw new InternalFailure(error)
   }
+}
+/** One repair line per diagnostic, naming its code and a host-free location; undefined when none qualifies. */
+function hostFreeRepair(diagnostics: readonly AdmissionDiagnostic[]): string | undefined {
+  const lines = new Set<string>()
+  for (const { code, location } of diagnostics) {
+    if (!POLICY_CODE.test(code)) continue
+    const at = location.length > 0 && location.length <= 200 && !unsafeDetail.test(location) ? `${location}: the` : 'The'
+    lines.add(`[${code}] ${at} value names an absolute path and is not repeated here. Use a repository-relative path and retry.`)
+  }
+  const text = [...lines].join('\n')
+  return text.length > 0 && text.length <= 4000 ? text : undefined
 }
 class MissingSession extends Error {
   constructor(readonly sessionId: SessionId) { super(`Session ${sessionId} is not an available workspace session`) }

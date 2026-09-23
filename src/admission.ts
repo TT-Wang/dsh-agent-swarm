@@ -437,7 +437,7 @@ export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[]
   for (const output of outputs) {
     const fault = declaredOutputFault(output, scope)
     if (fault === undefined) continue
-    throw new AdmissionError('output_outside_scope', 'tool_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
+    throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
   return [...outputs as string[]]
 }

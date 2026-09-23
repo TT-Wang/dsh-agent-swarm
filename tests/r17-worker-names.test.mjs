@@ -14,6 +14,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
+import { validatePlan } from '../lib/plans.js'
+import { PolicyError } from '../lib/policy-error.js'
 import { WORKER_NAME_POOL, nextWorkerName } from '../lib/types.js'
 import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
@@ -160,6 +162,20 @@ test('the pool is the bound: exhaustion refuses a name-less admission by name an
   }
   await assert.rejects(f.add({ role: 'overflow' }), /pool|name/i, 'an exhausted pool refuses a name-less admission with a named exit')
   await assert.rejects(f.add({ role: 'overflow' }), error => /explicit/i.test(error.message), 'the refusal names the explicit-name exit')
+  // The same inline code is typed here as on the plan path, with the same category and unchanged bytes.
+  await assert.rejects(f.add({ role: 'overflow' }), error => {
+    assert.ok(error instanceof PolicyError, `the refusal is typed: ${error}`)
+    assert.equal(error.code, 'worker_name_pool_exhausted')
+    assert.equal(error.category, 'budget_error')
+    assert.equal(error.message, '[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
+    assert.equal(String(error), `Error: ${error.message}`)
+    return true
+  })
+  const planned = { title: 'P', objective: 'O', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: POOL.length + 1 },
+    members: [...POOL.map((name, index) => ({ key: `m${index}`, name, role: 'worker' })), { key: 'extra', role: 'worker' }],
+    workstreams: [{ key: 'w', title: 'W', objective: 'W' }],
+    tasks: [{ key: 't', workstreamKey: 'w', title: 'T', objective: 'Read', kind: 'research', scope: ['src/'], acceptance: ['works'] }] }
+  assert.throws(() => validatePlan(planned), error => error.code === 'worker_name_pool_exhausted' && error.category === 'budget_error')
   assert.equal(f.rows().length, POOL.length, 'the refusal admitted nothing')
   const named = await f.add({ role: 'overflow', name: 'Zoe' })
   assert.equal(named.name, 'Zoe', 'a caller-supplied name still admits after pool exhaustion')
