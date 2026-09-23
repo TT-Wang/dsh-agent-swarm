@@ -21,7 +21,7 @@ import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
 
 const schemaIndex = await toolSchemaIndex()
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 }
@@ -169,6 +169,41 @@ for (const kind of ['research', 'implementation']) {
     const snapshot = await f.accept(task, 'docs/report.md')
     assert.equal(await readFile(path.join(f.reviewer.workspace, 'docs', 'report.md'), 'utf8'), '# Report\n\nfindings\n', 'the reviewer reads the captured report')
     assert.equal(f.taskRow(task.id).status, 'accepted')
+    assert.equal(snapshot.completion.eligible, true, snapshot.completion.reason)
+  })
+}
+
+test('the output_missing refusal is in the refusal inventory and satisfies its contract', async () => {
+  const file = 'src/workspaces.ts'
+  const sites = refusalSites(await readFile(new URL(`../${file}`, import.meta.url), 'utf8'), file)
+  const typed = sites.filter(site => site.code === 'output_missing')
+  assert.deepEqual(typed.map(site => [site.kind, site.errorClass, site.codes]), [['coded-throw', 'PolicyError', ['output_missing']]], 'one capture-time refusal serves submit and verify')
+  assert.deepEqual(assessRefusal(typed[0], { ...schemaIndex, diagnosticProducers: diagnosticProducers([sites]) }), [], typed[0].text)
+})
+
+for (const kind of ['research', 'implementation']) {
+  test(`(${kind}) a declared output never written is refused with output_missing and the attempt stays running; writing it and resubmitting is accepted`, async t => {
+    const f = await fixture(t)
+    const extra = kind === 'research' ? {} : { kind, checks: ['test -s docs/report.md'], checkTimeoutMs: 30000 }
+    const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Audit the scheduler', outputs: ['docs/report.md'], ...extra }).id)
+    await writeFile(path.join(f.author.workspace, 'notes', 'scratch.md'), 'working notes\n')
+    await f.readEvidence(f.author, task, 'notes/scratch.md')
+    for (const deliverables of [undefined, [], ['notes/scratch.md']]) {
+      await assert.rejects(f.submit(f.author, task, deliverables === undefined ? {} : { deliverables }), error => outputMissing(error, ['docs/report.md']))
+      const current = f.taskRow(task.id)
+      assert.equal(current.status, 'running', 'the refusal keeps the attempt running so the member can resubmit')
+      assert.equal(current.attempt.id, task.attempt.id)
+      assert.equal(current.artifact, undefined)
+    }
+    assert.ok(!f.runtime.store.events(f.mission.id, 200).some(event => event.type === 'task/submitted'), 'no submission is recorded while the declared output is missing')
+    assert.deepEqual(await f.refsCarrying('notes/scratch.md', 'refs/artifacts/'), [], 'a refused submission publishes no artifact ref')
+    await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Report\n')
+    const submitted = await f.submit(f.author, task)
+    assert.equal(submitted.status, 'submitted')
+    assert.deepEqual(submitted.artifact.files.map(file => file.path), ['docs/report.md'])
+    assert.deepEqual([...submitted.artifact.changedPaths].sort(), ['docs/report.md', 'notes/scratch.md'])
+    const snapshot = await f.accept(task, 'docs/report.md')
+    assert.equal(f.taskRow(task.id).status, 'accepted', 'an accepted artifact carries every declared output')
     assert.equal(snapshot.completion.eligible, true, snapshot.completion.reason)
   })
 }
