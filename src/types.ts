@@ -634,6 +634,8 @@ export interface NoticeEnvelope {
     class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
     subjects: string[]; trigger: string; reason: string; createdAt: number
     questionId?: string; deliveryFailureId?: string
+    /** Reminders spent on this constituent: each summarized fact has its own allowance. */
+    followupCount?: number
   }>
   /** First transport handoff freezes the rendered summary across uncertain retries. */
   handoffAt?: number

@@ -909,7 +909,14 @@ export class Notices {
     return latest
   }
 
-  /** Revisit delivered decisions only while their original durable obligation still stands. */
+  /**
+   * Revisit delivered decisions only while their original durable obligation
+   * still stands. Each fact has its own reminder allowance: a wake-budget
+   * summary reminds only the constituents that are unresolved and have
+   * reminders left, and spends only theirs, so an unrelated constituent that
+   * stays open cannot spend the reminders of one that is resolved for a while
+   * and then reopens.
+   */
   private followupObligations(view: MissionInterpretation): void {
     const mission = view.mission
     if (!['active', 'blocked'].includes(mission.status)) return
@@ -922,20 +929,26 @@ export class Notices {
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
-      if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
-      const unresolved = this.unresolvedSubjects(view, delivery)
+      if (now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
+      const parts = fact.aggregatedFacts?.filter(part => (part.followupCount ?? 0) < this.maxObligationFollowups
+        && this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
+      if (parts === undefined ? spent >= this.maxObligationFollowups : parts.length === 0) continue
+      const unresolved = parts === undefined ? this.unresolvedSubjects(view, delivery)
+        : [...new Set(parts.flatMap(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part))))]
       if (unresolved.length === 0) continue
-      const priorContent = fact.aggregatedFacts === undefined ? delivery.content
-        : fact.aggregatedFacts.filter(part => this.unresolvedSubjects(view, this.summaryFactDelivery(mission.id, delivery.id, part)).length > 0)
-          .flatMap(part => this.summaryFactText(delivery, part)).join('\n')
+      const priorContent = parts === undefined ? delivery.content : parts.flatMap(part => this.summaryFactText(delivery, part)).join('\n')
+      // A summary's reminder is counted per constituent it names.
+      const ordinal = parts === undefined ? spent + 1 : Math.max(...parts.map(part => (part.followupCount ?? 0) + 1))
+      const reminded = parts?.map(part => part.factStart) ?? []
       this.rt.commit(mission.id, () => {
         const current = this.rt.store.get('deliveries', delivery.id)
         const currentFact = current === undefined ? undefined : noticeRow(current)
         if (current === undefined || currentFact === undefined || (currentFact.followupCount ?? 0) !== spent) return
         currentFact.followupCount = spent + 1
         currentFact.followupAt = now
+        for (const part of currentFact.aggregatedFacts ?? []) if (reminded.includes(part.factStart)) part.followupCount = (part.followupCount ?? 0) + 1
         this.rt.store.put('deliveries', current)
-        this.notify(mission.id, `Owner decision still unresolved (reminder ${spent + 1} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(priorContent, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${spent + 1 === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
+        this.notify(mission.id, `Owner decision still unresolved (reminder ${ordinal} of ${this.maxObligationFollowups}, original delivery ${delivery.id}). Subjects: ${unresolved.join(', ')}. Prior notice: ${compactFact(priorContent, 600)}\nRead the original with swarm_observe({ missionId: "${mission.id}", deliveryId: "${delivery.id}" }) and apply the decision.${ordinal === this.maxObligationFollowups ? '\nReminder limit reached; the unresolved obligation remains on the board.' : ''}`, unresolved,
           { dedupe: true, dedupKey: `obligation-followup:${delivery.id}:${spent + 1}`, trigger: 'owner-decision-unresolved', reason: delivery.id, stampWitness: false })
       })
     }
@@ -1405,7 +1418,7 @@ export class Notices {
       const body = NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
       // A root the verify site already put in front of the owner (its rejection
-      // decision at this subject@epoch) is recorded against that decision when
+      // decision at this subject@epoch, as its own row) is recorded against that decision when
       // the decision says all the root does: it names no dependent beyond its
       // own rejecting review(s). The row and event stay; the second wake and its
       // reminders do not (the decision's own reminders carry the root). A root
@@ -1437,15 +1450,15 @@ export class Notices {
 
   /**
    * The owner delivery carrying the verify site's rejection decision for one
-   * subject@epoch (`REJECTION_DECISION_TRIGGER`), as its own row or as a
-   * wake-budget constituent; identified by its recorded trigger, never by prose.
+   * subject@epoch (`REJECTION_DECISION_TRIGGER`) as its own row, identified by
+   * its recorded trigger, never by prose. A decision carried by a wake-budget
+   * summary covers nothing: the stall root is then its own fact, delivered or
+   * summarized like any other, with its own reminder allowance.
    */
   private rejectionDecisionFor(missionId: string, subject: string): Delivery | undefined {
     return this.rt.store.list('deliveries', missionId).find(delivery => {
       const row = delivery.to === 'owner' ? noticeRow(delivery) : undefined
-      if (row === undefined) return false
-      if (row.trigger === REJECTION_DECISION_TRIGGER && (delivery.subjects ?? row.subjects ?? []).includes(subject)) return true
-      return row.aggregatedFacts?.some(part => part.trigger === REJECTION_DECISION_TRIGGER && part.subjects.includes(subject)) ?? false
+      return row?.trigger === REJECTION_DECISION_TRIGGER && (delivery.subjects ?? row.subjects ?? []).includes(subject)
     })
   }
 

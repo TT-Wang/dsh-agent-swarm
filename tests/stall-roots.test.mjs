@@ -299,6 +299,62 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('obligation-followup:')), [], 'no reminder was needed')
 })
 
+test('a rejected root whose decision was summarized is its own fact, and is named again when its repair is withdrawn', async t => {
+  // 82d9ec8: a stall root was recorded against a rejection decision that was a
+  // wake-budget summary constituent, so it had no reminders of its own and
+  // shared the summary's two with unrelated facts. Spent on another blocked
+  // task while the repair ran, they left nothing to name the root once the
+  // owner withdrew the repair. A summarized decision now covers nothing, and
+  // each summarized fact has its own reminder allowance.
+  const f = await fixture(t, { tickMs: 10, stallPassTimeoutMs: 5000 })
+  const rt = f.runtime
+  rt.notices.wakeBudget = 1
+  rt.notices.wakeBudgetWindowMs = 1e9
+  rt.notices.obligationFollowupMs = 300
+  // The one wake slot's delivery is held in transport, so every later fact is summarized.
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let hold = true
+  const deliver = rt.workers.deliver.bind(rt.workers)
+  rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) await gate; return deliver(member, delivery) }
+  const reviewer = await rt.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const other = await rt.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
+  await rt.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
+  rt.commit(f.mission.id, () => rt.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
+  const unrelated = f.propose('Unrelated dead end', { kind: 'research', checks: undefined, assigneeId: other.id })
+  await sleep(100)
+  const source = f.propose('Source')
+  const claimed = await rt.claim(f.actor, f.mission.id, source.id)
+  await rt.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = rt.propose(f.owner, f.mission.id, { outputs: [], workstreamId: rt.store.get('tasks', source.id).workstreamId, title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await rt.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  await rt.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  // In the same macrotask another task dies and the owner is asked to decide it.
+  rt.commit(f.mission.id, () => {
+    const row = rt.store.get('tasks', unrelated.id); row.status = 'blocked'; row.epoch++; row.output = 'blocked for repair'; rt.store.put('tasks', row)
+    rt.notify(f.mission.id, `Task ${unrelated.id} is blocked; decide`, [`${unrelated.id}@${row.epoch}`], { trigger: 'probe/unrelated-decision', reason: 'unrelated' })
+  })
+  const rootSubject = `${source.id}@${rt.store.get('tasks', source.id).epoch}`
+  const facts = () => f.notices().flatMap(delivery => delivery.notice?.aggregatedFacts === undefined
+    ? [{ delivery, dedupKey: delivery.notice?.dedupKey ?? '', subjects: delivery.subjects ?? [], createdAt: delivery.createdAt, coveredBy: delivery.notice?.coveredBy }]
+    : delivery.notice.aggregatedFacts.map(part => ({ delivery, dedupKey: part.dedupKey, subjects: part.subjects, createdAt: part.createdAt })))
+  const root = await eventually(() => facts().find(fact => fact.dedupKey === `stall-root:${f.mission.id}:${rootSubject}`), 'the stall root is recorded')
+  assert.equal(root.coveredBy, undefined, 'a rejection decision carried by a summary covers nothing: the root is its own fact')
+  // The owner repairs the root before the notices arrive; the unrelated fact
+  // stays open while the repair runs.
+  const repair = f.propose('Repair', { replaces: [source.id] })
+  await rt.claim(f.actor, f.mission.id, repair.id)
+  hold = false; release()
+  await sleep(1200)
+  assert.equal(rt.store.get('tasks', repair.id).status, 'running', 'the repair ran past two reminder intervals')
+  const withdrawnAt = Date.now()
+  rt.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'withdraw the repair' })
+  assert.ok(rt.notices.stallRoots(rt.store.list('tasks', f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
+  const naming = await eventually(() => facts().find(fact => fact.createdAt >= withdrawnAt && fact.subjects.includes(rootSubject)), 'a fact names the root after the withdrawal', 2000)
+  assert.ok(naming.dedupKey.startsWith('obligation-followup:'), `a reminder names the root: ${naming.dedupKey}`)
+})
+
 test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
   // The same generic `decision` notice shape the verify site used before, from
   // the scheduler's permanent preparation failure: it never covers a stall root.
