@@ -91,3 +91,37 @@ test('R11-07: a task already at its recovery limit still re-pends once after a r
   assert.equal(restarted.status, 'pending', 'a host restart never converts a running task into blocked work')
   assert.equal(restarted.recoveryCount, 1, 'the earlier worker credit is preserved, not increased')
 })
+
+test('restart recovery admits nothing again: a stored row whose text names prior work with no carrying edge is neither held nor escalated on open', async t => {
+  // A store written by d81a3fb can hold such a row (its owner amendment
+  // accepted `dependencies: []`). The guard refuses where a dependency set is
+  // written; the open is not a second admission, so it blocks nothing and
+  // wakes no owner, and a failure in the owner path cannot abort `start()`.
+  const directory = await mkdtemp(join(tmpdir(), 'swarm-restart-no-readmit-'))
+  const statePath = join(directory, 'state.sqlite')
+  t.after(async () => rm(directory, { recursive: true, force: true }))
+  const first = new SwarmRuntime(config(statePath), new Workers())
+  await first.start()
+  const owner = { sessionId: 'restart-owner' }
+  const mission = first.create(owner, { title: 'Reopen', objective: 'Reopen a stored row', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
+  const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  await first.addMember(owner, mission.id, { name: 'Researcher', role: 'research' })
+  const task = extra => first.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, kind: 'research', scope: ['**'], acceptance: ['works'], ...extra })
+  const source = task({ title: 'Source', objective: 'Implement the scoped change.' })
+  const resumed = task({ title: 'Resume', objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [source.id] })
+  first.store.transaction(() => first.store.put('tasks', { ...first.store.get('tasks', resumed.id), dependencies: [] }))
+  const lastSeq = Math.max(0, ...first.store.events(mission.id, 500).map(event => event.seq))
+  const earlier = new Set(first.store.list('deliveries', mission.id).map(delivery => delivery.id))
+  await first.dispose()
+  const reopened = new SwarmRuntime(config(statePath), new Workers())
+  t.after(async () => { await reopened.dispose().catch(() => undefined) })
+  await reopened.start()
+  const row = reopened.store.get('tasks', resumed.id)
+  assert.notEqual(row.status, 'blocked', 'the open holds nothing')
+  assert.equal(row.preparationFailure, undefined, 'no preparation failure is written on open')
+  const opened = reopened.store.events(mission.id, 500).filter(event => event.seq > lastSeq)
+  assert.deepEqual(opened.filter(event => ['task/preparation-failed', 'task/blocked'].includes(event.type)).map(event => event.type), [], 'recovery records no hold')
+  assert.equal(opened.filter(event => event.type === 'mission/recovered').length, 1)
+  const woken = reopened.store.list('deliveries', mission.id).filter(delivery => !earlier.has(delivery.id) && delivery.to === 'owner' && delivery.content.includes(resumed.id))
+  assert.deepEqual(woken.map(delivery => delivery.content.slice(0, 80)), [], 'the owner is not woken about the reopened row')
+})
