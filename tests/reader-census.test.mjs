@@ -28,7 +28,7 @@
  * still replay with its data intact. The live sibling keeps its writer and its
  * panel label, which is what makes the absence meaningful rather than a rename.
  *
- * COUNTS ON THIS ARTIFACT (measured, not quotas): 24 tools and 44 examined
+ * COUNTS ON THIS ARTIFACT (measured, not quotas): 24 tools and 43 examined
  * payload fields. Nothing below was deleted to move a number.
  */
 import test from 'node:test'
@@ -114,7 +114,6 @@ const PAYLOAD_CENSUS = [
   ['mission/stalled', 'taskId', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'memberId', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'detail', 'keep', 'engine', 'src/scheduling.ts'],
-  ['mission/stalled', 'coFires', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'epoch', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'dependents', 'keep', 'engine', 'src/scheduling.ts'],
   ['mission/stalled', 'unschedulable', 'keep', 'engine', 'src/scheduling.ts'],

@@ -16,7 +16,7 @@ import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import { liveLineageSubject, noticeFamily } from './notices.ts'
 import { installSwarmInvariant } from './invariant.ts'
-import { bindHostTelemetry, DEFAULT_TRACE_SPILL_LIMITS, TRACE_SPILL_RETENTION_DAYS, type HostTelemetrySink } from './trace.ts'
+import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
 import type { Budget } from './types.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
@@ -68,16 +68,6 @@ export interface Config {
   authorizedWorkspaces: WorkspaceGrant[]
   defaultBudget: Budget
   /**
-   * R17-G10: hard bound, in bytes, on the content-addressed span-payload spill
-   * beside the state file. Oldest payloads are evicted first, and an evicted
-   * payload is reported as `missing` by `traceMetrics`, never silently.
-   */
-  traceSpillMaxBytes: number
-  /** R17-G10: hard bound on the number of payload files held by the spill. */
-  traceSpillMaxFiles: number
-  /** R17-G10: days a payload file is retained; `0` disables age retention and keeps the size bound only. */
-  traceSpillRetentionDays: number
-  /**
    * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
    * left unanswered and instructs with the exact call. Legacy `block` is an
    * alias: the owner's control channel always remains available to answer.
@@ -128,11 +118,6 @@ export const Config: z<Config> = z.object({
     maxTasks: z.natural().min(1).default(40),
     maxExperiments: z.natural().min(0).default(8),
   }),
-  // The spill bound defaults come from the trace module's declared limits, so
-  // the schema and the sweep cannot disagree about what the bound is.
-  traceSpillMaxBytes: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxBytes),
-  traceSpillMaxFiles: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxFiles),
-  traceSpillRetentionDays: z.natural().min(0).default(TRACE_SPILL_RETENTION_DAYS),
 })
 
 /**

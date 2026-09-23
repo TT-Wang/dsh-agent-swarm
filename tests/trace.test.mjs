@@ -2,9 +2,9 @@
  * The persisted trace contract, held still across the R17-G10 host-contract
  * adoption.
  *
- * `src/trace.ts` gained a host telemetry sink and a bounded payload spill, and
- * the acceptance forbids losing anything observable: "the persisted span/trace
- * contract that `scripts/replay` and the trace tests depend on keeps working".
+ * `src/trace.ts` gained a host telemetry sink, and the acceptance forbids losing
+ * anything observable: "the persisted span/trace contract that `scripts/replay`
+ * and the trace tests depend on keeps working".
  * This file is the consumer-pair regression for that promise, run on a real
  * mission through the real tools:
  *
@@ -15,21 +15,14 @@
  *    `sha256:` digest, and the payload bytes still never enter the event log;
  *  - the replay gate still re-derives the orchestrator's decision sequence from
  *    the durable rows, deterministically, with no provider call;
- *  - the metrics still verify every stored digest, now with the spill instrument
- *    attached (`payloads.spill`), and the declared bound is the store's default
- *    rather than an implicit number.
+ *  - the metrics still count every payload reference in the window.
  *
  * Everything here passes on the pre-change tree and must keep passing after it:
  * a change that breaks any assertion has changed an observable contract.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readdir } from 'node:fs/promises'
-import { join } from 'node:path'
-import {
-  DEFAULT_TRACE_SPILL_LIMITS, EVENT_VOCABULARY, TracePayloadStore, digestText, orchestratorCommands,
-  spanContractViolation, traceMetrics,
-} from '../lib/trace.js'
+import { EVENT_VOCABULARY, canonicalJson, digestText, orchestratorCommands, payloadRef, spanContractViolation, traceMetrics } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 /** Every field a durable span row may carry; the census reads this contract. */
@@ -54,11 +47,9 @@ test('every durable span row keeps the recorded field set and a digest reference
   // The payload stays outside the log by construction.
   const log = JSON.stringify(spans)
   assert(!log.includes(f.bigClaim), 'payload bytes must never enter the event log')
-  const stored = spans.find(span => span.step === 'swarm_publish' && span.output.stored)
-  assert(stored !== undefined, 'the publish step stores the claim payload')
-  const bytes = await f.payloads.read(stored.output.digest)
-  assert(bytes !== undefined)
-  assert.equal(digestText(bytes), stored.output.digest, 'a persisted reference still resolves to the bytes it names')
+  // Nothing retains the bytes any more, so every recorded reference is a pure
+  // digest of what the step was called with.
+  for (const span of spans) for (const key of ['input', 'output']) assert.equal(span[key].stored, false, `${span.step}.${key} must not spill payload bytes`)
   assert(EVENT_VOCABULARY['trace/span'], 'the reader census still names trace/span as a kept, read kind')
 })
 
@@ -71,18 +62,12 @@ test('the replay gate still derives the decision sequence from the durable log',
   assert.equal(orchestratorCommands(structuredClone(events)).digest, replayed.digest, 'replay stays deterministic')
   // The metrics path the tool and the replay script both read.
   const spans = events.filter(event => event.type === 'trace/span').map(event => event.data)
-  const metrics = await traceMetrics(spans, { payloads: f.payloads })
+  const metrics = await traceMetrics(spans)
   assert.equal(metrics.contractCompliance, 1)
   assert.equal(metrics.firstViolatingStep, undefined)
-  assert.equal(metrics.payloads.stored, metrics.payloads.verified)
-  assert.equal(metrics.payloads.missing, 0)
-  assert.equal(metrics.payloads.mismatched, 0)
-  // R17-G10: the same read now also carries the declared spill bound and what a
-  // sweep would reclaim, measured without touching the directory.
-  assert.equal(metrics.payloads.spill.maxFiles, DEFAULT_TRACE_SPILL_LIMITS.maxFiles)
-  assert.equal(metrics.payloads.spill.maxBytes, DEFAULT_TRACE_SPILL_LIMITS.maxBytes)
-  assert(metrics.payloads.spill.files > 0)
-  assert.equal(metrics.payloads.spill.cleanable, 0, 'a fresh mission is inside the bound')
+  assert.equal(metrics.payloads.referenced, spans.length * 2, 'every span names an input and an output reference')
+  assert.equal(metrics.payloads.stored, 0)
+  assert.equal(metrics.payloads.omitted, metrics.payloads.referenced)
 })
 
 test('the payload reference guard is unchanged (pair: valid ref accepted, malformed refused)', () => {
@@ -99,18 +84,11 @@ test('the payload reference guard is unchanged (pair: valid ref accepted, malfor
   for (const bad of refused) assert.notEqual(spanContractViolation({ ...base, input: bad, output: ref }), undefined, JSON.stringify(bad))
 })
 
-test('the declared spill bound is the store default and the omission guard still holds', async t => {
-  const f = await traceFixture(t)
-  assert.deepEqual(new TracePayloadStore(f.payloads.directory).limits, DEFAULT_TRACE_SPILL_LIMITS)
-  // Pair: a payload larger than the per-payload cap is omitted (`stored: false`)
-  // and `verify` returns true for it without inventing a file, while a stored
-  // payload verifies against the bytes actually on disk.
-  const small = new TracePayloadStore(join(f.payloads.directory, 'bound-probe'), 8)
-  const omitted = await small.put('x'.repeat(64))
-  assert.equal(omitted.stored, false)
-  assert.equal(await small.verify(omitted), true)
-  const stored = await small.put({ ok: 1 })
-  assert.equal(stored.stored, true)
-  assert.equal(await small.verify(stored), true)
-  assert.equal((await readdir(join(f.payloads.directory, 'bound-probe'))).length, 1)
+test('a payload reference is the canonical digest of its payload and retains no bytes', () => {
+  const ref = payloadRef({ b: 2, a: 1 })
+  assert.deepEqual(Object.keys(ref).sort(), ['bytes', 'digest', 'stored'])
+  assert.equal(ref.stored, false, 'nothing is written anywhere, so nothing can be read back')
+  assert.equal(ref.digest, digestText(canonicalJson({ a: 1, b: 2 })), 'key order cannot change the digest')
+  assert.equal(ref.bytes, Buffer.byteLength(canonicalJson({ a: 1, b: 2 }), 'utf8'))
+  assert.notEqual(payloadRef({ a: 1 }).digest, ref.digest, 'a different payload gets a different digest')
 })

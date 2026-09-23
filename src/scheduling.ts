@@ -1463,7 +1463,6 @@ export interface GuardEscalationAction {
   code: string
   message: string
   exits: DecisionExit[]
-  coFires: GuardChainId[]
   taskId?: string
 }
 

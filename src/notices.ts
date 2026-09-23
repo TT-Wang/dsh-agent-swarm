@@ -11,7 +11,6 @@ import { hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as proje
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { requireText } from './refusals.ts'
-import { decisionRefusals } from './invariant.ts'
 import { taskGraphIndex } from './task-graph.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, DecisionCandidate, Delivery, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
@@ -596,16 +595,11 @@ export class Notices {
     // whose family claims "no live path will advance this subject" while a named
     // subject's lineage is still live is the false wake the wake-precision
     // projection would count after the fact; it is refused here instead of being
-    // written (no delivery row, no witness stamp, no dedup key consumed), and the
-    // refusal is recorded as a measurement rather than swallowed. Co-firing
+    // written (no delivery row, no witness stamp, no dedup key consumed). Co-firing
     // guards: the fall-through/stall-root classifiers (whose legal candidates pass),
     // the fact-keyed dedup, the per-owner wake budget, the transition-driven
     // publication and the close-out nudge — see `liveLineageSubject`.
-    const refusal = liveLineageSubject(this.rt, { missionId, ...(family === undefined ? {} : { family }), subjects: attributed })
-    if (refusal !== undefined) {
-      decisionRefusals.record({ at: Date.now(), missionId, family: family ?? 'unknown', subjects: [...attributed], reason: refusal, stage: 'emission' })
-      return
-    }
+    if (liveLineageSubject(this.rt, { missionId, ...(family === undefined ? {} : { family }), subjects: attributed }) !== undefined) return
     const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId, ...(family === undefined ? {} : { family }),
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }) }
     const dedupe = options.dedupe ?? true

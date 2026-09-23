@@ -11,8 +11,8 @@
  *    `stall-root`/`fallthrough` decision naming a subject whose lineage still has
  *    a live path is refused, while the classifiers' own legal candidates pass.
  * 3. The emission site refuses BEFORE anything durable is written — no delivery
- *    row, no board witness, no dedup key consumed — and records the refusal as a
- *    measurement (`decisionRefusals`) instead of a silent no-op.
+ *    row, no board witness, no dedup key consumed — so the same fact is still
+ *    admitted once the lineage really is closed.
  * 4. The adapter acknowledges an append-refused delivery, so the durable outbox
  *    cannot retry a decision the invariant will refuse again.
  * 5. Pair tests name the guards the invariant can co-fire with: the fall-through
@@ -23,9 +23,8 @@
  *    reports the pilot as not landed through `swarmInvariantStatus`.
  *
  * PRE-CHANGE FAILURE: on the pre-change tree this file fails at import —
- * `installSwarmInvariant`, `decisionRefusals`, `relayedSwarmMessages`,
- * `recordAppendRefusal`, `swarmInvariantStatus` and `liveLineageSubject` do not
- * exist there.
+ * `installSwarmInvariant`, `relayedSwarmMessages`, `recordAppendRefusal`,
+ * `swarmInvariantStatus` and `liveLineageSubject` do not exist there.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -36,7 +35,7 @@ import InvariantRegistry from '@deepseek-ai/dsh-invariants'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import {
-  decisionRefusals, installSwarmInvariant, recordAppendRefusal, relayedSwarmMessages,
+  installSwarmInvariant, recordAppendRefusal, relayedSwarmMessages,
   SWARM_INVARIANT_PACKAGE, swarmInvariantStatus,
 } from '../lib/invariant.js'
 import { liveLineageSubject, noticeFamily, taskSubject } from '../lib/notices.js'
@@ -82,7 +81,6 @@ async function scenario(t) {
 }
 
 test('R17-G9: an unmounted invariant registry is named, not assumed', async () => {
-  decisionRefusals.clear()
   // A deployment without @deepseek-ai/dsh-invariants keeps working: the companion
   // simply never installs, and the status says so instead of claiming the pilot.
   const bare = new Context()
@@ -93,7 +91,6 @@ test('R17-G9: an unmounted invariant registry is named, not assumed', async () =
 })
 
 test('R17-G9: the host registry refuses an illegal candidate before publication', async () => {
-  decisionRefusals.clear()
   const ctx = new Context()
   const judge = message => message.source?.deliveryId === 'delivery-illegal'
     ? { missionId: 'mission-1', family: 'fallthrough', subjects: ['task-1@1'], reason: 'fallthrough names task-1@1, whose lineage still has a live path', deliveryId: 'delivery-illegal' }
@@ -122,23 +119,17 @@ test('R17-G9: the host registry refuses an illegal candidate before publication'
     },
   )
   assert.deepEqual(appended, [], 'the refused session event never reached its listeners')
-  const refusals = decisionRefusals.list()
-  assert.equal(refusals.length, 1, 'the append refusal is a recorded measurement')
-  assert.equal(refusals[0].stage, 'append')
-  assert.equal(refusals[0].deliveryId, 'delivery-illegal')
-  assert.deepEqual(refusals[0].subjects, ['task-1@1'])
 
   // The same relay shape with a legal delivery is appended unchanged.
   ctx.emit('session/event', { tag: 'owner-session' }, { type: 'user/message', data: relay('delivery-legal') })
-  assert.deepEqual(appended, ['swarm:delivery-legal'])
-  assert.equal(decisionRefusals.count(), 1, 'a legal candidate is not a refusal')
+  assert.deepEqual(appended, ['swarm:delivery-legal'], 'a legal candidate is published')
 
   // An inbox splice is judged the same way, message by message.
   assert.throws(
     () => ctx.emit('session/event', { tag: 'owner-session' }, { type: 'agent/inbox/spliced', data: { inserted: [relay('delivery-legal'), relay('delivery-illegal')] } }),
     /InvariantError|invariant violated/,
   )
-  assert.equal(decisionRefusals.count(), 2, 'the splice candidate was judged before publication')
+  assert.deepEqual(appended, ['swarm:delivery-legal'], 'the splice was judged before publication, so nothing new was appended')
 
   // Disposal: unloading the companion releases the registration, and the same
   // relay is published again instead of being judged by a leaked check.
@@ -149,7 +140,6 @@ test('R17-G9: the host registry refuses an illegal candidate before publication'
 })
 
 test('R17-G9: the emission site refuses an illegal decision before anything durable is written', async t => {
-  decisionRefusals.clear()
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const original = f.block(f.propose('Blocked original', { assigneeId: builder.id }))
@@ -164,12 +154,8 @@ test('R17-G9: the emission site refuses an illegal decision before anything dura
   f.runtime.notify(f.mission.id, 'illegal fall-through', [subject], { family: 'fallthrough', dedupKey: `fallthrough:${f.mission.id}:${subject}`, reason: 'no live path advances it' })
   assert.equal(f.notices().length, before.deliveries, 'no owner delivery was written for the illegal candidate')
   assert.deepEqual(f.runtime.store.get('missions', f.mission.id).witness, before.witness, 'the board witness was not stamped')
-  const refusals = decisionRefusals.list()
-  assert.equal(refusals.length, 1, 'the emission refusal is recorded')
-  assert.equal(refusals[0].stage, 'emission')
-  assert.equal(refusals[0].family, 'fallthrough')
-  assert.deepEqual(refusals[0].subjects, [subject])
-  assert.match(refusals[0].reason, /live path/)
+  assert.match(String(liveLineageSubject(f.runtime, { missionId: f.mission.id, family: 'fallthrough', subjects: [subject] })), /live path/,
+    'the predicate that refused it names the live path')
 
   // Pair (the fact-keyed dedup and the wake budget): the refusal consumed nothing,
   // so closing the whole lineage lets the SAME fact through, once.
@@ -181,11 +167,9 @@ test('R17-G9: the emission site refuses an illegal decision before anything dura
   assert.equal(delivered.length, 1, 'the fact is admitted once the lineage is terminal')
   assert.equal(delivered[0].content, 'legal fall-through')
   assert.equal(noticeFamily(delivered[0]), 'fallthrough')
-  assert.equal(decisionRefusals.count(), 1, 'only the illegal candidate was refused')
 })
 
 test('R17-G9 pair: the classifiers\' own candidates pass and a blocked non-root is refused', async t => {
-  decisionRefusals.clear()
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
   const blocked = f.block(f.propose('Blocked root', { assigneeId: builder.id }))
@@ -217,7 +201,6 @@ test('R17-G9 pair: the classifiers\' own candidates pass and a blocked non-root 
 })
 
 test('R17-G9: an error naming the package is not proof of its delivery predicate', async t => {
-  decisionRefusals.clear()
   const ctx = new Context()
   const ownerSession = { snapshotEvents: () => [] }
   const refusal = Object.assign(new Error(`invariant violated by "${SWARM_INVARIANT_PACKAGE}": refusing an owner-facing fallthrough decision`), { name: 'InvariantError', code: 'INVARIANT' })
@@ -234,11 +217,11 @@ test('R17-G9: an error naming the package is not proof of its delivery predicate
   // The adapter resolves (acknowledges) instead of rejecting: the durable outbox
   // must not retry a decision the invariant will refuse again.
   await assert.rejects(workers.deliver(member, delivery), error => error === refusal)
-  assert.equal(decisionRefusals.count(), 0, 'unproven host errors remain transport failures')
+  assert.equal(recordAppendRefusal(refusal, { id: 'delivery-refused', missionId: 'mission-1', family: 'fallthrough', subjects: ['task-1@1'] }), false,
+    'an error that merely names the package is not proof of its predicate')
 
   // An unrelated failure is NOT a refusal: it is left to the outbox retry path.
   assert.equal(recordAppendRefusal(new Error('Mission owner is offline'), { id: 'd2', missionId: 'mission-1', family: 'fallthrough', subjects: [] }), false)
-  assert.equal(decisionRefusals.count(), 0)
 })
 
 test('R17-G9: only swarm relays are judged, and both relay shapes are seen', () => {

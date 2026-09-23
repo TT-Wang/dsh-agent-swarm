@@ -10,10 +10,9 @@
  * root is outside the sandbox. The assertions are unchanged.
  */
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
-import { TracePayloadStore } from '../../lib/trace.js'
 import { tempDirectory } from '../temp-root.mjs'
 
 export const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
@@ -76,6 +75,5 @@ export async function traceFixture(t, options = {}) {
     root, workspace, statePath, runtime, workers, definitions, raw, call, exec, owner, missionId, stream, builder, reviewer, reviewer2,
     source, claim, review, reviewClaim, review2, review2Claim, verdict, runId, bigClaim, events,
     task: id => runtime.store.get('tasks', id),
-    payloads: new TracePayloadStore(join(dirname(statePath), 'trace-payloads')),
   }
 }

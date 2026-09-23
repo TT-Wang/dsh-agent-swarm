@@ -9,7 +9,7 @@
  */
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
 
@@ -108,7 +108,7 @@ export async function runScenario(options = {}) {
     const commands = workers.commands
     const providerCalls = workers.providerCalls
     await runtime.dispose()
-    return { root, ownsRoot, workspace, statePath, payloadDir: join(dirname(statePath), 'trace-payloads'), missionId,
+    return { root, ownsRoot, workspace, statePath, missionId,
       commands, providerCalls, builderId: builder.id, reviewerId: reviewer.id, tasks: { first: first.id, second: second.id, review: review.id } }
   } catch (error) {
     await runtime.dispose().catch(() => {})

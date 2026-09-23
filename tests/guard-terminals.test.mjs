@@ -28,12 +28,12 @@
  *     generator does NOT reach are stated in `generatorLimits` below rather than
  *     implied away.
  *
- *  2. Every guard this round adds or alters names the other guards it can
- *     co-fire with (`coFires`), and the pair tests exercise the two real pairs
- *     of 2026-09-10: a workspace guard firing together with the review-capture
- *     guard (bricked a member, cost two missions extra members and budget), and
- *     "Member has uncommitted commits" firing during an attempt close-out with
- *     no exit at all.
+ *  2. The pair tests exercise the two real guard pairs of 2026-09-10: a workspace
+ *     guard firing together with the review-capture guard (bricked a member, cost
+ *     two missions extra members and budget), and "Member has uncommitted commits"
+ *     firing during an attempt close-out with no exit at all. Each pair is proven
+ *     by the board the two guards really produce and by the terminal that board
+ *     classifies to, not by a hand-written table of which guards pair up.
  *
  *  3. R12-F9: a task proposed with an empty dependency set while its objective
  *     or a `replaces` reference names existing artifact content is refused with
@@ -122,8 +122,6 @@ test('R14 property: every reachable non-terminal board state has an executable a
       const chain = guardTerminalChain(board)
       if (terminal.chain !== chain) failures.push(`terminal chain ${terminal.chain} != classified ${chain} for ${keyOf(board)}`)
       if (terminal.kind !== 'escalate') failures.push(`terminal is not an escalation for ${keyOf(board)}`)
-      if (terminal.coFires.length === 0) failures.push(`terminal ${terminal.chain} names no co-firing guard for ${keyOf(board)}`)
-      if (terminal.coFires.some(peer => !CHAINS.includes(peer))) failures.push(`terminal ${terminal.chain} names an unknown co-firing guard`)
       const violations = lintRefusal(terminal.message)
       if (violations.length > 0) failures.push(`terminal ${terminal.chain} does not resolve through the refusal lint: ${violations.join('; ')}`)
       terminalsSeen.add(terminal.chain)
@@ -164,9 +162,7 @@ test('R14 pair: the workspace guard and the review-capture guard co-fire and the
   assert.deepEqual(guardProgressActions(board), [],
     'the attempt is live, but its workspace chain cannot let it land: the pair is what makes it a trap, not liveness')
   const terminal = terminalEscalation(board)
-  assert.equal(terminal.chain, 'workspace')
-  assert.ok(terminal.coFires.includes('review_admission'), 'the pair names the review-admission guard it co-fires with')
-  assert.ok(terminal.coFires.includes('attempt_lease'), 'the pair names the attempt/lease guard it co-fires with')
+  assert.equal(terminal.chain, 'workspace', 'the workspace guard is the first chain that cannot progress on the pair board')
   assert.deepEqual(lintRefusal(terminal.message), [])
   assert.match(terminal.message, /swarm_control/)
   assert.match(terminal.message, /taskId/)
@@ -184,26 +180,21 @@ test('R14 pair: the workspace guard and "Member has uncommitted commits" co-fire
   }
   const terminal = terminalEscalation(board)
   assert.equal(terminal.chain, 'workspace', 'the workspace state is the first chain that cannot progress')
-  assert.ok(terminal.coFires.includes('attempt_lease'))
   assert.deepEqual(lintRefusal(terminal.message), [])
   // With the workspace repaired, the same blocked task is the attempt chain's dead
   // end, and that terminal names its own exits (release the attempt, withdraw it).
   const repaired = { ...board, mission: { status: 'active', workspace: 'authorized' } }
   const attempt = terminalEscalation(repaired)
   assert.equal(attempt.chain, 'dispatch_preconditions', 'a blocked task with no dispatchable work falls through to the dispatch terminal')
-  assert.ok(attempt.coFires.includes('workspace'), 'the dispatch terminal names the workspace guard it co-fires with')
   assert.deepEqual(lintRefusal(attempt.message), [])
 })
 
-test('R14: each chain terminal is total, coded and names the guards it can co-fire with', () => {
+test('R14: each chain terminal is total and coded', () => {
   for (const chain of CHAINS) {
     const terminal = guardTerminal(chain)
     assert.equal(terminal.chain, chain)
     assert.ok(terminal.code.length > 0, `${chain} carries a stable code`)
     assert.ok(terminal.exits.length > 0, `${chain} names at least one executable exit`)
-    assert.ok(terminal.coFires.length > 0, `${chain} names the guards it can co-fire with`)
-    assert.ok(terminal.coFires.every(peer => CHAINS.includes(peer)), `${chain} co-fires only with known chains`)
-    assert.ok(!terminal.coFires.includes(chain), `${chain} does not name itself as a co-firing guard`)
     assert.deepEqual(lintRefusal(terminal.message), [], `${chain} must resolve through the refusal lint`)
   }
   assert.equal(guardTerminal('admission').code, DEPENDENCY_ASSUMPTION_CODE,
@@ -269,7 +260,6 @@ test('R14 runtime pair (attempt close-out x "Member has uncommitted commits"): t
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').at(-1),
       'the thrown guard must be escalated, not swallowed', 8_000)
     assert.equal(event.data.code, 'attempt_terminal')
-    assert.ok(event.data.coFires.includes('workspace'))
     // Containment: one member's dead end never aborts the sweep for the others.
     await eventually(() => f.runtime.store.get('tasks', other.id).status === 'running' ? true : undefined,
       'the sweep must continue past the throw and dispatch another member', 8_000)
@@ -394,8 +384,6 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'workspace').at(-1),
       'the revoked workspace must escalate', 8_000)
     assert.equal(event.data.code, 'workspace_terminal')
-    assert.ok(event.data.coFires.includes('attempt_lease') && event.data.coFires.includes('review_admission'),
-      'the workspace terminal names the guards it co-fires with')
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[workspace_terminal\]/.test(delivery.content)),
       'the owner must receive the workspace terminal', 8_000)

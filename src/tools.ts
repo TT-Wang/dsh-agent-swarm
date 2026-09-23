@@ -402,7 +402,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
             ...(history.firstSeq === undefined ? {} : { firstSeq: history.firstSeq }), ...(history.lastSeq === undefined ? {} : { lastSeq: history.lastSeq }) },
           ...(a.vocabulary === true ? { eventVocabulary: eventVocabularyReport(history.events) } : {}) }
       }
-      if (a.trace === true && trace !== undefined) result = { ...result, trace: { ...await traceMetrics(trace.spansFor(missionId), { payloads: trace.payloads, window: trace.windowFor(missionId) }), unscopedSteps: trace.unscopedSteps() } }
+      if (a.trace === true && trace !== undefined) result = { ...result, trace: { ...await traceMetrics(trace.spansFor(missionId), { window: trace.windowFor(missionId) }), unscopedSteps: trace.unscopedSteps() } }
       return result
     })
   register('swarm_control', 'Owner: control exactly one missionId or prelaunch requestId. For a request, retry a failed plan, stop planning, or extend its deadline with timeoutMs and a reason; retry retains its snapshot and planning usage and queues a fresh owner turn. With taskId, amend execution fields using changes, or resume the same task after repair; the owner can reassign running work without member cooperation. Without taskId, amend changes.scope within the authorized objective/workspace, or pause/resume/stop/complete or replace coordinator. complete requires independently accepted coverage and the deliverable artifact; unresolved required work prevents completion. stop preserves evidence and artifacts.',
