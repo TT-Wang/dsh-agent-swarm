@@ -33,7 +33,8 @@ class Workers {
   workspaces = []
   bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { this.workspaces.push(id); return path.join(mission.workspace, id) }
-  async start(spec) { this.starts.push(spec.member.id) }
+  onStart = async () => {}
+  async start(spec) { this.starts.push(spec.member.id); await this.onStart(spec) }
   async stop() {}
   async deliver() {}
   isIdle() { return false }
@@ -71,11 +72,12 @@ async function fixture(t) {
   await ctx.plugin(AgentLoop, { agents: [] })
   class Catalog extends LlmAdapter {
     routeError
+    reasoning
     providerInfo(id) { return { id, name: 'Public provider' } }
     async listModels(provider) { return [{ provider, id: 'model-one', name: 'Model One' }] }
     async resolveModel(provider, model) {
       if (this.routeError) throw this.routeError
-      return { provider, id: model, name: model }
+      return { provider, id: model, name: model, ...(this.reasoning === undefined ? {} : { reasoning: this.reasoning }) }
     }
   }
   const catalog = new Catalog()
@@ -124,7 +126,7 @@ async function fixture(t) {
     budget, members: [{ key: 'builder', name: 'Builder', role: 'implementation' }],
     workstreams: [{ key: 'main', title: 'Main', objective: 'Build it' }],
     tasks: [{ key: 'build', workstreamKey: 'main', title: 'Build', objective: 'Make the change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeKey: 'builder' }] }
-  return { ctx, runtime, catalog, ownerId, rpc, workspace, input }
+  return { ctx, runtime, catalog, workers, ownerId, rpc, workspace, input }
 }
 
 const leaks = /SQLITE|secret|private|sqlite|LLM_ROUTE_LEAK|\/opt\/|internal route/
@@ -252,6 +254,43 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
     assert.equal(leaked.result.error.code, 'internal-error')
     assert.doesNotMatch(leaked.text, /private|secret|sqlite|cancelled by the owner/)
   }
+})
+
+test('a rejected reasoning effort reaches the browser in the canonical shape, never as the adapter text', async t => {
+  const f = await fixture(t)
+  f.catalog.reasoning = { efforts: [{ id: 'high', name: 'High' }] }
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  // The effort start is rejected with the adapter's code; the retry without it fails too.
+  const rejectWith = message => {
+    f.workers.onStart = async spec => {
+      if (spec.member.reasoningEffort === undefined) throw new Error('route rejected')
+      throw Object.assign(new Error(message), { code: 'UNSUPPORTED_REASONING_EFFORT' })
+    }
+  }
+  const add = name => f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
+    input: { name, role: 'implementation', provider: 'public-provider', model: 'model-one', reasoningEffort: 'high' } })
+  const refusal = name => `Member ${name} cannot start: provider "public-provider" model "model-one" does not support reasoning effort "high". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`
+  // The canonical Harness rejection keeps the bytes it always rendered.
+  rejectWith('provider "public-provider" model "model-one" does not support reasoning effort "high"')
+  const canonical = await add('Builder')
+  assert.equal(canonical.result.error.code, 'bad-request')
+  assert.equal(canonical.result.error.message, refusal('Builder'))
+  assert.deepEqual(canonical.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
+  // A gateway rejection that names an internal host and route code is not echoed.
+  const raw = 'upstream llm-gw.corp.internal:8443 refused route R-417 for reasoning_effort=high'
+  rejectWith(raw)
+  const gateway = await add('Checker')
+  assert.equal(gateway.result.error.code, 'bad-request')
+  assert.equal(gateway.result.error.message, refusal('Checker'))
+  assert.doesNotMatch(gateway.text, /llm-gw|corp\.internal|R-417/)
+  // A member that inherits the owner's route names no provider or model of its own.
+  const inherited = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id, input: { name: 'Scout', role: 'research', reasoningEffort: 'high' } })
+  assert.equal(inherited.result.error.message, 'Member Scout cannot start: provider (inherited) model (inherited) does not support reasoning effort "high". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.')
+  assert.doesNotMatch(inherited.text, /llm-gw|corp\.internal|R-417/)
+  // The raw rejection is kept only in the durable record.
+  const rejected = f.runtime.store.events(mission.id, 100).filter(event => event.type === 'member/effort-rejected')
+  assert.deepEqual(rejected.map(event => event.data.error), ['provider "public-provider" model "model-one" does not support reasoning effort "high"', raw, raw])
 })
 
 test('a refusal text on a plain Error grants no visibility: only the typed refusal reaches the browser', async t => {

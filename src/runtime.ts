@@ -1198,7 +1198,12 @@ export class SwarmRuntime {
               this.store.event(missionId, 'member/failed', 'runtime', { memberId, error: rejection.message })
               this.store.event(missionId, 'member/effort-rejected', 'runtime', { memberId, requested, rejected: rejection.requested ?? requested, error: rejection.message, retryError: retryMessage })
             })
-            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${rejection.message}. Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
+            // The adapter's rejection text can name gateway hosts and internal
+            // route codes, so it stays in the durable events above. The refusal
+            // is built from the route this runtime holds, in the adapter's
+            // canonical shape, so a canonical rejection renders the same bytes.
+            const route = (field: string, value: string | undefined) => `${field} ${value === undefined ? '(inherited)' : `"${value}"`}`
+            throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', `Member ${name} cannot start: ${route('provider', member.provider)} ${route('model', member.model)} does not support reasoning effort "${rejection.requested ?? requested}". Clearing reasoningEffort did not help; admit a replacement member without reasoningEffort, or with an effort this provider/model supports.`)
           }
         }
         member.phase = 'stopped'
