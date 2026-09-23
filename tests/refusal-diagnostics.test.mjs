@@ -22,11 +22,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
-  refusalSites, assessRefusal, diagnosticProducers, toolSchemaIndex, applyAllowlist,
+  refusalSites, assessRefusal, assessText, diagnosticProducers, toolSchemaIndex, applyAllowlist,
   uncoveredCodeLiterals, formatSite, DELEGATED_MESSAGES,
 } from './refusal-inventory.mjs'
 import { formatDiagnostic } from '../lib/admission.js'
 import { workspaceAuthorizationDiagnostic } from '../lib/authorization.js'
+import { guardTerminal } from '../lib/refusals.js'
 
 const IN_SCOPE_SOURCES = ['src/tools.ts', 'src/admission.ts']
 /**
@@ -154,6 +155,34 @@ test('the lint fails the pre-fix ceiling advice and other non-executable exits',
   // A refusal without a stable code.
   const uncoded = await probe("throw new Error('Correct `checks` and retry the same request.')")
   assert.ok(uncoded.some(violation => /no \[diagnostic_code\]/.test(violation)), uncoded.join('; '))
+})
+
+test('a coded refusal that names a parameter but gives no imperative next step fails the lint', async () => {
+  const { index } = await inventory()
+  const NO_VERB = 'no imperative next step (action verb)'
+  // The seven texts the batch-2 verifier found compliant once the verb check was
+  // dropped: each is coded and names a resolvable parameter, and none says what to do.
+  const statements = [
+    '[task_ceiling_exhausted] Task ceiling exhausted: `maxSteps` 150/150.',
+    '[mission_not_active] Mission is paused; `missionId` cannot accept work.',
+    '[task_not_in_mission] `taskId` is not in this mission.',
+    '[task_attempt_stale] The attempt for `taskId` is stale.',
+    '[guard_terminal] The budget chain has no progress for `missionId`; the owner must decide.',
+    '[deliverable_uncaptured] `swarm_submit` did not capture `deliverables`.',
+    '[review_path_missing] No live reviewer exists for `reviewOf`.',
+  ]
+  for (const text of statements) assert.deepEqual(assessText(text, index), [NO_VERB], text)
+  // The same text found at a source site fails the same way.
+  const [site] = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(statements[1])})\n}\n`, 'src/probe.ts')
+  assert.deepEqual(assess(site, { ...index, diagnosticProducers: new Set() }), [NO_VERB])
+  // A verb that is only a code token or a backticked name is not an instruction.
+  assert.deepEqual(assessText('[retry_pending] `name` is missing for `taskId`.', index), [NO_VERB])
+  // Each verb current refusals lead with is recognised, and the owner-reply
+  // terminal, which says only "Answer it … or close it", satisfies the lint.
+  for (const verb of ['Answer', 'Close', 'Inspect', 'Admit', 'Amend', 'Reassign', 'Extend', 'Observe', 'Restart', 'Resolve', 'Re-check', 'Leave', 'Send', 'Relaunch']) {
+    assert.deepEqual(assessText(`[probe_code] ${verb} it with \`swarm_control\` and its \`taskId\`.`, index), [], verb)
+  }
+  assert.deepEqual(assessText(guardTerminal('owner_reply').message, index), [])
 })
 
 test('the code the throw renderer prefixes is the diagnostic code itself', () => {

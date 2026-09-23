@@ -21,7 +21,9 @@
  *
  * The contract enforced on rendered text (see `assessText`):
  *   1. exactly one stable `[code]` token;
- *   2. at least one named parameter — a backticked identifier — and every named
+ *   2. an imperative next step: an action verb from `IMPERATIVE_ACTIONS` in the
+ *      prose, outside the code token and backticked names;
+ *   3. at least one named parameter — a backticked identifier — and every named
  *      parameter and `swarm_*` tool resolves in the captured tool schema; a
  *      named tool must have one of its own parameters named next to it.
  * `assessRefusal` applies it to a source site, where the token may also come
@@ -37,6 +39,32 @@ import { codeProperties, refusalNodes } from './source-semantics.mjs'
 export const CODE_TOKEN = /\[([a-z][a-z0-9_]{2,63})\]/
 export const CODE_TOKEN_ALL = /\[([a-z][a-z0-9_]{2,63})\]/g
 const GUARDS = ['object', 'text', 'array', 'optionalInteger']
+/**
+ * Imperative action verbs a next step may start from. The first group is the
+ * list the lexer-era lint enforced (tests/refusal-inventory.mjs at 664222d);
+ * the second adds the imperatives current refusals and guard terminals lead
+ * with (the owner-reply terminal's "Answer it … or close it", "amend an
+ * unsubmitted task", "reassign the same review", "extend active planning",
+ * "observe again", "restart with the root restored", "Resolve Git merge
+ * conflicts", "reload before saving", "edit the saved plan", "ensure the final
+ * captured artifact includes it", "re-check the board", "leave it open", "send
+ * the answer", "relaunch the complete plan", "create a new mission").
+ * Deliberately absent: `decide`, `accept` and `capture`, which the refusals
+ * the batch-2 verifier found use descriptively ("the owner must decide",
+ * "cannot accept work", "did not capture"), and `review`, `report`, `request`,
+ * `check`, `state`, `read`, `open` and `submit`, which refusal prose uses
+ * mostly as nouns or adjectives.
+ */
+export const IMPERATIVE_ACTIONS = new RegExp(`\\b(?:${[
+  'retry', 'resubmit', 're-?propose', 're-?run', 're-?submit', 'cancel', 'withdraw', 'replace', 'correct', 'repair', 'raise', 'lower', 'reduce',
+  'increase', 'set', 'pass', 'supply', 'provide', 'add', 'remove', 'omit', 'name', 'use', 'choose', 'declare', 'keep', 'split', 'narrow', 'widen',
+  'inspect', 'call', 'fix', 'follow', 'wait', 'stop', 'end', 'assign', 'resume', 'propose', 'admit', 'list', 'update', 'adjust', 'drop', 'move',
+  'fill', 'run', 'verify', 'preserve', 'respect',
+  'answer', 'close', 'amend', 'reassign', 'extend', 'observe', 'restart', 'restore', 'resolve', 'reload', 'create', 'edit', 'ensure', 're-?check',
+  'leave', 'send', 'relaunch',
+].join('|')})\\b`, 'i')
+/** The instruction prose of a text: the `[code]` token and backticked names are identifiers, not verbs. */
+const prose = text => text.replace(CODE_TOKEN_ALL, ' ').replace(/`[^`]*`/g, ' ')
 
 /** The code tokens, `swarm_*` tools and backticked parameters one rendered text names. */
 export function textFacts(text) {
@@ -140,9 +168,10 @@ export const CALLER_COMPOSED_MESSAGES = [
   },
 ]
 
-/** The next-step half of the contract, over the tools and parameters one rendered text names. */
-function exitViolations({ tools, params }, index) {
+/** The next-step half of the contract, over one rendered text's prose and the tools and parameters it names. */
+function exitViolations(text, { tools, params }, index) {
   const violations = []
+  if (!IMPERATIVE_ACTIONS.test(prose(text))) violations.push('no imperative next step (action verb)')
   if (params.length === 0) violations.push('next step names no parameter (backticked identifier)')
   for (const tool of tools) {
     if (!index.toolNames.has(tool)) { violations.push(`next step names unknown tool ${tool}`); continue }
@@ -158,17 +187,17 @@ function exitViolations({ tools, params }, index) {
 
 /**
  * The refusal contract over rendered text, exactly as the model reads it:
- * exactly one `[code]` token, at least one backticked parameter, and every
- * backticked identifier and `swarm_*` tool resolves in `schemaIndex` (from
- * `toolSchemaIndex`), with a named tool's own parameter named next to it.
- * Returns the violations (empty means compliant).
+ * exactly one `[code]` token, an imperative action verb in its prose, at least
+ * one backticked parameter, and every backticked identifier and `swarm_*` tool
+ * resolves in `schemaIndex` (from `toolSchemaIndex`), with a named tool's own
+ * parameter named next to it. Returns the violations (empty means compliant).
  */
 export function assessText(text, schemaIndex) {
   const facts = textFacts(text)
   const violations = []
   if (facts.codes.length === 0) violations.push('no [diagnostic_code] token')
   else if (facts.codes.length > 1) violations.push(`multiple diagnostic code tokens: ${facts.codes.join(', ')}`)
-  return [...violations, ...exitViolations(facts, schemaIndex)]
+  return [...violations, ...exitViolations(text, facts, schemaIndex)]
 }
 
 /**
@@ -217,7 +246,7 @@ export function assessRefusal(site, index) {
   } else if (site.code !== undefined && site.codes[0] !== site.code) {
     violations.push(`inline code ${site.codes[0]} does not match the declared code ${site.code}`)
   }
-  return text === null ? violations : [...violations, ...exitViolations(site, index)]
+  return text === null ? violations : [...violations, ...exitViolations(text, site, index)]
 }
 
 /** Precompute the local diagnostic-producer functions of a scanned file set. */
