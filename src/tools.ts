@@ -75,8 +75,9 @@ Use swarm_propose for bounded work; repairs name replaces and inherit its accept
 export const SWARM_PROMPT = ENTRY_PROMPT
 
 type Args = Record<string, unknown>
+/** The top-level arguments guard: typed like the schema check, the other [tool_arguments_invalid] producer. */
 function object(value: unknown): Args {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
   return value as Args
 }
 function text(args: Args, key: string): string {
@@ -406,6 +407,10 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_budget', 'Owner: revise a finite mission budget, or one task allocation using taskId and taskBudget. Consumption, task identity, evidence and artifacts remain. Resource-blocked tasks continue once stop is confirmed; explicit mission pauses require resume.',
     { ...mission, budget: budgetSchema, taskId: string, taskBudget: taskBudgetSchema, reason: string }, ['missionId', 'reason'],
     (a, actor) => {
+      // The schema cannot say "taskBudget with taskId, budget without it"; name
+      // the missing object instead of failing on it as a non-object.
+      if (a.taskId !== undefined && a.taskBudget === undefined) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] swarm_budget was called with `taskId` but no `taskBudget`. Nothing ran. Pass `taskBudget` with the task\'s new ceilings, or omit `taskId` and pass `budget` for the mission, then retry swarm_budget.')
+      if (a.taskId === undefined && a.budget === undefined) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] swarm_budget was called with neither `budget` nor `taskId`. Nothing ran. Pass `budget` with every mission ceiling, or `taskId` with `taskBudget` for one task, then retry swarm_budget.')
       if (a.taskId !== undefined) {
         if (a.budget !== undefined) throw new Error('[budget_target_conflict] Update `budget` first, then call swarm_budget with `taskId` and `taskBudget` separately.')
         // Only the declared ceilings: this tool must never amend structure

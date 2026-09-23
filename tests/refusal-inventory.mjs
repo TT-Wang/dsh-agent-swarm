@@ -30,8 +30,9 @@
  * from the site: a coded object literal's `code` (rendered by
  * `formatDiagnostic`), a declared delegate (`DELEGATED_MESSAGES`), or a
  * documented exemption — argument guards (`object`/`text`/`array`/
- * `optionalInteger`, and the typed schema guard `assertToolArguments`, whose
- * parameters are the caller's own schema paths) name the parameter they
+ * `optionalInteger`, and the typed guards `assertToolArguments`, whose
+ * parameters are the caller's own schema paths, and `object`, the top-level
+ * arguments guard) name the parameter they
  * validate dynamically, and a `formatDiagnostic(...)` throw delegates its code
  * to a local coded producer. The schema guard's rendered text is held to the
  * full `assessText` contract by tests/tool-output.test.mjs.
@@ -43,7 +44,7 @@ export const CODE_TOKEN = /\[([a-z][a-z0-9_]{2,63})\]/
 export const CODE_TOKEN_ALL = /\[([a-z][a-z0-9_]{2,63})\]/g
 const GUARDS = ['object', 'text', 'array', 'optionalInteger']
 /** Typed (`PolicyError`) argument guards: the only coded throws the guard exemption covers. */
-const CODED_GUARDS = ['assertToolArguments']
+const CODED_GUARDS = ['assertToolArguments', 'object']
 /**
  * Imperative action verbs a next step may start from. The first group is the
  * list the lexer-era lint enforced (tests/refusal-inventory.mjs at 664222d);

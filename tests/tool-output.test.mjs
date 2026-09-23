@@ -514,3 +514,24 @@ test('an empty member id is refused by field instead of binding work to nobody',
     assert.equal(f.runtime.store.get('tasks', task.id).assigneeId, undefined)
   } finally { await f.cleanup() }
 })
+
+test('swarm_budget without its conditional object and a non-object call are typed [tool_arguments_invalid] refusals naming what is missing', async () => {
+  const schemaIndex = await toolSchemaIndex()
+  const { calls, definitions } = recordingTools()
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  const typed = (...fragments) => error => {
+    assert.equal(error.name, 'PolicyError'); assert.equal(error.code, 'tool_arguments_invalid'); assert.equal(error.category, 'validation_error')
+    assert.ok(error.message.startsWith('[tool_arguments_invalid] '), error.message)
+    for (const fragment of fragments) assert.ok(error.message.includes(fragment), `${fragment} in ${error.message}`)
+    return true
+  }
+  // Used to fail inside object() as a plain Error saying "Expected an object".
+  await assert.rejects(definitions.get('swarm_budget').execute({ missionId: 'mission_1', taskId: 'task_1', reason: 'raise' }, exec), typed('called with `taskId` but no `taskBudget`', 'Pass `taskBudget`'))
+  await assert.rejects(definitions.get('swarm_budget').execute({ missionId: 'mission_1', reason: 'raise' }, exec), typed('called with neither `budget` nor `taskId`', 'Pass `budget`'))
+  for (const message of await Promise.all([{ missionId: 'mission_1', taskId: 'task_1', reason: 'raise' }, { missionId: 'mission_1', reason: 'raise' }]
+    .map(args => definitions.get('swarm_budget').execute(args, exec).catch(error => error.message)))) assert.deepEqual(assessText(message, schemaIndex), [], message)
+  for (const value of ['{"missionId":', [], null, 7]) {
+    await assert.rejects(definitions.get('swarm_observe').execute(value, exec), typed('Expected an object: pass this tool\'s named parameters as one JSON object'))
+  }
+  assert.deepEqual(calls, [], 'no refused call reached the runtime')
+})
