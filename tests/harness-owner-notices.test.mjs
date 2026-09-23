@@ -18,7 +18,6 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import SandboxLocal from '@deepseek-ai/dsh-sandbox-local'
 import Invariants from '@deepseek-ai/dsh-invariants'
 import * as Swarm from '../lib/index.js'
-import { swarmInvariantStatus } from '../lib/invariant.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
@@ -61,7 +60,6 @@ async function fixture(t, respond = () => text('Done'), configure) {
   const handle = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   await ctx.plugin(Swarm, { statePath: path.join(root, 'state.sqlite'), workspacesRoot: path.join(root, 'worktrees'), tickMs: 60000, leaseMs: 60000, maxEvents: 500, maxAttempts: 100, maxMessageChars: 10000 })
   const rt = ctx.swarm
-  assert.equal(swarmInvariantStatus.registered, true, 'full registration includes the native invariant')
   rt.kick = () => {}; rt.pumpOutbox = () => {}
   const owner = { sessionId: 'owner-session' }
   const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })

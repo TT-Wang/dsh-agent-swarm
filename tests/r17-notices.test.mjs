@@ -109,6 +109,49 @@ test('R17-G3: repetition is keyed on the fact — same fact once, unrelated boar
   assert.equal(first.notice.reason, 'blocked for repair')
 })
 
+test('one enforcement point: a no-live-path decision is withheld at delivery while its lineage is live, and delivered once it closes', async t => {
+  // Moved from the deleted emission/append refusal tests: the requirement is that
+  // the owner never RECEIVES a fall-through or stall-root naming a subject a live
+  // lineage still advances. Emission writes the fact; delivery (flushOutbox and
+  // the native pre-step, both through ownerDeliveryRelevant) is the one judge.
+  const f = await fixture(t)
+  const builder = await f.addMember('Builder')
+  const block = task => { const row = f.runtime.store.get('tasks', task.id); row.status = 'blocked'; row.epoch++; row.output = 'blocked for repair'; f.runtime.store.put('tasks', row); return row }
+  const relevant = delivery => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', delivery.id))
+  const original = block(f.propose('Blocked original', { assigneeId: builder.id }))
+  const repair = f.propose('Repair', { replaces: [original.id], assigneeId: builder.id })
+  await f.runtime.claim({ sessionId: builder.sessionId }, f.mission.id, repair.id)
+  const covered = `${original.id}@${original.epoch}`
+  f.emit('covered fall-through', [covered], { family: 'fallthrough', trigger: 'mission/stalled', reason: 'no live path advances it' })
+  f.emit('covered stall root', [covered], { family: 'stall-root', dedupKey: `stall-root:${f.mission.id}:${covered}`, stampWitness: false })
+  const fallthrough = f.ownerNotices().find(delivery => delivery.notice.dedupKey.startsWith('fallthrough:'))
+  const coveredRoot = f.ownerNotices().find(delivery => delivery.notice.dedupKey === `stall-root:${f.mission.id}:${covered}`)
+  assert.ok(fallthrough && coveredRoot, 'emission records the facts; it no longer judges them')
+  assert.equal(relevant(fallthrough), false, 'a fall-through naming a subject a live repair advances is withheld')
+  assert.equal(relevant(coveredRoot), false, 'a stall root whose root a live repair covers is withheld')
+  await sleep(150)
+  assert.equal(f.runtime.store.get('deliveries', fallthrough.id).deliveredAt, undefined, 'the pump never delivered the withheld fact')
+  // The classifier's own stall-root output, a root plus a pending dependent, is
+  // delivered: dependents are consequences of the root, not roots themselves.
+  const root = block(f.propose('Dead end', { assigneeId: builder.id }))
+  const dependent = f.propose('Waits on the dead end', { assigneeId: builder.id })
+  const dependentRow = f.runtime.store.get('tasks', dependent.id)
+  dependentRow.dependencies = [root.id]
+  f.runtime.store.put('tasks', dependentRow)
+  const rootKey = `stall-root:${f.mission.id}:${root.id}@${root.epoch}`
+  const named = await eventually(() => f.ownerNotices().find(delivery => delivery.notice.dedupKey === rootKey), 'the classifier names the dead end')
+  assert.deepEqual(named.subjects, [`${root.id}@${root.epoch}`, `${dependent.id}@${dependentRow.epoch}`])
+  await eventually(() => f.runtime.store.get('deliveries', named.id).deliveredAt, 'a stall root with a dependent reaches the owner')
+  // Closing the whole lineage makes the withheld fall-through deliverable; the
+  // fact key it consumed at emission is the same fact, delivered once.
+  const repairRow = f.runtime.store.get('tasks', repair.id)
+  repairRow.status = 'cancelled'
+  f.runtime.store.put('tasks', repairRow)
+  assert.equal(relevant(fallthrough), true, 'the fact is relevant once the lineage is terminal')
+  await eventually(() => f.runtime.store.get('deliveries', fallthrough.id).deliveredAt, 'the withheld fact is delivered once its lineage closes')
+  assert.equal(f.ownerNotices().filter(delivery => delivery.notice.dedupKey === fallthrough.notice.dedupKey).length, 1)
+})
+
 test('R17-G4: one per-owner budget bounds every family and degrades a burst into a summary that names every fact', async t => {
   const f = await fixture(t)
   f.runtime.notices.wakeBudget = 2

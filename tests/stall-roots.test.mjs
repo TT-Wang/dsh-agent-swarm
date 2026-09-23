@@ -182,3 +182,32 @@ test('pending stop waits remain bounded and use the same owner scope as dispatch
   const accepted = { id: 'accepted', missionId: 'mission', status: 'accepted', epoch: 1, dependencies: [] }
   assert.equal(waitsLegitimately(rt, { ...pending, dependencies: [accepted.id] }, [pending, accepted, running]), true, 'accepted prerequisites remain ready while the member is busy')
 })
+
+test('a real review rejection names its stall root exactly once, with exactly one stall-root event', async t => {
+  // 2026-09-18 review: after a real rejection the emission-time refusal refused
+  // every stall-root notice (the rejecting review, a blocked verdict record, is
+  // a dependent that is not itself a root), while the stall event was written on
+  // every tick: ~62 events and 0 deliveries. The event now exists only with its
+  // delivery row, and delivery judges the root the key names, not its dependents.
+  const f = await fixture(t, { tickMs: 10 })
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const source = f.propose('Rejected implementation')
+  const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+  await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+    title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  const rejected = f.runtime.store.get('tasks', source.id)
+  assert.equal(rejected.status, 'blocked', 'the reviewed source is blocked by the rejection')
+  await sleep(1500)
+  const key = `stall-root:${f.mission.id}:${source.id}@${rejected.epoch}`
+  const deliveries = f.stallRoots().filter(delivery => delivery.notice.dedupKey === key)
+  const events = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
+  const transitionSite = f.notices().filter(delivery => !delivery.notice?.dedupKey?.startsWith('stall-root:') && delivery.subjects?.includes(`${source.id}@${rejected.epoch}`))
+  t.diagnostic(`stall-root events ${events.length}; owner deliveries naming the rejected source: stall-root ${deliveries.length}, transition-site ${transitionSite.length} (${transitionSite.map(delivery => delivery.notice?.dedupKey).join(', ')})`)
+  assert.equal(deliveries.length, 1, `exactly one stall-root delivery: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  assert.equal(events.length, 1, `exactly one stall-root event, not one per tick: ${events.length}`)
+  assert.equal(events[0].data.taskId, source.id)
+  assert.ok(deliveries[0].deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
+})

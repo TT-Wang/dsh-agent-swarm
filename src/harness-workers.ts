@@ -19,8 +19,6 @@ import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspace
 import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
-import { recordAppendRefusal } from './invariant.ts'
-import { noticeFamily } from './notices.ts'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
@@ -980,16 +978,8 @@ export class HarnessWorkers implements WorkerAdapter {
       const message = this.deliveryMessage(delivery)
       const seen = owner.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
         || (event.type === 'agent/inbox/spliced' && event.data.inserted.some(item => item.id === message.id)))
-      if (!seen) {
-        try {
-          owner.send(message, 'next-step', true)
-        } catch (error) {
-          // Only our exact false-wake predicate for this delivery can suppress
-          // it. Other host invariant failures remain durable outbox obligations.
-          if (recordAppendRefusal(error, { id: delivery.id, missionId: delivery.missionId, family: noticeFamily(delivery), subjects: delivery.subjects ?? [] })) return
-          throw error
-        }
-      }
+      // A host append failure is not a delivery: it stays a durable outbox obligation.
+      if (!seen) owner.send(message, 'next-step', true)
       await this.ctx.sessions.flush(owner.session)
       return
     }

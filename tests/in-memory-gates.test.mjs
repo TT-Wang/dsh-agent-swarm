@@ -301,8 +301,6 @@ const RECOVERY_COLLECTIONS = {
   'src/workspaces.ts:preparations': { kind: 'Map', label: 'in-flight', proof: 'tests/rule-workspace-recovery.test.mjs',
     behavior: 'overlapping preparation of one member and epoch reuses its workspace after the first preparation settles',
     reason: 'Per-member preparation promises serialize concurrent workspace I/O and release in finally; stop/dispose abort queued work. Durable workspace manifests, not this process-local queue, own restart recovery.' },
-  'src/invariant.ts:appendRefusalProofs': { kind: 'WeakMap', label: 'per-error', proof: 'tests/rule-owner-channel.test.mjs',
-    behavior: 'only the proven predicate and exact delivery', reason: 'Provenance binds only live Error instances to the actual rejecting predicate. Losing this ephemeral proof fails closed into retry, never falsely acknowledges a delivery.' },
   'src/workspaces.ts:summary': { kind: 'Map', label: 'per-run', proof: 'tests/r12-workspace-fixes.test.mjs',
     behavior: 'shell stages and repeated names are counted', reason: 'A CheckOutputScanner owns one declared-check run; this summary is discarded with that run and never decides later scheduling.' },
   'src/attempts.ts:stopRetries': { kind: 'Map', label: 'derivable', proof: 'tests/r12-protocol-fixes.test.mjs',

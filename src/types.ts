@@ -782,19 +782,6 @@ export interface SwarmEvent {
   createdAt: number
 }
 /**
- * R17-G9: one owner-facing decision candidate, judged before it is written. The
- * candidate is what the emission site knows: the mission, the notice family (from
- * the explicit option or the dedup key) and the subjects the decision names as
- * `taskId@epoch` (or the mission root).
- */
-export interface DecisionCandidate {
-  missionId: string
-  /** The notice family; only the families whose claim is "no live path will advance this subject" are judged. */
-  family?: string
-  /** The named subjects, at their current epoch. */
-  subjects: readonly string[]
-}
-/**
  * S6: critical-path accounting for one mission, projected next to its total
  * spend. `length` is the number of tasks in the longest chain of dependent
  * steps, so a worker that does not shorten the longest branch earns nothing;
