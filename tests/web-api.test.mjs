@@ -793,6 +793,15 @@ test('native web task controls revise the original policy and preserve session a
   const invalid = await f.rpc('control', { ...payload, sessionId: f.ownerId, changes: { scope: ['../escape'] } })
   assert.equal(invalid.result.ok, false)
   assert.match(invalid.result.error.message, /scope|relative|invalid/i)
+  // An amendment naming no field used to write task/amended {} and a handoff line.
+  const amendedEvents = () => f.runtime.store.events(snapshot.mission.id, 5000).filter(event => event.type === 'task/amended').length
+  const recorded = amendedEvents()
+  for (const changes of [{}, undefined]) {
+    const empty = await f.rpc('control', { ...payload, sessionId: f.ownerId, changes })
+    assert.equal(empty.result.ok, false, empty.text)
+    assert.equal(empty.result.error.details.policyCode, 'task_amendment_empty')
+  }
+  assert.equal(amendedEvents(), recorded, 'nothing was recorded')
 })
 
 test('authored draft refusals keep a stable category through native RPC when wording changes', async t => {

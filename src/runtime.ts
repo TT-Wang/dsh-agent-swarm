@@ -3434,6 +3434,9 @@ export class SwarmRuntime {
     this.bounded(reason)
     const allowed = ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
     if (changes === null || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !allowed.includes(key))) throw new PolicyError('task_amendment_invalid', 'validation_error', 'Unknown task amendment field')
+    // An amendment naming no field would still record task/amended and append
+    // `Owner amend: <reason>` to the handoff workers read, changing nothing.
+    if (action === 'amend' && Object.values(changes).every(value => value === undefined)) throw new PolicyError('task_amendment_empty', 'validation_error', '[task_amendment_empty] This amendment names no field, so nothing would change and nothing was written. Pass each field to change with its new value in `changes` to `swarm_control`, or each ceiling in `taskBudget` to `swarm_budget`, then retry; use `action` resume to retry the task unchanged.')
     const cleanup = this.store.get('tasks', taskId)
     const cleanupOnly = action === 'resume' && Object.keys(changes).length === 0 && cleanup?.missionId === missionId
       && stopPending(cleanup)

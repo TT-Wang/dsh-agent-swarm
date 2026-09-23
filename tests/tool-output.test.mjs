@@ -522,6 +522,48 @@ test('a recorded launch shape carrying workspace is accepted and runs in the fro
   assert.doesNotMatch(OWNER_PROMPT, /\bcompact\b/, 'the owner protocol names no compact read')
 })
 
+/*
+ * A null on an optional field is an omission, so `changes: { maxSteps: null }`
+ * used to succeed as a no-op amendment: task/amended {} was written and
+ * `Owner amend: <reason>` was appended to the handoff workers read, while a
+ * caller who meant "clear the dependencies" saw success and an unchanged task.
+ */
+test('an amendment that names no field is refused on every path, and one emptied by nulls names the nulled fields, before anything is written', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const schemaIndex = await toolSchemaIndex()
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const owner = { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }
+    const source = f.propose({ title: 'Source' })
+    const dependent = f.propose({ title: 'Dependent', dependencies: [source.id], maxSteps: 6 })
+    const before = f.runtime.store.get('tasks', dependent.id)
+    const amendedEvents = () => f.runtime.store.events(f.mission.id, 5000).filter(event => event.type === 'task/amended').length
+    const empty = (...fragments) => error => {
+      assert.equal(error.name, 'PolicyError'); assert.equal(error.code, 'task_amendment_empty'); assert.equal(error.category, 'validation_error')
+      assert.ok(error.message.startsWith('[task_amendment_empty] '), error.message)
+      for (const fragment of fragments) assert.ok(error.message.includes(fragment), `${fragment} in ${error.message}`)
+      assert.deepEqual(assessText(error.message, schemaIndex), [], `the refusal satisfies the refusal contract: ${error.message}`)
+      return true
+    }
+    const call = (tool, args) => definitions.get(tool).execute(Object.freeze({ missionId: f.mission.id, taskId: dependent.id, reason: 'clear it', ...args }), owner)
+    await assert.rejects(call('swarm_budget', { taskBudget: { maxSteps: null } }), empty('swarm_budget `taskBudget` held only null fields (`maxSteps`)', 'retry swarm_budget'))
+    for (const field of ['maxSteps', 'dependencies', 'checks']) {
+      await assert.rejects(call('swarm_control', { action: 'amend', changes: { [field]: null } }), empty(`swarm_control \`changes\` held only null fields (\`${field}\`)`, 'retry swarm_control'))
+    }
+    await assert.rejects(call('swarm_control', { action: 'amend', changes: {} }), empty('names no field'))
+    await assert.rejects(call('swarm_budget', { taskBudget: {} }), empty('names no field'))
+    // The exported runtime API, which the browser control RPC calls with the raw body.
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, dependent.id, 'amend', {}, 'annotate'), empty('names no field'))
+    assert.equal(amendedEvents(), 0, 'no task/amended event')
+    const after = f.runtime.store.get('tasks', dependent.id)
+    assert.deepEqual([after.dependencies, after.maxSteps, after.checks, after.handoff, after.epoch], [before.dependencies, before.maxSteps, before.checks, before.handoff, before.epoch], 'the task and its handoff are untouched')
+    // A null beside a real change is still an omission of that one field.
+    await call('swarm_control', { action: 'amend', changes: { maxSteps: null, maxFindings: 7 } })
+    assert.deepEqual([f.runtime.store.get('tasks', dependent.id).maxFindings, f.runtime.store.get('tasks', dependent.id).maxSteps, amendedEvents()], [7, 6, 1])
+  } finally { await f.cleanup() }
+})
+
 test('an empty member id is refused by field instead of binding work to nobody', async () => {
   const f = await setup({ config: { tickMs: 60_000 } })
   try {
