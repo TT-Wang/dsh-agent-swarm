@@ -30,6 +30,17 @@ export const { Workspaces, runProcess } = await import(pathToFileURL(join(PROJEC
 export const budget = { maxTokens: 500_000, maxSteps: 500, maxWorkers: 3, maxDurationMs: 600_000, maxTasks: 30, maxExperiments: 0 }
 export const MISSION_ACCEPTANCE = ['fault recovery is proven from durable state']
 
+/**
+ * A hand-driven runtime clock: pass `now` as `RuntimeConfig.now` (or the
+ * clock itself as `setup({ clock })`) and move time with `advance(ms)`.
+ */
+export class FakeClock {
+  #at
+  constructor(start = Date.now()) { this.#at = start }
+  now = () => this.#at
+  advance(ms) { this.#at += ms; return this.#at }
+}
+
 /** Poll a synchronous reader; fail loudly instead of hanging. */
 export async function eventually(read, message, timeoutMs = 8_000) {
   const deadline = Date.now() + timeoutMs
@@ -149,12 +160,17 @@ export class WorkspaceWorkers extends FakeWorkers {
 /**
  * Runtime + mission + two members + a propose helper. The runtime, store,
  * admission, scheduler and outbox are real; only the adapter is controlled.
+ * With a `clock` (a FakeClock) the runtime reads it and runs no tick timer
+ * (`tickMs: 0`): the test drives `runtime.tick()`, `runtime.settle(missionId)`
+ * and `clock.advance(ms)`. The pass bound then defaults to a minute of clock
+ * time, which the real timers that share it never reach within a test.
  */
-export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace } = {}) {
+export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace, clock } = {}) {
   const dir = await realpath(await tempDirectory('swarm-faults-'))
   const runtime = new SwarmRuntime({
     statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, ...config,
+    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+    ...(clock === undefined ? {} : { tickMs: 0, now: clock.now, stallPassTimeoutMs: 60_000 }), ...config,
   }, workers)
   await runtime.start()
   const owner = { sessionId: 'fault-owner' }
@@ -168,7 +184,7 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
     kind: 'implementation', scope: ['**'], acceptance, checks, assigneeId: author.id, ...extra,
   })
   const cleanup = async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
-  return { dir, runtime, workers, owner, mission, stream, author, reviewer, actor, propose, cleanup }
+  return { dir, runtime, workers, owner, mission, stream, author, reviewer, actor, propose, cleanup, clock }
 }
 
 /** Drive a task to blocked through a real independent rejection. */
