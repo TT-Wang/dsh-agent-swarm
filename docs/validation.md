@@ -9,6 +9,45 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-21 simplification batch 1 (2026-09-23)
+
+The first batch of the remaining round-20 review items deletes mechanisms that no production code
+reads. Every deletion was preceded by a grep of `src/` for its consumers, and one item a reviewer
+had listed, `Workspaces.selfRunEnvironment`, was kept because every assignment still delivers it.
+Source shrank by about 1,700 lines.
+
+- **Self-run environment parser.** About 335 lines tokenised the text of every worker command to
+  infer the environment a reviewer's own run used. The verdict is decided by the host's declared
+  checks in a clean checkout under an environment the host constructs, so the reproduction check now
+  compares the delivered envelope only with the environments recorded on those host check rows.
+- **Trace payload spill.** Span payloads were copied into a content-addressed directory beside the
+  state file and bounded by a sweeper; nothing read them back. A span now keeps only the digest and
+  size of its input and output, and the first host start after the upgrade removes the old
+  directory. `npm run test:replay` reports `26 referenced, 0 stored, 26 omitted` where it used to
+  verify stored payloads; its digest is unchanged.
+- **Instruments only tests read.** The guard-chain board model, the wake-precision and silence
+  projections moved into `tests/guard-model.mjs` and `tests/instruments.mjs`; the guard co-fire
+  table, the in-process refusal log and the Workspaces in-memory issue logs were deleted. The
+  recovery-fallback and cleanup-failure callbacks those logs mirrored are now required options, so an
+  unwired production construction is a compile error.
+- **Advisory work on the propose path.** `reconcileTaskAdmission` computed path and ignore
+  advisories on every proposal, spawning `git check-ignore`, and the caller discarded them. The
+  hints the draft editor shows still come from `planAdvisories`.
+
+An adversarial verification (three reviewers: hidden consumers, lost guarantees, weakened tests)
+found no behaviour regression and seven weaker points, all closed before merge: the orphaned
+payload directory above; a span-digest test and a check-semaphore test that a deliberate mutation
+passed, both tightened and re-checked against the mutation; a test-side instrument that copied
+production constants instead of importing them; a trace comment that overstated what a digest can
+be resolved to; and the disclosures below. The full suite also exposed one test that had depended
+on a trace file write yielding to the scheduler; it now waits for the outbox explicitly, and the
+deliveries it observes are identical.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: **1,272 tests, 1,272 passing** on the final head (`e16f8c9`). One earlier full run of the same tree failed two load-sensitive cases, the round-18 report-survives case in `tests/artifact-policy.test.mjs` and case F of `tests/r19-recovery-fallback.test.mjs`; each passes in isolation and under a ten-file parallel load, and the repeat full run passed with neither.
+- `npm run test:replay`, `test:bundle`, `test:harness`, `test:pack` and `test:profile` against the
+  0.1.6-alpha.2 Loader: passed, with no model-visible snapshot drift.
+
 ## Round-20 simplifications (2026-09-18)
 
 A whole-repository review looked for problems solved by inference and patch accretion where a
