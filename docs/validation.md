@@ -9,6 +9,43 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-22 simplification batch 2: typed refusals (2026-09-23)
+
+What the browser may see of a refusal used to be decided by `src/web-api.ts` matching about sixty
+anchored regular expressions against English message text, and the refusal contract was policed by a
+573-line hand-written JavaScript lexer. Both are gone.
+
+- **Refusals are typed.** About 150 refusal sites reachable from the browser RPCs moved from plain
+  `Error('[code] prose')` to `PolicyError(code, category, message)` with byte-identical messages, in
+  families (draft and launch, the `Task …` cancel family, runtime shutdown, plan validation, mission
+  authority and budget, task and member admission, attempts, content and delivery). The allowlist,
+  `actionableMessages` and the predicate form of `exposed()` are deleted: a `PolicyError` reaches the
+  browser when its text is bounded, names no host detail and carries a well-formed code; anything
+  else is `internal-error`. The two validators that echo the caller's own input keep their
+  scrub-exempt path. `TaskGraphAdmissionError` became a subclass of a general `AdmissionError`, and
+  plan validation raises one `AdmissionError` carrying every diagnostic. `unsafeDetail` now also
+  recognises `/Volumes/`, `/srv/`, `/mnt/`, `/data/`, `/root/`, `/Library/`, `/System/` and other
+  absolute host roots.
+- **The refusal contract is checked on rendered text.** A TypeScript-AST walker in
+  `tests/source-semantics.mjs` replaces the lexer; it inventories every `throw new <Class>(…)`, reads
+  a class throw's message at the constructor's declared message parameter, and sees the 147 typed
+  sites the lexer never did. `assessText` checks rendered text against the registered tool schemas:
+  one code token, a named parameter that resolves, and an imperative next step.
+
+An adversarial verification (browser boundary, byte identity, lint strength) found, and this batch
+fixed before merge: plan validation had stopped collecting a non-typed failure, so one malformed
+scope entry replaced every other diagnostic with a bare `TypeError`; a reasoning-effort refusal
+echoed the adapter's raw text, which can name an internal gateway, to the browser; the wider host-path
+scrub turned a caller's own absolute selector on amend, propose and task control into an opaque
+internal error, now a fixed repair naming the code and location; three codes each had two categories
+or were typed in one place and untyped in another; the lint had lost its next-step check; and the
+typed-site structure test did not see `AdmissionError`. Each fix has a regression that fails before it.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: **1,294 tests, 1,294 passing** in two consecutive full runs on the final head (`58f998f`). The round-18 case that had failed in most full runs of this and the previous batch, the report-survives case in `tests/artifact-policy.test.mjs`, gave a stop barrier that checkpoints a workspace with real git only one second to settle; it now waits for the barrier itself and asserts the barrier settled before asserting the outcome.
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness`, `test:pack` and
+  `test:profile`: passed, with no model-visible snapshot drift.
+
 ## Round-21 simplification batch 1 (2026-09-23)
 
 The first batch of the remaining round-20 review items deletes mechanisms that no production code
