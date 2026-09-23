@@ -582,14 +582,14 @@ function watchBodies(f) {
   return { bodies, flushes: () => flushes }
 }
 
-test('S1: a chain of early stops on computation alone ends within one rotation, and the body that completes it runs the pass-end steps', async () => {
+test('S1: a body whose members each take less than a bound is not stopped early, however long its sweep takes', async () => {
   // Round 3 stopped a body early only when the event loop had idled since its
-  // previous stamp, which any I/O await satisfies: the rule behaved as the
-  // elapsed-time rule while claiming a computing body was exempt. A body past
-  // its bound now stops at the next member boundary whatever it spent the time
-  // on, and the one-rotation chain bound is what contains a computing body:
-  // here eight members whose adapter start computes for 3ms, against a 10ms
-  // bound, so no body can sweep them all within its bound.
+  // previous stamp, which any I/O await satisfies; round 4 stopped any body
+  // past its bound, which turned a sweep of quick members into a chain of
+  // bodies and halved the sweep rate. A body now stops early only when the
+  // member it just swept held it for a whole bound: here eight members whose
+  // adapter start computes for 3ms, against a 10ms bound, so every body is past
+  // its bound but none of its members held it for one.
   class ComputingStartWorkers extends FakeWorkers {
     async start(spec) {
       this.started.push(spec.member.id)
@@ -608,16 +608,9 @@ test('S1: a chain of early stops on computation alone ends within one rotation, 
     const firstStart = workers.started.length
     await sleep(600)
     const bodies = [...watched.bodies]
-    assert.ok(bodies.some(body => body.stopped), 'a body past its bound on computation alone stops at the next member boundary')
-    let chain = 0
-    for (const body of bodies) {
-      chain = body.stopped ? chain + 1 : 0
-      assert.ok(chain <= members.length - 1, `a chain of ${chain} early stops stays within one rotation of ${members.length} members`)
-    }
-    const completed = bodies.filter(body => !body.stopped)
-    assert.ok(completed.length >= 2, `chains end: ${completed.length} of ${bodies.length} bodies completed the rotation`)
-    assert.deepEqual(completed.filter(body => !body.witnessed || !body.flushed), [], 'every body that completes the rotation runs ensureWitness and flushOutbox')
-    assert.deepEqual(bodies.filter(body => body.stopped && (body.witnessed || body.flushed)), [], 'a body that stopped early leaves the pass-end steps to the chain')
+    assert.ok(bodies.length >= 2, `bodies ran: ${bodies.length}`)
+    assert.deepEqual(bodies.filter(body => body.stopped), [], 'no body is stopped early by members that each take less than a bound')
+    assert.deepEqual(bodies.filter(body => !body.witnessed || !body.flushed), [], 'every body runs ensureWitness and flushOutbox')
     assert.deepEqual(members.filter(id => !workers.started.slice(firstStart).includes(id)), [], 'every member is started')
   } finally { await f.cleanup() }
 })

@@ -1182,7 +1182,7 @@ export class Notices {
       // resolve), so a transition inside a pass classifies with `offPass`; the
       // question is asked by the transition that ends or names the pass, and
       // by a wedged pass, which never reached its own question; a body that
-      // committed within the last bound past its bound is running, not wedged
+      // made progress of its own within the last bound past its bound is running, not wedged
       // (`Scheduling.passState`).
       const state = this.rt.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)

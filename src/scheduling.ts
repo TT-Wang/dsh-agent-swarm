@@ -68,8 +68,8 @@ export interface DispatchQuestion {
  * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
  * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
  * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
- * and once past its bound it stops at the next member boundary so the next body
- * resumes from lease recovery (`dispatch`).
+ * and a member that held it for a whole bound makes it stop at the next member
+ * boundary so the next body resumes from lease recovery (`dispatch`).
  */
 export interface SchedulingPass {
   /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
@@ -216,20 +216,19 @@ export class Scheduling {
    * being active during an adapter await. It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
    *
-   * A body past its bound (`pastBound`) also returns false at the next member
-   * boundary, after sweeping at least one member, and records where it stopped
-   * (`stoppedBefore`), whether it spent the time waiting in an await or
-   * computing. `kick` then queues the next body at once, which starts from
-   * lease recovery and sweeps from that member onwards, wrapping round to the
-   * ones before it. Each member's long awaits (a worker start up to
-   * `workerStartTimeoutMs`, task preparation, a close-out capture) therefore
-   * delay lease recovery, automatic completion and the budget check by at most
-   * one such await, not by their sum over every member. The chain of early
-   * stops is bounded, and that bound is what contains a body that is past its
-   * bound only by computing: a chained body's sweep ends before the member the
-   * chain started from (`chainFrom`), so the body that completes the rotation
-   * returns true, runs the pass-end steps (`ensureWitness`, `flushOutbox`) and
-   * the next body waits for the tick.
+   * A body also returns false at the next member boundary when the member it
+   * just swept held it for a whole bound (`stallPassTimeoutMs`), and records
+   * where it stopped (`stoppedBefore`). `kick` then queues the next body at
+   * once, which starts from lease recovery and sweeps from that member onwards,
+   * wrapping round to the ones before it. Each member's long awaits (a worker
+   * start up to `workerStartTimeoutMs`, task preparation, a close-out capture)
+   * therefore delay lease recovery, automatic completion and the budget check
+   * by at most one such member, not by their sum over every member. A body
+   * whose members each take less than a bound finishes its sweep, however long
+   * the sweep takes in total. The chain of early stops is bounded: a chained
+   * body's sweep ends before the member the chain started from (`chainFrom`),
+   * so the body that completes the rotation returns true, runs the pass-end
+   * steps (`ensureWitness`, `flushOutbox`) and the next body waits for the tick.
    * `pass` is the body's own record, handed down by `kick`; a direct call
    * without one never stamps progress and never stops early.
    */
@@ -244,14 +243,16 @@ export class Scheduling {
         const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
         const order = end > 0 ? rotation.slice(0, end) : rotation
+        let memberSince = Date.now()
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && this.pastBound(pass)) {
+          if (pass !== undefined && index > 0 && Date.now() - memberSince >= this.rt.stallPassTimeoutMs) {
             pass.stoppedBefore = member.id
             // A chain whose start member is gone restarts from this body's first one.
             pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
             return false
           }
+          memberSince = Date.now()
           progressed(pass)
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
