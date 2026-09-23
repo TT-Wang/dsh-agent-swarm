@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { waitsLegitimately } from '../lib/notices.js'
+import { wakePrecision } from './instruments.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -255,6 +256,17 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   assert.equal(root.notice.coveredBy, decision.id, 'the stall root is recorded against the rejection decision')
   assert.equal(root.deliveredAt, undefined, 'the stall root is not a second wake')
   assert.equal(stallRootEvents().length, 1, 'the stall root stays a durable fact')
+  // The covered row is no notice on any owner instrument: not a wake or false
+  // wake in the precision projection, not queued, not the last notice.
+  const precision = wakePrecision(f.runtime, f.mission.id)
+  assert.equal(precision.decisions.byFamily['stall-root'], undefined, `the covered row is no wake: ${JSON.stringify(precision.decisions.byFamily)}`)
+  assert.equal(precision.falseWakes.total, 0, `its listed rejecting review is no false wake: ${JSON.stringify(precision.falseWakes)}`)
+  const ledger = f.runtime.noticeLedger(f.owner, f.mission.id).ledger
+  assert.equal(ledger.some(entry => entry.deliveryId === root.id), false, 'the covered row is not a ledger entry')
+  assert.deepEqual(ledger.filter(entry => entry.state === 'queued').map(entry => entry.dedupKey), [], 'nothing is left queued')
+  const observed = f.runtime.observe(f.owner, f.mission.id)
+  assert.equal(observed.pendingDeliveries, 0, 'the covered row is not a pending delivery')
+  assert.notEqual(observed.lastWitness?.dedupKey, root.notice.dedupKey, 'the covered row is not the last notice')
 })
 
 test('a rejected root that strands a dependent names it in a delivered notice, not first in a reminder', async t => {
@@ -348,13 +360,22 @@ for (const repaired of [true, false]) {
       assert.deepEqual(naming.map(fact => fact.dedupKey.split(':')[0]), [], 'no reminder or fall-through names the rejecting review while the repair runs')
       return
     }
-    const reminder = await eventually(() => reminders().find(item => item.delivery.deliveredAt !== undefined), 'a stall-root reminder reaches the owner', 3000)
+    // The rejected root is recorded against its rejection decision, whose own
+    // reminders carry the root.
+    const cover = f.runtime.store.get('deliveries', stallRoot.notice.coveredBy)
+    assert.ok(cover !== undefined, 'the rejected root is recorded against the rejection decision')
+    const reminder = await eventually(() => remindersOf(cover).find(item => item.delivery.deliveredAt !== undefined), 'the rejection decision\'s reminder reaches the owner', 3000)
     assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
     // The W3 board stall lists the review too; its reminders judge the same rule.
     const stall = f.notices().find(delivery => delivery.notice?.dedupKey?.startsWith('mission/stalled:'))
     assert.ok(stall?.subjects.includes(reviewSubject), 'the W3 stall lists the rejecting review')
     await eventually(() => remindersOf(stall).length >= f.runtime.notices.maxObligationFollowups, 'every W3 reminder is recorded', 5000)
     assert.deepEqual(remindersOf(stall).map(fact => fact.subjects), remindersOf(stall).map(() => [rootSubject]), 'the W3 reminders name the root only')
+    // 12b12a6: the covered row reminded on its own, beside the decision's
+    // reminder, citing an "original delivery" the owner never received.
+    assert.deepEqual(reminders(), [], 'the covered stall root has no reminders of its own')
+    const cited = facts().filter(fact => fact.dedupKey.startsWith('obligation-followup:')).map(fact => fact.dedupKey.split(':')[1])
+    assert.deepEqual(cited.filter(id => f.runtime.store.get('deliveries', id)?.deliveredAt === undefined), [], 'every reminder cites a delivery the owner received')
   })
 }
 

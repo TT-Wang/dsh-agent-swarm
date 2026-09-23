@@ -96,8 +96,10 @@ export interface NotifyOptions {
   deliveryFailureId?: string
   /**
    * The delivery that already put this same obligation in front of the owner.
-   * The fact is still written durably (ledger, dedup, reminders), but it is no
-   * wake of its own: it takes no wake-budget slot and the outbox never sends it.
+   * The fact is still written durably (row, dedup, event), but it is no wake of
+   * its own: it takes no wake-budget slot, the outbox never sends it, it has no
+   * reminders (the covering delivery's carry it) and the owner instruments do
+   * not count it as a notice.
    */
   coveredBy?: string
 }
@@ -909,14 +911,13 @@ export class Notices {
     const now = Date.now()
     for (const delivery of this.rt.store.list('deliveries', mission.id)) {
       const fact = noticeRow(delivery)
-      // A covered fact reached the owner with the delivery that covers it, and
-      // stays the durable fact its own reminders are judged from.
-      const handedAt = fact?.coveredBy === undefined ? delivery.deliveredAt : this.rt.store.get('deliveries', fact.coveredBy)?.deliveredAt
-      if (delivery.to !== 'owner' || handedAt === undefined || fact === undefined
+      // A covered fact is never sent, so it has no reminders of its own: the
+      // covering delivery's reminders carry its root.
+      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined || fact.coveredBy !== undefined
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
-      if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? handedAt) < this.obligationFollowupMs) continue
+      if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
       const unresolved = this.unresolvedSubjects(view, delivery)
       if (unresolved.length === 0) continue
       const priorContent = fact.aggregatedFacts === undefined ? delivery.content
@@ -969,7 +970,7 @@ export class Notices {
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean {
     if (ownerDeliveryMoot(mission, delivery)) return false
     // A covered fact is never a wake of its own: the covering delivery carried
-    // the obligation, and reminders are generated from this row separately.
+    // the obligation, and that delivery's reminders carry it too.
     if (noticeRow(delivery)?.coveredBy !== undefined) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
     const stopFailures = this.stopFailureSubjects(mission.id, delivery)
@@ -1378,9 +1379,10 @@ export class Notices {
       // A root the verify site already put in front of the owner (its rejection
       // decision at this subject@epoch) is recorded against that decision when
       // the decision says all the root does: it names no dependent beyond its
-      // own rejecting review(s). The row, event and reminders stay, the second
-      // wake does not. A root that strands other work, or has no such decision
-      // (preparation failure, ceiling, exhausted recovery), wakes to name it.
+      // own rejecting review(s). The row and event stay; the second wake and its
+      // reminders do not (the decision's own reminders carry the root). A root
+      // that strands other work, or has no such decision (preparation failure,
+      // ceiling, exhausted recovery), wakes to name it.
       const cover = dependents.every(task => task.reviewOf === root.id && task.status === 'blocked')
         ? this.rejectionDecisionFor(mission.id, subject) : undefined
       this.rt.commit(mission.id, () => {

@@ -96,6 +96,14 @@ export function noticeFingerprint(input: FingerprintInput): string {
   return digest(input, true)
 }
 
+/** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
+const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
+
+/** Whether a delivery is still owed to its recipient; a covered fact never is. */
+export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
+  return delivery.deliveredAt === undefined && !covered(delivery)
+}
+
 function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pendingReadiness(input.tasks, input.members)): string {
   const { mission, tasks, members, evidence, deliveries } = input
   const canonical = {
@@ -105,7 +113,7 @@ function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pe
     notReady: readiness.notReady,
     submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, task.id)).map(task => task.id).sort(),
     members: [...members].sort(byId).map(member => [member.id, member.status]),
-    pendingDeliveries: deliveries.filter(delivery => delivery.deliveredAt === undefined && !(excludeNotices && delivery.notice !== undefined)).length,
+    pendingDeliveries: deliveries.filter(delivery => awaitsDelivery(delivery) && !(excludeNotices && delivery.notice !== undefined)).length,
     challenged: evidence.filter(item => item.status === 'challenged').map(item => item.id).sort(),
     ceilings: tasks.filter(task => task.ceiling !== undefined)
       .map(task => [task.id, task.ceiling!.dimension, task.ceiling!.limit, task.ceiling!.used]).sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
@@ -170,10 +178,14 @@ export function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
   }
 }
 
-/** Newest-first bounded ledger page. Read-only: the caller receives copies. */
+/**
+ * Newest-first bounded ledger page. Read-only: the caller receives copies. A
+ * covered fact is no notice the owner was sent, so it is not a ledger entry
+ * (never `queued`, never the last notice); `hasNotice` still dedups on it.
+ */
 export function noticeLedger(deliveries: readonly Delivery[], limit = 20): NoticeLedgerEntry[] {
   const bounded = Math.max(1, Math.trunc(limit))
-  return deliveries.map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
+  return deliveries.filter(delivery => !covered(delivery)).map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
 }
 
 /**

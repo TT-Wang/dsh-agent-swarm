@@ -17,7 +17,7 @@ import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type M
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
-import { hasNotice, proposalAllowance as computeProposalAllowance } from './arena.ts'
+import { awaitsDelivery, hasNotice, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, DEPENDENCY_ASSUMPTION_CODE, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
@@ -3161,7 +3161,7 @@ export class SwarmRuntime {
     const completionReason = this.completionError(mission)
     // R17-G6: the client's read face takes member statuses from the derived board
     // (the registered projection when published), not from a second derivation.
-    return { mission, members: this.projectedMembers(missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(d => !d.deliveredAt).length,
+    return { mission, members: this.projectedMembers(missionId), workstreams: this.store.list('workstreams', missionId), tasks, evidence: this.store.list('evidence', missionId), events: this.store.events(missionId, this.config.maxEvents), pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
       ...(deliveryTarget === undefined ? {} : { deliveryTarget }),
       completion: { eligible: completionReason === undefined, ...(completionReason === undefined ? {} : { reason: completionReason }) },
       criticalPath: this.criticalPath(missionId),
@@ -3339,7 +3339,7 @@ export class SwarmRuntime {
       mission: { id: mission.id, title: mission.title, status: mission.status, ...(mission.reason ? { reason: mission.reason } : {}), ...budget, criticalPath: this.criticalPath(missionId), workerUsage: mission.workerUsage ?? emptyUsage(), ownerUsage: mission.ownerUsage ?? emptyUsage() },
       ...rows, ...cursorView,
       unschedulable: this.unschedulable(mission, tasks, members).map(task => task.id),
-      pendingDeliveries: this.store.list('deliveries', missionId).filter(delivery => !delivery.deliveredAt).length,
+      pendingDeliveries: this.store.list('deliveries', missionId).filter(awaitsDelivery).length,
       posts: { total: this.store.countPosts(missionId), newest: newest.map(post => postView(post)),
         ...(postAfter === undefined ? {} : { count: postCount }), ...(postCount > newest.length ? { omitted: postCount - newest.length } : {}) },
       events, ...eventCursor,
