@@ -31,7 +31,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime, compareCheckEnvironments, selfRunEnvironmentSource, selfRunEnvironmentFacts, SELF_RUN_EXTRACTOR_LIMITATIONS } from '../lib/runtime.js'
+import { SwarmRuntime, compareCheckEnvironments } from '../lib/runtime.js'
 import { Workspaces, checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
@@ -110,8 +110,8 @@ async function cacheHome(root, warm) {
 
 /**
  * A real source repository plus a real `Workspaces`. `checkEnv` decides the
- * environment the host check runs under, which is what a self-run must
- * reproduce.
+ * environment the host check runs under, which the envelope states and the
+ * executed check records.
  */
 async function workspaceFixture(t, options = {}) {
   const temp = await realpath(await tempDirectory('swarm-check-envelope-'))
@@ -501,48 +501,6 @@ test('ENV × rejection: an accept with a failing check is blocked by the failure
   assert.equal(fixture.events().some(event => event.type === 'task/accepted'), false)
 })
 
-/* ------------------------------------------------------------------ *
- * ENV-R: the self-run facts are the EXECUTED command's environment.
- * ------------------------------------------------------------------ */
-
-test('ENV-R: the extractor reads only the environment a command declares for itself', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  assert.deepEqual(facts(selfRunEnvironmentSource('HOME=/a npm test')), { HOME: '/a' }, 'a segment-initial assignment is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('a && XDG_CACHE_HOME=/b b')), { XDG_CACHE_HOME: '/b' }, 'an assignment after && is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('a || GOCACHE=/c c')), { GOCACHE: '/c' }, 'an assignment after || is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('(HOME=/d; npm test)')), { HOME: '/d' }, 'an assignment after ( is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('npm run x | HOME=/e node y')), { HOME: '/e' }, 'an assignment after | is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export PIP_CACHE_DIR=/f')), { PIP_CACHE_DIR: '/f' }, 'export is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('env YARN_CACHE_FOLDER=/g npm test')), { YARN_CACHE_FOLDER: '/g' }, 'env arguments are read')
-  assert.deepEqual(facts(selfRunEnvironmentSource("sh -c 'HOME=/h npm test'")), { HOME: '/h' }, 'a shell -c body is read')
-  assert.deepEqual(facts(selfRunEnvironmentSource('env -u HOME node x')), { HOME: null }, 'env -u removes a name')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset HOME')), { HOME: null }, 'unset removes a name')
-  assert.deepEqual(facts(selfRunEnvironmentSource('HOME=/i VERSION=1 npm test')), { HOME: '/i' }, 'only the names the envelope records are kept')
-  // The negative direction: a mention is not an override.
-  assert.deepEqual(facts(selfRunEnvironmentSource('grep "HOME=/j" f')), {}, 'a quoted mention is an argument, not an override')
-  assert.deepEqual(facts(selfRunEnvironmentSource("grep 'HOME=/k' f")), {}, 'a single-quoted mention is an argument')
-  assert.deepEqual(facts(selfRunEnvironmentSource('echo HOME=/l')), {}, 'a non-initial word is an argument')
-  assert.deepEqual(facts(selfRunEnvironmentSource('HOME=/m npm test 2>/dev/null')), { HOME: '/m' }, 'the assignment still reads with a trailing redirect')
-  assert.equal(selfRunEnvironmentSource('env -i node x').cleared, true, 'env -i clears the environment')
-  assert.equal(selfRunEnvironmentSource('HOME=/n npm test').cleared, false)
-  assert.equal(selfRunEnvironmentSource(undefined).operations.length, 0, 'a tool with no command declares nothing')
-
-  const ambient = { home: '/ambient', userCacheDir: '/ambient/.cache', huggingfaceCacheDir: '/ambient/.cache/huggingface',
-    userCacheDirExists: true, huggingfaceCacheDirExists: true, xdgCacheHome: null,
-    sandboxPolicy: { mode: 'workspace-write', enforcement: 'full', workspaceRoot: null },
-    dependencyLinks: { mode: 'copy', dirs: [] }, checkCacheRoot: null, checkCacheRoots: {} }
-  const overridden = selfRunEnvironmentFacts(ambient, selfRunEnvironmentSource('HOME=/other npm test'))
-  assert.equal(overridden.home, '/other')
-  assert.equal(overridden.userCacheDir, '/other/.cache', 'the user cache root is re-derived for the overridden HOME')
-  assert.equal(overridden.huggingfaceCacheDir, '/other/.cache/huggingface')
-  assert.equal(overridden.userCacheDirExists, false, 'an absent overridden cache root is recorded as absent')
-  const cleared = selfRunEnvironmentFacts(ambient, selfRunEnvironmentSource('env -i node x'))
-  assert.equal(cleared.home, null, 'a cleared environment has no HOME unless the command sets one')
-  assert.equal(cleared.userCacheDir, null)
-  const managerRoot = selfRunEnvironmentFacts(ambient, selfRunEnvironmentSource('npm_config_cache=/m npm test'))
-  assert.equal(managerRoot.checkCacheRoots.npm_config_cache, '/m', 'a package-manager cache root the command sets is carried')
-})
-
 test('ENV: the scoped check roots are reported as advisory divergences, never silently ignored', async t => {
   const fixture = await missionFixture(t, { checkEnv: checkEnvFor(process.env.HOME) })
   const reviewer = fixture.reviews[0]
@@ -603,9 +561,7 @@ test('R16-B: a real check runs with TMPDIR/TMP/TEMP inside the checkout even whe
   await assert.rejects(stat(path.join(fixture.author.workspace, '.swarm-check-cache')), /ENOENT/, 'no scoped check root is written into the member worktree')
   // The envelope decision, made explicit: the scoped roots it records are still
   // exactly the five package-manager roots. TMPDIR/TMP/TEMP are deliberately not
-  // envelope fields: a self-run cannot reproduce a disposable checkout path, and
-  // recording the temp root as a scoped root would make `selfRunEnvironmentFacts`
-  // spread it into every self-run as if the member's own run had used it.
+  // envelope fields: a self-run cannot reproduce a disposable checkout path.
   const environment = fixture.workers.workspaces.checkEnvelope().environment
   assert.deepEqual(Object.keys(environment.checkCacheRoots).sort(), ['GOCACHE', 'PIP_CACHE_DIR', 'XDG_CACHE_HOME', 'YARN_CACHE_FOLDER', 'npm_config_cache'])
   assert.equal(Object.keys(environment).some(field => /temp|tmp/i.test(field)), false, 'no temp field is added to the delivered envelope')
@@ -650,106 +606,4 @@ test('ENV-R2: the budget-resume assignment carries the check envelope too', asyn
   assert.deepEqual(content.checkEnvironment.environment.dependencyLinks.dirs, DEFAULT_DEPENDENCY_DIRS, 'it states the dependency links')
   assert.equal(content.checkEnvironment.selfRun.home, process.env.HOME, 'it states the self-run baseline')
   assert.equal(fixture.runtime.store.get('tasks', reviewer.review.id).status, 'running', 'the same attempt resumes')
-})
-
-/* ------------------------------------------------------------------ *
- * ENV-R3: the two extractor defects the reviewer reproduced.
- * ------------------------------------------------------------------ */
-
-test('ENV-R3: unset option forms that act on functions record no variable removal', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -f HOME')), {}, 'unset -f removes a function, not the variable')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -n HOME')), {}, 'unset -n removes a nameref')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -fv HOME')), {}, 'a combined non-variable option records nothing')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -f HOME; echo HOME=$HOME')), {}, 'the whole command is read, not only its first word')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -v HOME')), { HOME: null }, 'unset -v removes the variable')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -- HOME')), { HOME: null }, '-- ends option processing')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset HOME')), { HOME: null }, 'a bare name removes the variable')
-  assert.deepEqual(facts(selfRunEnvironmentSource('unset -f HOME XDG_CACHE_HOME')), {}, 'no name after a function option is a variable removal')
-})
-
-test('ENV-R3: a quoted NAME=VALUE after env or export is an assignment; at segment start it is not', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  assert.deepEqual(facts(selfRunEnvironmentSource('env "HOME=/a" cmd')), { HOME: '/a' }, 'env parses its operand after quote removal')
-  assert.deepEqual(facts(selfRunEnvironmentSource("env 'HOME=/b' cmd")), { HOME: '/b' }, 'single quotes too')
-  assert.deepEqual(facts(selfRunEnvironmentSource('env -i "HOME=/c" cmd')), { HOME: '/c' }, 'and with a cleared environment')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export "HOME=/d"')), { HOME: '/d' }, 'export parses its operand the same way')
-  assert.deepEqual(facts(selfRunEnvironmentSource('"HOME=/e" cmd')), {}, 'a quoted segment-initial word is a command name, not an assignment')
-  assert.deepEqual(facts(selfRunEnvironmentSource('env -C /tmp "HOME=/f" cmd')), { HOME: '/f' }, "an env option's argument is consumed, not read as a command")
-  assert.deepEqual(facts(selfRunEnvironmentSource('env "HOME=/g" "XDG_CACHE_HOME=/h" cmd')), { HOME: '/g', XDG_CACHE_HOME: '/h' }, 'several quoted operands')
-})
-
-test('ENV-R3: every documented extractor limitation is pinned to the direction it claims', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  assert.equal(SELF_RUN_EXTRACTOR_LIMITATIONS.length, 3, 'the list is exactly what these three cases pin')
-  // 1. A non-literal value is recorded literally, so the divergence is REPORTED.
-  assert.deepEqual(facts(selfRunEnvironmentSource('HOME=$OTHER cmd')), { HOME: '$OTHER' }, 'an unexpanded value is recorded as the text it is')
-  assert.deepEqual(facts(selfRunEnvironmentSource('HOME=$(pwd) cmd')), { HOME: '$(pwd)' }, 'command substitution is recorded as text')
-  // 2. `set -a`/`source`/functions/heredocs are not followed: absent (permissive).
-  assert.deepEqual(facts(selfRunEnvironmentSource('. ./env.sh && npm test')), {}, 'a sourced file is not followed')
-  assert.deepEqual(facts(selfRunEnvironmentSource('set -a; npm test')), {}, 'set -a exports later values the extractor does not follow')
-  assert.deepEqual(facts(selfRunEnvironmentSource('f() { HOME=/x; }; f; npm test')), {}, 'a function body is not followed')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<DOC\nHOME=/x\nDOC\nnpm test')), {}, 'a heredoc body is not followed')
-  // ENV-R5: the same clause holds for a heredoc nested inside a shell -c body.
-  // The top-level scanner cannot see the redirect (it sits inside a quote on the
-  // `sh -c '...` line), so the recursion has to apply the strip itself.
-  assert.deepEqual(facts(selfRunEnvironmentSource("sh -c 'cat <<DOC\nHOME=/x\nDOC'")), {}, 'a nested heredoc body is not followed either')
-  assert.deepEqual(facts(selfRunEnvironmentSource('sh -c "cat <<DOC\nHOME=/x\nDOC"')), {}, 'nor in a double-quoted -c body')
-  // 3. `env -S` / `export -n`: absent (permissive).
-  assert.deepEqual(facts(selfRunEnvironmentSource('env -S "HOME=/x node y"')), {}, 'env -S is not split')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -n HOME')), {}, 'export -n is not modelled')
-})
-
-test('ENV-R5: a heredoc body nested inside a shell -c body is not read as code either', () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  // The reviewer's falsified shapes: the redirect lives inside the quoted -c
-  // body, so the top-level scanner cannot strip it; every one of these must read
-  // as an empty environment rather than as an override.
-  const shapes = [
-    ['single-quoted -c', "sh -c 'cat <<DOC\nHOME=/x\nDOC'"],
-    ['double-quoted -c', 'sh -c "cat <<DOC\nHOME=/x\nDOC"'],
-    ['bash -c', "bash -c 'cat <<DOC\nHOME=/x\nDOC'"],
-    ['tab-indented <<-DOC', "sh -c 'cat <<-DOC\n\tHOME=/x\n\tDOC'"],
-    ['a preceding command in the body', "sh -c 'cat <<DOC\nHOME=/x; echo hi\nDOC'"],
-    ['the redirect on a later line', "sh -c 'cat\n<<DOC\nHOME=/x\nDOC'"],
-  ]
-  for (const [label, command] of shapes) {
-    assert.deepEqual(facts(selfRunEnvironmentSource(command)), {}, `${label}: a nested heredoc body is data, not code`)
-  }
-  // The fix must not silence a real override written as code in the nested body.
-  assert.deepEqual(facts(selfRunEnvironmentSource("sh -c 'HOME=/x npm test'")), { HOME: '/x' }, 'a nested assignment in code is still recorded')
-  assert.deepEqual(facts(selfRunEnvironmentSource("sh -c 'export HOME=/x && npm test'")), { HOME: '/x' }, 'a nested export in code is still recorded')
-  assert.deepEqual(facts(selfRunEnvironmentSource("sh -c 'cat <<DOC\nHOME=/x\nDOC\nHOME=/y npm test'")), { HOME: '/y' },
-    'only the code after the stripped body counts')
-})
-
-/* ------------------------------------------------------------------ *
- * ENV-R4: a heredoc body is never an assignment; export -n declares nothing.
- * ------------------------------------------------------------------ */
-
-test('ENV-R4: a heredoc body is not read as an assignment under any preceding shell state', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  // The reviewer's shape: a preceding `export` segment must not make the body
-  // read as an export operand.
-  assert.deepEqual(facts(selfRunEnvironmentSource('export FOO=bar\ncat <<DOC\nHOME=/x\nDOC')), {}, 'a body after an export segment is not an operand')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<DOC\nx; export HOME=/x\nDOC')), {}, 'an assignment inside a body is body text')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<DOC\nHOME=/x\nDOC\nnpm test')), {}, 'the previously pinned shape stays unpinned to code')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<-DOC\n\tHOME=/x\n\tDOC\nnpm test')), {}, 'a <<- body with tab indentation is stripped')
-  assert.deepEqual(facts(selfRunEnvironmentSource("cat <<'DOC'\nHOME=/x\nDOC\nnpm test")), {}, 'a quoted delimiter still names the terminator')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<DOC\nHOME=/x\nDOC\nHOME=/y npm test')), { HOME: '/y' }, 'code after the terminator is read again')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<A <<B\nHOME=/x\nA\nHOME=/y\nB')), {}, 'two heredocs in one command are consumed in order')
-  assert.deepEqual(facts(selfRunEnvironmentSource('grep foo <<< "HOME=/z"')), {}, 'a here-string is not a heredoc and is not code either')
-  assert.deepEqual(facts(selfRunEnvironmentSource('cat <<"DOC"\nHOME=/x\nDOC')), {}, 'a double-quoted delimiter is stripped')
-})
-
-test('ENV-R4: export -n declares nothing, for the value form and the no-value form alike', async () => {
-  const facts = source => Object.fromEntries(source.operations.map(operation => [operation.name, operation.value]))
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -n HOME=/x')), {}, 'the value form leaves the child without HOME, so it is not an assignment')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -n HOME')), {}, 'the no-value form removes the export attribute')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -n XDG_CACHE_HOME=/y')), {}, 'the same for every recorded name')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -nf HOME=/x')), {}, 'a combined option word declares nothing either')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -f HOME')), {}, 'export -f exports a function, not a variable')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -p')), {}, 'export -p prints')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export HOME=/x')), { HOME: '/x' }, 'a plain export still assigns')
-  assert.deepEqual(facts(selfRunEnvironmentSource('export -- HOME=/x')), { HOME: '/x' }, '-- ends option processing and the assignment stands')
 })
