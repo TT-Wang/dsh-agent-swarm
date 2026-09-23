@@ -10,10 +10,12 @@
  * stayed running, nothing durable was written and there was no deferral and no
  * guided exit. On this repository (288 escaping symlinks) the check pipeline
  * was unusable under the default configuration. Both sites now throw
- * `DependencyMaterialisationError`, which the declared-check layer treats like
- * a coded I/O failure: a `(verification preparation)` row with exit 125 and
- * `failureKind: 'infrastructure'`, the retry rule, and a deferred review whose
- * output names the two documented ways out.
+ * `DependencyMaterialisationError`, which `Workspaces.verifyArtifact` returns,
+ * like every other preparation failure, as a `(verification preparation)` row
+ * with exit 125 and `failureKind: 'infrastructure'`: the retry rule runs, and
+ * the review is deferred with output naming the two documented ways out. The
+ * declared-check layer defers on that row; it does not recognise thrown errors
+ * by name.
  *
  * M-d. The copy ran after the check slot was taken and before the timed
  * command, so a slow copy held a slot other verifications were queued for. It
@@ -149,27 +151,56 @@ test('R19-H2: a dangling dependency root is the same typed error, returned as a 
   assert.equal(workspaces.checkEnvelope().completed, 0, 'no check slot was consumed by the refused preparation')
 })
 
-test('R19-H2: the declared-check layer classifies the typed error as infrastructure without a real engine', async () => {
-  const f = await setup({ checks: [CHECK] })
-  try {
-    f.workers.verifyArtifact = async () => { throw new DependencyMaterialisationError('dependency_copy_escape', 'A dependency link leaves its dependency directory.', 'node_modules/@scope/pkg') }
+test('R19-H2: the declared-check layer defers on the preparation row and never reclassifies a thrown error by its name', async () => {
+  const review = async (f, adapter) => {
+    f.workers.verifyArtifact = adapter
     const task = f.propose()
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = f.runtime.propose(f.owner, f.mission.id, {
+    const proposed = f.runtime.propose(f.owner, f.mission.id, {
       workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
       reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
     })
-    const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
-    const verdict = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })
+    const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, proposed.id)
+    return { task, review: proposed, verify: () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: proposed.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' }) }
+  }
+  const rows = (f, taskId) => f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.taskId === taskId)
+
+  // The engine's row: exactly what Workspaces returns for the typed error.
+  const materialisation = new DependencyMaterialisationError('dependency_copy_escape', 'A dependency link leaves its dependency directory.', 'node_modules/@scope/pkg')
+  const f = await setup({ checks: [CHECK] })
+  try {
+    const { task, review: deferredReview, verify } = await review(f, async () => [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(materialisation)}` }])
+    const verdict = await verify()
     assert.equal(verdict.status, 'blocked')
     assert.equal(taskOf(f.runtime, task.id).status, 'submitted')
-    const runs = f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.taskId === review.id)
+    const runs = rows(f, deferredReview.id)
     assert.deepEqual(runs.map(run => [run.result.command, run.result.exitCode, run.result.failureKind]),
       [['(verification preparation)', 125, 'infrastructure'], ['(verification preparation)', 125, 'infrastructure']])
     assert.match(runs[0].result.output, /node_modules\/@scope\/pkg/)
     assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 1)
   } finally { await f.cleanup() }
+
+  // A thrown error is recognised only by its errno code (the backstop for an
+  // adapter that throws); a name alone says nothing about where it came from,
+  // so a codeless throw that merely carries an infrastructure name escapes.
+  for (const name of ['DependencyMaterialisationError', 'ProcessTimeoutError']) {
+    const g = await setup({ checks: [CHECK] })
+    try {
+      const thrown = Object.assign(new Error(`an adapter refusal named ${name}`), { name })
+      const { task, review: escaped, verify } = await review(g, async () => { throw thrown })
+      await assert.rejects(verify(), error => error === thrown, `${name} is not reclassified by its name`)
+      assert.equal(taskOf(g.runtime, escaped.id).status, 'running', 'the review is not deferred on a name')
+      assert.equal(taskOf(g.runtime, task.id).status, 'submitted')
+      assert.deepEqual(rows(g, escaped.id), [], 'no row is recorded for a thrown refusal')
+    } finally { await g.cleanup() }
+  }
+  const coded = await setup({ checks: [CHECK] })
+  try {
+    const { task, verify } = await review(coded, async () => { throw Object.assign(new Error('EMFILE: too many open files'), { code: 'EMFILE' }) })
+    assert.equal((await verify()).status, 'blocked', 'an errno-coded adapter throw still defers')
+    assert.equal(taskOf(coded.runtime, task.id).status, 'submitted')
+  } finally { await coded.cleanup() }
 })
 
 test('R19-M-d: dependency materialisation runs before the check slot is taken and outside the check deadline', async t => {
