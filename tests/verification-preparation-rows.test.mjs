@@ -145,6 +145,75 @@ for (const [label, error, output] of [
   })
 }
 
+/** `git merge-base --is-ancestor`, the ancestry proof `validateArtifact` runs before any checkout exists. */
+const ancestryProof = argv => argv.includes('merge-base') && argv.includes('--is-ancestor')
+
+/**
+ * The artifact's ancestry is proved with host git before the checkout exists,
+ * under HOST_GIT_TIMEOUT_MS. Before batch 3 the declared-check layer turned
+ * that deadline into two exit-124 timeout rows by error name; once the name
+ * rule left it, the deadline escaped `swarm_verify` as a bare throw with the
+ * review left running and nothing durable. The deadline is scaled down here;
+ * the substituted proof outlasts it on both passes.
+ */
+test('a host git deadline while proving the artifact ancestry defers the review with timeout rows', async t => {
+  let armed = false, substituted = 0
+  const f = await reviewFixture(t, { options: { subprocess: substitutingSeam(argv => armed && ancestryProof(argv), ['/bin/sh', '-c', 'sleep 20'], () => { substituted++ }) } })
+  f.workspaces.gitTimeout = () => 1_500
+  armed = true
+  const verdict = await f.verify()
+  armed = false
+  assert.equal(substituted, 2, 'the ancestry proof really ran and outlasted the deadline on both passes')
+  assert.equal(verdict.status, 'blocked', 'the review is deferred, not thrown and not rejected')
+  assert.equal(taskOf(f.runtime, f.source.id).status, 'submitted', 'the immutable source stays submitted')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 1)
+  assert.equal(events(f.runtime, f.mission.id, 'task/rejected').length, 0)
+  assert.match(verdict.output, /swarm_control\(action: "resume"/, 'the guided exit is on the review')
+  const runs = f.runs()
+  assert.deepEqual(runs.map(run => run.arguments.attempt), [1, 2], 'both passes of the retry rule are durable')
+  for (const run of runs) {
+    assert.equal(run.result.command, PREPARATION)
+    assert.equal(run.result.exitCode, 124, 'the host deadline is a timeout row')
+    assert.equal(run.result.failureKind, 'timeout')
+    assert.match(run.result.output, /^Host verification could not execute: ProcessTimeoutError: Execution timed out after 1500ms$/)
+  }
+  assert.deepEqual(await verificationCheckouts(f.repo.root), [], 'no checkout was created before the proof failed')
+  assert.equal(f.workspaces.checkEnvelope().completed, 0, 'no check slot was taken')
+})
+
+test('an artifact whose ancestry proof exits non-zero is still refused by a throw', async t => {
+  let armed = false
+  const f = await reviewFixture(t, { options: { subprocess: substitutingSeam(argv => armed && ancestryProof(argv), ['/bin/sh', '-c', 'exit 1']) } })
+  armed = true
+  await assert.rejects(f.verify(), /git merge-base failed \(1\)/, 'a non-ancestor is a refusal of the artifact, not host infrastructure')
+  armed = false
+  assert.equal(taskOf(f.runtime, f.review.id).status, 'running')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 0)
+  assert.deepEqual(f.runs(), [], 'nothing was recorded as a check row')
+})
+
+/**
+ * A check admitted before admission refused control characters can still hold
+ * a NUL byte. The process API refuses that argument (ERR_INVALID_ARG_VALUE):
+ * the request is defective, not the host, so it is not an infrastructure row
+ * the review would defer on. `swarm_verify` throws, as it did at e8ac876.
+ */
+test('a legacy check the process API refuses as an argument throws instead of deferring', async t => {
+  const f = await reviewFixture(t)
+  f.runtime.commit(f.mission.id, () => {
+    const legacy = f.runtime.store.get('tasks', f.source.id)
+    legacy.checks = ['test -f src/answer.txt\u0000 && true']
+    f.runtime.store.put('tasks', legacy)
+  })
+  await assert.rejects(f.verify(), error => error?.code === 'ERR_INVALID_ARG_VALUE', 'an argument refusal is not host infrastructure')
+  assert.equal(taskOf(f.runtime, f.review.id).status, 'running')
+  assert.equal(taskOf(f.runtime, f.source.id).status, 'submitted')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 0)
+  assert.deepEqual(f.runs(), [], 'nothing was recorded as a check row')
+  assert.deepEqual(await verificationCheckouts(f.repo.root), [], 'the checkout is removed on the throw path')
+  assert.deepEqual((({ active, queued }) => ({ active, queued }))(f.workspaces.checkEnvelope()), { active: 0, queued: 0 }, 'the check slot was released')
+})
+
 test('Workspaces.cancel during preparation still rejects instead of becoming a row', async t => {
   const repo = await makeRepo('verification-preparation-cancel', { 'src/answer.txt': 'base\n' })
   const started = []

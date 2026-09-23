@@ -1825,7 +1825,15 @@ export class Workspaces {
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     return await this.operation(member.id, async signal => {
       await this.memberRecord(member)
-      await this.validateArtifact(member, artifact, signal)
+      try { await this.validateArtifact(member, artifact, signal) }
+      catch (error) {
+        // Only the host's own git deadline (HOST_GIT_TIMEOUT_MS) proving the
+        // artifact is a timeout row: no command has run. Any other failure here
+        // (a non-ancestor, a missing commit) refuses the artifact by a throw,
+        // and cancellation stays cancellation.
+        if (!(error instanceof ProcessTimeoutError) || signal.aborted) throw error
+        return [unexecutedCheck('(verification preparation)', error)]
+      }
       const mission = await this.missionRecord(member.missionId)
       // Revocation fencing: the verification checkout is created only after the
       // persisted mission manifest still authorizes its recorded root.
@@ -1886,6 +1894,11 @@ export class Workspaces {
             // remains cancellation, including when it arrives during timeout drain.
             if (!(error instanceof ProcessTimeoutError)) {
               if (signal.aborted) throw error
+              // An argument the process API refused (a NUL byte in a check
+              // admitted before admission refused control characters) is a
+              // defect in the request, not the host: it stays a thrown refusal.
+              const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+              if (code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_INVALID_ARG_TYPE') throw error
               // F-29: a confinement the host refused (partial enforcement) or a
               // command the seam could not start never ran; record it as this
               // command's infrastructure row, never as an assertion failure.
@@ -2023,12 +2036,27 @@ export class Workspaces {
       if (entryStat?.isSymbolicLink() && (targetStat === undefined || !targetStat.isDirectory())) throw new DependencyMaterialisationError('dependency_directory_unavailable', 'A dependency link has no readable directory target; repair or reinstall the dependency directory', relative)
       if (targetStat === undefined || !targetStat.isDirectory()) continue
       if (await lstat(link).then(() => true, () => false)) continue
+      // The artifact decides the checkout's tree: when it made a parent of this
+      // directory something other than a directory (a file, or a link that is
+      // never written through), the dependency has no place here. Materialise
+      // nothing for it and let the checks judge the artifact; failing here would
+      // report an immutable artifact as a host condition no repair can change.
+      if (await this.displacedByArtifact(checkout, relative)) continue
       await mkdir(path.dirname(link), { recursive: true })
       if (copy) await this.copyDependencyTree(resolved!, link, source, relative, signal)
       else await symlink(target, link, 'dir')
       linked.push(relative)
     }
     return linked
+  }
+
+  /** Whether an existing parent of `relative` inside the checkout is not a directory. */
+  private async displacedByArtifact(checkout: string, relative: string): Promise<boolean> {
+    for (let parent = path.dirname(relative); parent !== '.'; parent = path.dirname(parent)) {
+      const stat = await lstat(path.join(checkout, parent)).catch(() => undefined)
+      if (stat !== undefined && !stat.isDirectory()) return true
+    }
+    return false
   }
 
   /** Copy into staging, relocate internal links, and materialize external

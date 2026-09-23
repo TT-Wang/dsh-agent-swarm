@@ -258,3 +258,44 @@ test('R19-M-d: dependency materialisation runs before the check slot is taken an
     assert.ok(envelope.maxRunMs < HOLD_MS, `the measured run time excludes materialisation, saw maxRunMs=${envelope.maxRunMs}`)
   } finally { gate.resolve() }
 })
+
+/**
+ * The artifact decides the checkout's tree. Here it replaces the tracked
+ * directory `pkg` with a regular file while the source still holds an ignored
+ * `pkg/node_modules`. Materialising that dependency tried to create
+ * `checkout/pkg` and failed with EEXIST; batch 3 reported the failure as host
+ * infrastructure, so every resume deferred the review again, without bound,
+ * telling the owner to fix an environment no repair can change: the artifact
+ * is immutable. A dependency directory whose place the artifact removed is now
+ * skipped, the other dependency directories are still materialised, and the
+ * checks judge the artifact.
+ */
+test('a dependency directory whose parent the artifact turned into a file is skipped, and the review reaches a verdict', async t => {
+  const repo = await makeRepo('r19-displaced', { 'src/answer.txt': 'base\n', 'pkg/index.js': 'module.exports = 1\n', '.gitignore': 'node_modules/\n' })
+  for (const root of ['node_modules', join('pkg', 'node_modules')]) {
+    await mkdir(join(repo.source, root, 'dep'), { recursive: true })
+    await writeFile(join(repo.source, root, 'dep', 'index.js'), 'module.exports = 2\n')
+  }
+  const workspaces = new Workspaces(workspaceOptions(repo.root))
+  const f = await setup({ workers: new WorkspaceWorkers(workspaces), workspace: repo.source, config: { tickMs: 60_000 } })
+  t.after(async () => { await f.cleanup(); await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
+  const source = f.propose({ checks: ['test -f pkg && test -f node_modules/dep/index.js'] })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await rm(join(f.author.workspace, 'pkg'), { recursive: true, force: true })
+  await writeFile(join(f.author.workspace, 'pkg'), 'collapsed into one file\n')
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  assert.ok(taskOf(f.runtime, source.id).artifact.changedPaths.includes('pkg'), 'the artifact really replaced the directory with a file')
+  const review = f.runtime.propose(f.owner, f.mission.id, {
+    workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
+  })
+  const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  const verdict = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })
+  assert.equal(verdict.status, 'accepted', verdict.output)
+  assert.equal(taskOf(f.runtime, source.id).status, 'accepted', 'the checks judged the artifact')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 0, 'no infrastructure deferral')
+  const runs = f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.tool === 'swarm.host_verification')
+  assert.deepEqual(runs.map(run => [run.arguments.attempt, run.result.exitCode]), [[1, 0]])
+  assert.deepEqual(runs[0].result.environment.dependencyLinks.materializedPaths, ['node_modules'], 'only the displaced dependency was skipped')
+  assert.deepEqual(await verificationCheckouts(repo.root), [])
+})
