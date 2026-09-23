@@ -24,7 +24,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import { dirname, join, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
 import { MISSION_ACCEPTANCE, WorkspaceWorkers, Workspaces, eventually, events, makeRepo, setup, taskOf } from './faults/harness.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
@@ -176,4 +178,35 @@ test('Workspaces.cancel during preparation still rejects instead of becoming a r
   } finally { workspaces.checks.release(0) }
   assert.equal(workspaces.checkEnvelope().queued, 0)
   assert.deepEqual(await verificationCheckouts(repo.root), [], 'cleanup still runs on the cancelled paths')
+})
+
+/**
+ * `WorkerAdapter` is published (`./types`) for adapters built outside this
+ * package. It declares the rows `verifyArtifact` really returns, `failureKind`
+ * included, so an adapter can report a check it could not execute as a row and
+ * a reader needs no cast; the declarations still never import the Node-only
+ * workspace module.
+ */
+test('the published WorkerAdapter declares the check rows verifyArtifact returns', () => {
+  const declarations = fileURLToPath(new URL('../lib/types.d.ts', import.meta.url))
+  const consumer = join(dirname(declarations), '__adapter-consumer.ts')
+  const text = `import type { Artifact, Member, Task, WorkerAdapter } from './types.js'
+export async function read(adapter: WorkerAdapter, member: Member, task: Task, artifact: Artifact) {
+  const [row] = await adapter.verifyArtifact(member, task, artifact)
+  const kind: 'timeout' | 'infrastructure' | undefined = row?.failureKind
+  const stage: string | null | undefined = row?.attribution?.stage
+  const home: string | null | undefined = row?.environment?.home
+  return { kind, stage, home }
+}
+export const unexecuted: WorkerAdapter['verifyArtifact'] = async () => [{ command: '${PREPARATION}', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: host' }]
+`
+  const options = { strict: true, noEmit: true, skipLibCheck: true, types: [], target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext }
+  const host = ts.createCompilerHost(options)
+  const getSourceFile = host.getSourceFile.bind(host), fileExists = host.fileExists.bind(host)
+  host.getSourceFile = (name, version, ...rest) => name === consumer ? ts.createSourceFile(name, text, version) : getSourceFile(name, version, ...rest)
+  host.fileExists = name => name === consumer || fileExists(name)
+  const program = ts.createProgram([consumer], options, host)
+  const diagnostics = ts.getPreEmitDiagnostics(program).map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))
+  assert.deepEqual(diagnostics, [], 'an adapter reads and returns failureKind, attribution and environment without a cast')
+  assert.equal(program.getSourceFiles().some(file => file.fileName.endsWith(`${sep}workspaces.d.ts`)), false, 'the adapter interface never loads the workspace module')
 })

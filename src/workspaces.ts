@@ -10,15 +10,9 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { deliverablePaths, ignoredDeliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
-export type { CheckEnvelope }
+import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
+export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
 
-export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
-  failureKind?: 'timeout' | 'infrastructure'
-  /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
-  attribution?: CheckAttribution
-  /** ENV: the environment this check actually ran under. */
-  environment?: CheckEnvironment }
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
 /**
@@ -143,61 +137,6 @@ const DEFAULT_CHECK_CONCURRENCY = 2
 export const HOST_GIT_TIMEOUT_MS = 5 * 60_000
 
 export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
-/**
- * ENV: the environment a declared check runs under, stated as facts instead of
- * folklore, so the assignee knows which environment the host check will use and
- * a verification can tell when the executed check did not reproduce it.
- *
- * `home`, the two user cache roots, the sandbox policy and the dependency links
- * are what an execution must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
- * scoped roots the envelope itself provides inside the disposable checkout: they
- * differ by design on every run and are excluded from the reproduction
- * comparison. Existence flags are recorded and reported but never refuse an
- * acceptance: a check must not depend on the ambient cache staying warm.
- *
- * Structural mirror: `src/runtime.ts` reads the same shape through a type-only
- * import, and `WorkerAdapter.checkEnvelope` keeps declaring the measured type.
- */
-export interface CheckEnvironment {
-  /** HOME the check process receives; null when it inherits none. */
-  home: string | null
-  /** User-level cache directory the check's HOME resolves (`<home>/.cache`); null without a HOME. */
-  userCacheDir: string | null
-  /** `<userCacheDir>/huggingface`, where a user-level model cache lives; null without a HOME. */
-  huggingfaceCacheDir: string | null
-  /** Whether the two user cache roots existed when these facts were recorded. */
-  userCacheDirExists: boolean
-  huggingfaceCacheDirExists: boolean
-  /** XDG_CACHE_HOME in force for this environment (the scoped root for a check). */
-  xdgCacheHome: string | null
-  /** The confinement the host applies: workspace-write rooted at the checkout, full enforcement. */
-  sandboxPolicy: { mode: string; enforcement: string; workspaceRoot: string | null }
-  /** Dependency materialisation policy. dirs is the configured set of directory names. */
-  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[];
-    /** Actual relative paths found and materialised in this execution; absent before execution. */
-    materializedPaths?: string[] }
-  /** Scoped cache root the envelope provides inside the checkout; null for a self-run. */
-  checkCacheRoot: string | null
-  /** Package-manager cache roots the check sets below `checkCacheRoot`. */
-  checkCacheRoots: Record<string, string>
-}
-/** ENV: one check's failure attribution, captured before the output bound can cut it off. */
-export interface CheckAttribution {
-  /** 1-based position of the failing check in the declared sequence. */
-  index: number
-  command: string
-  /** The last stage banner (`> script`, `$ command`, `# stage: name`) before the first failure. */
-  stage: string | null
-  /** The last `# Subtest:` heading before the first failure (the suite that failed). */
-  subtest: string | null
-  /** TAP `not ok` names seen in the stream, bounded; the count is every name seen. */
-  failingTests: string[]
-  failingTestCount: number
-  /** TAP summary lines (`1..N`, `# tests/# pass/# fail/...`), latest value per key. */
-  tapSummary: string[]
-  /** True when the stored output was cut at the host's output bound. */
-  outputTruncated: boolean
-}
 /**
  * ENV: the measured envelope plus the declared-check environment.
  * `environment` is the declared envelope the runtime delivers to the assignee

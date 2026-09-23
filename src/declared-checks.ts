@@ -27,7 +27,7 @@ export function excerpt(value: unknown, limit: number): string {
 }
 
 /** One declared check's outcome, as the host recorded it. */
-export type CheckResult = import('./workspaces.js').CheckResult
+export type CheckResult = import('./types.ts').CheckResult
 
 export class DeclaredChecks {
   /**

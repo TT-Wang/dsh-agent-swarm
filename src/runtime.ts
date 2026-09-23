@@ -25,13 +25,9 @@ import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckEnvelope, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
-// ENV: the declared-check environment is authored by the host's workspace layer
-// and read here through a type-only import, so the policy module never depends
-// on the Node worktree module at runtime.
-import type { CheckAttribution, CheckEnvironment } from './workspaces.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
@@ -1694,19 +1690,15 @@ export class SwarmRuntime {
       if (input.verdict === 'accept' && source.checks.length > 0 && checks.length === 0) throw new Error('Declared host checks returned no execution evidence; retry verification of the same artifact')
       if (input.verdict === 'accept' && checks.length === 0 && independentRuns.length === 0) throw new Error('Acceptance requires independent host-recorded verification evidence')
       const { passed, failingChecks } = this.declaredChecks.classify(input.verdict, checks)
-      // ENV: the host check attaches the environment it ran under and, on
-      // failure, the attribution captured before the output bound. The adapter
-      // interface still declares the narrow result, so widen it here.
-      const outcomes = checks as Array<{ command: string; exitCode: number; output: string; truncated?: boolean; attribution?: CheckAttribution; environment?: CheckEnvironment }>
       const attributionOf = (check: { command: string; exitCode: number }): { attribution?: CheckAttribution } => {
-        const found = outcomes.find(item => item.command === check.command && item.exitCode === check.exitCode)
+        const found = checks.find(item => item.command === check.command && item.exitCode === check.exitCode)
         return found?.attribution === undefined ? {} : { attribution: found.attribution }
       }
-      const failureAttribution = outcomes.find(check => check.attribution !== undefined)?.attribution
+      const failureAttribution = checks.find(check => check.attribution !== undefined)?.attribution
       // ENV: the envelope delivered to this attempt must be reproduced by the
       // host checks that support it. A blocking divergence is durable before it
       // is reported, so a later reader sees the environments, not only the refusal.
-      const reproduction = this.checkEnvironmentReproduction(missionId, task.id, input.attemptId, outcomes)
+      const reproduction = this.checkEnvironmentReproduction(missionId, task.id, input.attemptId, checks)
       if (reproduction !== undefined && (reproduction.comparison.blocking.length > 0 || reproduction.comparison.advisory.length > 0)) {
         this.commit(missionId, () => this.store.event(missionId, 'task/check-envelope', member.id, {
           taskId: task.id, sourceTaskId: source.id, verdict: input.verdict, reproduction: 'check-environment-mismatch',
