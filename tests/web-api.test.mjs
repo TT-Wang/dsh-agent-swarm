@@ -23,6 +23,7 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
+import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -394,12 +395,41 @@ test('replacement cycles return an actionable bad-request through native RPC wit
   assert.equal(rejected.result.error.code, 'bad-request')
   assert.match(rejected.result.error.message, /\[task_graph_cycle\]/)
   assert.match(rejected.result.error.message, /dependencies.*reviewOf.*swarm_propose/)
+  assert.deepEqual(rejected.result.error.details, { issues: [], policyCode: 'task_graph_invalid', category: 'validation_error' })
   assert.deepEqual(f.runtime.store.list('tasks', mission.id), before)
   const message = rejected.result.error.message
   f.runtime.propose = () => { throw new Error(message) }
   const imitation = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
   assert.equal(imitation.result.error.code, 'internal-error', 'a matching message alone is not a typed validation failure')
   assert.doesNotMatch(imitation.result.error.message, /task_graph_cycle/)
+  // A graph refusal naming host detail keeps its fixed repair text instead of being hidden.
+  const hosted = { code: 'task_graph_cycle', taskId: '/Users/secret/a', target: 'b', message: 'task "/Users/secret/a" depends on "b". Remove one edge.' }
+  f.runtime.propose = () => { throw new TaskGraphAdmissionError([hosted]) }
+  const fallback = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
+  assert.equal(fallback.result.error.code, 'bad-request')
+  assert.match(fallback.result.error.message, /^\[task_graph_invalid\] Task dependencies or review sources form an invalid graph/)
+  assert.doesNotMatch(fallback.text, /secret/)
+})
+
+test('admission refusals are typed policy errors carrying their diagnostics, with the legacy bytes', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, { ...f.input, scope: ['src/'] })
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  let refused
+  try { f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Wide', objective: 'Edit docs', kind: 'research', scope: ['docs/'], acceptance: ['works'] }) } catch (error) { refused = error }
+  assert.ok(refused instanceof AdmissionError && refused instanceof PolicyError)
+  assert.equal(refused.code, 'scope_selector_out_of_scope')
+  assert.equal(errorTypeFor(refused), 'budget_error', 'the category the trace already gave this text')
+  assert.equal(refused.message, 'task.scope exceeds mission scope: "docs/" is not covered by allowed mission selectors ["src/"]. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow `scope` to a subset of the mission `scope` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]')
+  assert.deepEqual(refused.diagnostics, [{ code: 'scope_selector_out_of_scope', location: 'task.scope', message: refused.message }])
+  const defects = [{ code: 'task_graph_self_edge', taskId: 'a', target: 'a', message: 'task "a" declares an edge to itself.' }, { code: 'task_graph_unknown_edge', taskId: 'b', target: 'z', message: 'task "b" declares edge "z".' }]
+  const graph = new TaskGraphAdmissionError(defects)
+  assert.ok(graph instanceof AdmissionError && graph instanceof PolicyError)
+  assert.equal(graph.name, 'TaskGraphAdmissionError')
+  assert.equal(graph.message, '[task_graph_self_edge] task: task "a" declares an edge to itself.\n[task_graph_unknown_edge] task: task "b" declares edge "z".')
+  assert.deepEqual(graph.diagnostics.map(diagnostic => diagnostic.code), ['task_graph_self_edge', 'task_graph_unknown_edge'])
+  assert.deepEqual(graph.defects, defects)
 })
 
 test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {

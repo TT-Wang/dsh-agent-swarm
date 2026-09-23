@@ -8,6 +8,7 @@ import { scopeSubset, validScope, withinScope } from './scope.ts'
 // engine excludes from capture; both sides must never drift apart.
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
 import type { TaskCeiling, TaskCeilingDimension, TaskCeilingProvenance } from './types.ts'
+import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
 export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
@@ -21,13 +22,13 @@ export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
 
 export function assertScopeSelectors(scopes: readonly string[], location: string, parent?: readonly string[]): void {
   const invalid = scopes.findIndex(selector => !validScope(selector))
-  // The code token trails the pinned `location[` prefix so the browser's
-  // actionable-message allowlist in src/web-api.ts (out of this task's scope)
-  // keeps exposing this refusal; every refusal still carries its stable code.
-  if (invalid !== -1) throw new Error(`${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_invalid]`)
+  // The code token trails the legacy `location[` prefix so the message bytes
+  // stay the ones tests and callers pin; the category is the one errorTypeFor
+  // always derived from this text (it says "budget").
+  if (invalid !== -1) throw new AdmissionError('scope_selector_invalid', 'budget_error', `${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_invalid]`, `${location}[${invalid}]`)
   if (parent && !scopeSubset(scopes, parent)) {
     const offending = scopes.find(selector => !scopeSubset([selector], parent))
-    throw new Error(`${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow \`scope\` to a subset of the mission \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]`)
+    throw new AdmissionError('scope_selector_out_of_scope', 'budget_error', `${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow \`scope\` to a subset of the mission \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]`, location)
   }
 }
 
@@ -139,10 +140,26 @@ export function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): 
   return { code: defect.code, location, path: defect.target, message: defect.message }
 }
 
+/**
+ * An authored admission refusal: typed for the RPC boundary and the trace, and
+ * carrying the machine-checkable diagnostics it refuses with. A single refusal
+ * is its own diagnostic at `location`; a refusal with several diagnostics
+ * passes them, and its message is their formatted join.
+ */
+export class AdmissionError extends PolicyError {
+  readonly diagnostics: readonly AdmissionDiagnostic[]
+  constructor(code: string, category: PolicyErrorCategory, message: string, location: string, diagnostics?: readonly AdmissionDiagnostic[]) {
+    super(code, category, message)
+    this.name = 'AdmissionError'
+    this.diagnostics = diagnostics ?? [{ code, location, message }]
+  }
+}
+
 /** Authored graph validation, distinguishable from an internal host failure at RPC. */
-export class TaskGraphAdmissionError extends Error {
+export class TaskGraphAdmissionError extends AdmissionError {
   constructor(readonly defects: readonly TaskGraphDefect[]) {
-    super(defects.map(defect => formatDiagnostic(taskGraphDiagnostic(defect, 'task'))).join('\n'))
+    super('task_graph_invalid', 'validation_error', defects.map(defect => formatDiagnostic(taskGraphDiagnostic(defect, 'task'))).join('\n'), 'task',
+      defects.map(defect => taskGraphDiagnostic(defect, 'task')))
     this.name = 'TaskGraphAdmissionError'
   }
 }
@@ -195,7 +212,7 @@ export const DEFAULT_TASK_MAX_STEPS = 150
 export const DEFAULT_TASK_MAX_FINDINGS = 50
 
 function assertCeilingValue(value: number, location: string, dimension: TaskCeilingDimension): void {
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Set \`maxSteps\` or \`maxFindings\` on this task to a positive safe integer and retry the same task/request.`)
+  if (!Number.isSafeInteger(value) || value < 1) throw new AdmissionError('task_ceiling_invalid', 'validation_error', `[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Set \`maxSteps\` or \`maxFindings\` on this task to a positive safe integer and retry the same task/request.`, `${location}.${dimension}`)
 }
 
 /**
@@ -208,7 +225,7 @@ export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: n
   const maxFindings = task.maxFindings ?? DEFAULT_TASK_MAX_FINDINGS
   assertCeilingValue(maxSteps, location, 'maxSteps')
   assertCeilingValue(maxFindings, location, 'maxFindings')
-  if (maxSteps > missionMaxSteps) throw new Error(`[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`)
+  if (maxSteps > missionMaxSteps) throw new AdmissionError('task_ceiling_exceeds_mission_budget', 'budget_error', `[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`, `${location}.maxSteps`)
   const provenance = (dimension: TaskCeilingDimension, value: number): NonNullable<TaskCeilingProvenance[TaskCeilingDimension]> => {
     const prior = task.ceilingProvenance?.[dimension]
     // Revalidation receives filled-in numbers. Retain their saved origin only
@@ -946,20 +963,20 @@ export function isNoopCheck(command: string): boolean { return /^(?:true|:|exit\
 
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
-    if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`)
+    if (!Array.isArray(checks)) throw new AdmissionError('check_not_array', 'budget_error', `${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`, `${location}.checks`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
-    if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`)
+    if (invalid !== -1) throw new AdmissionError('check_invalid', 'budget_error', `${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`, `${location}.checks[${invalid}]`)
     const noop = checks.findIndex(isNoopCheck)
-    if (noop !== -1) throw new Error(`[check_noop] ${location}.checks[${noop}] is an always-passing no-op. Supply a real assertion in \`checks\` with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`)
+    if (noop !== -1) throw new AdmissionError('check_noop', 'validation_error', `[check_noop] ${location}.checks[${noop}] is an always-passing no-op. Supply a real assertion in \`checks\` with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`, `${location}.checks[${noop}]`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
-    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there until the check route is repaired. Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
+    if (hostOnly) throw new AdmissionError('check_requires_host', 'budget_error', `[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there until the check route is repaired. Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`, `${location}.checks[${hostOnly.index}]`)
     // Round 9-C: a check that names a host-absolute path cannot run in the
     // disposable checkout. Refuse it here, at the shared admission point, so a
     // repair cannot silently swap its check for the source toolchain.
-    const absolute = checks.map((command, index) => ({ index, diagnostics: reconcileCheckPaths(command, `${location}.checks[${index}]`) })).find(item => item.diagnostics.length > 0)
-    if (absolute) throw new Error(formatDiagnostic(absolute.diagnostics[0]!))
+    const absolute = checks.map((command, index) => reconcileCheckPaths(command, `${location}.checks[${index}]`)[0]).find(diagnostic => diagnostic !== undefined)
+    if (absolute) throw new AdmissionError(absolute.code, 'validation_error', formatDiagnostic(absolute), absolute.location, [absolute])
   }
   if ((kind === 'implementation' || kind === 'integration') && !checks?.length) {
-    throw new Error(`${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. [check_required] Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add a real \`checks\` command and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`)
+    throw new AdmissionError('check_required', 'budget_error', `${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. [check_required] Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add a real \`checks\` command and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`, `${location}.checks`)
   }
 }

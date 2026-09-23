@@ -74,7 +74,6 @@ const actionableMessages: readonly RegExp[] = [
   /^workstreams\[/,
   /^tasks\[/,
   /^scope\[/,
-  /^scope exceeds mission scope:/,
   // Runtime authority, lifecycle and budget refusals.
   /^Unknown (?:mission|workstream|assignee|coordinator|task kind)$/,
   /^Session is not a participant in this mission$/,
@@ -128,18 +127,19 @@ class InternalFailure extends Error {
 async function exposed<T>(operation: () => Promise<T> | T, userActionable: boolean | ((message: string) => boolean) = false): Promise<T> {
   try { return await operation() } catch (error) {
     if (error instanceof MissingSession || error instanceof RequestError) throw error
+    const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
     if (error instanceof PolicyError) {
       // A type is not permission to expose host paths or unbounded details.
-      if (error.message.length === 0 || error.message.length > 4000 || unsafeDetail.test(error.message)
-        || !/^[a-z][a-z0-9_]{0,79}$/.test(error.code)) throw new InternalFailure(error)
-      throw new RequestError(error.message, { code: error.code, category: error.category })
-    }
-    const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-    if (error instanceof TaskGraphAdmissionError) {
-      // Only the runtime's typed, authored diagnostic crosses this boundary;
-      // matching prose in an arbitrary internal Error grants no visibility.
-      throw new RequestError(message.length <= 4000 && !unsafeDetail.test(message) ? message
-        : '[task_graph_invalid] Task dependencies or review sources form an invalid graph. Inspect the tasks with swarm_observe, remove the cyclic dependencies or reviewOf edge, and retry with swarm_propose.')
+      if (message.length > 0 && message.length <= 4000 && !unsafeDetail.test(message) && /^[a-z][a-z0-9_]{0,79}$/.test(error.code)) {
+        throw new RequestError(message, { code: error.code, category: error.category })
+      }
+      // A graph refusal whose task identities carry host detail has a fixed repair text.
+      if (error instanceof TaskGraphAdmissionError) {
+        throw new RequestError('[task_graph_invalid] Task dependencies or review sources form an invalid graph. Inspect the tasks with swarm_observe, remove the cyclic dependencies or reviewOf edge, and retry with swarm_propose.')
+      }
+      // A validator's own-input echo stays scrub-exempt whatever its type.
+      if (userActionable === true && message !== '') throw new RequestError(message)
+      throw new InternalFailure(error)
     }
     if (message !== '' && (userActionable === true || (typeof userActionable === 'function' && userActionable(message)))) throw new RequestError(message)
     throw new InternalFailure(error)
