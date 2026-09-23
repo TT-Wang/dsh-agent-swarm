@@ -1376,10 +1376,13 @@ export class Notices {
       const body = NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
       // A root the verify site already put in front of the owner (its rejection
-      // decision at this subject@epoch) is recorded against that decision: the
-      // row, event and reminders stay, the second wake does not. Roots with no
-      // such decision (preparation failure, ceiling, exhausted recovery) wake.
-      const cover = this.rejectionDecisionFor(mission.id, subject)
+      // decision at this subject@epoch) is recorded against that decision when
+      // the decision says all the root does: it names no dependent beyond its
+      // own rejecting review(s). The row, event and reminders stay, the second
+      // wake does not. A root that strands other work, or has no such decision
+      // (preparation failure, ceiling, exhausted recovery), wakes to name it.
+      const cover = dependents.every(task => task.reviewOf === root.id && task.status === 'blocked')
+        ? this.rejectionDecisionFor(mission.id, subject) : undefined
       this.rt.commit(mission.id, () => {
         this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupe: true, dedupKey: key, stampWitness: false, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
           ...(cover === undefined ? {} : { coveredBy: cover.id }) })

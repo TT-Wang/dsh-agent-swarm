@@ -257,6 +257,36 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   assert.equal(stallRootEvents().length, 1, 'the stall root stays a durable fact')
 })
 
+test('a rejected root that strands a dependent names it in a delivered notice, not first in a reminder', async t => {
+  // 12b12a6: the rejected root's stall-root row was recorded against the
+  // rejection decision, which names the source only; while other work ran, the
+  // stranded dependent first reached the owner in a reminder (600 s by default).
+  const f = await fixture(t, { tickMs: 10 })
+  f.runtime.notices.obligationFollowupMs = 1e9
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const other = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  const source = f.propose('Rejected implementation')
+  const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+  await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+    title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
+  await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
+  // Research kind keeps the integration-gap diagnostic (which lists every
+  // implementation branch) from naming the dependent first.
+  const dependent = f.propose('Downstream of the rejected source', { kind: 'research', checks: undefined, assigneeId: other.id })
+  f.runtime.store.transaction(() => { const row = f.runtime.store.get('tasks', dependent.id); row.dependencies = [source.id]; f.runtime.store.put('tasks', row) })
+  await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  const naming = await eventually(() => f.notices().find(delivery => delivery.deliveredAt !== undefined && delivery.content.includes(dependent.id)), 'a delivered notice names the stranded dependent', 2000)
+  assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'other work is running')
+  assert.equal(f.runtime.store.get('tasks', dependent.id).status, 'pending')
+  assert.ok(naming.notice.dedupKey.startsWith(`stall-root:${f.mission.id}:${source.id}@`), `the root's own stall-root notice names it: ${naming.notice.dedupKey}`)
+  assert.equal(naming.notice.coveredBy, undefined, 'a root that strands other work is not recorded against the rejection decision')
+  assert.ok(naming.subjects.includes(`${dependent.id}@${f.runtime.store.get('tasks', dependent.id).epoch}`), 'the dependent is a subject of the delivered notice')
+  assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('obligation-followup:')), [], 'no reminder was needed')
+})
+
 test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
   // The same generic `decision` notice shape the verify site used before, from
   // the scheduler's permanent preparation failure: it never covers a stall root.
