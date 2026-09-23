@@ -470,7 +470,7 @@ delivery lose anything) found and fixed seven defects. The regressions live in
 
 ## Round-19 workflow audit and fixes (2026-09-18)
 
-- **Deliverables the task text does not name, or names without writing.** `[deliverable_uncaptured]`
+- **Deliverables the task text does not name, or names without writing** (superseded in round 24, which deleted the text heuristic and this gate; see the round-24 entry). `[deliverable_uncaptured]`
   covers only literal in-scope file paths that `deliverablePaths()` finds in the objective or
   acceptance text (a path followed directly by a sentence-ending period is not recognised) and that
   exist as ignored regular files in the member worktree at submit time. A report the text describes
@@ -502,7 +502,7 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   confirms, which covers every fence cause and cannot be lifted by fresh input. Past that point the
   handle has been stopped, so the guarantee rests on the adapter's stop contract rather than on a
   durable row. The in-flight window is strictly stronger than before; the post-stop window is weaker.
-- **`outputs` is a declaration with a fallback, not yet the only rule.** A task that declares
+- **`outputs` is a declaration with a fallback, not yet the only rule** (superseded in round 24: the fallback is deleted). A task that declares
   `outputs` has an exact deliverable list. A row that does not, meaning a legacy mission, a staged
   draft that omits the field, or a hand-assembled `swarm_create` mission, still falls back to the
   write-verb heuristic in `src/admission.ts` and keeps every caveat recorded for rounds 4 through 19.
@@ -513,7 +513,7 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   cross-mission registry reads it as refuted. The common case, a review blocked short of a verdict,
   now reports correctly.
 - **The owner protocol is at the ceiling of its prompt budget.** `tests/roles.test.mjs` caps
-  `OWNER_PROMPT`, and after round 20 it sits within a few characters of that cap. A new protocol
+  `OWNER_PROMPT`, and after round 20 it sits within a few characters of that cap (round 24: 5528 characters, 2 below the cap). A new protocol
   sentence must replace an existing one, or state something no tool schema description can carry.
 - **`npm run test:web` fails on the team-roster assertion** in `scripts/smoke-web.mjs`, both before and
   after round 20. It is not part of the gate the validation entries record, which is why it went
@@ -593,3 +593,34 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   failure count now survives a successful retry, as it did before round 23, so a pending task that
   recovered from a transient preparation failure is not counted as legitimately waiting until it is
   dispatched again. This matches the pre-round-23 behaviour and belongs to the owner-notice rework.
+
+## Round-24 simplification batch 4: declared outputs only (2026-09-23)
+
+- **Nothing is inferred from task text.** An ignored file a task writes is captured only when it is a
+  declared output or a listed deliverable; one that is neither is silently left out, as any unlisted
+  ignored file always was. The planner must declare every file a task produces, and a path the prose
+  names outside the task scope now surfaces only when the submission is refused, not as a draft hint.
+- **A declared output only has to exist.** `[output_missing]` checks that each declared output is a
+  regular file at submission, not that the task changed it; a declared file already present in the base
+  passes unchanged and is listed in `artifact.files`.
+- **Rows written before this round.** A task stored without `outputs` reads as `[]`: it captures and
+  preserves no ignored file. Accepted rows whose stored artifact still lists `uncapturedPaths` are no
+  longer named in the completion notice.
+- **Case-folding filesystems.** A tracked (not ignored) file written under an out-of-scope case of the
+  scope directory, for example `Reports/x.md` with scope `reports/`, is carried by the handoff
+  snapshot, and on a case-folding filesystem renaming the directory cannot remove the index entry, so the
+  replacement stays wedged; this predates round 24. Declared outputs that differ only in case resolve to
+  one file there, and a declared output written in a different case whose stored spelling is in scope is
+  captured under the stored spelling.
+- **Repair and editor edges.** A repair that omits `outputs` and narrows its scope past an inherited
+  output gets the generic `[output_outside_scope]` exit that tells it to correct `outputs`. The draft
+  editor has no control that declares `[]` on an untouched task; the owner edits the field and clears it.
+- **Other required schema fields the runtime does not check.** The Harness does not enforce a tool
+  schema's required list. `swarm_verify` without `verdict` is treated as a rejection and recorded with
+  `verdict: undefined`; `swarm_message` without `kind` is delivered with no kind, so a question sent
+  that way opens no reply receipt; `swarm_submit` treats missing `deliverables` as none; and
+  `swarm_launch` enforces `tasks[].assigneeKey` only for reviewed deliverables and their reviews.
+- **The fault suite has drifted.** `npm run test:faults` passes 15 of 24 scenarios; F1, F3a-c, F4, F14,
+  F18, F19 and F21 fail identically on the round-19 main 98c6657. Some fixtures are stale (F3a-c declare
+  a check admission now refuses as a no-op); whether F19 (no-silent-state row 7b) and F21 (wedged-pass
+  release) are stale fixtures or real regressions is not yet established.

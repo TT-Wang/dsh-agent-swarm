@@ -9,6 +9,62 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-24 simplification batch 4: declared outputs only (2026-09-23)
+
+The write-verb heuristic that guessed a task's output paths from its prose, patched in rounds 4
+through 19 and rewritten three times in round 19 alone, is deleted. A live mission on 2026-09-23
+showed the planner declares `outputs` correctly: the implementation task declared
+`["docs/summary.md"]`, the review declared `[]`, and the artifact carried exactly that file.
+
+- **Capture, gates and preservation read the declaration.** `captureArtifact` force-captures every
+  declared output, ignored or not, under its on-disk spelling, and checks that spelling against the
+  scope before anything is committed. A declared output that is not a regular file at `swarm_submit`
+  or `swarm_verify` is refused with `[output_missing]` while the attempt stays running, and the text
+  names each cause: not written, deleted or renamed by the task (escalate, do not recreate), symlink or
+  symlinked parent, directory, special file. Checkpoints capture declared outputs already written and
+  skip owed ones. Handoff preservation carries exactly the declared outputs under their stored spelling
+  and fails the snapshot if one is not recorded. A recovered checkout untracks every ignored path added
+  since the task base that is not a declared output, which covers snapshots written by earlier builds.
+- **Typed capture refusals.** `[output_case_mismatch]` (the stored spelling fails the path checks:
+  rename it), `[output_path_refused]` (a declared output is outside the current scope or under a
+  dependency or scratch directory: escalate so the owner amends `outputs` or `scope`) and
+  `[artifact_path_outside_scope]` (a stray file: remove or move it and retry) replace untyped errors.
+  A capture that fails after its commit resets the member HEAD and restores the saved index.
+- **Every task declares outputs.** `swarm_propose` refuses a task without `outputs` unless it is a
+  repair, which inherits the union of every replaced task's outputs and names them in the result;
+  explicit outputs on a repair replace the inherited list. Plan launch refuses all undeclared tasks with
+  one `[outputs_required]` refusal naming every location. The draft editor keeps an untouched field
+  undeclared. An owner scope amendment that would leave declared outputs outside the scope is refused.
+  Admission checks outputs against the host's configured `verificationDependencyDirs`, the set capture
+  uses. The Harness does not enforce a tool schema's required list, so these checks live in the runtime.
+- **The outputs text says what an output is:** a file the task leaves in place, never a path it removes
+  or renames away (a delete-only task declares `[]`), a directory, a symlink or a file a check
+  generates; submission checks existence only.
+- **Deleted:** `writeDirectivePaths`, `deliverablePaths`, `ignoredDeliverablePaths` and its synchronous
+  `git check-ignore`, `reconcileObjectiveScope`, `reconcileDeliverableIgnores`, the hint-based
+  `untrackPreservedHints`, `Artifact.uncapturedPaths`, both `[deliverable_uncaptured]` gates,
+  `[deliverable_gate_unavailable]`, the prose-derived draft advisories and the round-19 heuristic tests,
+  replaced by exact-rule tests in `tests/r24-declared-outputs-capture.test.mjs`.
+
+The adversarial verification of this batch found two high-severity defects, both fixed before merge:
+on a case-insensitive filesystem a declared output whose directory case differed was committed and
+then refused, leaving the member worktree wedged on a bad commit; and a preservation snapshot written
+before the upgrade could carry a member-created `.env` that the recovered checkout then tracked and the
+next capture committed (a cross-version probe recovered an e92ce4c snapshot with the fixed build: the
+artifact no longer carries `.env`). It also found a scope amendment that stranded declared outputs,
+delete and rename tasks that could never satisfy their declaration, repairs that inherited only the
+first replaced task's outputs, a propose path that stored undeclared tasks, an editor save that declared
+every untouched task analysis-only, and admission and capture using different dependency directories;
+each has a regression that fails on 041e223.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: 1346 tests at d5c22ec, 1345 passed; the one failure was a new capture test whose setup (an owner scope amendment stranding a declared output) the new amendment check refuses. It now asserts that refusal and reaches the state through a stored row (ffdb7b3); `tests/r24-declared-outputs-capture.test.mjs` and `tests/r20-declared-outputs.test.mjs` then pass 37/37.
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness` (smoke snapshot unchanged
+  under `UPDATE_SMOKE_SNAPSHOT=1`), `test:pack` and `test:profile`: passed.
+- `npm run test:faults`: 15 of 24 pass. The nine failures (F1, F3a-c, F4, F14, F18, F19, F21) are the
+  same set, with the same errors, on the round-19 main 98c6657, so they predate this programme; F3a-c
+  fail on `[check_noop]` before any outputs check. The fault suite is not part of the recorded gate.
+
 ## Round-23 simplification batch 3: declarations and correctness (2026-09-23)
 
 - **A host that cannot prepare a check defers the review.** A failed `git worktree add`, a dependency copy
