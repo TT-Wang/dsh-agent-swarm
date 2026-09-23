@@ -101,11 +101,13 @@ export interface SchedulingPass {
  * R16-D: what the watchdog measured when it named a wedged body: the whole
  * time the body had held the mission when it was named, the bound it was
  * measured against, and the live work that held the naming to its second bound.
- * The durable `mission/stalled` event carries these facts.
+ * The durable `mission/stalled` event carries these facts. Nothing is released:
+ * the `release*` names are kept for the event's existing readers.
  */
 interface WedgeRecord {
+  /** The instant of the tick whose naming committed (a retried naming measures its own tick). */
   releasedAt: number
-  /** `releasedAt - startedAt`. */
+  /** `releasedAt - startedAt`: how long the body had held the mission when it was named. */
   gapMs: number
   /** The live subjects that held the naming to its second bound. */
   liveSubjects: string[]
@@ -818,10 +820,10 @@ export class Scheduling {
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
     const unreached = this.rt.store.list('tasks', missionId).filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-    // R16-D: a release held to its second bound names the live work that held it
+    // R16-D: a naming held to its second bound names the live work that held it
     // as a subject too. The claim is still "this pass cannot finish", but the
     // owner must be able to see which subjects made the wait unavoidable, and
-    // that the release preserved them (it cancels no task, drops no attempt and
+    // that the naming preserved them (it cancels no task, drops no attempt and
     // changes no lease). Guard pair: this naming x the off-pass sweep — the sweep
     // names what no live path advances, this names what the wedged pass never
     // reached and what held it; both carry task@epoch and neither consumes the
@@ -829,7 +831,7 @@ export class Scheduling {
     const holders = info.liveHolders ?? []
     const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]
     const heldText = info.heldByLiveWork === true && holders.length
-      ? ` The release was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
+      ? ` The naming was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
       : ''
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     // R15-D2: when a subject of this escalation is a blocked task whose stop is
@@ -865,11 +867,15 @@ export class Scheduling {
         revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
         missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
         // R16-D: what the wedge was measured against, whether live work held it,
-        // and the subjects whose work it preserved. The `release*` names are kept
-        // for every existing reader: the instant is when the watchdog named the
-        // wedge. `boundMs` keeps its original meaning (the pass's own stall bound);
-        // these facts are additive and only present on a wedge, never on the
-        // no-progress variant.
+        // and the subjects whose work it preserved. Nothing is released; the
+        // `release*` names are kept for every existing reader and describe the
+        // naming: `releasedAt` is the instant of the tick whose naming committed,
+        // `releaseGapMs` how long the body had held the mission by then,
+        // `releaseBoundMs` the bound the naming was measured against (the
+        // live-work bound when live work held it) and `releasedWhileLive` whether
+        // live work held it. `boundMs` keeps its original meaning (the pass's own
+        // stall bound); these facts are additive and only present on a wedge,
+        // never on the no-progress variant.
         ...(info.wedge === undefined ? {} : {
           releasedAt: info.wedge.releasedAt,
           releaseBoundMs: info.releaseBoundMs ?? info.boundMs,
@@ -879,9 +885,9 @@ export class Scheduling {
         }),
       })
       this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        ? `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
         : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
-        // R17-G5: the pass release is its own fact, not the board's witness. A
+        // R17-G5: the pass naming is its own fact, not the board's witness. A
         // wedged-pass escalation must not consume the board's W2 witness for a
         // fingerprint whose decision the transition-driven classifier still owes
         // (the dispatch question the dead pass never reached).
