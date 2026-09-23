@@ -1277,15 +1277,12 @@ export class SwarmRuntime {
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'task.scope', mission.scope)
-    // A repair carries the obligation it replaces: omitting `outputs` inherits
-    // the replaced task's declaration, so a replacement cannot quietly drop a
-    // deliverable the original promised. They are still checked against this
-    // task's own scope below, because a repair may narrow that scope.
-    if (input.outputs === undefined) {
-      const inherited = (input.replaces ?? []).map(previousId => this.store.get('tasks', previousId))
-        .find(previous => previous?.missionId === missionId && previous.outputs !== undefined)?.outputs
-      if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
-    }
+    // `outputs` is the only record of the files a task writes, and the Harness
+    // does not enforce a tool schema's `required` list, so admission refuses a
+    // new task that declares none rather than storing one that captures and
+    // preserves nothing. A repair may omit it to inherit the replaced tasks'
+    // declarations, which are read below once those tasks are known to exist.
+    if (input.outputs === undefined && !input.replaces?.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: a new task must declare the files it writes. Pass `outputs` with `swarm_propose` as the repository-relative files this task writes inside its `scope`, or [] for analysis-only work, then retry.')
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
     // A repair inherits the acceptance of every task it replaces: the host holds
     // those obligations, so the proposal never has to copy them. The stored list
@@ -1295,6 +1292,16 @@ export class SwarmRuntime {
     // so an unknown `replaces` id never hides a field error.
     const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
     requireStrings(acceptance, 'acceptance')
+    // A repair carries the obligation it replaces: omitting `outputs` inherits
+    // the replaced task's declaration, so a replacement cannot quietly drop a
+    // deliverable the original promised. They are still checked against this
+    // task's own scope, because a repair may narrow that scope. A repair whose
+    // replaced tasks declared nothing has nothing to inherit and must declare.
+    if (input.outputs === undefined) {
+      const inherited = input.replaces!.map(previousId => this.task(missionId, previousId)).find(previous => previous.outputs !== undefined)?.outputs
+      if (inherited === undefined) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: no task in `replaces` declared outputs for this repair to inherit. Pass `outputs` with `swarm_propose` as the repository-relative files this repair writes inside its `scope`, or [] for analysis-only work, then retry.')
+      input = { ...input, outputs: assertDeclaredOutputs(inherited, input.scope, 'task') }
+    }
     // What the host added beyond the proposal's own list is recorded on the
     // admission event and named in the swarm_propose result, so a criterion the
     // proposal left out is carried visibly, never silently.

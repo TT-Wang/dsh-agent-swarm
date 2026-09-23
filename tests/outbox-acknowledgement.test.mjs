@@ -258,7 +258,7 @@ for (const summary of [false, true]) test(`cancelled task preservation failure r
   f.runtime.kick = () => {}
   f.runtime.notices.wakeBudget = summary ? 1 : 100
   const stream = f.runtime.workstream(f.owner, f.mission.id, { title: 'Recovery', objective: 'Preserve cancelled work' })
-  const task = f.runtime.propose(f.owner, f.mission.id, { workstreamId: stream.id, title: 'Cancelled work', objective: 'Preserve work', scope: ['**'], acceptance: ['preserved'], kind: 'research', checks: [] })
+  const task = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: stream.id, title: 'Cancelled work', objective: 'Preserve work', scope: ['**'], acceptance: ['preserved'], kind: 'research', checks: [] })
   const row = f.runtime.task(f.mission.id, task.id)
   row.status = 'cancelled'; row.epoch++
   row.resumeAfterStop = { epoch: row.epoch, memberId: f.member.id, reason: 'handoff', failure: { message: 'Cannot checkpoint a workspace owned by another task', deterministic: true } }

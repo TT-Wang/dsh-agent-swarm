@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
+import { registerTools } from '../lib/tools.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
@@ -135,6 +136,38 @@ test('R20: a replacement inherits the replaced task\'s outputs', async t => {
   f.runtime.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'withdrawn so a second repair can be admitted' })
   const narrowed = f.propose('Write the adapter differently', { outputs: ['src/adapter2.ts'], replaces: [repair.id] })
   assert.deepEqual(f.runtime.store.get('tasks', narrowed.id).outputs, ['src/adapter2.ts'], 'an explicit declaration is not overwritten')
+})
+
+test('R24: propose refuses a new task without outputs on every caller path; a repair may omit them only to inherit a declaration', async t => {
+  const f = await runtimeFixture(t)
+  const required = error => {
+    assert.equal(error.code, 'outputs_required')
+    assert.equal(error.category, 'validation_error')
+    assert.match(error.message, /^\[outputs_required\] .*Pass `outputs` with `swarm_propose`/)
+    assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
+    return true
+  }
+  // A direct caller: nothing reached the store.
+  assert.throws(() => f.propose('Undeclared'), required, 'runtime.propose refuses a task that declares no outputs')
+  // swarm_propose: the schema lists outputs as required, but the Harness
+  // dispatches `execute` without checking that list, so the runtime must refuse.
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+  const tool = definitions.get('swarm_propose')
+  assert.ok(tool.parameters.required.includes('outputs'))
+  await assert.rejects(tool.execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Report', objective: 'Write the audit to docs/audit.md',
+    kind: 'research', scope: ['docs/'], acceptance: ['works'] }, { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }), required)
+  assert.deepEqual(f.runtime.store.list('tasks', f.mission.id), [], 'no refused proposal was admitted')
+  // A repair of a row that declares nothing (a store written before the field
+  // existed) has nothing to inherit, so it must declare its own.
+  const legacy = f.propose('Legacy work', { outputs: [] })
+  const row = f.runtime.store.get('tasks', legacy.id)
+  delete row.outputs
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', row))
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: legacy.id, reason: 'withdrawn so a repair can be admitted' })
+  assert.throws(() => f.propose('Repair without a declaration', { replaces: [legacy.id] }), error => required(error) && /`replaces`/.test(error.message))
+  const repair = f.propose('Repair that declares', { replaces: [legacy.id], outputs: ['src/legacy.ts'] })
+  assert.deepEqual(f.runtime.store.get('tasks', repair.id).outputs, ['src/legacy.ts'])
 })
 
 test('R20: the host-created automatic review declares no outputs', async t => {

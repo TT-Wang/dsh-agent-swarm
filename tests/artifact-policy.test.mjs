@@ -43,7 +43,7 @@ async function fixture(t) {
   const author = await runtime.addMember(owner, mission.id, { role: 'author' })
   const reviewer = await runtime.addMember(owner, mission.id, { role: 'reviewer' })
   const a = { sessionId: author.sessionId }, b = { sessionId: reviewer.sessionId }
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Review', objective: 'Inspect project', scope: ['**'], acceptance: ['Reviewed'], kind: 'research', checks: [], ...extra })
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Review', objective: 'Inspect project', scope: ['**'], acceptance: ['Reviewed'], kind: 'research', checks: [], ...extra })
   const readEvidence = async (member, actor, task, file) => {
     const result = await readFile(path.join(member.workspace, file), 'utf8')
     await workers.callbacks.toolRun(member.id, { tool: 'read', arguments: { path: file }, result, isError: false })

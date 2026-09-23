@@ -47,7 +47,7 @@ async function fixture(t) {
   const integrator = await runtime.addMember(owner, mission.id, { name: 'Integrator', role: 'integration' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Complete the original graph' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', assigneeId: author.id, scope: ['src/'], acceptance: ['done'], checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const integration = dependencies => propose('Existing integration', { kind: 'integration', assigneeId: integrator.id, dependencies: dependencies.map(task => task.id) })

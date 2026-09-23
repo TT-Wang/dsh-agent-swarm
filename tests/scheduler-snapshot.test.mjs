@@ -66,7 +66,7 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5000 })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation', maxOutputTokens: 5000 })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = title => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: undefined })
   const taskOf = id => runtime.store.get('tasks', id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
@@ -131,7 +131,7 @@ test('S1r: a live operation whose lease already expired is renewed, not expired,
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
   const actor = { sessionId: member.sessionId }
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Long verification', objective: 'Long host verification',
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long verification', objective: 'Long host verification',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, maxRecoveryAttempts: 3 })
   const claimed = await runtime.claim(actor, mission.id, task.id)
   // A live operation (verification activity) with an already-expired lease: the

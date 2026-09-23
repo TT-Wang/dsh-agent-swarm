@@ -60,7 +60,7 @@ export async function providerFixture({ leaseMs = 60_000, fault }) {
     }
   })
   const task = runtime.propose(FAULT_OWNER, mission.id, {
-    workstreamId: stream.id, title: 'Provider fault target', objective: 'Carry the injected provider fault',
+    outputs: [], workstreamId: stream.id, title: 'Provider fault target', objective: 'Carry the injected provider fault',
     kind: 'implementation', scope: ['**'], acceptance: ['provider fault recovery holds'], checks: ['true'], assigneeId: author.id,
   })
   state.taskId = task.id

@@ -71,7 +71,7 @@ async function fixture(t) {
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   // The tick timer is deliberately not started: these tests drive writes directly
   // so the interleaving is deterministic rather than load-dependent.
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Task', objective: 'Task',
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Task', objective: 'Task',
     kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test -d .'], assigneeId: author.id })
   const store = runtime.store
   const refusals = () => store.events(mission.id, 500).filter(event => event.type === STALE_TASK_REFUSAL_EVENT)

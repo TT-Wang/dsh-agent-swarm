@@ -109,7 +109,7 @@ async function fixture(t, options = {}) {
   f.current = rt => taskId => rt.store.get('tasks', taskId)
   f.events = rt => rt.store.events(mission.id, 500)
   f.taskRecord = taskId => readFile(join(root, 'worktrees', mission.id, 'tasks', `${taskId}.json`), 'utf8').then(JSON.parse)
-  f.propose = (overrides = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...overrides })
+  f.propose = (overrides = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...overrides })
   /** Author claims, then leaves in-scope and out-of-scope WIP in its worktree. */
   f.claimWithWip = async task => {
     await runtime.claim(f.actor(author), mission.id, task.id)
@@ -294,7 +294,7 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   const claim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await writeFile(join(f.runtime.store.get('members', f.author.id).workspace, 'src', 'answer.txt'), 'answer\n')
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claim.attempt.id, output: 'ready for review' })
-  const review = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Review', objective: 'Review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], checks: ['test -f src/answer.txt && echo checked'], assigneeId: f.reviewer.id })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], checks: ['test -f src/answer.txt && echo checked'], assigneeId: f.reviewer.id })
   const reviewClaim = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   const verdict = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: 'accept', reason: 'Independent review' })
   assert.equal(verdict.status, 'accepted', 'the cleanup failure never masks the check result')

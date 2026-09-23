@@ -22,7 +22,7 @@ async function fixture(t, checks, options = {}) {
   await writeFile(join(f.author.workspace, 'src/answer.txt'), 'candidate\n')
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
+    outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

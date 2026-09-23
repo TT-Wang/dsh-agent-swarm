@@ -38,7 +38,7 @@ async function firstHost(t, statePath) {
   const mission = runtime.create(owner, { title: 'Restart', objective: 'Survive a host restart', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Long task', objective: 'Survive', kind: 'implementation',
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long task', objective: 'Survive', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, maxRecoveryAttempts: 1 })
   const claimed = await runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
   await runtime.dispose()

@@ -188,13 +188,13 @@ async function missionFixture(t, options = {}) {
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewers = []
   for (const name of options.reviewerNames ?? ['Reviewer']) reviewers.push(await runtime.addMember(owner, mission.id, { name, role: 'verification' }))
-  const source = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Source', objective: 'Source', kind: 'implementation',
+  const source = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Source', objective: 'Source', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: options.sourceChecks ?? [PASSING_CHECK], assigneeId: author.id })
   const sourceClaim = await runtime.claim({ sessionId: author.sessionId }, mission.id, source.id)
   await runtime.submit({ sessionId: author.sessionId }, mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
   const reviews = []
   for (const reviewer of reviewers) {
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${reviewer.id}`, objective: 'Review', kind: 'verification',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${reviewer.id}`, objective: 'Review', kind: 'verification',
       reviewOf: source.id, scope: ['**'], acceptance: ['works'], checks: options.reviewChecks ?? options.sourceChecks ?? [PASSING_CHECK], checkTimeoutMs: 30000, assigneeId: reviewer.id })
     const claim = await runtime.claim({ sessionId: reviewer.sessionId }, mission.id, review.id)
     reviews.push({ review, claim, reviewer })

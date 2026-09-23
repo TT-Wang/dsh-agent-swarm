@@ -43,7 +43,7 @@ async function setup(t) {
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const execution = { agent: { id: 'ceiling-owner' }, signal: new AbortController().signal }
-  const propose = extra => definitions.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Bound', objective: 'Bound the work', kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra }, execution)
+  const propose = extra => definitions.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Bound', objective: 'Bound the work', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [], ...extra }, execution)
   return { runtime, workers, owner, mission, stream, builder, definitions, propose }
 }
 

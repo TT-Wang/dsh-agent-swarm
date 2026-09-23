@@ -46,12 +46,12 @@ async function fixture(t) {
   const actor = member => ({ sessionId: member.sessionId })
   const stored = task => runtime.store.get('tasks', task.id)
   // Built without an `acceptance` key unless one is passed, so omission is real.
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], checks: ['test'], ...extra })
   async function verdict(task, value) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['independent review'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     await runtime.verify(actor(reviewer), mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: value, reason: `Independent host checks ${value}` })
@@ -138,7 +138,7 @@ test('a repair that leaves out a replaced criterion keeps it and names it on the
   const restated = await call({ title: 'Repair restating', replaces: [repair.id], acceptance: ['supports IE11', 'works'] })
   assert.equal(proposed(restated.task.id).data.inheritedAcceptance, undefined)
   assert.equal(restated.rendered.note, undefined)
-  const fresh = await call({ title: 'Fresh', acceptance: ['works'] })
+  const fresh = await call({ title: 'Fresh', acceptance: ['works'], outputs: [] })
   assert.equal(proposed(fresh.task.id).data.inheritedAcceptance, undefined)
   assert.equal(fresh.rendered.note, undefined)
 })

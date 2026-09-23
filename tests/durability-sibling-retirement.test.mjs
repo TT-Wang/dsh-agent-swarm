@@ -52,17 +52,17 @@ async function fixture(t) {
   const actor = member => ({ sessionId: member.sessionId })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
-  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: 'Independent review',
+  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
   async function submittedSource() {
-    const source = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+    const source = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
       kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
     const claimed = await runtime.claim(actor(author), mission.id, source.id)
     await runtime.submit(actor(author), mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
     return source
   }
   async function submittedSourceWithEvidence(outcome = 'supported') {
-    const source = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement with evidence', objective: 'Implement',
+    const source = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement with evidence', objective: 'Implement',
       kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
     const claimed = await runtime.claim(actor(author), mission.id, source.id)
     const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })

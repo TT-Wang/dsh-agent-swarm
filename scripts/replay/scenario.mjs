@@ -73,7 +73,7 @@ export async function runScenario(options = {}) {
     const builder = (await call('swarm_add_member', { missionId: mission.id, name: 'Builder', role: 'implementation' }, owner)).result
     const reviewer = (await call('swarm_add_member', { missionId: mission.id, name: 'Reviewer', role: 'verification' }, owner)).result
     const missionId = mission.id
-    const propose = async (extra, sessionId = owner) => (await call('swarm_propose', { missionId, workstreamId: stream.id, scope: ['src/'], acceptance: ['works'], ...extra }, sessionId)).result
+    const propose = async (extra, sessionId = owner) => (await call('swarm_propose', { missionId, workstreamId: stream.id, outputs: [], scope: ['src/'], acceptance: ['works'], ...extra }, sessionId)).result
     const publish = async (taskId, sessionId) => {
       const runId = await workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'true' }, result: { output: 'ok' }, isError: false })
       await call('swarm_publish', { missionId, taskId, attemptId: attemptOf(taskId), claim: `Evidence for ${taskId}`, outcome: 'supported', toolRunIds: [runId] }, sessionId)

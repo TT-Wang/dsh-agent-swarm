@@ -39,7 +39,7 @@ async function manual(t, overrides = {}, acceptance = ['works']) {
   const a = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actorA = { sessionId: a.sessionId }, actorB = { sessionId: b.sessionId }
-  const propose = (actor = actorA, extra = {}) => runtime.propose(actor, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
+  const propose = (actor = actorA, extra = {}) => runtime.propose(actor, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const controls = () => workers.deliveries.filter(d => d.kind === 'control' && d.to === 'owner')
   async function submitted(extra = {}) {
@@ -353,8 +353,8 @@ test('a stalled automatic board preserves covered leftovers and completes only a
   assert.throws(() => f.runtime.control(f.owner, missionId, 'complete', 'try'), /unfinished or blocked required work/)
   // The owner covers the criterion with new reviewed research instead of repairing the blocked chain.
   const stream = f.runtime.store.list('workstreams', missionId)[0]
-  const doc = f.runtime.propose(f.owner, missionId, { workstreamId: stream.id, title: 'doc', objective: 'Document', kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeId: builder.id, maxRecoveryAttempts: 3 })
-  const rdoc = f.runtime.propose(f.owner, missionId, { workstreamId: stream.id, title: 'rdoc', objective: 'Review doc', kind: 'verification', reviewOf: doc.id, scope: ['src/'], acceptance: ['documented'], assigneeId: reviewer.id, maxRecoveryAttempts: 3 })
+  const doc = f.runtime.propose(f.owner, missionId, { outputs: [], workstreamId: stream.id, title: 'doc', objective: 'Document', kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeId: builder.id, maxRecoveryAttempts: 3 })
+  const rdoc = f.runtime.propose(f.owner, missionId, { outputs: [], workstreamId: stream.id, title: 'rdoc', objective: 'Review doc', kind: 'verification', reviewOf: doc.id, scope: ['src/'], acceptance: ['documented'], assigneeId: reviewer.id, maxRecoveryAttempts: 3 })
   await researchSubmitted(doc)
   await verdict(rdoc, 'accept')
   await settle()

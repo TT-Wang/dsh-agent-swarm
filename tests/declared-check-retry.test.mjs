@@ -35,7 +35,7 @@ async function verifySource(f, task) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
     reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -154,7 +154,7 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     const review = f.runtime.propose(f.owner, f.mission.id, {
-      workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+      outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
       reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
     })
     const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

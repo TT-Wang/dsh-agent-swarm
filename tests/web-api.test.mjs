@@ -400,7 +400,7 @@ test('replacement cycles return an actionable bad-request through native RPC wit
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Graph', objective: 'Repair dependencies' })
-  const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
+  const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], outputs: [], checks: ['test -d .'] }
   const original = f.runtime.propose(owner, mission.id, input)
   const dependent = f.runtime.propose(owner, mission.id, { ...input, title: 'Dependent', dependencies: [original.id] })
   f.runtime.cancel(owner, mission.id, { taskId: original.id, reason: 'Revise implementation' })
@@ -472,7 +472,7 @@ test('mission authority, lifecycle and budget refusals reach the browser by thei
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, { ...f.input, budget: { ...budget, maxWorkers: 1 } })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
-  const propose = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  const propose = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
   const refused = async (endpoint, payload, message, policyCode, category) => {
     const response = await f.rpc(endpoint, { sessionId: f.ownerId, ...payload })
@@ -501,7 +501,7 @@ test('task admission refusals reach the browser by their policy code, with the l
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
-  const research = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  const research = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   const pending = f.runtime.propose(owner, mission.id, research)
   const before = f.runtime.store.list('tasks', mission.id)
   const refused = async (input, message, policyCode, category) => {
@@ -517,6 +517,10 @@ test('task admission refusals reach the browser by their policy code, with the l
     `replaces ${pending.id}: that task is pending, and only blocked or cancelled work can be replaced; wait for its verdict or use swarm_handoff/challenge`,
     'replacement_source_not_blocked', 'tool_error')
   await refused({ ...research, maxRecoveryAttempts: 0 }, 'maxRecoveryAttempts must be a positive safe integer', 'task_recovery_limit_invalid', 'validation_error')
+  // The browser RPC is a direct runtime caller with no tool schema in front of
+  // it: a task without outputs is refused, typed, instead of being stored.
+  const { outputs: _outputs, ...undeclared } = research
+  await refused(undeclared, '[outputs_required] `outputs` is required: a new task must declare the files it writes. Pass `outputs` with `swarm_propose` as the repository-relative files this task writes inside its `scope`, or [] for analysis-only work, then retry.', 'outputs_required', 'validation_error')
   assert.deepEqual(f.runtime.store.list('tasks', mission.id), before, 'a refused proposal admits nothing')
 })
 
@@ -528,7 +532,7 @@ test('an automatic mission refuses an unbounded propose RPC as a typed bad-reque
   f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_typed', ownerSessionId: f.ownerId,
     commandId: 'typed', goal: 'g', workspace: f.workspace, status: 'running', createdAt: Date.now(), updatedAt: Date.now(), missionId: mission.id }))
   const before = f.runtime.store.list('tasks', mission.id)
-  const input = { workstreamId: stream.id, title: 'Unbounded', objective: 'Implement it', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
+  const input = { workstreamId: stream.id, title: 'Unbounded', objective: 'Implement it', kind: 'implementation', scope: ['src/'], acceptance: ['works'], outputs: [], checks: ['test -d .'] }
   const recovery = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input })
   assert.equal(recovery.result.ok, false)
   assert.equal(recovery.result.error.code, 'bad-request', recovery.text)

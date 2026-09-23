@@ -139,7 +139,7 @@ test('an accepted replacement satisfies the original prerequisite without replac
   const common = { workstreamId: report.workstreamId, scope: report.scope, acceptance, maxRecoveryAttempts: 3 }
   const replacement = f.runtime.propose(f.owner, f.missionId, { ...common, title: 'Repair the tests audit', objective: 'Recover the withdrawn track',
     kind: 'research', assigneeId: f.author.id, replaces: [original.id] })
-  f.runtime.propose(f.owner, f.missionId, { ...common, title: 'Review the repair', objective: 'Verify the repaired audit',
+  f.runtime.propose(f.owner, f.missionId, { outputs: [], ...common, title: 'Review the repair', objective: 'Verify the repaired audit',
     kind: 'verification', assigneeId: f.reviewer.id, reviewOf: replacement.id })
   await f.submit(replacement); await f.accept(replacement)
   assert.deepEqual(f.current(report.id).dependencies, report.dependencies, 'original dependency ids resolve through the accepted replacement')
@@ -154,7 +154,7 @@ test('an accepted replacement satisfies the original prerequisite without replac
 test('a blocked optional experiment keeps its evidence and status when the required plan completes', async t => {
   const f = await fixture(t)
   const report = f.task('s_report')
-  const experiment = f.runtime.propose(f.owner, f.missionId, { workstreamId: report.workstreamId, scope: report.scope,
+  const experiment = f.runtime.propose(f.owner, f.missionId, { outputs: [], workstreamId: report.workstreamId, scope: report.scope,
     acceptance: ['Explore an optional hypothesis'], title: 'Optional experiment', objective: 'Explore a non-required alternative',
     kind: 'research', experiment: true, maxSteps: 1, maxRecoveryAttempts: 3, assigneeId: f.author.id })
   const claimed = await f.runtime.claim(f.actor(f.author), f.missionId, experiment.id)

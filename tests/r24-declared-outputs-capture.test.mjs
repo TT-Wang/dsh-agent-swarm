@@ -107,7 +107,7 @@ async function fixture(t) {
   const peer = await runtime.addMember(owner, mission.id, { role: 'research' })
   const reviewer = await runtime.addMember(owner, mission.id, { role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Report', objective: 'Inspect the repository', scope: ['docs/', 'notes/'], acceptance: ['Reviewed'], kind: 'research', checks: [], ...extra })
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Report', objective: 'Inspect the repository', scope: ['docs/', 'notes/'], acceptance: ['Reviewed'], kind: 'research', checks: [], ...extra })
   const readEvidence = async (member, task, file) => {
     const result = await readFile(path.join(member.workspace, file), 'utf8')
     await workers.callbacks.toolRun(member.id, { tool: 'read', arguments: { path: file }, result, isError: false })
@@ -293,7 +293,12 @@ test('a declared draft survives a handoff and is captured by the replacement, wh
 test('a stored task without outputs declares none: an ignored draft and a .env its prose names are neither preserved nor captured', async t => {
   const f = await fixture(t)
   const proposed = f.propose({ objective: 'Write docs/report.md and read DATABASE_URL from .env', acceptance: ['Write docs/report.md'], scope: ['**'] })
-  assert.equal(f.taskRow(proposed.id).outputs, undefined, 'a row without the field, as a legacy or manual assembly leaves it')
+  // Admission refuses a task without outputs, so the row a store written
+  // before the field existed still holds is made by dropping it.
+  const legacy = f.taskRow(proposed.id)
+  delete legacy.outputs
+  f.runtime.store.transaction(() => f.runtime.store.put('tasks', legacy))
+  assert.equal(f.taskRow(proposed.id).outputs, undefined, 'a row without the field, as a legacy store leaves it')
   const task = await f.runtime.claim(f.actor(f.author), f.mission.id, proposed.id)
   await writeFile(path.join(f.author.workspace, 'notes', 'config.md'), 'uses .env\n')
   await writeFile(path.join(f.author.workspace, '.env'), SECRET)

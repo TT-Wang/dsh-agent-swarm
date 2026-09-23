@@ -54,7 +54,7 @@ test('replayed member session returns only new content, refuses worker detail=fu
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Replay' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
   let current = await runtime.claim(actor, mission.id, task.id)
 
   const results = []
@@ -71,7 +71,7 @@ test('replayed member session returns only new content, refuses worker detail=fu
     }
     if (turn.reassign) {
       await runtime.submit(actor, mission.id, { taskId: current.id, attemptId: current.attempt.id, output: 'first task done' })
-      const next = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Follow-up', objective: 'Continue the session', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
+      const next = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Follow-up', objective: 'Continue the session', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
       current = await runtime.claim(actor, mission.id, next.id)
     }
     results.push(runtime.observe(actor, mission.id))

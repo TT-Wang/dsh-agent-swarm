@@ -46,7 +46,7 @@ async function runtimeFixture(t) {
   const owner={sessionId:'owner'}, mission=runtime.create(owner,{title:'Activity',objective:'Work',workspace:'/source',scope:['src/'],acceptance:['works'],budget})
   const stream=runtime.workstream(owner,mission.id,{title:'Code',objective:'Work'})
   const member=await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'}), actor={sessionId:member.sessionId}
-  const propose=(extra={})=>runtime.propose(owner,mission.id,{workstreamId:stream.id,title:'Task',objective:'Work',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['check'],maxRecoveryAttempts:1,...extra})
+  const propose=(extra={})=>runtime.propose(owner,mission.id,{ outputs: [],workstreamId:stream.id,title:'Task',objective:'Work',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['check'],maxRecoveryAttempts:1,...extra})
   const task=await runtime.claim(actor,mission.id,propose().id)
   const snapshot=()=>runtime.snapshot(owner,mission.id)
   const activity={id:'owned-operation',kind:'tool',tool:'slow-tool',startedAt:Date.now(),updatedAt:Date.now()}

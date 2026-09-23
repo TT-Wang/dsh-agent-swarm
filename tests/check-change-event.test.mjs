@@ -36,9 +36,9 @@ async function runtimeFixture(t) {
   const mission = runtime.create(owner, { title: 'Check lineage', objective: 'Track declared checks', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement change',
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['npm run typecheck'], ...extra })
-  const research = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Analyse', objective: 'Analyse the change',
+  const research = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Analyse', objective: 'Analyse the change',
     kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra })
   const checkEvents = () => runtime.store.events(mission.id, 500).filter(event => event.type === 'task/check-changed')
   return { runtime, owner, mission, stream, propose, research, checkEvents }

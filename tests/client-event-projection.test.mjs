@@ -111,7 +111,7 @@ test('a real restart with the human root removed projects the revocation with it
     workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = before.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  before.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  before.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   await before.start(grants)
   await eventually(() => workers.prepared > 0, 'the mission never started working')
   await before.dispose()

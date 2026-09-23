@@ -39,7 +39,7 @@ async function setup(t, overrides = {}, options = {}) {
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
   const actorA = {sessionId:a.sessionId}, actorB = {sessionId:b.sessionId}
-  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
+  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{ outputs: [],workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
   return {runtime,workers,config,owner,mission,stream,a,b,actorA,actorB,propose}
 }
 test('participants propose work within the same scope and budget, without captain relaying',async t=>{

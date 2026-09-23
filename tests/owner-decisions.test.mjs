@@ -66,7 +66,7 @@ async function scenario(t, { workers = new Workers(), config = {}, directory } =
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => f.runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const actorFor = member => ({ sessionId: member.sessionId })
-  const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
+  const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
   const notices = () => f.runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const block = (task, extra = {}) => {
     const row = f.runtime.store.get('tasks', task.id)
@@ -92,9 +92,9 @@ test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carri
   const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } })
   const stream = limited.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const builder = await limited.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-  await limited.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
+  await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
   let refusal
-  try { await limited.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Second', objective: 'Second', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id }) }
+  try { await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Second', objective: 'Second', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id }) }
   catch (error) { refusal = error }
   assert.ok(refusal instanceof Error, `the second proposal is refused: ${String(refusal)}`)
   assert.match(String(refusal), /task budget|ceiling/i)

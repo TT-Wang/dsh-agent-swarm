@@ -58,7 +58,7 @@ test('R11-15: two members naming the same temp path emit one durable event and o
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
-  const propose = assigneeId => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
+  const propose = assigneeId => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId })
   await runtime.claim({ sessionId: first.sessionId }, mission.id, propose(first.id).id)
   await runtime.claim({ sessionId: second.sessionId }, mission.id, propose(second.id).id)

@@ -60,7 +60,7 @@ async function setup(t, options = {}) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix governance' })
   const addMember = (input, admittedId) => runtime.addMember(owner, mission.id, { maxOutputTokens: 1000, ...input }, admittedId)
   const propose = (actor, extra = {}, admittedId) => runtime.propose(actor, mission.id, {
-    workstreamId: stream.id, title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra }, admittedId)
+    outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra }, admittedId)
   const events = type => runtime.snapshot(owner, mission.id).events.filter(event => event.type === type)
   return { runtime, workers, mission, stream, owner, addMember, propose, events }
 }

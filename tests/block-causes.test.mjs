@@ -145,7 +145,7 @@ test('the guard-chain board reads a preparation block from the recorded failure,
     scope: ['src/'], acceptance: ['works'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-  const propose = title => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
   const put = (task, fields) => { const row = runtime.store.get('tasks', task.id); Object.assign(row, fields); runtime.store.transaction(() => runtime.store.put('tasks', row)) }
   // Resumed after its preparation was repaired, then blocked again for another

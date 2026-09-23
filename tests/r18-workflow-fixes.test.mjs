@@ -94,7 +94,7 @@ async function fixture(t, config = {}) {
   const reopen = async () => { await f.runtime.dispose(); Object.assign(f, open()); await f.runtime.start() }
   return Object.assign(f, { directory, owner, mission, stream, author, second, reviewer, actor, reopen })
 }
-const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title, objective: title,
+const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title, objective: title,
   kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
 const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
 const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status

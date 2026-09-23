@@ -395,7 +395,7 @@ test('R14 runtime (budget chain): a refused worker proposal escalates as a coded
     f.propose({ title: 'Owner fills the only slot' })
     const stream = f.runtime.store.list('workstreams', f.mission.id)[0]
     assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, {
-      workstreamId: stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research',
+      outputs: [], workstreamId: stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research',
       scope: ['**'], acceptance: f.mission.acceptance,
     }), /task budget exhausted/)
     const notice = await eventually(() => f.workers.deliveries

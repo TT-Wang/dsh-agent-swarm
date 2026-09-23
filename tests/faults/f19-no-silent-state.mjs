@@ -369,7 +369,7 @@ await runScenario({
         const evidence = publishEvidence(f, task, claimed.attempt.id)
         await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate with evidence' })
         const review = f.runtime.propose(f.owner, f.mission.id, {
-          workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
+          outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
           reviewOf: task.id, scope: ['**'], acceptance: ['fault recovery is proven from durable state'], assigneeId: f.reviewer.id,
         })
         const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

@@ -25,7 +25,7 @@ const publishEvidence = (f, task, attemptId) => {
   return f.runtime.publish(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId, claim: 'Host-backed claim', outcome: 'supported', toolRunIds: [run.id] })
 }
 const proposeResearch = (f, extra = {}) => f.runtime.propose(f.owner, f.mission.id, {
-  workstreamId: f.stream.id, title: 'Research the change', objective: 'Read-only audit of the change', kind: 'research',
+  outputs: [], workstreamId: f.stream.id, title: 'Research the change', objective: 'Read-only audit of the change', kind: 'research',
   scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.author.id, ...extra,
 })
 
@@ -78,7 +78,7 @@ test('R10-16/R11-16: a challenge to research evidence admits an independent repl
   const evidence = publishEvidence(f, source, claimed.attempt.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Research artifact' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review the research', objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: 'Review the research', objective: 'Independent review', kind: 'verification',
     reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -123,7 +123,7 @@ test('R11-18: the rejection reason and repair path reach the source author', asy
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
     reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

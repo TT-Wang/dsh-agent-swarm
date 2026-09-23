@@ -22,7 +22,7 @@ async function fixture(t) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const a = await runtime.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'B', role: 'implementation' })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Task', objective: 'Task', kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra })
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Task', objective: 'Task', kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra })
   return { runtime, workers, owner, mission, a, b, propose }
 }
 

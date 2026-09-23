@@ -164,7 +164,7 @@ test('A2-01: both spellings are refused at runtime.propose', async t => {
   const owner = { sessionId: 'a2-01-owner' }
   const mission = runtime.create(owner, { title: 'Bypass', objective: 'Refuse host paths', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const propose = checks => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
+  const propose = checks => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks })
   for (const check of ['cat \\/Users/tongtao/secret', 'cat //Users/tongtao/secret']) {
     assert.throws(() => propose([check]), /\[check_absolute_path\]/, check)

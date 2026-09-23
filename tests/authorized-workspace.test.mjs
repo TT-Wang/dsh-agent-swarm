@@ -142,10 +142,10 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
   await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   // swarm_propose accepts no workspace and cannot re-point an existing mission.
   const stream = runtime.workstream({ sessionId: 'owner' }, mission.id, { title: 'Main', objective: 'Main' })
-  await runtime.propose({ sessionId: 'owner' }, mission.id, { workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  await runtime.propose({ sessionId: 'owner' }, mission.id, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   // Extra grant-shaped arguments are ignored: the call may admit an in-mission
   // task or fail for its own reasons, but it can never re-point the mission.
-  await tools.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
+  await tools.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
   assert.deepEqual({ workspace: runtime.store.get('missions', mission.id).workspace, root: runtime.store.get('missions', mission.id).workspaceGrantRoot }, { workspace: mission.workspace, root: mission.workspaceGrantRoot })
   // The configured set is a snapshot: mutating the caller's array cannot widen it.
   const mutable = [{ path: granted }]
@@ -273,7 +273,7 @@ test('AC6: a removed root refuses new missions and fences a running mission with
   const mission = runtime.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   await runtime.start(before)
   await eventually(() => workers.prepared > 0, 'the mission never started working')
   await runtime.dispose()

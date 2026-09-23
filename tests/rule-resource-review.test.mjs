@@ -28,12 +28,12 @@ async function fixture(t) {
   const member = await rt.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const other = await rt.addMember(owner, mission.id, { name: 'B', role: 'implementation' })
   const actor = { sessionId: member.sessionId }
-  const task = rt.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Implement source', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], maxSteps: 1, maxFindings: 5, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId: member.id })
+  const task = rt.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Implement source', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], maxSteps: 1, maxFindings: 5, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId: member.id })
   return { get rt() { return rt }, workers, owner, mission, member, other, actor, task,
     async restart() { await rt.dispose(); rt = new SwarmRuntime(config, workers); rt.kick = () => {}; await rt.start() },
     holdCheckpoint() { workers.checkpointGate = new Promise(resolve => { releaseCheckpoint = resolve }); return () => { releaseCheckpoint(); workers.checkpointGate = undefined } },
     holdStop() { workers.stopGate = new Promise(resolve => { releaseStop = resolve }); return () => { releaseStop(); workers.stopGate = undefined } },
-    nextTask(assigneeId = member.id) { return rt.propose(owner, mission.id, { workstreamId: stream.id, title: 'Next', objective: 'Next work', kind: 'implementation', scope: ['src/next.ts'], acceptance: ['works'], checks: ['test'], maxSteps: 5, maxFindings: 5, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId }) },
+    nextTask(assigneeId = member.id) { return rt.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Next', objective: 'Next work', kind: 'implementation', scope: ['src/next.ts'], acceptance: ['works'], checks: ['test'], maxSteps: 5, maxFindings: 5, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId }) },
   }
 }
 
@@ -256,7 +256,7 @@ test('task headroom warns before the final independent review admission and leav
   assert.equal(warnings()[0].data.projectionBasis, 'admitted-plus-unpaired-reviews')
   assert.equal(f.rt.mission(f.mission.id).status, 'active')
   assert.equal(f.rt.task(f.mission.id, extra.id).status, 'pending')
-  const review = f.rt.propose(f.owner, f.mission.id, { workstreamId: extra.workstreamId, title: 'Review work', objective: 'Review the source',
+  const review = f.rt.propose(f.owner, f.mission.id, { outputs: [], workstreamId: extra.workstreamId, title: 'Review work', objective: 'Review the source',
     kind: 'verification', reviewOf: extra.id, scope: ['src/'], acceptance: ['works'], assigneeId: f.other.id })
   f.rt.gates.warnBudget(f.rt.mission(f.mission.id))
   assert.equal(warnings().length, 1, 'review admission consumes its already projected slot, without a duplicate wake')
