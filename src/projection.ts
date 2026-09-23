@@ -81,7 +81,8 @@ export function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boole
  * parked member dispatchable), the W6 idle close-out (which owns the attempt
  * until it fences it, so this agrees with it rather than racing it), the dispatch
  * decision (which asks `startBlocker` about the handle, never this status) and
- * the guard board (`guardProgressActions` reads `working` as progress).
+ * the test-side guard model (tests/guard-model.mjs, whose `guardProgressActions`
+ * reads `working` as progress).
  */
 export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean): MemberStatus {
   if (phase === 'stopped') return 'stopped'

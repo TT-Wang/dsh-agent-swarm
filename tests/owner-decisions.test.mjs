@@ -31,6 +31,7 @@ import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js
 import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
+import { guardBoard } from './guard-model.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -338,7 +339,7 @@ test('R15-F2/R17-G7: a member owning a live attempt can never read idle — impo
   // The projection derives the phase from the durable task rows, not from the row.
   assert.equal(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection shows the live attempt even while a stale status write is presented')
   // The guard board derives the same fact for the model-facing progress action.
-  const board = f.runtime.scheduling.guardBoard(f.mission.id)
+  const board = guardBoard(f.runtime, f.mission.id)
   assert.equal(board.members.find(member => member.id === builder.id).status, 'working', 'the guard board derives a working member from the live attempt')
   // Every read on every tick derives the same value; nothing writes the row.
   await sleep(250)
@@ -362,7 +363,7 @@ test('R15-F2/R17-G7: a member owning a live attempt can never read idle — impo
   f.runtime.store.put('tasks', done)
   await sleep(250)
   assert.notEqual(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection stops reporting work once the attempt is gone')
-  const after = f.runtime.scheduling.guardBoard(f.mission.id)
+  const after = guardBoard(f.runtime, f.mission.id)
   assert.equal(after.members.find(member => member.id === builder.id).status, 'idle', 'with no live attempt the same derivation is idle')
   assert.equal(f.runtime.store.get('members', builder.id).status, 'idle', 'the derived read stops claiming work once the attempt is gone')
   // The idle callback removes the attempt through the close-out path; the status

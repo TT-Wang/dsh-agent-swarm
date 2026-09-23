@@ -4,11 +4,11 @@
  * The owner's prototype censuses every live task as RECOVERABLE, OWNER-GATED or
  * DEAD END. This file makes that census checkable from the state machines
  * instead of running it by hand, over the *same* generated board space and the
- * *same* guard vocabulary the dispatch path uses (`guardActions`,
- * `guardMissionTerminal`, `terminalEscalation` in `src/scheduling.ts`,
- * `guardTerminal` in `src/refusals.ts`; the generator lives in
- * tests/guard-states.mjs, shared with tests/guard-terminals.test.mjs). No second
- * model of the board is grown here.
+ * *same* guard vocabulary the property test uses (`guardActions`,
+ * `guardMissionTerminal`, `terminalEscalation` in tests/guard-model.mjs, whose
+ * terminal is production's `guardTerminal` in `src/refusals.ts`; the generator
+ * lives in tests/guard-states.mjs, shared with tests/guard-terminals.test.mjs).
+ * No second model of the board is grown here.
  *
  * Classification, per live task (a task is live while it is neither accepted nor
  * cancelled): the census projects the board to that one task and asks the
@@ -39,7 +39,7 @@
  * **0 dead ends and 4 owner-gated**, the four being the blocked reviews whose
  * sources were rejected, each naming a real exit pair. That board is
  * reconstructed here from durable rows through the production projection
- * (`SwarmRuntime.scheduling.guardBoard`) and must classify as 0 dead ends and
+ * (`guardBoard` in tests/guard-model.mjs) and must classify as 0 dead ends and
  * exactly 4 owner-gated. Over the whole reachable closure the corrected
  * (task-scoped) census reports **60 recoverable / 12740 owner-gated / 0 dead
  * ends**; before the D1 fix it reported 86/12714/0, the difference being the
@@ -71,7 +71,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { guardActions, guardMissionTerminal } from '../lib/scheduling.js'
+import { guardActions, guardBoard, guardMissionTerminal } from './guard-model.mjs'
 import { reconcileTaskAdmission } from '../lib/admission.js'
 import { ReplayGraphError, orchestratorCommands } from '../lib/trace.js'
 import { assessRefusal, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
@@ -122,7 +122,7 @@ export function census(board, actions = guardActions) {
     // to this task — the same reason the member-scoped progress action is
     // dropped below. A `stopped` member cannot act at all. What remains is the
     // set the production dispatch predicate itself considers (`idle`/`waiting`),
-    // so no second model of the board is grown: the production `guardActions`
+    // so no second model of the board is grown: the shared `guardActions`
     // still answers every question.
     const projected = {
       ...board,
@@ -225,7 +225,7 @@ test('DEAD census reference: this round\'s board shape reports 0 dead ends and 4
   const f = await setup({ config: { tickMs: 10_000 } })
   try {
     const reviews = putReferenceBoard(f)
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     const result = census(board)
     assert.equal(result.totals[DEAD_END], 0, 'this round\'s board has no dead ends')
     const ownerGated = result.perTask.filter(entry => entry.outcome === OWNER_GATED)
@@ -256,7 +256,7 @@ test('DEAD non-vacuity: the classifier returns DEAD END under the documented mut
         kind: 'implementation', dependencies: [], scope: ['**'], acceptance: ['works'], checks: [], status: 'blocked', priority: 0, experiment: false, epoch: 1, evidenceIds: [],
       })
     })
-    board = f.runtime.scheduling.guardBoard(f.mission.id)
+    board = guardBoard(f.runtime, f.mission.id)
     // The production model on the real board: no dead ends.
     assert.equal(census(board).totals[DEAD_END], 0, 'the production model never reports a dead end on a real board')
     // Mutant A: no terminal, no actions at all.
@@ -352,7 +352,7 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
   const f = await setup({ config: { tickMs: 10_000 } })
   try {
     const reviews = putReferenceBoard(f)
-    const idleBoard = f.runtime.scheduling.guardBoard(f.mission.id)
+    const idleBoard = guardBoard(f.runtime, f.mission.id)
     const baseline = census(idleBoard)
     assert.equal(baseline.totals[OWNER_GATED], 4, 'the four blocked reviews are owner-gated while every member is idle')
     assert.equal(baseline.totals[RECOVERABLE], 0)
@@ -366,7 +366,7 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     // reviews, so the same four subjects are classified before and after.
     const unrelated = f.propose({ title: 'Unrelated work', assigneeId: f.reviewer.id })
     await f.runtime.claim(f.actor(f.reviewer), f.mission.id, unrelated.id)
-    const driven = f.runtime.scheduling.guardBoard(f.mission.id)
+    const driven = guardBoard(f.runtime, f.mission.id)
     assert.equal(driven.members.find(member => member.id === f.reviewer.id).status, 'working', 'the driven board really reports a working member')
     const workingBoard = { ...driven, tasks: driven.tasks.filter(task => reviews.includes(task.id)) }
     const after = census(workingBoard)

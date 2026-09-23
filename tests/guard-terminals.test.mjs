@@ -45,7 +45,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { guardActions, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from '../lib/scheduling.js'
+import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { refusalSites, assessRefusal, toolSchemaIndex } from './refusal-inventory.mjs'
@@ -545,7 +545,7 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
     const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
       'the automatic review is admitted', 8_000)
     f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S4r: withdraw the review' })
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     const source = board.tasks.find(candidate => candidate.id === task.id)
     const schedulerSays = f.runtime.scheduling.reviewable(f.runtime.store.get('tasks', task.id), f.runtime.store.list('tasks', f.mission.id))
     assert.equal(schedulerSays, false, 'the scheduler sees no live review')
@@ -562,7 +562,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
   try {
     f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); mission.usedTokens = mission.budget.maxTokens; f.runtime.store.put('missions', mission) })
     await eventually(() => f.runtime.mission(f.mission.id).status === 'blocked', 'the exhausted budget blocks the mission', 8_000)
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     assert.equal(guardMissionTerminal(board), false, 'a blocked mission is not terminal')
     const escalation = guardActions(board).find(action => action.kind === 'escalate')
     assert.ok(escalation, 'a blocked mission still has an executable action')

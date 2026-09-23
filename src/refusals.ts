@@ -251,8 +251,8 @@ export class RefusalRegistry {
  * the fact that the *same* decision request is already durable for the same
  * board fingerprint.
  *
- * `guardTerminal` is the single builder of those requests, so the pure board
- * model in `src/scheduling.ts`, the dispatch path that emits them, the
+ * `guardTerminal` is the single builder of those requests, so the dispatch path
+ * that emits them, the test-side board model in `tests/guard-model.mjs`, the
  * admission guard in `src/admission.ts` and the property test in
  * `tests/guard-terminals.test.mjs` all speak one vocabulary.
  * Every message carries a stable `[diagnostic_code]`, an imperative next step
