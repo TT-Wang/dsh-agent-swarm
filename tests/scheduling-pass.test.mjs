@@ -185,6 +185,44 @@ test('S1: a wedge that passes its bound while the owner has the mission paused i
   } finally { await f.cleanup() }
 })
 
+test('S1/R17-G5: a named body\'s own commits never publish with the wedged branch, so no dispatch question is asked about work the sweep then dispatches', async () => {
+  // The body is named while it waits in the Author's long preparation. When
+  // that await settles it keeps sweeping: it claims task A, then prepares and
+  // claims task B. Before, the claim of A published with the wedged branch
+  // (the body was still named and past its bound), which asked "has an eligible
+  // idle member but was not dispatched this tick" about B about 30ms before
+  // the same sweep claimed B. A commit the body makes itself proves it is not
+  // sitting in the wedged await.
+  class SlowPrepareWorkers extends FakeWorkers {
+    names = new Map()
+    authorFirst = true
+    async prepareTask(member, task) {
+      const name = this.names.get(member.id)
+      if (name === 'Author' && this.authorFirst) { this.authorFirst = false; await sleep(150) }
+      else if (name === 'Builder') await sleep(30)
+      await super.prepareTask(member, task)
+    }
+  }
+  const workers = new SlowPrepareWorkers()
+  workers.autoIdle = true
+  const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: 5_000 } })
+  try {
+    const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+    for (const member of [f.author, f.reviewer, builder]) workers.names.set(member.id, member.name)
+    const a = f.propose({ title: 'Task A', assigneeId: f.author.id })
+    const b = f.propose({ title: 'Task B', assigneeId: builder.id })
+    await eventually(() => taskOf(f.runtime, a.id).status === 'running' && taskOf(f.runtime, b.id).status === 'running' ? true : undefined, 'both tasks dispatch', 4_000)
+    await sleep(150)
+    const wedge = wedgeEvents(f)[0]
+    assert.ok(wedge !== undefined, 'the body was named while it waited in the long preparation')
+    const claimedB = events(f.runtime, f.mission.id, 'task/claimed').find(item => item.data.taskId === b.id)
+    assert.ok(claimedB.createdAt > wedge.createdAt, 'task B was dispatched after the naming')
+    const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith('dispatch-question:'))
+    assert.deepEqual(questions.filter(item => item.notice.dedupKey.includes(b.id)).map(item => item.content), [],
+      'no dispatch question is asked about task B, which the sweep dispatched without any blocker')
+  } finally { await f.cleanup() }
+})
+
 test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never named; past that bound it is named with its live work preserved', async () => {
   // Inside `stallPassReleaseBoundMs` (= stallPassTimeoutMs + stallPassLiveGraceMs,
   // both declared) a live lease is progress: the pass stays live and no stall is

@@ -7,6 +7,7 @@
  * thin forwarding methods and `schedule` calls `dispatch` exactly where its
  * member loop used to be.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
@@ -83,6 +84,11 @@ export interface SchedulingPass {
   noProgressPasses: number
   /** Set once the watchdog's naming of this body past its bound has committed; it is then wedged, not live. */
   escalatedAt?: number
+  /**
+   * The last commit the body made itself, in its own async context (`runBody`).
+   * A commit proves the body is running, not sitting in an await (`passState`).
+   */
+  committedAt?: number
 }
 
 /**
@@ -145,8 +151,23 @@ export class Scheduling {
    * process's leftover and never gates this runtime.
    */
   readonly instanceId = id('runtime')
+  /**
+   * The async context of the scheduling body that is queued or running
+   * (`runBody`, entered by `kick`). A commit made inside it is the body's own,
+   * whatever await or helper it came through; the commit listener below stamps
+   * `committedAt` on that body's record.
+   */
+  private readonly body = new AsyncLocalStorage<SchedulingPass>()
 
-  constructor(private readonly rt: SwarmRuntime) {}
+  constructor(private readonly rt: SwarmRuntime) {
+    rt.subscribe(missionId => {
+      const pass = this.body.getStore()
+      if (pass !== undefined && pass.missionId === missionId && this.passes.get(missionId) === pass) pass.committedAt = Date.now()
+    })
+  }
+
+  /** Run one scheduling body, its queue wait included, in its own async context. */
+  runBody<T>(pass: SchedulingPass, fn: () => Promise<T>): Promise<T> { return this.body.run(pass, fn) }
 
   /**
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
@@ -579,6 +600,25 @@ export class Scheduling {
   passWedged(missionId: string): boolean {
     const pass = this.passes.get(missionId)
     return pass !== undefined && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs
+  }
+
+  /**
+   * R17-G5: the pass state a committed transition publishes with
+   * (`SwarmRuntime.passState`, read by the notice publication). A body past its
+   * bound that has itself committed within the last bound is not sitting in the
+   * wedged await: it is running and reaches its own dispatch question when it
+   * settles (or hands the unswept members to the next body), so the transition
+   * publishes as inside a live pass. The wedged branch would instead ask "was
+   * not dispatched this tick" about work the same sweep is about to dispatch.
+   * Otherwise the body is live inside its bound (`livePass`) and wedged past it
+   * (`passWedged`), as before; a body silent for a whole bound after its last
+   * commit is wedged again.
+   */
+  passState(missionId: string): { passLive: boolean; wedged: boolean } {
+    const pass = this.passes.get(missionId)
+    const bound = this.rt.stallPassTimeoutMs
+    if (pass?.committedAt !== undefined && pass.committedAt - pass.startedAt > bound && Date.now() - pass.committedAt <= bound) return { passLive: true, wedged: false }
+    return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
 
   /**

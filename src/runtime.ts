@@ -420,10 +420,8 @@ export class SwarmRuntime {
   interpretation(missionId: string): MissionInterpretation { return this.notices.interpretation(missionId) }
   /** R17-G5: the named wedged pass owed its dispatch question; publish with the wedged branch. */
   expectWedgedRelease(missionId: string): void { this.notices.expectWedgedRelease(missionId) }
-  /** R17-G5: the scheduling pass state at a committed transition (for publication). */
-  passState(missionId: string): { passLive: boolean; wedged: boolean } {
-    return { passLive: this.scheduling.livePass(missionId) !== undefined, wedged: this.scheduling.passWedged(missionId) }
-  }
+  /** R17-G5: the scheduling pass state at a committed transition (for publication; see `Scheduling.passState`). */
+  passState(missionId: string): { passLive: boolean; wedged: boolean } { return this.scheduling.passState(missionId) }
   /** R17-G5: a settled pass is a transition; it publishes what its live window left unpublished. */
   passSettled(missionId: string): void { this.notices.transition(missionId) }
   notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
@@ -4145,7 +4143,7 @@ export class SwarmRuntime {
     const pass = this.openPass(missionId)
     if (pass === undefined) return
     this.defer(async () => {
-      try { await this.exclusive(missionId, () => this.schedule(missionId)) }
+      try { await this.scheduling.runBody(pass, () => this.exclusive(missionId, () => this.schedule(missionId))) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
