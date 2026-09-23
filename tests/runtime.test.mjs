@@ -446,3 +446,14 @@ test('budget exhaustion names the exhausted dimension in the reason and event', 
   const exhausted = snapshot.events.find(event => event.type === 'mission/budget-exhausted')
   assert.deepEqual(exhausted.data.dimensions, ['maxTokens'])
 })
+test('runtime.propose reads a null priority or experiment as omitted, as the tool path does, and still refuses a mistyped one', async t => {
+  // The exported runtime API and the browser propose RPC pass the caller's
+  // input through without a tool schema; d81a3fb and 5347f5b stored null here
+  // as the defaults, and the restored type checks refused it.
+  const f = await setup(t)
+  const task = f.propose(f.owner, { title: 'Null defaults', kind: 'research', checks: [], priority: null, experiment: null })
+  assert.deepEqual([task.priority, task.experiment], [50, false])
+  assert.deepEqual([f.runtime.store.get('tasks', task.id).priority, f.runtime.store.get('tasks', task.id).experiment], [50, false])
+  assert.throws(() => f.propose(f.owner, { title: 'String priority', kind: 'research', checks: [], priority: '3' }), /\[task_priority_invalid\]/)
+  assert.throws(() => f.propose(f.owner, { title: 'String experiment', kind: 'research', checks: [], experiment: 'false' }), /\[task_experiment_invalid\]/)
+})

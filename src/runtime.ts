@@ -1277,9 +1277,10 @@ export class SwarmRuntime {
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     // The tool path's schema types these first; the browser propose RPC and the
     // exported runtime API reach here without it, and a stored string priority
-    // or experiment makes the client reject the whole mission snapshot.
-    if (input.priority !== undefined && !Number.isSafeInteger(input.priority)) throw new PolicyError('task_priority_invalid', 'validation_error', '[task_priority_invalid] `priority` must be an integer. Pass `priority` as an integer with `swarm_propose`, or omit it for the default, then retry.')
-    if (input.experiment !== undefined && typeof input.experiment !== 'boolean') throw new PolicyError('task_experiment_invalid', 'validation_error', '[task_experiment_invalid] `experiment` must be a boolean. Pass `experiment` as true or false with `swarm_propose`, or omit it, then retry.')
+    // or experiment makes the client reject the whole mission snapshot. Null is
+    // an omission (the default), as on the tool path.
+    if (input.priority != null && !Number.isSafeInteger(input.priority)) throw new PolicyError('task_priority_invalid', 'validation_error', '[task_priority_invalid] `priority` must be an integer. Pass `priority` as an integer with `swarm_propose`, or omit it for the default, then retry.')
+    if (input.experiment != null && typeof input.experiment !== 'boolean') throw new PolicyError('task_experiment_invalid', 'validation_error', '[task_experiment_invalid] `experiment` must be a boolean. Pass `experiment` as true or false with `swarm_propose`, or omit it, then retry.')
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'task.scope', mission.scope)
