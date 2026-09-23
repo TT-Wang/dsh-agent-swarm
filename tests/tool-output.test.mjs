@@ -38,7 +38,7 @@ test('all model plan entry points require their chosen budget; automatic schema 
   for (const name of ['swarm_launch', 'swarm_create', 'swarm_stage']) assert(definitions.get(name).parameters.required.includes('budget'))
   const properties = definitions.get('swarm_launch').parameters.properties
   assert(properties.members.items.required.includes('maxOutputTokens'))
-  for (const key of ['key', 'assigneeKey', 'maxRecoveryAttempts']) assert(properties.tasks.items.required.includes(key))
+  for (const key of ['key', 'maxRecoveryAttempts']) assert(properties.tasks.items.required.includes(key))
   // M9(a): runtime admission requires checkTimeoutMs only for non-verification
   // tasks that declare checks, so the schema must not demand it on every task.
   assert(!properties.tasks.items.required.includes('checkTimeoutMs'), 'checkTimeoutMs is conditional, never universally required')
@@ -50,7 +50,7 @@ test('all model plan entry points require their chosen budget; automatic schema 
 test('swarm_propose leaves acceptance optional for a repair to inherit; every plan entry point still requires it', () => {
   const definitions = tools()
   const propose = definitions.get('swarm_propose').parameters
-  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'])
+  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope'])
   assert.deepEqual(propose.properties.acceptance.items, { type: 'string' }, 'the property stays declared as a string array')
   assert.match(propose.properties.acceptance.description, /Required unless replaces is given/)
   assert(propose.properties.replaces, 'replaces carries the inheritance')
@@ -59,6 +59,24 @@ test('swarm_propose leaves acceptance optional for a repair to inherit; every pl
     assert(definitions.get(name).parameters.required.includes('acceptance'), `${name} mission acceptance`)
     assert(definitions.get(name).parameters.properties.tasks.items.required.includes('acceptance'), `${name} task acceptance`)
   }
+})
+
+test('a schema requires only what the runtime requires on every call, and says when a conditional field may be omitted', () => {
+  const definitions = tools()
+  // swarm_submit: missing deliverables are none; the declared outputs are always captured.
+  const submit = definitions.get('swarm_submit').parameters
+  assert.deepEqual(submit.required, ['missionId', 'taskId', 'attemptId', 'output'])
+  assert.match(submit.properties.deliverables.description, /^Optional; omit when the task's declared outputs are everything to capture\./)
+  // swarm_propose: a repair inherits the replaced tasks' outputs, so outputs is conditional like acceptance.
+  const propose = definitions.get('swarm_propose').parameters
+  assert.equal(propose.required.includes('outputs'), false)
+  assert.match(propose.properties.outputs.description, /Required unless replaces is given\. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
+  // swarm_launch: the automatic plan requires assigneeKey on deliverables and one review of each, not on every task.
+  const launchTask = definitions.get('swarm_launch').parameters.properties.tasks.items
+  assert.equal(launchTask.required.includes('assigneeKey'), false)
+  assert.match(launchTask.properties.assigneeKey.description, /Required on every non-verification task and on at least one verification task reviewing it, with a different member; may be omitted on any further review\./)
+  // The staged plan never required it.
+  assert.equal(definitions.get('swarm_stage').parameters.properties.tasks.items.required.includes('assigneeKey'), false)
 })
 
 test('R24: model-visible text states the declared-outputs rule once and never describes guessing paths from prose', async () => {
