@@ -811,3 +811,28 @@ test('S5: the durable notice ledger alone dedups a decision notice, within one p
     assert.deepEqual(recorded(restarted), { deliveries: 1, events: 1 }, 'a restart does not re-emit the blocker the ledger already records')
   } finally { if (restarted !== undefined) await restarted.dispose(); await f.cleanup() }
 })
+
+test('tickMs 0 runs no timer: settle() returns once the kicked body has settled, and tick() runs the guards once and waits for the body it kicked', async () => {
+  // Before, every runtime installed a tick timer (tickMs 0 clamps to 1ms) and
+  // had no awaitable pass, so a test could only poll real time for the effects
+  // of a kick or a tick.
+  const f = await setup({ config: { tickMs: 0, stallPassTimeoutMs: 60_000, stallPasses: 1_000 } })
+  const scheduling = f.runtime.scheduling
+  try {
+    assert.equal(f.runtime.timer, undefined, 'no tick timer is installed')
+    await f.runtime.settle(f.mission.id)
+    assert.equal(scheduling.passes.has(f.mission.id), false, 'the setup kicks have settled')
+    f.workers.autoIdle = true
+    const task = f.propose()
+    assert.equal(scheduling.passes.has(f.mission.id), true, 'the proposal kicked a body')
+    await f.runtime.settle(f.mission.id)
+    assert.equal(scheduling.passes.has(f.mission.id), false, 'settle returns once that body has settled')
+    assert.equal(taskOf(f.runtime, task.id).status, 'running', 'and the body dispatched the task')
+    let checks = 0
+    const check = scheduling.checkSchedulingPasses.bind(scheduling)
+    scheduling.checkSchedulingPasses = (...args) => { checks += 1; return check(...args) }
+    await f.runtime.tick()
+    assert.equal(checks, 1, 'one tick runs the watchdog once')
+    assert.equal(scheduling.passes.has(f.mission.id), false, 'and returns once the body it kicked has settled')
+  } finally { await f.cleanup() }
+})

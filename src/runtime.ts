@@ -648,27 +648,55 @@ export class SwarmRuntime {
    * racing the watchdog for the same state.
    */
   private startTicker(): void {
-    if (this.timer !== undefined) return
-    this.timer = setInterval(() => {
-      if (this.closed || this.shuttingDown) return
-      // S2: the outbox pump is driven from the tick timer, never from a mission
-      // queue. A durable owner notice is delivered even when the mission's pass
-      // is wedged in an adapter call or the lock is otherwise held, because the
-      // pump reads only durable rows and never takes `exclusive`.
-      this.tickGuard('outbox', () => this.pumpOutbox())
-      this.tickGuard('starts', () => this.sweepStarts())
-      this.tickGuard('passes', () => this.checkSchedulingPasses())
-      this.tickGuard('decisions', () => this.sweepDecisions())
-      this.tickGuard('writer-recovery', () => this.refusals.recordWriterBusyRecovery())
-      this.tickGuard('missions', () => { for (const mission of this.store.list('missions')) this.tickGuard(`mission ${mission.id}`, () => {
-        if (mission.executionTime !== undefined) executionClock(mission, mission.executionTime.since !== undefined, this.now())
-        // Deadline cancellation cannot queue behind a long verification holding the mission queue.
-        if (mission.status === 'active' && this.now() >= mission.deadline) this.blockBudget(mission)
-        else if (mission.status === 'active') this.warnBudget(mission)
-        if (!terminal(mission)) this.kick(mission.id)
-      }) })
-    }, this.config.tickMs)
+    if (this.timer !== undefined || this.config.tickMs <= 0) return
+    this.timer = setInterval(() => this.runTick(), this.config.tickMs)
     this.timer.unref()
+  }
+  /**
+   * One tick by hand, for a runtime built with `tickMs: 0` (no timer): the
+   * timer's guards, then it resolves once every operation they deferred (a
+   * scheduling body, the outbox pump, a stop barrier), and every operation
+   * started while it waits, has settled. An operation already in flight when
+   * the tick began (a body wedged in an adapter call) is not waited for, so a
+   * test can tick the watchdog past it. A test moves its clock between ticks.
+   */
+  async tick(): Promise<void> {
+    const inFlight = new Set(this.operations)
+    this.runTick()
+    const started = () => [...this.operations].filter(operation => !inFlight.has(operation))
+    for (let pending = started(); pending.length > 0; pending = started()) await Promise.allSettled(pending)
+  }
+  /**
+   * Resolves once the mission's scheduling body, and any body already kicked
+   * after it, has settled and no deferred operation (a worker start, a stop
+   * barrier, an outbox pump) is in flight. Deferred operations carry no
+   * mission, so it waits for every one. It never kicks a body itself.
+   */
+  async settle(missionId: string): Promise<void> {
+    for (;;) {
+      const queued = this.queues.get(missionId)
+      if (queued === undefined && this.operations.size === 0) return
+      await Promise.allSettled([...this.operations, ...(queued === undefined ? [] : [queued])])
+    }
+  }
+  private runTick(): void {
+    if (this.closed || this.shuttingDown) return
+    // S2: the outbox pump is driven from the tick timer, never from a mission
+    // queue. A durable owner notice is delivered even when the mission's pass
+    // is wedged in an adapter call or the lock is otherwise held, because the
+    // pump reads only durable rows and never takes `exclusive`.
+    this.tickGuard('outbox', () => this.pumpOutbox())
+    this.tickGuard('starts', () => this.sweepStarts())
+    this.tickGuard('passes', () => this.checkSchedulingPasses())
+    this.tickGuard('decisions', () => this.sweepDecisions())
+    this.tickGuard('writer-recovery', () => this.refusals.recordWriterBusyRecovery())
+    this.tickGuard('missions', () => { for (const mission of this.store.list('missions')) this.tickGuard(`mission ${mission.id}`, () => {
+      if (mission.executionTime !== undefined) executionClock(mission, mission.executionTime.since !== undefined, this.now())
+      // Deadline cancellation cannot queue behind a long verification holding the mission queue.
+      if (mission.status === 'active' && this.now() >= mission.deadline) this.blockBudget(mission)
+      else if (mission.status === 'active') this.warnBudget(mission)
+      if (!terminal(mission)) this.kick(mission.id)
+    }) })
   }
   /** A failed durable write must not silence unrelated guards or missions. */
   private tickGuard(name: string, operation: () => void): void {
