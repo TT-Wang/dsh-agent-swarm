@@ -20,7 +20,8 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import ts from 'typescript'
 import {
   refusalSites, assessRefusal, assessText, diagnosticProducers, toolSchemaIndex, applyAllowlist,
   uncoveredCodeLiterals, formatSite, DELEGATED_MESSAGES,
@@ -28,6 +29,7 @@ import {
 import { formatDiagnostic } from '../lib/admission.js'
 import { workspaceAuthorizationDiagnostic } from '../lib/authorization.js'
 import { guardTerminal } from '../lib/refusals.js'
+import { constructorArguments, sourceErrorClasses, sourceTree } from './source-semantics.mjs'
 
 const IN_SCOPE_SOURCES = ['src/tools.ts', 'src/admission.ts']
 /**
@@ -183,6 +185,51 @@ test('a coded refusal that names a parameter but gives no imperative next step f
     assert.deepEqual(assessText(`[probe_code] ${verb} it with \`swarm_control\` and its \`taskId\`.`, index), [], verb)
   }
   assert.deepEqual(assessText(guardTerminal('owner_reply').message, index), [])
+})
+
+test('a class throw\'s message is the argument at its constructor\'s declared message parameter', () => {
+  // src/plans.ts's aggregate refusal: a conditional code, a category binding, a `.join` message
+  // and a code-like location literal. No argument is shaped like a message, and position took the code.
+  const [aggregate] = refusalSites("export function probe() {\n  throw new AdmissionError(diagnostics.length === 1 ? diagnostics[0]!.code : 'plan_invalid', category, admissionIssues.map(issue => issue.message).join('\\n'), 'plan', diagnostics)\n}\n", 'src/probe.ts')
+  assert.equal(aggregate.expression, "admissionIssues.map(issue => issue.message).join('\\n')")
+  // The named parameter wins over an earlier argument shaped like a message, a subclass without a
+  // constructor inherits it, and a class that takes no message parameter falls back to shape.
+  const declared = refusalSites([
+    'class DetailedError extends Error { constructor(readonly detail: string, message: string) { super(message) } }',
+    'class InheritedError extends DetailedError {}',
+    'class RenderedError extends Error { constructor(code: string, detail: string) { super(`[${code}] ${detail}`) } }',
+    'export function probe() {',
+    '  if (a) throw new DetailedError(`detail ${a}`, reason)',
+    '  if (b) throw new InheritedError(`detail ${b}`, reason)',
+    "  throw new RenderedError('rendered_code', `detail ${c}`)",
+    '}',
+  ].join('\n'), 'src/probe.ts')
+  assert.deepEqual(declared.map(site => [site.errorClass, site.expression]), [['DetailedError', 'reason'], ['InheritedError', 'reason'], ['RenderedError', '`detail ${c}`']])
+  // Every class throw in src/ whose class declares a message parameter reads that argument.
+  const classes = sourceErrorClasses()
+  const files = readdirSync(new URL('../src/', import.meta.url), { recursive: true }).filter(file => file.endsWith('.ts')).map(file => `src/${file}`)
+  const mismatches = []
+  let checked = 0
+  for (const file of files) {
+    const text = read(file), tree = sourceTree(text, file), sites = refusalSites(text, file)
+    const visit = node => {
+      const created = ts.isThrowStatement(node) && node.expression ? node.expression : undefined
+      if (created && ts.isNewExpression(created) && ts.isIdentifier(created.expression)) {
+        const slot = constructorArguments(classes, created.expression.text)?.get('message')
+        if (slot?.index !== undefined) {
+          checked++
+          const line = tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1
+          const argument = created.arguments?.[slot.index]?.getText(tree) ?? ''
+          const site = sites.find(item => item.line === line && item.errorClass === created.expression.text)
+          if (site?.expression !== argument) mismatches.push(`${file}:${line} ${created.expression.text}: walker read ${JSON.stringify(site?.expression)}, the declared message is ${JSON.stringify(argument)}`)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+  }
+  assert.ok(checked >= 200, `the class throws of src/ are checked (${checked})`)
+  assert.deepEqual(mismatches, [])
 })
 
 test('the code the throw renderer prefixes is the diagnostic code itself', () => {

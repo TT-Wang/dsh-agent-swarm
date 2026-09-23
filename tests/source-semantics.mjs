@@ -66,20 +66,23 @@ const nameOf = node => node.name && (ts.isIdentifier(node.name) || ts.isStringLi
 export function errorClasses(sources) {
   const classes = new Map()
   for (const { text, filename } of sources) {
-    const tree = filename.endsWith('.tsx') ? ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX) : sourceTree(text, filename)
-    const visit = node => {
-      if (ts.isClassDeclaration(node) && node.name) {
-        const heritage = node.heritageClauses?.find(clause => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
-        const ctor = node.members.find(member => ts.isConstructorDeclaration(member) && member.body)
-        const superCall = ctor?.body.statements.map(item => ts.isExpressionStatement(item) && ts.isCallExpression(item.expression) && item.expression.expression.kind === ts.SyntaxKind.SuperKeyword ? item.expression : undefined).find(Boolean)
-        classes.set(node.name.text, { name: node.name.text, file: filename, parent: heritage && ts.isIdentifier(heritage) ? heritage.text : undefined,
-          params: ctor?.parameters.map(parameter => parameter.name.getText(tree)), superArgs: superCall ? [...superCall.arguments] : undefined })
-      }
-      ts.forEachChild(node, visit)
-    }
-    visit(tree)
+    declareClasses(filename.endsWith('.tsx') ? ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX) : sourceTree(text, filename), filename, classes)
   }
   return classes
+}
+
+function declareClasses(tree, filename, classes) {
+  const visit = node => {
+    if (ts.isClassDeclaration(node) && node.name) {
+      const heritage = node.heritageClauses?.find(clause => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
+      const ctor = node.members.find(member => ts.isConstructorDeclaration(member) && member.body)
+      const superCall = ctor?.body.statements.map(item => ts.isExpressionStatement(item) && ts.isCallExpression(item.expression) && item.expression.expression.kind === ts.SyntaxKind.SuperKeyword ? item.expression : undefined).find(Boolean)
+      classes.set(node.name.text, { name: node.name.text, file: filename, parent: heritage && ts.isIdentifier(heritage) ? heritage.text : undefined,
+        params: ctor?.parameters.map(parameter => parameter.name.getText(tree)), superArgs: superCall ? [...superCall.arguments] : undefined })
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
 }
 
 /** Whether `name` is `ancestor` or reaches it, through `classes`, as a transitive parent. */
@@ -145,12 +148,18 @@ export function messageText(node, tree) {
 /**
  * Every refusal node of one source: each `throw new <AnyClass>(…)` and each object literal
  * carrying a `code` literal with a `message` or `reason`. The code of a class throw is its
- * first argument when that is a code literal; its message is the first later argument that
- * is not a code-like literal or a number. A class declared here whose constructor renders
- * `[${firstParameter}] …` prefixes the code token, as its instances do.
+ * first argument when that is a code literal. Its message is the argument at the position of
+ * the constructor parameter named `message`, read from the class declarations in src/ and in
+ * this source (`constructorArguments`: a class that declares no constructor takes its
+ * parent's); only for a class whose declaration does not take the message as a parameter is
+ * it the first argument shaped like a message, else the first that is not a code-like literal
+ * or a number. A class declared here whose constructor renders `[${firstParameter}] …`
+ * prefixes the code token, as its instances do.
  */
 export function refusalNodes(text, filename) {
   const tree = sourceTree(text, filename), found = [], prefixing = new Set()
+  const classes = new Map(sourceErrorClasses())
+  declareClasses(tree, filename, classes)
   const line = node => tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1
   const enclosing = node => { for (let at = node.parent; at; at = at.parent) if ((ts.isFunctionDeclaration(at) || ts.isFunctionExpression(at)) && at.name && at.body) return at }
   const calls = fn => { const names = new Set(), visit = node => { if (ts.isCallExpression(node) && (ts.isIdentifier(node.expression) || ts.isPropertyAccessExpression(node.expression))) names.add(ts.isIdentifier(node.expression) ? node.expression.text : node.expression.name.text); ts.forEachChild(node, visit) }; if (fn) visit(fn.body); return names }
@@ -166,16 +175,20 @@ export function refusalNodes(text, filename) {
       if (errorClass === 'Error') site(node, { kind: 'throw' }, args[0])
       else {
         const code = codeText(args[0])
+        // The declared message parameter decides: at src/plans.ts's aggregate AdmissionError the
+        // code is a conditional and the message a `.join` call, so neither shape nor position finds it.
+        const declared = constructorArguments(classes, errorClass)?.get('message')
         const rest = args.slice(code === undefined ? 0 : 1)
-        // A computed code (`new AdmissionError(diagnostic.code, …, formatDiagnostic(diagnostic))`)
-        // is not a literal, so prefer the argument shaped like a message over position.
+        // Fallback for a class that does not take its message as a parameter: prefer the
+        // argument shaped like a message over position.
         const shaped = arg => {
           const value = unwrap(arg)
           return ts.isStringLiteralLike(value) || ts.isTemplateExpression(value)
             || (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken)
             || (ts.isCallExpression(value) && value.expression.getText(tree) === 'formatDiagnostic')
         }
-        const message = rest.find(arg => codeText(arg) === undefined && shaped(arg)) ?? rest.find(arg => codeText(arg) === undefined && !ts.isNumericLiteral(arg))
+        const message = declared?.index !== undefined ? args[declared.index]
+          : rest.find(arg => codeText(arg) === undefined && shaped(arg)) ?? rest.find(arg => codeText(arg) === undefined && !ts.isNumericLiteral(arg))
         site(node, { kind: 'coded-throw', errorClass, code, prefix: code !== undefined && prefixing.has(errorClass) ? `[${code}] ` : '' }, message)
       }
     }
