@@ -157,6 +157,17 @@ test('wrapped runtime and LLM failures return sanitized internal errors, never r
   assert.match(route.result.error.message, /Model route is unavailable: public-provider\/model-one/)
 })
 
+test('a staged plan whose task scope holds a non-string entry returns every diagnostic, not a TypeError', async t => {
+  const f = await fixture(t)
+  const input = { ...f.input, tasks: [{ ...f.input.tasks[0], scope: [{ path: 'src/' }], outputs: ['src/a.ts'], priority: 500 }] }
+  const draft = await f.rpc('create-draft', { sessionId: f.ownerId, input })
+  assert.equal(draft.result.ok, false)
+  assert.equal(draft.result.error.code, 'bad-request')
+  assert.equal(draft.result.error.message, 'tasks[0] (build).scope must be nonempty text of at most 16000 characters\ntasks[0] (build).priority must be 0–100')
+  assert.deepEqual(draft.result.error.details, { issues: [], policyCode: 'plan_invalid', category: 'validation_error' })
+  assert.doesNotMatch(draft.text, /endsWith/)
+})
+
 test('authored validation and policy refusals stay actionable', async t => {
   const f = await fixture(t)
   const validation = await f.rpc('watch', { sessionId: f.ownerId, afterRevision: -1 })

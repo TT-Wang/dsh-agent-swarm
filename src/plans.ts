@@ -81,10 +81,16 @@ export function validatePlan(value: unknown): PlanInput {
   const admissionIssues: Array<{ category: PolicyErrorCategory; diagnostics: readonly AdmissionDiagnostic[]; message: string }> = []
   const scripts = loadPackageScripts(String(value.workspace))
   const inspectAdmission = (inspect: () => void): void => {
-    // Anything but an authored admission refusal is a host failure, not a plan issue.
     try { inspect() } catch (error) {
-      if (!(error instanceof AdmissionError)) throw error
-      admissionIssues.push({ category: error.category, diagnostics: error.diagnostics, message: error.message })
+      if (error instanceof AdmissionError) {
+        admissionIssues.push({ category: error.category, diagnostics: error.diagnostics, message: error.message })
+        return
+      }
+      // A check that fails without an authored refusal is still one issue of
+      // this plan: its text joins the others, as it did before refusals were
+      // typed, so one malformed field cannot discard every other diagnostic.
+      const message = String(error instanceof Error ? error.message : error)
+      admissionIssues.push({ category: 'tool_error', diagnostics: [{ code: 'plan_invalid', location: 'plan', message }], message })
     }
   }
   inspectAdmission(() => assertScopeSelectors(value.scope as string[], 'scope'))
@@ -134,8 +140,11 @@ export function validatePlan(value: unknown): PlanInput {
     })
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
     // A plan states its deliverables; nothing downstream has to read them out of
-    // the objective prose. Empty is legal and means "writes no file".
-    inspectAdmission(() => { if (task.outputs !== undefined) task.outputs = assertDeclaredOutputs(task.outputs, Array.isArray(task.scope) ? task.scope as string[] : [], at) })
+    // the objective prose. Empty is legal and means "writes no file". Outputs
+    // are matched only against a scope of strings: a malformed scope is already
+    // refused above, and matching against it would fail on its entries.
+    const stringScope = Array.isArray(task.scope) && task.scope.every(selector => typeof selector === 'string')
+    inspectAdmission(() => { if (task.outputs !== undefined && stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at) })
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new AdmissionError('plan_recovery_limit_invalid', 'validation_error', `${at}.maxRecoveryAttempts must be a positive safe integer`, `${at}.maxRecoveryAttempts`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new AdmissionError('plan_check_timeout_invalid', 'validation_error', `${at}.checkTimeoutMs must be a positive integer within the platform timer range`, `${at}.checkTimeoutMs`) })
     if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key), scripts))
