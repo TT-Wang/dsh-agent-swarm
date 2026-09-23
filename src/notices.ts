@@ -12,6 +12,7 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
+import { blockCauses } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, Delivery, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
@@ -437,7 +438,17 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     }
     if (rt.unfinishedDependencies(task.missionId, task, tasks).length > 0) return true
     const graph = taskGraphIndex(tasks)
-    if (!task.dependencies.every(dependency => graph.dependencyMet(dependency)) || task.preparationFailure !== undefined) return false
+    if (!task.dependencies.every(dependency => graph.dependencyMet(dependency))) return false
+    // A preparation failure the host will not retry is a block cause the owner
+    // repairs (`blockCauses` owns that distinction). One carrying `retryAt` is the
+    // host's own bounded back-off: a live wait until one tick past `retryAt`.
+    // Past that bound the back-off explains nothing and the task is judged like
+    // any other ready work below.
+    const failure = task.preparationFailure
+    if (failure !== undefined) {
+      if (blockCauses(task, () => undefined, Number.POSITIVE_INFINITY).has('preparation-failed')) return false
+      if (failure.retryAt !== undefined && Date.now() <= failure.retryAt + rt.config.tickMs) return true
+    }
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
     const memberId = task.assigneeId ?? task.plannedAssigneeId
