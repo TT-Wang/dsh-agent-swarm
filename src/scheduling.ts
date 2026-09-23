@@ -19,7 +19,7 @@ import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { ATTEMPT_FENCING_EVENTS, type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type SwarmEvent, type Task } from './types.ts'
+import { type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -62,8 +62,9 @@ export interface DispatchQuestion {
  * release-to-bound gap seen (with the bound it was measured against). The row is
  * the single durable carrier of these facts for the same reason as
  * `releasedRunId`: the once-per-pass overwrite would otherwise erase the only
- * record of a bounded release, and the silence projection (below) must not
- * depend on the retained event window.
+ * record of a bounded release. No src/ reader consumes `releases` or
+ * `worstRelease` beyond this carry-forward; the test-side silence projection
+ * (tests/instruments.mjs) reads them from the row.
  */
 interface ReleaseRecord {
   runId: string
@@ -108,58 +109,6 @@ export interface SilentAttempt {
   boundMs: number
 }
 
-/** R16-D: one subject whose silence was measured against the bound that applied to it. */
-export interface SubjectSilence {
-  subject: string
-  kind: 'scheduling-pass' | 'attempt'
-  gapMs: number
-  /** The declared bound it was measured against. */
-  boundMs: number
-  /** When the measurement was taken (release instant or escalation instant). */
-  at: number
-}
-
-/** R16-D: the durable per-attempt reporting record, for one attempt of the retained window. */
-export interface AttemptReport {
-  attemptId: string
-  taskId: string
-  epoch: number
-  memberId: string
-  claimedAt: number
-  /** When the attempt stopped being current; undefined while the task row still carries it. */
-  endedAt?: number
-  lastDurableAt: number
-  /** Longest interval between consecutive durable elements (or to `endedAt` / now). */
-  worstReportingGapMs: number
-  /** The current silence: `(endedAt ?? now) - lastDurableAt`. */
-  silentMs: number
-  /** Owner escalations naming this attempt, by dedup key. */
-  escalations: string[]
-  /** The attempt ended with nothing durable after its own dispatch (no report, no escalation). */
-  endedUnreported: boolean
-}
-
-/**
- * R16-D: the round's silence projection, read from the durable store alone.
- * Read-only: it changes no task, member, pass or delivery state.
- */
-export interface SilenceReport {
-  missionId: string
-  bounds: { passMs: number; passReleaseMs: number; attemptMs: number }
-  /** Every subject whose silence was measured, with the bound it was measured against. */
-  subjects: SubjectSilence[]
-  worstSubjectSilence: SubjectSilence | undefined
-  attempts: AttemptReport[]
-  worstAttemptReportingGap: { attemptId: string; taskId: string; gapMs: number } | undefined
-  attemptsEnded: number
-  /** Attempts that ended with no durable report or escalation after their own dispatch. */
-  attemptsEndedUnreported: number
-  attemptSilenceEscalations: number
-  /** The durable pass-row release record: how many wedges were released and the widest one. */
-  passReleases: { count: number; worst: ReleaseRecord | undefined }
-  note: string
-}
-
 /** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
 function formatSpan(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -167,17 +116,6 @@ function formatSpan(ms: number): string {
   const minutes = Math.floor(seconds / 60)
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
-
-/**
- * R16-D: the durable events after which a task no longer holds its attempt. The
- * vocabulary is declared ONCE in `src/types.ts` (`ATTEMPT_FENCING_EVENTS`) and
- * read here and by the replay decoder, which is what stops the two readers from
- * drifting: the hand-mirrored copy this function replaced had lost
- * `task/restart-repended` and `task/ceiling-exhausted`, so the replay refused
- * logs its own runtime wrote. A frozen array, not a Set: it is a lookup
- * vocabulary, and the S5 in-memory census classifies every collection in src/.
- */
-const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.some(kind => kind === type)
 
 export class Scheduling {
   /**
@@ -1150,149 +1088,6 @@ export class Scheduling {
     if (Array.isArray(data)) return data.some(item => this.identityIn(item, taskId, attemptId, depth + 1))
     if (data !== null && typeof data === 'object') return Object.values(data as Record<string, unknown>).some(item => this.identityIn(item, taskId, attemptId, depth + 1))
     return false
-  }
-
-  /**
-   * R16-D: the round's silence projection. Read from the durable store alone —
-   * the retained event window, the tool-run rows, the delivery rows, the current
-   * task rows and the one durable pass row — and it changes nothing.
-   *
-   * The two numbers the round quotes:
-   *  - the worst per-subject silent gap, each subject carrying the declared bound
-   *    it was measured against (a released scheduling pass against the pass
-   *    release bound; an escalated attempt against the attempt reporting bound);
-   *  - the worst per-attempt reporting gap, plus how many attempts ended with no
-   *    durable report or escalation at all.
-   *
-   * Definitions, stated so a reader can falsify them:
-   *  - an attempt's durable elements are its `task/claimed` dispatch (and the
-   *    assignment delivery written with it), every durable event naming its task
-   *    or attempt while it was current, every delivery naming them, and every
-   *    recorded tool run of the attempt;
-   *  - its reporting gap is the longest interval between consecutive elements,
-   *    closed at its end (or at read time while it is live);
-   *  - it ended unreported when it is no longer the task's current attempt and no
-   *    durable event or delivery after its dispatch ever named it — the dispatch
-   *    itself is not a report about the attempt.   *
-   * LIMITS, named rather than hidden: the attempt intervals come from the
-   * retained event window (`maxEvents`), so an attempt whose dispatch has aged
-   * out is not reconstructed; an attempt that ended with no closing event is
-   * dated at its last durable element; the attempt bound quoted is the bound in
-   * force at read time, not necessarily the one in force when an old escalation
-   * fired (the escalation's own `[witness: …]` token carries that one).
-   */
-  silenceReport(missionId: string): SilenceReport {
-    const now = Date.now()
-    const bounds = { passMs: this.rt.stallPassTimeoutMs, passReleaseMs: this.rt.stallPassReleaseBoundMs, attemptMs: this.rt.attemptSilenceBoundMs }
-    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
-    const deliveries = this.rt.store.list('deliveries', missionId)
-    const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))
-    type ElementKind = 'claim' | 'event' | 'delivery' | 'run'
-    interface Element { at: number; kind: ElementKind; isClaim: boolean }
-    interface Interval { attemptId: string; taskId: string; epoch: number; memberId: string; claimedAt: number; endedAt?: number; elements: Element[] }
-    const byAttempt = new Map<string, Interval>()
-    const open = new Map<string, Interval>()
-    const claimStart = (event: SwarmEvent): void => {
-      const data = event.data as { taskId?: unknown; attempt?: { id?: unknown; ownerId?: unknown; epoch?: unknown } } | undefined
-      const taskId = typeof data?.taskId === 'string' ? data.taskId : undefined
-      const attemptId = typeof data?.attempt?.id === 'string' ? data.attempt.id : undefined
-      const ownerId = typeof data?.attempt?.ownerId === 'string' ? data.attempt.ownerId : undefined
-      if (taskId === undefined || attemptId === undefined || ownerId === undefined) return
-      const prior = open.get(taskId)
-      // A re-dispatch is the durable close of the attempt it replaces.
-      if (prior !== undefined) prior.endedAt = Math.min(prior.endedAt ?? event.createdAt, event.createdAt)
-      const interval: Interval = { attemptId, taskId, epoch: typeof data?.attempt?.epoch === 'number' ? data.attempt.epoch : 0, memberId: ownerId, claimedAt: event.createdAt, elements: [{ at: event.createdAt, kind: 'claim', isClaim: true }] }
-      byAttempt.set(attemptId, interval)
-      open.set(taskId, interval)
-    }
-    for (const event of events) {
-      if (event.type === 'task/claimed') { claimStart(event); continue }
-      // The event is attributed to the open attempt of each task it names; a
-      // closer ends that attempt at this instant and takes it out of the open
-      // set, so a later event about the same task is never attributed to a
-      // closed attempt (a later delivery or run that names the attempt id is
-      // still attributed, because that identity is exact).
-      let closedTask: string | undefined
-      for (const [taskId, interval] of open) {
-        if (!this.identityIn(event.data, taskId, interval.attemptId)) continue
-        interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
-        if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
-      }
-      if (closedTask !== undefined) open.delete(closedTask)
-    }
-    for (const run of this.rt.store.toolRuns(missionId)) {
-      const interval = byAttempt.get(run.attemptId)
-      if (interval === undefined) continue
-      interval.elements.push({ at: run.createdAt, kind: 'run', isClaim: false })
-    }
-    for (const delivery of deliveries) {
-      const interval = delivery.attemptId === undefined ? open.get(delivery.taskId ?? '') : byAttempt.get(delivery.attemptId)
-      if (interval === undefined) continue
-      // The assignment delivery is written in the same transaction as the
-      // dispatch: it is the claim, not a report about the attempt.
-      interval.elements.push({ at: delivery.createdAt, kind: 'delivery', isClaim: delivery.kind === 'assignment' })
-    }
-    const escalations = new Map<string, string[]>()
-    for (const delivery of deliveries) {
-      const key = delivery.notice?.dedupKey
-      if (typeof key !== 'string') continue
-      const attemptId = /^(?:attempt-silent|operation-silent):([^:]+):/.exec(key)?.[1]
-      if (attemptId === undefined) continue
-      const list = escalations.get(attemptId) ?? []
-      list.push(key)
-      escalations.set(attemptId, list)
-    }
-    const reports: AttemptReport[] = []
-    const subjects: SubjectSilence[] = []
-    for (const interval of byAttempt.values()) {
-      const task = current.get(interval.taskId)
-      const stillCurrent = task?.status === 'running' && task.attempt?.id === interval.attemptId
-      const lastDurableAt = interval.elements.reduce((latest, element) => Math.max(latest, element.at), interval.claimedAt)
-      // No closer was recorded but the task no longer carries the attempt: the
-      // attempt ended at its last durable element, without a report.
-      const endedAt = interval.endedAt ?? (stillCurrent ? undefined : lastDurableAt)
-      const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)
-      const end = endedAt === undefined ? now : Math.max(endedAt, instants.at(-1) ?? endedAt)
-      let worstReportingGapMs = 0
-      let previousInstant = interval.claimedAt
-      for (const instant of instants) { worstReportingGapMs = Math.max(worstReportingGapMs, instant - previousInstant); previousInstant = instant }
-      worstReportingGapMs = Math.max(worstReportingGapMs, end - previousInstant)
-      const endedUnreported = endedAt !== undefined && !interval.elements.some(element => !element.isClaim && element.kind !== 'run')
-      const attemptEscalations = escalations.get(interval.attemptId) ?? []
-      reports.push({
-        attemptId: interval.attemptId, taskId: interval.taskId, epoch: interval.epoch, memberId: interval.memberId,
-        claimedAt: interval.claimedAt, ...(endedAt === undefined ? {} : { endedAt }), lastDurableAt,
-        worstReportingGapMs, silentMs: Math.max(0, end - lastDurableAt), escalations: attemptEscalations, endedUnreported,
-      })
-      for (const key of attemptEscalations) {
-        const delivery = deliveries.find(candidate => candidate.notice?.dedupKey === key)
-        const silentSince = Number(key.slice(key.lastIndexOf(':') + 1))
-        if (delivery === undefined || !Number.isSafeInteger(silentSince)) continue
-        subjects.push({ subject: delivery.subjects?.[0] ?? `${interval.taskId}@${interval.epoch}`, kind: 'attempt', gapMs: Math.max(0, delivery.createdAt - silentSince), boundMs: bounds.attemptMs, at: delivery.createdAt })
-      }
-    }
-    // The released scheduling passes: the durable pass row is the carrier (the
-    // once-per-pass overwrite erases per-run detail, so it accumulates the worst).
-    const passRow = this.rt.store.get('passes', this.passKey(missionId))
-    const passRelease = passRow === undefined ? undefined : releasedPassFields(passRow)
-    const worstRelease = passRelease?.worstRelease
-    if (worstRelease !== undefined) {
-      subjects.push({ subject: `pass:${worstRelease.runId}`, kind: 'scheduling-pass', gapMs: worstRelease.gapMs, boundMs: worstRelease.boundMs, at: worstRelease.releasedAt })
-    }
-    const worstSubjectSilence = subjects.reduce<SubjectSilence | undefined>((worst, item) =>
-      worst === undefined || item.gapMs > worst.gapMs || (item.gapMs === worst.gapMs && item.gapMs - item.boundMs > worst.gapMs - worst.boundMs) ? item : worst, undefined)
-    const worstAttempt = reports.reduce<{ attemptId: string; taskId: string; gapMs: number } | undefined>((worst, report) =>
-      worst === undefined || report.worstReportingGapMs > worst.gapMs ? { attemptId: report.attemptId, taskId: report.taskId, gapMs: report.worstReportingGapMs } : worst, undefined)
-    return {
-      missionId, bounds, subjects, worstSubjectSilence,
-      attempts: reports,
-      worstAttemptReportingGap: worstAttempt,
-      attemptsEnded: reports.filter(report => report.endedAt !== undefined).length,
-      attemptsEndedUnreported: reports.filter(report => report.endedUnreported).length,
-      attemptSilenceEscalations: subjects.filter(item => item.kind === 'attempt').length,
-      passReleases: { count: passRelease?.releases ?? 0, worst: worstRelease },
-      note: 'Read-only projection over the durable rows at read time. A subject silence is measured against the declared bound carried next to it: a released scheduling pass against the pass release bound it was released under, an escalated attempt against the attempt reporting bound in force at read time. The worst subject silence is the widest gap (ties: the widest overrun). The worst per-attempt reporting gap is the longest interval between durable elements attributable to one attempt, closed at its end or at read time. `attemptsEndedUnreported` counts attempts no longer current whose only durable element is their own dispatch. Limits: attempt intervals come from the retained event window, an attempt that ended with no closing event is dated at its last durable element, and a second release of an unchanged board is deduped into the first escalation (the pass row still counts it in `releases`).',
-    }
   }
 
   /**

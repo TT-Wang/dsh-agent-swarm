@@ -4398,12 +4398,6 @@ export class SwarmRuntime {
     return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_ATTEMPT_SILENCE_BOUND_MS
   }
   /**
-   * R16-D: the round's silence projection, read from the durable store alone
-   * (src/scheduling.ts#silenceReport). Read-only and ungated: it is the
-   * instrument the round's outcome report quotes, not an owner decision channel.
-   */
-  silenceReport(missionId: string): ReturnType<Scheduling['silenceReport']> { return this.scheduling.silenceReport(missionId) }
-  /**
    * R16-D: the durable reporting bound verdict for the live attempt on one task
    * (`taskId@epoch` + member), or undefined when the attempt is inside its bound
    * or another guard owns it (F1's operation, the W6 idle close-out, a parked
