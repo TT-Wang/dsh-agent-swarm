@@ -119,7 +119,7 @@ test('R17: deterministic preparation failures wait immediately for cause-changin
   assert.equal(f.workers.calls, 1, 'unchanged deterministic failure is not retried every tick')
 })
 
-test('a handoff after a successful preparation retry re-pends the task without the stale preparation failure', async t => {
+test('a handoff after a successful preparation retry re-pends the task and never hands the worker the retried failure', async t => {
   const f = await setup(t)
   f.workers.failures = 1
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
@@ -127,7 +127,7 @@ test('a handoff after a successful preparation retry re-pends the task without t
   const running = await eventually(() => { const row = f.task(proposed.id); return row.status === 'running' ? row : undefined },
     'the task was not re-dispatched once the preparation retry succeeded')
   assert.equal(f.workers.calls, 2)
-  assert.equal(running.preparationFailure, undefined, 'the assignment after a successful retry drops the stale failure')
+  assert.equal(running.preparationFailure?.attempts, 1, 'the recovered failure keeps its retry count until an owner resume')
   const assignment = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.kind === 'assignment' && row.attemptId === running.attempt.id)
   assert.equal(assignment.length, 1)
   assert.equal(JSON.parse(assignment[0].content).task.preparationFailure, undefined, 'the worker is not handed the retried failure')
@@ -137,6 +137,61 @@ test('a handoff after a successful preparation retry re-pends the task without t
   await eventually(() => f.events('task/handoff-ready').some(event => event.data.taskId === proposed.id), 'the handoff stop barrier did not confirm')
   const handedOff = f.task(proposed.id)
   assert.equal(handedOff.status, 'pending', 'a handoff after a recovered preparation re-pends the task instead of blocking it')
-  assert.equal(handedOff.preparationFailure, undefined)
+  assert.equal(handedOff.preparationFailure?.attempts, 1, 'the retry count survives the handoff')
   assert.equal(f.events('task/blocked').filter(event => event.data.taskId === proposed.id).length, 0)
+})
+
+test('a flapping preparation keeps its retry count across start-failure re-pends and blocks on the third failure', async t => {
+  const f = await setup(t)
+  // Every odd preparation fails with a typed transient code; every even one
+  // succeeds, and the worker start then fails because the member holds a
+  // running attempt. A start failure re-pends the task without spending task
+  // recovery credit, so only the preparation count can bound this loop.
+  f.workers.prepareTask = async () => {
+    f.workers.calls++
+    if (f.workers.calls % 2 === 1) throw Object.assign(new Error(`workspace busy ${f.workers.calls}`), { code: 'EBUSY' })
+  }
+  f.workers.start = async ({ member }) => {
+    if (f.runtime.store.list('tasks', f.mission.id).some(row => row.status === 'running' && row.attempt?.ownerId === member.id)) {
+      throw Object.assign(new Error('worker start failed'), { code: 'EMFILE' })
+    }
+  }
+  const proposed = f.propose({ maxRecoveryAttempts: 3 })
+  const blocked = await eventually(() => { const row = f.task(proposed.id); return row.status === 'blocked' ? row : undefined },
+    'the flapping preparation never blocked the task', 20000)
+  const failed = f.events('task/preparation-failed').filter(event => event.data.taskId === proposed.id)
+  assert.deepEqual(failed.map(event => event.data.attempts), [1, 2, 3], 'the count survives each successful preparation')
+  assert.deepEqual(failed.map(event => event.data.status), ['pending', 'pending', 'blocked'], 'the third failure blocks')
+  assert.ok(f.events('task/start-failed').some(event => event.data.taskId === proposed.id), 'a start failure re-pended the task between preparations')
+  assert.equal(blocked.recoveryCount ?? 0, 0, 'no task recovery credit was spent')
+  assert.equal(blocked.preparationFailure.attempts, 3)
+  assert.equal(blocked.preparationFailure.retryAt, undefined)
+  assert.match(blocked.output, /workspace busy 5[\s\S]*swarm_control\(action: "resume"/)
+  const blockEvents = f.events('task/blocked').filter(event => event.data.taskId === proposed.id)
+  assert.equal(blockEvents.length, 1)
+  const notified = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.to === 'owner' && row.content === blocked.output)
+  assert.equal(notified.length, 1, 'the owner is notified of the block with its resume path')
+  const calls = f.workers.calls
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(f.workers.calls, calls, 'a blocked task is not prepared again')
+})
+
+test('the assignment of a task that never failed preparation embeds its stored row unchanged', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'swarm-prep-shape-'))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
+    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, new PrepWorkers())
+  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const owner = { sessionId: 'shape-owner' }
+  const mission = runtime.create(owner, { title: 'Shape', objective: 'Assignment shape', workspace: '/source',
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  const proposed = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation',
+    scope: ['src/'], acceptance: ['works'], checks: ['test'], maxRecoveryAttempts: 2 })
+  const claimed = await runtime.claim({ sessionId: member.sessionId }, mission.id, proposed.id)
+  const [assignment] = runtime.store.list('deliveries', mission.id).filter(row => row.kind === 'assignment' && row.attemptId === claimed.attempt.id)
+  const stored = runtime.store.get('tasks', proposed.id)
+  assert.equal(stored.preparationFailure, undefined)
+  // Key order included: the worker receives exactly the row the claim stored.
+  assert.equal(JSON.stringify(JSON.parse(assignment.content).task), JSON.stringify(stored))
 })
