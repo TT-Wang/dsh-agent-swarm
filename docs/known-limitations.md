@@ -61,11 +61,11 @@ This is an experimental, single-host plugin. The current compatibility tests do 
 
 Round 13 replaced a scheduling guard that was in-memory evidence with durable state, after a first-party defect on 2026-09-10: the only active mission produced zero durable events for 120 minutes while the same process kept serving another mission, because `Runtime.kick()` deduplicated a mission with the in-memory `scheduled` Set and the pass it deduplicated was wedged inside a worker adapter call. The tick timer's only liveness action was that same `kick()`, so the mission became invisible to its own watchdog.
 
-- **S1 — the guard is a durable pass row.** One row per mission (`passes`, key `pass_<missionId>`, overwritten per pass) records `(revision-before, revision-after)`, `(fingerprint-before, fingerprint-after)` and the consecutive no-progress count. `kick()` re-reads it; there is no in-memory `scheduled` Set. A `running` row older than the declared bound is not a guard unless the mission still has live work (a renewed lease or an in-flight stop acknowledgement), so a pass that never returns cannot swallow a tick.
+- **S1 — the guard is a durable pass row** (superseded in round 25: the guard is the in-memory record of the one body queued or running on the mission queue, and nothing releases it; see the round-25 section). One row per mission (`passes`, key `pass_<missionId>`, overwritten per pass) records `(revision-before, revision-after)`, `(fingerprint-before, fingerprint-after)` and the consecutive no-progress count. `kick()` re-reads it; there is no in-memory `scheduled` Set. A `running` row older than the declared bound is not a guard unless the mission still has live work (a renewed lease or an in-flight stop acknowledgement), so a pass that never returns cannot swallow a tick.
 - **S1 — declared, configurable bounds.** `RuntimeConfig.stallPasses` (default 3, a window of 3 × `tickMs`) is the number of consecutive passes that may advance no durable state and terminate nothing; `RuntimeConfig.stallPassTimeoutMs` (default 30 × `tickMs`) is the bound on one pass. When either bound is exceeded with no live work, the runtime commits a durable `mission/stalled` event (`cause: 'scheduling-pass'`, `wedged`, pass run, bound, revision window, unchanged state digest, unschedulable list) naming what happened, records an owner notice (delivered by an unqueued flush, so the notice path does not share the fate of the pass it reports on), and releases the guard. Repeated stalls for one unchanged board are deduplicated by the state fingerprint and re-arm when the board changes.
 - **S1 — a false stall notice is treated as a defect.** A live lease renewed by recorded operations, or a stop whose acknowledgement is in flight, suppresses both the no-progress and the wedge escalation; a pass that is still progressing past the bound keeps its guard and is re-evaluated on later ticks. A state another witness (W2 notice, board-level `mission/stalled`, coverage notice) already announced for the same fingerprint gets the audit event but not a duplicate notice.
 - **Intermittent (recorded, with the measurement):** `tests/durability-w9-recovery.test.mjs` (the W9 recovery case) failed in two of three full-suite runs on the merged baseline and in one of three on this branch under the same load, so it is pre-existing load sensitivity, not a regression. While the pass handed delivery entirely to the asynchronous pump, `tests/liveness-create-path.test.mjs` ("a create-path stall notice ...") and `tests/liveness-create-path.test.mjs`'s R10-09 case also flaked under load (three of three runs, different tests each time); restoring the bounded in-pass flush (see S2 above) returned the profile to the baseline's. F4 in the fault suite fails on both trees in this environment.
-- **S1 residual.** A pass wedged while the mission still has live work is released only once that work lapses (at latest after `leaseMs`), because the runtime cannot distinguish a slow adapter call from a hung one while the lease says progress. `dispose()` now drains within `stallPassTimeoutMs` instead of waiting forever on a wedged pass body.
+- **S1 residual** (superseded in round 25: no pass is released). A pass wedged while the mission still has live work is released only once that work lapses (at latest after `leaseMs`), because the runtime cannot distinguish a slow adapter call from a hung one while the lease says progress. `dispose()` now drains within `stallPassTimeoutMs` instead of waiting forever on a wedged pass body.
 - **S5 — every in-memory `Set`/`Map` outside `src/client` is classified, and no behaviour-gating entry is left unlabelled.** `tests/in-memory-gates.test.mjs` scans every `new Map`/`new Set`/`new WeakMap`/`new WeakSet` in `src/` (106 occurrences), fails on any occurrence it has not classified, and asserts BY NAME that every gate is either *derivable* (it re-reads the store before it gates) or *cache-only* (clearing it cannot change a durable outcome), with one test per entry that clears a NON-EMPTY collection and shows the durable result. *Derivable:* the pass guard (durable `passes` row); the pass-release fence (`releasedRunId` stamped on the `passes` row by the watchdog and carried forward by `openPass`/`closePass`, so clearing the in-memory Set cannot let a released body resume and dispatch); the unreviewed-submission grace (age of the durable `task/submitted` event); a withdrawn automatic review (durable `task/review-admitted` events, with the map as a fallback); a recorded missing review (durable `task/review-missing` event per submission); the parked-holder, review-blocked and integration-gap notice dedup sets (durable delivery ledger keyed by class + dedup key); the launch-cancellation decision (`launchDraft` re-reads the durable `starts` row immediately before activation, so the abort controller is an accelerator and a cancelled launch cannot come active without it); the consecutive start-failure count (durable `startFailures` field on the member row, read by the retirement gate and cleared by the same successful start that clears a provider outage); the budget stop claim (durable `budgetPause.stopping`). *Cache-only:* `queues` (the mission queue waits for a predecessor only up to `stallPassTimeoutMs` and then starts the next operation, so a wedged body cannot swallow it; two bodies that overlap after the bound cannot lose an update because every commit is a synchronous single-writer transaction and every task write is a compare-and-swap on the task's own revision); `operations` (the drain registry orders shutdown only — every deferred body re-derives its work from durable state: the pass row, the budget stop claim, the durable outbox); `idleSignals` (durable `Task.idleSignal`); `fingerprintCache` (keyed by store revision); `observeCursors`; the per-attempt notice claim (`delivering`); the shared-temp mention windows. The census test's predecessor (S5) reported `queues`, `operations`, `startControllers`, `startFailures` and `releasedPasses` as neither label with hand-offs; S5c closed all five structurally, and the census asserts each one's label by name so a regression cannot hide behind an edited count. **Events:** `task/stale-revision-refused` is emitted through the exported constant `STALE_TASK_REFUSAL_EVENT`, and since round 20 a constant emission is checked by the `EventKind` type exactly like a literal, with the row registered in `src/events.ts`; `eventVocabularyReport` over a real mission log recognizes it.
 - **S2 — the notice path no longer shares the fate of the pass.** A tick-driven, queue-external pump (`pumpOutbox`) walks the durable outbox and never takes `exclusive`, so a pass wedged in an adapter call, or a mission lock held for any reason, still delivers a durable owner notice: `tests/outbox-outside-queue.test.mjs` holds the lock with a never-resolving adapter `start` and shows an inserted durable notice delivered while the same pass row stays `running`, and shows a wedged pass's own `mission/stalled` escalation (`cause: 'scheduling-pass'`) delivered inside the declared bound without the pass returning. The scheduling pass still flushes its own outbox (bounded per delivery) because delivery *ordering* is semantic: a stale assignment must not wake a member, and the repair wake must be observable with the assignment — restoring that flush removed the load flake this branch had widened. Each delivery attempt is claimed individually and bounded by `stallPassTimeoutMs`; an attempt the adapter never settles is abandoned, retried by a later pump, and recorded durably on the mission row (`outboxStarved`), so one hung `deliver` cannot starve another notice — not even another notice of the same mission. Pump requests coalesce only inside that bound, so a pump whose deliveries hang past it never suppresses the next one. The replay suite (`npm run test:replay`) is unchanged and green, so event ordering did not move.
 - **S6 — critical-path accounting.** `SwarmRuntime.criticalPath(missionId)` projects the longest chain of dependent steps (`length`, `remaining`, `usedSteps`, `taskIds`) over the durable task graph; it is reported next to the mission spend in the observe payload (`mission.criticalPath` beside `usedSteps`/`usedTokens`) and in the client snapshot, and rendered as a CRITICAL PATH metric beside STEPS USED. It is accounting only: no budget enforcement reads it, and a cyclic or dangling graph cannot throw. `tests/critical-path.test.mjs` pins a known graph (A→B→C longest), shows that adding a worker never shortens it and that accepting an off-path task leaves it open, and injects a cycle to prove the projection stays total.
@@ -90,7 +90,7 @@ No two seams share a file. Behaviour is unchanged: `npm run test:replay` still c
 
 - **Payment.** `src/runtime.ts` 4657 → 2783 lines (round 13's own pre-growth baseline was 4107) and `await`s inside `schedule()` 14 → 6. Of those six, four are the bounded outbox flush and two are the named sweeps `Attempts.recoverExpired` and `Scheduling.dispatch`; the `schedule` body itself names no worker adapter, no spawn, no network and no subprocess. The `\bthrow\b` count over `src/runtime.ts`, `src/workspaces.ts`, `src/admission.ts`, `src/harness-workers.ts`, `src/tools.ts` and `src/authorization.ts` is reported with the artifact, and refusals that moved are counted in their new modules rather than laundered out of the six-file number.
 - **Residual (named, not hidden).** The serialized pass still *holds the mission lock* across adapter work: `recoverExpired` (checkpoint, stop), `dispatch` (start, prepare, assign) and `flushOutbox` (deliver) run inside `exclusive`. The seam is now a module boundary, so the awaits are countable and owned, but the wedge class is not eliminated — a pass can still be slow inside the adapter. Making those effects queue-external changes event ordering, which the replay digest pins, so it is deliberately not done here.
-- **Caches.** The in-memory collections that moved with their seam (`idleSignals`, `budgetStops`, `fingerprintCache`, `releasedPasses`, `parkedNotices`, `reviewPathNotices`, `integrationGapWarned`, `instanceId`) stay reachable on the runtime as live getters, so `tests/scheduling-pass.test.mjs` clears exactly the objects the scheduling path reads and its cache-only proof keeps its original assertions.
+- **Caches** (round 25 deleted `releasedPasses`, `parkedNotices`, `reviewPathNotices` and `integrationGapWarned`). The in-memory collections that moved with their seam (`idleSignals`, `budgetStops`, `fingerprintCache`, `releasedPasses`, `parkedNotices`, `reviewPathNotices`, `integrationGapWarned`, `instanceId`) stay reachable on the runtime as live getters, so `tests/scheduling-pass.test.mjs` clears exactly the objects the scheduling path reads and its cache-only proof keeps its original assertions.
 - **The refusal inventory follows the split, it is not narrowed.** Three lint tests derive their counts from a file list, and the moved refusals would have silently dropped out of it: `tests/refusal-diagnostics.test.mjs` (deferred sources), `tests/refusal-runtime-annotations.test.mjs` (the 235-site property over the two serialized files) and `tests/rpc-refusal-classification.test.mjs` (the 103-actionable floor). Each list now names the module that received the sites, so every assertion is evaluated over the *union* of the split files: the site total is still exactly 235, the annotated codes are still found exactly once each, the uncoded delta is still the 17 codes S3 added, and the classified floor is still 103 — the same thresholds, measured over more files. The composer probe for `review_path_missing` now reads `src/notices.ts`, which is where `notifyReviewBlocked` moved. No assertion was deleted, skipped, loosened or re-pinned to a line.
 
 
@@ -159,7 +159,7 @@ check-environment branch (TMPDIR/TMP/TEMP inside the disposable checkout, the du
 `HarnessWorkers.readScratch`), the delivery-temp-root and census branch, and the bounded-release/reporting branch.
 The union of changed paths is exactly the branches' declared scopes; no path outside them changed against the base.
 
-**Bounds and their tree.** A scheduling pass whose body does not return is released past
+**Bounds and their tree** (round 25: a wedged pass is named, not released). A scheduling pass whose body does not return is released past
 `stallPassTimeoutMs + stallPassLiveGraceMs` (defaults: 30 ticks plus one grace period of the same length —
 7,500 ms and 15,000 ms under a 250 ms tick), with the release recorded on the durable pass row and the live work
 it preserved named in the escalation; an attempt whose durable progress passes `attemptSilenceBoundMs`
@@ -214,8 +214,8 @@ at the same subject@epoch and recorded reason is the same fact and is suppressed
 trigger in the key; both rules are stated at `factKey` in `src/notices.ts`, where the key is defined.
 Cause-bearing generation is TRANSITION-DRIVEN: the runtime's commit funnel
 coalesces the commits of one operation and publishes the decision facts against the settled state, with the pass
-state selecting the one pass-end branch (a wedged or released pass asks its dispatch question, a live pass does
-not). **The sampled tick (`sweepDecisions`) emits exactly two absence instruments and no cause:** the absence net —
+state selecting the one pass-end branch (a wedged or just-named pass asks its dispatch question; a live pass, or a body that made progress of its
+own within the last bound past its bound, does not). **The sampled tick (`sweepDecisions`) emits exactly two absence instruments and no cause:** the absence net —
 the absence of a durable transition and the elapsed clock (default bound 600,000 ms, `Notices.absenceBoundMs`) —
 and the retained attempt-silence escalation (`Scheduling.sweepSilentAttempts`, one bounded `stall`-class notice per
 silent attempt, declared bound `attemptSilenceBoundMs`, default 600,000 ms), which states the silence and the
@@ -513,7 +513,7 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   cross-mission registry reads it as refuted. The common case, a review blocked short of a verdict,
   now reports correctly.
 - **The owner protocol is at the ceiling of its prompt budget.** `tests/roles.test.mjs` caps
-  `OWNER_PROMPT`, and after round 20 it sits within a few characters of that cap (round 24: 5528 characters, 2 below the cap). A new protocol
+  `OWNER_PROMPT`, and after round 20 it sits within a few characters of that cap (round 24: 5528 characters, 2 below the cap; round 25: 5520). A new protocol
   sentence must replace an existing one, or state something no tool schema description can carry.
 - **`npm run test:web` fails on the team-roster assertion** in `scripts/smoke-web.mjs`, both before and
   after round 20. It is not part of the gate the validation entries record, which is why it went
@@ -589,7 +589,7 @@ delivery lose anything) found and fixed seven defects. The regressions live in
 - **An accepted repair retires only the task it names.** In a chain A, R1, R2, accepting R2 cancels R1
   but leaves A and A's rejecting review blocked, so mission completion is refused until the owner
   cancels them. This predates round 23; it belongs to the planned rework of replacement lineage.
-- **A retried preparation still reads as an obstacle to the owner-notice classifier.** The preparation
+- **A retried preparation still reads as an obstacle to the owner-notice classifier** (resolved in round 25: a back-off is a bounded live wait). The preparation
   failure count now survives a successful retry, as it did before round 23, so a pending task that
   recovered from a transient preparation failure is not counted as legitimately waiting until it is
   dispatched again. This matches the pre-round-23 behaviour and belongs to the owner-notice rework.
@@ -615,12 +615,50 @@ delivery lose anything) found and fixed seven defects. The regressions live in
 - **Repair and editor edges.** A repair that omits `outputs` and narrows its scope past an inherited
   output gets the generic `[output_outside_scope]` exit that tells it to correct `outputs`. The draft
   editor has no control that declares `[]` on an untouched task; the owner edits the field and clears it.
-- **Other required schema fields the runtime does not check.** The Harness does not enforce a tool
+- **Other required schema fields the runtime does not check** (resolved in round 25: every swarm tool call is checked against its schema). The Harness does not enforce a tool
   schema's required list. `swarm_verify` without `verdict` is treated as a rejection and recorded with
   `verdict: undefined`; `swarm_message` without `kind` is delivered with no kind, so a question sent
   that way opens no reply receipt; `swarm_submit` treats missing `deliverables` as none; and
   `swarm_launch` enforces `tasks[].assigneeKey` only for reviewed deliverables and their reviews.
-- **The fault suite has drifted.** `npm run test:faults` passes 15 of 24 scenarios; F1, F3a-c, F4, F14,
+- **The fault suite has drifted** (round 25: F19 and F21 were stale fixtures and are rebuilt; 17 of 24 pass). `npm run test:faults` passes 15 of 24 scenarios; F1, F3a-c, F4, F14,
   F18, F19 and F21 fail identically on the round-19 main 98c6657. Some fixtures are stale (F3a-c declare
   a check admission now refuses as a no-op); whether F19 (no-silent-state row 7b) and F21 (wedged-pass
   release) are stale fixtures or real regressions is not yet established.
+
+## Round-25 simplification batch 5 (2026-09-24)
+
+- **The false-wake rule is judged only at delivery.** `ownerDeliveryRelevant` withholds a notice whose
+  subject a live lineage covers, at delivery and at native consumption; nothing refuses it at emission. A
+  withheld row stays durable and is delivered once its lineage closes.
+- **A covered stall root is never sent.** A rejected root that strands nothing beyond its rejecting review
+  is recorded against the rejection decision's own row (`coveredBy`): it takes no wake-budget slot, has no
+  reminders and no notice-ledger entry, and the decision's reminders carry the root. A decision carried by a
+  wake-budget summary covers nothing; the root is then its own fact, and every summarized fact keeps its own
+  reminder allowance. A rejecting review is cancelled
+  only when its repair is accepted; until then it is not named on its own.
+- **Clock-bounded waits other than a back-off.** Only an expired preparation back-off bypasses the witness
+  dedup. A stop bound, a lease end or the review grace that expires with `F(S)` unchanged stays covered by
+  an earlier witness for that `F(S)` until the board changes. `Scheduling.stalled()` still reports a board
+  whose only work is in back-off as a W3 stall.
+- **Dispatch does not re-read task prose.** A store written by d81a3fb or earlier in which the owner
+  amended a prose-assuming task's dependencies to `[]` dispatches that task from the bare mission
+  baseline. The cost is one wasted attempt the independent review rejects, not a safety property; none of
+  the 1,029 task rows in the 17 profile stores checked on 2026-09-24 is affected.
+- **Tool calls are checked against their schema, not against `minimum`.** Required properties, enums,
+  primitive types, `oneOf` and undeclared keys are refused with `[tool_arguments_invalid]` naming each
+  path and the accepted keys; a model that adds an undeclared key needs one retry. Numeric minimums stay
+  runtime checks. JSON null on an optional property is an omission, except `swarm_control`
+  `changes.assigneeId`, where null or an empty string releases the binding. `swarm_launch` ignores a
+  top-level `workspace` and always uses the frozen request workspace.
+- **A wedged scheduling pass holds its mission until its await returns.** The watchdog names it past
+  `stallPassTimeoutMs`, once per body (a body that wedges on a board an earlier naming left unchanged only
+  when that naming reached the owner), but nothing releases it: lease recovery, completion and the budget
+  check for that mission wait for the await's own bound (`workerStartTimeoutMs`, the per-attempt delivery
+  bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`). Capture and preparation have no overall bound beyond
+  their git subprocesses. A body stops early only when one member held it for a whole bound: a body whose members
+  each take less than a bound finishes its sweep however long the sweep takes, and lease recovery for that
+  mission waits for it.
+  The notice clause "produced no durable state change" is unconditional. An old database keeps an unread
+  `passes` table.
+- **Decide-then-act is not done.** Adapter calls (start, prepare, capture, deliver) still run inside the
+  mission's serial queue.

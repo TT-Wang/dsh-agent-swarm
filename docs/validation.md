@@ -9,6 +9,79 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-25 simplification batch 5: one owner per notice and scheduling rule (2026-09-24)
+
+Batch 5 removed duplicated owner-notice and scheduling machinery and added one schema check for every
+swarm tool call. It was verified adversarially three times: the second and third passes reviewed the
+fixes to the pass before, because those fixes added mechanisms of their own.
+
+- **The owner false-wake rule has one enforcement point.** `ownerDeliveryRelevant` judges a notice at
+  delivery and at native consumption. The emission-time refusal in `Notices.notify()`,
+  `liveLineageSubject`, the host pre-append invariant (`src/invariant.ts`), the harness append-refusal
+  catch and `tests/r17-invariant.test.mjs` are deleted. A real rejection used to write about 280
+  `mission/stalled{cause:'stall-root'}` events in 1.5 s and deliver none; the event is now written only
+  with its delivery row, and a stall root is judged, delivered and reminded on the root its key names.
+- **Notice dedup reads the durable ledger.** The in-memory `parkedNotices`, `integrationGapWarned` and
+  `reviewPathNotices` Sets are deleted; a restart no longer writes a duplicate `task/review-blocked` event.
+- **A rejection is one wake unless it strands other work.** Owner notices delivered per rejection went
+  from 3 to 2: the stall root is recorded against the verify-site rejection decision's own row (`coveredBy`)
+  when it names no dependent beyond its rejecting review, and then has no reminders or ledger entry of its
+  own. A decision carried by a wake-budget summary covers nothing, and each fact in a summary has its own
+  reminder allowance. A rejected root that strands other work is still delivered, naming those dependents.
+  A rejecting review is not named on its own while its source has a live replacement or is itself a stall
+  root.
+- **A preparation back-off is a bounded wait.** A pending task whose transient preparation failure carries
+  `retryAt` waits legitimately until one tick past it, and its expiry bypasses the witness dedup once.
+- **Dispatch no longer reads task prose.** The dispatch-time `dependencyAssumptions` filter, its
+  `dispatchQuestion` branch, `assumedContent` and the `admission` guard-terminal chain are deleted (eight
+  chains become seven). `swarm_control` refuses a `changes.dependencies` amendment that leaves an assumed
+  dependency uncarried; the hex-token diagnostic no longer claims unchecked provenance. A restart-time hold
+  for rows written by earlier builds was tried and removed: none of 1,029 task rows in 17 real profile
+  stores would have been held, and it cost two to three owner wakes per held task.
+- **Every swarm tool call is checked against its own published schema.** `register()` checks required
+  properties, enums, primitive types, `oneOf` and `additionalProperties: false` before anything runs and
+  refuses with one typed `[tool_arguments_invalid]`. JSON null on an optional property is an omission;
+  `swarm_control` `changes.assigneeId` is published as string-or-null. Three required lists were made
+  truthful (`swarm_submit.deliverables`; `swarm_propose.outputs`, required unless `replaces`;
+  `swarm_launch` `tasks[].assigneeKey`). Measured against 12,761 recorded real swarm tool calls: 18% of the
+  recorded `swarm_launch` calls carried a top-level `workspace` the tool always overwrote, which is now
+  declared and ignored; 28 other calls carried an undeclared key that was silently dropped and is now
+  refused by name. The runtime API and browser RPC keep their own checks (evidence outcome, post and board
+  kind, proposal priority and experiment, empty member ids), `swarm_budget` forwards only its ceiling keys,
+  and an amendment that changes nothing is refused with `[task_amendment_empty]`.
+- **The scheduling pass guard lives on the mission queue.** The durable `passes` row, the released-run
+  fence and the supersede release are deleted. `Scheduling.passes` holds the one body queued or running per
+  mission; `kick` skips while it exists. The watchdog names a body past `stallPassTimeoutMs` once per body
+  and retries until the naming commits (a busy writer, a paused mission); a body that wedges on a board an
+  earlier naming left unchanged is named again only when that naming reached the owner, so under a recorded
+  provider outage the renaming stops at the first repeat. Nothing is released: the body
+  keeps the mission until the await it is in returns at that await's own bound. The body stamps its own
+  progress when its awaits return, and a call that commits before its promise settles (a worker start, an
+  outbox delivery, the workspace check, a recovery-fallback report) stamps it first (an AsyncLocalStorage
+  version leaked into worker turns the body woke and was replaced), so its own commits never publish as a
+  wedged pass. A body stops at the next member boundary when the member it just swept held it for a whole
+  bound, and a chain of such stops covers at most one member rotation.
+  The wedge notice no longer says the guard was released (a model-visible text change).
+- **Fault fixtures.** F19 (rows 7b and 9b, stale since 69211b9) and F21 (stale since 20fc1a5 and 69211b9)
+  were rebuilt, with new rows 7c and 7d and invariants I5 and I6.
+
+The first adversarial pass found a wedge naming that was attempted once and lost for good (high), a
+back-off hidden by a witness stamped during it, stall-root reminders while the repair ran, nulls refused
+on optional fields, runtime API calls that lost their vocabulary checks, prose-assuming rows from the
+previous build dispatched without escalation, a false dispatch question from a named body's own commits,
+and lease recovery delayed by the sum of every member's slow awaits. The second pass, over the fixes,
+found the AsyncLocalStorage leak (a wedged body published as live, silencing the owner), covered stall
+roots that hid the dependents a rejection strands, the restart hold's extra wakes and release paths, the
+`workspace` refusals and an unbounded chain of early-stopped bodies. The third pass confirmed every second-pass fix and found a body's own start failures, deliveries and recovery reports published against a stale progress stamp (a false dispatch question), an early-stop test that counted any idle time as waiting, endless renaming of wedged bodies under a recorded provider outage with the owner claimed notified of suppressed notices, a stall root whose summarized rejection decision spent its reminders on unrelated facts, and a back-off re-stamp that hid a bound passing during the judging pass. A fourth, narrow round fixed those; its elapsed-time early stop halved the sweep rate of quick members, so the final rule stops a body only after one member held it for a whole bound. Every fix has a
+regression that fails before it.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: 1378 tests at 4572a56, all passed. Earlier runs of the same batch found a Scheduling constructor that subscribed to a runtime it was not given (four failures in `tests/r12-workspace-fixes.test.mjs`) and a new early-stop test too tight for suite load; both were fixed before this run.
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness` (smoke snapshot unchanged
+  under `UPDATE_SMOKE_SNAPSHOT=1`), `test:pack` and `test:profile`: passed.
+- `npm run test:faults`: 17 of 24 pass. F19 and F21 now pass; F1, F3a-c, F4, F14 and F18 fail as they
+  did on the round-19 main.
+
 ## Round-24 simplification batch 4: declared outputs only (2026-09-23)
 
 The write-verb heuristic that guessed a task's output paths from its prose, patched in rounds 4
