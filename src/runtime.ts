@@ -3287,7 +3287,7 @@ export class SwarmRuntime {
   
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
-    if (!this.workers.inspectDelivery) throw new Error('This worker adapter does not support delivery inspection')
+    if (!this.workers.inspectDelivery) throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support delivery inspection')
     return this.workers.inspectDelivery(mission, task.artifact!.commit, actor.signal)
   }
   async applyDelivery(actor: Actor, missionId: string) {
@@ -3295,7 +3295,7 @@ export class SwarmRuntime {
     // Different completed missions for one source must not apply concurrently.
     return this.exclusive(`delivery:${target.mission.workspace}`, async () => {
       const { mission, task } = this.deliveryTarget(actor, missionId)
-      if (!this.workers.applyDelivery) throw new Error('This worker adapter does not support applying results')
+      if (!this.workers.applyDelivery) throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support applying results')
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
       this.commit(missionId, () => {
         // The projection states what is currently in effect, so a conflicts result

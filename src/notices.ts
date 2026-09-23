@@ -814,7 +814,7 @@ export class Notices {
 
   bounded(text: string): string {
     requireText(text, 'content')
-    if (text.length > this.rt.config.maxMessageChars) throw new Error(`Content exceeds ${this.rt.config.maxMessageChars} characters`)
+    if (text.length > this.rt.config.maxMessageChars) throw new PolicyError('content_too_long', 'tool_error', `Content exceeds ${this.rt.config.maxMessageChars} characters`)
     return text
   }
 

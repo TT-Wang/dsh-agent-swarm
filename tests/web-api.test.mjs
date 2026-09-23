@@ -246,18 +246,34 @@ test('delivery routes require owner, completed acceptance and the exact session 
   for (const endpoint of ['delivery', 'apply-delivery']) {
     const before = await f.rpc(endpoint, { sessionId: f.ownerId, missionId: mission.id })
     assert.equal(before.result.ok, false, 'active work cannot be delivered')
+    assert.equal(before.result.error.message, 'Complete independent acceptance before applying results')
+    assert.deepEqual(before.result.error.details, { issues: [], policyCode: 'delivery_acceptance_required', category: 'tool_error' })
     for (const sessionId of ['other-owner', member.sessionId]) {
       const denied = await f.rpc(endpoint, { sessionId, missionId: mission.id })
       assert.equal(denied.result.ok, false)
     }
   }
   assert.equal(writes, 0)
+  // Oversized content is refused typed, with the bound in its text.
+  assert.throws(() => f.runtime.cancel(owner, mission.id, { taskId: 'any', reason: 'x'.repeat(10001) }),
+    error => error instanceof PolicyError && error.code === 'content_too_long' && error.message === 'Content exceeds 10000 characters'
+      && errorTypeFor(error) === errorTypeFor(new Error(error.message)))
   mission.status = 'completed'
+  f.runtime.store.put('missions', mission)
+  const historical = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(historical.result.error.message, 'This historical mission has no saved delivery baseline; inspect its retained artifact')
+  assert.deepEqual(historical.result.error.details, { issues: [], policyCode: 'delivery_baseline_missing', category: 'tool_error' })
   mission.baseline = { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/private/planning', changedPaths: ['user.txt'], createdAt: 1 }
   f.runtime.store.put('missions', mission)
   const source = { id: 'delivery-source', missionId: mission.id, kind: 'implementation', status: 'accepted', dependencies: [], artifact: { commit: 'c'.repeat(40) } }
   const final = { id: 'delivery-final', missionId: mission.id, kind: 'integration', status: 'accepted', dependencies: [source.id], artifact: { commit: 'd'.repeat(40) } }
   f.runtime.store.put('tasks', source); f.runtime.store.put('tasks', final)
+  const adapter = f.workers.inspectDelivery
+  delete f.workers.inspectDelivery
+  const unsupported = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(unsupported.result.error.message, 'This worker adapter does not support delivery inspection')
+  assert.deepEqual(unsupported.result.error.details, { issues: [], policyCode: 'delivery_unsupported', category: 'tool_error' })
+  f.workers.inspectDelivery = adapter
   const inspected = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id, resultCommit: 'forged' })
   assert.equal(inspected.result.value.delivery.resultCommit, final.artifact.commit, 'caller cannot choose an unaccepted commit')
   const applied = await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })
