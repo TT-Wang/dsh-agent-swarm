@@ -18,20 +18,20 @@
  *   --no-start         provision only; never launch the host
  *   --dry-run          print the plan; write nothing
  */
-import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, writeFileSync, chmodSync, appendFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, appendFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
 import { resolveHarnessRoot } from './harness-target.mjs'
 import { importHarness } from '../tests/fixtures/built-harness.mjs'
+import { awaitLaunchUrl, hostEnv, startHost, stopHost, writeServer } from './host.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
 const value = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback
 const flag = name => args.includes(name)
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const fail = message => { process.stderr.write(`start-lab: ${message}\n`); process.exit(1) }
 
 if (flag('--help') || args.includes('-h')) { process.stdout.write(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].slice(3) + '\n'); process.exit(0) }
@@ -48,7 +48,6 @@ if (!existsSync(cli)) fail(`harness CLI not found: ${cli}`)
 
 const home = join(root, 'home')
 const workspace = join(root, 'workspace')
-const env = { ...process.env, DSH_HOME: home, DSH_AGENTS_HOME: join(root, 'agents-home'), DSH_BUNDLED_SKILL_DIR: join(root, 'bundled-skills'), DSH_TELEMETRY_DISABLED: '1' }
 const patch = join(root, 'lab.patch.yml')
 const serverPath = join(root, 'server.json')
 const logPath = join(root, 'server.log')
@@ -60,6 +59,7 @@ if (dryRun) { process.stdout.write(JSON.stringify({ ...plan, dryRun: true }, nul
 // ---------------------------------------------------------------- provision
 mkdirSync(root, { recursive: true, mode: 0o700 }); chmodSync(root, 0o700)
 for (const dir of [home, workspace, join(root, 'agents-home'), join(root, 'bundled-skills'), join(root, 'worktrees')]) mkdirSync(dir, { recursive: true, mode: 0o700 })
+const env = hostEnv(root, home)
 log(`provisioning lab at ${root} (plugin ${plugin})`)
 
 // Credentials are seeded once through the native provider, like start-preview.
@@ -112,29 +112,14 @@ if (!existsSync(join(workspace, '.git'))) {
 }
 
 // ---------------------------------------------------------------- restart
-const previous = existsSync(serverPath) ? JSON.parse(readFileSync(serverPath, 'utf8')) : {}
-if (Number.isInteger(previous.pid) && previous.pid > 1) {
-  log(`stopping previous lab host ${previous.pid}`)
-  try { process.kill(previous.pid, 'SIGTERM') } catch { /* already gone */ }
-  for (let attempt = 0; attempt < 50; attempt++) { try { process.kill(previous.pid, 0) } catch { break } await sleep(200) }
-  try { process.kill(previous.pid, 'SIGKILL') } catch { /* already gone */ }
-  await sleep(1200)
-}
+// The lab host is whatever listens on the port, however it was last started.
+await stopHost(port, { onStop: pid => log(`stopping previous lab host ${pid}`) })
 if (noStart) { process.stdout.write(JSON.stringify({ ...plan, started: false }, null, 2) + '\n'); process.exit(0) }
 
-writeFileSync(serverPath, JSON.stringify({ status: 'starting', pid: null, url: `http://127.0.0.1:${port}`, root, home, plugin, port, startedAt: new Date().toISOString() }, null, 2) + '\n', { mode: 0o600 })
-const out = openSync(logPath, 'a', 0o600)
-const child = spawn(process.execPath, ['--expose-internals', cli, '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { cwd: workspace, env, detached: true, stdio: ['ignore', out, out] })
-child.unref(); closeSync(out)
+writeServer(root, { status: 'starting', url: `http://127.0.0.1:${port}`, root, home, plugin, harness: harnessRoot, port, startedAt: new Date().toISOString() })
+const child = startHost({ root, port, cli, patch, cwd: workspace, env })
 log(`started lab host ${child.pid} on ${port}`)
-let launchUrl
-for (let attempt = 0; attempt < 450; attempt++) {
-  await sleep(200)
-  try { launchUrl = readFileSync(logPath, 'utf8').match(new RegExp(`http://127\\.0\\.0\\.1:${port}/\\?token=[A-Za-z0-9_.-]+`, 'g'))?.at(-1) } catch { /* log not ready */ }
-  if (launchUrl) break
-  try { process.kill(child.pid, 0) } catch { fail(`lab host exited early; inspect ${logPath}`) }
-}
-if (!launchUrl) fail(`lab host did not publish a launch url; inspect ${logPath}`)
-writeFileSync(join(root, 'launch.url'), launchUrl + '\n', { mode: 0o600 })
-writeFileSync(serverPath, JSON.stringify({ status: 'running', pid: child.pid, url: `http://127.0.0.1:${port}`, root, home, plugin, port, startedAt: new Date().toISOString(), launchUrl }, null, 2) + '\n', { mode: 0o600 })
+const launchUrl = await awaitLaunchUrl({ root, port, child, timeoutMs: 90_000 })
+if (!launchUrl) fail(child.exitCode === null && child.signalCode === null ? `lab host did not publish a launch url; inspect ${logPath}` : `lab host exited early; inspect ${logPath}`)
+writeServer(root, { status: 'running', pid: child.pid, url: `http://127.0.0.1:${port}`, root, home, plugin, harness: harnessRoot, port, startedAt: new Date().toISOString(), launchUrl })
 process.stdout.write(JSON.stringify({ ...plan, started: true, pid: child.pid, launchUrl }, null, 2) + '\n')
