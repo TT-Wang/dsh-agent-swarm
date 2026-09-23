@@ -1293,10 +1293,14 @@ export class Notices {
       }
       return
     }
-    // Row 3 (documented scope): only a board whose *every* non-terminal task is
-    // running under a live lease is exempt. Running work plus a pending or
-    // blocked task falls through to the witnesses below, so a dependent that
-    // cannot start yet still leaves the owner a decision (T1av2 evidence_978a4694).
+    // Row 3 (documented scope): a board whose *every* non-terminal task is
+    // running under a live lease is exempt outright. Running work plus a pending
+    // or blocked task falls through to the classifiers below, which owe a witness
+    // only for what no live path advances: a dependent whose lineage is dead
+    // (T1av2 evidence_978a4694) is named. Ready work queued behind its selected
+    // member's live lease is not (the 69211b9 wait rule in `waitsLegitimately`):
+    // that lease bounds the wait exactly as in row 3, and its end (close-out, or
+    // the row-4 expiry recovery) is the next chance to run the queued task.
     const nonTerminal = view.nonTerminal
     if (nonTerminal.length && nonTerminal.every(task => task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= Date.now())) return
     if (view.stalled) {
