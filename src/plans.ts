@@ -5,8 +5,8 @@ import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
 
 // Plan refusals echo the caller's own plan, so they are typed admission
-// refusals: the browser sees them by type, and each category is the one the
-// trace classifier gave the same text before it was typed.
+// refusals the browser sees by type. Each category is authored at its own
+// site; it is not derived from the text the trace classifier once matched.
 function record(value: unknown, location = 'plan'): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new AdmissionError('plan_entry_invalid', 'validation_error', 'Plan entries must be objects', location)
 }
@@ -59,9 +59,9 @@ export function checkSyntaxDetail(declared: readonly DeclaredPlanCheck[], issues
 }
 
 /**
- * The trace classifier's precedence: a joined refusal is classified by the
- * first of these categories any of its lines carries, so the plan refusal that
- * carries several diagnostics takes that one.
+ * A plan refusal that carries several issues takes the first of these
+ * categories any of its issues carries. The order is the trace classifier's
+ * rule order; each issue's category is authored at its own site.
  */
 const CATEGORY_PRECEDENCE: readonly PolicyErrorCategory[] = ['authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'validation_error', 'tool_error']
 

@@ -27,6 +27,8 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { AdmissionError } from '../lib/admission.js'
+import { Workspaces } from '../lib/workspaces.js'
+import { subprocessSeam } from './subprocess-seam.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -377,4 +379,30 @@ test('a scope or check echoing the caller\'s own absolute path is a fixed repair
   const uncoded = await f.rpc('control', control)
   assert.equal(uncoded.result.error.code, 'internal-error')
   assert.doesNotMatch(uncoded.text, /secret/)
+})
+
+test('a staged launch refused by the shell syntax preflight is an internal error in the browser', async t => {
+  const f = await fixture(t)
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(f.workspace, '..', 'worktrees'),
+    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  t.after(() => workspaces.dispose())
+  // The real parse-only probe, as the Harness adapter runs it.
+  f.workers.checkSyntaxPreflight = (checks, cwd, signal) => workspaces.checkSyntaxPreflight(checks, cwd, signal)
+  const input = { ...f.input, tasks: [{ ...f.input.tasks[0], checks: ['node --test ;;('] }] }
+  const created = await f.rpc('create-draft', { sessionId: f.ownerId, input })
+  assert.equal(created.result.ok, true, created.text)
+  const draft = created.result.value.draft
+  // The refusal quotes the shell's own diagnostic, which begins with "/bin/sh:",
+  // so the boundary always takes it for host detail and never shows it.
+  const launch = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(launch.result.ok, false)
+  assert.equal(launch.result.error.code, 'internal-error', launch.text)
+  assert.doesNotMatch(launch.text, /check_syntax_invalid|syntax|\/bin\/sh/)
+  assert.deepEqual(f.runtime.store.list('missions'), [], 'nothing launched')
+  assert.equal(f.runtime.drafts({ sessionId: f.ownerId }).find(row => row.id === draft.id).status, 'draft')
+  // The runtime refusal the boundary hid: typed, coded and carrying the shell's text.
+  const refused = await f.runtime.launchDraft({ sessionId: f.ownerId }, draft.id, draft.revision).then(() => assert.fail('the draft launched'), error => error)
+  assert.ok(refused instanceof PolicyError)
+  assert.equal(refused.code, 'check_syntax_invalid')
+  assert.match(refused.message, /^\[check_syntax_invalid\] tasks\[build\]\.checks\[0\] has invalid shell syntax in "node --test ;;\(": \/bin\/sh: /)
 })
