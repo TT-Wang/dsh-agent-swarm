@@ -8,7 +8,6 @@ import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } fr
 import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
-import { deliverablePaths } from './admission.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
@@ -1254,10 +1253,6 @@ export class Workspaces {
             } finally { await rm(patchPath, { force: true }) }
           }
           if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
-          // R19-C F1: a recovered checkout tracks the hinted ignored files its
-          // snapshot force-included; put them back to untracked+ignored on disk
-          // so the submit gate sees them exactly as the previous owner's did.
-          if (recovery !== undefined) await this.untrackPreservedHints(member.workspace, baseCommit, preservationPaths, signal)
           record.task = { taskId: task.id, epoch: task.epoch, baseCommit, preservationPaths,
             ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
             ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
@@ -1376,14 +1371,14 @@ export class Workspaces {
   }
 
   /**
-   * The files this task owes, so a quiescent draft of one survives a handoff.
-   * A declared `outputs` is exact and needs no guessing; a row without the field
-   * (a legacy task, or a manually assembled mission that omitted it) still falls
-   * back to reading them out of the objective and acceptance text.
+   * The files this task owes, so a quiescent draft of one survives a handoff
+   * even when it is ignored: exactly the declared `outputs` (a row without the
+   * field declares none). An undeclared ignored file, such as a member-created
+   * `.env`, is never force-included; the recovered checkout tracks a preserved
+   * output, which is exactly what the replacement's capture carries.
    */
   private taskRecoveryPaths(task: Task): string[] {
-    return (task.outputs ?? deliverablePaths(task.objective ?? '', task.acceptance ?? [])).filter(name => validRecoveryPath(name)
-      && withinScope(name, task.scope) && !this.toolchainName(name))
+    return (task.outputs ?? []).filter(name => validRecoveryPath(name) && withinScope(name, task.scope) && !this.toolchainName(name))
   }
 
   /**
@@ -1429,42 +1424,6 @@ export class Workspaces {
       if (await lstat(path.join(workspace, ...resolved, '.git')).then(() => true, () => false)) return undefined
     }
     return resolved.join('/')
-  }
-
-  /**
-   * R19-C F1: restore the submit gate's view of a recovered checkout. The
-   * preservation snapshot force-includes every hinted ignored file so a report
-   * draft survives a handoff, and this worktree was just checked out (or
-   * rebased) AT that snapshot, so those files are TRACKED here. `git
-   * check-ignore` never reports a tracked path, `captureArtifact` would list
-   * nothing, and an undeclared submission would publish a member-created
-   * `.env` into the immutable artifact. Every hinted path that is in the index,
-   * ignored by pattern and absent from the task base is removed from the index
-   * only: the file stays on disk for the new owner, capture flags it unless it
-   * is declared, and a declared output is force-added exactly as it was for the
-   * previous owner. A tracked ignored path the base already carries (a declared
-   * dependency output, a force-added source file) is real content and stays.
-   */
-  private async untrackPreservedHints(workspace: string, baseCommit: string, hints: readonly string[], signal: AbortSignal): Promise<void> {
-    if (!hints.length) return
-    const tracked = new Set((await this.git(workspace, ['ls-files', '--cached', '-z', '--', ...hints.map(name => `:(literal)${name}`)], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
-    const candidates = hints.filter(name => tracked.has(name))
-    if (!candidates.length) return
-    // `-z` needs `--stdin`, which the process seam does not offer; hints are
-    // ASCII path tokens without quotes, backslashes or control characters, so
-    // with `core.quotePath=false` the newline-separated answer is exact.
-    const check = await this.gitResult(workspace, ['-c', 'core.quotePath=false', 'check-ignore', '--no-index', '--', ...candidates], signal, undefined, INVENTORY_BYTES)
-    if (check.exitCode !== 0 && check.exitCode !== 1) throw new Error(`git check-ignore failed (${check.exitCode}): ${check.output.trim()}`)
-    if (check.truncated) throw new Error('git check-ignore output exceeded the configured limit; refusing incomplete recovery inspection')
-    const ignored = new Set(check.exitCode === 0 ? check.output.split('\n').filter(Boolean) : [])
-    const forced: string[] = []
-    for (const name of candidates) {
-      if (!ignored.has(name)) continue
-      const inBase = await this.git(workspace, ['cat-file', '-e', `${baseCommit}:${name}`], signal).then(() => true, () => false)
-      signal.throwIfAborted()
-      if (!inBase) forced.push(name)
-    }
-    if (forced.length) await this.git(workspace, ['rm', '--cached', '--force', '--quiet', '--', ...forced.map(name => `:(literal)${name}`)], signal)
   }
 
   /** A legacy failed claim may have moved the member after saving its old task.

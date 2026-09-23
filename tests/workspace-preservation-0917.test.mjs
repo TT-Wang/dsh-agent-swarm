@@ -27,7 +27,8 @@ async function fixture(t) {
   const mission = { id: 'mission-preserve', workspace: source }
   const member = { id: 'first', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'first') }
   const peer = { id: 'second', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'second') }
-  const task = { id: 'draft', missionId: mission.id, epoch: 1, title: 'Draft review', objective: 'Write review/final.md', acceptance: ['Deliver review/final.md'], kind: 'research', scope: ['review/'], checks: [], status: 'running' }
+  // R24: the draft is preserved because the task declares it, not because the prose names it.
+  const task = { id: 'draft', missionId: mission.id, epoch: 1, title: 'Draft review', objective: 'Write review/final.md', acceptance: ['Deliver review/final.md'], outputs: ['review/final.md'], kind: 'research', scope: ['review/'], checks: [], status: 'running' }
   const taskPath = taskId => path.join(temp, 'worktrees', mission.id, 'tasks', `${taskId}.json`)
   const memberPath = memberId => path.join(temp, 'worktrees', mission.id, `${memberId}.workspace.json`)
   const read = async file => JSON.parse(await readFile(file, 'utf8'))
@@ -55,7 +56,7 @@ test('checkpoint preserves a named ignored draft privately; handoff restores it 
   assert.equal(await git(path.join(f.temp, 'worktrees', f.mission.id, 'artifacts.git'), 'for-each-ref', '--format=%(refname)', 'refs/artifacts/'), '', 'preserving a draft does not submit an artifact')
 })
 
-test('legacy metadata gets deliverable hints from checkpoint task contract', async t => {
+test('legacy metadata gets its preservation paths from the checkpoint task\'s declared outputs', async t => {
   const f = await fixture(t)
   await f.workspaces.prepareTask(f.member, f.task, [])
   for (const filename of [f.memberPath(f.member.id), f.taskPath(f.task.id)]) {
@@ -97,7 +98,7 @@ for (const operation of ['checkout', 'dependency merge']) test(`unclaimed ignore
   // This path is not a declared output of any task on the receiving member.
   await f.report(f.member, 'unowned ignored content\n')
   const head = await git(f.member.workspace, 'rev-parse', 'HEAD')
-  const next = { ...f.task, id: 'next', objective: 'Inspect existing work', acceptance: [], ...(operation === 'checkout' ? { kind: 'verification', reviewOf: source.id } : { kind: 'integration' }) }
+  const next = { ...f.task, id: 'next', objective: 'Inspect existing work', acceptance: [], outputs: [], ...(operation === 'checkout' ? { kind: 'verification', reviewOf: source.id } : { kind: 'integration' }) }
   await assert.rejects(operation === 'checkout'
     ? f.workspaces.prepareTask(f.member, next, [], { ...source, status: 'submitted', artifact })
     : f.workspaces.prepareTask(f.member, next, [{ ...source, status: 'accepted', artifact }]), error => error.code === 'workspace_ignored_collision')

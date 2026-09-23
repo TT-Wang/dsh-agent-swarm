@@ -26,6 +26,15 @@ import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchem
 const schemaIndex = await toolSchemaIndex()
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 }
 const SECRET = 'DATABASE_URL=postgres://user:SECRET@db/prod\n'
+async function eventually(read, message, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = read()
+    if (result) return result
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.fail(message)
+}
 
 /** True when the temp filesystem folds case (macOS default); the spelling test needs that. */
 async function caseInsensitiveTemp() {
@@ -252,6 +261,54 @@ test('an undeclared ignored file is never captured, even a member-created .env t
   assert.equal(await f.inCommit(submitted.artifact.commit, '.env'), false, 'the secret never entered the immutable artifact')
   assert.deepEqual(await f.refsCarrying('.env', 'refs/'), [], 'no durable ref carries the secret')
   assert.equal(await readFile(path.join(f.author.workspace, '.env'), 'utf8'), SECRET, 'the member file stays on disk untouched')
+})
+
+test('a declared draft survives a handoff and is captured by the replacement, while an undeclared .env the objective names is never preserved', async t => {
+  const f = await fixture(t)
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Update notes/config.md to read DATABASE_URL from .env and report in docs/report.md', scope: ['**'], outputs: ['docs/report.md', 'notes/config.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'notes', 'config.md'), 'DATABASE_URL comes from .env\n')
+  await writeFile(path.join(f.author.workspace, '.env'), SECRET)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Draft by the first owner\n')
+  await f.readEvidence(f.author, task, 'notes/config.md')
+  // The production stop barrier: handoff -> stop -> Workspaces.checkpointTask (preservation snapshot) -> pending.
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing the config work over' })
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  assert.ok((await f.refsCarrying('docs/report.md', 'refs/preservation/')).length >= 1, 'the private preservation snapshot carries the ignored declared draft')
+  assert.deepEqual(await f.refsCarrying('.env', 'refs/'), [], 'no ref carries the undeclared .env')
+  const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
+  assert.equal(recovered.attempt.ownerId, f.peer.id)
+  assert.equal(await readFile(path.join(f.peer.workspace, 'docs', 'report.md'), 'utf8'), '# Draft by the first owner\n', 'the declared draft reaches the replacement')
+  assert.equal(await readFile(path.join(f.peer.workspace, 'notes', 'config.md'), 'utf8'), 'DATABASE_URL comes from .env\n', 'ordinary WIP is inherited as before')
+  await assert.rejects(lstat(path.join(f.peer.workspace, '.env')), { code: 'ENOENT' }, 'the undeclared .env never leaves the first owner worktree')
+  await writeFile(path.join(f.peer.workspace, 'docs', 'report.md'), '# Report finished by the replacement\n')
+  const submitted = await f.submit(f.peer, recovered)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path).sort(), ['docs/report.md', 'notes/config.md'])
+  assert.deepEqual([...submitted.artifact.changedPaths].sort(), ['docs/report.md', 'notes/config.md'])
+  assert.equal(await f.show(submitted.artifact.commit, 'docs/report.md'), '# Report finished by the replacement')
+  assert.deepEqual(await f.refsCarrying('.env', 'refs/'), [], 'no artifact or preservation ref ever carries the secret')
+  assert.equal(await readFile(path.join(f.author.workspace, '.env'), 'utf8'), SECRET, 'the previous owner worktree is untouched')
+})
+
+test('a stored task without outputs declares none: an ignored draft and a .env its prose names are neither preserved nor captured', async t => {
+  const f = await fixture(t)
+  const proposed = f.propose({ objective: 'Write docs/report.md and read DATABASE_URL from .env', acceptance: ['Write docs/report.md'], scope: ['**'] })
+  assert.equal(f.taskRow(proposed.id).outputs, undefined, 'a row without the field, as a legacy or manual assembly leaves it')
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, proposed.id)
+  await writeFile(path.join(f.author.workspace, 'notes', 'config.md'), 'uses .env\n')
+  await writeFile(path.join(f.author.workspace, '.env'), SECRET)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Undeclared draft\n')
+  await f.readEvidence(f.author, task, 'notes/config.md')
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  for (const name of ['.env', 'docs/report.md']) assert.deepEqual(await f.refsCarrying(name, 'refs/'), [], `no ref carries the undeclared ignored ${name}`)
+  const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
+  assert.equal(await readFile(path.join(f.peer.workspace, 'notes', 'config.md'), 'utf8'), 'uses .env\n')
+  for (const name of ['.env', 'docs/report.md']) await assert.rejects(lstat(path.join(f.peer.workspace, name)), { code: 'ENOENT' }, `${name} is not preserved`)
+  const submitted = await f.submit(f.peer, recovered)
+  assert.equal(submitted.status, 'submitted', 'nothing is owed, so nothing is refused')
+  assert.deepEqual(submitted.artifact.changedPaths, ['notes/config.md'])
+  assert.equal(submitted.artifact.files, undefined)
 })
 
 test('an undeclared report in a tracked directory is still captured by the whole-tree add', async t => {

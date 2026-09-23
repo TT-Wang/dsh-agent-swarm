@@ -4,9 +4,9 @@
  * Before this, nothing on a task named its deliverables, so five consumers read
  * them out of the objective and acceptance prose with `deliverablePaths()` — a
  * write-verb heuristic whose edge cases were patched from round 4 to round 19.
- * `outputs` states the same list exactly, validated once at admission, and the
- * two workspace consumers prefer it. A row without the field still falls back to
- * the heuristic, so legacy and manually assembled work is untouched.
+ * `outputs` states the same list exactly, validated once at admission, and
+ * since R24 it is the only rule the workspace consumers read: a row without the
+ * field declares no output.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -15,7 +15,6 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
-import { deliverablePaths } from '../lib/admission.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
@@ -183,11 +182,9 @@ async function workspaceFixture(t) {
 
 test('R20: a declared gitignored report survives a handoff although no task text names it', async t => {
   const f = await workspaceFixture(t)
-  // Deliberately mute prose: the write-verb heuristic finds nothing here, so the
-  // draft is preserved only because the task declares the file.
+  // Deliberately mute prose: the draft is preserved only because the task declares the file.
   const task = { id: 'audit', missionId: f.mission.id, epoch: 1, title: 'Audit', objective: 'Audit the scheduler and report what you find',
     acceptance: ['The audit is reported'], outputs: ['review/final.md'], kind: 'research', scope: ['review/'], checks: [], status: 'running' }
-  assert.deepEqual(deliverablePaths(task.objective, task.acceptance), [], 'the heuristic names nothing for this task text')
   await f.workspaces.prepareTask(f.member, task, [])
   await f.draft(f.member, 'declared draft\n')
   await f.workspaces.checkpointTask(f.member, { ...task, epoch: 2 })
@@ -196,7 +193,7 @@ test('R20: a declared gitignored report survives a handoff although no task text
     'the declared deliverable reaches the replacement worktree')
 })
 
-test('R20: a task row with no outputs still recovers the paths its text names', async t => {
+test('R24: a task row with no outputs declares none, so an ignored draft its text names is not preserved', async t => {
   const f = await workspaceFixture(t)
   const legacy = { id: 'legacy', missionId: f.mission.id, epoch: 1, title: 'Draft review', objective: 'Write review/final.md',
     acceptance: ['Deliver review/final.md'], kind: 'research', scope: ['review/'], checks: [], status: 'running' }
@@ -204,6 +201,7 @@ test('R20: a task row with no outputs still recovers the paths its text names', 
   await f.draft(f.member, 'legacy draft\n')
   await f.workspaces.checkpointTask(f.member, { ...legacy, epoch: 2 })
   await f.workspaces.prepareTask(f.peer, { ...legacy, epoch: 2 }, [])
-  assert.equal(await readFile(path.join(f.peer.workspace, 'review/final.md'), 'utf8'), 'legacy draft\n',
-    'a row without the field keeps the heuristic it had before')
+  await assert.rejects(readFile(path.join(f.peer.workspace, 'review/final.md'), 'utf8'), { code: 'ENOENT' },
+    'the objective prose is no longer read for output paths')
+  assert.equal(await readFile(path.join(f.member.workspace, 'review/final.md'), 'utf8'), 'legacy draft\n', 'the file stays in the previous owner worktree')
 })

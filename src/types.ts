@@ -410,8 +410,9 @@ export interface Task {
    * The repository-relative files this task must produce, declared by whoever
    * planned it instead of inferred from the objective prose. An empty array is
    * a declaration ("this task writes no file"); absent means the row predates
-   * the field or came from a manual assembly that omitted it, and the
-   * consumers fall back to the `deliverablePaths` text heuristic for it.
+   * the field or came from a manual assembly that omitted it, and it reads as
+   * `[]`. Capture force-adds and preservation carries exactly these files, and
+   * submit and verify refuse one that was never written (`[output_missing]`).
    */
   outputs?: string[]
   checks: string[]
