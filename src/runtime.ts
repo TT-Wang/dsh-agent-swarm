@@ -2211,7 +2211,7 @@ export class SwarmRuntime {
     // author of the reviewed source, so a handoff that skipped the check left the
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
-    if (input.to !== undefined && task.reviewOf !== undefined && this.authorIds(this.task(missionId, task.reviewOf)).has(input.to)) throw new Error('[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    if (input.to !== undefined && task.reviewOf !== undefined && this.authorIds(this.task(missionId, task.reviewOf)).has(input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: Date.now() }

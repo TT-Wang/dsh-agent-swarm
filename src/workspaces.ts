@@ -1198,7 +1198,7 @@ export class Workspaces {
           if (reviewSource?.id !== task.reviewOf || reviewSource.missionId !== task.missionId || reviewSource.status !== 'submitted' || reviewSource.artifact === undefined) throw new Error('[verification_source_required] Verification requires its exact submitted review source artifact Verify again with `swarm_verify` and the reviewed `taskId`.')
           await this.validateArtifact(member, reviewSource.artifact, signal)
           if (task.attempt?.sourceCommit !== undefined && task.attempt.sourceCommit !== reviewSource.artifact.commit) throw new Error('[review_source_changed] Source artifact changed after assignment; reassign the same review before preparing its workspace')
-        } else if (reviewSource !== undefined) throw new Error('[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
+        } else if (reviewSource !== undefined) throw new PolicyError('review_source_not_verification', 'tool_error', '[review_source_not_verification] Only a verification task can name a review source Correct `reviewOf` with `swarm_propose` and retry.')
         const taskOwner = await readJson(this.taskPath(member.missionId, task.id))
         const ownsRecovery = taskOwner === undefined || (isRecord(taskOwner) && taskOwner.memberId === member.id)
         const sameReview = reviewSource === undefined || record.task?.baseCommit === reviewSource.artifact?.commit
