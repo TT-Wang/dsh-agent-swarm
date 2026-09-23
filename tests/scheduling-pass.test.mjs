@@ -223,6 +223,78 @@ test('S1/R17-G5: a named body\'s own commits never publish with the wedged branc
   } finally { await f.cleanup() }
 })
 
+test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps committing, but only the body\'s own progress keeps it live, so the wedge publishes and the owner is asked about new work', async () => {
+  // The real adapter's isIdle drains a stranded inbox item by waking a Harness
+  // turn, which runs in the caller's async context. Called from the body's
+  // startBlocker, that turn's heartbeats committed inside the body's context,
+  // and every one of them stamped the body's progress: the body sat in H's hung
+  // start for the whole start bound, published as a live pass, and the owner
+  // was never asked about task Z proposed for idle member I until the start
+  // settled. Only the body's own awaits and member boundaries count as its
+  // progress now.
+  const startBoundMs = 1_500
+  class StrandedInboxWorkers extends FakeWorkers {
+    names = new Map()
+    busy = new Set()
+    stranded = new Set()
+    beats = []
+    heartbeats = 0
+    hangH = false
+    hang
+    async start(spec, signal) {
+      this.started.push(spec.member.id)
+      if (this.names.get(spec.member.id) !== 'H' || !this.hangH) return
+      this.hangH = false
+      this.hang = { from: Date.now() }
+      try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
+      finally { this.hang.to = Date.now() }
+    }
+    isIdle(id) {
+      if (this.stranded.delete(id)) { this.wake(id); return true }
+      return !this.busy.has(id)
+    }
+    /** The woken turn: its running tool republishes the member's activity every 40ms. */
+    wake(id) {
+      const startedAt = Date.now()
+      this.busy.add(id)
+      this.beats.push(setInterval(() => {
+        this.heartbeats += 1
+        this.callbacks.activity(id, { id: 'op-tool', kind: 'tool', tool: 'bash', startedAt, updatedAt: Date.now() })
+      }, 40))
+    }
+  }
+  const workers = new StrandedInboxWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: startBoundMs } })
+  try {
+    const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
+    const i = await f.runtime.addMember(f.owner, f.mission.id, { name: 'I', role: 'implementation', maxOutputTokens: 5_000 })
+    workers.names.set(h.id, 'H')
+    const running = f.propose({ title: 'Author work' })
+    await eventually(() => taskOf(f.runtime, running.id).status === 'running' ? true : undefined, 'the Author task dispatches', 4_000)
+    await sleep(50)
+    // Armed in one synchronous step: the next body's startBlocker(Author) drains
+    // the stranded item and wakes the turn, then the body waits in H's start.
+    workers.stranded.add(f.author.id)
+    workers.hangH = true
+    await eventually(() => workers.hang !== undefined ? true : undefined, 'the body waits in H\'s hung start', 4_000)
+    const named = await eventually(() => wedgeEvents(f)[0], 'the body is named while it waits in H\'s start', 4_000)
+    assert.equal(workers.hang.to, undefined, 'named while H\'s start still hangs')
+    assert.equal(workers.beats.length, 1, 'the stranded drain woke one turn from inside the body')
+    const beatsAtNaming = workers.heartbeats
+    await sleep(100)
+    assert.ok(workers.heartbeats > beatsAtNaming, 'the woken turn keeps committing its heartbeats during the wedge')
+    assert.deepEqual(f.runtime.passState(f.mission.id), { passLive: false, wedged: true }, 'yet the body publishes as wedged, not as a live pass')
+    const z = f.propose({ title: 'Z work for idle I', assigneeId: i.id })
+    const question = await eventually(() => f.runtime.store.list('deliveries', f.mission.id)
+      .find(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${z.id}@`)), 'the owner is asked about Z during the wedge', 1_000)
+    assert.equal(workers.hang.to, undefined, 'the question was asked while the body still waited in H\'s start')
+    assert.ok(question.createdAt > named.createdAt, 'after the naming')
+  } finally {
+    for (const beat of workers.beats) clearInterval(beat)
+    await f.cleanup()
+  }
+})
+
 test('S1: a body past its bound stops at the next member boundary, so lease recovery waits for one long await, not for every member\'s', async () => {
   // Three members whose first native start hangs until the declared start
   // bound aborts it, and a healthy member X whose running task's lease expires

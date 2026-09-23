@@ -13,6 +13,7 @@ import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
+import { awaited, type SchedulingPass } from './scheduling.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -549,8 +550,9 @@ export class Attempts {
    * bounded, durable nudge; when the bound is exhausted, capture the member
    * workspace as an immutable checkpoint, fence the attempt and re-pend the
    * task with the same member preferred so recovery resumes partial work.
+   * `pass` is the dispatching body's record: its capture await is the body's own.
    */
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> {
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> {
     const bound = this.rt.config.maxIdleCloseouts ?? DEFAULT_IDLE_CLOSEOUTS
     const nudges = task.closeout?.nudges ?? 0
     if (nudges < bound) {
@@ -567,7 +569,7 @@ export class Attempts {
       return
     }
     let checkpoint: Artifact
-    try { checkpoint = await this.rt.workers.captureArtifact(member, task) }
+    try { checkpoint = await awaited(pass, this.rt.workers.captureArtifact(member, task)) }
     catch (error) {
       const failed = this.rt.task(mission.id, task.id)
       if (failed.status !== 'running' || failed.attempt?.id !== task.attempt?.id) return
@@ -620,9 +622,10 @@ export class Attempts {
    * each running attempt is judged against the declared bound before renewal, so
    * an operation that has stopped producing is named to the owner and stops
    * counting as liveness. Returns false when a shutdown was observed, so the
-   * caller keeps the original "abandon the pass" control flow.
+   * caller keeps the original "abandon the pass" control flow. `pass` is the
+   * scheduling body's own record (`kick`); its capture await is the body's own.
    */
-  async recoverExpired(mission: Mission, missionId: string): Promise<boolean> {
+  async recoverExpired(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
         // S1 (P0): iterate ids and re-read each row inside the loop. The loop awaits
         // external work (captureArtifact, stop), and cancel/challenge/handoff/
         // publish/beforeStep/recordToolRun commit directly during those awaits; a
@@ -666,7 +669,7 @@ export class Attempts {
             const owner = this.rt.store.get('members', oldOwner)
             if (owner !== undefined && owner.status !== 'stopped') {
               try {
-                const checkpoint = await this.rt.workers.captureArtifact(owner, task)
+                const checkpoint = await awaited(pass, this.rt.workers.captureArtifact(owner, task))
                 const current = this.rt.task(missionId, task.id)
                 if (current.epoch === task.epoch && current.status === 'running' && current.attempt?.id === attemptId) {
                   // S1 (P0): commit the row re-read after the await, never the

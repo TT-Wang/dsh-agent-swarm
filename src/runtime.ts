@@ -486,7 +486,6 @@ export class SwarmRuntime {
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.store = new SwarmStore(config.statePath, storeOptions)
-    this.subscribe(missionId => this.scheduling.recordCommit(missionId))
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
       idle: memberId => this.onIdle(memberId),
@@ -1021,7 +1020,7 @@ export class SwarmRuntime {
     }
   }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task) }
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task, pass) }
   /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
   private replacementLineage(missionId: string, task: Task): Set<string> {
     const tasks = this.store.list('tasks', missionId)
@@ -4206,7 +4205,8 @@ export class SwarmRuntime {
    * from the member it stopped before (`sweepFrom`). It is opened in the same
    * synchronous step that closes the stopped body, so the close publishes as
    * inside that live pass, never as a finished sweep that left the unswept
-   * members' work undispatched.
+   * members' work undispatched. The body is handed its own record (`schedule`),
+   * which it stamps with its own progress (`Scheduling.passState`).
    */
   kick(missionId: string, sweepFrom?: string): void {
     if (this.shuttingDown || this.closed) return
@@ -4214,7 +4214,7 @@ export class SwarmRuntime {
     if (pass === undefined) return
     if (sweepFrom !== undefined) pass.sweepFrom = sweepFrom
     this.defer(async () => {
-      try { await this.scheduling.runBody(pass, () => this.exclusive(missionId, () => this.schedule(missionId))) }
+      try { await this.exclusive(missionId, () => this.schedule(missionId, pass)) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
@@ -4296,7 +4296,12 @@ export class SwarmRuntime {
     this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined })
     return promise
   }
-  private async schedule(missionId: string): Promise<void> {
+  /**
+   * One scheduling body. `pass` is its own record when `kick` queued it; the
+   * body hands it to lease recovery and the dispatch sweep, which stamp its
+   * progress and stop it early past its bound. A direct call has none.
+   */
+  private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.shuttingDown) return
     const mission = this.mission(missionId)
     if (mission.status !== 'active') { await this.flushOutbox(missionId); return }
@@ -4315,11 +4320,11 @@ export class SwarmRuntime {
     // S1 (P0): the lease-expiry sweep is src/attempts.ts#recoverExpired, in the
     // same order as before; it iterates ids and re-reads each row inside the loop,
     // so a row committed during its awaits is never written back over.
-    if (!await this.attempts.recoverExpired(mission, missionId)) return
+    if (!await this.attempts.recoverExpired(mission, missionId, pass)) return
     // M1a seam 7/7: the dispatch sweep is src/scheduling.ts#dispatch, in the same
     // order as before; a false result abandons the pass where the loop's early
     // returns did.
-    if (!await this.scheduling.dispatch(mission, missionId)) return
+    if (!await this.scheduling.dispatch(mission, missionId, pass)) return
     // Backstop: a full pass that dispatched nothing must still witness the state.
     this.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the
