@@ -480,3 +480,50 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
     assert.ok(witness.at > retryAt + tickMs, 'the current witness post-dates the bound')
   })
 }
+
+test('an expired back-off that still waits (queued behind a live lease) is judged once, then the witness dedup holds again', async t => {
+  // 12b12a6: once a back-off expired after the witness was stamped, the F(S)
+  // dedup stayed bypassed for as long as the task legitimately waited, so the
+  // whole classifier ran on every pass and transition (~40 per second here).
+  const f = await fixture(t)
+  const tickMs = f.runtime.config.tickMs
+  const research = { kind: 'research', checks: undefined }
+  const running = f.propose('Running work', research)
+  await f.runtime.claim(f.actor, f.mission.id, running.id)
+  const other = f.propose('Unrelated dead end', research)
+  // Queued behind its own assignee's live lease once the back-off expires.
+  const backoff = f.propose('Backing off', research)
+  const retryAt = Date.now() + 300
+  f.runtime.commit(f.mission.id, () => {
+    const row = f.runtime.store.get('tasks', backoff.id)
+    row.epoch++
+    row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+    f.runtime.store.put('tasks', row)
+    const dead = f.runtime.store.get('tasks', other.id)
+    dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked for repair'
+    f.runtime.store.put('tasks', dead)
+  })
+  // The unrelated stall root stamps the W2 witness inside the back-off window.
+  const stamped = await eventually(() => {
+    const witness = f.runtime.store.get('missions', f.mission.id).witness
+    return witness?.kind === 'W2' && witness.at <= retryAt && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+  }, 'a W2 witness is stamped during the back-off window')
+  const notices = f.runtime.notices
+  const judged = [], passes = []
+  const waits = notices.waitsLegitimately.bind(notices)
+  notices.waitsLegitimately = (task, tasks) => { if (task.id === backoff.id) judged.push(Date.now()); return waits(task, tasks) }
+  const ensure = notices.ensureWitness.bind(notices)
+  notices.ensureWitness = (missionId, options) => { passes.push(Date.now()); return ensure(missionId, options) }
+  await sleep(Math.max(0, retryAt + tickMs - Date.now()) + 800)
+  const bound = retryAt + tickMs
+  const after = judged.filter(at => at > bound)
+  t.diagnostic(`witness passes after the bound: ${passes.filter(at => at > bound).length}; back-off judgements after the bound: ${after.length}`)
+  assert.ok(passes.filter(at => at > bound).length >= 5, `the witness path kept running after the bound: ${passes.filter(at => at > bound).length}`)
+  assert.ok(after.length >= 1, 'the expired back-off is judged after its bound')
+  assert.ok(after.length <= 2, `the expired back-off is judged once, not on every pass: ${after.length}`)
+  const witness = f.runtime.store.get('missions', f.mission.id).witness
+  assert.equal(witness.fingerprint, stamped.fingerprint, 'the same F(S) is re-stamped')
+  assert.ok(witness.at > bound, 'the witness now post-dates the expired bound')
+  assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'the back-off still waits behind the live lease')
+  assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [], 'a legitimately waiting back-off is not named')
+})
