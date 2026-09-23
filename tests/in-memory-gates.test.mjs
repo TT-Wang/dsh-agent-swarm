@@ -152,9 +152,6 @@ const CENSUS = [
   ["src/notices.ts",3,"Set","const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])","constant","","module-level immutable lookup table; excludes recursive and receipt followups, no mutable recovery state"],
   ["src/notices.ts",3,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call (the shared lineage helper `replacementCoverage`), so it cannot gate a later call"],
   ["src/notices.ts",4,"Set","const roots = new Set(stallRootsFor(rt, tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside the one synchronous call of the R17-G9 refusal predicate, which re-reads the durable task rows on every call, so it cannot gate a later call"],
-  ["src/notices.ts",5,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
-  ["src/notices.ts",6,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",7,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
   ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
   ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
@@ -607,22 +604,6 @@ const GATE_TESTS = {
       assert.ok(closed)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:5': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Parked holder' })
-      await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      const epoch = taskOf(f.runtime, task.id).epoch
-      // Phantom presence: the set claims the notice for this attempt was sent,
-      // but the durable delivery ledger has no such notice.
-      f.runtime.parkedNotices.add(`parked:${f.mission.id}:${task.id}:${epoch}`)
-      // R17-G7: the park is durable state (`phase`); the live `status` is derived from it.
-      f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', f.author.id); member.phase = 'parked'; f.runtime.store.put('members', member) })
-      const notice = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.to === 'owner' && /parked member/.test(delivery.content)),
-        'the parked-holder notice is emitted from the durable state despite the phantom cache entry')
-      assert.equal(notice.notice.dedupKey, `parked:${f.mission.id}:${task.id}:${epoch}`, 'the durable ledger is the gate')
-    } finally { await f.cleanup() }
-  },
   'src/notices.ts:9': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
@@ -648,35 +629,6 @@ const GATE_TESTS = {
       const state = f.runtime.passState(f.mission.id)
       assert.equal(typeof state.passLive, 'boolean')
       assert.equal(typeof state.wedged, 'boolean')
-    } finally { await f.cleanup() }
-  },
-  'src/notices.ts:6': async t => {
-    const f = await setup()
-    try {
-      f.runtime.integrationGapWarned.add(`integration-gap:${f.mission.id}:2`)   // phantom presence
-      f.propose({ title: 'First implementation' })
-      f.propose({ title: 'Second implementation' })
-      const notice = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === `integration-gap:${f.mission.id}:2`),
-        'the integration-gap notice is emitted because the durable ledger has no such row')
-      assert.ok(notice)
-    } finally { await f.cleanup() }
-  },
-  'src/notices.ts:7': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Blocked review path' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'the automatic review is admitted')
-      // The blocker reason is deterministic; seed the set with the exact key
-      // before the review is withdrawn, so the cache claims the notice was sent.
-      const reason = `the automatically admitted review ${review.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${task.id}) or cancel the source task`
-      f.runtime.reviewPathNotices.add(`review-blocked:${f.mission.id}:${task.id}:${reason}`)
-      f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S5: withdraw' })
-      const delivery = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(item => item.notice?.dedupKey === `review-blocked:${f.mission.id}:${task.id}:${reason}`),
-        'the durable ledger, not the set, decides whether the blocked-review notice is sent')
-      assert.ok(delivery)
     } finally { await f.cleanup() }
   },
   'src/notices.ts:8': async t => {

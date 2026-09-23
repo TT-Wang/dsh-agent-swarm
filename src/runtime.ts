@@ -279,9 +279,7 @@ export class SwarmRuntime {
    *   - a withdrawn automatic review: durable `task/review-admitted` events
    *     and deterministic task identity (`withdrawnAutomaticReview`);
    *   - a recorded missing review: durable `task/review-missing` event per
-   *     submission (`missingReviewRecorded`);
-   *   - notice dedup: the durable delivery ledger keyed by class + dedup key
-   *     (`parkedNotices`, `reviewPathNotices`, `integrationGapWarned`).
+   *     submission (`missingReviewRecorded`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `releasedPasses`, `idleSignals` (durable `Task.idleSignal`),
@@ -479,9 +477,6 @@ export class SwarmRuntime {
   get budgetStops() { return this.gates.budgetStops }
   get fingerprintCache() { return this.gates.fingerprintCache }
   get releasedPasses() { return this.scheduling.releasedPasses }
-  get parkedNotices() { return this.notices.parkedNotices }
-  get reviewPathNotices() { return this.notices.reviewPathNotices }
-  get integrationGapWarned() { return this.notices.integrationGapWarned }
   get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {

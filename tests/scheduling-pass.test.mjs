@@ -16,7 +16,8 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { setup, eventually, events, taskOf } from './faults/harness.mjs'
+import { join } from 'node:path'
+import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
 
 const keyOf = missionId => `pass_${missionId}`
 const writePass = (f, fields) => {
@@ -122,10 +123,7 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.startFailures.clear()
     f.runtime.budgetStops.clear()
     f.runtime.releasedPasses.clear()
-    f.runtime.parkedNotices.clear()
-    f.runtime.reviewPathNotices.clear()
     f.runtime.reviewPathReported.clear()
-    f.runtime.integrationGapWarned.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()
     const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
@@ -164,8 +162,14 @@ test('S5: a withdrawn automatic review is not re-admitted when its admission fal
   } finally { await f.cleanup() }
 })
 
-test('S5: the durable notice ledger dedups decision notices when the in-memory set is cleared', async () => {
+test('S5: the durable notice ledger alone dedups a decision notice, within one process and across a restart', async () => {
+  // The notice-dedup Sets (parked, integration-gap, review-blocked) are gone.
+  // Within one process the delivery row is written synchronously in the call
+  // that emits it, so the next pass reads it; after a restart it is the only
+  // record there is. Before, an empty set after a restart let the persistent
+  // blocker re-run its site, writing a second `task/review-blocked` event.
   const f = await setup({ config: { tickMs: 10 } })
+  let restarted
   try {
     f.runtime.store.transaction(() => {
       const reviewer = f.runtime.store.get('members', f.reviewer.id)
@@ -178,11 +182,18 @@ test('S5: the durable notice ledger dedups decision notices when the in-memory s
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate without a review path' })
     const first = await eventually(() => f.runtime.store.list('deliveries', f.mission.id)
       .find(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('review-blocked:')), 'the blocker notice is recorded', 8_000)
-    // Drop the in-memory dedup set: the durable ledger must still suppress a repeat.
-    f.runtime.reviewPathNotices.clear()
+    const recorded = runtime => ({
+      deliveries: runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey === first.notice.dedupKey).length,
+      events: events(runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === task.id).length,
+    })
     await sleep(200)
-    const duplicates = f.runtime.store.list('deliveries', f.mission.id)
-      .filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey === first.notice.dedupKey)
-    assert.equal(duplicates.length, 1, 'the durable notice ledger is the gate, not the cleared set')
-  } finally { await f.cleanup() }
+    assert.deepEqual(recorded(f.runtime), { deliveries: 1, events: 1 }, 'repeated passes in one process read the durable row')
+    await f.runtime.dispose()
+    restarted = new SwarmRuntime({ statePath: join(f.dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
+      maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000 }, new FakeWorkers())
+    await restarted.start()
+    await sleep(300)
+    assert.equal(restarted.store.get('tasks', task.id).status, 'submitted', 'the blocker persists across the restart')
+    assert.deepEqual(recorded(restarted), { deliveries: 1, events: 1 }, 'a restart does not re-emit the blocker the ledger already records')
+  } finally { if (restarted !== undefined) await restarted.dispose(); await f.cleanup() }
 })

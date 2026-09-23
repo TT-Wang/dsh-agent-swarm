@@ -457,11 +457,6 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 export class Notices {
-  /** R10-15 parked-holder signals already emitted, keyed by mission:task:epoch. */
-  readonly parkedNotices = new Set<string>()
-  /** R11-03 integration-gap diagnostics already emitted, keyed by mission:implementation count. */
-  readonly integrationGapWarned = new Set<string>()
-  readonly reviewPathNotices = new Set<string>()
   /**
    * Deliveries a pump is currently attempting (cache-only claim keyed per
    * delivery, so two pumps cannot duplicate one attempt and one hung call
@@ -1423,9 +1418,8 @@ export class Notices {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === task.id) ?? task
     const key = `parked:${mission.id}:${row.id}:${row.epoch}`
-    // S5: the durable notice ledger is the gate; the set is only a cache.
-    if (this.parkedNotices.has(key) && hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.parkedNotices.add(key)
+    // S5: the durable notice ledger is the gate (its row is written in this call).
+    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     this.rt.commit(mission.id, () => {
       this.notify(mission.id, NOTICE_TEMPLATES.parked.build({ taskId: row.id, title: row.title }), view.subjectsOf([row]),
         { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked' })
@@ -1443,9 +1437,8 @@ export class Notices {
     const implementations = view.implementations
     if (implementations.length < 2 || view.tasks.some(task => task.kind === 'integration')) return
     const key = `integration-gap:${mission.id}:${implementations.length}`
-    // S5: the durable notice ledger is the gate; the set is only a cache.
-    if (this.integrationGapWarned.has(key) && hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    this.integrationGapWarned.add(key)
+    // S5: the durable notice ledger is the gate (its row is written in this call).
+    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
     this.rt.commit(mission.id, () => {
       this.notify(mission.id, NOTICE_TEMPLATES['integration-gap'].build({ diagnostic, implementations: view.implementations.map(task => task.id) }), view.subjectsOf(view.implementations),
@@ -1458,16 +1451,15 @@ export class Notices {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
     const key = `review-blocked:${mission.id}:${row.id}:${reason}`
-    // S5: the durable notice ledger (class, key, sender) is the gate; the set is
-    // only a cache, so losing it cannot produce a second notice for the state.
-    if (this.reviewPathNotices.has(key) && hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
+    // S5: the durable notice ledger (class, key, sender) is the gate; its row is
+    // written in this call, so neither a restart nor a repeat can re-emit it.
+    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
       this.notify(mission.id, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic, sourceId: row.id }), view.subjectsOf([row]),
         { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason })
     })
-    this.reviewPathNotices.add(key)
   }
 
   topicDelivery(missionId: string, from: string, topic: string, content: string): void {
