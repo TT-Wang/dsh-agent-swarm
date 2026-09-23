@@ -158,10 +158,10 @@ export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
 /**
  * ENV: the environment a declared check runs under, stated as facts instead of
  * folklore, so the assignee knows which environment the host check will use and
- * a verification can tell when its self-run cannot reproduce it.
+ * a verification can tell when the executed check did not reproduce it.
  *
  * `home`, the two user cache roots, the sandbox policy and the dependency links
- * are what a self-run must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
+ * are what an execution must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
  * scoped roots the envelope itself provides inside the disposable checkout: they
  * differ by design on every run and are excluded from the reproduction
  * comparison. Existence flags are recorded and reported but never refuse an
@@ -223,10 +223,12 @@ export interface ObservedCheck {
 /**
  * ENV: the measured envelope plus the declared-check environment and the last
  * observation. `environment` is the declared envelope the runtime delivers to
- * the assignee and compares with the verification attempt's self-run facts:
- * blocking divergences (HOME, the user cache roots, the sandbox policy, the
- * dependency links) are the ones a self-run cannot reproduce, the existence
- * flags are advisory, because a cold cache is not a wrong environment.
+ * the assignee and compares with the environment recorded on the declared host
+ * checks it ran: blocking divergences (HOME, the user cache roots, the sandbox
+ * policy, the dependency links) refuse an acceptance, the existence flags are
+ * advisory, because a cold cache is not a wrong environment.
+ * `selfRunEnvironment` is delivered beside it as the baseline a member's own
+ * commands inherit; it is reported to the assignee, never compared.
  */
 export interface DeclaredCheckEnvelope extends CheckEnvelope {
   environment: CheckEnvironment
@@ -687,11 +689,8 @@ export const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
  * ENOENT, which would turn the fix into a different failure).
  *
  * This is deliberately NOT part of `checkCacheEnvironment`: that record becomes
- * the envelope's `checkCacheRoots`, which `selfRunEnvironmentFacts` spreads into
- * a member's self-run facts and re-derives only for the four package-manager
- * names. Recording a checkout-scoped TMPDIR there would make every self-run
- * falsely claim the envelope's disposable temp root. The envelope still records
- * the scoped roots it always did; no new field is added and the blocking half of
+ * the envelope's `checkCacheRoots`. The envelope still records the scoped roots
+ * it always did; no new field is added and the blocking half of
  * `compareCheckEnvironments` sees no new field at all.
  */
 export function checkTempEnvironment(cacheRoot: string): Record<string, string> {
@@ -736,14 +735,14 @@ export class Workspaces {
   /**
    * ENV: the environment the host's declared checks run under, computed without
    * running one. `checkCacheRoot`/`checkCacheRoots` name the placeholder
-   * checkout a check will be given; the rest are the facts a self-run must
-   * reproduce.
+   * checkout a check will be given; the rest are the facts an executed check
+   * must reproduce.
    */
   declaredCheckEnvironment(): CheckEnvironment { return this.checkEnvironment(this.checkProcessEnv(CHECKOUT_PLACEHOLDER), CHECKOUT_PLACEHOLDER, true) }
   /**
-   * ENV: what a member's own self-run inherits in this host process. A self-run
-   * has none of the envelope's scoped check caches, which is why those fields
-   * are excluded from the reproduction comparison.
+   * ENV: what a member's own self-run inherits in this host process, delivered
+   * beside the envelope as `selfRun`. A self-run has none of the envelope's
+   * scoped check caches; these facts are reported, never compared.
    */
   selfRunEnvironment(): CheckEnvironment { return this.checkEnvironment(ambientEnvironment(), CHECKOUT_PLACEHOLDER, false) }
   /**
