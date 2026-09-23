@@ -1249,15 +1249,19 @@ export class Notices {
     const witness = options.wedged === true ? undefined : mission.witness
     if (witness?.fingerprint === fingerprint && !backoffExpiredSince(this.rt, tasks, witness.at)) return
     // A pass past that bypass which judged the board and published nothing
-    // re-stamps the same F(S) at now (a notice re-stamps it itself), so the
+    // re-stamps the same F(S) (a notice re-stamps it itself), so the
     // short-circuit holds again instead of the whole classifier running on
     // every pass while the task waits (for example behind a live lease). A pass
     // that left the board to a later judgement judged nothing and leaves it.
+    // The stamp is the instant the judgement began, not its end: a back-off
+    // judged still waiting whose bound passes while the pass finishes has not
+    // been judged expired, so it still bypasses the dedup on a later pass.
+    const judgedAt = Date.now()
     if (!this.judgeBoard(view, options, stallRootNotices) || witness?.fingerprint !== fingerprint) return
     this.rt.commit(missionId, () => {
       const board = this.rt.store.get('missions', missionId)
       if (board?.witness === undefined || board.witness.at !== witness.at) return
-      board.witness = { ...board.witness, at: Date.now() }
+      board.witness = { ...board.witness, at: judgedAt }
       this.rt.store.put('missions', board)
     })
   }

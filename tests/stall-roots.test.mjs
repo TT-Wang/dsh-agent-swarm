@@ -583,3 +583,61 @@ test('an expired back-off that still waits (queued behind a live lease) is judge
   assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'the back-off still waits behind the live lease')
   assert.deepEqual(f.fallthroughs().map(delivery => delivery.subjects), [], 'a legitimately waiting back-off is not named')
 })
+
+test('a back-off whose bound passes while a pass judges the board is still judged expired by a later pass', async t => {
+  // 24ee7ce re-stamped the witness at the end of the judging pass. Back-off B
+  // was judged still waiting early in that pass; its bound passed before the
+  // pass ended, and the re-stamp then post-dated it, so every later pass read
+  // the same F(S) as already judged and B's fall-through was never owed. The
+  // re-stamp now carries the instant the judgement began.
+  const f = await fixture(t)
+  const tickMs = f.runtime.config.tickMs
+  const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+  const research = { kind: 'research', checks: undefined }
+  const sibling = f.propose('Healthy sibling', research)
+  await f.runtime.claim(f.actor, f.mission.id, sibling.id)
+  const other = f.propose('Unrelated dead end', research)
+  // A waits behind the live lease once expired (judged, nothing to publish:
+  // the re-stamp); B's assignee is stopped, so once expired a fall-through is owed.
+  const a = f.propose('Backoff A', research)
+  const b = f.propose('Backoff B', { ...research, assigneeId: second.id })
+  const retryA = Date.now() + 400
+  const retryB = retryA + 80
+  f.runtime.commit(f.mission.id, () => {
+    for (const [task, retryAt] of [[a, retryA], [b, retryB]]) {
+      const row = f.runtime.store.get('tasks', task.id)
+      row.epoch++
+      row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+      f.runtime.store.put('tasks', row)
+    }
+    const dead = f.runtime.store.get('tasks', other.id)
+    dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked for repair'
+    f.runtime.store.put('tasks', dead)
+    const member = f.runtime.store.get('members', second.id)
+    member.phase = 'stopped'
+    f.runtime.store.put('members', member)
+  })
+  const boundA = retryA + tickMs, boundB = retryB + tickMs
+  const bSubject = `${b.id}@${f.runtime.store.get('tasks', b.id).epoch}`
+  await eventually(() => {
+    const witness = f.runtime.store.get('missions', f.mission.id).witness
+    return witness?.kind === 'W2' && witness.at <= retryA && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+  }, 'a W2 witness is stamped inside both back-off windows')
+  const notices = f.runtime.notices
+  let spun
+  const judgedB = []
+  const waits = notices.waitsLegitimately.bind(notices)
+  notices.waitsLegitimately = (task, tasks) => { const result = waits(task, tasks); if (task.id === b.id) judgedB.push({ at: Date.now(), waits: result }); return result }
+  const judge = notices.judgeBoard.bind(notices)
+  notices.judgeBoard = (...args) => {
+    const start = Date.now()
+    const result = judge(...args)
+    // The first judgement after A's bound runs past B's bound: a slow tail.
+    if (spun === undefined && start > boundA && start < boundB) { spun = { start }; while (Date.now() <= boundB + 1) { /* a slow judgement */ } }
+    return result
+  }
+  const named = await eventually(() => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject)), 'B\'s expired back-off is named by the fall-through', Math.max(0, boundB - Date.now()) + 1000).catch(error => error)
+  assert.ok(spun !== undefined, 'a judgement began between the two bounds and ran past B\'s')
+  assert.ok(judgedB.some(item => item.at >= spun.start && item.at < boundB && item.waits), 'that judgement found B still waiting')
+  assert.ok(!(named instanceof Error), 'a later pass judged B expired and named it')
+})
