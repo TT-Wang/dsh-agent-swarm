@@ -87,6 +87,7 @@ async function fixture(t, options = {}) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-outputs-')))
   const { source, run, git, workspaces } = await repository(root, options)
   // Production-shaped: the stop barrier reaches Workspaces.checkpointTask exactly as HarnessWorkers forwards it.
+  const idle = new Set()
   const workers = {
     bind(callbacks) { this.callbacks = callbacks },
     prepareBaseline: (...args) => workspaces.prepareBaseline(...args),
@@ -96,10 +97,10 @@ async function fixture(t, options = {}) {
     captureArtifact: (...args) => workspaces.captureArtifact(...args),
     inspectArtifact: (...args) => workspaces.inspectArtifact(...args),
     verifyArtifact: (...args) => workspaces.verifyArtifact(...args),
-    start: async () => {}, stop: async () => {}, deliver: async () => {}, isIdle: () => false,
+    start: async () => {}, stop: async () => {}, deliver: async () => {}, isIdle: memberId => idle.has(memberId),
     dispose: () => workspaces.dispose(),
   }
-  const runtime = new SwarmRuntime({ statePath: path.join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
+  const runtime = new SwarmRuntime({ statePath: path.join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, ...options.runtimeConfig }, workers)
   t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner' }
   const mission = runtime.create(owner, { title: 'Report', objective: 'Report on the project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget })
@@ -135,7 +136,8 @@ async function fixture(t, options = {}) {
     }
     return carrying
   }
-  return { root, source, run, git, runtime, workers, workspaces, owner, mission, author, peer, reviewer, actor, propose, readEvidence, submit, accept, taskRow, inCommit, show, refsCarrying }
+  const events = type => runtime.store.events(mission.id, 200).filter(event => event.type === type)
+  return { root, source, run, git, runtime, workers, workspaces, idle, owner, mission, author, peer, reviewer, actor, propose, readEvidence, submit, accept, taskRow, inCommit, show, refsCarrying, events }
 }
 
 test('a checkpoint capture carries a written declared output past ignore rules and skips one still owed; requireOutputs refuses the owed one', async t => {
@@ -650,4 +652,78 @@ test('a snapshot hint that is present but not recorded fails the snapshot instea
   await assert.rejects(captureGitSnapshot(source, path.join(root, 'snapshots'), snapshotGit, undefined, ['docs/Report.md']), /"docs\/Report\.md" is present in the worktree but was not recorded in the snapshot/)
   const snapshot = await captureGitSnapshot(source, path.join(root, 'snapshots'), snapshotGit, undefined, ['docs/report.md'])
   assert.equal(await git(source, 'show', `${snapshot.snapshotCommit}:docs/report.md`), '# Draft')
+})
+
+test('an idle close-out checkpoints a task that still owes a declared output, and the resumed attempt is refused with output_missing until it writes the file', async t => {
+  const f = await fixture(t, { runtimeConfig: { maxIdleCloseouts: 0, tickMs: 20 } })
+  await f.runtime.start()
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Write docs/report.md and docs/appendix.md', outputs: ['docs/report.md', 'docs/appendix.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Report\n')
+  await writeFile(path.join(f.author.workspace, 'notes', 'wip.md'), 'wip\n')
+  await f.readEvidence(f.author, task, 'notes/wip.md')
+  // The worker ends its turn with the attempt open and the appendix still owed.
+  f.idle.add(f.author.id)
+  f.workers.callbacks.idle(f.author.id)
+  const abandoned = await eventually(() => f.events('task/closeout-abandoned')[0], 'the idle close-out checkpointed the attempt')
+  assert.deepEqual(f.events('task/closeout-failed'), [], 'an owed output never fails the checkpoint')
+  assert.equal(await f.inCommit(abandoned.data.commit, 'docs/report.md'), true, 'the written declared output is carried past ignore rules')
+  assert.equal(await f.inCommit(abandoned.data.commit, 'docs/appendix.md'), false, 'the owed output is skipped')
+  const resumed = await eventually(() => {
+    const row = f.taskRow(task.id)
+    return row.status === 'running' && row.attempt?.id !== task.attempt.id ? row : undefined
+  }, 'the checkpointed task resumes on the same member')
+  assert.equal(resumed.attempt.ownerId, f.author.id)
+  f.idle.delete(f.author.id)
+  await f.readEvidence(f.author, resumed, 'notes/wip.md')
+  await assert.rejects(f.submit(f.author, resumed), error => {
+    outputMissing(error, ['docs/appendix.md'])
+    assert.doesNotMatch(error.message, /docs\/report\.md/, 'only the owed output is named')
+    return true
+  })
+  assert.equal(f.taskRow(task.id).status, 'running')
+  await writeFile(path.join(f.author.workspace, 'docs', 'appendix.md'), '# Appendix\n')
+  const submitted = await f.submit(f.author, resumed)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path).sort(), ['docs/appendix.md', 'docs/report.md'])
+})
+
+test('a lease-expiry checkpoint of a task that still owes a declared output succeeds, and the replacement is refused with output_missing until it writes the file', async t => {
+  const f = await fixture(t, { runtimeConfig: { tickMs: 20 } })
+  await f.runtime.start()
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Write docs/report.md and docs/appendix.md', outputs: ['docs/report.md', 'docs/appendix.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Report by the first owner\n')
+  await f.readEvidence(f.author, task, 'docs/report.md')
+  // The quiescent owner's lease expires; the plan intends the peer next.
+  f.idle.add(f.author.id)
+  f.idle.add(f.peer.id)
+  f.runtime.store.transaction(() => {
+    const row = f.runtime.store.get('tasks', task.id)
+    row.plannedAssigneeId = f.peer.id
+    row.attempt.leaseUntil = Date.now() - 1
+    f.runtime.store.put('tasks', row)
+  })
+  const checkpointed = await eventually(() => f.events('task/checkpointed').find(event => event.data.reason === 'lease-expired'), 'the lease-expiry checkpoint was recorded')
+  assert.deepEqual(f.events('task/checkpoint-failed'), [], 'an owed output never fails the checkpoint')
+  assert.equal(await f.inCommit(checkpointed.data.commit, 'docs/report.md'), true)
+  assert.equal(await f.inCommit(checkpointed.data.commit, 'docs/appendix.md'), false)
+  const replacement = await eventually(() => {
+    const row = f.taskRow(task.id)
+    return row.status === 'running' && row.attempt?.ownerId === f.peer.id ? row : undefined
+  }, 'the planned replacement takes the task')
+  f.idle.delete(f.author.id)
+  f.idle.delete(f.peer.id)
+  assert.equal(await readFile(path.join(f.peer.workspace, 'docs', 'report.md'), 'utf8'), '# Report by the first owner\n', 'the checkpointed output reaches the replacement')
+  await f.readEvidence(f.peer, replacement, 'docs/report.md')
+  await assert.rejects(f.submit(f.peer, replacement), error => {
+    outputMissing(error, ['docs/appendix.md'])
+    assert.doesNotMatch(error.message, /docs\/report\.md/)
+    return true
+  })
+  assert.equal(f.taskRow(task.id).status, 'running')
+  assert.equal(f.taskRow(task.id).attempt.id, replacement.attempt.id)
+  await writeFile(path.join(f.peer.workspace, 'docs', 'appendix.md'), '# Appendix\n')
+  const submitted = await f.submit(f.peer, replacement)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path).sort(), ['docs/appendix.md', 'docs/report.md'])
+  assert.equal(await f.show(submitted.artifact.commit, 'docs/report.md'), '# Report by the first owner')
 })
