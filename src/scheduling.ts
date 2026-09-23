@@ -18,6 +18,7 @@ import { AdmissionRefusedError } from './scheduler.ts'
 import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
+import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type Task } from './types.ts'
 
@@ -531,11 +532,11 @@ export class Scheduling {
   /** One completion policy is shared by manual controls and automatic requests. */
   deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
     actor.signal?.throwIfAborted()
-    if (this.rt.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.rt.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const mission = this.rt.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
-    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
-    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
+    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
+    if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
+    if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
     return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }
   }
 

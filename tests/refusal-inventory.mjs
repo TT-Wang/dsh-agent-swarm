@@ -292,12 +292,16 @@ export const IMPERATIVE_ACTIONS = /\b(?:retry|resubmit|re-?propose|re-?run|re-?s
  * given, so the throw site itself carries no token. R19-H2 moved the two
  * dependency materialisation refusals from `throw new Error('[code] …')` into
  * such a class and they left the inventory unnoticed. `message` is the index of
- * the constructor argument that carries the message text. `PolicyError` is not
- * registered: its second argument is the category, and its sites are outside
- * this inventory today.
+ * the constructor argument that carries the message text. `authored` marks a
+ * class that takes its code first but does not render it: the authored message
+ * carries its own token, which must then match the declared code (admission's
+ * `AdmissionError`). `PolicyError` is registered the same way, so a refusal
+ * does not leave the inventory when its plain `Error` is typed.
  */
 export const CODED_ERROR_CLASSES = {
   DependencyMaterialisationError: { message: 1 },
+  AdmissionError: { message: 2, authored: true },
+  PolicyError: { message: 2, authored: true },
 }
 
 /**
@@ -323,9 +327,10 @@ export function refusalSites(source, file) {
     if (close === -1) continue
     const args = topLevelSegments(source, open + 1, close).map(([from, to]) => source.slice(from, to).trim())
     const code = /^'([a-z][a-z0-9_]*)'$/.exec(args[0] ?? '')?.[1]
-    const expression = args[CODED_ERROR_CLASSES[match[1]].message] ?? ''
-    // The class renders the token; the site's text is assessed as the class renders it.
-    sites.push(describe({ kind: 'coded-throw', errorClass: match[1], file, source, masked, index: match.index, code, expression, prefix: code === undefined ? '' : `[${code}] ` }))
+    const { message, authored } = CODED_ERROR_CLASSES[match[1]]
+    const expression = args[message] ?? ''
+    // The site's text is assessed as the class renders it.
+    sites.push(describe({ kind: 'coded-throw', errorClass: match[1], file, source, masked, index: match.index, code, expression, prefix: code === undefined || authored ? '' : `[${code}] ` }))
   }
   // The `code:` key is code, but its string value is masked; search the
   // original source and require the key itself to sit at a code position.
@@ -348,7 +353,7 @@ function describe(base) {
   const expression = base.expression.trim()
   const info = classifyExpression(expression)
   const text = info.text === null ? null : `${base.prefix ?? ''}${info.text}`
-  const fn = base.kind === 'throw' ? enclosingFunction(base.source, base.masked, base.index) : undefined
+  const fn = base.kind === 'throw' || base.kind === 'coded-throw' ? enclosingFunction(base.source, base.masked, base.index) : undefined
   return {
     ...base,
     line: lineAt(base.source, base.index),
@@ -491,7 +496,7 @@ export function assessRefusal(site, index) {
       }
     } else if (site.codes.length > 1) {
       violations.push(`multiple diagnostic code tokens: ${site.codes.join(', ')}`)
-    } else if (site.kind === 'message' && site.codes[0] !== site.code) {
+    } else if ((site.kind === 'message' || site.kind === 'coded-throw') && site.code !== undefined && site.codes[0] !== site.code) {
       violations.push(`inline code ${site.codes[0]} does not match the declared code ${site.code}`)
     }
   }

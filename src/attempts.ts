@@ -12,6 +12,7 @@ import { hasNotice } from './arena.ts'
 import { taskSubject } from './notices.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import { memberPhaseOf } from './projection.ts'
+import { PolicyError } from './policy-error.ts'
 
 /**
  * The detail a terminal message embeds. A guard's own message may already carry
@@ -260,8 +261,8 @@ export class Attempts {
   ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
     const { member } = this.rt.active(actor, missionId)
     const task = this.rt.task(missionId, taskId)
-    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < Date.now()) throw new Error('Stale or unauthorized task attempt; stop work and observe the current assignment')
-    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(missionId, dep))) throw new Error('A task prerequisite is no longer accepted; stop work')
+    if (!member || task.status !== 'running' || !task.attempt || task.attempt.id !== attemptId || task.attempt.ownerId !== member.id || task.attempt.leaseUntil < Date.now()) throw new PolicyError('task_attempt_stale', 'authorization_error', 'Stale or unauthorized task attempt; stop work and observe the current assignment')
+    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(missionId, dep))) throw new PolicyError('task_prerequisite_revoked', 'tool_error', 'A task prerequisite is no longer accepted; stop work')
     return { task, member }
   }
   /**
@@ -269,9 +270,9 @@ export class Attempts {
    * the mission deadline so a stored lease can never outlive the mission.
    */
   fenceAttempt(mission: Mission, task: Task, windowMs: number): void {
-    if (!task.attempt) throw new Error('Task has no active attempt')
+    if (!task.attempt) throw new PolicyError('task_attempt_missing', 'lease_error', 'Task has no active attempt')
     const leaseUntil = Math.min(mission.deadline, Date.now() + Math.max(this.rt.config.leaseMs, windowMs))
-    if (!Number.isSafeInteger(leaseUntil)) throw new Error('Attempt lease exceeds the supported clock range')
+    if (!Number.isSafeInteger(leaseUntil)) throw new PolicyError('attempt_lease_out_of_range', 'lease_error', 'Attempt lease exceeds the supported clock range')
     task.attempt.leaseUntil = leaseUntil
     this.rt.commit(mission.id, () => this.rt.store.put('tasks', task))
   }

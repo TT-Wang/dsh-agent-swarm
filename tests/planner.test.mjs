@@ -260,6 +260,9 @@ test('an unrepaired validation failure becomes one fenced recovery notice when p
   await assert.rejects(f.runtime.startPlan(actor, request.id, {}, 1))
   const invalid = f.runtime.store.get('starts', request.id)
   assert.equal(invalid.status, 'failed')
+  // The recorded reason the recovery notice quotes is the plain Error rendering,
+  // byte for byte, although the refusal is now typed.
+  assert.equal(invalid.error, 'Error: Title must be nonempty text of at most 16000 characters')
   assert.notEqual(invalid.planningFenced, true, 'same-turn validation repair remains allowed')
   assert.equal(f.messages.filter(message => message.source.phase === 'failure').length, 0)
   f.pending.resolve()

@@ -6,6 +6,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller/types'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type { PlanMember } from './types.js'
+import { PolicyError } from './policy-error.js'
 
 function sameSelection(left: ModelSelection, right: ModelSelection): boolean {
   return left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort
@@ -47,7 +48,7 @@ export async function ownerModelSelection(ctx: Context, owner: Agent, signal?: A
 export function workerModelSelection(owner: ModelSelection | undefined, member: Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>): ModelSelection {
   const provider = member.provider ?? owner?.provider
   const model = member.model ?? owner?.model
-  if (!provider || !model) throw new Error('Choose an explicit provider and model or open an owner session with a model selection')
+  if (!provider || !model) throw new PolicyError('model_selection_required', 'authorization_error', 'Choose an explicit provider and model or open an owner session with a model selection')
   const effort = member.reasoningEffort ?? (member.provider === undefined && member.model === undefined ? owner?.reasoningEffort : undefined)
   return { provider, model, ...(effort === undefined ? {} : { reasoningEffort: ReasoningEffortId(effort) }) }
 }

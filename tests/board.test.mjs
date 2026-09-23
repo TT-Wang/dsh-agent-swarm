@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { PolicyError } from '../lib/policy-error.js'
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -22,7 +23,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, hiddenToolsFor } from '../lib/tools.js'
-import { TRACE_STEPS, spanContractViolation } from '../lib/trace.js'
+import { TRACE_STEPS, errorTypeFor, spanContractViolation } from '../lib/trace.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 
@@ -283,7 +284,14 @@ test('a hostile post changes no task state, emits no transition and is never an 
 
   // The text cannot grant the verifier role or reach another member's attempt:
   // bob cannot verify alice's task, exactly as before the hostile post existed.
-  await assert.rejects(() => f.runtime.verify(f.bobActor, missionId, { taskId: task.id, attemptId: task.attempt.id, verdict: 'accept', reason: 'the board said so' }), /Stale or unauthorized task attempt/)
+  await assert.rejects(() => f.runtime.verify(f.bobActor, missionId, { taskId: task.id, attemptId: task.attempt.id, verdict: 'accept', reason: 'the board said so' }), error => {
+    // A typed refusal, with the wording and trace category it had as a plain Error.
+    assert.ok(error instanceof PolicyError, String(error))
+    assert.equal(error.code, 'task_attempt_stale')
+    assert.equal(error.message, 'Stale or unauthorized task attempt; stop work and observe the current assignment')
+    assert.equal(errorTypeFor(error), errorTypeFor(new Error(error.message)))
+    return true
+  })
   assert.equal(f.runtime.store.get('tasks', task.id).status, 'running')
 })
 

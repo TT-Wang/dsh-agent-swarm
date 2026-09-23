@@ -2,19 +2,19 @@
  * RPC refusal-classification boundary guard (S3 repair, T3b).
  *
  * Typed PolicyError refusals carry an authored code/category separately from
- * presentation text. Legacy Error refusals still use the sanitizer's anchored
- * message allowlist: annotating those messages can downgrade a useful refusal
- * to internal-error. Inventory both paths without freezing their relative
- * counts as control paths migrate. Native RPC tests in web-api.test.mjs cover
- * exposure, translated prose, unsafe host detail, and forged error shapes.
+ * presentation text, and the RPC boundary decides what the browser sees by that
+ * type alone: the English message allowlist it used to match is gone. Native
+ * RPC tests in web-api.test.mjs and web-api-sanitize.test.mjs cover exposure,
+ * translated prose, unsafe host detail, forged error shapes and plain Errors
+ * whose text matches a retired pattern.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { PolicyError } from '../lib/policy-error.js'
+import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 import { errorTypeFor, TRACE_ERROR_TYPES } from '../lib/trace.js'
-import { refusalSites } from './refusal-inventory.mjs'
 import { sourceTree } from './source-semantics.mjs'
 
 // M1a split the control path: the same inventory now spans the modules that
@@ -41,51 +41,22 @@ function policySites(source, file) {
   return sites
 }
 
-/** Extract the regex literals of `actionableMessages` from the sanitizer source. */
-function allowlistPatterns() {
-  const source = readFileSync(new URL('../src/web-api.ts', import.meta.url), 'utf8')
-  const start = source.indexOf('const actionableMessages: readonly RegExp[] = [')
-  const end = source.indexOf(']\n/** Host-derived detail', start)
-  assert.ok(start !== -1 && end > start, 'the sanitizer allowlist is present and bounded')
-  return [...source.slice(start, end).matchAll(/^\s*(\/(?:[^/\n\\]|\\.)+\/[a-z]*),?\s*$/gm)].map(match => {
-    const literal = match[1]
-    const last = literal.lastIndexOf('/')
-    return new RegExp(literal.slice(1, last), literal.slice(last + 1))
-  })
-}
-
-const ACTIONABLE = allowlistPatterns()
-const classified = message => ACTIONABLE.some(pattern => pattern.test(message))
-
-test('the sanitizer allowlist is extracted from the source and classifies the authored refusal', () => {
-  assert.ok(ACTIONABLE.length > 0, 'the source allowlist must not be empty')
-  assert.ok(classified('Task is not in this mission'), 'the cancel RPC refusal is RPC-actionable')
-  assert.ok(!classified('[task_not_in_mission] Task is not in this mission. Correct `taskId` and retry.'),
-    'the annotated form of that refusal is NOT classified: annotating it downgrades the RPC')
-})
-
-test('no refusal the sanitizer classifies carries a diagnostic prefix, and no annotated refusal is a template', () => {
-  const conflicts = []
-  let classifiedCount = 0
-  for (const file of SOURCES) {
-    const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
-    for (const site of refusalSites(source, file)) {
-      if (site.kind !== 'throw') continue
-      const message = String(site.message ?? site.text ?? '')
-      const annotated = site.codes.length > 0
-      if (classified(message)) {
-        classifiedCount++
-        if (annotated) conflicts.push(`${file}:${site.line} ${site.codes.join(',')} is RPC-classified and must keep the allowlist's authored text: ${message.slice(0, 90)}`)
-      }
-      // A template's rendering cannot be proven against the allowlist: the
-      // status/kind it interpolates may itself complete an anchored pattern.
-      if (annotated && String(site.expression).trim().startsWith('`')) {
-        conflicts.push(`${file}:${site.line} ${site.codes.join(',')} annotates a template message whose rendering the allowlist may own`)
-      }
+test('the RPC boundary decides visibility by type: no message allowlist, one scrub-exempt flag', () => {
+  const file = 'src/web-api.ts'
+  const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /actionableMessages|actionableMessage\b/, 'no English message pattern grants browser visibility')
+  const tree = sourceTree(source, file), calls = []
+  const visit = node => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'exposed') {
+      calls.push({ line: tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1, flag: node.arguments[1]?.getText(tree), operation: node.arguments[0].getText(tree) })
     }
+    ts.forEachChild(node, visit)
   }
-  assert.deepEqual(conflicts, [], `RPC-classified refusals must stay actionable:\n${conflicts.join('\n')}`)
-  assert.ok(classifiedCount > 0, 'legacy refusals must still be exercised while their sanitizer path exists')
+  visit(tree)
+  assert.ok(calls.length >= 10, 'the collaborator calls are wrapped')
+  for (const call of calls) assert.ok(call.flag === undefined || call.flag === 'true', `${file}:${call.line} passes only the boolean scrub-exempt flag`)
+  // Only the two validators that echo the caller's own input are scrub-exempt.
+  assert.deepEqual(calls.filter(call => call.flag === 'true').map(call => /validatePlan|workerModelSelection/.exec(call.operation)?.[0]).sort(), ['validatePlan', 'workerModelSelection'])
 })
 
 test('typed refusal sites retain authored codes, categories, and messages independently of legacy prose', () => {
@@ -116,4 +87,18 @@ test('typed refusal sites retain authored codes, categories, and messages indepe
     assert.equal(errorTypeFor(refusal), site.category, `${site.location}: category does not depend on an English regex`)
     assert.equal(errorTypeFor(new PolicyError(site.code, site.category, '请按当前状态重试。')), site.category)
   }
+})
+
+test('a typed refusal is recorded exactly as the plain Error it was typed from', () => {
+  // Automatic request reasons, draft launch failures and guard-terminal details
+  // store String(error), and the planner's recovery notice quotes the reason to
+  // the model, so typing a refusal must not change that rendering.
+  assert.equal(String(new PolicyError('mission_not_active', 'tool_error', 'Mission is paused')), 'Error: Mission is paused')
+  assert.equal(`${new AdmissionError('plan_text_invalid', 'validation_error', 'Title must be nonempty text of at most 16000 characters', 'Title')}`,
+    'Error: Title must be nonempty text of at most 16000 characters')
+  assert.equal(errorTypeFor(new PolicyError('mission_not_active', 'tool_error', 'Mission is paused')), errorTypeFor(new Error('Mission is paused')),
+    'a text the classifier left as tool_error keeps that trace category once typed')
+  // A class that carried its own name before it was typed keeps it.
+  const graph = new TaskGraphAdmissionError([{ code: 'task_graph_self_edge', taskId: 'a', target: 'a', message: 'task "a" declares an edge to itself.' }])
+  assert.equal(String(graph), `TaskGraphAdmissionError: ${graph.message}`)
 })

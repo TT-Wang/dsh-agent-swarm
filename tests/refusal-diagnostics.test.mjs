@@ -63,6 +63,10 @@ test('the inventory walks every refusal in the tool and admission surface, not a
     const rawThrows = [...source.matchAll(/throw new Error\(/g)].length
     const found = sitesByFile[index].filter(site => site.kind === 'throw').length
     assert.equal(found, rawThrows, `${file}: every throw call site is inventoried (${found}/${rawThrows})`)
+    // Typed admission refusals carry their own token and stay in the walk.
+    const rawAdmission = [...source.matchAll(/throw new AdmissionError\(/g)].length
+    assert.equal(sitesByFile[index].filter(site => site.kind === 'coded-throw' && site.errorClass === 'AdmissionError').length, rawAdmission,
+      `${file}: every AdmissionError call site is inventoried`)
     const uncovered = uncoveredCodeLiterals(source, sitesByFile[index])
     for (const entry of uncovered) {
       const classificationMarker = entry.keys.includes('runnable') || entry.keys.includes('requirement')
@@ -72,6 +76,7 @@ test('the inventory walks every refusal in the tool and admission surface, not a
   }
   // The durable ceiling reason is the motivating refusal; it must be in the walk.
   assert.ok(sites.some(site => site.code === 'task_ceiling_exhausted'), 'the durable ceiling refusal is inventoried')
+  assert.ok(sites.filter(site => site.errorClass === 'AdmissionError').length >= 10, 'the typed admission refusals are inventoried')
 })
 
 test('every in-scope refusal is coded and its next step names a parameter that resolves in the tool schema', async () => {

@@ -19,10 +19,11 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { ObserveDetailRefusedError, SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
+import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -245,18 +246,34 @@ test('delivery routes require owner, completed acceptance and the exact session 
   for (const endpoint of ['delivery', 'apply-delivery']) {
     const before = await f.rpc(endpoint, { sessionId: f.ownerId, missionId: mission.id })
     assert.equal(before.result.ok, false, 'active work cannot be delivered')
+    assert.equal(before.result.error.message, 'Complete independent acceptance before applying results')
+    assert.deepEqual(before.result.error.details, { issues: [], policyCode: 'delivery_acceptance_required', category: 'tool_error' })
     for (const sessionId of ['other-owner', member.sessionId]) {
       const denied = await f.rpc(endpoint, { sessionId, missionId: mission.id })
       assert.equal(denied.result.ok, false)
     }
   }
   assert.equal(writes, 0)
+  // Oversized content is refused typed, with the bound in its text.
+  assert.throws(() => f.runtime.cancel(owner, mission.id, { taskId: 'any', reason: 'x'.repeat(10001) }),
+    error => error instanceof PolicyError && error.code === 'content_too_long' && error.message === 'Content exceeds 10000 characters'
+      && errorTypeFor(error) === errorTypeFor(new Error(error.message)))
   mission.status = 'completed'
+  f.runtime.store.put('missions', mission)
+  const historical = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(historical.result.error.message, 'This historical mission has no saved delivery baseline; inspect its retained artifact')
+  assert.deepEqual(historical.result.error.details, { issues: [], policyCode: 'delivery_baseline_missing', category: 'tool_error' })
   mission.baseline = { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/private/planning', changedPaths: ['user.txt'], createdAt: 1 }
   f.runtime.store.put('missions', mission)
   const source = { id: 'delivery-source', missionId: mission.id, kind: 'implementation', status: 'accepted', dependencies: [], artifact: { commit: 'c'.repeat(40) } }
   const final = { id: 'delivery-final', missionId: mission.id, kind: 'integration', status: 'accepted', dependencies: [source.id], artifact: { commit: 'd'.repeat(40) } }
   f.runtime.store.put('tasks', source); f.runtime.store.put('tasks', final)
+  const adapter = f.workers.inspectDelivery
+  delete f.workers.inspectDelivery
+  const unsupported = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(unsupported.result.error.message, 'This worker adapter does not support delivery inspection')
+  assert.deepEqual(unsupported.result.error.details, { issues: [], policyCode: 'delivery_unsupported', category: 'tool_error' })
+  f.workers.inspectDelivery = adapter
   const inspected = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id, resultCommit: 'forged' })
   assert.equal(inspected.result.value.delivery.resultCommit, final.artifact.commit, 'caller cannot choose an unaccepted commit')
   const applied = await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })
@@ -394,12 +411,134 @@ test('replacement cycles return an actionable bad-request through native RPC wit
   assert.equal(rejected.result.error.code, 'bad-request')
   assert.match(rejected.result.error.message, /\[task_graph_cycle\]/)
   assert.match(rejected.result.error.message, /dependencies.*reviewOf.*swarm_propose/)
+  assert.deepEqual(rejected.result.error.details, { issues: [], policyCode: 'task_graph_invalid', category: 'validation_error' })
   assert.deepEqual(f.runtime.store.list('tasks', mission.id), before)
   const message = rejected.result.error.message
   f.runtime.propose = () => { throw new Error(message) }
   const imitation = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
   assert.equal(imitation.result.error.code, 'internal-error', 'a matching message alone is not a typed validation failure')
   assert.doesNotMatch(imitation.result.error.message, /task_graph_cycle/)
+  // A graph refusal naming host detail keeps its fixed repair text instead of being hidden.
+  const hosted = { code: 'task_graph_cycle', taskId: '/Users/secret/a', target: 'b', message: 'task "/Users/secret/a" depends on "b". Remove one edge.' }
+  f.runtime.propose = () => { throw new TaskGraphAdmissionError([hosted]) }
+  const fallback = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: cyclic })
+  assert.equal(fallback.result.error.code, 'bad-request')
+  assert.match(fallback.result.error.message, /^\[task_graph_invalid\] Task dependencies or review sources form an invalid graph/)
+  assert.doesNotMatch(fallback.text, /secret/)
+})
+
+test('admission refusals are typed policy errors carrying their diagnostics, with the legacy bytes', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, { ...f.input, scope: ['src/'] })
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  let refused
+  try { f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Wide', objective: 'Edit docs', kind: 'research', scope: ['docs/'], acceptance: ['works'] }) } catch (error) { refused = error }
+  assert.ok(refused instanceof AdmissionError && refused instanceof PolicyError)
+  assert.equal(refused.code, 'scope_selector_out_of_scope')
+  assert.equal(errorTypeFor(refused), 'budget_error', 'the category the trace already gave this text')
+  assert.equal(refused.message, 'task.scope exceeds mission scope: "docs/" is not covered by allowed mission selectors ["src/"]. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow `scope` to a subset of the mission `scope` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]')
+  assert.deepEqual(refused.diagnostics, [{ code: 'scope_selector_out_of_scope', location: 'task.scope', message: refused.message }])
+  const defects = [{ code: 'task_graph_self_edge', taskId: 'a', target: 'a', message: 'task "a" declares an edge to itself.' }, { code: 'task_graph_unknown_edge', taskId: 'b', target: 'z', message: 'task "b" declares edge "z".' }]
+  const graph = new TaskGraphAdmissionError(defects)
+  assert.ok(graph instanceof AdmissionError && graph instanceof PolicyError)
+  assert.equal(graph.name, 'TaskGraphAdmissionError')
+  assert.equal(graph.message, '[task_graph_self_edge] task: task "a" declares an edge to itself.\n[task_graph_unknown_edge] task: task "b" declares edge "z".')
+  assert.deepEqual(graph.diagnostics.map(diagnostic => diagnostic.code), ['task_graph_self_edge', 'task_graph_unknown_edge'])
+  assert.deepEqual(graph.defects, defects)
+})
+
+test('plan refusals reach the browser by type at the validator and at the launch boundary', async t => {
+  const f = await fixture(t)
+  const several = structuredClone(f.input)
+  several.tasks[0].priority = 101
+  several.tasks[0].scope = ['lib/']
+  const staged = await f.rpc('create-draft', { sessionId: f.ownerId, input: several })
+  assert.equal(staged.result.error.code, 'bad-request', staged.text)
+  assert.match(staged.result.error.message, /^tasks\[0\]\.scope exceeds mission scope: "lib\/"[^\n]+\[scope_selector_out_of_scope\]\ntasks\[0\] \(build\)\.priority must be 0–100$/)
+  assert.deepEqual(staged.result.error.details, { issues: [], policyCode: 'plan_invalid', category: 'budget_error' })
+  // Launch revalidates the saved plan outside the scrub-exempt validator call.
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  f.runtime.store.transaction(() => f.runtime.store.put('drafts', { ...draft, input: { ...draft.input, title: '' } }))
+  const launch = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(launch.result.error.code, 'bad-request', launch.text)
+  assert.equal(launch.result.error.message, 'Title must be nonempty text of at most 16000 characters')
+  assert.deepEqual(launch.result.error.details, { issues: [], policyCode: 'plan_text_invalid', category: 'validation_error' })
+  assert.deepEqual(f.runtime.store.list('missions'), [], 'a refused launch admits nothing')
+})
+
+test('mission authority, lifecycle and budget refusals reach the browser by their policy code, with the legacy wording', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, { ...f.input, budget: { ...budget, maxWorkers: 1 } })
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const propose = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
+  const refused = async (endpoint, payload, message, policyCode, category) => {
+    const response = await f.rpc(endpoint, { sessionId: f.ownerId, ...payload })
+    assert.equal(response.result.error.code, 'bad-request', response.text)
+    assert.equal(response.result.error.message, message)
+    assert.deepEqual(response.result.error.details, { issues: [], policyCode, category })
+    assert.equal(category, errorTypeFor(new Error(message)), `${policyCode} keeps the trace category its text had`)
+  }
+  await refused('cancel', { missionId: 'mission-missing', taskId: 'x', reason: 'x' }, 'Unknown mission', 'mission_unknown', 'validation_error')
+  await refused('propose', { missionId: mission.id, input: { ...propose, workstreamId: 'stream-missing' } }, 'Unknown workstream', 'workstream_unknown', 'validation_error')
+  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, 'Mission worker budget exhausted', 'mission_worker_budget_exhausted', 'budget_error')
+  f.runtime.control(owner, mission.id, 'pause', 'Hold')
+  await refused('propose', { missionId: mission.id, input: propose }, 'Mission is paused', 'mission_not_active', 'tool_error')
+  f.runtime.control(owner, mission.id, 'stop', 'Done')
+  await refused('cancel', { missionId: mission.id, taskId: 'x', reason: 'x' }, 'Mission is terminal; create a new mission to continue', 'mission_terminal', 'conflict_error')
+  // The observe detail refusal is typed and still recorded under its own name.
+  const detail = new ObserveDetailRefusedError()
+  assert.ok(detail instanceof PolicyError)
+  assert.equal(detail.code, 'observe_detail_full_owner_only')
+  assert.equal(errorTypeFor(detail), errorTypeFor(new Error(detail.message)))
+  assert.equal(String(detail), `ObserveDetailRefusedError: ${detail.message}`)
+})
+
+test('task admission refusals reach the browser by their policy code, with the legacy wording', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const research = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  const pending = f.runtime.propose(owner, mission.id, research)
+  const before = f.runtime.store.list('tasks', mission.id)
+  const refused = async (input, message, policyCode, category) => {
+    const response = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input })
+    assert.equal(response.result.error.code, 'bad-request', response.text)
+    assert.equal(response.result.error.message, message)
+    assert.deepEqual(response.result.error.details, { issues: [], policyCode, category })
+    assert.equal(category, errorTypeFor(new Error(message)), `${policyCode} keeps the trace category its text had`)
+  }
+  await refused({ ...research, kind: 'verification' }, 'Verification requires reviewOf', 'verification_review_source_required', 'validation_error')
+  await refused({ ...research, reviewOf: pending.id }, 'Only verification tasks may set reviewOf', 'review_source_not_verification', 'tool_error')
+  await refused({ ...research, replaces: [pending.id] },
+    `replaces ${pending.id}: that task is pending, and only blocked or cancelled work can be replaced; wait for its verdict or use swarm_handoff/challenge`,
+    'replacement_source_not_blocked', 'tool_error')
+  await refused({ ...research, maxRecoveryAttempts: 0 }, 'maxRecoveryAttempts must be a positive safe integer', 'task_recovery_limit_invalid', 'validation_error')
+  assert.deepEqual(f.runtime.store.list('tasks', mission.id), before, 'a refused proposal admits nothing')
+})
+
+test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_typed', ownerSessionId: f.ownerId,
+    commandId: 'typed', goal: 'g', workspace: f.workspace, status: 'running', createdAt: Date.now(), updatedAt: Date.now(), missionId: mission.id }))
+  const before = f.runtime.store.list('tasks', mission.id)
+  const input = { workstreamId: stream.id, title: 'Unbounded', objective: 'Implement it', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
+  const recovery = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input })
+  assert.equal(recovery.result.ok, false)
+  assert.equal(recovery.result.error.code, 'bad-request', recovery.text)
+  assert.deepEqual(recovery.result.error.details, { issues: [], policyCode: 'task_recovery_limit_required', category: 'validation_error' })
+  assert.match(recovery.result.error.message, /^\[task_recovery_limit_required\] Automatic tasks require a recovery limit chosen by the primary agent\. Pass `maxRecoveryAttempts`/)
+  const timeout = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: { ...input, maxRecoveryAttempts: 2 } })
+  assert.equal(timeout.result.error.code, 'bad-request', timeout.text)
+  assert.deepEqual(timeout.result.error.details, { issues: [], policyCode: 'task_check_timeout_required', category: 'validation_error' })
+  assert.match(timeout.result.error.message, /^\[task_check_timeout_required\] Automatic task checks require a timeout chosen by the primary agent\. Pass `checkTimeoutMs`/)
+  assert.deepEqual(f.runtime.store.list('tasks', mission.id), before, 'a refused proposal admits nothing')
 })
 
 test('add-member validates subscriptions as a string array before admitting a worker', async t => {
@@ -664,6 +803,31 @@ test('authored draft refusals keep a stable category through native RPC when wor
     assert.doesNotMatch(hidden.result.error.message, /secret|private|host operation/)
     assert.equal(hidden.result.error.details.policyCode, undefined, 'an untrusted shape or unsafe detail is not an authored public refusal')
   }
+})
+
+test('launch refusals reach the browser by their policy code, with the legacy wording unchanged', async t => {
+  const f = await fixture(t)
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  const stale = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision + 1 })
+  assert.equal(stale.result.error.code, 'bad-request', stale.text)
+  assert.equal(stale.result.error.message, 'Draft changed; reload before launching')
+  assert.deepEqual(stale.result.error.details, { issues: [], policyCode: 'draft_revision_conflict', category: 'conflict_error' })
+  f.runtime.store.transaction(() => f.runtime.store.put('drafts', { ...draft, status: 'launching' }))
+  const busy = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(busy.result.error.message, 'Draft cannot be launched in its current state')
+  assert.deepEqual(busy.result.error.details, { issues: [], policyCode: 'draft_not_launchable', category: 'conflict_error' })
+  assert.equal(f.runtime.store.get('drafts', draft.id).status, 'launching', 'a refused launch changes nothing')
+})
+
+test('a shutting-down runtime refuses control RPCs with a typed conflict', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  f.runtime.shuttingDown = true
+  const refused = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: 'any', reason: 'x' })
+  assert.equal(refused.result.error.code, 'bad-request', refused.text)
+  assert.equal(refused.result.error.message, 'Swarm runtime is shutting down')
+  assert.deepEqual(refused.result.error.details, { issues: [], policyCode: 'runtime_shutting_down', category: 'conflict_error' })
 })
 
 test('mission owner refusals carry authorization even when the wording has no legacy match', async t => {

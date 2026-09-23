@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
+import { AdmissionError } from '../lib/admission.js'
+import { PolicyError } from '../lib/policy-error.js'
+import { errorTypeFor } from '../lib/trace.js'
 import { WORKER_NAME_POOL } from '../lib/types.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
@@ -262,6 +265,38 @@ test('scope and missing code checks are diagnosed together before any admission,
   assert.equal(admitted.input.tasks[1].kind, before.tasks[1].kind)
   assert.deepEqual(admitted.input.acceptance, before.acceptance)
   assert.deepEqual(admitted.input.budget, before.budget)
+})
+
+test('plan refusals are one typed admission refusal carrying every diagnostic, with the legacy bytes', () => {
+  const refusal = input => { try { validatePlan(input) } catch (error) { return error } assert.fail('the plan must be refused') }
+  const workspace = tmpdir()
+  // One early refusal is its own diagnostic, typed with the category the trace gave its text.
+  const title = refusal({ ...plan(workspace), title: '' })
+  assert.ok(title instanceof AdmissionError && title instanceof PolicyError)
+  assert.equal(title.message, 'Title must be nonempty text of at most 16000 characters')
+  assert.equal(title.code, 'plan_text_invalid')
+  assert.equal(errorTypeFor(title), errorTypeFor(new Error(title.message)))
+  assert.deepEqual(title.diagnostics, [{ code: 'plan_text_invalid', location: 'Title', message: title.message }])
+  // Collected issues become one refusal: the message is their text joined as
+  // before, and the category is the one the trace gave that joined text.
+  const several = plan(workspace)
+  several.tasks[0].priority = 101
+  several.tasks[1].scope = ['lib/value.cjs']
+  const joined = refusal(several)
+  assert.ok(joined instanceof AdmissionError)
+  assert.equal(joined.code, 'plan_invalid')
+  assert.deepEqual(joined.diagnostics.map(diagnostic => diagnostic.code), ['plan_priority_invalid', 'scope_selector_out_of_scope'])
+  assert.equal(joined.message, joined.diagnostics.map(diagnostic => diagnostic.message).join('\n'))
+  assert.match(joined.message, /^tasks\[0\] \(review\)\.priority must be 0–100\ntasks\[1\]\.scope exceeds mission scope: "lib\/value\.cjs"/)
+  assert.equal(joined.category, 'budget_error')
+  assert.equal(errorTypeFor(joined), errorTypeFor(new Error(joined.message)))
+  // A single collected issue keeps its own code.
+  const single = plan(workspace)
+  single.tasks[0].priority = 101
+  const priority = refusal(single)
+  assert.equal(priority.code, 'plan_priority_invalid')
+  assert.equal(priority.message, 'tasks[0] (review).priority must be 0–100')
+  assert.equal(errorTypeFor(priority), errorTypeFor(new Error(priority.message)))
 })
 
 test('missing plan keys identify the exact field and explain how to repair references', () => {

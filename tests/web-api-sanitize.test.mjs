@@ -25,6 +25,7 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
+import { PolicyError } from '../lib/policy-error.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -187,7 +188,8 @@ test('the cancel RPC withdraws one task for the owner and refuses other sessions
   const refused = await f.rpc('cancel', { sessionId: member.sessionId, missionId: mission.id, taskId: task.id, reason: 'not mine' })
   assert.equal(refused.result.ok, false)
   assert.equal(refused.result.error.code, 'bad-request')
-  assert.match(refused.result.error.message, /Only the mission owner/)
+  assert.equal(refused.result.error.message, 'Only the mission owner can cancel admitted work')
+  assert.deepEqual(refused.result.error.details, { issues: [], policyCode: 'task_cancel_owner_required', category: 'authorization_error' })
   const cancelled = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: task.id, reason: 'Owner withdrew it' })
   assert.equal(cancelled.result.ok, true, cancelled.text)
   assert.equal(cancelled.result.value.task.status, 'cancelled')
@@ -199,27 +201,80 @@ test('the cancel RPC withdraws one task for the owner and refuses other sessions
   // Unknown tasks fail with an authored policy message, not a raw store error.
   const unknown = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: 'invented', reason: 'x' })
   assert.equal(unknown.result.error.code, 'bad-request')
-  assert.match(unknown.result.error.message, /Task is not in this mission/)
+  assert.equal(unknown.result.error.message, 'Task is not in this mission')
+  // Typed, so its visibility no longer depends on the allowlist matching its prose.
+  assert.deepEqual(unknown.result.error.details, { issues: [], policyCode: 'task_not_in_mission', category: 'validation_error' })
 })
 
 test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t => {
   const f = await fixture(t)
   // Byte-for-byte messages agreed with the governance task (member_9e7abaca).
   const w8 = 'Member Builder cannot start: provider "public-provider" model "model-one" does not support reasoning effort "high". Clearing reasoningEffort and retrying also failed: Error: route rejected. Admit a replacement member without reasoningEffort, or with an effort this provider/model supports.'
-  f.runtime.addMember = () => { throw new Error(w8) }
+  f.runtime.addMember = () => { throw new PolicyError('member_reasoning_effort_unsupported', 'tool_error', w8) }
   const member = await f.rpc('add-member', { sessionId: f.ownerId, missionId: 'mission-x', input: { name: 'Builder', role: 'implementation' } })
   assert.equal(member.result.ok, false)
   assert.equal(member.result.error.code, 'bad-request')
   assert.equal(member.result.error.message, w8, 'the W8 refusal is not sanitized')
+  assert.deepEqual(member.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
+  // F7 from the real runtime: a deterministic retry of a withdrawn record is a typed refusal.
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const input = { workstreamId: stream.id, title: 'Withdrawn', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  f.runtime.propose(owner, mission.id, input, 'task_1')
+  f.runtime.cancel(owner, mission.id, { taskId: 'task_1', reason: 'Withdrawn' })
   const f7 = 'Task task_1 was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.'
-  f.runtime.propose = () => { throw new Error(f7) }
+  let readmitted
+  try { f.runtime.propose(owner, mission.id, input, 'task_1') } catch (error) { readmitted = error }
+  assert.ok(readmitted instanceof PolicyError, 'the runtime types the F7 refusal')
+  assert.equal(readmitted.message, f7)
+  f.runtime.propose = () => { throw readmitted }
   const propose = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
   assert.equal(propose.result.ok, false)
   assert.equal(propose.result.error.code, 'bad-request')
   assert.equal(propose.result.error.message, f7, 'the F7 refusal is not sanitized')
-  // The allowlist is still fail-closed: the same prefix with host detail appended is sanitized.
-  f.runtime.propose = () => { throw new Error(`${f7} /private/var/secret/swarm.sqlite`) }
-  const leaked = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
-  assert.equal(leaked.result.error.code, 'internal-error')
-  assert.doesNotMatch(leaked.text, /private|secret|sqlite/)
+  assert.deepEqual(propose.result.error.details, { issues: [], policyCode: 'task_cancelled_readmission', category: 'tool_error' })
+  // Fail closed: the same text on a plain Error, or the typed refusal with host detail appended, is sanitized.
+  for (const failure of [new Error(f7), new PolicyError('task_cancelled_readmission', 'tool_error', `${f7} /private/var/secret/swarm.sqlite`)]) {
+    f.runtime.propose = () => { throw failure }
+    const leaked = await f.rpc('propose', { sessionId: f.ownerId, missionId: 'mission-x', input: { workstreamId: 'stream-x' } })
+    assert.equal(leaked.result.error.code, 'internal-error')
+    assert.doesNotMatch(leaked.text, /private|secret|sqlite|cancelled by the owner/)
+  }
+})
+
+test('a refusal text on a plain Error grants no visibility: only the typed refusal reaches the browser', async t => {
+  const f = await fixture(t)
+  // Texts the retired message allowlist used to expose by wording alone.
+  for (const text of ['Mission is paused', 'Unknown mission', 'Only the mission owner can cancel admitted work',
+    'tasks[0] (build).priority must be 0–100', 'Complete independent acceptance before applying results']) {
+    f.runtime.control = () => { throw new Error(text) }
+    const plain = await f.rpc('control', { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' })
+    assert.equal(plain.result.error.code, 'internal-error', `${text} on a plain Error is not an authored refusal`)
+    assert.doesNotMatch(plain.text, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    f.runtime.control = () => { throw new PolicyError('probe_refusal', 'tool_error', text) }
+    const typed = await f.rpc('control', { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' })
+    assert.equal(typed.result.error.code, 'bad-request')
+    assert.equal(typed.result.error.message, text)
+    assert.deepEqual(typed.result.error.details, { issues: [], policyCode: 'probe_refusal', category: 'tool_error' })
+  }
+})
+
+test('a typed refusal naming an absolute host path under any system root is an internal error', async t => {
+  const f = await fixture(t)
+  const control = { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' }
+  for (const hostPath of ['/Volumes/External/secret.db', '/srv/swarm/secret.db', '/mnt/disk/secret.db', '/data/swarm/secret.db', '/root/.ssh/secret',
+    '/Library/Application Support/secret', '/System/Volumes/Data/secret', '/Applications/Secret.app', '/proc/1/environ', '/run/secrets/token',
+    '/media/usb/secret', '/snap/bin/secret', '/nix/store/secret', '/dev/shm/secret', '/sys/kernel/secret', '/boot/secret', '/bin/secret',
+    '/sbin/secret', '/lib/secret.so', '/lib64/secret.so', '/workspace/secret', '/workspaces/secret', '~/.dsh/secret', 'C:\\Users\\secret']) {
+    f.runtime.control = () => { throw new PolicyError('probe_refusal', 'conflict_error', `Cannot open "${hostPath}" for this mission`) }
+    const response = await f.rpc('control', control)
+    assert.equal(response.result.error.code, 'internal-error', `${hostPath} is host detail`)
+    assert.doesNotMatch(response.text, /secret/i)
+  }
+  // The same names inside a relative repository path are not host detail.
+  f.runtime.control = () => { throw new PolicyError('probe_refusal', 'conflict_error', 'tests/data/fixture.json and src/lib/run/x.ts are outside the task scope') }
+  const relative = await f.rpc('control', control)
+  assert.equal(relative.result.error.code, 'bad-request', relative.text)
+  assert.equal(relative.result.error.details.policyCode, 'probe_refusal')
 })
