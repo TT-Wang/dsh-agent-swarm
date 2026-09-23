@@ -94,7 +94,16 @@ export function refusalNodes(text, filename) {
       if (errorClass === 'Error') site(node, { kind: 'throw' }, args[0])
       else {
         const code = codeText(args[0])
-        const message = args.slice(code === undefined ? 0 : 1).find(arg => codeText(arg) === undefined && !ts.isNumericLiteral(arg))
+        const rest = args.slice(code === undefined ? 0 : 1)
+        // A computed code (`new AdmissionError(diagnostic.code, …, formatDiagnostic(diagnostic))`)
+        // is not a literal, so prefer the argument shaped like a message over position.
+        const shaped = arg => {
+          const value = unwrap(arg)
+          return ts.isStringLiteralLike(value) || ts.isTemplateExpression(value)
+            || (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken)
+            || (ts.isCallExpression(value) && value.expression.getText(tree) === 'formatDiagnostic')
+        }
+        const message = rest.find(arg => codeText(arg) === undefined && shaped(arg)) ?? rest.find(arg => codeText(arg) === undefined && !ts.isNumericLiteral(arg))
         site(node, { kind: 'coded-throw', errorClass, code, prefix: code !== undefined && prefixing.has(errorClass) ? `[${code}] ` : '' }, message)
       }
     }
