@@ -351,8 +351,15 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
   // hung starts: about (N-1) start bounds after the lease expired. A body past
   // its bound now stops at the next member boundary; the next body starts from
   // lease recovery and sweeps from the member the previous one stopped before.
+  //
+  // The hangs are armed in the same synchronous step that proposes X, so one
+  // body claims X (its lease starts) and then enters A's hang; the lease
+  // expires half-way through B's hang, 200ms from either end of it. The
+  // recovery is measured against the end of the hang that was in flight when
+  // the lease expired: an early-stopping body recovers it at once, a full sweep
+  // only after C's whole start bound.
   const startBoundMs = 400
-  const leaseMs = 450
+  const leaseMs = 600
   class HangFirstStartWorkers extends FakeWorkers {
     armed = new Set()
     hung = new Map()
@@ -371,14 +378,17 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
   try {
     const hanging = []
     for (const name of ['A', 'B', 'C']) hanging.push(await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 }))
-    const task = f.propose({ title: 'Task X' })
-    const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined, 'X is dispatched', 4_000)
+    await sleep(50)
     for (const member of hanging) workers.armed.add(member.id)
+    const task = f.propose({ title: 'Task X' })
+    const { leaseUntil } = await eventually(() => taskOf(f.runtime, task.id).attempt, 'X is dispatched', 4_000)
     const expired = await eventually(() => events(f.runtime, f.mission.id, 'task/lease-expired').find(item => item.data.taskId === task.id), 'the lease expiry is recovered', 10_000)
-    const latency = expired.createdAt - running.attempt.leaseUntil
-    assert.ok(latency <= startBoundMs + 150, `lease recovery ran ${latency}ms after the lease expired, within one start bound (${startBoundMs}ms) and a tick`)
     const settled = await eventually(() => hanging.every(member => workers.hung.get(member.id)?.to !== undefined) ? true : undefined, 'every member reaches its hung start', 6_000)
     assert.equal(settled, true)
+    const inFlight = hanging.map(member => workers.hung.get(member.id)).find(hang => hang.from <= leaseUntil && leaseUntil <= hang.to)
+    assert.ok(inFlight !== undefined, `a hung start was in flight when the lease expired at ${leaseUntil}: ${JSON.stringify(hanging.map(member => workers.hung.get(member.id)))}`)
+    const latency = expired.createdAt - inFlight.to
+    assert.ok(latency <= startBoundMs / 2, `lease recovery ran ${latency}ms after the hang in flight at the expiry ended, not after a further start bound (${startBoundMs}ms)`)
     const [a, b, c] = hanging
     assert.equal(workers.started[workers.hung.get(a.id).index + 1], b.id, 'the body after A\'s hung start sweeps first from B, the member the stopped body did not reach')
     assert.equal(workers.started[workers.hung.get(b.id).index + 1], c.id, 'and the one after B\'s from C')
