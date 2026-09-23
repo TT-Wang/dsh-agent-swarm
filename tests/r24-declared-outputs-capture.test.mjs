@@ -15,7 +15,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
@@ -58,7 +58,7 @@ function outputMissing(error, paths, tool = 'swarm_submit') {
   return true
 }
 
-async function repository(root) {
+async function repository(root, { ignore = [] } = {}) {
   const source = path.join(root, 'source')
   for (const dir of ['docs', 'notes', 'src']) await mkdir(path.join(source, dir), { recursive: true })
   const run = (cwd, argv) => runProcess(argv, { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 200000 })
@@ -72,7 +72,7 @@ async function repository(root) {
   // The shape this repository ships plus the two toolchain roots: docs/ ignores
   // everything but named files, the root ignores the local environment file,
   // the dependency directory and the member scratch root.
-  await writeFile(path.join(source, '.gitignore'), '.env\nnode_modules/\n.swarm-scratch/\n')
+  await writeFile(path.join(source, '.gitignore'), ['.env', 'node_modules/', '.swarm-scratch/', ...ignore].join('\n') + '\n')
   await writeFile(path.join(source, 'docs', '.gitignore'), '*\n!.gitignore\n')
   await writeFile(path.join(source, 'notes', '.gitkeep'), '')
   await writeFile(path.join(source, 'src', 'index.js'), 'export const answer = 42\n')
@@ -82,9 +82,9 @@ async function repository(root) {
   return { source, run, git, workspaces }
 }
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-outputs-')))
-  const { source, run, git, workspaces } = await repository(root)
+  const { source, run, git, workspaces } = await repository(root, options)
   // Production-shaped: the stop barrier reaches Workspaces.checkpointTask exactly as HarnessWorkers forwards it.
   const workers = {
     bind(callbacks) { this.callbacks = callbacks },
@@ -363,4 +363,72 @@ test('analysis-only research that declares outputs [] completes on evidence alon
   assert.equal(f.taskRow(task.id).status, 'accepted')
   assert.equal(snapshot.completion.eligible, true, snapshot.completion.reason)
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Evidence reviewed').status, 'completed')
+})
+
+test('a declared output written under a directory of a different case outside scope is refused before any commit, and renaming the directory repairs it', { skip: (await caseInsensitiveTemp()) ? false : 'the temp filesystem is case-sensitive' }, async t => {
+  // S6b: `reports/` is ignored and in scope; `Reports/summary.md` answers lstat
+  // for the declared name on a case-folding filesystem, but git records the
+  // stored spelling, which is outside the task scope.
+  const f = await fixture(t, { ignore: ['reports/'] })
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Write reports/summary.md', scope: ['reports/', 'notes/'], outputs: ['reports/summary.md'] }).id)
+  await mkdir(path.join(f.author.workspace, 'Reports'))
+  await writeFile(path.join(f.author.workspace, 'Reports', 'summary.md'), '# Summary\n')
+  await f.readEvidence(f.author, task, 'Reports/summary.md')
+  const head = await f.git(f.author.workspace, 'rev-parse', 'HEAD')
+  for (let round = 0; round < 2; round++) {
+    await assert.rejects(f.submit(f.author, task), error => {
+      assert.equal(error.name, 'PolicyError', error.message)
+      assert.equal(error.code, 'output_case_mismatch')
+      assert.equal(error.category, 'validation_error')
+      assert.ok(error.message.startsWith('[output_case_mismatch] '), error.message)
+      assert.ok(error.message.includes('"reports/summary.md" exists in your worktree only as "Reports/summary.md"'), error.message)
+      assert.match(error.message, /Rename each file, and every parent directory whose case differs/)
+      assert.ok(error.message.includes('retry `swarm_submit` with the same `taskId`'), error.message)
+      assert.deepEqual(assessText(error.message, schemaIndex), [], error.message)
+      return true
+    }, `round ${round}: the same typed refusal, not a scope error from an earlier bad commit`)
+    assert.equal(await f.git(f.author.workspace, 'rev-parse', 'HEAD'), head, 'the refusal committed nothing to the member worktree')
+    assert.equal(await f.git(f.author.workspace, 'diff', '--cached', '--name-only'), '', 'nothing was left staged')
+    assert.equal(f.taskRow(task.id).status, 'running')
+    assert.equal(f.taskRow(task.id).attempt.id, task.attempt.id)
+    assert.equal(f.taskRow(task.id).artifact, undefined)
+  }
+  assert.deepEqual(await f.refsCarrying('Reports/summary.md', 'refs/'), [], 'no ref carries the out-of-scope spelling')
+  // The named repair: rename the directory to the declared case.
+  await rename(path.join(f.author.workspace, 'Reports'), path.join(f.author.workspace, 'reports'))
+  const submitted = await f.submit(f.author, task)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path), ['reports/summary.md'])
+  assert.deepEqual(submitted.artifact.changedPaths, ['reports/summary.md'])
+  assert.equal(await f.git(f.author.workspace, 'rev-parse', `${submitted.artifact.commit}^`), head, 'the artifact commit sits directly on the untouched HEAD')
+})
+
+test('a capture that fails after committing puts the member HEAD and index back, and the retry captures from them', async t => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-rollback-')))
+  const { source, git, workspaces } = await repository(root)
+  const objects = path.join(root, 'worktrees', 'rollback', 'artifacts.git', 'objects')
+  t.after(async () => { await chmod(objects, 0o700).catch(() => undefined); await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
+  const mission = { id: 'rollback', workspace: source }
+  const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }
+  const task = { id: 'report', missionId: mission.id, epoch: 1, title: 'Report', kind: 'research', scope: ['docs/', 'notes/'], checks: [], status: 'running',
+    objective: 'Write docs/report.md', acceptance: ['Reviewed'], outputs: ['docs/report.md'] }
+  await workspaces.prepareTask(member, task, [])
+  await writeFile(path.join(member.workspace, 'docs', 'report.md'), '# Draft\n')
+  const first = await workspaces.captureArtifact(member, task)
+  await writeFile(path.join(member.workspace, 'docs', 'report.md'), '# Report\n')
+  await writeFile(path.join(member.workspace, 'notes', 'extra.md'), 'extra\n')
+  const head = await git(member.workspace, 'rev-parse', 'HEAD')
+  assert.equal(head, first.commit)
+  const status = await git(member.workspace, 'status', '--porcelain=v1', '--untracked-files=all')
+  // The artifact ref cannot be published: the commit exists, then the push fails.
+  await chmod(objects, 0o500)
+  await assert.rejects(workspaces.captureArtifact(member, task, [], { requireOutputs: true }), /git push failed/)
+  assert.equal(await git(member.workspace, 'rev-parse', 'HEAD'), head, 'the failed capture left no commit in the member worktree')
+  assert.equal(await git(member.workspace, 'diff', '--cached', '--name-only'), '', 'the index is back to its pre-capture state')
+  assert.equal(await git(member.workspace, 'status', '--porcelain=v1', '--untracked-files=all'), status, 'the member sees exactly the state it had')
+  await chmod(objects, 0o700)
+  const retried = await workspaces.captureArtifact(member, task, [], { requireOutputs: true })
+  assert.equal(await git(member.workspace, 'rev-parse', `${retried.commit}^`), head, 'the retry commits on the restored HEAD')
+  assert.deepEqual([...retried.changedPaths].sort(), ['docs/report.md', 'notes/extra.md'])
+  assert.equal(await git(member.workspace, 'show', `${retried.commit}:docs/report.md`), '# Report')
 })
