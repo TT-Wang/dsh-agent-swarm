@@ -488,6 +488,82 @@ test('an undeclared key is refused by name with the keys that object accepts, at
   assert.deepEqual(calls, [], 'no refused call reached the runtime')
 })
 
+/*
+ * 15 of 82 recorded swarm_launch calls repeat the planning message's
+ * `Workspace:` line as a top-level `workspace`. The launch always runs in the
+ * frozen request workspace, so the key is accepted and ignored: refusing it
+ * cost a whole 10-25k-character plan re-emission and protected nothing.
+ */
+test('a recorded launch shape carrying workspace is accepted and runs in the frozen request workspace, while compact stays refused on swarm_observe', async () => {
+  const launched = [], definitions = new Map()
+  const runtime = { config: {}, starts: () => [{ id: 'request_1', workspace: '/frozen/request' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, snapshot: () => undefined }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  // The keys, key order and budget of call_00_IDLtqD00MZDkoD3xm0HV5189
+  // (agent-swarm-preview-5199, 2026-09-17), a launch that succeeded live, with
+  // its text trimmed and today's required task outputs added.
+  const task = (key, extra) => ({ key, workstreamKey: 'audit', title: key, objective: `Audit ${key}`, kind: 'research', scope: ['src/'], acceptance: ['Report every finding'], assigneeKey: 'auditor_a',
+    maxSteps: 60, maxFindings: 20, maxRecoveryAttempts: 1, checkTimeoutMs: 120000, priority: 1, checks: ['node --version'], outputs: [], ...extra })
+  const recorded = { requestId: 'request_1', planningEpoch: 1, title: 'Audit', objective: 'Audit the slice', workspace: '/Users/someone/code/dsh-slice-agent-loop', scope: ['src/'], acceptance: ['Report every finding'],
+    budget: { maxTokens: 2000000, maxSteps: 620, maxWorkers: 4, maxDurationMs: 7200000, maxTasks: 14, maxExperiments: 0 },
+    members: [{ key: 'auditor_a', role: 'Audit group A', maxOutputTokens: 8000 }, { key: 'synthesizer_d', role: 'Independent verification', maxOutputTokens: 8000 }],
+    workstreams: [{ key: 'audit', title: 'Audit', objective: 'Audit the slice' }],
+    tasks: [task('T1_audit'), task('T5_verify', { kind: 'verification', reviewOf: 'T1_audit', assigneeKey: 'synthesizer_d', priority: 2 })] }
+  await definitions.get('swarm_launch').execute(Object.freeze(recorded), exec)
+  assert.equal(launched.length, 1, 'the recorded shape launches')
+  assert.equal(launched[0].workspace, '/frozen/request', 'the frozen request workspace, never the caller\'s value')
+  const declared = definitions.get('swarm_launch').parameters
+  assert.equal(declared.required.includes('workspace'), false)
+  assert.match(declared.properties.workspace.description, /ignored.*frozen request workspace/i)
+  // A flag-like word in the owner protocol produced compact:true on 4/4 recorded reads; the parameter still does not exist.
+  const schemaIndex = await toolSchemaIndex()
+  await assert.rejects(definitions.get('swarm_observe').execute({ missionId: 'mission_1', compact: true }, exec), refusedBySchema(schemaIndex, 'swarm_observe', '"compact" is not a parameter'))
+  const { OWNER_PROMPT } = await import('../lib/tools.js')
+  assert.doesNotMatch(OWNER_PROMPT, /\bcompact\b/, 'the owner protocol names no compact read')
+})
+
+/*
+ * A null on an optional field is an omission, so `changes: { maxSteps: null }`
+ * used to succeed as a no-op amendment: task/amended {} was written and
+ * `Owner amend: <reason>` was appended to the handoff workers read, while a
+ * caller who meant "clear the dependencies" saw success and an unchanged task.
+ */
+test('an amendment that names no field is refused on every path, and one emptied by nulls names the nulled fields, before anything is written', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const schemaIndex = await toolSchemaIndex()
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const owner = { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }
+    const source = f.propose({ title: 'Source' })
+    const dependent = f.propose({ title: 'Dependent', dependencies: [source.id], maxSteps: 6 })
+    const before = f.runtime.store.get('tasks', dependent.id)
+    const amendedEvents = () => f.runtime.store.events(f.mission.id, 5000).filter(event => event.type === 'task/amended').length
+    const empty = (...fragments) => error => {
+      assert.equal(error.name, 'PolicyError'); assert.equal(error.code, 'task_amendment_empty'); assert.equal(error.category, 'validation_error')
+      assert.ok(error.message.startsWith('[task_amendment_empty] '), error.message)
+      for (const fragment of fragments) assert.ok(error.message.includes(fragment), `${fragment} in ${error.message}`)
+      assert.deepEqual(assessText(error.message, schemaIndex), [], `the refusal satisfies the refusal contract: ${error.message}`)
+      return true
+    }
+    const call = (tool, args) => definitions.get(tool).execute(Object.freeze({ missionId: f.mission.id, taskId: dependent.id, reason: 'clear it', ...args }), owner)
+    await assert.rejects(call('swarm_budget', { taskBudget: { maxSteps: null } }), empty('swarm_budget `taskBudget` held only null fields (`maxSteps`)', 'retry swarm_budget'))
+    for (const field of ['maxSteps', 'dependencies', 'checks']) {
+      await assert.rejects(call('swarm_control', { action: 'amend', changes: { [field]: null } }), empty(`swarm_control \`changes\` held only null fields (\`${field}\`)`, 'retry swarm_control'))
+    }
+    await assert.rejects(call('swarm_control', { action: 'amend', changes: {} }), empty('names no field'))
+    await assert.rejects(call('swarm_budget', { taskBudget: {} }), empty('names no field'))
+    // The exported runtime API, which the browser control RPC calls with the raw body.
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, dependent.id, 'amend', {}, 'annotate'), empty('names no field'))
+    assert.equal(amendedEvents(), 0, 'no task/amended event')
+    const after = f.runtime.store.get('tasks', dependent.id)
+    assert.deepEqual([after.dependencies, after.maxSteps, after.checks, after.handoff, after.epoch], [before.dependencies, before.maxSteps, before.checks, before.handoff, before.epoch], 'the task and its handoff are untouched')
+    // A null beside a real change is still an omission of that one field.
+    await call('swarm_control', { action: 'amend', changes: { maxSteps: null, maxFindings: 7 } })
+    assert.deepEqual([f.runtime.store.get('tasks', dependent.id).maxFindings, f.runtime.store.get('tasks', dependent.id).maxSteps, amendedEvents()], [7, 6, 1])
+  } finally { await f.cleanup() }
+})
+
 test('an empty member id is refused by field instead of binding work to nobody', async () => {
   const f = await setup({ config: { tickMs: 60_000 } })
   try {
