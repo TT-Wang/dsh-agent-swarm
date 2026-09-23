@@ -94,7 +94,20 @@ export interface NotifyOptions {
   /** Exact receipt / failed transport behind this action, including wake summaries. */
   questionId?: string
   deliveryFailureId?: string
+  /**
+   * The delivery that already put this same obligation in front of the owner.
+   * The fact is still written durably (ledger, dedup, reminders), but it is no
+   * wake of its own: it takes no wake-budget slot and the outbox never sends it.
+   */
+  coveredBy?: string
 }
+
+/**
+ * The trigger the verify site records a rejection decision under. A stall root
+ * at the same subject@epoch restates that decision, so it is recorded against
+ * it (`NotifyOptions.coveredBy`) rather than waking the owner a second time.
+ */
+export const REJECTION_DECISION_TRIGGER = 'task/rejected'
 
 /**
  * R17-G3/G8: the durable fact fields a notice row carries. The declared
@@ -117,6 +130,8 @@ export interface NoticeFactRecord {
   /** Bounded reminders for an unresolved fact; transport/turn end never resolves it. */
   followupCount?: number
   followupAt?: number
+  /** The delivery that carried this obligation to the owner (`NotifyOptions.coveredBy`). */
+  coveredBy?: string
   /** R17-G4: the facts a degraded wake-budget summary carries. */
   facts?: string[]
   aggregatedIdentities?: NonNullable<Delivery['notice']>['aggregatedIdentities']
@@ -567,7 +582,8 @@ export class Notices {
     // suppressed by an old one. A caller can still opt out explicitly.
     const family = options.family ?? (options.dedupKey === undefined ? undefined : options.dedupKey.split(':')[0])
     const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId, ...(family === undefined ? {} : { family }),
-      ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }) }
+      ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
+      ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }) }
     const dedupe = options.dedupe ?? true
     // No-silent-state witness W2: every owner-decision notice is durable under
     // the fingerprint of the board it was emitted for, so the owner can verify
@@ -604,7 +620,8 @@ export class Notices {
     const at = Date.now()
     // R17-G4: one per-owner budget bounds every family together. Over budget, the
     // fact is carried by the window's degraded summary instead of being dropped.
-    const summary = this.wakeWindowFor(missionId, at)
+    // A covered fact is no wake, so it neither spends a slot nor joins a summary.
+    const summary = fact?.coveredBy === undefined ? this.wakeWindowFor(missionId, at) : undefined
     if (summary !== undefined && summary.count >= this.wakeBudget) {
       const facts = fact?.facts ?? [`[${fact?.trigger ?? noticeClass}] ${content}`]
       this.appendToWakeSummary(missionId, summary, facts, [{
@@ -619,7 +636,8 @@ export class Notices {
     const delivery: Delivery = {
       id: id('msg'), missionId, from, to: 'owner', kind: noticeClass === 'escalation' ? 'escalation' : 'control',
       content, createdAt: at,
-      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId }) } as NonNullable<Delivery['notice']>,
+      notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
+        ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }) }) } as NonNullable<Delivery['notice']>,
       ...deliveryExtra,
     }
     const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
@@ -885,11 +903,14 @@ export class Notices {
     const now = Date.now()
     for (const delivery of this.rt.store.list('deliveries', mission.id)) {
       const fact = noticeRow(delivery)
-      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined
+      // A covered fact reached the owner with the delivery that covers it, and
+      // stays the durable fact its own reminders are judged from.
+      const handedAt = fact?.coveredBy === undefined ? delivery.deliveredAt : this.rt.store.get('deliveries', fact.coveredBy)?.deliveredAt
+      if (delivery.to !== 'owner' || handedAt === undefined || fact === undefined
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
-      if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? delivery.deliveredAt) < this.obligationFollowupMs) continue
+      if (spent >= this.maxObligationFollowups || now - (fact.followupAt ?? handedAt) < this.obligationFollowupMs) continue
       const unresolved = this.unresolvedSubjects(view, delivery)
       if (unresolved.length === 0) continue
       const priorContent = fact.aggregatedFacts === undefined ? delivery.content
@@ -941,6 +962,9 @@ export class Notices {
    */
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean {
     if (ownerDeliveryMoot(mission, delivery)) return false
+    // A covered fact is never a wake of its own: the covering delivery carried
+    // the obligation, and reminders are generated from this row separately.
+    if (noticeRow(delivery)?.coveredBy !== undefined) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
     const stopFailures = this.stopFailureSubjects(mission.id, delivery)
     if (stopFailures !== undefined) return mission.status !== 'completed' && stopFailures.length > 0
@@ -1339,8 +1363,14 @@ export class Notices {
         : 'no live replacement exists anywhere in its lineage'
       const body = NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
+      // A root the verify site already put in front of the owner (its rejection
+      // decision at this subject@epoch) is recorded against that decision: the
+      // row, event and reminders stay, the second wake does not. Roots with no
+      // such decision (preparation failure, ceiling, exhausted recovery) wake.
+      const cover = this.rejectionDecisionFor(mission.id, subject)
       this.rt.commit(mission.id, () => {
-        this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupe: true, dedupKey: key, stampWitness: false, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause })
+        this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupe: true, dedupKey: key, stampWitness: false, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
+          ...(cover === undefined ? {} : { coveredBy: cover.id }) })
         // The event exists only with the delivery row that carries the fact (its
         // own row or the wake-budget summary), in the same transaction: a notice
         // that was not written must not leave an event per tick behind it.
@@ -1358,6 +1388,20 @@ export class Notices {
       })
     }
     return emitted
+  }
+
+  /**
+   * The owner delivery carrying the verify site's rejection decision for one
+   * subject@epoch (`REJECTION_DECISION_TRIGGER`), as its own row or as a
+   * wake-budget constituent; identified by its recorded trigger, never by prose.
+   */
+  private rejectionDecisionFor(missionId: string, subject: string): Delivery | undefined {
+    return this.rt.store.list('deliveries', missionId).find(delivery => {
+      const row = delivery.to === 'owner' ? noticeRow(delivery) : undefined
+      if (row === undefined) return false
+      if (row.trigger === REJECTION_DECISION_TRIGGER && (delivery.subjects ?? row.subjects ?? []).includes(subject)) return true
+      return row.aggregatedFacts?.some(part => part.trigger === REJECTION_DECISION_TRIGGER && part.subjects.includes(subject)) ?? false
+    })
   }
 
   /**
