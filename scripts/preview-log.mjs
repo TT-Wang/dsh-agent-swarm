@@ -1,17 +1,13 @@
 /**
- * Pure helpers behind the two host-lifecycle decisions in `update-preview.mjs`.
- *
- * They live here, with no side effects, so the restart worker's fragile parts
- * can be unit-tested without a live preview host:
- *   - `selectLaunchUrl` picks the token of the host that was *just* started out
- *     of an append-only `server.log` that still contains every previous host's
- *     token (R7-02);
- *   - `summarizePaths`/`changedPaths` hash every packaged path in the sync
- *     entry list, so a sync that replaces ten files and adds two missing
- *     modules no longer reports a single changed file (R7-03).
+ * Pure helpers behind update-preview's snapshot summary: `summarizePaths` and
+ * `changedPaths` hash every packaged path in the sync entry list, so a sync that
+ * replaces ten files and adds two missing modules no longer reports a single
+ * changed file (R7-03).
  *
  * Nothing here writes, spawns or mutates shared state; the only reads are the
- * filesystem reads `summarizePaths` needs to hash the packaged bytes.
+ * filesystem reads `summarizePaths` needs to hash the packaged bytes. Which
+ * launch URL belongs to the new host is no longer a question: scripts/host.mjs
+ * gives every boot a fresh server.log.
  */
 import { createHash } from 'node:crypto'
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from 'node:fs'
@@ -19,31 +15,6 @@ import { join, sep } from 'node:path'
 
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const toPosix = path => path.split(sep).join('/')
-
-/** The launch-URL shape the host prints, anchored to one port. */
-export function launchUrlPattern(port) {
-  return new RegExp(`http://127\\.0\\.0\\.1:${port}/\\?token=[A-Za-z0-9_.-]+`, 'g')
-}
-
-/**
- * Select the launch URL of the host started after `sinceOffset` characters of
- * `logText`, or `undefined` when that host has not printed one yet.
- *
- * `server.log` is append-only and keeps every previous host's token, so a
- * whole-file match returns the *previous* host's URL before the new host has
- * printed anything, and the documented link then returns 401. Only matches at
- * or after `sinceOffset` — the log length captured before the new host was
- * spawned — can belong to the new host.
- *
- * `sinceOffset` 0 (no prior token, or a caller that wants the whole file)
- * reproduces the pre-fix selection exactly.
- */
-export function selectLaunchUrl(logText, sinceOffset, port) {
-  if (typeof logText !== 'string' || logText.length === 0) return undefined
-  const offset = Number.isInteger(sinceOffset) && sinceOffset > 0 ? sinceOffset : 0
-  const found = logText.slice(offset).match(launchUrlPattern(port))
-  return found ? found.at(-1) : undefined
-}
 
 /**
  * Hash every packaged path reachable from `entries`, relative to `pluginDir`.

@@ -1,19 +1,15 @@
 /**
- * R7-02 / R7-03 regression tests for the pure helpers in
- * `scripts/preview-log.mjs`.
+ * R7-03 regression tests for the pure helpers in `scripts/preview-log.mjs`.
  *
- * Both defects were in `scripts/update-preview.mjs`; the selection and summary
- * logic now lives in exported pure helpers so these tests run without a live
- * preview host (`node --test tests/preview-log.test.mjs`).
+ * The defect was in `scripts/update-preview.mjs`; the summary logic now lives
+ * in exported pure helpers so these tests run without a live preview host
+ * (`node --test tests/preview-log.test.mjs`).
  *
  * Every scenario also runs the *pre-fix* algorithm, inlined below as
- * executable counterevidence: the assertions that follow fail if the helpers
- * regress to the old behaviour.
- *   - pre-fix `awaitLaunchUrl` matched the whole append-only `server.log` and
- *     took the last token, so a previous host's token was recorded before the
- *     new host had printed anything (documented link then returned 401);
- *   - pre-fix `summarize()` hashed only `lib/index.js` and `lib/client.js`, so
- *     a sync replacing ten files and adding two missing modules reported one.
+ * executable counterevidence: pre-fix `summarize()` hashed only `lib/index.js`
+ * and `lib/client.js`, so a sync replacing ten files and adding two missing
+ * modules reported one. (R7-02, the stale launch token, is covered by
+ * tests/host.test.mjs: every boot now gets a fresh server.log.)
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -21,18 +17,9 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { changedPaths, selectLaunchUrl, summarizePaths } from '../scripts/preview-log.mjs'
+import { changedPaths, summarizePaths } from '../scripts/preview-log.mjs'
 
-const PORT = 5192
-const token = name => `http://127.0.0.1:${PORT}/?token=${name}`
 const sha256 = value => createHash('sha256').update(value).digest('hex')
-
-/** Pre-fix R7-02 selection: last token match anywhere in the whole log. */
-function preFixSelectLaunchUrl(logText) {
-  const pattern = new RegExp(`http://127\\.0\\.0\\.1:${PORT}/\\?token=[A-Za-z0-9_.-]+`, 'g')
-  const found = logText.match(pattern)
-  return found ? found.at(-1) : undefined
-}
 
 /** Pre-fix R7-03 summary: only the two hard-coded entry files. */
 function preFixSummarize(pluginDir) {
@@ -50,57 +37,6 @@ function tempTree(t, files) {
   }
   return root
 }
-
-const logLine = message => `[2026-09-09T00:00:00.000Z] ${message}`
-
-test('R7-02a: a stale token before the offset is never selected, even as the last token in the log', () => {
-  const stale = token('previous-host-token')
-  const log = `${logLine('started host 111')}\n${logLine(`restart complete: ${stale}`)}\n`
-  const sinceOffset = log.length
-
-  assert.equal(selectLaunchUrl(log, sinceOffset, PORT), undefined,
-    'the token that was already in the append-only log must not be recorded for the new host')
-  assert.equal(preFixSelectLaunchUrl(log), stale,
-    'the pre-fix logic does select that stale token — this is the R7-02 defect')
-})
-
-test('R7-02b: a token appended after the offset is selected, and the newest appended token wins', () => {
-  const stale = token('previous-host-token')
-  const beforeStart = `${logLine('started host 111')}\n${logLine(`restart complete: ${stale}`)}\n`
-  const sinceOffset = beforeStart.length
-  const fresh = token('new-host-token')
-  const grown = beforeStart + `${logLine('started host 222')}\n${logLine(`restart complete: ${fresh}`)}\n`
-
-  assert.equal(selectLaunchUrl(grown, sinceOffset, PORT), fresh,
-    'the first token printed after the new host started belongs to the new host')
-  const regrown = grown + `${logLine(`another url: ${token('newest-host-token')}`)}\n`
-  assert.equal(selectLaunchUrl(regrown, sinceOffset, PORT), token('newest-host-token'))
-})
-
-test('R7-02c: no token after the offset yields undefined so the rollback path stays reachable', () => {
-  assert.equal(selectLaunchUrl('', 0, PORT), undefined)
-  assert.equal(selectLaunchUrl(`${logLine('booting')}\n`, 0, PORT), undefined)
-
-  const stale = `${logLine(`restart complete: ${token('previous-host-token')}`)}\n`
-  assert.equal(selectLaunchUrl(stale, stale.length, PORT), undefined,
-    'the new host has not printed anything yet')
-  assert.equal(selectLaunchUrl(stale, stale.length + 4096, PORT), undefined,
-    'a truncated or rotated log must not resurrect a token from before the offset')
-})
-
-test('R7-02: offset 0 preserves the pre-fix selection when the log has no prior token', () => {
-  const fresh = token('only-host-token')
-  const log = `${logLine('started host 111')}\n${logLine(`restart complete: ${fresh}`)}\n`
-  assert.equal(selectLaunchUrl(log, 0, PORT), fresh)
-  assert.equal(selectLaunchUrl(log, 0, PORT), preFixSelectLaunchUrl(log),
-    'with no prior token the new helper and the old whole-file match agree')
-})
-
-test('R7-02: only tokens for the restart port are selected', () => {
-  const log = `${logLine('started other')}\n${logLine(`restart complete: http://127.0.0.1:5193/?token=other-port`)}\n`
-  assert.equal(selectLaunchUrl(log, 0, PORT), undefined)
-  assert.equal(selectLaunchUrl(log, 0, 5193), 'http://127.0.0.1:5193/?token=other-port')
-})
 
 test('R7-03: summarizePaths hashes every packaged path and expands directory entries recursively', t => {
   const root = tempTree(t, {

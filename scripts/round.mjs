@@ -21,8 +21,9 @@
  *          profile and pack smokes; --browser adds the live browser smokes
  * promote: --commit <sha> --dry-run; requires a recorded green gate for that
  *          exact commit and a clean tree in its paths; never commits by itself
- * mount:   --harness <dir> (default: inferred from the lab host)
+ * mount:   --harness <dir> (default: the one recorded in the lab's server.json)
  * soak:    verifies the lab is alive, loaded the plugin and started after the build
+ * The lab host is whatever listens on its port, not a recorded pid.
  * new:     --scope "one-line round scope"
  * record:  --gate pass|fail --revision <sha> --findings <n> --fixed <n> --notes "..."
  */
@@ -31,6 +32,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSyn
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findHost, readServer } from './host.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
@@ -42,16 +44,17 @@ const roundsPath = join(lab, 'rounds.json')
 const ledgerPath = join(project, 'docs/improvement-rounds.md')
 const readRounds = () => existsSync(roundsPath) ? JSON.parse(readFileSync(roundsPath, 'utf8')) : []
 const writeRounds = rounds => { mkdirSync(lab, { recursive: true }); writeFileSync(roundsPath, JSON.stringify(rounds, null, 2) + '\n', { mode: 0o600 }) }
-const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+const hostPid = server => findHost(Number(server.port ?? new URL(server.url).port))
 const fail = message => { process.stderr.write(`round: ${message}\n`); process.exit(2) }
 const stamp = () => new Date().toISOString()
 
 if (!command || command === '--help' || command === '-h') { process.stdout.write(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0].slice(3) + '\n'); process.exit(0) }
 
 if (command === 'status') {
-  const server = existsSync(join(lab, 'server.json')) ? JSON.parse(readFileSync(join(lab, 'server.json'), 'utf8')) : undefined
+  const server = readServer(lab)
+  const pid = server && hostPid(server)
   const rounds = readRounds()
-  process.stdout.write(JSON.stringify({ lab, host: server ? { ...server, alive: alive(server.pid) } : null, rounds: rounds.slice(-3), roundCount: rounds.length }, null, 2) + '\n')
+  process.stdout.write(JSON.stringify({ lab, host: server ? { ...server, pid: pid ?? null, alive: pid !== undefined } : null, rounds: rounds.slice(-3), roundCount: rounds.length }, null, 2) + '\n')
   process.exit(0)
 }
 
@@ -90,7 +93,7 @@ if (command === 'record') {
 }
 
 if (command === 'mount') {
-  const server = existsSync(join(lab, 'server.json')) ? JSON.parse(readFileSync(join(lab, 'server.json'), 'utf8')) : undefined
+  const server = readServer(lab)
   if (!server) fail(`no lab host provisioned at ${lab}; run: node scripts/start-lab.mjs`)
   const patch = existsSync(join(lab, 'lab.patch.yml')) ? join(lab, 'lab.patch.yml') : join(lab, 'preview.patch.yml')
   const harness = value('--harness', '')
@@ -181,16 +184,17 @@ if (command === 'promote') {
 }
 
 if (command === 'soak') {
-  const server = existsSync(join(lab, 'server.json')) ? JSON.parse(readFileSync(join(lab, 'server.json'), 'utf8')) : undefined
+  const server = readServer(lab)
   if (!server) fail(`no lab host provisioned at ${lab}`)
+  const pid = hostPid(server)
   const lockPath = join(lab, 'swarm.sqlite.lock')
   const lock = existsSync(lockPath) ? JSON.parse(readFileSync(lockPath, 'utf8')) : undefined
   const buildPath = join(project, 'lib/index.js')
   const buildMtime = existsSync(buildPath) ? statSync(buildPath).mtimeMs : 0
   const startedAt = server.startedAt ? Date.parse(server.startedAt) : 0
   const checks = [
-    { name: 'host-alive', ok: alive(server.pid), detail: `pid ${server.pid}` },
-    { name: 'plugin-loaded', ok: lock?.pid === server.pid, detail: `store lock owner ${lock?.pid ?? 'none'}` },
+    { name: 'host-alive', ok: pid !== undefined, detail: `pid ${pid ?? 'none'}` },
+    { name: 'plugin-loaded', ok: pid !== undefined && lock?.pid === pid, detail: `store lock owner ${lock?.pid ?? 'none'}` },
     { name: 'mounted-after-build', ok: startedAt > buildMtime, detail: `build ${new Date(buildMtime).toISOString()} < host ${server.startedAt}` },
   ]
   const launchUrl = existsSync(join(lab, 'launch.url')) ? readFileSync(join(lab, 'launch.url'), 'utf8').trim() : server.launchUrl
