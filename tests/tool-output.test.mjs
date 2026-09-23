@@ -61,6 +61,15 @@ test('swarm_propose leaves acceptance optional for a repair to inherit; every pl
   }
 })
 
+test('repair guidance says a repair inherits acceptance instead of asking the model to copy it', async () => {
+  const { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT } = await import('../lib/tools.js')
+  const surfaces = { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT, swarm_propose: tools().get('swarm_propose').description }
+  for (const [where, text] of Object.entries(surfaces)) {
+    assert.doesNotMatch(text, /unchanged acceptance|acceptance verbatim|retain original acceptance/i, `${where} no longer asks for a copy`)
+  }
+  for (const where of ['OWNER_PROMPT', 'WORKER_PROMPT', 'swarm_propose']) assert.match(surfaces[where], /replaces[^.]*inherit[^.]*acceptance/, `${where} states the inheritance once`)
+})
+
 test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {
   const definitions = tools()
   // M9(b): optionalInteger rejects negatives, so every cursor declares minimum 0.
