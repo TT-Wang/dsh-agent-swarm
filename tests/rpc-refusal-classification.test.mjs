@@ -60,8 +60,8 @@ const classified = message => ACTIONABLE.some(pattern => pattern.test(message))
 
 test('the sanitizer allowlist is extracted from the source and classifies the authored refusal', () => {
   assert.ok(ACTIONABLE.length > 0, 'the source allowlist must not be empty')
-  assert.ok(classified('Session is not a participant in this mission'), 'a legacy participant refusal is RPC-actionable')
-  assert.ok(!classified('[mission_participant_required] Session is not a participant in this mission. Correct `missionId` and retry.'),
+  assert.ok(classified('Complete independent acceptance before applying results'), 'a legacy delivery refusal is RPC-actionable')
+  assert.ok(!classified('[delivery_acceptance_required] Complete independent acceptance before applying results. Inspect `missionId` and retry.'),
     'the annotated form of that refusal is NOT classified: annotating a legacy Error downgrades the RPC')
 })
 

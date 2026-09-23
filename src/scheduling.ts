@@ -534,7 +534,7 @@ export class Scheduling {
     actor.signal?.throwIfAborted()
     if (this.rt.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const mission = this.rt.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
+    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
     if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
     if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
     return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }

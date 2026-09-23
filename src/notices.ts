@@ -12,6 +12,7 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
+import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Actor, DecisionCandidate, Delivery, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
@@ -763,7 +764,7 @@ export class Notices {
    */
   private requireOwner(actor: Actor, missionId: string, instrument: string): void {
     const { owner } = this.rt.participant(actor, missionId)
-    if (!owner) throw new Error(`Only the mission owner can read the ${instrument}`)
+    if (!owner) throw new PolicyError('observe_owner_required', 'authorization_error', `Only the mission owner can read the ${instrument}`)
   }
 
   /**

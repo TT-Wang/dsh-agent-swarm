@@ -63,19 +63,7 @@ class RequestError extends Error {
  * owner-actionable runtime refusal must be added here to become visible.
  */
 const actionableMessages: readonly RegExp[] = [
-  // Runtime authority, lifecycle and budget refusals.
-  /^Unknown (?:mission|workstream|assignee|coordinator|task kind)$/,
-  /^Session is not a participant in this mission$/,
-  /^Only (?:the mission owner|members|independent verification)/,
-  /^Mission is (?:active|paused|blocked|stopped|completed|staged)$/,
-  /^Mission is waiting for budget-pause quiescence and a fresh resume assignment$/,
-  /^Mission is terminal; create a new mission to continue$/,
-  /^Mission (?:duration|worker|task|experiment) budget exhausted$/,
-  /^Mission (?:already exists|duration exceeds the supported clock range)$/,
-  /^Member admission identity conflict$/,
-  /^Workstream (?:identity conflict|admission budget exhausted)$/,
-  /^Worker name already exists$/,
-  /^Workers cannot create independent missions or budgets$/,
+  // Runtime task and attempt refusals.
   /^Task .* is accepted; accepted work is immutable/,
   /^A task prerequisite is no longer accepted/,
   /^Stale or unauthorized task attempt/,

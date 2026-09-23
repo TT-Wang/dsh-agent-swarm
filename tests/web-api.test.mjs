@@ -19,7 +19,7 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { ObserveDetailRefusedError, SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
@@ -449,6 +449,35 @@ test('plan refusals reach the browser by type at the validator and at the launch
   assert.equal(launch.result.error.message, 'Title must be nonempty text of at most 16000 characters')
   assert.deepEqual(launch.result.error.details, { issues: [], policyCode: 'plan_text_invalid', category: 'validation_error' })
   assert.deepEqual(f.runtime.store.list('missions'), [], 'a refused launch admits nothing')
+})
+
+test('mission authority, lifecycle and budget refusals reach the browser by their policy code, with the legacy wording', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, { ...f.input, budget: { ...budget, maxWorkers: 1 } })
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const propose = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
+  const refused = async (endpoint, payload, message, policyCode, category) => {
+    const response = await f.rpc(endpoint, { sessionId: f.ownerId, ...payload })
+    assert.equal(response.result.error.code, 'bad-request', response.text)
+    assert.equal(response.result.error.message, message)
+    assert.deepEqual(response.result.error.details, { issues: [], policyCode, category })
+    assert.equal(category, errorTypeFor(new Error(message)), `${policyCode} keeps the trace category its text had`)
+  }
+  await refused('cancel', { missionId: 'mission-missing', taskId: 'x', reason: 'x' }, 'Unknown mission', 'mission_unknown', 'validation_error')
+  await refused('propose', { missionId: mission.id, input: { ...propose, workstreamId: 'stream-missing' } }, 'Unknown workstream', 'workstream_unknown', 'validation_error')
+  await refused('add-member', { missionId: mission.id, input: { name: 'Second', role: 'implementation' } }, 'Mission worker budget exhausted', 'mission_worker_budget_exhausted', 'budget_error')
+  f.runtime.control(owner, mission.id, 'pause', 'Hold')
+  await refused('propose', { missionId: mission.id, input: propose }, 'Mission is paused', 'mission_not_active', 'tool_error')
+  f.runtime.control(owner, mission.id, 'stop', 'Done')
+  await refused('cancel', { missionId: mission.id, taskId: 'x', reason: 'x' }, 'Mission is terminal; create a new mission to continue', 'mission_terminal', 'conflict_error')
+  // The observe detail refusal is typed and still recorded under its own name.
+  const detail = new ObserveDetailRefusedError()
+  assert.ok(detail instanceof PolicyError)
+  assert.equal(detail.code, 'observe_detail_full_owner_only')
+  assert.equal(errorTypeFor(detail), errorTypeFor(new Error(detail.message)))
+  assert.equal(String(detail), `ObserveDetailRefusedError: ${detail.message}`)
 })
 
 test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
