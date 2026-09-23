@@ -7,8 +7,8 @@
  * thin forwarding methods and `schedule` calls `dispatch` exactly where its
  * member loop used to be.
  */
-import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
@@ -69,8 +69,8 @@ export interface DispatchQuestion {
  * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
  * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
  * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
- * and past its own bound it stops at the next member boundary so the next body
- * resumes from lease recovery (`dispatch`).
+ * and once one of its own awaits has waited past its bound it stops at the next
+ * member boundary so the next body resumes from lease recovery (`dispatch`).
  */
 export interface SchedulingPass {
   /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
@@ -87,13 +87,30 @@ export interface SchedulingPass {
   /** Set once the watchdog's naming of this body past its bound has committed; it is then wedged, not live. */
   escalatedAt?: number
   /**
-   * The last commit the body made itself, in its own async context (`runBody`).
-   * A commit proves the body is running, not sitting in an await (`passState`).
+   * The body's own last progress: when one of its own awaits returned (stamped
+   * before it commits the result) or it reached a member boundary (`progressed`).
+   * Only the body stamps it, with the record `kick` handed it, so a worker turn
+   * one of its adapter calls woke commits without crediting the body; progress
+   * proves the body is running, not sitting in an await (`passState`).
    */
-  committedAt?: number
+  progressAt?: number
+  /** The event loop's total idle time at the body's last stamp (`progressed`). */
+  idleMs?: number
+  /**
+   * The last stamp at which the event loop had sat idle since the body's
+   * previous stamp: the body was waiting on one of its own awaits, not
+   * computing. Past the bound it stops the body early (`dispatch`).
+   */
+  waitedAt?: number
   /** The member this body's sweep starts from: the one its predecessor stopped before. */
   sweepFrom?: string
-  /** Set when this body stopped at a member boundary past its bound: the first member it did not sweep. */
+  /**
+   * The member where the chain of early-stopped bodies this body belongs to
+   * started. A chained body's sweep ends before it, so the chain covers at most
+   * one rotation and its last body runs the pass-end steps.
+   */
+  chainFrom?: string
+  /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
   stoppedBefore?: string
 }
 
@@ -139,6 +156,37 @@ function formatSpan(ms: number): string {
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 
+/**
+ * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body
+ * calls it itself, with the record `kick` handed it, when it starts, at each
+ * member boundary and when one of its own awaits returns (`awaited`). Nothing
+ * else stamps it: commits made by a worker turn the body woke inside an adapter
+ * call are that turn's, not the body's. Without a record (a direct `schedule`
+ * or `dispatch` call) it does nothing.
+ *
+ * It also records whether the body waited since its previous stamp: the event
+ * loop only idles while the body is suspended in an await with nothing left to
+ * run, so time spent computing (the body's own or an adapter's synchronous
+ * work) never counts as waiting (`waitedAt`).
+ */
+export function progressed(pass: SchedulingPass | undefined): void {
+  if (pass === undefined) return
+  const now = Date.now()
+  const idleMs = performance.eventLoopUtilization().idle
+  if (pass.idleMs !== undefined && idleMs > pass.idleMs) pass.waitedAt = now
+  pass.progressAt = now
+  pass.idleMs = idleMs
+}
+
+/**
+ * One of a scheduling body's own awaits: `work` settles, the body stamps its
+ * progress (`progressed`), and only then does it act on the result, so the
+ * commit of that result publishes as a running body's.
+ */
+export function awaited<T>(pass: SchedulingPass | undefined, work: Promise<T>): Promise<T> {
+  return pass === undefined ? work : work.finally(() => progressed(pass))
+}
+
 export class Scheduling {
   /**
    * The scheduling body queued or running per mission (see `SchedulingPass`).
@@ -159,24 +207,8 @@ export class Scheduling {
    * process's leftover and never gates this runtime.
    */
   readonly instanceId = id('runtime')
-  /**
-   * The async context of the scheduling body that is queued or running
-   * (`runBody`, entered by `kick`). A commit made inside it is the body's own,
-   * whatever await or helper it came through; `recordCommit` stamps
-   * `committedAt` on that body's record.
-   */
-  private readonly body = new AsyncLocalStorage<SchedulingPass>()
 
   constructor(private readonly rt: SwarmRuntime) {}
-
-  /** Commit listener, registered by the runtime: stamp the committing body's own progress. */
-  recordCommit(missionId: string): void {
-    const pass = this.body.getStore()
-    if (pass !== undefined && pass.missionId === missionId && this.passes.get(missionId) === pass) pass.committedAt = Date.now()
-  }
-
-  /** Run one scheduling body, its queue wait included, in its own async context. */
-  runBody<T>(pass: SchedulingPass, fn: () => Promise<T>): Promise<T> { return this.body.run(pass, fn) }
 
   /**
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
@@ -185,18 +217,24 @@ export class Scheduling {
    * being active during an adapter await. It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
    *
-   * A body past its bound (`stallPassTimeoutMs`) also returns false at the next
-   * member boundary, after sweeping at least one member, and records where it
-   * stopped (`stoppedBefore`). `kick` then queues the next body at once, which
-   * starts from lease recovery and sweeps from that member onwards, wrapping
-   * round to the ones before it. Each member's long awaits (a worker start up to
-   * `workerStartTimeoutMs`, task preparation, a close-out capture) therefore
-   * delay lease recovery, automatic completion and the budget check by at most
-   * one such await, not by their sum over every member.
+   * A body one of whose own awaits waited past its bound (`waitedAt`,
+   * `pastBound`) also returns false at the next member boundary, after sweeping
+   * at least one member, and records where it stopped (`stoppedBefore`). `kick`
+   * then queues the next body at once, which starts from lease recovery and
+   * sweeps from that member onwards, wrapping round to the ones before it. Each
+   * member's long awaits (a worker start up to `workerStartTimeoutMs`, task
+   * preparation, a close-out capture) therefore delay lease recovery, automatic
+   * completion and the budget check by at most one such await, not by their sum
+   * over every member. A body past its bound on computation alone (its own or
+   * an adapter's synchronous work) does not stop: another body would only add
+   * its own start-up work. The chain of early stops is bounded: a chained body's
+   * sweep ends before the member the chain started from (`chainFrom`), so the
+   * body that completes the rotation returns true, runs the pass-end steps
+   * (`ensureWitness`, `flushOutbox`) and the next body waits for the tick.
+   * `pass` is the body's own record, handed down by `kick`; a direct call
+   * without one never stamps progress and never stops early.
    */
-  async dispatch(mission: Mission, missionId: string): Promise<boolean> {
-        const body = this.body.getStore()
-        const pass = body !== undefined && this.passes.get(missionId) === body ? body : undefined
+  async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
         // R17-G1: the dispatcher reads the SAME shared interpretation every
         // owner-facing generator consumes (`ready`, `dispatchable`, the task and
         // member rows), so no notice can describe a board the dispatcher would
@@ -204,13 +242,18 @@ export class Scheduling {
         // never staler than the per-step store reads it replaces.
         const members = this.rt.interpretation(missionId).members
         const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
-        const order = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
+        const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
+        const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
+        const order = end > 0 ? rotation.slice(0, end) : rotation
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs) {
+          if (pass?.waitedAt !== undefined && index > 0 && this.pastBound(pass, pass.waitedAt)) {
             pass.stoppedBefore = member.id
+            // A chain whose start member is gone restarts from this body's first one.
+            pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
             return false
           }
+          progressed(pass)
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.
@@ -223,7 +266,7 @@ export class Scheduling {
           // dispatching the other members.
           try {
           if (!this.rt.isolationAllows(missionId, member)) continue
-          try { await this.rt.startWorker(mission, member) }
+          try { await awaited(pass, this.rt.startWorker(mission, member)) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
@@ -255,7 +298,7 @@ export class Scheduling {
             // is only a cache for an attempt whose row write is still in flight.
             const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
             const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt?.id
-            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open)
+            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
           const all = view.tasks
@@ -270,8 +313,8 @@ export class Scheduling {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
             this.rt.assertAdmission(task, member)
-            await this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId))
-            await this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)
+            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId)))
+            await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined))
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
@@ -583,11 +626,11 @@ export class Scheduling {
   livePass(missionId: string): SchedulingPass | undefined {
     const pass = this.passes.get(missionId)
     if (pass === undefined || pass.escalatedAt !== undefined) return undefined
-    const age = Date.now() - pass.startedAt
-    if (age < this.rt.stallPassTimeoutMs) return pass
+    const now = Date.now()
+    if (!this.pastBound(pass, now)) return pass
     // Past the declared pass bound the body is live only while the mission has
     // live work to progress AND the bounded live-work hold has not elapsed.
-    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
+    if (now - pass.startedAt < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
@@ -626,25 +669,38 @@ export class Scheduling {
    */
   passWedged(missionId: string): boolean {
     const pass = this.passes.get(missionId)
-    return pass !== undefined && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs
+    return pass !== undefined && this.pastBound(pass)
+  }
+
+  /**
+   * The one bound predicate: a body is past its bound once it has held the
+   * mission for a whole `stallPassTimeoutMs`. The watchdog names it by this
+   * (`checkSchedulingPasses`), the notices publish it wedged by this
+   * (`passWedged`, `livePass`, `passState`) and the sweep stops it early by
+   * this, so no instant exists at which one of them already acts on the bound
+   * and another does not yet.
+   */
+  pastBound(pass: SchedulingPass, now = Date.now()): boolean {
+    return now - pass.startedAt >= this.rt.stallPassTimeoutMs
   }
 
   /**
    * R17-G5: the pass state a committed transition publishes with
    * (`SwarmRuntime.passState`, read by the notice publication). A body past its
-   * bound that has itself committed within the last bound is not sitting in the
-   * wedged await: it is running and reaches its own dispatch question when it
-   * settles (or hands the unswept members to the next body), so the transition
-   * publishes as inside a live pass. The wedged branch would instead ask "was
-   * not dispatched this tick" about work the same sweep is about to dispatch.
-   * Otherwise the body is live inside its bound (`livePass`) and wedged past it
-   * (`passWedged`), as before; a body silent for a whole bound after its last
-   * commit is wedged again.
+   * bound that has itself made progress within the last bound (`progressAt`:
+   * one of its own awaits returned, or it reached a member boundary) is not
+   * sitting in the wedged await: it is running and reaches its own dispatch
+   * question when it settles (or hands the unswept members to the next body),
+   * so the transition publishes as inside a live pass. The wedged branch would
+   * instead ask "was not dispatched this tick" about work the same sweep is
+   * about to dispatch. Otherwise the body is live inside its bound (`livePass`)
+   * and wedged past it (`passWedged`), as before; a body without progress for a
+   * whole bound is wedged again, whatever a worker turn it woke commits.
    */
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     const pass = this.passes.get(missionId)
     const bound = this.rt.stallPassTimeoutMs
-    if (pass?.committedAt !== undefined && pass.committedAt - pass.startedAt > bound && Date.now() - pass.committedAt <= bound) return { passLive: true, wedged: false }
+    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && Date.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
     return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
 
@@ -676,7 +732,9 @@ export class Scheduling {
    * before). A naming that did not commit (a busy writer on that tick) or was
    * skipped (the mission paused, blocked or already carrying this board's wedge
    * key) leaves the body unnamed, so the next tick retries; the durable
-   * `schedulingWedgeNotice` key makes every retry idempotent.
+   * `schedulingWedgeNotice` key makes every retry idempotent, and `closePass`
+   * clears it when a named body settles, so the next body that wedges on the
+   * same board is named as well.
    *
    * This revokes nothing: the operation queue keeps the body as the physical
    * owner until it actually returns, and a later kick is skipped until then.
@@ -718,10 +776,15 @@ export class Scheduling {
       this.noProgress.set(missionId, noProgressPasses)
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
+      // A named body that settles has spent its wedge key too: the key dedups
+      // the retried naming of that one body (`escalatedAt` keeps one naming per
+      // body), so a later body that wedges on this same board is named once.
       const mission = this.rt.store.get('missions', missionId)
-      if (progressed && mission !== undefined && (mission.schedulingStallNotice !== undefined || mission.schedulingWedgeNotice !== undefined)) {
-        delete mission.schedulingStallNotice
-        delete mission.schedulingWedgeNotice
+      const clearStall = progressed && mission?.schedulingStallNotice !== undefined
+      const clearWedge = (progressed || pass.escalatedAt !== undefined) && mission?.schedulingWedgeNotice !== undefined
+      if (mission !== undefined && (clearStall || clearWedge)) {
+        if (clearStall) delete mission.schedulingStallNotice
+        if (clearWedge) delete mission.schedulingWedgeNotice
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
       }
       if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {
@@ -747,11 +810,11 @@ export class Scheduling {
    * stays suppressed after the naming), the off-pass decision sweep (which runs
    * while the body is wedged and names the subjects no live path advances), the
    * notice dedup (one escalation per body and per unchanged board) and the
-   * lease-renewal path (the naming changes no task, attempt or lease).
+   * lease-renewal path (the naming changes no task, attempt or lease). `now` is
+   * the tick's one instant, read once for every body (`pastBound`).
    */
-  checkSchedulingPasses(): void {
+  checkSchedulingPasses(now = Date.now()): void {
     if (this.rt.closed || this.rt.shuttingDown) return
-    const now = Date.now()
     for (const [missionId, pass] of this.passes) {
       if (pass.escalatedAt !== undefined) continue
       const mission = this.rt.store.get('missions', missionId)
@@ -759,13 +822,12 @@ export class Scheduling {
       // the first tick after the owner resumes it names the body if it is still
       // held (the resume does not go through the mission queue).
       if (mission?.status !== 'active') continue
-      const age = now - pass.startedAt
-      if (age < this.rt.stallPassTimeoutMs) continue
+      if (!this.pastBound(pass, now)) continue
       const held = this.hasLiveWork(missionId)
       // Inside the second bound live work keeps the body live: a pass that may
       // legitimately be inside a long adapter await for that work is not named.
       // Past it the window is over, and the notice names the subject that held it.
-      if (held && age < this.rt.stallPassReleaseBoundMs) continue
+      if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
       this.escalateWedge(missionId, pass, held, held ? this.liveWorkHolders(missionId) : [])
     }
   }

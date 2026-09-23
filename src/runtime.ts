@@ -8,7 +8,7 @@ import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, REJECTION_DECISION_TRIGGER, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
-import { Scheduling, type SchedulingPass } from './scheduling.ts'
+import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -486,7 +486,6 @@ export class SwarmRuntime {
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
     this.store = new SwarmStore(config.statePath, storeOptions)
-    this.subscribe(missionId => this.scheduling.recordCommit(missionId))
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
       idle: memberId => this.onIdle(memberId),
@@ -1021,7 +1020,7 @@ export class SwarmRuntime {
     }
   }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
-  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task) }
+  async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task, pass) }
   /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
   private replacementLineage(missionId: string, task: Task): Set<string> {
     const tasks = this.store.list('tasks', missionId)
@@ -4201,24 +4200,26 @@ export class SwarmRuntime {
    * The record is removed in `closePass` when the body settles, whatever the
    * outcome; the tick watchdog names a body that holds it past its bound.
    *
-   * A body that stopped at a member boundary past its bound
-   * (`Scheduling.dispatch`) is followed at once by the next body, which sweeps
-   * from the member it stopped before (`sweepFrom`). It is opened in the same
-   * synchronous step that closes the stopped body, so the close publishes as
-   * inside that live pass, never as a finished sweep that left the unswept
-   * members' work undispatched.
+   * A body that stopped early at a member boundary (`Scheduling.dispatch`,
+   * handed here as `after`) is followed at once by the next body, which sweeps
+   * from the member it stopped before (`sweepFrom`) and continues its chain
+   * (`chainFrom`, so the chain covers at most one rotation). It is opened in the
+   * same synchronous step that closes the stopped body, so the close publishes
+   * as inside that live pass, never as a finished sweep that left the unswept
+   * members' work undispatched. The body is handed its own record (`schedule`),
+   * which it stamps with its own progress (`Scheduling.passState`).
    */
-  kick(missionId: string, sweepFrom?: string): void {
+  kick(missionId: string, after?: SchedulingPass): void {
     if (this.shuttingDown || this.closed) return
     const pass = this.openPass(missionId)
     if (pass === undefined) return
-    if (sweepFrom !== undefined) pass.sweepFrom = sweepFrom
+    if (after?.stoppedBefore !== undefined) { pass.sweepFrom = after.stoppedBefore; pass.chainFrom = after.chainFrom }
     this.defer(async () => {
-      try { await this.scheduling.runBody(pass, () => this.exclusive(missionId, () => this.schedule(missionId))) }
+      try { await this.exclusive(missionId, () => this.schedule(missionId, pass)) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
-        if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass.stoppedBefore)
+        if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass)
       }
     })
   }
@@ -4296,8 +4297,16 @@ export class SwarmRuntime {
     this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined })
     return promise
   }
-  private async schedule(missionId: string): Promise<void> {
+  /**
+   * One scheduling body. `pass` is its own record when `kick` queued it; the
+   * body hands it to lease recovery and the dispatch sweep, which stamp its
+   * progress and stop it early past its bound. A direct call has none.
+   */
+  private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.shuttingDown) return
+    // The body starts: its first progress, and the baseline from which its
+    // later stamps tell waiting from computing (the queue wait is not its own).
+    progressed(pass)
     const mission = this.mission(missionId)
     if (mission.status !== 'active') { await this.flushOutbox(missionId); return }
     if (mission.budgetPause) {
@@ -4315,11 +4324,11 @@ export class SwarmRuntime {
     // S1 (P0): the lease-expiry sweep is src/attempts.ts#recoverExpired, in the
     // same order as before; it iterates ids and re-reads each row inside the loop,
     // so a row committed during its awaits is never written back over.
-    if (!await this.attempts.recoverExpired(mission, missionId)) return
+    if (!await this.attempts.recoverExpired(mission, missionId, pass)) return
     // M1a seam 7/7: the dispatch sweep is src/scheduling.ts#dispatch, in the same
     // order as before; a false result abandons the pass where the loop's early
     // returns did.
-    if (!await this.scheduling.dispatch(mission, missionId)) return
+    if (!await this.scheduling.dispatch(mission, missionId, pass)) return
     // Backstop: a full pass that dispatched nothing must still witness the state.
     this.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the

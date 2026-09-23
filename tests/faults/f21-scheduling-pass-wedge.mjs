@@ -108,11 +108,13 @@ async function namingCommitFailsOnce() {
     const scheduling = runtime.scheduling
     const check = scheduling.checkSchedulingPasses.bind(scheduling)
     let locked
-    scheduling.checkSchedulingPasses = () => {
-      if (locked !== undefined || !scheduling.passWedged(mission.id)) return check()
+    // Keyed on the watchdog's own predicate at the tick's own instant.
+    scheduling.checkSchedulingPasses = (now = Date.now()) => {
+      const pass = scheduling.passes.get(mission.id)
+      if (locked !== undefined || pass === undefined || !scheduling.pastBound(pass, now)) return check(now)
       const other = new DatabaseSync(statePath)
       other.exec('BEGIN IMMEDIATE')
-      try { return check() } finally { other.exec('ROLLBACK'); other.close(); locked = { events: wedgeEvents(runtime, mission.id).length } }
+      try { return check(now) } finally { other.exec('ROLLBACK'); other.close(); locked = { events: wedgeEvents(runtime, mission.id).length } }
     }
     workers.wedgeNext = true
     const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
