@@ -63,17 +63,6 @@ class RequestError extends Error {
  * owner-actionable runtime refusal must be added here to become visible.
  */
 const actionableMessages: readonly RegExp[] = [
-  // Plan admission and scope diagnostics.
-  /^Plan entries must be objects$/,
-  /^Plan exceeds (?:1 MiB|task\/workstream budget|experiment budget)$/,
-  /^(?:Title|Objective|Workspace|Mission scope|Mission acceptance) must be nonempty text of at most 16000 characters$/,
-  /^Workspace must be absolute$/,
-  /^Invalid budget (?:maxTokens|maxSteps|maxWorkers|maxDurationMs|maxTasks|maxExperiments)$/,
-  /^Roster exceeds worker budget$/,
-  /^members\[/,
-  /^workstreams\[/,
-  /^tasks\[/,
-  /^scope\[/,
   // Runtime authority, lifecycle and budget refusals.
   /^Unknown (?:mission|workstream|assignee|coordinator|task kind)$/,
   /^Session is not a participant in this mission$/,

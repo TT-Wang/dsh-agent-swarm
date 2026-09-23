@@ -432,6 +432,25 @@ test('admission refusals are typed policy errors carrying their diagnostics, wit
   assert.deepEqual(graph.defects, defects)
 })
 
+test('plan refusals reach the browser by type at the validator and at the launch boundary', async t => {
+  const f = await fixture(t)
+  const several = structuredClone(f.input)
+  several.tasks[0].priority = 101
+  several.tasks[0].scope = ['lib/']
+  const staged = await f.rpc('create-draft', { sessionId: f.ownerId, input: several })
+  assert.equal(staged.result.error.code, 'bad-request', staged.text)
+  assert.match(staged.result.error.message, /^tasks\[0\]\.scope exceeds mission scope: "lib\/"[^\n]+\[scope_selector_out_of_scope\]\ntasks\[0\] \(build\)\.priority must be 0–100$/)
+  assert.deepEqual(staged.result.error.details, { issues: [], policyCode: 'plan_invalid', category: 'budget_error' })
+  // Launch revalidates the saved plan outside the scrub-exempt validator call.
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  f.runtime.store.transaction(() => f.runtime.store.put('drafts', { ...draft, input: { ...draft.input, title: '' } }))
+  const launch = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(launch.result.error.code, 'bad-request', launch.text)
+  assert.equal(launch.result.error.message, 'Title must be nonempty text of at most 16000 characters')
+  assert.deepEqual(launch.result.error.details, { issues: [], policyCode: 'plan_text_invalid', category: 'validation_error' })
+  assert.deepEqual(f.runtime.store.list('missions'), [], 'a refused launch admits nothing')
+})
+
 test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }

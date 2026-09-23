@@ -8,6 +8,7 @@
  */
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
+import { PolicyError } from './policy-error.ts'
 import { hasNotice } from './arena.ts'
 import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -29,11 +30,11 @@ export function validatedBudget(input: Budget): Budget {
   const budget = {} as Budget
   for (const key of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'] as const) {
     const value = input?.[key]
-    if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${key}`)
+    if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new PolicyError('budget_invalid', 'budget_error', `Invalid budget ${key}`)
     budget[key] = value
   }
   if (input.deadlineAt !== undefined) {
-    if (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 1) throw new Error('Invalid budget deadlineAt')
+    if (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 1) throw new PolicyError('budget_invalid', 'budget_error', 'Invalid budget deadlineAt')
     budget.deadlineAt = input.deadlineAt
   }
   return budget

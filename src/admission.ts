@@ -433,11 +433,11 @@ function declaredOutputFault(output: unknown, scope: readonly string[]): string 
  * stores, so no call site can admit an entry it did not validate.
  */
 export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string): string[] {
-  if (!Array.isArray(outputs)) throw new Error(`[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`)
+  if (!Array.isArray(outputs)) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`, `${location}.outputs`)
   for (const output of outputs) {
     const fault = declaredOutputFault(output, scope)
     if (fault === undefined) continue
-    throw new Error(`[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`)
+    throw new AdmissionError('output_outside_scope', 'tool_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
   return [...outputs as string[]]
 }
