@@ -63,7 +63,9 @@ export function guardBoard(runtime, missionId, mission) {
         // independent review.
         ...(reviewSourceLive === undefined ? {} : { reviewSourceLive }),
         ...(source === undefined ? {} : { authorMemberIds: [...runtime.authorIds(source)] }),
-        preparationExhausted: task.status === 'blocked' && typeof task.output === 'string' && task.output.startsWith('Workspace or worker preparation failed'),
+        // The recorded preparation failure, not the prose of `task.output`,
+        // which a later transition rewrites or leaves stale.
+        preparationExhausted: task.status === 'blocked' && runtime.taskBlockCauses(task).has('preparation-failed'),
         ...(task.dependencies.length === 0 && task.reviewOf === undefined
           && dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: task.dependencies, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`).length > 0
           ? { assumedContent: true } : {}),

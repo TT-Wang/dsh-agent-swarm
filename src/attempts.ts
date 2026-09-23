@@ -24,7 +24,7 @@ import { PolicyError } from './policy-error.ts'
  */
 const terminalDetail = (text: string): string => text.replace(/\[[a-z][a-z0-9_]{2,63}\]\s*/g, '').trim()
 import type { SwarmRuntime } from './runtime.ts'
-import type { Actor, Artifact, Member, Mission, Task, WorkerActivity } from './types.ts'
+import type { Actor, Artifact, EvidenceStatus, Member, Mission, Task, WorkerActivity } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
@@ -53,6 +53,53 @@ export function pendingStopOwner(tasks: readonly Task[], memberId: string): bool
     // handle; reserve every member until the complete scan confirms quiescence.
     return true
   })
+}
+
+/**
+ * Why a task is, or on its next confirmed stop would be, blocked. A `blocked`
+ * status has several causes that can hold together and clear independently (a
+ * restart retires an obsolete finding ceiling while a preparation failure still
+ * needs repair), so the set is derived from the task's own fields whenever a
+ * reader asks, never stored as one discriminant.
+ */
+export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
+
+/**
+ * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
+ * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
+ * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
+ * preparation failure still inside its backoff retry is not a cause: that task
+ * is pending and the host retries it.
+ */
+export function blockCauses(
+  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts'>,
+  evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
+  defaultMaxRecoveryAttempts: number,
+): Set<BlockCause> {
+  const causes = new Set<BlockCause>()
+  if (task.ceiling !== undefined) causes.add('task-ceiling')
+  if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
+  if (task.verificationRecovery !== undefined) causes.add('review-deferred')
+  // A rejected source, or submitted work invalidated after submission: its
+  // artifact is immutable, so only a replacement can repair it.
+  if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
+  if ((task.evidenceIds ?? []).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
+  if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
+  return causes
+}
+
+/** Stops the host or the owner caused: the task's automatic recovery limit does not decide where they land. */
+const recoveryLimitExempt = (reason: StopReason): boolean => reason === 'resource' || reason === 'handoff' || reason === 'invalidated'
+
+/**
+ * Where a confirmed stop lands, decided from the causes holding when the stop
+ * is confirmed: blocked when the stop was an invalidation, or when any cause
+ * holds other than a recovery limit this stop reason is exempt from.
+ * `recoveryLimit` is true when the recovery limit is one of the deciding causes.
+ */
+export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason): { blocked: boolean; recoveryLimit: boolean } {
+  const recoveryLimit = causes.has('recovery-exhausted') && !recoveryLimitExempt(reason)
+  return { blocked: reason === 'invalidated' || recoveryLimit || [...causes].some(cause => cause !== 'recovery-exhausted'), recoveryLimit }
 }
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
@@ -192,10 +239,8 @@ export class Attempts {
           const fresh = this.rt.task(missionId, task.id)
           if (fresh.epoch !== state.epoch || fresh.resumeAfterStop?.epoch !== state.epoch || fresh.resumeAfterStop.memberId !== state.memberId) return
           const reason = fresh.resumeAfterStop.reason
-          const recoveryExhausted = reason !== 'resource' && reason !== 'handoff' && reason !== 'invalidated' && (fresh.recoveryCount ?? 0) >= (fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember)
-          const exhausted = reason === 'invalidated' || recoveryExhausted || fresh.ceiling !== undefined || fresh.preparationFailure !== undefined || fresh.verificationRecovery !== undefined
-            || (fresh.status === 'blocked' && fresh.artifact !== undefined)
-            || (fresh.evidenceIds ?? []).some(evidenceId => this.rt.store.get('evidence', evidenceId)?.status === 'refuted')
+          const causes = blockCauses(fresh, evidenceId => this.rt.store.get('evidence', evidenceId)?.status, this.rt.config.maxTasksPerMember)
+          const { blocked: exhausted, recoveryLimit: recoveryExhausted } = stopOutcome(causes, reason)
           const released = ownerIds.map(memberId => this.rt.store.get('members', memberId)).filter((member): member is Member => member !== undefined)
           if (reason === 'worker-closeout' && state.memberId !== undefined && (released.length === 0 || released[0]!.status === 'stopped')) delete fresh.assigneeId
           if (fresh.status !== 'cancelled' && fresh.status !== 'accepted') fresh.status = exhausted ? 'blocked' : 'pending'
