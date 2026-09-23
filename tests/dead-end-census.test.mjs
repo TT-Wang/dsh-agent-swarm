@@ -61,7 +61,7 @@
  * the classification and the counts, the reachability of the DEAD END branch
  * (by mutation), and the well-formedness of every escalation's exits. What stays
  * a lint property: whether the named tools and parameters resolve in the real
- * tool schema — that is `assessRefusal` over `toolSchemaIndex`
+ * tool schema — that is `assessText` over `toolSchemaIndex`
  * (tests/refusal-inventory.mjs), which this file runs over the census's own
  * terminals so a drifted exit fails here too.
  *
@@ -74,7 +74,7 @@ import assert from 'node:assert/strict'
 import { guardActions, guardBoard, guardMissionTerminal } from './guard-model.mjs'
 import { reconcileTaskAdmission } from '../lib/admission.js'
 import { ReplayGraphError, orchestratorCommands } from '../lib/trace.js'
-import { assessRefusal, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup } from './faults/harness.mjs'
 import { CHAINS, generatedBoards, generatorLimits, keyOf, reachableClosure } from './guard-states.mjs'
 
@@ -141,11 +141,7 @@ export function census(board, actions = guardActions) {
 
 /** The production message text goes through the real refusal lint, as in tests/guard-terminals.test.mjs. */
 const schemaIndex = await toolSchemaIndex()
-function exitViolations(message) {
-  const sites = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(message)})\n}\n`, 'src/probe.ts')
-  assert.equal(sites.length, 1, 'the lint fixture has exactly one refusal site')
-  return assessRefusal(sites[0], { ...schemaIndex, diagnosticProducers: new Set() })
-}
+const exitViolations = message => assessText(message, schemaIndex)
 
 test('DEAD census: every reachable non-terminal board state is RECOVERABLE or OWNER-GATED, and the reachable set is the generator\'s closure', () => {
   const reachable = reachableClosure()

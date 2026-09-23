@@ -48,23 +48,19 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
-import { refusalSites, assessRefusal, toolSchemaIndex } from './refusal-inventory.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events } from './faults/harness.mjs'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
 /**
  * Run one message through the *real* refusal lint: the production message text
- * is embedded in a throw fixture and assessed against the schema the production
- * registration path installs, so a terminal that names a tool or parameter the
- * model cannot call fails here.
+ * is assessed as rendered against the schema the production registration path
+ * installs, so a terminal that names a tool or parameter the model cannot call
+ * fails here.
  */
 const schemaIndex = await toolSchemaIndex()
-function lintRefusal(message) {
-  const sites = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(message)})\n}\n`, 'src/probe.ts')
-  assert.equal(sites.length, 1, 'the lint fixture has exactly one refusal site')
-  return assessRefusal(sites[0], { ...schemaIndex, diagnosticProducers: new Set() })
-}
+const lintRefusal = message => assessText(message, schemaIndex)
 
 /* ------------------------------------------------------------------------- *
  * 1. The property test over generated board states.
