@@ -18,6 +18,15 @@ import { validatePlan } from '../lib/plans.js'
 import { deliverablePaths } from '../lib/admission.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+
+const schemaIndex = await toolSchemaIndex()
+/** The refusal is `[output_outside_scope]`, and its rendered text satisfies the refusal contract. */
+const outsideScope = error => {
+  assert.match(error.message, /\[output_outside_scope\]/)
+  assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
+  return true
+}
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -78,13 +87,13 @@ async function runtimeFixture(t) {
 test('R20: a declared output outside the task scope is refused at plan validation and at propose', async t => {
   const outside = plan('/workspace')
   outside.tasks[1].outputs = ['src/change.ts', 'docs/report.md']
-  assert.throws(() => validatePlan(outside), /\[output_outside_scope\]/, 'plan validation refuses a deliverable the task may not write')
+  assert.throws(() => validatePlan(outside), outsideScope, 'plan validation refuses a deliverable the task may not write')
   assert.throws(() => validatePlan(outside), /docs\/report\.md/, 'the refusal names the offending path')
   assert.deepEqual(validatePlan(plan('/workspace')).tasks.find(task => task.key === 'code').outputs, ['src/change.ts'],
     'a declared in-scope output survives into the canonical plan')
 
   const f = await runtimeFixture(t)
-  assert.throws(() => f.propose('Audit', { outputs: ['docs/report.md'] }), /\[output_outside_scope\]/,
+  assert.throws(() => f.propose('Audit', { outputs: ['docs/report.md'] }), outsideScope,
     'propose refuses the same declaration, so the error is not deferred to submission')
   // The exact rule replaces the advisory hint: a read-only audit can now declare
   // its report at plan time by putting the path inside its own scope.
@@ -104,11 +113,14 @@ test('R20: a declared output must be a literal in-scope file, never a directory,
     ['/etc/passwd', 'an absolute path is not repository-relative'],
     ['', 'an empty entry names nothing'],
   ]) {
-    assert.throws(() => f.propose(`Refuse ${declared}`, { outputs: [declared] }), /\[output_outside_scope\]/, why)
+    assert.throws(() => f.propose(`Refuse ${declared}`, { outputs: [declared] }), outsideScope, why)
     const planned = plan('/workspace')
     planned.tasks[1].outputs = [declared]
-    assert.throws(() => validatePlan(planned), /\[output_outside_scope\]/, `${why} (plan validation)`)
+    assert.throws(() => validatePlan(planned), outsideScope, `${why} (plan validation)`)
   }
+  const notArray = plan('/workspace')
+  notArray.tasks[1].outputs = 'src/change.ts'
+  assert.throws(() => validatePlan(notArray), outsideScope, 'a declaration that is not an array is refused with the same code')
   assert.ok(f.propose('Analysis only', { kind: 'research', checks: [], outputs: [] }), 'an empty array is a legal declaration')
 })
 

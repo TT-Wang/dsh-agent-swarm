@@ -25,6 +25,9 @@ import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
+
+const schemaIndex = await toolSchemaIndex()
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 }
 async function eventually(read, message, timeoutMs = 3000) {
@@ -104,10 +107,23 @@ async function fixture(t) {
     assert.ok(error.message.includes(`retry \`swarm_submit\` with \`deliverables\`: ${JSON.stringify(paths)}`), `${error.message} offers the declare repair`)
     assert.match(error.message, /remove them from your worktree and retry `swarm_submit`/, 'the second repair is removal')
     assert.doesNotMatch(error.message, /input/i, 'the refusal never suggests declaring an input')
+    assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
     return true
   }
   return { root, source, runtime, workers, workspaces, owner, mission, author, reviewer, a, b, propose, readEvidence, submit, accept, taskRow, inCommit, refused }
 }
+
+test('both typed deliverable_uncaptured refusals are in the refusal inventory and satisfy its contract', async () => {
+  const file = 'src/runtime.ts'
+  const sites = refusalSites(await readFile(new URL(`../${file}`, import.meta.url), 'utf8'), file)
+  const typed = sites.filter(site => site.code === 'deliverable_uncaptured')
+  assert.deepEqual(typed.map(site => [site.kind, site.errorClass, site.codes]), [
+    ['coded-throw', 'PolicyError', ['deliverable_uncaptured']], ['coded-throw', 'PolicyError', ['deliverable_uncaptured']],
+  ], 'the submit and the verify refusal are both walked')
+  assert.deepEqual(typed.map(site => site.tools), [['swarm_submit'], ['swarm_verify']])
+  const producers = diagnosticProducers([sites])
+  for (const site of typed) assert.deepEqual(assessRefusal(site, { ...schemaIndex, diagnosticProducers: producers }), [], site.text)
+})
 
 for (const kind of ['research', 'implementation']) {
   test(`H-1 (${kind}): a hinted ignored report written but omitted from deliverables is refused with both repairs; the attempt stays live and the declared resubmission is accepted`, async t => {
