@@ -242,3 +242,20 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
     assert.doesNotMatch(leaked.text, /private|secret|sqlite|cancelled by the owner/)
   }
 })
+
+test('a refusal text on a plain Error grants no visibility: only the typed refusal reaches the browser', async t => {
+  const f = await fixture(t)
+  // Texts the retired message allowlist used to expose by wording alone.
+  for (const text of ['Mission is paused', 'Unknown mission', 'Only the mission owner can cancel admitted work',
+    'tasks[0] (build).priority must be 0–100', 'Complete independent acceptance before applying results']) {
+    f.runtime.control = () => { throw new Error(text) }
+    const plain = await f.rpc('control', { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' })
+    assert.equal(plain.result.error.code, 'internal-error', `${text} on a plain Error is not an authored refusal`)
+    assert.doesNotMatch(plain.text, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    f.runtime.control = () => { throw new PolicyError('probe_refusal', 'tool_error', text) }
+    const typed = await f.rpc('control', { sessionId: f.ownerId, missionId: 'mission-1', action: 'pause', reason: 'test' })
+    assert.equal(typed.result.error.code, 'bad-request')
+    assert.equal(typed.result.error.message, text)
+    assert.deepEqual(typed.result.error.details, { issues: [], policyCode: 'probe_refusal', category: 'tool_error' })
+  }
+})

@@ -3017,8 +3017,8 @@ export class SwarmRuntime {
         // The adapter result is located; `checkSyntaxDetail` pairs each issue
         // with the check it refuses by that index.
         const issues = await this.workers.checkSyntaxPreflight(declaredChecks.map(check => check.command), input.workspace, actor.signal)
-        // Typed, so the browser sees it by its code rather than an allowlist
-        // match; the RPC boundary still hides it when the detail names a host path.
+        // Typed, so the browser sees it by its code; the RPC boundary still
+        // hides it when the detail names a host path.
         if (issues.length) throw new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] ' + checkSyntaxDetail(declaredChecks, issues) + '\nPrefer the existing repository check commands; repair every command in the `checks` array and relaunch the complete plan.')
       }
       assertCurrent()
