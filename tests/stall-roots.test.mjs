@@ -260,3 +260,60 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const { retryAt: _retryAt, ...permanent } = f.runtime.store.get('tasks', backoff.id).preparationFailure
   assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }, board()), false)
 })
+
+for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
+  test(`a W2 witness stamped during a preparation back-off (${coStamp}) does not hide the back-off once its bound passes`, async t => {
+    // 5347f5b: the back-off wait ends on a timer that changes nothing in F(S), so
+    // a W2 stamped inside the window (the row-7b stamp after a stall-root notice,
+    // or another task's permanent preparation-failure notice) matched F(S) forever
+    // and the fall-through never named the task nothing would retry.
+    const f = await fixture(t)
+    const tickMs = f.runtime.config.tickMs
+    const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+    const research = { kind: 'research', checks: undefined }
+    const sibling = f.propose('Healthy sibling', research)
+    await f.runtime.claim(f.actor, f.mission.id, sibling.id)
+    const other = f.propose('Unrelated dead end', research)
+    const backoff = f.propose('Backing off', { ...research, assigneeId: second.id })
+    const retryAt = Date.now() + 400
+    f.runtime.commit(f.mission.id, () => {
+      const row = f.runtime.store.get('tasks', backoff.id)
+      row.epoch++
+      row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+      f.runtime.store.put('tasks', row)
+      const dead = f.runtime.store.get('tasks', other.id)
+      dead.status = 'blocked'; dead.epoch++
+      if (coStamp === 'permanent-preparation-failure') {
+        // The scheduler's own permanent-failure shape (src/scheduling.ts), notice included.
+        dead.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
+        dead.output = 'Workspace or worker preparation failed: EACCES'
+        f.runtime.store.put('tasks', dead)
+        f.runtime.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { from: 'runtime' })
+      } else {
+        dead.output = 'blocked for repair'
+        f.runtime.store.put('tasks', dead)
+      }
+      const member = f.runtime.store.get('members', second.id)
+      member.phase = 'stopped'
+      f.runtime.store.put('members', member)
+    })
+    const epoch = f.runtime.store.get('tasks', backoff.id).epoch
+    const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
+    // The co-stamp happened inside the window and the board did not change after it.
+    const stamped = await eventually(() => {
+      const witness = f.runtime.store.get('missions', f.mission.id).witness
+      return witness?.kind === 'W2' && witness.at <= retryAt + tickMs && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+    }, 'a W2 witness is stamped during the back-off window')
+    assert.ok(stamped.at <= retryAt, `stamped inside the window (${retryAt - stamped.at} ms before retryAt)`)
+    assert.equal(named().length, 0, 'the live back-off is not named')
+    const notice = await eventually(() => named()[0], 'the expired back-off is named despite the earlier W2 for the same F(S)', 3000)
+    assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
+    assert.deepEqual(notice.subjects, [`${backoff.id}@${epoch}`], 'only the expired back-off is named')
+    assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
+    await sleep(150)
+    assert.equal(named().length, 1, 'named exactly once: the fall-through re-stamps the witness past the bound')
+    const witness = f.runtime.store.get('missions', f.mission.id).witness
+    assert.equal(witness.fingerprint, f.runtime.fingerprint(f.mission.id), 'the witness is still keyed by F(S) alone')
+    assert.ok(witness.at > retryAt + tickMs, 'the current witness post-dates the bound')
+  })
+}

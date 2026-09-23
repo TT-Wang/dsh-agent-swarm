@@ -393,6 +393,33 @@ export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs'>, ta
 }
 
 /**
+ * The instant a pending task's transient preparation back-off stops being a live
+ * wait: one tick past the host's `retryAt`. Undefined when the task carries no
+ * back-off (a permanent failure has no `retryAt`; `blockCauses` reads it as a
+ * block cause). One bound for `waitsLegitimately` and the witness dedup.
+ */
+export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task, 'status' | 'preparationFailure'>): number | undefined {
+  const retryAt = task.status === 'pending' ? task.preparationFailure?.retryAt : undefined
+  return retryAt === undefined ? undefined : retryAt + rt.config.tickMs
+}
+
+/**
+ * Whether a back-off that was still a live wait when a witness was stamped at
+ * `since` has run out by `now`. F(S) excludes wall-clock (spec §4), so the
+ * expiry changes no fingerprint and an F(S)-only dedup would let a witness
+ * stamped during the wait (a stall-root row-7b stamp, another task's
+ * preparation-failure notice) suppress the fall-through that names the expired
+ * back-off forever. The witness therefore compares F(S) plus this one clock
+ * fact, read from its own durable `at`; F(S) itself stays clock-free.
+ */
+export function backoffExpiredSince(rt: Pick<LineageRuntime, 'config'>, tasks: readonly Task[], since: number, now = Date.now()): boolean {
+  return tasks.some(task => {
+    const bound = backoffBound(rt, task)
+    return bound !== undefined && since <= bound && bound < now
+  })
+}
+
+/**
  * R14-F2(c) / R16-A: whether an unfinished task is waiting on something still
  * alive — a live lease, the bounded review grace, a stop inside its bound, or an
  * unfinished dependency/predecessor edge. One implementation for the classifiers
@@ -447,7 +474,8 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     const failure = task.preparationFailure
     if (failure !== undefined) {
       if (blockCauses(task, () => undefined, Number.POSITIVE_INFINITY).has('preparation-failed')) return false
-      if (failure.retryAt !== undefined && Date.now() <= failure.retryAt + rt.config.tickMs) return true
+      const bound = backoffBound(rt, task)
+      if (bound !== undefined && Date.now() <= bound) return true
     }
     // The same marker that fences dispatch is a live wait only while every
     // matching stop is inside its bound. An unknown owner reserves all members.
@@ -1150,7 +1178,12 @@ export class Notices {
     // unrelated notice (the integration-gap warning, a coverage notice) must not
     // consume the decision a dead pass owes its task. The pass-scoped path keeps
     // the dedup: there, an unchanged board is exactly what the witness means.
-    if (options.wedged !== true && mission.witness?.fingerprint === fingerprint) return
+    // A witness stamped while a preparation back-off was a live wait does not
+    // cover the board once that bound passes (`backoffExpiredSince`): the expiry
+    // changes nothing in F(S), so the dedup also compares it. Every branch below
+    // deduplicates its own fact, so re-running past this point cannot repeat one.
+    if (options.wedged !== true && mission.witness?.fingerprint === fingerprint
+      && !backoffExpiredSince(this.rt, tasks, mission.witness.at)) return
     // Spec §2 dispatchable: pending, dependencies accepted, and an idle or
     // waiting member can run it. A working member is busy, not a silent board.
     const runnable = view.runnable
