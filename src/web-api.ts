@@ -102,7 +102,7 @@ const actionableMessages: readonly RegExp[] = [
   /^Attempt lease exceeds the supported clock range$/,
   /^Content exceeds \d+ characters$/,
   /^A prerequisite was invalidated/,
-  /^Automatic (?:workers require maxOutputTokens|tasks require a recovery limit|task checks require a timeout) chosen by the primary agent$/,
+  /^Automatic workers require maxOutputTokens chosen by the primary agent$/,
   /^Verification (?:requires reviewOf|cannot review another verification task)$/,
   /^Only verification tasks may set reviewOf$/,
   /^(?:reviewOf|replaces|Dependency|assigneeId) /,

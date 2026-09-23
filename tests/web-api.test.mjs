@@ -402,6 +402,27 @@ test('replacement cycles return an actionable bad-request through native RPC wit
   assert.doesNotMatch(imitation.result.error.message, /task_graph_cycle/)
 })
 
+test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_typed', ownerSessionId: f.ownerId,
+    commandId: 'typed', goal: 'g', workspace: f.workspace, status: 'running', createdAt: Date.now(), updatedAt: Date.now(), missionId: mission.id }))
+  const before = f.runtime.store.list('tasks', mission.id)
+  const input = { workstreamId: stream.id, title: 'Unbounded', objective: 'Implement it', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
+  const recovery = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input })
+  assert.equal(recovery.result.ok, false)
+  assert.equal(recovery.result.error.code, 'bad-request', recovery.text)
+  assert.deepEqual(recovery.result.error.details, { issues: [], policyCode: 'task_recovery_limit_required', category: 'validation_error' })
+  assert.match(recovery.result.error.message, /^\[task_recovery_limit_required\] Automatic tasks require a recovery limit chosen by the primary agent\. Pass `maxRecoveryAttempts`/)
+  const timeout = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id, input: { ...input, maxRecoveryAttempts: 2 } })
+  assert.equal(timeout.result.error.code, 'bad-request', timeout.text)
+  assert.deepEqual(timeout.result.error.details, { issues: [], policyCode: 'task_check_timeout_required', category: 'validation_error' })
+  assert.match(timeout.result.error.message, /^\[task_check_timeout_required\] Automatic task checks require a timeout chosen by the primary agent\. Pass `checkTimeoutMs`/)
+  assert.deepEqual(f.runtime.store.list('tasks', mission.id), before, 'a refused proposal admits nothing')
+})
+
 test('add-member validates subscriptions as a string array before admitting a worker', async t => {
   const f = await fixture(t)
   const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)

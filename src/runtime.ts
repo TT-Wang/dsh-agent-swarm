@@ -1256,8 +1256,8 @@ export class SwarmRuntime {
             maxFindings: input.maxFindings == null ? origin?.ceilingProvenance?.maxFindings : input.ceilingProvenance?.maxFindings,
           } }
       }
-      if (input.maxRecoveryAttempts === undefined) throw new Error('[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
-      if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new Error('[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
+      if (input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
+      if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
     requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(input.acceptance, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new Error('Unknown task kind')
