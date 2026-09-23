@@ -2,6 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { inheritedAcceptance } from './admission.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -343,7 +344,12 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     // ([task_acceptance_required]) and the schema leaves it optional.
     { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, outputs: outputsSchema, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
     ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'],
-    (a, actor) => runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput))
+    (a, actor) => {
+      const task = runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput)
+      // One line naming the criteria a repair inherited beyond its own `acceptance`.
+      const inherited = task.replaces?.length ? inheritedAcceptance(task.acceptance, a.acceptance) : []
+      return inherited.length ? { ...task, note: `Acceptance inherited from ${task.replaces!.join(', ')} beyond the supplied list: ${inherited.map(criterion => JSON.stringify(criterion)).join(', ')}.` } : task
+    })
   register('swarm_claim', 'Claim ready work as yourself; ownership is atomic and expires. Use the returned attemptId on every result. The scheduler also assigns idle workers automatically.',
     { ...mission, taskId: string }, ['missionId', 'taskId'], (a, actor) => runtime.claim(actor, text(a, 'missionId'), text(a, 'taskId')))
   register('swarm_publish', 'Publish a finding backed by host run ids from this attempt (each tool result ends with its id). outcome describes the hypothesis, not task success; publishing does not verify.',

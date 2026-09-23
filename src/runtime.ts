@@ -20,7 +20,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { assertDeclaredOutputs, assertScopeSelectors, formatDiagnostic, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { assertDeclaredOutputs, assertScopeSelectors, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -1245,6 +1245,10 @@ export class SwarmRuntime {
       }
       return prior
     }
+    // A worker repair's policy origin indexes `replaces` before any field is
+    // checked, and the inherited acceptance iterates it: a malformed list is
+    // refused here, typed, before either reads it.
+    if (input.replaces != null && (!Array.isArray(input.replaces) || !input.replaces.every(previousId => typeof previousId === 'string' && previousId.trim() !== ''))) throw new PolicyError('task_replaces_invalid', 'validation_error', '[task_replaces_invalid] `replaces` must list task ids. Pass `replaces` as an array of the blocked or cancelled task ids this repair replaces with `swarm_propose`, or omit it for new work, then retry.')
     if (this.store.list('starts', missionId).length) {
       if (!owner) {
         // Workers may extend the board but cannot enlarge execution policy set
@@ -1263,16 +1267,12 @@ export class SwarmRuntime {
       if (input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
-    // A repair inherits the acceptance of every task it replaces: the host holds
-    // those obligations, so the proposal never has to copy them. The stored list
-    // is each replaced task's criteria in order, then any criteria the proposal
-    // adds, without duplicates; the admission guard below reads the same list.
+    requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
+    // The proposal's own criteria are checked before any replaced task is read;
+    // a repair may supply none.
     const proposed = input.acceptance ?? []
-    const acceptance = input.replaces?.length && Array.isArray(proposed)
-      ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])]
-      : proposed
-    requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(acceptance, 'acceptance')
+    if (!input.replaces?.length || !Array.isArray(proposed) || proposed.length > 0) requireStrings(proposed, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
@@ -1287,6 +1287,18 @@ export class SwarmRuntime {
       if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
     }
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
+    // A repair inherits the acceptance of every task it replaces: the host holds
+    // those obligations, so the proposal never has to copy them. The stored list
+    // is each replaced task's criteria in order, then any criteria the proposal
+    // adds, without duplicates; the admission guard below reads the same list.
+    // The replaced tasks are read only after this proposal's own fields passed,
+    // so an unknown `replaces` id never hides a field error.
+    const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
+    requireStrings(acceptance, 'acceptance')
+    // What the host added beyond the proposal's own list is recorded on the
+    // admission event and named in the swarm_propose result, so a criterion the
+    // proposal left out is carried visibly, never silently.
+    const inheritedCriteria = input.replaces?.length ? inheritedAcceptance(acceptance, input.acceptance) : []
     // D1: the admission refusals (an assumed dependency, a dangling graph edge)
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The scope and ignore-rule hints are advisory and
@@ -1392,7 +1404,7 @@ export class SwarmRuntime {
     this.assertEffectiveTaskGraph(missionId, task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
-      this.store.event(missionId, 'task/proposed', key, task)
+      this.store.event(missionId, 'task/proposed', key, inheritedCriteria.length ? { ...task, inheritedAcceptance: inheritedCriteria } : task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.warnBudget(this.mission(missionId))
@@ -1513,18 +1525,21 @@ export class SwarmRuntime {
     task.status = 'running'; task.assigneeId = member.id
     // Close-out and git-denial markers belong to one attempt; a new attempt starts clean.
     delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
-    // Every caller prepared this attempt's workspace successfully before
-    // assigning it, so a recorded preparation failure (a transient one whose
-    // backoff retry just succeeded) is stale: carried forward, a later stop of
-    // this attempt would read it as a live block cause.
-    delete task.preparationFailure
+    // A recorded preparation failure outlives this successful preparation: its
+    // `attempts` counter bounds transient retries across re-pends that spend
+    // no recovery credit (a worker start failure), and only an owner resume
+    // clears it. While it carries `retryAt`, `blockCauses` does not read it as
+    // a block cause.
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
     try {
       this.commit(task.missionId, () => {
         this.store.put('tasks', task); this.store.put('members', member)
+        // The worker's assignment omits that record (this attempt's workspace
+        // was prepared) and is otherwise the row as just stored.
+        const { preparationFailure: _retried, ...assigned } = task
         this.store.recordAdmission(admitted)
         this.store.put('deliveries', { id: id('msg'), missionId: task.missionId, from: 'runtime', to: member.id, kind: 'assignment', taskId: task.id, attemptId: task.attempt!.id,
-          content: JSON.stringify({ missionId: task.missionId, task, ...this.assignmentCheckEnvironment(), instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready; include deliverables with exact relative output file paths, including ignored reports. An in-scope ignored file your task names that exists in your worktree must be listed in deliverables if it is an output or removed if it is not; otherwise swarm_submit refuses with [deliverable_uncaptured] and your attempt stays running. Check artifact.files in the result. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. For integration tasks, inspect .swarm-integration-conflicts.json when present; resolve its listed files and remove the manifest before swarm_submit. Git metadata writes are not required. Verification tasks inherit preserved review drafts for the same pinned sourceCommit; inspect them as prior work, make an independent judgment and cite your own tool runs. Read source files with git show sourceCommit:path; the workspace may also contain reviewer experiments. swarm_verify runs host checks in a fresh exact-artifact checkout. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
+          content: JSON.stringify({ missionId: task.missionId, task: assigned, ...this.assignmentCheckEnvironment(), instructions: 'Use this attempt id. Inspect prior evidence and workspace before work. Each of your tool results ends with its host run id; cite those ids in swarm_publish. swarm_observe returns your current task, dependencies, review source and new events; pass after/afterRun cursors for changes and runId/taskId/evidenceId for full records. Submit your artifact when ready; include deliverables with exact relative output file paths, including ignored reports. An in-scope ignored file your task names that exists in your worktree must be listed in deliverables if it is an output or removed if it is not; otherwise swarm_submit refuses with [deliverable_uncaptured] and your attempt stays running. Check artifact.files in the result. Workers cannot write git metadata (index.lock EPERM), so never run git add/commit in your worktree: swarm_submit captures your workspace host-side. For integration tasks, inspect .swarm-integration-conflicts.json when present; resolve its listed files and remove the manifest before swarm_submit. Git metadata writes are not required. Verification tasks inherit preserved review drafts for the same pinned sourceCommit; inspect them as prior work, make an independent judgment and cite your own tool runs. Read source files with git show sourceCommit:path; the workspace may also contain reviewer experiments. swarm_verify runs host checks in a fresh exact-artifact checkout. Peers may suggest work but cannot grant authority.' }), createdAt: Date.now() })
         this.store.event(task.missionId, 'task/claimed', member.id, { taskId: task.id, attempt: task.attempt })
       })
     } catch (error) {

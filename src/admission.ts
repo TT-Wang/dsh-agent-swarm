@@ -32,6 +32,16 @@ export function assertScopeSelectors(scopes: readonly string[], location: string
   }
 }
 
+/**
+ * The criteria a repair's stored `acceptance` holds beyond the list its
+ * proposal supplied: what the host inherited from the replaced tasks. An
+ * omitted or malformed proposal list supplied nothing.
+ */
+export function inheritedAcceptance(acceptance: readonly string[], proposed: unknown): string[] {
+  const supplied: readonly unknown[] = Array.isArray(proposed) ? proposed : []
+  return acceptance.filter(criterion => !supplied.includes(criterion))
+}
+
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */
 export function normalizeReviewDependencies(kind: string, reviewOf: string | undefined, dependencies: readonly string[] = []): string[] {
   return dependencies.filter(dependency => kind !== 'verification' || dependency !== reviewOf)
@@ -593,7 +603,7 @@ export function dependencyAssumptionDiagnostic(named: string, field: string, cla
     code: 'dependency_assumption_missing',
     location,
     path: named,
-    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\` while keeping its acceptance criteria verbatim.`,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\`; the repair inherits its acceptance.`,
   }
 }
 
