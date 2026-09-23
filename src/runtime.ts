@@ -3458,6 +3458,12 @@ export class SwarmRuntime {
       }
     }
     const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next) === undefined)
+    // A blocked task that carries an artifact was rejected, or invalidated after
+    // it submitted: the artifact is immutable, so a resume would only fence the
+    // historical author and re-pend work that can never change. A resume while a
+    // stop is still pending is the advertised cleanup retry, which keeps the
+    // blocked outcome, so it stays allowed.
+    if (resumes && !stopPending(task) && task.status === 'blocked' && task.artifact !== undefined) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] and keeping its acceptance verbatim, or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
