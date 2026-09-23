@@ -1402,9 +1402,10 @@ export class SwarmRuntime {
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
     const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
-    // Absent stays absent: only a declaration is stored, so a row without the
-    // field keeps falling back to the text heuristic instead of reading as
-    // "this task writes nothing".
+    // Admission above leaves every new task with a declaration, its own or the
+    // one a repair inherited. A row without the field comes only from a store
+    // written before `outputs` existed: it reads as [] ("this task writes
+    // nothing"), and no output is inferred from its objective or acceptance.
     if (input.outputs !== undefined) task.outputs = [...input.outputs]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode

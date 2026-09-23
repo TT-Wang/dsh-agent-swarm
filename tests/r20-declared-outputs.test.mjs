@@ -9,7 +9,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
@@ -267,4 +267,17 @@ test('R24: a task row with no outputs declares none, so an ignored draft its tex
   await assert.rejects(readFile(path.join(f.peer.workspace, 'review/final.md'), 'utf8'), { code: 'ENOENT' },
     'the objective prose is no longer read for output paths')
   assert.equal(await readFile(path.join(f.member.workspace, 'review/final.md'), 'utf8'), 'legacy draft\n', 'the file stays in the previous owner worktree')
+})
+
+test('R24: no source comment still promises a text-heuristic fallback for a row without outputs', async () => {
+  // The write-verb heuristic is deleted: an absent field reads as [] and
+  // nothing is inferred, so a comment describing the old fallback misleads.
+  const root = new URL('../src/', import.meta.url)
+  const files = (await readdir(root, { recursive: true })).filter(file => /\.tsx?$/.test(file))
+  const stale = []
+  for (const file of files) {
+    const text = await readFile(new URL(file, root), 'utf8')
+    if (/text heuristic|falling back to the (?:write-verb )?heuristic/i.test(text)) stale.push(file)
+  }
+  assert.deepEqual(stale, [])
 })
