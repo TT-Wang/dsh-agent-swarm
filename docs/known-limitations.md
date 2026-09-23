@@ -570,3 +570,26 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   that runs a real git checkpoint a fixed second to settle, so under a full parallel run it read a
   status the barrier had not decided yet. It now waits for the barrier. The other load-sensitive cases
   recorded in earlier rounds still share the absence of an injectable clock.
+
+## Round-23 simplification batch 3 (2026-09-23)
+
+- **Deferred verification has no bound.** A review deferred for host infrastructure stays blocked until
+  the owner resumes it, and every resume that meets the same failure defers again. A failure that is in
+  fact caused by the artifact or its check and is not one of the two cases now kept out of that path
+  would be reported as an environment problem each time; the owner's exit is to cancel or replace the
+  source.
+- **An invalidated submission is repaired by replacement.** A dependent whose submitted work was
+  invalidated by a challenged prerequisite now refuses `resume` with `task_needs_replacement`, as a
+  rejected source does; its own output already tells the owner to propose a replacement. Earlier builds
+  re-pended it in place.
+- **A repair cannot withdraw an inherited criterion.** Every criterion of the replaced task is carried
+  into its repair. An owner who cancelled a task because one criterion was a mistake must amend the
+  mission plan rather than drop the criterion through `replaces`; the criteria the host added are named
+  in the `swarm_propose` result.
+- **An accepted repair retires only the task it names.** In a chain A, R1, R2, accepting R2 cancels R1
+  but leaves A and A's rejecting review blocked, so mission completion is refused until the owner
+  cancels them. This predates round 23; it belongs to the planned rework of replacement lineage.
+- **A retried preparation still reads as an obstacle to the owner-notice classifier.** The preparation
+  failure count now survives a successful retry, as it did before round 23, so a pending task that
+  recovered from a transient preparation failure is not counted as legitimately waiting until it is
+  dispatched again. This matches the pre-round-23 behaviour and belongs to the owner-notice rework.

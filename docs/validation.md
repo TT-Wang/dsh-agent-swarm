@@ -9,6 +9,41 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-23 simplification batch 3: declarations and correctness (2026-09-23)
+
+- **A host that cannot prepare a check defers the review.** A failed `git worktree add`, a dependency copy
+  error with any code or none, a failed checkout directory, a sandbox that reports only partial
+  enforcement, a process that cannot be spawned, and a host git deadline while the artifact is validated
+  now come back from `Workspaces.verifyArtifact` as the existing `(verification preparation)` or
+  per-command infrastructure row, so the review is deferred with a durable record instead of
+  `swarm_verify` throwing. Cancellation, authorization and ownership refusals still throw.
+  `DeclaredChecks.execute` no longer recognises failures by their class name, and
+  `WorkerAdapter.verifyArtifact` declares the check rows it returns. Two failures that are the artifact's
+  or the check's own fault are kept out of that path: a dependency directory whose place in the checkout
+  the artifact turned into a file is skipped, and a check with a control character is refused at
+  admission.
+- **One owner for why a task is blocked.** `blockCauses()` returns the set of causes a blocked task
+  carries (ceiling, preparation failure, deferred review, needs replacement, refuted evidence, exhausted
+  recovery). The stop barrier, the restart path and `controlTask` read it instead of re-deriving it;
+  an exhaustive comparison of the old and new barrier expressions over every combination of their
+  inputs differs only where intended. Resuming a blocked task that carries an immutable artifact is now
+  refused as `task_needs_replacement` instead of bumping its epoch and stopping its historical author.
+- **A repair inherits the acceptance of the task it replaces.** `swarm_propose` with `replaces` stores
+  the replaced tasks' criteria followed by any new ones, so the planner no longer copies them verbatim
+  and `acceptance` may be omitted for a repair; criteria the host added are named in the result and on
+  the `task/proposed` event. The model-facing texts that told the planner to copy acceptance were
+  reworded.
+
+The adversarial verification of this batch found a host git timeout that no longer deferred, a
+preparation retry counter reset by an assignment (a flapping preparation could loop without ever
+escalating to the owner), two artifact- or check-caused failures misread as host infrastructure,
+stale repair wording and an unvalidated `replaces`; each was fixed with a regression before merge.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: **1,330 tests, 1,330 passing** on the final head (`c1f4be9`). The two runs before it each had one timing failure in a different test: `tests/worker-closeout.test.mjs` gave a barrier-issued stop a fixed 50 ms and now waits for the stop, and a planner retry-snapshot case in `tests/planner.test.mjs` passed five consecutive isolated runs and the final full run.
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness`, `test:pack` and
+  `test:profile`: passed, with no model-visible snapshot drift.
+
 ## Round-22 simplification batch 2: typed refusals (2026-09-23)
 
 What the browser may see of a refusal used to be decided by `src/web-api.ts` matching about sixty
