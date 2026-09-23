@@ -66,7 +66,7 @@ async function reviewFixture(t, install = escapingInstall) {
   await writeFile(join(f.author.workspace, 'src/answer.txt'), 'candidate\n')
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
+    outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -158,7 +158,7 @@ test('R19-H2: the declared-check layer defers on the preparation row and never r
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     const proposed = f.runtime.propose(f.owner, f.mission.id, {
-      workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
+      outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
       reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
     })
     const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, proposed.id)
@@ -286,7 +286,7 @@ test('a dependency directory whose parent the artifact turned into a file is ski
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   assert.ok(taskOf(f.runtime, source.id).artifact.changedPaths.includes('pkg'), 'the artifact really replaced the directory with a file')
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
+    outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

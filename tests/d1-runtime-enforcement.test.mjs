@@ -40,7 +40,7 @@ async function setup(t, overrides = {}) {
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = { sessionId: builder.sessionId }
   const propose = (extra = {}, from = actor) => runtime.propose(from, mission.id, {
-    workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation',
+    outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix module', kind: 'implementation',
     scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra,
   })
   return { runtime, workers, owner, mission, stream, builder, reviewer, actor, propose }

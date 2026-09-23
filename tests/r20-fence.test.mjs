@@ -67,7 +67,7 @@ async function fixture(t) {
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   return { directory, runtime, workers, owner, mission, stream, author, reviewer, holdStop, actor: member => ({ sessionId: member.sessionId }) }
 }
-const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title, objective: title,
+const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title, objective: title,
   kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
 const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
 const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status
@@ -210,7 +210,7 @@ test('R20-8: the cross-mission registry reports a refutation only when the revie
   const source = propose(f, 'Reviewable work', { assigneeId: f.author.id })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  const review = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Review the work',
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the work',
     objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id,
     scope: ['src/'], acceptance: ['done'], checks: [], maxSteps: 1 })
   await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

@@ -1277,16 +1277,13 @@ export class SwarmRuntime {
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'task.scope', mission.scope)
-    // A repair carries the obligation it replaces: omitting `outputs` inherits
-    // the replaced task's declaration, so a replacement cannot quietly drop a
-    // deliverable the original promised. They are still checked against this
-    // task's own scope below, because a repair may narrow that scope.
-    if (input.outputs === undefined) {
-      const inherited = (input.replaces ?? []).map(previousId => this.store.get('tasks', previousId))
-        .find(previous => previous?.missionId === missionId && previous.outputs !== undefined)?.outputs
-      if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
-    }
-    if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
+    // `outputs` is the only record of the files a task writes, and the Harness
+    // does not enforce a tool schema's `required` list, so admission refuses a
+    // new task that declares none rather than storing one that captures and
+    // preserves nothing. A repair may omit it to inherit the replaced tasks'
+    // declarations, which are read below once those tasks are known to exist.
+    if (input.outputs === undefined && !input.replaces?.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: a new task must declare the files it writes. Pass `outputs` with `swarm_propose` as the repository-relative files this task writes inside its `scope`, or [] for analysis-only work, then retry.')
+    if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
     // A repair inherits the acceptance of every task it replaces: the host holds
     // those obligations, so the proposal never has to copy them. The stored list
     // is each replaced task's criteria in order, then any criteria the proposal
@@ -1295,6 +1292,18 @@ export class SwarmRuntime {
     // so an unknown `replaces` id never hides a field error.
     const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
     requireStrings(acceptance, 'acceptance')
+    // A repair carries the obligations it replaces: omitting `outputs` inherits
+    // every replaced task's declaration, in order and without duplicates like
+    // the acceptance above, so a replacement cannot quietly drop a deliverable
+    // an original promised. Explicit `outputs` replace the inherited list. The
+    // union is still checked against this task's own scope, because a repair
+    // may narrow that scope. A repair whose replaced tasks declared nothing has
+    // nothing to inherit and must declare.
+    if (input.outputs === undefined) {
+      const declared = input.replaces!.flatMap(previousId => { const outputs = this.task(missionId, previousId).outputs; return outputs === undefined ? [] : [outputs] })
+      if (!declared.length) throw new PolicyError('outputs_required', 'validation_error', '[outputs_required] `outputs` is required: no task in `replaces` declared outputs for this repair to inherit. Pass `outputs` with `swarm_propose` as the repository-relative files this repair writes inside its `scope`, or [] for analysis-only work, then retry.')
+      input = { ...input, outputs: assertDeclaredOutputs([...new Set(declared.flat())], input.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs }) }
+    }
     // What the host added beyond the proposal's own list is recorded on the
     // admission event and named in the swarm_propose result, so a criterion the
     // proposal left out is carried visibly, never silently.
@@ -1393,9 +1402,10 @@ export class SwarmRuntime {
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
     const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
-    // Absent stays absent: only a declaration is stored, so a row without the
-    // field keeps falling back to the text heuristic instead of reading as
-    // "this task writes nothing".
+    // Admission above leaves every new task with a declaration, its own or the
+    // one a repair inherited. A row without the field comes only from a store
+    // written before `outputs` existed: it reads as [] ("this task writes
+    // nothing"), and no output is inferred from its objective or acceptance.
     if (input.outputs !== undefined) task.outputs = [...input.outputs]
     if (input.assigneeId !== undefined) task.plannedAssigneeId = input.assigneeId
     if (input.assignmentMode !== undefined) task.assignmentMode = input.assignmentMode
@@ -2681,7 +2691,7 @@ export class SwarmRuntime {
   }
   /** Automatic requests must contain a complete independently verifiable topology. */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
-    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, { launch: true })
+    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
     // New automatic plans use preferences; old/manual task rows keep their binding.
     for (const task of plan.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
@@ -2853,7 +2863,7 @@ export class SwarmRuntime {
     return draft
   }
   private prepareDraftInput(input: PlanInput) {
-    const admitted = validatePlan(input)
+    const admitted = validatePlan(input, { dependencyDirs: this.config.verificationDependencyDirs })
     const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     // Store the authorization anchor on the draft, outside its canonical plan.
     const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
@@ -3016,7 +3026,7 @@ export class SwarmRuntime {
           || (current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1))) throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
       }
       assertCurrent()
-      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input, { launch: true })
+      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
       draft.input = input
       draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
       // P4: the parse-only check preflight runs on EVERY launch path, at the one
@@ -3452,8 +3462,11 @@ export class SwarmRuntime {
       assertScopeSelectors(next.scope, 'scope', mission.scope)
     }
     // After the scope amendment, so a combined change is checked against the
-    // scope this task ends up with, never the one it is leaving.
-    if (changes.outputs !== undefined) next.outputs = assertDeclaredOutputs(changes.outputs, next.scope, 'task')
+    // scope this task ends up with, never the one it is leaving. A scope
+    // amendment alone re-checks the outputs the task already declared: one
+    // left outside the new scope would refuse every later submit.
+    if (changes.outputs !== undefined) next.outputs = assertDeclaredOutputs(changes.outputs, next.scope, 'task', { dependencyDirs: this.config.verificationDependencyDirs })
+    else if (changes.scope !== undefined && next.outputs !== undefined) assertDeclaredOutputs(next.outputs, next.scope, 'task', { scopeAmendment: true, dependencyDirs: this.config.verificationDependencyDirs })
     if (changes.dependencies !== undefined) {
       if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
       next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]

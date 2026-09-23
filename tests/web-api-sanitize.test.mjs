@@ -197,7 +197,7 @@ test('the cancel RPC withdraws one task for the owner and refuses other sessions
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
-  const task = f.runtime.propose(owner, mission.id, { workstreamId: stream.id,
+  const task = f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id,
     title: 'Withdrawable', objective: 'A task the owner withdraws', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
@@ -236,7 +236,7 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
-  const input = { workstreamId: stream.id, title: 'Withdrawn', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'] }
+  const input = { workstreamId: stream.id, title: 'Withdrawn', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   f.runtime.propose(owner, mission.id, input, 'task_1')
   f.runtime.cancel(owner, mission.id, { taskId: 'task_1', reason: 'Withdrawn' })
   const f7 = 'Task task_1 was cancelled by the owner; a cancelled record cannot be re-admitted. Propose a new task, or a repair with a new id.'
@@ -337,7 +337,7 @@ test('a scope or check echoing the caller\'s own absolute path is a fixed repair
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input)
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
-  const task = f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Read', objective: 'Read the code', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  const task = f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Read', objective: 'Read the code', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   const repair = location => `[scope_selector_invalid] ${location}: the value names an absolute path and is not repeated here. Use a repository-relative path and retry.`
   const refusal = (response, text, policyCode) => {
     assert.equal(response.result.ok, false)
@@ -351,7 +351,7 @@ test('a scope or check echoing the caller\'s own absolute path is a fixed repair
     refusal(amendScope, repair('scope[0]'), 'scope_selector_invalid')
     assert.doesNotMatch(amendScope.text, echoed)
     const propose = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id,
-      input: { workstreamId: stream.id, title: 'Read more', objective: 'Read more code', kind: 'research', scope: [value], acceptance: ['works'] } })
+      input: { workstreamId: stream.id, title: 'Read more', objective: 'Read more code', kind: 'research', scope: [value], acceptance: ['works'], outputs: [] } })
     refusal(propose, repair('task.scope[0]'), 'scope_selector_invalid')
     assert.doesNotMatch(propose.text, echoed)
     const amendTask = await f.rpc('control', { sessionId: f.ownerId, missionId: mission.id, taskId: task.id, action: 'amend', changes: { scope: [value] }, reason: 'narrow' })
@@ -359,7 +359,7 @@ test('a scope or check echoing the caller\'s own absolute path is a fixed repair
     assert.doesNotMatch(amendTask.text, echoed)
     // A check naming the caller's absolute path is answered the same way.
     const check = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id,
-      input: { workstreamId: stream.id, title: 'Build', objective: 'Change the code', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: [`node ${value}check.cjs`] } })
+      input: { workstreamId: stream.id, title: 'Build', objective: 'Change the code', kind: 'implementation', scope: ['src/'], acceptance: ['works'], outputs: [], checks: [`node ${value}check.cjs`] } })
     assert.equal(check.result.error.code, 'bad-request', check.text)
     assert.equal(check.result.error.message, '[check_absolute_path] task.checks[0]: the value names an absolute path and is not repeated here. Use a repository-relative path and retry.')
     assert.deepEqual(check.result.error.details, { issues: [], policyCode: 'check_absolute_path', category: 'validation_error' })

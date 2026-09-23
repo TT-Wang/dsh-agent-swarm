@@ -38,7 +38,7 @@ test('a live model stream renews the lease with output-token headroom; a stale a
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep the lease' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
   const actor = { sessionId: member.sessionId }
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Stream', objective: 'Long generation', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Stream', objective: 'Long generation', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id })
   await runtime.claim(actor, mission.id, task.id)
 
   const activity = { id: 'model-op', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }

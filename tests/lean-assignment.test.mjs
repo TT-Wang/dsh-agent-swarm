@@ -37,7 +37,7 @@ async function fixture(t) {
   const spare = await runtime.addMember(owner, mission.id, { name: 'Spare', role: 'general' })
   const preferred = await runtime.addMember(owner, mission.id, { name: 'Preferred', role: 'general' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Change', objective: 'Implement an independent change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], assigneeId: preferred.id, assignmentMode: 'preferred', ...extra })
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Change', objective: 'Implement an independent change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], assigneeId: preferred.id, assignmentMode: 'preferred', ...extra })
   const runtimes = [runtime]
   t.after(async () => { for (const rt of runtimes) await rt.dispose(); await rm(root, { recursive: true, force: true }) })
   const restart = async () => {

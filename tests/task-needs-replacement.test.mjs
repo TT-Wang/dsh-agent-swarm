@@ -53,7 +53,7 @@ async function fixture(t) {
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
@@ -65,7 +65,7 @@ async function fixture(t) {
       runtime.publish(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, claim: 'The change works', outcome: 'supported', toolRunIds: [runId] })
     }
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     workers.checks = [{ command: 'test', exitCode: 1, output: 'host check failed' }]

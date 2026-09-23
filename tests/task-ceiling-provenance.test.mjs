@@ -81,7 +81,7 @@ test('draft launch and subsequent proposals durably retain ceiling provenance', 
   const expected = { maxSteps: { source: 'agent', value: 17 }, maxFindings: { source: 'default', value: 50 } }
   assert.deepEqual(canonical.tasks[0].ceilingProvenance, expected)
   assert.deepEqual(source.ceilingProvenance, expected, 'launch carries the canonical origin through propose')
-  const proposed = runtime.propose(owner, launched.mission.id, { workstreamId: source.workstreamId,
+  const proposed = runtime.propose(owner, launched.mission.id, { outputs: [], workstreamId: source.workstreamId,
     title: 'Follow-up', objective: 'Investigate a separate question', kind: 'research', scope: ['**'], acceptance: ['question answered'], maxFindings: 6 })
   const proposalExpected = { maxSteps: { source: 'default', value: 100 }, maxFindings: { source: 'agent', value: 6 } }
   assert.deepEqual(proposed.ceilingProvenance, proposalExpected)
@@ -104,7 +104,7 @@ test('automatic worker proposals preserve inherited defaults and identify explic
   const launched = await runtime.startPlan(owner, request.id, input)
   const source = launched.tasks.find(task => task.kind === 'research')
   const author = launched.members.find(member => member.name === 'Author')
-  const inherited = runtime.propose({ sessionId: author.sessionId }, launched.mission.id, { workstreamId: source.workstreamId,
+  const inherited = runtime.propose({ sessionId: author.sessionId }, launched.mission.id, { outputs: [], workstreamId: source.workstreamId,
     title: 'Related research', objective: 'Investigate a separate question', kind: 'research', dependencies: [source.id],
     scope: ['**'], acceptance: ['question answered'], maxFindings: 7 })
   assert.deepEqual(inherited.ceilingProvenance, {

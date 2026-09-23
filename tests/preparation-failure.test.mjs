@@ -50,7 +50,7 @@ async function setup(t, overrides = {}) {
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await runtime.start()
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
-    workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
+    outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const task = id => runtime.store.get('tasks', id)
   const events = type => runtime.snapshot(owner, mission.id).events.filter(event => event.type === type)
   return { runtime, workers, mission, owner, member, propose, task, events }
@@ -186,7 +186,7 @@ test('the assignment of a task that never failed preparation embeds its stored r
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-  const proposed = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation',
+  const proposed = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation',
     scope: ['src/'], acceptance: ['works'], checks: ['test'], maxRecoveryAttempts: 2 })
   const claimed = await runtime.claim({ sessionId: member.sessionId }, mission.id, proposed.id)
   const [assignment] = runtime.store.list('deliveries', mission.id).filter(row => row.kind === 'assignment' && row.attemptId === claimed.attempt.id)

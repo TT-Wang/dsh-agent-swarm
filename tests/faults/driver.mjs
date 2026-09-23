@@ -60,7 +60,7 @@ if (phase === 'f4-crash') {
   await acceptThroughReview(f, first)
   await acceptThroughReview(f, second)
   const integration = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Integrate both implementations', objective: 'Assemble the deliverable',
+    outputs: [], workstreamId: f.stream.id, title: 'Integrate both implementations', objective: 'Assemble the deliverable',
     kind: 'integration', dependencies: [first.id, second.id], scope: ['**'], acceptance: ['fault recovery is proven from durable state'],
     checks: ['true'], assigneeId: f.author.id,
   })

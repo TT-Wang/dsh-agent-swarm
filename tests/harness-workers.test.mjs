@@ -607,7 +607,7 @@ test('a silent generation keeps its attempt lease renewed through the runtime wi
     const member = await runtime.addMember(owner, mission.id, { name: 'silent-worker', role: 'implementation' })
     const actor = { sessionId: member.sessionId }
     const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep the attempt alive' })
-    const task = runtime.propose(actor, mission.id, { workstreamId: stream.id, title: 'Long generation', objective: 'Generate without tools', kind: 'implementation', scope: ['**'], acceptance: ['survives'], checks: ['check'] })
+    const task = runtime.propose(actor, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long generation', objective: 'Generate without tools', kind: 'implementation', scope: ['**'], acceptance: ['survives'], checks: ['check'] })
     // start() must precede the claim: it treats an already-running task as host-restart recovery.
     await runtime.start()
     // The runtime's own dispatcher can win the race with this explicit claim: its

@@ -64,9 +64,9 @@ async function fixture(t) {
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   const refutations = evidenceId => events('evidence/refuted').filter(event => event.data.evidenceId === evidenceId)
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
-  const proposeSource = (title = 'Implement', extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const proposeSource = (title = 'Implement', extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
-  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: 'Independent review',
+  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
   async function publishEvidence(claimed, claim, outcome = 'supported', supersedes) {
     const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })

@@ -64,7 +64,7 @@ async function fixture(t, options = {}) {
 /** One running implementation attempt owned by `actor`, plus a host-recorded run. */
 async function runningAttempt(f, actor) {
   const task = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Implement the board', objective: 'Exercise the board end to end',
+    outputs: [], workstreamId: f.stream.id, title: 'Implement the board', objective: 'Exercise the board end to end',
     kind: 'implementation', scope: ['src/'], acceptance: ['board works'], checks: ['node --test'],
   })
   const claimed = await f.runtime.claim(actor, f.mission.id, task.id)

@@ -80,7 +80,7 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const actorFor = member => ({ sessionId: member.sessionId })
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, {
-    workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
+    outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
   const notices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const staleEvents = type => runtime.store.events(mission.id, runtime.config.maxEvents).filter(event => event.type === type)
   return {

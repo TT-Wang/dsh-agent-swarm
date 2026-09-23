@@ -54,7 +54,7 @@ async function fixture(t, { members = ['author', 'reviewer'], budget: overrides 
   // escalates an unreviewable submission, so the regression must run it.
   await runtime.start()
   const actor = name => ({ sessionId: added[name].sessionId })
-  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', assigneeId: added.author.id, scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
   const submit = async (task, name = 'author') => {
     const claimed = await runtime.claim(actor(name), mission.id, task.id)
@@ -199,7 +199,7 @@ test('an unreviewable submission survives a host restart and is repaired on reco
   const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const author = await first.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   await first.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
-  const source = first.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement before restart', objective: 'Implement before restart',
+  const source = first.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement before restart', objective: 'Implement before restart',
     kind: 'implementation', assigneeId: author.id, scope: ['src/'], acceptance: ['done'], checks: ['npm test'] })
   const claimed = await first.claim({ sessionId: author.sessionId }, mission.id, source.id)
   await first.submit({ sessionId: author.sessionId }, mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Candidate before restart' })

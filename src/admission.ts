@@ -280,9 +280,10 @@ export function taskCeilingBlock(task: TaskCeilingState, now = Date.now()): Task
  * Why one declared output is unusable, or undefined when it is exact. The rules
  * are the capture gate's own (`Workspaces.captureArtifact`), stated at
  * admission: literal in-scope file, no directory, no glob, no traversal, no Git
- * metadata, no dependency or scratch directory.
+ * metadata, no dependency or scratch directory. `dependencyDirs` is the name
+ * set the host's workspace engine was configured with.
  */
-function declaredOutputFault(output: unknown, scope: readonly string[]): string | undefined {
+function declaredOutputFault(output: unknown, scope: readonly string[], dependencyDirs: readonly string[]): string | undefined {
   if (typeof output !== 'string' || !output.trim()) return 'is not a nonempty path string'
   if (output.endsWith('/')) return 'ends in "/", so it names a directory rather than one file'
   if (/[*?[\]]/.test(output)) return 'contains a glob character, and only literal paths can be captured'
@@ -294,10 +295,27 @@ function declaredOutputFault(output: unknown, scope: readonly string[]): string 
   if (parts.some(part => part.toLowerCase() === '.git')) return 'names Git metadata'
   // The same names the workspace engine treats as toolchain state by name alone,
   // so a declared output can never force-capture an installed dependency.
-  const toolchain = parts.find(part => part === SWARM_SCRATCH_DIRNAME || DEFAULT_VERIFICATION_DEPENDENCY_DIRS.includes(part))
+  const toolchain = parts.find(part => part === SWARM_SCRATCH_DIRNAME || dependencyDirs.includes(part))
   if (toolchain !== undefined) return `lies under ${JSON.stringify(toolchain)}, a dependency or scratch directory that is never captured as work`
   if (!withinScope(output, scope)) return `is outside the task scope ${JSON.stringify([...scope])}`
   return undefined
+}
+
+/** The context of one `assertDeclaredOutputs` call, which decides the refusal's exit. */
+export interface DeclaredOutputsOptions {
+  /**
+   * The outputs are the task's stored declaration, re-checked because the
+   * owner amended only its scope. The caller never passed `outputs`, so the
+   * exit names adding them to the same `swarm_control` amendment.
+   */
+  scopeAmendment?: boolean
+  /**
+   * The dependency directory names the host configured for its workspace
+   * engine (`verificationDependencyDirs`), which capture treats as toolchain
+   * state. Omitted means the engine's own default,
+   * `DEFAULT_VERIFICATION_DEPENDENCY_DIRS`.
+   */
+  dependencyDirs?: readonly string[]
 }
 
 /**
@@ -305,11 +323,12 @@ function declaredOutputFault(output: unknown, scope: readonly string[]): string 
  * `propose` and the owner amendment. It returns the detached list the caller
  * stores, so no call site can admit an entry it did not validate.
  */
-export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string): string[] {
+export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string, options: DeclaredOutputsOptions = {}): string[] {
   if (!Array.isArray(outputs)) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`, `${location}.outputs`)
   for (const output of outputs) {
-    const fault = declaredOutputFault(output, scope)
+    const fault = declaredOutputFault(output, scope, options.dependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)
     if (fault === undefined) continue
+    if (options.scopeAmendment) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault} once this amendment applies, so every later submit would be refused. Pass \`changes\` with \`outputs\` that fit the new \`scope\` in the same \`swarm_control\` call, or keep a \`scope\` that contains every declared output, then retry.`, `${location}.outputs`)
     throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
   return [...outputs as string[]]

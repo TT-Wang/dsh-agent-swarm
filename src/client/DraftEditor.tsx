@@ -9,7 +9,7 @@ const lines = (value: string) => value.split('\n')
 const cleanLines = (value: string[]) => value.map(item => item.trim()).filter(Boolean)
 const localDeadline = (value?: number) => value === undefined ? '' : new Date(value).toLocaleString('sv-SE').replace(' ', 'T').slice(0, 16)
 export function cleanPlan(input: PlanInput): PlanInput {
-  return { ...input, scope: cleanLines(input.scope), acceptance: cleanLines(input.acceptance), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), outputs: cleanLines(task.outputs ?? []), checks: task.checks ? cleanLines(task.checks) : undefined })) }
+  return { ...input, scope: cleanLines(input.scope), acceptance: cleanLines(input.acceptance), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), outputs: task.outputs ? cleanLines(task.outputs) : undefined, checks: task.checks ? cleanLines(task.checks) : undefined })) }
 }
 const freshKey = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 /** Read-only subset of the native model directory's advertised route metadata. */

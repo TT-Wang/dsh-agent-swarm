@@ -43,7 +43,7 @@ async function fixture(t, extra = {}) {
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const integrator = await runtime.addMember(owner, mission.id, { name: 'Integrator', role: 'integration' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (title, values = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], assigneeId: author.id, ...values })
+  const propose = (title, values = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], assigneeId: author.id, ...values })
   const submit = async task => {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'Candidate artifact' })

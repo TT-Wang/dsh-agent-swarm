@@ -303,7 +303,7 @@ test('workers see only member tools and the member protocol, and each tool resul
   assert.ok(worker, 'the adapter started a real worker agent')
   assert.deepEqual(swarmNames(f.ctx.tools.schemas(worker)), SWARM_TOOLS.filter(name => !MANAGEMENT_TOOLS.includes(name)).sort())
   assert.deepEqual(swarmNames(f.ctx.tools.schemas(owner.agent)), SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort(), 'creating a mission promotes the owner')
-  const task = f.runtime.propose(actor, missionId, { workstreamId: stream.id, title: 'Probe', objective: 'Run the probe', kind: 'research', scope: ['**'], acceptance: ['done'], assigneeId: builder.id })
+  const task = f.runtime.propose(actor, missionId, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Run the probe', kind: 'research', scope: ['**'], acceptance: ['done'], assigneeId: builder.id })
   const diagnostics = () => JSON.stringify({ task: f.runtime.store.get('tasks', task.id)?.status, worker: worker.status, runs: f.runtime.store.list('tool_runs', missionId).length,
     builderRequests: f.requests.filter(r => r.sessionId === builder.sessionId).map(r => JSON.stringify(r.messages.at(-1)).slice(0, 200)),
     events: f.runtime.store.events(missionId, 12).map(e => [e.type, JSON.stringify(e.data).slice(0, 160)]),

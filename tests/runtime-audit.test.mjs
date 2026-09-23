@@ -37,7 +37,7 @@ async function fixture(t) {
   const a = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'reviewer', role: 'verification' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Audit paths' })
-  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['test'], ...extra })
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { runtime, workers, owner, mission, a, b, stream, propose }

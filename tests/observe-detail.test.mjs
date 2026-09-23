@@ -29,7 +29,7 @@ async function focusedMission(t) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Inspect' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Inspect detail', objective: 'Inspect the board', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Inspect detail', objective: 'Inspect the board', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
   const claimed = await runtime.claim(actor, mission.id, task.id)
   assert.equal(claimed.attempt.ownerId, member.id)
   return { runtime, workers, owner, actor, mission, task, member }

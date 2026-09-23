@@ -46,7 +46,7 @@ async function fixture(t, workers = new OutageWorkers()) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: first.id, maxRecoveryAttempts: 1, ...extra })
   return { directory, runtime, workers, owner, mission, first, second, propose }
 }

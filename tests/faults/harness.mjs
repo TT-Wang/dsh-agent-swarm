@@ -164,7 +164,7 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
-    workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
+    outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',
     kind: 'implementation', scope: ['**'], acceptance, checks, assigneeId: author.id, ...extra,
   })
   const cleanup = async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
@@ -176,7 +176,7 @@ export async function blockThroughReview(f, task) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate rejected by the injected fault' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
     reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -190,7 +190,7 @@ export async function acceptThroughReview(f, task) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate accepted after host checks' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
     reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

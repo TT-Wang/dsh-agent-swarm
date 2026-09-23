@@ -87,7 +87,7 @@ function definitions(runtime) {
 const execution = sessionId => ({ signal: new AbortController().signal, agent: { id: sessionId } })
 const proposal = (f, overrides = {}) => ({
   missionId: f.mission.id, workstreamId: f.stream.id, title: 'Worker task',
-  objective: 'Exercise the arena contract', kind: 'research', scope: ['src/'], acceptance: ['the arena works'], ...overrides,
+  objective: 'Exercise the arena contract', kind: 'research', scope: ['src/'], acceptance: ['the arena works'], outputs: [], ...overrides,
 })
 const notices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const records = f => ({
@@ -214,7 +214,7 @@ test('swarm_escalate is a typed durable owner escalation that grants no authorit
   assert.match(escalate.description, /grants no authority/)
 
   const source = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Owned work', objective: 'Give alice a live attempt',
+    outputs: [], workstreamId: f.stream.id, title: 'Owned work', objective: 'Give alice a live attempt',
     kind: 'research', scope: ['src/'], acceptance: ['the arena works'],
   })
   const claimed = await f.runtime.claim(f.aliceActor, f.mission.id, source.id)

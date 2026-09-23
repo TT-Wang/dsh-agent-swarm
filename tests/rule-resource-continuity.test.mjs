@@ -33,7 +33,7 @@ async function fixture(t) {
   const member = await rt.addMember(owner, mission.id, { name: 'Ada', role: 'builder' })
   const other = await rt.addMember(owner, mission.id, { name: 'Alan', role: 'builder and review' })
   const actor = { sessionId: member.sessionId }
-  const propose = (extra = {}) => rt.propose(owner, mission.id, { workstreamId: ws.id, title: `Work ${rt.store.list('tasks', mission.id).length}`, objective: 'Implement source', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], maxSteps: 2, maxFindings: 2, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId: member.id, ...extra })
+  const propose = (extra = {}) => rt.propose(owner, mission.id, { outputs: [], workstreamId: ws.id, title: `Work ${rt.store.list('tasks', mission.id).length}`, objective: 'Implement source', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], maxSteps: 2, maxFindings: 2, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId: member.id, ...extra })
   return { rt, config, workers, owner, mission, member, other, actor, propose }
 }
 async function eventually(read) {

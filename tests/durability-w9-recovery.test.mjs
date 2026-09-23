@@ -92,7 +92,7 @@ async function fixture(t) {
 
 test('W9: a cross-member recovery from a dirty workspace carries its preserved snapshot to the new owner instead of blocking', async t => {
   const f = await fixture(t)
-  const task = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Implement', objective: 'Implement',
+  const task = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   assert.equal(claimed.attempt.ownerId, f.author.id)

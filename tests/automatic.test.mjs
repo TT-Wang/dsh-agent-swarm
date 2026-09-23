@@ -472,7 +472,7 @@ test('workers inherit primary-admitted execution policy when extending an automa
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const actor = { sessionId: snapshot.members[0].sessionId }
   const input = { workstreamId: snapshot.workstreams[0].id, title: 'Additional review', objective: 'Check the proposed result', kind: 'verification',
-    scope: ['src/'], acceptance: ['works'], reviewOf: source.id, maxRecoveryAttempts: 999, checkTimeoutMs: 999999 }
+    scope: ['src/'], acceptance: ['works'], outputs: [], reviewOf: source.id, maxRecoveryAttempts: 999, checkTimeoutMs: 999999 }
   const workerTask = f.runtime.propose(actor, snapshot.mission.id, input)
   assert.equal(workerTask.maxRecoveryAttempts, source.maxRecoveryAttempts)
   assert.equal(workerTask.checkTimeoutMs, source.checkTimeoutMs)
@@ -490,7 +490,7 @@ test('zero experiment allowance is valid and updates cannot erase admitted exper
   assert.equal(snapshot.mission.budget.maxExperiments, 0)
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const input = { workstreamId: snapshot.workstreams[0].id, title: 'Experiment', objective: 'Try a variant', kind: 'integration', scope: ['src/'],
-    acceptance: ['works'], checks: ['node check.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1234, experiment: true }
+    acceptance: ['works'], outputs: [], checks: ['node check.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1234, experiment: true }
   assert.throws(() => f.runtime.propose(f.owner, snapshot.mission.id, input), /experiment budget exhausted/)
   f.runtime.updateBudget(f.owner, snapshot.mission.id, { ...budget, maxExperiments: 1 })
   f.runtime.propose(f.owner, snapshot.mission.id, input)

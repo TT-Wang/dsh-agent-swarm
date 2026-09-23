@@ -185,7 +185,7 @@ const execution = sessionId => ({ signal: new AbortController().signal, agent: {
 /** Submit one artifact-bearing task in a mission and return it. */
 async function submitArtifact(f, actor, stream, title) {
   const source = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: stream.id, title, objective: 'Produce an artifact', kind: 'implementation',
+    outputs: [], workstreamId: stream.id, title, objective: 'Produce an artifact', kind: 'implementation',
     scope: ['src/'], acceptance: ['arena works'], checks: ['node --test'],
   })
   const claimed = await f.runtime.claim(actor, f.mission.id, source.id)
@@ -198,7 +198,7 @@ test('the cross-mission artifact registry is the sanctioned read path: scoped, r
   const source = await submitArtifact(f, f.aliceActor, f.stream, 'Implement the arena')
   // Deterministic independent review: proposed before submission, accepted after.
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review the arena', objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: 'Review the arena', objective: 'Independent review', kind: 'verification',
     reviewOf: source.id, assigneeId: f.bob.id, scope: ['src/'], acceptance: ['arena works'], checks: [],
   })
   const reviewClaim = await f.runtime.claim(f.bobActor, f.mission.id, review.id)
@@ -216,7 +216,7 @@ test('the cross-mission artifact registry is the sanctioned read path: scoped, r
 
   // The other tenant has its own artifact.
   const otherSource = f.runtime.propose(f.otherOwner, f.other.id, {
-    workstreamId: f.otherStream.id, title: 'Other artifact', objective: 'Other work', kind: 'implementation',
+    outputs: [], workstreamId: f.otherStream.id, title: 'Other artifact', objective: 'Other work', kind: 'implementation',
     scope: ['src/'], acceptance: ['other works'], checks: ['node --test'],
   })
   const otherClaim = await f.runtime.claim(f.carolActor, f.other.id, otherSource.id)
@@ -257,10 +257,10 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
   // A pending task assigned to alice whose dependency is not accepted: the arena
   // must show what she is waiting on even though she holds no attempt.
   const first = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'First', objective: 'Prerequisite', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
+    outputs: [], workstreamId: f.stream.id, title: 'First', objective: 'Prerequisite', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
   })
   const waiting = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Waiting', objective: 'Depends on first', kind: 'research',
+    outputs: [], workstreamId: f.stream.id, title: 'Waiting', objective: 'Depends on first', kind: 'research',
     dependencies: [first.id], assigneeId: f.alice.id, priority: 100, scope: ['src/'], acceptance: ['arena works'],
   })
   let view = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' })
@@ -274,7 +274,7 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
 
   // A live attempt shows the current task, its attempt id and an age.
   const running = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Running', objective: 'Give alice a live attempt', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
+    outputs: [], workstreamId: f.stream.id, title: 'Running', objective: 'Give alice a live attempt', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
   })
   const claimed = await f.runtime.claim(f.aliceActor, f.mission.id, running.id)
   f.runtime.escalate(f.aliceActor, f.mission.id, { body: 'Owner: the check command is ambiguous' })

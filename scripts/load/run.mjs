@@ -61,7 +61,7 @@ export async function runEnvelope({ workerCount }) {
     const members = []
     for (let index = 0; index < workerCount; index++) members.push(await runtime.addMember(owner, mission.id, { name: `load-${index}`, role: 'worker', maxOutputTokens: 1000 }))
     const tasks = members.map((member, index) => runtime.propose(owner, mission.id, {
-      workstreamId: stream.id, title: `load task ${index}`, objective: `run synthetic work ${index}`, kind: 'implementation',
+      outputs: [], workstreamId: stream.id, title: `load task ${index}`, objective: `run synthetic work ${index}`, kind: 'implementation',
       scope: [`src/w${index}/`], acceptance: ['measured'], checks: ['node -e "process.exit(0)"'], assigneeId: member.id,
     }))
     // Hierarchical per-scope limits: a free scope, a task-class cap that must bind

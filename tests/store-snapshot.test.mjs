@@ -52,7 +52,7 @@ async function fixture(t, { storeOptions = {}, workspace } = {}) {
   const mission = runtime.create(owner, { title: 'Snapshot', objective: 'Prove snapshot and restore', workspace: workspace ?? directory,
     scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test'] })
   t.after(async () => { await runtime.dispose().catch(() => undefined); await rm(directory, { recursive: true, force: true }) })
   return { directory, statePath: join(directory, 'state.sqlite'), runtime, owner, mission }

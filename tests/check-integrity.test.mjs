@@ -199,7 +199,7 @@ test('admission refuses a declared check that names a host-absolute path outside
   const owner = { sessionId: 'check-integrity-owner' }
   const mission = runtime.create(owner, { title: 'Checks', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], ...extra })
   assert.throws(() => propose({ checks: [benchmark] }), /\[check_absolute_path\]/)
   assert.throws(() => propose({ checks: [`${path.join(directory, '.venv', 'bin', 'python')} -m pytest`] }), /\[check_absolute_path\]/)

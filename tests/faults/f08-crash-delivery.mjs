@@ -27,7 +27,7 @@ await runScenario({
       const submitted = await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'value is two' })
       artifact = submitted.artifact.commit
       const review = f.runtime.propose(f.owner, f.mission.id, {
-        workstreamId: f.stream.id, title: 'Review value two', objective: 'Independent review', kind: 'verification',
+        outputs: [], workstreamId: f.stream.id, title: 'Review value two', objective: 'Independent review', kind: 'verification',
         reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
       })
       const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

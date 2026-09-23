@@ -68,7 +68,7 @@ async function setup(t, { gamma = false, tickMs = 20 } = {}) {
   const beta = await runtime.addMember(owner, mission.id, { name: 'Beta', role: 'implementation' })
   const memberGamma = gamma ? await runtime.addMember(owner, mission.id, { name: 'Gamma', role: 'implementation' }) : undefined
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
-    workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
+    outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const task = id => runtime.store.get('tasks', id)
   const member = id => runtime.store.get('members', id)
   const events = type => runtime.snapshot(owner, mission.id).events.filter(event => event.type === type)

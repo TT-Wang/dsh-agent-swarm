@@ -70,6 +70,17 @@ test('R24: model-visible text states the declared-outputs rule once and never de
   for (const text of texts) assert.doesNotMatch(text, /inferred|objective text|uncaptured|names that exists/i, text)
   const outputs = definitions.get('swarm_propose').parameters.properties.outputs.description
   assert.match(outputs, /The host captures exactly these, including ignored files, and refuses a submission missing one\./)
+  // What is never an output, and what "declared" promises at submit, are stated
+  // on every surface that takes outputs; the owner prompt only points there.
+  const surfaces = [outputs, definitions.get('swarm_launch').parameters.properties.tasks.items.properties.outputs.description,
+    definitions.get('swarm_stage').parameters.properties.tasks.items.properties.outputs.description,
+    definitions.get('swarm_control').parameters.properties.changes.properties.outputs.description]
+  for (const description of surfaces) {
+    assert.match(description, /no directories, symlinks, globs, "\.\." segments, dependency directories or files a declared check generates\./)
+    assert.match(description, /A removed or renamed-away path is never an output; a delete-only task declares \[\]\./)
+    assert.match(description, /A declared output only has to exist as a regular file at submit; it is not checked for having changed\./)
+  }
+  assert.match(OWNER_PROMPT, /Declare files a task writes in outputs per schema; \[\] if it only reads\/deletes\./)
 })
 
 test('repair guidance says a repair inherits acceptance instead of asking the model to copy it', async () => {
@@ -113,6 +124,7 @@ test('registered launch accepts omitted member names and forwards canonical iden
   const definitions = new Map(), launched = []
   const snapshot = { mission: { id: 'named-mission' } }
   const runtime = {
+    config: {},
     starts: () => [{ id: 'named-request', workspace: '/workspace' }],
     async startPlan(_actor, requestId, plan) { launched.push({ requestId, plan }); return snapshot },
     snapshot: () => snapshot,
@@ -158,7 +170,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
     checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
   t.after(() => workspaces.dispose())
-  const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
+  const runtime = { config: {}, starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
     const declared = declaredPlanChecks(plan.tasks)
     const issues = await workspaces.checkSyntaxPreflight(declared.map(check => check.command), workspace)
     if (issues.length) throw new Error(`[check_syntax_invalid] ${checkSyntaxDetail(declared, issues)}`)

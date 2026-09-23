@@ -58,9 +58,9 @@ async function fixture(t, config = {}) {
   const third = await runtime.addMember(owner, mission.id, { name: 'independent-reviewer', role: 'verification', maxOutputTokens: 5000 })
   const actor = member => ({ sessionId: member.sessionId })
   const taskOf = id => runtime.store.get('tasks', id)
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'shared work', objective: 'do the work',
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'shared work', objective: 'do the work',
     kind: 'implementation', scope: ['src/'], acceptance: ['ok'], checks: ['t'], maxRecoveryAttempts: 3, checkTimeoutMs: 1000, ...extra })
-  const review = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'review', objective: 'review it',
+  const review = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'review', objective: 'review it',
     kind: 'verification', scope: ['src/'], acceptance: ['ok'], maxRecoveryAttempts: 2, ...extra })
   return { directory, runtime, workers, owner, mission, stream, first, second, third, actor, taskOf, propose, review }
 }

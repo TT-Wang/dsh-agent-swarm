@@ -70,11 +70,11 @@ test('R11-05: a long queued check keeps its attempt lease alive and does not del
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
-  const source = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Source', objective: 'Source', kind: 'implementation',
+  const source = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Source', objective: 'Source', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test -d .'], assigneeId: author.id })
   const sourceClaim = await runtime.claim({ sessionId: author.sessionId }, mission.id, source.id)
   await runtime.submit({ sessionId: author.sessionId }, mission.id, { taskId: source.id, attemptId: sourceClaim.attempt.id, output: 'ready for review' })
-  const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Review', objective: 'Review', kind: 'verification',
+  const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Review', objective: 'Review', kind: 'verification',
     reviewOf: source.id, scope: ['**'], acceptance: ['works'], checks: ['test -d .'], checkTimeoutMs: 100, assigneeId: reviewer.id })
   const reviewClaim = await runtime.claim({ sessionId: reviewer.sessionId }, mission.id, review.id)
   const initialLease = runtime.store.get('tasks', review.id).attempt.leaseUntil
@@ -93,7 +93,7 @@ test('R11-05: a long queued check keeps its attempt lease alive and does not del
   // R11-05: dispatch is not delayed behind the check: a second ready task is
   // claimed while the first check is still in flight.
   workers.idleMembers.add(other.id)
-  const parallel = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Parallel', objective: 'Dispatch during the check', kind: 'implementation',
+  const parallel = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Parallel', objective: 'Dispatch during the check', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test -d .'], assigneeId: other.id })
   const dispatched = await eventually(() => {
     const task = runtime.store.get('tasks', parallel.id)

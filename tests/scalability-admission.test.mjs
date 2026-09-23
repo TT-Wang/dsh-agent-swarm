@@ -60,7 +60,7 @@ async function addWorker(runtime, m, name) {
 
 function propose(runtime, m, stream, member, scope) {
   return runtime.propose(owner, m.id, {
-    workstreamId: stream.id, title: `task ${scope}`, objective: `do ${scope}`, kind: 'implementation', scope: [scope],
+    outputs: [], workstreamId: stream.id, title: `task ${scope}`, objective: `do ${scope}`, kind: 'implementation', scope: [scope],
     acceptance: ['done'], checks: ['node -e "process.exit(0)"'], assigneeId: member.id,
   })
 }

@@ -79,7 +79,7 @@ async function fixture(t, config, taskInput = {}) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Bound the operation' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Stuck call', objective: 'Hold one operation', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, ...taskInput })
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Stuck call', objective: 'Hold one operation', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, ...taskInput })
   await runtime.claim(actor, mission.id, task.id)
   return { directory, workers, runtime, owner, mission, member, task }
 }

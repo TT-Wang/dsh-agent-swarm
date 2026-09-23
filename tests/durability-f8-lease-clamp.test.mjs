@@ -39,7 +39,7 @@ async function fixture(t, overrides = {}) {
     scope: ['src/'], acceptance: ['works'], budget: { ...budget, ...overrides } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
-  const task = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
   const claimed = await runtime.claim({ sessionId: author.sessionId }, mission.id, task.id)
   return { runtime, workers, owner, mission, author, task, claimed }

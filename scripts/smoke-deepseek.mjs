@@ -118,7 +118,7 @@ try {
   await owner.dispose()
   owner = undefined
   const task = ctx.swarm.propose(actor, missionId, {
-    workstreamId: stream.id, title: 'Deliver value two', kind: 'integration', assigneeId: builder.id,
+    outputs: [], workstreamId: stream.id, title: 'Deliver value two', kind: 'integration', assigneeId: builder.id,
     scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], checks: ['node check.cjs'],
     objective: [
       'Change value.cjs to export 2, preserving check.cjs. Work only in your assigned directory. Be concise.',
