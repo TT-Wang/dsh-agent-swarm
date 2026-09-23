@@ -295,12 +295,13 @@ export const IMPERATIVE_ACTIONS = /\b(?:retry|resubmit|re-?propose|re-?run|re-?s
  * the constructor argument that carries the message text. `authored` marks a
  * class that takes its code first but does not render it: the authored message
  * carries its own token, which must then match the declared code (admission's
- * `AdmissionError`). `PolicyError` itself is not registered: its sites are
- * outside this inventory today.
+ * `AdmissionError`). `PolicyError` is registered the same way, so a refusal
+ * does not leave the inventory when its plain `Error` is typed.
  */
 export const CODED_ERROR_CLASSES = {
   DependencyMaterialisationError: { message: 1 },
   AdmissionError: { message: 2, authored: true },
+  PolicyError: { message: 2, authored: true },
 }
 
 /**

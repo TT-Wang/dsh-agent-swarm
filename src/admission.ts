@@ -162,6 +162,8 @@ export class TaskGraphAdmissionError extends AdmissionError {
       defects.map(defect => taskGraphDiagnostic(defect, 'task')))
     this.name = 'TaskGraphAdmissionError'
   }
+  /** Named before it was typed, so its recorded rendering keeps the name. */
+  override toString(): string { return `${this.name}: ${this.message}` }
 }
 
 /** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */

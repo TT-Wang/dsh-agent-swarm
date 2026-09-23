@@ -13,6 +13,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { PolicyError } from '../lib/policy-error.js'
+import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
 import { errorTypeFor, TRACE_ERROR_TYPES } from '../lib/trace.js'
 import { refusalSites } from './refusal-inventory.mjs'
 import { sourceTree } from './source-semantics.mjs'
@@ -116,4 +117,18 @@ test('typed refusal sites retain authored codes, categories, and messages indepe
     assert.equal(errorTypeFor(refusal), site.category, `${site.location}: category does not depend on an English regex`)
     assert.equal(errorTypeFor(new PolicyError(site.code, site.category, '请按当前状态重试。')), site.category)
   }
+})
+
+test('a typed refusal is recorded exactly as the plain Error it was typed from', () => {
+  // Automatic request reasons, draft launch failures and guard-terminal details
+  // store String(error), and the planner's recovery notice quotes the reason to
+  // the model, so typing a refusal must not change that rendering.
+  assert.equal(String(new PolicyError('mission_not_active', 'tool_error', 'Mission is paused')), 'Error: Mission is paused')
+  assert.equal(`${new AdmissionError('plan_text_invalid', 'validation_error', 'Title must be nonempty text of at most 16000 characters', 'Title')}`,
+    'Error: Title must be nonempty text of at most 16000 characters')
+  assert.equal(errorTypeFor(new PolicyError('mission_not_active', 'tool_error', 'Mission is paused')), errorTypeFor(new Error('Mission is paused')),
+    'a text the classifier left as tool_error keeps that trace category once typed')
+  // A class that carried its own name before it was typed keeps it.
+  const graph = new TaskGraphAdmissionError([{ code: 'task_graph_self_edge', taskId: 'a', target: 'a', message: 'task "a" declares an edge to itself.' }])
+  assert.equal(String(graph), `TaskGraphAdmissionError: ${graph.message}`)
 })
