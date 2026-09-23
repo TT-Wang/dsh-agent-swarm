@@ -98,3 +98,11 @@ test('mission completion coverage sees the criteria a repair inherited', async t
   assert.equal(f.runtime.completionError(current()), undefined, 'the inherited criteria cover the mission acceptance')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted inherited repair').status, 'completed')
 })
+
+test('a new task that replaces nothing is still refused without acceptance', async t => {
+  const f = await fixture(t)
+  assert.throws(() => f.propose({ title: 'No criteria' }), error => error.code === 'task_acceptance_required' && /^\[task_acceptance_required\] .*`acceptance`.*`swarm_propose`.*`replaces`/.test(error.message))
+  assert.throws(() => f.propose({ title: 'Empty replaces', replaces: [] }), /\[task_acceptance_required\]/, 'an empty replaces list is not a repair')
+  assert.throws(() => f.propose({ title: 'Empty criteria', acceptance: [] }), /acceptance must contain nonempty strings/, 'a malformed list keeps its existing refusal')
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 0, 'nothing was admitted')
+})

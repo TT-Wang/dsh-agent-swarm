@@ -47,6 +47,20 @@ test('all model plan entry points require their chosen budget; automatic schema 
   assert.equal(properties.budget.properties.maxTokens.default, undefined)
 })
 
+test('swarm_propose leaves acceptance optional for a repair to inherit; every plan entry point still requires it', () => {
+  const definitions = tools()
+  const propose = definitions.get('swarm_propose').parameters
+  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'])
+  assert.deepEqual(propose.properties.acceptance.items, { type: 'string' }, 'the property stays declared as a string array')
+  assert.match(propose.properties.acceptance.description, /Required unless replaces is given/)
+  assert(propose.properties.replaces, 'replaces carries the inheritance')
+  assert(definitions.get('swarm_create').parameters.required.includes('acceptance'))
+  for (const name of ['swarm_launch', 'swarm_stage']) {
+    assert(definitions.get(name).parameters.required.includes('acceptance'), `${name} mission acceptance`)
+    assert(definitions.get(name).parameters.properties.tasks.items.required.includes('acceptance'), `${name} task acceptance`)
+  }
+})
+
 test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {
   const definitions = tools()
   // M9(b): optionalInteger rejects negatives, so every cursor declares minimum 0.

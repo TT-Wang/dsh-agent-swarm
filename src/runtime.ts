@@ -1269,6 +1269,7 @@ export class SwarmRuntime {
     // those obligations, so the proposal never has to copy them. The stored list
     // is each replaced task's criteria in order, then any criteria the proposal
     // adds, without duplicates; the admission guard below reads the same list.
+    if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
     const proposed = input.acceptance ?? []
     const acceptance = input.replaces?.length && Array.isArray(proposed)
       ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])]
