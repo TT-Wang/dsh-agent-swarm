@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { captureGitSnapshot } from '../lib/git-snapshot.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
 
@@ -431,4 +432,41 @@ test('a capture that fails after committing puts the member HEAD and index back,
   assert.equal(await git(member.workspace, 'rev-parse', `${retried.commit}^`), head, 'the retry commits on the restored HEAD')
   assert.deepEqual([...retried.changedPaths].sort(), ['docs/report.md', 'notes/extra.md'])
   assert.equal(await git(member.workspace, 'show', `${retried.commit}:docs/report.md`), '# Report')
+})
+
+test('a legacy preservation snapshot that tracks an undeclared ignored .env is recovered with .env untracked: the replacement never captures it, and captures the declared ignored output the snapshot carries', async t => {
+  const f = await fixture(t)
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Update notes/config.md to read DATABASE_URL from .env and report in docs/report.md', scope: ['**'], outputs: ['docs/report.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'notes', 'config.md'), 'DATABASE_URL comes from .env\n')
+  await writeFile(path.join(f.author.workspace, '.env'), SECRET)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Draft by the first owner\n')
+  await f.readEvidence(f.author, task, 'notes/config.md')
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  // Replace the checkpoint with the shape a pre-R24 host wrote: its snapshot
+  // force-included every ignored file the prose hinted at, `.env` among them.
+  const git = async (args, env = {}) => {
+    const result = await runProcess(['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', ...args], { subprocess: subprocessSeam, cwd: f.author.workspace, timeoutMs: 30000, maxBytes: 16 * 1024 * 1024, env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), ...env } })
+    assert.equal(result.exitCode, 0, result.output)
+    return args.includes('-z') ? result.output : result.output.trim()
+  }
+  const legacy = await captureGitSnapshot(f.author.workspace, path.join(f.root, 'legacy-snapshot'), git, undefined, ['.env', 'docs/report.md'])
+  assert.equal(await f.inCommit(legacy.snapshotCommit, '.env'), true, 'the legacy-shaped snapshot tracks the secret')
+  const recordPath = path.join(f.root, 'worktrees', f.mission.id, 'tasks', `${task.id}.json`)
+  const record = JSON.parse(await readFile(recordPath, 'utf8'))
+  record.task.preservedCommit = legacy.snapshotCommit
+  await writeFile(recordPath, JSON.stringify(record))
+  const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
+  assert.equal(await f.git(f.peer.workspace, 'rev-parse', 'HEAD'), legacy.snapshotCommit, 'the replacement starts from the legacy snapshot')
+  assert.equal(await f.git(f.peer.workspace, 'ls-files', '--', '.env'), '', 'the undeclared ignored .env is untracked again')
+  assert.equal(await f.git(f.peer.workspace, 'check-ignore', '--', '.env'), '.env', 'and back to ignored on disk')
+  assert.equal(await f.git(f.peer.workspace, 'ls-files', '--', 'docs/report.md'), 'docs/report.md', 'the declared output stays tracked')
+  await f.readEvidence(f.peer, recovered, 'notes/config.md')
+  const submitted = await f.submit(f.peer, recovered)
+  assert.equal(submitted.status, 'submitted')
+  assert.deepEqual(submitted.artifact.files.map(file => file.path), ['docs/report.md'], 'the declared ignored output is captured')
+  assert.equal(await f.show(submitted.artifact.commit, 'docs/report.md'), '# Draft by the first owner')
+  assert.deepEqual([...submitted.artifact.changedPaths].sort(), ['docs/report.md', 'notes/config.md'])
+  assert.equal(await f.inCommit(submitted.artifact.commit, '.env'), false, 'the secret is not in the artifact tree')
+  assert.deepEqual(await f.refsCarrying('.env', 'refs/artifacts/'), [], 'no artifact ref tree carries the secret')
 })

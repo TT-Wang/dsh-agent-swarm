@@ -1253,6 +1253,7 @@ export class Workspaces {
             } finally { await rm(patchPath, { force: true }) }
           }
           if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
+          if (recovery !== undefined) await this.untrackUndeclaredIgnored(member.workspace, baseCommit, preservationPaths, signal)
           record.task = { taskId: task.id, epoch: task.epoch, baseCommit, preservationPaths,
             ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
             ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
@@ -1424,6 +1425,30 @@ export class Workspaces {
       if (await lstat(path.join(workspace, ...resolved, '.git')).then(() => true, () => false)) return undefined
     }
     return resolved.join('/')
+  }
+
+  /**
+   * A recovered checkout tracks whatever its snapshot tracked. Preservation
+   * snapshots written before R24 force-included every ignored file the task
+   * prose hinted at, a member-created `.env` among them, so right after such a
+   * checkout those files are tracked here and the replacement's whole-tree
+   * capture would commit them. Every path the recovered commit tracks that is
+   * ignored by pattern, absent from the task base (added since it) and not a
+   * declared output is removed from the index only: the file stays on disk,
+   * untracked and ignored, and is captured only once a declaration names it. A
+   * declared output (under its declared or its on-disk spelling) stays tracked,
+   * and an ignored path the base already carries is real content.
+   */
+  private async untrackUndeclaredIgnored(workspace: string, baseCommit: string, outputs: readonly string[], signal: AbortSignal): Promise<void> {
+    const ignored = (await this.git(workspace, ['ls-files', '--cached', '--ignored', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+    if (!ignored.length) return
+    const added = new Set((await this.git(workspace, ['diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', baseCommit, 'HEAD', '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
+    const declared = [...outputs]
+    for (const name of outputs) declared.push(await this.onDiskSpelling(workspace, name) ?? name)
+    const stray = ignored.filter(name => added.has(name) && !declared.includes(name))
+    for (let offset = 0; offset < stray.length; offset += 64) {
+      await this.git(workspace, ['rm', '--cached', '--force', '--quiet', '--', ...stray.slice(offset, offset + 64).map(name => `:(literal)${name}`)], signal)
+    }
   }
 
   /** A legacy failed claim may have moved the member after saving its old task.
