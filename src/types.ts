@@ -968,7 +968,7 @@ export interface ProposeTaskInput {
   scope: string[]
   /** Required unless `replaces` names a task: a repair inherits every replaced task's acceptance, and entries here are added after it. */
   acceptance?: string[]
-  /** Declared deliverable files; see `Task.outputs`. A replacement inherits the replaced task's when it omits them. */
+  /** Declared deliverable files; see `Task.outputs`. Required, except that a repair omitting them inherits every replaced task's declaration (in order, de-duplicated); explicit outputs replace that list. */
   outputs?: string[]
   checks?: string[]
   maxRecoveryAttempts?: number

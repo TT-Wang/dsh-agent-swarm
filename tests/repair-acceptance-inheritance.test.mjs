@@ -127,7 +127,7 @@ test('a repair that leaves out a replaced criterion keeps it and names it on the
     return { task: value.result, rendered: JSON.parse(tool.output.render(args, value)[0].text).result }
   }
   const proposed = id => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'task/proposed' && event.data.id === id)
-  const { task: repair, rendered } = await call({ title: 'Repair without IE11', replaces: [original.id], acceptance: ['works'] })
+  const { task: repair, rendered } = await call({ title: 'Repair without IE11', replaces: [original.id], acceptance: ['works'], outputs: [] })
   assert.deepEqual(f.stored(repair).acceptance, ['works', 'supports IE11'], 'the inheritance is kept')
   assert.deepEqual(proposed(repair.id).data.inheritedAcceptance, ['supports IE11'], 'the admission event records what the host added')
   assert.equal(f.stored(repair).inheritedAcceptance, undefined, 'the task row keeps its shape')
@@ -135,12 +135,47 @@ test('a repair that leaves out a replaced criterion keeps it and names it on the
   assert.equal(rendered.note.split('\n').length, 1, 'one short line')
   // Nothing added, nothing said: a repair restating every criterion, and a new task.
   f.runtime.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'Restate the criteria' })
-  const restated = await call({ title: 'Repair restating', replaces: [repair.id], acceptance: ['supports IE11', 'works'] })
+  const restated = await call({ title: 'Repair restating', replaces: [repair.id], acceptance: ['supports IE11', 'works'], outputs: [] })
   assert.equal(proposed(restated.task.id).data.inheritedAcceptance, undefined)
   assert.equal(restated.rendered.note, undefined)
   const fresh = await call({ title: 'Fresh', acceptance: ['works'], outputs: [] })
   assert.equal(proposed(fresh.task.id).data.inheritedAcceptance, undefined)
   assert.equal(fresh.rendered.note, undefined)
+})
+
+test('a repair that omits outputs inherits every replaced task\'s declaration in order, and the swarm_propose result names them', async t => {
+  const f = await fixture(t)
+  const first = f.propose({ title: 'Report', acceptance: ['works'], outputs: ['src/report.md', 'src/shared.md'] })
+  const second = f.propose({ title: 'Appendix', acceptance: ['works'], outputs: ['src/shared.md', 'src/appendix.md'] })
+  const analysis = f.propose({ title: 'Analysis', acceptance: ['works'], outputs: [] })
+  for (const task of [first, second, analysis]) f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Merged into one repair' })
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
+  const tool = definitions.get('swarm_propose')
+  const exec = { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }
+  const call = async extra => {
+    const args = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Repair', objective: 'Implement', kind: 'implementation', scope: ['src/'], checks: ['test'], ...extra }
+    const value = await tool.execute(args, exec)
+    return { task: value.result, rendered: JSON.parse(tool.output.render(args, value)[0].text).result }
+  }
+  // Omitted: the union of every declaration, in `replaces` order, de-duplicated like acceptance.
+  const merged = await call({ title: 'Merged repair', replaces: [first.id, second.id, analysis.id], acceptance: ['works'] })
+  assert.deepEqual(f.stored(merged.task).outputs, ['src/report.md', 'src/shared.md', 'src/appendix.md'], 'no replaced task\'s deliverable is dropped')
+  assert.equal(merged.rendered.note, `Outputs inherited from ${first.id}, ${second.id}, ${analysis.id}: ["src/report.md","src/shared.md","src/appendix.md"]; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
+  assert.equal(merged.rendered.note.split('\n').length, 1, 'one short line')
+  // Explicit: the proposal's own list replaces the inherited one, and nothing is said.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: merged.task.id, reason: 'The repair moves the report' })
+  const moved = await call({ title: 'Moved repair', replaces: [merged.task.id], acceptance: ['works'], outputs: ['src/notes/report.md'] })
+  assert.deepEqual(f.stored(moved.task).outputs, ['src/notes/report.md'])
+  assert.equal(moved.rendered.note, undefined)
+  // Both inheritances in one line.
+  const lost = f.propose({ title: 'Lost', acceptance: ['works', 'is documented'], outputs: ['src/lost.md'] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: lost.id, reason: 'Repair it' })
+  const both = await call({ title: 'Both', replaces: [lost.id], acceptance: ['works'] })
+  assert.equal(both.rendered.note, `Acceptance inherited from ${lost.id} beyond the supplied list: "is documented". Outputs inherited from ${lost.id}: ["src/lost.md"]; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
+  // The schema text says an explicit list replaces the inherited one.
+  assert.match(tool.description, /repair inherits their acceptance and declared outputs, and explicit outputs replace the inherited ones/)
+  assert.match(tool.parameters.properties.outputs.description, /On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
 })
 
 test('a malformed replaces is a typed refusal before any replaced task is read', async t => {

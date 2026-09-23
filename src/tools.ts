@@ -338,17 +338,22 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_workstream', 'Create a durable workstream in this mission; any member can propose work under it.',
     { ...mission, title: string, objective: string, coordinatorId: string }, ['missionId', 'title', 'objective'],
     (a, actor) => runtime.workstream(actor, text(a, 'missionId'), { title: text(a, 'title'), objective: text(a, 'objective'), coordinatorId: a.coordinatorId as string | undefined }))
-  register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. Rejected implementations are repaired with replaces; the repair inherits their acceptance. Raise an existing task\'s allocation with swarm_budget(taskId, taskBudget, reason); amend its unsubmitted scope, dependencies, checks or assignee with swarm_control(taskId, action: amend, changes, reason). Correct admission field errors and retry the proposal.',
+  register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. Rejected implementations are repaired with replaces; the repair inherits their acceptance and declared outputs, and explicit outputs replace the inherited ones. Raise an existing task\'s allocation with swarm_budget(taskId, taskBudget, reason); amend its unsubmitted scope, outputs, dependencies, checks or assignee with swarm_control(taskId, action: amend, changes, reason). Correct admission field errors and retry the proposal.',
     // `acceptance` is required unless `replaces` is given. The Harness schema
     // subset has no if/then, so the runtime enforces the condition
     // ([task_acceptance_required]) and the schema leaves it optional.
-    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, outputs: outputsSchema, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
+    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, outputs: { ...outputsSchema, description: `${outputsSchema.description} On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces.` }, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
     ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'],
     (a, actor) => {
       const task = runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput)
-      // One line naming the criteria a repair inherited beyond its own `acceptance`.
+      // One line naming what a repair inherited: the criteria beyond its own
+      // `acceptance`, and the declared outputs when it passed none, so a
+      // proposer whose repair writes other files sees the list to replace.
+      const notes: string[] = []
       const inherited = task.replaces?.length ? inheritedAcceptance(task.acceptance, a.acceptance) : []
-      return inherited.length ? { ...task, note: `Acceptance inherited from ${task.replaces!.join(', ')} beyond the supplied list: ${inherited.map(criterion => JSON.stringify(criterion)).join(', ')}.` } : task
+      if (inherited.length) notes.push(`Acceptance inherited from ${task.replaces!.join(', ')} beyond the supplied list: ${inherited.map(criterion => JSON.stringify(criterion)).join(', ')}.`)
+      if (task.replaces?.length && a.outputs === undefined) notes.push(`Outputs inherited from ${task.replaces.join(', ')}: ${JSON.stringify(task.outputs ?? [])}; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
+      return notes.length ? { ...task, note: notes.join(' ') } : task
     })
   register('swarm_claim', 'Claim ready work as yourself; ownership is atomic and expires. Use the returned attemptId on every result. The scheduler also assigns idle workers automatically.',
     { ...mission, taskId: string }, ['missionId', 'taskId'], (a, actor) => runtime.claim(actor, text(a, 'missionId'), text(a, 'taskId')))
