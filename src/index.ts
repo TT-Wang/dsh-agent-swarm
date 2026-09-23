@@ -157,7 +157,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // The profile passes unknown keys through; the runtime clock and the manual
   // tick are never among them.
   const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants,
-    authorizeWorkspace: (workspace, sessionCwd) => authorizeWorkspace(workspace, sessionCwd, grants) }, workers)
+    authorizeWorkspace: (workspace, sessionCwd, now) => authorizeWorkspace(workspace, sessionCwd, grants, now) }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')

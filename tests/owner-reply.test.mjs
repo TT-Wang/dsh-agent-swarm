@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
+import { FakeClock } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 
@@ -42,11 +43,11 @@ class SilentWorkers {
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
 
-async function fixture(t) {
+async function fixture(t, config = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-owner-reply-'))
   const workers = new SilentWorkers()
   const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
+    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, ...config }, workers)
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
@@ -200,6 +201,27 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   const view = f.runtime.observe(f.owner, f.mission.id, {})
   assert.equal(view.openAsks.count, 0)
   assert.match(view.openAsks.note, /replyTo/)
+})
+
+test('L2: the turn boundary and the consumption stamp are on the runtime clock, so a clock ahead of the host still nudges', async t => {
+  // The guard booked a question only when its runtime-clock deliveredAt was at or
+  // before the host's user/message createdAt, and stamped consumedAt with that
+  // host time. With the runtime clock ten minutes ahead of the host, an
+  // unanswered owner question was never booked, so it was never nudged.
+  const clock = new FakeClock(Date.now() + 600_000)
+  const f = await fixture(t, { now: clock.now })
+  const ask = await f.ask()
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  t.after(() => guard.dispose())
+  clock.advance(1_000)
+  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  assert.deepEqual(f.events('owner/reply-missing').map(event => event.data.deliveryId), [ask.id], 'the unanswered question is booked and recorded')
+  f.runtime.pumpOutbox = () => {}
+  f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'And the schema version?' })
+  const consumed = f.deliveries().filter(row => row.replyExpected && row.id !== ask.id).at(-1)
+  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now(), source: { kind: 'swarm', deliveryId: consumed.id } })
+  assert.equal(f.runtime.store.get('deliveries', consumed.id).consumedAt, clock.now(), 'consumption is stamped on the runtime clock')
 })
 
 test('L2: an answered turn is never nudged, and a repeated turn end is a no-op', async t => {

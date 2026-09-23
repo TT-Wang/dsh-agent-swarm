@@ -1644,7 +1644,7 @@ export class SwarmRuntime {
     const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
     // D1: a task that exhausted its own finding (or step) ceiling blocks instead
     // of publishing more evidence and consuming the mission budget.
-    const ceiling = taskCeilingBlock(task)
+    const ceiling = taskCeilingBlock(task, this.now())
     if (ceiling !== undefined) { this.blockTaskCeiling(this.mission(missionId), task, ceiling); throw new Error(ceiling.reason) }
     this.bounded(input.claim)
     if (!EVIDENCE_OUTCOMES.includes(input.outcome)) throw new PolicyError('invalid_evidence_outcome', 'validation_error', '[invalid_evidence_outcome] Evidence `outcome` must be supported, disproved or inconclusive; it describes the hypothesis, not task success. Correct `outcome` and retry `swarm_publish`.')
@@ -3552,7 +3552,7 @@ export class SwarmRuntime {
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }
-    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next) === undefined)
+    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next, this.now()) === undefined)
     // A blocked task that carries an artifact was rejected, or invalidated after
     // it submitted: the artifact is immutable, so a resume would only fence the
     // historical author and re-pend work that can never change. A resume while a
@@ -3560,7 +3560,7 @@ export class SwarmRuntime {
     // blocked outcome, so it stays allowed.
     if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
-    if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
+    if (resumes && taskCeilingBlock(next, this.now()) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
       const source = this.task(missionId, task.verificationRecovery.sourceTaskId)
       if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
@@ -3571,7 +3571,7 @@ export class SwarmRuntime {
     if (resumes && next.status === 'blocked' && next.artifact === undefined && next.resumeAfterStop?.reason === 'invalidated') {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
-    if (taskCeilingBlock(next) === undefined) delete next.ceiling
+    if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
     const activeOwner = task.attempt?.ownerId
     if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
@@ -3750,7 +3750,7 @@ export class SwarmRuntime {
     // the next step is charged, so the mission budget is never drained by it.
     const activeTask = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
     if (activeTask !== undefined) {
-      const ceiling = taskCeilingBlock(activeTask)
+      const ceiling = taskCeilingBlock(activeTask, this.now())
       if (ceiling !== undefined) { this.blockTaskCeiling(mission, activeTask, ceiling); return false }
     }
     // Requests still streaming for other workers will settle against the same pool.

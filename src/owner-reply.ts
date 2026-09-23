@@ -99,10 +99,12 @@ export class OwnerReplyGuard {
   /**
    * Book the questions this turn is expected to settle: delivered before it
    * started and still open. A turn with no such question books nothing, so an
-   * ordinary owner turn is never nudged.
+   * ordinary owner turn is never nudged. The turn starts when its message is
+   * observed, on the runtime clock that stamps `deliveredAt`, never on the
+   * host's message `createdAt`: two clocks cannot order one question.
    */
   private startTurn(sessionId: string, data?: unknown): void {
-    const at = typeof (data as { createdAt?: unknown } | undefined)?.createdAt === 'number' ? (data as { createdAt: number }).createdAt : this.rt.now()
+    const at = this.rt.now()
     const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
     const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
     // Several admitted messages (including the generated context snapshot) can

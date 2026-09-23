@@ -18,6 +18,7 @@ import { registerTools } from '../lib/tools.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Config } from '../lib/index.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeClock } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 const plan = (workspace, extra = {}) => ({
@@ -477,4 +478,29 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
   assert.equal(revoked.length, 1, 'the source-less record is fenced exactly once on revocation')
   assert.match(revoked[0].data.reason, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   assert.ok(restarted.store.list('deliveries', mission.id).some(delivery => delivery.to === 'owner' && delivery.kind === 'control'), 'the owner is notified of the revocation')
+})
+
+test('G1: grant expiry is judged at the runtime clock\'s instant by admission and by the dispatch fence alike', async t => {
+  // Admission read the runtime clock, but the dispatch and verification fence
+  // called config.authorizeWorkspace, which judged expiry on the wall clock. With
+  // the runtime clock past expiresAt, admission refused a new mission under the
+  // grant while the fence kept the admitted one live.
+  const { temp, granted, project } = await fixture(t)
+  const second = join(granted, 'second')
+  await mkdir(second)
+  const grants = await loadWorkspaceGrants([{ path: granted, expiresAt: Date.now() + 5_000 }])
+  const clock = new FakeClock()
+  // Wired as src/index.ts wires the plugin runtime.
+  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), manualTick: true, now: clock.now, grants,
+    authorizeWorkspace: (workspace, cwd, now) => authorizeWorkspace(workspace, cwd, grants, now) }, new Workers())
+  t.after(async () => { await runtime.dispose() })
+  const owner = { sessionId: 'owner-expiry' }
+  const grantedPath = await realpath(granted), projectPath = await realpath(project), secondPath = await realpath(second)
+  const input = workspace => ({ title: 'Expiring grant', objective: 'Fence at expiry', workspace, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const mission = runtime.create(owner, input(projectPath))
+  await runtime.assertWorkspaceAuthorized(runtime.mission(mission.id))
+  clock.advance(10_000)
+  assert.throws(() => runtime.create(owner, input(secondPath)), /not inside a currently authorizedWorkspaces root/, 'admission refuses the expired grant')
+  await assert.rejects(runtime.assertWorkspaceAuthorized(runtime.mission(mission.id)), /was removed from authorizedWorkspaces or has expired/, 'the dispatch fence refuses it at the same instant')
+  assert.equal(runtime.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 1, 'the admitted mission is fenced once')
 })

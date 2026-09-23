@@ -1156,9 +1156,10 @@ export interface RuntimeConfig {
    * at start. When present the runtime re-derives every mission's grant root
    * from it and fences a mission whose root was revoked; when absent (unit
    * runtimes and adapters without Git) the recorded admission result stands.
-   * It is a value on the runtime's own config, never a model-callable surface.
+   * It judges grant expiry at `now`, the runtime clock's instant, as admission
+   * does. It is a value on the runtime's own config, never a model-callable surface.
    */
-  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined) => Promise<WorkspaceAuthorization>
+  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined, now: number) => Promise<WorkspaceAuthorization>
   /**
    * The roots `authorizeWorkspace` closes over, carried so revocation fencing
    * can name the recorded root without re-reading configuration. Never

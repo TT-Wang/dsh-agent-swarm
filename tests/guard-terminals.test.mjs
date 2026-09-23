@@ -51,7 +51,7 @@ import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, g
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
-import { setup, eventually, events } from './faults/harness.mjs'
+import { setup, eventually, events, FakeClock } from './faults/harness.mjs'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
@@ -670,6 +670,20 @@ test('S4b (task ceiling): the blocked task escalates with the coded ceiling term
       'the owner decision request replaces the prose-only ceiling notice', 8_000)
     assert.match(notice.content, /swarm_budget/)
     assert.deepEqual(lintRefusal(notice.content), [])
+  } finally { await f.cleanup() }
+})
+
+test('S4b (task ceiling): the ceiling block is stamped on the runtime clock', async () => {
+  // taskCeilingBlock defaulted its instant to Date.now(), and the runtime called
+  // it without the clock, so task.ceiling.at was host time on a runtime-clock row.
+  const clock = new FakeClock(Date.now() + 600_000)
+  const f = await setup({ clock })
+  try {
+    const task = f.propose({ title: 'Ceiling bound', maxSteps: 1 })
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.workers.callbacks.beforeStep(f.author.id, true)
+    assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), false, 'the ceiling refuses the next step')
+    assert.equal(f.runtime.store.get('tasks', task.id).ceiling.at, clock.now())
   } finally { await f.cleanup() }
 })
 
