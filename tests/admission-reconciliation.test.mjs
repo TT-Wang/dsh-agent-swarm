@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { planAdvisories, validatePlan } from '../lib/plans.js'
+import { setup } from './faults/harness.mjs'
 import {
   DEFAULT_TASK_MAX_FINDINGS, DEFAULT_TASK_MAX_STEPS, classifyCheck, ignoredDeliverablePaths,
   reconcileObjectiveScope, taskCeilingBlock, taskCeilingExhaustion, writeDirectivePaths,
@@ -268,4 +269,34 @@ test('the real round-4 task objectives are not false-flagged by scope reconcilia
   for (const [scope, objective] of cases) {
     assert.deepEqual(reconcileObjectiveScope(objective, scope, 'objective'), [], `no false positive for scope ${JSON.stringify(scope)}`)
   }
+})
+
+/**
+ * A declared check reaches the host as one `/bin/sh -c` argument. A NUL byte
+ * there is refused by the process API itself (ERR_INVALID_ARG_VALUE), which the
+ * verification path recorded as host infrastructure and deferred the review on,
+ * so admission refuses every control character a check cannot need. Tab and
+ * newline stay admitted: a multi-line or tab-indented script is a real check.
+ */
+test('a declared check carrying a control character other than tab or newline is refused at admission', async t => {
+  const refusal = (location, codePoint) => `[check_control_character] ${location} contains the control character U+${codePoint}; a declared check may contain tab and newline but no other control character. Remove it from \`checks\` and retry with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`
+  const typed = (location, codePoint) => error => {
+    assert.equal(error.code, 'check_control_character')
+    assert.equal(error.category, 'validation_error')
+    assert.equal(error.message, refusal(location, codePoint))
+    return true
+  }
+  for (const [character, codePoint] of [['\u0000', '0000'], ['\r', '000D'], ['\u001b', '001B'], ['\u007f', '007F']]) {
+    const input = plan('/workspace'); input.tasks[1].checks = ['node check.cjs', `node check.cjs${character} && true`]
+    assert.throws(() => validatePlan(input), typed('tasks[1].checks[1]', codePoint), 'plan admission refuses it')
+  }
+  const multiline = plan('/workspace'); multiline.tasks[1].checks = ['node check.cjs &&\n\tnode --test']
+  assert.doesNotThrow(() => validatePlan(multiline), 'tab and newline are still admitted')
+
+  const f = await setup()
+  t.after(() => f.cleanup())
+  assert.throws(() => f.propose({ checks: ['test -f src/answer.txt\u0000 && true'] }), typed('task.checks[0]', '0000'), 'swarm_propose refuses it')
+  const task = f.propose({ checks: ['test -d .'] })
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: ['test -d .\u0000'] }, 'narrow the check'), typed('task.checks[0]', '0000'), 'swarm_control amend refuses it')
+  assert.deepEqual(f.runtime.store.get('tasks', task.id).checks, ['test -d .'], 'the refused amendment changed nothing')
 })

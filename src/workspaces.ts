@@ -1894,6 +1894,11 @@ export class Workspaces {
             // remains cancellation, including when it arrives during timeout drain.
             if (!(error instanceof ProcessTimeoutError)) {
               if (signal.aborted) throw error
+              // An argument the process API refused (a NUL byte in a check
+              // admitted before admission refused control characters) is a
+              // defect in the request, not the host: it stays a thrown refusal.
+              const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+              if (code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_INVALID_ARG_TYPE') throw error
               // F-29: a confinement the host refused (partial enforcement) or a
               // command the seam could not start never ran; record it as this
               // command's infrastructure row, never as an assertion failure.

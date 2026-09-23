@@ -963,11 +963,24 @@ export function reconcileCheckPaths(command: string, location: string): Admissio
 
 export function isNoopCheck(command: string): boolean { return /^(?:true|:|exit\s+0)\s*;?$/.test(command.trim()) }
 
+/**
+ * A control character a declared check cannot need. The check reaches the host
+ * as one `/bin/sh -c` argument: a NUL byte there is refused by the process API
+ * itself, and the others (a carriage return, an escape) are never part of a
+ * real command. Tab and newline are admitted: a multi-line script is a check.
+ */
+const CHECK_CONTROL_CHARACTER = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/
+
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
     if (!Array.isArray(checks)) throw new AdmissionError('check_not_array', 'budget_error', `${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`, `${location}.checks`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
     if (invalid !== -1) throw new AdmissionError('check_invalid', 'budget_error', `${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`, `${location}.checks[${invalid}]`)
+    const control = checks.findIndex(command => CHECK_CONTROL_CHARACTER.test(command))
+    if (control !== -1) {
+      const codePoint = checks[control]!.match(CHECK_CONTROL_CHARACTER)![0].codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')
+      throw new AdmissionError('check_control_character', 'validation_error', `[check_control_character] ${location}.checks[${control}] contains the control character U+${codePoint}; a declared check may contain tab and newline but no other control character. Remove it from \`checks\` and retry with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`, `${location}.checks[${control}]`)
+    }
     const noop = checks.findIndex(isNoopCheck)
     if (noop !== -1) throw new AdmissionError('check_noop', 'validation_error', `[check_noop] ${location}.checks[${noop}] is an always-passing no-op. Supply a real assertion in \`checks\` with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`, `${location}.checks[${noop}]`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')

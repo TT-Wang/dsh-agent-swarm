@@ -192,6 +192,28 @@ test('an artifact whose ancestry proof exits non-zero is still refused by a thro
   assert.deepEqual(f.runs(), [], 'nothing was recorded as a check row')
 })
 
+/**
+ * A check admitted before admission refused control characters can still hold
+ * a NUL byte. The process API refuses that argument (ERR_INVALID_ARG_VALUE):
+ * the request is defective, not the host, so it is not an infrastructure row
+ * the review would defer on. `swarm_verify` throws, as it did at e8ac876.
+ */
+test('a legacy check the process API refuses as an argument throws instead of deferring', async t => {
+  const f = await reviewFixture(t)
+  f.runtime.commit(f.mission.id, () => {
+    const legacy = f.runtime.store.get('tasks', f.source.id)
+    legacy.checks = ['test -f src/answer.txt\u0000 && true']
+    f.runtime.store.put('tasks', legacy)
+  })
+  await assert.rejects(f.verify(), error => error?.code === 'ERR_INVALID_ARG_VALUE', 'an argument refusal is not host infrastructure')
+  assert.equal(taskOf(f.runtime, f.review.id).status, 'running')
+  assert.equal(taskOf(f.runtime, f.source.id).status, 'submitted')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 0)
+  assert.deepEqual(f.runs(), [], 'nothing was recorded as a check row')
+  assert.deepEqual(await verificationCheckouts(f.repo.root), [], 'the checkout is removed on the throw path')
+  assert.deepEqual((({ active, queued }) => ({ active, queued }))(f.workspaces.checkEnvelope()), { active: 0, queued: 0 }, 'the check slot was released')
+})
+
 test('Workspaces.cancel during preparation still rejects instead of becoming a row', async t => {
   const repo = await makeRepo('verification-preparation-cancel', { 'src/answer.txt': 'base\n' })
   const started = []
