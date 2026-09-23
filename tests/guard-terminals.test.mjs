@@ -344,8 +344,16 @@ test('R12-F9: the diagnostic distinguishes "add the dependency" from "state how 
   assert.match(known[0].message, /exists in this mission/)
   const unknown = dependencyAssumptions(task, 'task', { knownContents: new Set() })
   assert.equal(unknown.length, 1)
-  assert.match(unknown[0].message, /not in the mission baseline/)
-  for (const diagnostic of [...known, ...unknown]) {
+  assert.match(unknown[0].message, /not a task id of this mission/)
+  // A hex commit may be an ancestor of the mission baseline: the guard checks
+  // only the mission's task ids, so the text must not assert the commit's
+  // absence from the baseline, which nothing verified.
+  const hex = dependencyAssumptions({ objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [] }, 'task', { knownContents: new Set(['task_source']) })
+  assert.equal(hex.length, 1)
+  assert.equal(hex[0].path, '09883f3')
+  assert.doesNotMatch(hex[0].message, /not in the mission baseline|worktree will not contain it/, 'no unverified provenance claim')
+  assert.match(hex[0].message, /whether the mission baseline or a task artifact already contains it was not checked/)
+  for (const diagnostic of [...known, ...unknown, ...hex]) {
     assert.deepEqual(lintRefusal(`[${diagnostic.code}] ${diagnostic.location}: ${diagnostic.message}`), [])
   }
 })

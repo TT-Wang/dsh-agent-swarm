@@ -396,7 +396,7 @@ export interface DependencyAssumptionContext {
   /** The declared dependency set. Absent means unknown, never "empty". */
   dependencies?: readonly string[]
   replaces?: readonly string[]
-  /** Durable task ids, artifact commits and evidence ids this mission already holds. */
+  /** Identities this mission already holds; every caller passes its durable task ids. */
   knownContents?: ReadonlySet<string>
   /**
    * The dependency set is an owner amendment of an admitted task
@@ -428,8 +428,12 @@ export function namedContentTokens(text: string): string[] {
 
 /**
  * The coded diagnostic for one clause that assumes content no dependency
- * carries. `known` is the caller's answer to "does this mission already hold
- * that content"; undefined names both executable exits. `amendment` is an owner
+ * carries. `known` is the caller's answer to "is that name one of this
+ * mission's identities" (its task ids); undefined names both executable exits.
+ * An unknown name is only that: a commit named by hex may still be an ancestor
+ * of the mission baseline, and nothing here runs git to find out (every caller
+ * is synchronous, and the workspace git seam is not), so the text claims no
+ * provenance it did not check. `amendment` is an owner
  * amendment of an admitted task's dependencies: its objective and acceptance
  * are fixed, so the exits are the amendment itself or a withdrawal.
  */
@@ -437,7 +441,7 @@ export function dependencyAssumptionDiagnostic(named: string, field: string, cla
   const provenance = known === true
     ? 'That content exists in this mission, so a dependency edge is what carries it into a prepared worktree.'
     : known === false
-      ? 'That content is not in the mission baseline, so the worktree will not contain it.'
+      ? 'That name is not a task id of this mission; whether the mission baseline or a task artifact already contains it was not checked.'
       : 'No declared dependency carries that content into the prepared worktree.'
   if (amendment) return {
     code: 'dependency_assumption_missing',
