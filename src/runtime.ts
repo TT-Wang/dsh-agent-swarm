@@ -254,7 +254,7 @@ interface OwnerCursor {
  * the field is declared here and travels as a plain JSON property on the same
  * durable row; the integration task records the one-line schema addition.
  */
-interface MemberStartFailureFields { startFailures?: number }
+interface MemberStartFailureFields { startFailures?: number; startError?: string }
 const startFailureFields = (member: Member): Member & MemberStartFailureFields => member as Member & MemberStartFailureFields
 /** A single runtime owns scheduling, admission, state transitions and a durable outbox. */
 /**
@@ -461,7 +461,13 @@ export class SwarmRuntime {
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
   private reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
-  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined { return this.scheduling.rerouteTarget(missionId, task, failedId) }
+  /** R11-01: a route inside its provider outage window waits for its next probe, so it is re-routed work's last resort. */
+  private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
+    const target = this.scheduling.rerouteTarget(missionId, task, failedId)
+    if (target === undefined || this.providerQuiescent(target) === undefined) return target
+    return this.store.list('members', missionId).find(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
+      && this.providerQuiescent(member) === undefined && this.scheduling.capable(task, member)) ?? target
+  }
 
   /** M1a seam 5/7: the declared-check execution path. */
   private readonly declaredChecks = new DeclaredChecks(this)
@@ -3899,7 +3905,7 @@ export class SwarmRuntime {
     }
   }
   /** R11-01: the member's route is quiescent only inside the outage window. */
-  private providerQuiescent(member: Member): ProviderOutage | undefined {
+  private providerQuiescent(member: Member): Member['providerOutage'] {
     const outage = member.providerOutage
     return outage !== undefined && this.now() - outage.at <= PROVIDER_OUTAGE_WINDOW_MS ? outage : undefined
   }
@@ -3916,6 +3922,7 @@ export class SwarmRuntime {
     if (outage === undefined && failures === undefined) return
     delete member.providerOutage
     delete fields.startFailures
+    delete fields.startError
     this.commit(missionId, () => {
       this.store.put('members', member)
       if (outage !== undefined) this.store.event(missionId, 'provider/recovered', 'runtime', { memberId })
@@ -4012,14 +4019,19 @@ export class SwarmRuntime {
   }
   /**
    * R5-02: a `workers.start` failure is a recoverable interruption, not a
-   * permanent block of the member's work. Mirror the preparation, lease-expiry
-   * and close-out policy: spend exactly one recovery credit per affected task
-   * and re-pend while its limit is not exhausted (blocking only at the limit,
-   * with the reason in `task.output`). The same member is retried for
+   * permanent block of the member's work. Route startup is infrastructure
+   * recovery, so it never spends task execution credit: every affected task
+   * re-pends with its recovery allowance intact. The same member is retried for
    * `START_FAILURE_REROUTE_LIMIT` consecutive failures so a transient start
    * error self-heals; at the limit the route is retired and its work re-routed
    * to another capable live member with a durable `task/reassigned` event. A
-   * successful start clears the member's consecutive failure counter.
+   * successful start clears the member's consecutive failure counter. The bound
+   * is therefore k failed starts per route: when a retirement leaves a pending
+   * task with no live route that could start it, the owner notice names that
+   * task, every route retired for start failures with its count and last error,
+   * and the exits. A classified provider outage neither counts nor retires the
+   * route; `startWorker` paces its retries to one probe per outage window and
+   * `recordProviderOutage` tells the owner once per outage.
    */
   onStartFailure(mission: Mission, member: Member, error: unknown): void {
     if (this.closed || this.shuttingDown) return
@@ -4042,12 +4054,13 @@ export class SwarmRuntime {
     const consecutiveFailures = (startFailureFields(durable).startFailures ?? this.startFailures.get(member.id) ?? 0) + 1
     if (outage === undefined) {
       startFailureFields(member).startFailures = consecutiveFailures
+      startFailureFields(member).startError = String(error).slice(0, 300)
       this.startFailures.set(member.id, consecutiveFailures)
     }
     const reroute = outage === undefined && consecutiveFailures >= START_FAILURE_REROUTE_LIMIT
     // Below the limit the member stays live so the next tick retries the same
     // route; at the limit it is retired exactly like a dead session. A quiescent
-    // route is always kept live: the provider may recover on the next tick.
+    // route is always kept live: the provider may recover on the next probe.
     if (reroute) member.phase = 'stopped'
     this.commit(missionId, () => {
       if (outage === undefined) this.store.put('members', member)
@@ -4060,35 +4073,42 @@ export class SwarmRuntime {
         const pinned = task.assigneeId
         delete task.assigneeId
         task.status = 'pending'
-        const limit = task.maxRecoveryAttempts ?? this.config.maxTasksPerMember
         const target = task.assignmentMode !== 'pinned' && (outage !== undefined || reroute) ? this.rerouteTarget(missionId, task, member.id) : undefined
         // Re-route wins over the credit limit: the obligation moves to another
-        // live route instead of blocking, and the credit spent so far travels
-        // with the task so the new owner still has a bounded budget.
+        // live route instead of blocking, with its recovery allowance intact.
         if (target !== undefined) task.assigneeId = target.id
         // No capable target: keep the same live route below the limit, and
         // release the work to any live member once the route is retired.
         else if (!reroute || task.assignmentMode === 'pinned') task.assigneeId = pinned
-        const exhausted = false // Route startup is infrastructure recovery, never task execution credit.
-        task.status = exhausted ? 'blocked' : 'pending'
         this.store.put('tasks', task)
-        this.store.event(missionId, 'task/start-failed', 'runtime', { taskId: task.id, epoch: task.epoch, reason, recoveryCount: task.recoveryCount ?? 0, maxRecoveryAttempts: limit, status: task.status, consecutiveFailures, quiescent: outage !== undefined })
-        if (target !== undefined) {
-          this.store.event(missionId, 'task/reassigned', 'runtime', { taskId: task.id, from: member.id, to: target.id, reason, consecutiveFailures })
-          continue
-        }
-        if (!exhausted) continue
-        this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
-        this.notify(missionId, `${reason} (${task.id} exhausted its recovery limit of ${limit})`, this.interpretation(missionId).subjectsOf([task]))
+        this.store.event(missionId, 'task/start-failed', 'runtime', { taskId: task.id, epoch: task.epoch, reason, recoveryCount: task.recoveryCount ?? 0, maxRecoveryAttempts: task.maxRecoveryAttempts ?? this.config.maxTasksPerMember, status: task.status, consecutiveFailures, quiescent: outage !== undefined })
+        if (target !== undefined) this.store.event(missionId, 'task/reassigned', 'runtime', { taskId: task.id, from: member.id, to: target.id, reason, consecutiveFailures })
       }
       this.store.event(missionId, 'member/resume-failed', 'runtime', { memberId: member.id, error: String(error), consecutiveFailures, rerouted: reroute, ...(outage === undefined ? {} : { outage: outage.class }) })
       // The outage notice is emitted by `recordProviderOutage`; do not claim a
       // recovery credit that was never spent.
       if (outage !== undefined) return
-      this.notify(missionId, reroute
-        ? `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`
-        : `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
-        this.noticeSubjectsFor(missionId, { memberId: member.id }))
+      if (!reroute) {
+        this.notify(missionId, `${member.name} could not start (failure ${consecutiveFailures} of ${START_FAILURE_REROUTE_LIMIT}); its queued work and task recovery allowance are preserved.`,
+          this.noticeSubjectsFor(missionId, { memberId: member.id }))
+        return
+      }
+      // The retirement is its own fact (never deduplicated into an earlier
+      // failure notice). Pending work this route could start and no live route
+      // can is named with every retired route: nothing retries it any more.
+      const stranded = this.store.list('tasks', missionId).filter(task => task.status === 'pending' && this.scheduling.capable(task, member)
+        && (task.assignmentMode === 'pinned' ? task.assigneeId === member.id : this.rerouteTarget(missionId, task, member.id) === undefined))
+      const retired = this.store.list('members', missionId).filter(candidate => memberPhaseOf(candidate) === 'stopped'
+        && (startFailureFields(candidate).startFailures ?? 0) >= START_FAILURE_REROUTE_LIMIT && stranded.some(task => this.scheduling.capable(task, candidate)))
+      const options = { trigger: 'member/resume-failed', reason: `${member.id} retired after ${consecutiveFailures} consecutive start failures` }
+      if (!stranded.length) {
+        this.notify(missionId, `${member.name} could not start after ${consecutiveFailures} consecutive failures; its work remains on the board; capable live routes may claim it, or use swarm_control with taskId and action=amend to choose an assignee.`,
+          this.noticeSubjectsFor(missionId, { memberId: member.id }), options)
+        return
+      }
+      const routes = retired.map(candidate => `${candidate.name} (${candidate.id}): ${startFailureFields(candidate).startFailures} consecutive start failures, last error: ${startFailureFields(candidate).startError ?? 'not recorded'}`)
+      this.notify(missionId, `No live member can start ${stranded.map(task => `${task.id} (${task.title})`).join(', ')}: every route that could was retired for start failures. ${routes.join('; ')}. The work stays pending with its recovery allowance preserved and nothing retries it. Admit a working route with swarm_add_member (it claims unpinned work), move pinned work to it with swarm_control(taskId, action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw work that is no longer required with swarm_cancel.`,
+        this.interpretation(missionId).subjectsOf(stranded), options)
     })
   }
   defer(fn: () => Promise<void>): void {
@@ -4309,7 +4329,10 @@ export class SwarmRuntime {
         if (entry?.controller === controller) {
           // Keep a timed-out opening fenced until its native cleanup settles.
           // Multiple callers of that same opening never spend more credits.
-          if (failed) entry.retryAfter = this.now() + this.config.tickMs
+          // R11-01: a route inside its recorded provider outage window gets one
+          // probe per window, not one per tick (an owner admission still supersedes).
+          const quiet = failed ? this.providerQuiescent(this.store.get('members', member.id) ?? member) : undefined
+          if (failed) entry.retryAfter = quiet === undefined ? this.now() + this.config.tickMs : quiet.at + PROVIDER_OUTAGE_WINDOW_MS
           else this.workerStarts.delete(member.id)
         }
       }
