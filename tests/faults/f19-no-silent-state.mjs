@@ -249,23 +249,42 @@ await runScenario({
     }
 
     // Row 7b — T1av2 (evidence_978a4694): running work plus a pending dependent
-    // whose prerequisite is not accepted. The documented row-3 exemption covers
-    // only an all-running board, so this state must still leave a W2 notice.
+    // that no live path advances. The documented row-3 exemption covers only an
+    // all-running board, so row 7's condition (deps blocked/cancelled) must still
+    // leave a W2 notice while unrelated work runs. A dependent whose prerequisite
+    // is merely queued behind its assignee's live lease is NOT that condition: the
+    // lease bounds the wait exactly as in row 3, so waking the owner there would be
+    // a false wake. Both halves are asserted. Research kind keeps the board free of
+    // the second-implementation integration-gap diagnostic (as rows 5b/5c do).
     {
       const f = await setup({ config: { leaseMs: 60_000 } })
       try {
-        const first = f.propose({ title: 'Running work' })
+        const research = { kind: 'research', checks: undefined }
+        const first = f.propose({ title: 'Running work', ...research })
         await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
         assert.equal(taskOf(f.runtime, first.id).status, 'running')
-        const prerequisite = f.propose({ title: 'Pending prerequisite' })
-        const dependent = { ...taskOf(f.runtime, prerequisite.id), id: 'task_f19_running_dependent', title: 'Pending dependent',
-          dependencies: [prerequisite.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
-          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
+        const dependentOf = (id, prerequisiteId) => ({ ...taskOf(f.runtime, first.id), id, title: `Dependent of ${prerequisiteId}`,
+          dependencies: [prerequisiteId], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
+          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined })
+        const fallthroughs = () => ownerNotices(f).filter(delivery => /made no progress|Mission stalled/.test(delivery.content))
+        // (a) The prerequisite is ready for its assignee, who holds a live lease on
+        // `first`: a bounded live wait, so no fall-through may name either task.
+        const prerequisite = f.propose({ title: 'Queued prerequisite', ...research })
+        const waiting = dependentOf('task_f19_waiting_dependent', prerequisite.id)
+        f.runtime.store.transaction(() => f.runtime.store.put('tasks', waiting))
+        await sleep(200)
+        assert.deepEqual(fallthroughs(), [], 'row 7b: work queued behind a live lease is a bounded wait, not a stall')
+        // (b) A dependent admitted before its prerequisite was withdrawn: its
+        // lineage is dead (spec row 7), and the running work must not hide it.
+        const withdrawn = f.propose({ title: 'Withdrawn prerequisite', ...research })
+        f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'withdrawn by the owner' })
+        const dependent = dependentOf('task_f19_running_dependent', withdrawn.id)
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
-        const notice = await eventually(() => ownerNotices(f).find(delivery => /made no progress|Mission stalled/.test(delivery.content)),
+        const notice = await eventually(() => fallthroughs()[0],
           'row 7b: running work plus a not-ready dependent must still leave a witness')
         assertWitness(f, 'W2', 'row 7b')
         assert.match(notice.content, /swarm_propose|swarm_control/, 'the notice names a decision the owner can take')
+        assert.deepEqual(notice.subjects, [`${dependent.id}@0`], 'the notice names only the subject no live path advances')
         rows.row7b = { witness: 'W2', taskId: dependent.id }
       } finally { await f.cleanup() }
     }
@@ -316,7 +335,10 @@ await runScenario({
         await acceptThroughReview(f, second)
         const stall = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled').at(-1),
           'row 9b: two implementation artifacts without an integration must stall')
-        assert.match(stall.data.reason, /Coding missions require an independently accepted integration artifact/)
+        // The delivery predicate's wording since 69211b9; the row's claim is that
+        // the stall carries exactly what completion reports.
+        assert.match(stall.data.reason, /A unique independently accepted implementation artifact is required/)
+        assert.equal(stall.data.reason, f.runtime.completionError(f.runtime.store.get('missions', f.mission.id)))
         assertWitness(f, 'W3', 'row 9b')
         rows.row9b = { witness: 'W3', reason: stall.data.reason }
       } finally { await f.cleanup() }

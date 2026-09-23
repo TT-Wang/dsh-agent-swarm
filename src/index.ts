@@ -14,8 +14,6 @@ import { RoleScoper } from './roles.ts'
 import { OwnerReplyGuard } from './owner-reply.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
-import { liveLineageSubject, noticeFamily } from './notices.ts'
-import { installSwarmInvariant } from './invariant.ts'
 import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
 import type { Budget } from './types.ts'
 
@@ -174,24 +172,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const owner = mission === undefined ? undefined : ctx.agents.get(SessionId(mission.ownerSessionId))
     if (owner !== undefined) pruneOwnerInbox(owner)
   }), 'swarm.owner-inbox-relevance')
-  // R17-G9: the pre-append invariant pilot. The companion registers through the
-  // host's `ctx.invariants` facility (the same one twelve host packages use), so
-  // an owner-facing decision naming a subject whose lineage still has a live path
-  // is refused BEFORE its host session event is published. The judge maps one
-  // relayed swarm message to the shared lineage predicate (`liveLineageSubject`,
-  // the emission-time counterpart of the wake-precision classifier); a deployment
-  // that mounts no invariant registry keeps working and reports the pilot as not
-  // landed through `swarmInvariantStatus`.
-  installSwarmInvariant(ctx, message => {
-    const source = message.source
-    if (source?.kind !== 'swarm' || typeof source.deliveryId !== 'string') return undefined
-    const delivery = runtime.store.get('deliveries', source.deliveryId)
-    if (delivery === undefined || delivery.to !== 'owner') return undefined
-    const family = noticeFamily(delivery)
-    const reason = liveLineageSubject(runtime, { missionId: delivery.missionId, family, subjects: delivery.subjects ?? [] })
-    if (reason === undefined) return undefined
-    return { missionId: delivery.missionId, family, subjects: [...(delivery.subjects ?? [])], reason, deliveryId: delivery.id }
-  })
   // R17-G10: the host sink link exists before the recorder does; `registerTools`
   // builds the recorder from the runtime identity this binding is keyed on.
   installHostTelemetry(ctx, runtime)

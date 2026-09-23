@@ -7,7 +7,6 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
-import { installSwarmInvariant, recordAppendRefusal } from '../lib/invariant.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice } from '../lib/arena.js'
 import { tempDirectory } from './temp-root.mjs'
@@ -97,31 +96,17 @@ test('R01: legacy block config leaves owner tool execution available to answer',
   assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
 })
 
-function invariantHook(judge) {
-  let hook
-  const child = { on: (_name, fn) => { hook = fn } }
-  const registry = { register: (_package, install) => {
-    install(child, message => { throw Object.assign(new Error(message), { name: 'InvariantError', code: 'INVARIANT' }) })
-    return () => {}
-  } }
-  installSwarmInvariant({ inject: (_services, mount) => mount({ get: () => registry }) }, judge)
-  return message => hook('emit', 'session/event', [{}, { type: 'user/message', data: message }])
-}
-
-test('R03: only the proven predicate and exact delivery can suppress an append rejection', async t => {
+test('R03: a host append rejection is never an acknowledgement, even one naming this package', async t => {
+  // The package-owned append refusal is gone: delivery relevance is the one
+  // false-wake judge, so every host append failure stays an outbox obligation.
   const f = await fixture(t), ctx = new Context()
   const delivery = { id: 'exact', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'old decision', createdAt: Date.now(), subjects: ['task@1'], notice: { class: 'decision', dedupKey: 'fallthrough:fact' } }
-  const gate = invariantHook(message => ({ missionId: message.source.missionId, deliveryId: message.source.deliveryId, family: 'fallthrough', subjects: ['task@1'], reason: 'lineage now advances' }))
-  let proven
-  try { gate({ source: { kind: 'swarm', missionId: delivery.missionId, deliveryId: delivery.id } }) } catch (error) { proven = error }
-  assert.equal(recordAppendRefusal(proven, { ...delivery, family: 'fallthrough' }), true)
-  assert.equal(recordAppendRefusal(proven, { ...delivery, id: 'other', family: 'fallthrough' }), false)
-  assert.equal(recordAppendRefusal(Object.assign(new Error('other package'), { name: 'InvariantError', code: 'INVARIANT' }), { ...delivery, family: 'fallthrough' }), false)
-  ctx.provide('agents', { get: () => ({ session: { snapshotEvents: () => [] }, send: gate }) })
+  const refusal = Object.assign(new Error('invariant violated by "@dsh-external/dsh-agent-swarm": refusing an owner-facing fallthrough decision'), { name: 'InvariantError', code: 'INVARIANT' })
+  ctx.provide('agents', { get: () => ({ session: { snapshotEvents: () => [] }, send: () => { throw refusal } }) })
   ctx.provide('sessions', { flush: async () => {} })
   const adapter = new HarnessWorkers(ctx, { workspacesRoot: f.root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
   t.after(() => adapter.dispose())
-  await adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery)
+  await assert.rejects(adapter.deliver({ id: 'owner', missionId: f.mission.id, sessionId: 'owner' }, delivery), error => error === refusal)
 })
 
 test('R03: unrelated host invariant retains outbox identity and one durable failure until retry succeeds', async t => {

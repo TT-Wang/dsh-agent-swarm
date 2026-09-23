@@ -14,6 +14,10 @@ import { tempDirectory } from './temp-root.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+async function eventually(read, message, timeoutMs = 5000) {
+  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(5)) { const value = read(); if (value) return value }
+  assert.fail(`timed out: ${message}`)
+}
 class Workers {
   bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
@@ -181,4 +185,78 @@ test('pending stop waits remain bounded and use the same owner scope as dispatch
   assert.equal(waitsLegitimately(rt, { ...pending, reviewOf: 'missing' }, [pending, bounded]), false, 'a bounded stop does not repair a missing review source')
   const accepted = { id: 'accepted', missionId: 'mission', status: 'accepted', epoch: 1, dependencies: [] }
   assert.equal(waitsLegitimately(rt, { ...pending, dependencies: [accepted.id] }, [pending, accepted, running]), true, 'accepted prerequisites remain ready while the member is busy')
+})
+
+test('a real review rejection names its stall root exactly once, with exactly one stall-root event', async t => {
+  // 2026-09-18 review: after a real rejection the emission-time refusal refused
+  // every stall-root notice (the rejecting review, a blocked verdict record, is
+  // a dependent that is not itself a root), while the stall event was written on
+  // every tick: ~62 events and 0 deliveries. The event now exists only with its
+  // delivery row, and delivery judges the root the key names, not its dependents.
+  const f = await fixture(t, { tickMs: 10 })
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const source = f.propose('Rejected implementation')
+  const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+  await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+    title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  const rejected = f.runtime.store.get('tasks', source.id)
+  assert.equal(rejected.status, 'blocked', 'the reviewed source is blocked by the rejection')
+  await sleep(1500)
+  const key = `stall-root:${f.mission.id}:${source.id}@${rejected.epoch}`
+  const deliveries = f.stallRoots().filter(delivery => delivery.notice.dedupKey === key)
+  const events = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
+  const transitionSite = f.notices().filter(delivery => !delivery.notice?.dedupKey?.startsWith('stall-root:') && delivery.subjects?.includes(`${source.id}@${rejected.epoch}`))
+  t.diagnostic(`stall-root events ${events.length}; owner deliveries naming the rejected source: stall-root ${deliveries.length}, transition-site ${transitionSite.length} (${transitionSite.map(delivery => delivery.notice?.dedupKey).join(', ')})`)
+  assert.equal(deliveries.length, 1, `exactly one stall-root delivery: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  assert.equal(events.length, 1, `exactly one stall-root event, not one per tick: ${events.length}`)
+  assert.equal(events[0].data.taskId, source.id)
+  assert.ok(deliveries[0].deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
+})
+
+test('a pending task in preparation back-off is a bounded live wait, and a named fall-through once the bound passes without a retry', async t => {
+  // Before, any `preparationFailure` made a pending task "not legitimately
+  // waiting", so the host's own transient back-off woke the owner through the
+  // fall-through while the retry was still scheduled.
+  const f = await fixture(t)
+  const tickMs = f.runtime.config.tickMs
+  const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+  // A healthy sibling keeps the board out of the W3 stall class; research kind
+  // keeps the integration-gap diagnostic off the board.
+  const research = { kind: 'research', checks: undefined }
+  const sibling = f.propose('Healthy sibling', research)
+  await f.runtime.claim(f.actor, f.mission.id, sibling.id)
+  const backoff = f.propose('Backing off', { ...research, assigneeId: second.id })
+  // The scheduler's transient back-off (src/scheduling.ts) and then the loss of
+  // the only member it could retry on: nothing will retry once retryAt passes.
+  const retryAt = Date.now() + 400
+  f.runtime.store.transaction(() => {
+    const row = f.runtime.store.get('tasks', backoff.id)
+    row.epoch++
+    row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+    f.runtime.store.put('tasks', row)
+    const member = f.runtime.store.get('members', second.id)
+    member.phase = 'stopped'
+    f.runtime.store.put('members', member)
+  })
+  const epoch = f.runtime.store.get('tasks', backoff.id).epoch
+  const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
+  const board = () => f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(waitsLegitimately(f.runtime, f.runtime.store.get('tasks', backoff.id), board()), true, 'the back-off is a live wait')
+  await sleep(250)
+  assert.equal(named().length, 0, `no fall-through while the host's retry is scheduled: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
+  const notice = await eventually(() => named()[0], 'the overdue retry is named once the bound passes')
+  assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
+  assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
+  await sleep(100)
+  assert.equal(named().length, 1, 'named exactly once')
+  // Past the bound the back-off explains nothing: the row is judged like any
+  // other ready work, so an assignee holding a live lease is still a live wait.
+  assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), assigneeId: f.member.id }, board()), true,
+    'an expired back-off queued behind its assignee\'s live lease is not an obstacle')
+  // A failure the host will not retry stays a block cause, never a wait.
+  const { retryAt: _retryAt, ...permanent } = f.runtime.store.get('tasks', backoff.id).preparationFailure
+  assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }, board()), false)
 })
