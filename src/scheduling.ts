@@ -732,7 +732,9 @@ export class Scheduling {
    * before). A naming that did not commit (a busy writer on that tick) or was
    * skipped (the mission paused, blocked or already carrying this board's wedge
    * key) leaves the body unnamed, so the next tick retries; the durable
-   * `schedulingWedgeNotice` key makes every retry idempotent.
+   * `schedulingWedgeNotice` key makes every retry idempotent, and `closePass`
+   * clears it when a named body settles, so the next body that wedges on the
+   * same board is named as well.
    *
    * This revokes nothing: the operation queue keeps the body as the physical
    * owner until it actually returns, and a later kick is skipped until then.
@@ -774,10 +776,15 @@ export class Scheduling {
       this.noProgress.set(missionId, noProgressPasses)
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
+      // A named body that settles has spent its wedge key too: the key dedups
+      // the retried naming of that one body (`escalatedAt` keeps one naming per
+      // body), so a later body that wedges on this same board is named once.
       const mission = this.rt.store.get('missions', missionId)
-      if (progressed && mission !== undefined && (mission.schedulingStallNotice !== undefined || mission.schedulingWedgeNotice !== undefined)) {
-        delete mission.schedulingStallNotice
-        delete mission.schedulingWedgeNotice
+      const clearStall = progressed && mission?.schedulingStallNotice !== undefined
+      const clearWedge = (progressed || pass.escalatedAt !== undefined) && mission?.schedulingWedgeNotice !== undefined
+      if (mission !== undefined && (clearStall || clearWedge)) {
+        if (clearStall) delete mission.schedulingStallNotice
+        if (clearWedge) delete mission.schedulingWedgeNotice
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
       }
       if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {

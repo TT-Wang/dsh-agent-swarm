@@ -95,6 +95,50 @@ test('S1: a wedged body is not followed by refused successor passes, so the owne
   } finally { await f.cleanup() }
 })
 
+test('S1: every body that wedges is named once, also when an earlier named body left the board unchanged', async () => {
+  // Before, the durable wedge key (the board fingerprint) outlived the named
+  // body: closePass cleared it only when the board changed during that body.
+  // H's every start hangs to its bound, and the second hung body changes
+  // nothing, so the third body wedged on the board the key still named: every
+  // tick's naming was refused by the key and that wedge got no event, no owner
+  // notice and no wedged mark. A named body that settles now clears the key.
+  class HangEveryStartWorkers extends FakeWorkers {
+    names = new Map()
+    hangs = []
+    async start(spec, signal) {
+      this.started.push(spec.member.id)
+      if (this.names.get(spec.member.id) !== 'H') return
+      const hang = { from: Date.now() }
+      this.hangs.push(hang)
+      try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
+      finally { hang.to = Date.now() }
+    }
+  }
+  const workers = new HangEveryStartWorkers()
+  workers.autoIdle = true
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: 400 } })
+  try {
+    const scheduling = f.runtime.scheduling
+    const closed = []
+    const closePass = scheduling.closePass.bind(scheduling)
+    scheduling.closePass = (missionId, pass) => {
+      closed.push({ runId: pass.operationId, heldMs: Date.now() - pass.startedAt, named: pass.escalatedAt !== undefined, unchanged: f.runtime.fingerprint(missionId) === pass.fingerprintBefore })
+      return closePass(missionId, pass)
+    }
+    const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
+    workers.names.set(h.id, 'H')
+    f.propose({ title: 'Work for H', assigneeId: h.id })
+    await eventually(() => workers.hangs.length >= 3 && workers.hangs.every(hang => hang.to !== undefined) && scheduling.passes.get(f.mission.id) === undefined ? true : undefined,
+      'H\'s three hung starts settle and the start-failure limit retires it', 6_000)
+    const wedged = closed.filter(body => body.heldMs >= 300)
+    assert.equal(wedged.length, 3, `each of H's three hung starts held one body past its bound (${JSON.stringify(closed.filter(body => body.heldMs >= 100))})`)
+    assert.ok(wedged.slice(0, -1).some(body => body.unchanged), 'an earlier wedged body left the board it named unchanged')
+    const runIds = wedgeEvents(f).map(item => item.data.runId)
+    assert.deepEqual(wedged.map(body => body.named), [true, true, true], 'every wedged body was named')
+    assert.deepEqual(runIds, wedged.map(body => body.runId), 'once each, in order, by one wedge event per body')
+  } finally { await f.cleanup() }
+})
+
 test('S1: a naming whose commit fails once is retried by a later tick, and the wedge is named exactly once', async () => {
   // Before, the watchdog marked the body named before its durable write, so a
   // naming that failed on its one tick (here a real SQLite writer lock held by a
