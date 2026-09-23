@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from 'node:fs'
+import { join, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 
 export function sourceTree(text, filename = 'source.ts') {
@@ -53,6 +56,75 @@ const CODE_LITERAL = /^[a-z][a-z0-9_]*$/
 const unwrap = node => { while (node && (ts.isParenthesizedExpression(node) || ts.isNonNullExpression(node) || ts.isAsExpression(node))) node = node.expression; return node }
 const codeText = node => { node = unwrap(node); return node && ts.isStringLiteralLike(node) && CODE_LITERAL.test(node.text) ? node.text : undefined }
 const nameOf = node => node.name && (ts.isIdentifier(node.name) || ts.isStringLiteralLike(node.name)) ? node.name.text : undefined
+
+/**
+ * The class declarations of a set of sources, by name: the parent class, the
+ * constructor's parameter names (undefined when the class declares no
+ * constructor, so its arguments pass straight to the parent's) and the
+ * arguments of its `super(…)` call.
+ */
+export function errorClasses(sources) {
+  const classes = new Map()
+  for (const { text, filename } of sources) {
+    const tree = filename.endsWith('.tsx') ? ts.createSourceFile(filename, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX) : sourceTree(text, filename)
+    const visit = node => {
+      if (ts.isClassDeclaration(node) && node.name) {
+        const heritage = node.heritageClauses?.find(clause => clause.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression
+        const ctor = node.members.find(member => ts.isConstructorDeclaration(member) && member.body)
+        const superCall = ctor?.body.statements.map(item => ts.isExpressionStatement(item) && ts.isCallExpression(item.expression) && item.expression.expression.kind === ts.SyntaxKind.SuperKeyword ? item.expression : undefined).find(Boolean)
+        classes.set(node.name.text, { name: node.name.text, file: filename, parent: heritage && ts.isIdentifier(heritage) ? heritage.text : undefined,
+          params: ctor?.parameters.map(parameter => parameter.name.getText(tree)), superArgs: superCall ? [...superCall.arguments] : undefined })
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+  }
+  return classes
+}
+
+/** Whether `name` is `ancestor` or reaches it, through `classes`, as a transitive parent. */
+export function extendsClass(classes, name, ancestor) {
+  for (let at = name, seen = new Set(); at !== undefined && !seen.has(at); seen.add(at), at = classes.get(at)?.parent) if (at === ancestor) return true
+  return false
+}
+
+/**
+ * Where each named constructor parameter of `name` and of every declared
+ * ancestor comes from at a `new <name>(…)`: `{ index }` is the call's argument
+ * at that position; `{ node }` is an expression a class declaration itself
+ * passes to `super` (the code `TaskGraphAdmissionError` fixes, say). A
+ * subclass that declares no constructor inherits its parent's positions, and
+ * an ancestor parameter the subclass forwards by name keeps the subclass's
+ * position. Undefined for a class `classes` does not declare.
+ */
+export function constructorArguments(classes, name, seen = new Set()) {
+  const declared = classes.get(name)
+  if (declared === undefined || seen.has(name)) return undefined
+  seen.add(name)
+  const inherited = declared.parent === undefined ? undefined : constructorArguments(classes, declared.parent, seen)
+  if (declared.params === undefined) return inherited ?? new Map()
+  const slots = new Map()
+  for (const [parameter, slot] of inherited ?? []) {
+    if (slot.index === undefined) { slots.set(parameter, slot); continue }
+    const argument = unwrap(declared.superArgs?.[slot.index])
+    const forwarded = argument !== undefined && ts.isIdentifier(argument) ? declared.params.indexOf(argument.text) : -1
+    if (forwarded !== -1) slots.set(parameter, { index: forwarded })
+    else if (argument !== undefined) slots.set(parameter, { node: argument })
+  }
+  declared.params.forEach((parameter, index) => slots.set(parameter, { index }))
+  return slots
+}
+
+let declaredInSource
+/** `errorClasses` over every TypeScript file under src/, read once. */
+export function sourceErrorClasses() {
+  if (declaredInSource === undefined) {
+    const root = fileURLToPath(new URL('../src/', import.meta.url))
+    declaredInSource = errorClasses(readdirSync(root, { recursive: true }).filter(file => /\.tsx?$/.test(file)).sort()
+      .map(file => ({ filename: `src/${file.split(sep).join('/')}`, text: readFileSync(join(root, file), 'utf8') })))
+  }
+  return declaredInSource
+}
 
 /** The static text of a message expression: a literal, a template (quasis joined by a gap) or a `+` chain with a gap for each non-literal operand. */
 export function messageText(node, tree) {
