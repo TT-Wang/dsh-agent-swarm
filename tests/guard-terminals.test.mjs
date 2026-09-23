@@ -5,8 +5,8 @@
  * element escalates unconditionally, so a dead end is structurally impossible.
  * The chain is the ordered set of predicates a control path evaluates before it
  * can act — budget, workspace state, the attempt/lease lifecycle, per-task
- * ceilings, review admission, dispatch preconditions and (the seventh chain in
- * the same family) admission itself. When every earlier element answers "no",
+ * ceilings, review admission and dispatch preconditions (the owner-reply receipt
+ * chain is tests/owner-reply.test.mjs's). When every earlier element answers "no",
  * `terminalEscalation` names the chain and `guardTerminal` renders the coded
  * decision request that `Scheduling.escalateGuardTerminal` records durably.
  *
@@ -40,7 +40,9 @@
  *     a coded diagnostic and an executable exit, reproduced from the two real
  *     precedents (`T3b`: "resume from your own artifact `09883f3`"; `INT2`: the
  *     assembly was already in its worktree), while a legitimately self-contained
- *     task with no dependencies is not refused.
+ *     task with no dependencies is not refused. The guard refuses where a
+ *     dependency set is written (plan validation, propose, the owner's
+ *     dependency amendment); it is not a dispatch-time chain.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -193,8 +195,6 @@ test('R14: each chain terminal is total and coded', () => {
     assert.ok(terminal.exits.length > 0, `${chain} names at least one executable exit`)
     assert.deepEqual(lintRefusal(terminal.message), [], `${chain} must resolve through the refusal lint`)
   }
-  assert.equal(guardTerminal('admission').code, DEPENDENCY_ASSUMPTION_CODE,
-    'the admission chain code and the admission diagnostic code are one vocabulary')
 })
 
 test('R14: the terminal classification names the first chain that cannot progress', () => {
@@ -203,7 +203,6 @@ test('R14: the terminal classification names the first chain that cannot progres
     [{ mission: { status: 'active', workspace: 'revoked' }, tasks: [{ id: 't', status: 'pending' }], members: [{ id: 'm', status: 'idle' }] }, 'workspace'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'running', attempt: { leaseLive: false } }], members: [{ id: 'm', status: 'idle' }] }, 'attempt_lease'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', ceilingExhausted: true }], members: [{ id: 'm', status: 'idle' }] }, 'task_ceiling'],
-    [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', assumedContent: true }], members: [{ id: 'm', status: 'idle' }] }, 'admission'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'submitted', reviewSourceLive: false }], members: [{ id: 'm', status: 'idle' }] }, 'review_admission'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', dependenciesDead: true }], members: [{ id: 'm', status: 'idle' }] }, 'dispatch_preconditions'],
   ]
@@ -380,24 +379,6 @@ test('R12-F9: an owner amendment that strips the content-carrying edge is refuse
   } finally { await f.cleanup() }
 })
 
-test('R12-F9: the dispatch path is a backstop — a row admitted before the guard is refused before preparation', async () => {
-  // Admission now refuses this text at propose() (S4r-D3). The dispatch check
-  // remains as defence in depth for a row that reached the store another way
-  // (admitted before the guard existed, or written by an older process), so the
-  // member is never prepared from the bare baseline.
-  const f = await setup({ config: { tickMs: 10 } })
-  try {
-    f.workers.autoIdle = true
-    const task = injectLegacyTask(f, { id: 'task_legacy_assumed', title: 'Legacy assumed work', objective: 'Resume from your own artifact `09883f3` and finish the guard.', createdAt: 1 })
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dependency_assumption_missing\]/.test(delivery.content)),
-      'the admission decision request must reach the owner', 8_000)
-    assert.deepEqual(lintRefusal(notice.content), [])
-    assert.equal(f.workers.prepared.filter(item => item.taskId === task.id).length, 0, 'no preparation ran on the bare baseline')
-    assert.equal(f.runtime.store.get('tasks', task.id).status, 'pending', 'the task stays admitted and repairable, never dispatched')
-  } finally { await f.cleanup() }
-})
-
 test('R14 runtime (workspace chain): a revoked workspace escalates with the coded workspace terminal', async () => {
   const f = await setup({ config: { tickMs: 10 } })
   try {
@@ -476,47 +457,28 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
  * S4r — the four defects the independent verification reproduced.
  * ------------------------------------------------------------------------- */
 
-/**
- * Put a task row straight into the store, the way a legacy row admitted before
- * the R12-F9 guard existed reaches the dispatch sweep. Admission refuses the
- * text at propose() now, so this is the only way to exercise the dispatch
- * backstop and the non-starvation guarantee it owes.
- */
-function injectLegacyTask(f, overrides) {
-  const seed = f.propose({ title: 'Seed row', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.reviewer.id })
-  const row = { ...f.runtime.store.get('tasks', seed.id), ...overrides, status: 'pending', attempt: undefined, epoch: 0 }
-  f.runtime.store.transaction(() => f.runtime.store.put('tasks', row))
-  return row
-}
-
-test('S4r-D1 pair (admission guard x dispatch sweep): an assumed-content task must not starve its member', async () => {
-  // The verifier's reproduction: `continue` skipped the member's whole iteration
-  // and only `tasks[0]` was ever considered, so an ineligible head task starved
-  // every later ready task on that member forever. The pair is the point: the
-  // admission guard is individually correct and the sweep is individually
-  // correct; together they were a trap.
+test('R12-F9 has no dispatch half: the sweep dispatches the first ready task as admitted and escalates nothing about its text', async () => {
+  // The dispatch-time re-check of objective prose existed only for rows admitted
+  // before the guard, and its co-firing with the sweep was the S4r-D1 wedge.
+  // Every write of a dependency set is refused at its own call now, so dispatch
+  // reads no prose: a stored row whose text resumes from prior work is prepared
+  // and dispatched like any other ready task, and no guard terminal names it.
   const f = await setup({ config: { tickMs: 10 } })
   try {
     f.workers.autoIdle = true
-    // The ineligible head is injected directly: propose() now refuses this text
-    // (S4r-D3), so the sweep's non-starvation guarantee is proven against the
-    // legacy-row backstop, which is exactly the row the verifier reproduced with.
-    const head = injectLegacyTask(f, { id: 'task_assumed_head', title: 'Assumed head', objective: 'Resume from your own artifact `09883f3` and finish the guard.', assigneeId: f.author.id, createdAt: 1 })
-    const second = f.propose({ title: 'Self-contained second', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.author.id })
-    await eventually(() => f.runtime.store.get('tasks', second.id).status === 'running' ? true : undefined,
-      'the self-contained task must be dispatched even though an assumed-content task is ahead of it', 8_000)
-    assert.equal(f.runtime.store.get('tasks', head.id).status, 'pending', 'the ineligible head stays admitted and repairable')
-    assert.equal(f.runtime.store.get('tasks', head.id).attempt, undefined, 'the ineligible head is never given an attempt')
-    assert.equal(f.workers.prepared.filter(item => item.taskId === head.id).length, 0, 'the ineligible head is never prepared')
-    assert.ok(f.workers.prepared.some(item => item.taskId === second.id), 'the later task really was prepared and dispatched')
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dependency_assumption_missing\]/.test(delivery.content)),
-      'the ineligible head still escalates once', 8_000)
-    assert.deepEqual(lintRefusal(notice.content), [])
+    const seed = f.propose({ title: 'Seed row', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.author.id })
+    const stored = { ...f.runtime.store.get('tasks', seed.id), objective: 'Resume from your own artifact `09883f3` and finish the guard.' }
+    f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
+    await eventually(() => f.runtime.store.get('tasks', seed.id).status === 'running' ? true : undefined,
+      'the stored row is dispatched as admitted', 8_000)
+    assert.ok(f.workers.prepared.some(item => item.taskId === seed.id), 'the row was prepared')
+    assert.equal(events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.code === DEPENDENCY_ASSUMPTION_CODE).length, 0,
+      'no dispatch-time escalation reads the objective')
+    assert.equal(f.workers.deliveries.filter(delivery => /\[dependency_assumption_missing\]/.test(delivery.content)).length, 0)
   } finally { await f.cleanup() }
 })
 
-test('S4r-D3: the admission guard refuses at propose() and at plan validation, not only at dispatch', async () => {
+test('S4r-D3: the admission guard refuses at propose() and at plan validation', async () => {
   const f = await setup({ config: { tickMs: 10 } })
   try {
     // T3b precedent, at the production call shape: propose() must refuse it.

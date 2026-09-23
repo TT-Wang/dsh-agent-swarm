@@ -243,8 +243,8 @@ export class RefusalRegistry {
  * structurally impossible". A *guard chain* is the ordered set of predicates a
  * control path evaluates before it can act: budget, workspace state, the
  * attempt/lease lifecycle, per-task ceilings, review admission, dispatch
- * preconditions and admission itself (the seventh chain in the same family,
- * R12-F9). The *terminal element* is what happens when every predicate
+ * preconditions and the owner's reply to a delivered question. The *terminal
+ * element* is what happens when every predicate
  * before it answers "no": it must be an unconditional escalation that emits a
  * durable decision request naming the executable exits. It has no conditions of
  * its own — it cannot be skipped, deduplicated away into silence, or left
@@ -253,16 +253,18 @@ export class RefusalRegistry {
  * board fingerprint.
  *
  * `guardTerminal` is the single builder of those requests, so the dispatch path
- * that emits them, the test-side board model in `tests/guard-model.mjs`, the
- * admission guard in `src/admission.ts` and the property test in
- * `tests/guard-terminals.test.mjs` all speak one vocabulary.
+ * that emits them, the test-side board model in `tests/guard-model.mjs` and the
+ * property test in `tests/guard-terminals.test.mjs` all speak one vocabulary.
+ * The R12-F9 dependency-assumption guard is not a chain: it refuses at the call
+ * that writes a dependency set (plan validation, propose, the owner amendment),
+ * so no admitted task reaches dispatch in that state.
  * Every message carries a stable `[diagnostic_code]`, an imperative next step
  * and backticked parameters that resolve in the real tool schema — the refusal
  * lint (`tests/refusal-inventory.mjs`) is run over every one of them.
  * ------------------------------------------------------------------------- */
 
 /** The seven control-path chains whose terminal element must escalate. */
-export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'admission' | 'owner_reply'
+export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
 export interface DecisionExit {
@@ -296,10 +298,6 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   task_ceiling: 'task_ceiling_terminal',
   review_admission: 'review_admission_terminal',
   dispatch_preconditions: 'dispatch_terminal',
-  // One vocabulary entry for the admission guard, which is the terminal element
-  // of the seventh chain in the same family (R12-F9): the code is authored in
-  // src/admission.ts and tests/guard-terminals.test.mjs asserts the two match.
-  admission: 'dependency_assumption_missing',
   // L2: the owner was asked a question and closed the turn in prose, so the
   // answer never reached the asker. The chain names the receipt, not the model.
   owner_reply: 'owner_reply_missing',
@@ -321,7 +319,6 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     workspace: `[workspace_terminal] ${task} cannot prepare its workspace (${described(context, 'workspace state is unresolved')}). Repair the condition, then use \`swarm_control\` with \`taskId\`, \`action: resume\` and \`reason\`; or amend the same task's scope/dependencies/assignee with \`action: amend\` and \`changes\`.`,
     attempt_lease: `[attempt_terminal] ${task} cannot advance (${described(context, 'the lease or workspace guard refused it')}). The owner can use \`swarm_control\` with \`taskId\`, \`action: amend\`, \`changes.assigneeId\` and \`reason\` to fence and reassign it, or \`action: resume\` after repair. No member attemptId is required.`,
     task_ceiling: context.taskId === undefined ? `[task_ceiling_terminal] Mission admission reached its allocation (${described(context, 'admission budget')}). Review the need and use \`swarm_budget\` with a finite raised \`budget\` and \`reason\`, then retry the original admission.` : `[task_ceiling_terminal] ${task} reached its execution estimate (${described(context, 'step limit')}). Review progress, then raise its finite allocation with \`swarm_budget\` using \`taskId\`, \`taskBudget\` and \`reason\`. Raise the mission budget first if needed. Preserve this task, its consumption, dependencies and evidence; no replacement is needed.`,
-    admission: `[dependency_assumption_missing] ${task} declares no dependency while its text assumes prior work is already available (${described(context, 'the worktree would be prepared from the bare mission baseline')}), so the work starts without the content it needs. ${context.taskId === undefined ? 'Correct the proposal with `swarm_propose` by passing the content-carrying `dependencies`, or state in `objective` how the work will obtain that content.' : 'Amend this admitted task with `swarm_control` using `taskId`, `action: amend`, `changes.dependencies` and `reason` to name the task carrying the required content.'} Preserve the acceptance criteria and consumed work.`,
     review_admission: `[review_admission_terminal] Submitted work ${task} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`acceptance\`, or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`,
     owner_reply: `[owner_reply_missing] An owner-facing question was delivered and the owner's turn ended without binding an answer to it (${described(context, 'the receipt is still open')}). Answer it with \`swarm_message\` by passing \`to\`, \`kind: 'question'\`, the answer in \`content\` and the asked question's id in \`replyTo\`, or close it deliberately with \`dismiss: true\` and a \`replyTo\`; prose in the conversation is never delivered to the asker.`,
     dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`. Extend resource allocations with \`swarm_budget\`; amend an unsubmitted task or resume it after environment repair with \`swarm_control\` and its \`taskId\`. Rejected implementations require \`swarm_propose\` with \`replaces\`; the repair inherits its acceptance. Withdraw mistaken work with \`swarm_cancel\`, or decide to complete or stop with \`swarm_control\` and its \`action\`.`,
@@ -345,12 +342,6 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     ] : [
       { tool: 'swarm_budget', parameter: 'taskBudget', instruction: 'raise the finite allocation of this taskId' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the exhausted task' },
-    ],
-    admission: context.taskId === undefined ? [
-      { tool: 'swarm_propose', parameter: 'dependencies', instruction: 'add the dependency that carries the assumed content' },
-      { tool: 'swarm_propose', parameter: 'objective', instruction: 'state how the proposed work will obtain the required content' },
-    ] : [
-      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend the admitted task with changes.dependencies and a reason' },
     ],
     review_admission: [
       { tool: 'swarm_propose', parameter: 'reviewOf', instruction: 'admit an independent verification task' },

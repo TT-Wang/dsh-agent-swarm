@@ -9,8 +9,12 @@
  * the transition relation and the documented limits are unchanged.
  */
 
-/** The seven control-path chains whose terminal element must escalate. */
-export const CHAINS = ['budget', 'workspace', 'attempt_lease', 'task_ceiling', 'review_admission', 'dispatch_preconditions', 'admission']
+/**
+ * The control-path chains the board model classifies. `owner_reply`, the
+ * seventh `GuardChainId`, is a receipt chain with no board state here; its
+ * terminal is exercised by tests/owner-reply.test.mjs.
+ */
+export const CHAINS = ['budget', 'workspace', 'attempt_lease', 'task_ceiling', 'review_admission', 'dispatch_preconditions']
 
 export const TASK_STATUS = ['pending', 'running', 'submitted', 'blocked', 'accepted', 'cancelled']
 export const ATTEMPTS = [{ label: 'no-attempt' }, { label: 'live-attempt', attempt: { leaseLive: true } }, { label: 'lapsed-attempt', attempt: { leaseLive: false } }]
@@ -27,7 +31,6 @@ export const FLAGS = [
   { label: 'plain' },
   { label: 'ceiling-exhausted', ceilingExhausted: true },
   { label: 'preparation-exhausted', preparationExhausted: true },
-  { label: 'assumed-content', assumedContent: true },
   { label: 'review-dead', reviewOf: 'task_source', reviewSourceLive: false },
   { label: 'review-live', reviewOf: 'task_source', reviewSourceLive: true },
   { label: 'dependency-unsatisfied', dependenciesSatisfied: false },
@@ -44,7 +47,6 @@ export const flagFields = flag => {
   const fields = {}
   if (flag.ceilingExhausted) fields.ceilingExhausted = true
   if (flag.preparationExhausted) fields.preparationExhausted = true
-  if (flag.assumedContent) fields.assumedContent = true
   if (flag.dependenciesSatisfied === false) fields.dependenciesSatisfied = false
   if (flag.dependenciesDead === true) fields.dependenciesDead = true
   if (flag.reviewOf !== undefined) { fields.reviewOf = flag.reviewOf; fields.reviewSourceLive = flag.reviewSourceLive }

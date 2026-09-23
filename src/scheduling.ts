@@ -7,7 +7,6 @@
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { dependencyAssumptions } from './admission.ts'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
@@ -206,33 +205,11 @@ export class Scheduling {
           }
           const all = view.tasks
           const ready = all.filter(t => view.ready(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
-          // R12-F9, dispatch-time half: a task whose own text assumes prior work
-          // is already in the worktree while no content-carrying edge provides it
-          // would be prepared from the bare mission baseline and surprise the
-          // member at submit (T3b lost a cycle to "Artifact changes path outside
-          // task scope"; INT2 was repaired by hand). The admission-time call site
-          // refuses it at propose()/plan validation; this is the last guard before
-          // preparation.
-          //
-          // S4r-D1: the ineligible task is removed from THIS member's candidate
-          // set before the first candidate is chosen. Skipping the member's whole
-          // iteration here used to starve every later ready task on that member
-          // forever — the admission guard and the dispatch sweep co-firing into a
-          // trap, exactly the pair class this round is about. One escalation per
-          // ineligible task, and the sweep still dispatches the next ready task.
-          // A review's source is prepared into the worktree like a dependency
-          // (`prepareTask` receives it as the review source), so it is a
-          // content-carrying edge too.
-          const ineligible: Array<{ task: Task; detail: string }> = []
-          const candidates = ready.filter(candidate => {
-            const carryingEdges = [...candidate.dependencies, ...(candidate.reviewOf === undefined ? [] : [candidate.reviewOf])]
-            const assumptions = dependencyAssumptions({ objective: candidate.objective, acceptance: candidate.acceptance, dependencies: carryingEdges, replaces: candidate.replaces }, `task ${JSON.stringify(candidate.id)}`)
-            if (!assumptions.length) return true
-            ineligible.push({ task: candidate, detail: assumptions.map(item => `${item.location}: ${item.message}`).join(' ') })
-            return false
-          })
-          for (const refused of ineligible) this.escalateGuardTerminal(missionId, 'admission', { taskId: refused.task.id, detail: refused.detail })
-          const task = candidates[0]
+          // R12-F9 (a task whose text assumes prior work no content-carrying edge
+          // provides) is refused where a dependency set is written: plan
+          // validation, propose() and the owner's `changes.dependencies`
+          // amendment. Dispatch takes the first ready task as admitted.
+          const task = ready[0]
           if (!task) continue
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
@@ -351,16 +328,12 @@ export class Scheduling {
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       if (eligible.some(member => this.startBlocker(member) === undefined)) {
-        const edges = [...task.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])]
-        const assumptions = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: edges, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`)
         const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
         const startable = eligible.filter(member => this.startBlocker(member) === undefined)
         const isolated = startable.filter(member => !issues.some(issue => issue.memberIds.includes(member.id)))
-        const detail = assumptions.length
-          ? `Its dependency assumptions require repair: ${assumptions.map(item => item.message).join(' ')} Amend this task with explicit content-carrying dependencies using swarm_control(taskId: "${task.id}", action: "amend", changes: { dependencies: [...] }, reason: "dependency repaired").`
-          : isolated.length === 0
-            ? `Workspace isolation prevents dispatch: ${issues.filter(issue => startable.some(member => issue.memberIds.includes(member.id))).map(issue => issue.message).join(' ')} Inspect the named members and repair their isolated workspaces before retrying.`
-            : 'An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.'
+        const detail = isolated.length === 0
+          ? `Workspace isolation prevents dispatch: ${issues.filter(issue => startable.some(member => issue.memberIds.includes(member.id))).map(issue => issue.message).join(' ')} Inspect the named members and repair their isolated workspaces before retrying.`
+          : 'An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.'
         return { task, subjects, dedupKey,
           message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. ${detail}` }
       }

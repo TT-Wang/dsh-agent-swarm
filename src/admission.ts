@@ -342,9 +342,9 @@ export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[]
  */
 export function reconcileTaskAdmission(task: DependencyAssumptionInput, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
   const diagnostics: AdmissionDiagnostic[] = []
-  // R12-F9, admission-time half: the terminal element of the admission chain.
-  // It fires only when the caller supplies the task's dependency set, so a call
-  // site that does not know the edges can never refuse a legitimate task.
+  // R12-F9: refused where the dependency set is written (there is no dispatch
+  // half). It fires only when the caller supplies the task's dependency set, so
+  // a call site that does not know the edges can never refuse a legitimate task.
   diagnostics.push(...dependencyAssumptions(task, location, context))
   // DEAD, admission-time half: the same graph validator the replay path runs.
   // It fires only when the caller supplies the mission's durable identities —

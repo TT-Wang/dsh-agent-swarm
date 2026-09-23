@@ -41,9 +41,13 @@
  * reconstructed here from durable rows through the production projection
  * (`guardBoard` in tests/guard-model.mjs) and must classify as 0 dead ends and
  * exactly 4 owner-gated. Over the whole reachable closure the corrected
- * (task-scoped) census reports **60 recoverable / 12740 owner-gated / 0 dead
- * ends**; before the D1 fix it reported 86/12714/0, the difference being the
- * states whose only "action" was an unrelated member's `working` status. The
+ * (task-scoped) census reports **52 recoverable / 11148 owner-gated / 0 dead
+ * ends** over six board chains (60/12740/0 while the R12-F9 dependency guard
+ * was a seventh, dispatch-time `admission` chain with its own `assumed-content`
+ * seed; that guard now refuses at the call that writes a dependency set, so the
+ * seed and its states are gone); before the D1 fix it reported 86/12714/0, the
+ * difference being the states whose only "action" was an unrelated member's
+ * `working` status. The
  * *discriminating* number is the owner-gated count (0 dead ends is structural:
  * the terminal element of every chain is unconditional).
  *
@@ -396,7 +400,8 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     // member-scoped liveness and adds dispatch eligibility for a pending task;
     // the fixed census may therefore move OWNER-GATED -> RECOVERABLE for a
     // pending task, but it must NEVER move RECOVERABLE -> OWNER-GATED — which is
-    // exactly what the pre-D1 census does, 24 times (the verifier's 24 of 86).
+    // exactly what the pre-D1 census does, 21 times (the verifier's 24 of 86,
+    // measured while the `assumed-content` seed was still part of the closure).
     const reachable = reachableClosure()
     const forceIdle = board => ({ ...board, members: board.members.map(member => member.status === 'stopped' ? member : { ...member, status: 'idle' }) })
     const outcomes = (board, fn) => fn(board).perTask.map(entry => entry.outcome).join(',')
