@@ -285,17 +285,16 @@ test('DEAD non-vacuity: the classifier returns DEAD END under the documented mut
 })
 
 test('DEAD pair: the same graph validator refuses an illegal graph at admission and on replay', () => {
-  const workspace = '/tmp/dead-census-workspace'
   const location = 'task'
   const source = { objective: 'Implement the scoped change in src/admission.ts.', scope: ['src/'], acceptance: ['the graph is validated'] }
   // Admission: the same defect the replay path refuses.
-  const dangling = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, workspace, location, { dependencies: ['task_never_admitted'], knownContents: new Set(['task_real']) })
+  const dangling = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, location, { dependencies: ['task_never_admitted'], knownContents: new Set(['task_real']) })
   const danglingDefects = dangling.filter(diagnostic => diagnostic.code.startsWith('task_graph'))
   assert.equal(danglingDefects.length, 1, `admission must refuse the dangling edge, saw ${JSON.stringify(dangling)}`)
   assert.equal(danglingDefects[0].code, 'task_graph_unknown_edge')
   assert.match(danglingDefects[0].message, /swarm_propose/, 'the admission diagnostic names an executable exit')
   // A known dependency is graph-legal: the validator does not double-refuse.
-  const legal = reconcileTaskAdmission({ ...source, dependencies: ['task_real'] }, workspace, location, { dependencies: ['task_real'], knownContents: new Set(['task_real']) })
+  const legal = reconcileTaskAdmission({ ...source, dependencies: ['task_real'] }, location, { dependencies: ['task_real'], knownContents: new Set(['task_real']) })
   assert.deepEqual(legal.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'a known edge is admitted')
   // Co-firing guards, named and shown disjoint rather than double-refusing:
   //  - the R12-F9 admission guard (a task whose text assumes prior work while it
@@ -306,15 +305,15 @@ test('DEAD pair: the same graph validator refuses an illegal graph at admission 
   //  - cancellation and replacement lineage are the runtime's own guards: a
   //    `replaces` id is not a graph edge, and a cancelled dependency is a known
   //    identity, so the graph validator stays silent for both.
-  const assumed = reconcileTaskAdmission({ objective: 'Resume from your own artifact `09883f3` and finish it.', scope: ['src/'], acceptance: ['works'], dependencies: [] }, workspace, location,
+  const assumed = reconcileTaskAdmission({ objective: 'Resume from your own artifact `09883f3` and finish it.', scope: ['src/'], acceptance: ['works'], dependencies: [] }, location,
     { dependencies: [], replaces: [], knownContents: new Set(['task_real']) })
   assert.ok(assumed.some(diagnostic => diagnostic.code === 'dependency_assumption_missing'), 'the R12-F9 guard fires on an empty edge set')
   assert.deepEqual(assumed.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'and the graph validator stays silent there')
   assert.deepEqual(dangling.filter(diagnostic => diagnostic.code === 'dependency_assumption_missing'), [], 'the R12-F9 guard stays silent on a dangling edge')
-  const repair = reconcileTaskAdmission({ ...source, dependencies: [], replaces: ['task_blocked'] }, workspace, location, { dependencies: [], replaces: ['task_blocked'], knownContents: new Set(['task_blocked']) })
+  const repair = reconcileTaskAdmission({ ...source, dependencies: [], replaces: ['task_blocked'] }, location, { dependencies: [], replaces: ['task_blocked'], knownContents: new Set(['task_blocked']) })
   assert.deepEqual(repair.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'a `replaces` lineage is not a graph edge')
   // A call site that does not know the mission's identities must never guess.
-  const blind = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, workspace, location, { dependencies: ['task_never_admitted'] })
+  const blind = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, location, { dependencies: ['task_never_admitted'] })
   assert.deepEqual(blind.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'without known identities the graph guard cannot judge an edge and stays silent')
 
   // Replay: the same defects, from a durable log, refused before any command.

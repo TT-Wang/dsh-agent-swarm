@@ -1606,10 +1606,11 @@ export class SwarmRuntime {
       if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
     }
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
-    // D1: reconcile the objective's write directives with the task scope and the
-    // named deliverables with the effective ignore rules at the production
-    // admission point, so a plan error is rejected here instead of at submit.
-    const reconciliation = reconcileTaskAdmission({ objective: input.objective, scope: input.scope, acceptance: input.acceptance }, mission.workspace, 'task', {
+    // D1: the admission refusals (an assumed dependency, a dangling graph edge)
+    // at the production admission point, so a plan error is rejected here
+    // instead of at submit. The scope and ignore-rule hints are advisory and
+    // belong to the draft UI (`planAdvisories`); nothing here would read them.
+    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance: input.acceptance }, 'task', {
       // R12-F9: the guard needs the content-carrying edges (the declared
       // dependencies plus a review source, which `prepareTask` merges into the
       // worktree like a dependency) and the durable identities this mission
@@ -1619,7 +1620,6 @@ export class SwarmRuntime {
       replaces: input.replaces,
       knownContents: new Set(this.store.list('tasks', missionId).map(task => task.id)),
     })
-    const refused = reconciliation.filter(item => item.severity !== 'advisory')
     if (refused.length) throw new Error(refused.map(formatDiagnostic).join('\n'))
     const stream = this.store.get('workstreams', input.workstreamId)
     if (!stream || stream.missionId !== missionId) throw new Error('Unknown workstream')

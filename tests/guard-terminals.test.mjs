@@ -296,7 +296,7 @@ test('R12-F9: the admissibility guard fires on the two real precedents', () => {
   const t3b = reconcileTaskAdmission({
     objective: 'Resume from your own artifact `09883f3` and finish the guard chain.',
     scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
-  }, '/workspace', 'task')
+  }, 'task')
   assert.equal(t3b.length, 1, 'the T3b precedent must be refused')
   assert.equal(t3b[0].code, DEPENDENCY_ASSUMPTION_CODE)
   assert.ok(t3b[0].message.includes('09883f3'), 'the diagnostic names the artifact it objects to')
@@ -324,7 +324,7 @@ test('R12-F9: a legitimately self-contained task is not refused, and a declared 
   const selfContained = reconcileTaskAdmission({
     objective: 'Implement the guard in src/admission.ts and cover it in tests/guard-terminals.test.mjs.',
     scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
-  }, '/workspace', 'task')
+  }, 'task')
   assert.deepEqual(selfContained, [], 'a self-contained task with no dependencies is admitted')
 
   // A factual sentence about the baseline is not a claim about prepared content.
