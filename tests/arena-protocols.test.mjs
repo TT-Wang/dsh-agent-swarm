@@ -148,8 +148,13 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   const propose = definitions(f.runtime).get('swarm_propose')
   const alice = execution(f.alice.sessionId)
   for (let index = 0; index < 6; index++) await propose.execute(proposal(f, { title: `Ledger task ${index}` }), alice)
-  // Trigger the refusal synchronously so the outbox has not drained yet: the
-  // same call through the tool awaits a trace write, which lets setImmediate run.
+  // Let the outbox deliver what the proposals queued, so every pending row below
+  // belongs to the refusal. This used to happen implicitly: each tool call awaited
+  // a trace payload file write, and that I/O yielded to the scheduler pass. The
+  // trace now records only the digest, so the wait is stated instead of implied.
+  await eventually(() => f.runtime.store.list('deliveries', f.mission.id).every(delivery => delivery.deliveredAt !== undefined), 'the proposals\' deliveries never drained')
+  // Trigger the refusal synchronously so the outbox has not drained its notice yet:
+  // the same call through the tool would yield to the scheduler before the read.
   assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger over capacity' })), /task budget exhausted/)
 
   // Synchronous read: the notice is recorded and queued, not yet delivered.
