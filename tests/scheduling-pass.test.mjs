@@ -271,6 +271,130 @@ test('S1/R17-G5: a named body\'s own commits never publish with the wedged branc
   } finally { await f.cleanup() }
 })
 
+test('S1/R17-G5: a start that fails past the bound stamps the body before it commits the failure, so no dispatch question is asked about the next member\'s ready task', async () => {
+  // Before, the body stamped its progress only once startWorker's promise had
+  // settled, but startWorker commits the start failure (onStartFailure) before
+  // that. The failure's publication read a stamp from before the hung start,
+  // took the wedged branch and asked "has an eligible idle member but was not
+  // dispatched this tick" about task T, which the next body dispatched a few
+  // milliseconds later. Live work keeps the body live inside its release
+  // bound, so the watchdog never names it.
+  const startBoundMs = 400
+  class HangOnceWorkers extends FakeWorkers {
+    names = new Map()
+    hangH = false
+    hang
+    async start(spec, signal) {
+      this.started.push(spec.member.id)
+      if (this.names.get(spec.member.id) !== 'H' || !this.hangH) return
+      this.hangH = false
+      this.hang = { from: Date.now() }
+      try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
+      finally { this.hang.to = Date.now() }
+    }
+  }
+  const workers = new HangOnceWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, workerStartTimeoutMs: startBoundMs, attemptSilenceBoundMs: 0 } })
+  try {
+    const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
+    const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    workers.names.set(h.id, 'H')
+    workers.idle.add(f.author.id)
+    const live = f.propose({ title: 'Live work' })
+    await eventually(() => taskOf(f.runtime, live.id).status === 'running' ? true : undefined, 'the live work dispatches', 4_000)
+    workers.idle.delete(f.author.id)
+    workers.idle.add(h.id); workers.idle.add(b.id)
+    await sleep(60)
+    // One synchronous step: the next body waits in H's start, and T is ready for B, swept after H.
+    workers.hangH = true
+    const t = f.propose({ title: 'T for B', assigneeId: b.id })
+    await eventually(() => taskOf(f.runtime, t.id).status === 'running' ? true : undefined, 'T dispatches', 4_000)
+    await sleep(100)
+    const failed = events(f.runtime, f.mission.id, 'member/resume-failed').find(item => item.data.memberId === h.id)
+    assert.ok(workers.hang?.to !== undefined && failed !== undefined, 'H\'s start hung and its failure was committed')
+    const heldMs = workers.hang.to - workers.hang.from
+    assert.ok(heldMs >= 100 && heldMs < 100 + 20_000, `the start failed between the pass bound and the release bound (${heldMs}ms)`)
+    assert.deepEqual(wedgeEvents(f), [], 'live work kept the body live: it was never named')
+    const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${t.id}@`))
+    assert.deepEqual(questions.map(item => item.content), [], 'no dispatch question is asked about T, which the sweep dispatched')
+  } finally { await f.cleanup() }
+})
+
+test('S1/R17-G5: a recovery fallback reported from inside the body\'s preparation stamps the body before it commits, so no dispatch question is asked about the task being prepared', async () => {
+  // The adapter reports a recovery fallback from inside prepareTask, and the
+  // runtime commits it at once. Before, that commit published against the
+  // stamp from before the preparation: past the bound it took the wedged
+  // branch and asked about T, the very task the body was preparing.
+  class SlowRecoveryWorkers extends FakeWorkers {
+    slowFor
+    async prepareTask(member, task) {
+      if (member.id === this.slowFor) {
+        this.slowFor = undefined
+        await sleep(150)
+        this.callbacks.recoveryFallback({ missionId: member.missionId, taskId: task.id, epoch: task.epoch, memberId: member.id, previousOwnerId: 'member_previous', commit: 'c'.repeat(40), preserved: true, reason: 'capture refused' })
+      }
+      return super.prepareTask(member, task)
+    }
+  }
+  const workers = new SlowRecoveryWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  try {
+    const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    workers.idle.add(f.author.id)
+    const live = f.propose({ title: 'Live work' })
+    await eventually(() => taskOf(f.runtime, live.id).status === 'running' ? true : undefined, 'the live work dispatches', 4_000)
+    workers.idle.delete(f.author.id)
+    workers.idle.add(b.id)
+    await sleep(60)
+    workers.slowFor = b.id
+    const t = f.propose({ title: 'T for B', assigneeId: b.id })
+    await eventually(() => taskOf(f.runtime, t.id).status === 'running' ? true : undefined, 'T dispatches', 4_000)
+    await sleep(50)
+    assert.equal(events(f.runtime, f.mission.id, 'task/recovery-fallback').length, 1, 'the fallback was committed from inside the preparation')
+    assert.deepEqual(wedgeEvents(f), [], 'live work kept the body live: it was never named')
+    const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${t.id}@`))
+    assert.deepEqual(questions.map(item => item.content), [], 'no dispatch question is asked about T, which the body was preparing')
+  } finally { await f.cleanup() }
+})
+
+test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush, so a flush past the bound asks no dispatch question', async () => {
+  // Before, the pass-end flushOutbox awaited workers.deliver without stamping
+  // the body. Deliveries that carried it past its bound published their
+  // deliveredAt commits against the stamp of the last member boundary: the
+  // wedged branch skipped the rule that an all-busy board is working and named
+  // B's busy handle as the holder of T.
+  class SlowOwnerWorkers extends FakeWorkers {
+    slowOwnerMs = 0
+    async deliver(member, delivery) {
+      if (member.id === 'owner' && this.slowOwnerMs > 0) await sleep(this.slowOwnerMs)
+      return super.deliver(member, delivery)
+    }
+  }
+  const workers = new SlowOwnerWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  try {
+    // Only the body delivers: the queue-external pump is off.
+    f.runtime.notices.pumpOutbox = () => {}
+    const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    workers.idle.add(f.author.id)
+    const live = f.propose({ title: 'Live work' })
+    const t = f.propose({ title: 'T for busy B', assigneeId: b.id })
+    await eventually(() => taskOf(f.runtime, live.id).status === 'running' ? true : undefined, 'the live work dispatches', 4_000)
+    workers.idle.delete(f.author.id)
+    await sleep(300)
+    workers.slowOwnerMs = 60
+    const startedAt = Date.now()
+    for (const n of [1, 2, 3]) f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, `Owner fact ${n}`, [`mission:${f.mission.id}`], { from: 'runtime', dedupKey: `flush-fact-${n}` }))
+    f.runtime.kick(f.mission.id)
+    const last = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(item => item.content === 'Owner fact 3' && item.deliveredAt !== undefined), 'the body delivers the three facts', 4_000)
+    assert.ok(last.deliveredAt - startedAt >= 100, `the flush carried the body past its bound (${last.deliveredAt - startedAt}ms)`)
+    await sleep(50)
+    assert.equal(taskOf(f.runtime, t.id).status, 'pending', 'T waits for B\'s busy handle')
+    const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${t.id}@`))
+    assert.deepEqual(questions.map(item => item.content), [], 'no question: every eligible handle is busy, so the board is working')
+  } finally { await f.cleanup() }
+})
+
 test('S1/R17-G5: a worker turn the body woke inside an adapter call keeps committing, but only the body\'s own progress keeps it live, so the wedge publishes and the owner is asked about new work', async () => {
   // The real adapter's isIdle drains a stranded inbox item by waking a Harness
   // turn, which runs in the caller's async context. Called from the body's

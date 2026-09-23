@@ -309,7 +309,7 @@ export class SwarmRuntime {
   /** Deferred bodies in flight; shutdown drains them within the declared pass bound. */
   private readonly operations = new Set<Promise<unknown>>()
   private readonly startControllers = new Map<string, AbortController>()
-  private readonly workerStarts = new Map<string, { controller: AbortController; promise: Promise<void>; retryAfter?: number; nativePending?: boolean; admissionSignal?: AbortSignal }>()
+  private readonly workerStarts = new Map<string, { controller: AbortController; promise: Promise<void>; retryAfter?: number; nativePending?: boolean; admissionSignal?: AbortSignal; bodies?: SchedulingPass[] }>()
   private disposal?: Promise<void>
   
   
@@ -358,7 +358,7 @@ export class SwarmRuntime {
   isMissionTerminal(mission: Mission): boolean { return terminal(mission) }
   // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
   assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } { return this.workspaceAdmission.assertAuthorizedRoot(workspace, grantRoot, source) }
-  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): Promise<void> { return this.workspaceAdmission.assertWorkspaceAuthorized(mission) }
+  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> { return this.workspaceAdmission.assertWorkspaceAuthorized(mission, pass) }
   fenceWorkspace(missionId: string, reason: string): void { return this.workspaceAdmission.fenceWorkspace(missionId, reason) }
   deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined { return this.workspaceAdmission.deniedGitWrite(input) }
   tempRendezvous(memberId: string, taskId: string, input: { tool: string; arguments: unknown }): { path: string; first: TempMention; second: TempMention } | undefined { return this.workspaceAdmission.tempRendezvous(memberId, taskId, input) }
@@ -438,7 +438,7 @@ export class SwarmRuntime {
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
   private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
-  async flushOutbox(missionId: string): Promise<void> { return this.notices.flushOutbox(missionId) }
+  async flushOutbox(missionId: string, pass?: SchedulingPass): Promise<void> { return this.notices.flushOutbox(missionId, pass) }
   pumpOutbox(): void { return this.notices.pumpOutbox() }
 
   /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
@@ -3930,6 +3930,11 @@ export class SwarmRuntime {
    */
   onRecoveryFallback(info: RecoveryFallback): void {
     if (this.closed) return
+    // The report arrives from inside a `prepareTask` call. When the scheduling
+    // body awaiting it marked this member (`SchedulingPass.preparing`), the
+    // body stamps its progress before the report commits.
+    const body = this.scheduling.passes.get(info.missionId)
+    if (body?.preparing === info.memberId) progressed(body)
     const names = (memberId: string) => this.store.get('members', memberId)?.name ?? memberId
     const previous = names(info.previousOwnerId)
     const content = info.preserved
@@ -4194,14 +4199,23 @@ export class SwarmRuntime {
       this.defer(async () => { try { await this.startWorker(mission, member) } catch { /* recorded once by startWorker */ } })
     }
   }
-  /** One bounded startup per member, shared by admission, recovery and dispatch. */
-  startWorker(mission: Mission, member: Member, options: { admission?: boolean; signal?: AbortSignal } = {}): Promise<void> {
+  /**
+   * One bounded startup per member, shared by admission, recovery and dispatch.
+   * `pass` is the record of a scheduling body that awaits this start (one that
+   * joins a start already in flight included): the body's progress is stamped
+   * the moment the adapter call settles, before this start commits its failure
+   * or its outage clearance, so neither publishes against a stale stamp.
+   */
+  startWorker(mission: Mission, member: Member, options: { admission?: boolean; signal?: AbortSignal; pass?: SchedulingPass } = {}): Promise<void> {
     if (this.closed || this.shuttingDown) return Promise.reject(new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down'))
     if (pendingStopOwner(this.store.list('tasks', mission.id), member.id)) return Promise.reject(new Error('Worker is waiting for its previous attempt to stop'))
     const existing = this.workerStarts.get(member.id)
     const superseded = existing !== undefined && options.admission && (existing.admissionSignal !== options.signal || (!existing.nativePending && existing.retryAfter !== undefined))
     if (superseded) existing.controller.abort(new Error('Worker startup superseded by a new admission'))
-    else if (existing !== undefined && (existing.nativePending || existing.retryAfter === undefined || Date.now() < existing.retryAfter)) return existing.promise
+    else if (existing !== undefined && (existing.nativePending || existing.retryAfter === undefined || Date.now() < existing.retryAfter)) {
+      if (options.pass !== undefined) existing.bodies?.push(options.pass)
+      return existing.promise
+    }
     const controller = new AbortController()
     const cancel = () => controller.abort(options.signal?.reason)
     options.signal?.addEventListener('abort', cancel, { once: true })
@@ -4224,7 +4238,13 @@ export class SwarmRuntime {
           const entry = this.workerStarts.get(member.id)!
           entry.nativePending = true
           void native.then(() => { entry.nativePending = false }, () => { entry.nativePending = false })
-          await abortableStart(native, controller.signal)
+          try { await abortableStart(native, controller.signal) }
+          finally {
+            // Every body awaiting this start stamps its progress before the start commits its outcome.
+            const bodies = entry.bodies ?? []
+            entry.bodies = undefined
+            for (const body of bodies) progressed(body)
+          }
           controller.signal.throwIfAborted()
         } catch (error) {
           failed = true
@@ -4258,7 +4278,7 @@ export class SwarmRuntime {
         }
       }
     })
-    this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined })
+    this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined, bodies: options.pass === undefined ? [] : [options.pass] })
     return promise
   }
   /**
@@ -4272,15 +4292,15 @@ export class SwarmRuntime {
     // later stamps tell waiting from computing (the queue wait is not its own).
     progressed(pass)
     const mission = this.mission(missionId)
-    if (mission.status !== 'active') { await this.flushOutbox(missionId); return }
+    if (mission.status !== 'active') { await this.flushOutbox(missionId, pass); return }
     if (mission.budgetPause) {
       if (!mission.budgetPause.quiesced) {
         this.beginBudgetStop(missionId, mission.budgetPause.id)
-        await this.flushOutbox(missionId); return
+        await this.flushOutbox(missionId, pass); return
       }
       this.resumeBudgetTasks(mission)
     }
-    if (this.completeAutomatic(missionId)) { await this.flushOutbox(missionId); return }
+    if (this.completeAutomatic(missionId)) { await this.flushOutbox(missionId, pass); return }
     if (Date.now() >= mission.deadline || mission.usedTokens >= mission.budget.maxTokens || mission.usedSteps >= mission.budget.maxSteps) { this.blockBudget(mission); return }
     // F2: a submitted code deliverable no live review can accept is repaired
     // before dispatch, so the auto-admitted review can be scheduled this tick.
@@ -4297,8 +4317,9 @@ export class SwarmRuntime {
     this.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the
     // queue-external tick pump is the backstop that delivers durable notices
-    // while this pass is wedged or the mission lock is held.
-    await this.flushOutbox(missionId)
+    // while this pass is wedged or the mission lock is held. Each delivery
+    // await is the body's own, stamped before its result commits.
+    await this.flushOutbox(missionId, pass)
   }
   
   

@@ -15,6 +15,7 @@ import { taskGraphIndex } from './task-graph.ts'
 import { blockCauses } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
+import { awaited, type SchedulingPass } from './scheduling.ts'
 import type { Actor, Delivery, Member, Mission, NoticeClass, Task, WorkerAdapter } from './types.ts'
 
 /** R14-F2(a): the durable identity of one task at one epoch, as notices carry it. */
@@ -1637,7 +1638,12 @@ export class Notices {
     })
   }
 
-  async flushOutbox(missionId: string): Promise<void> {
+  /**
+   * Deliver a mission's queued rows. `pass` is the record of the scheduling
+   * body flushing its own outbox: each delivery await is the body's own and is
+   * stamped (`awaited`) before its result commits.
+   */
+  async flushOutbox(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.rt.shuttingDown) return
     for (const queued of this.rt.store.list('deliveries', missionId)) {
       if (this.rt.shuttingDown) return
@@ -1686,10 +1692,10 @@ export class Notices {
       if (window?.summaryId === delivery.id) delete window.summaryId
       let bound: ReturnType<typeof setTimeout> | undefined
       try {
-        const settled = await Promise.race([
+        const settled = await awaited(pass, Promise.race([
           this.rt.workers.deliver(member, delivery).then(() => true),
           new Promise<boolean>(resolve => { bound = setTimeout(() => resolve(false), this.rt.stallPassTimeoutMs) }),
-        ])
+        ]))
         if (!settled) { this.recordOutboxStarvation(missionId, delivery); continue }
         // R17-G8: delivery is the transport fact. It is never relabelled as
         // consumption; the host's claimed signal records consumption separately

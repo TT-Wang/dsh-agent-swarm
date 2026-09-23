@@ -13,6 +13,7 @@ import { stopPending } from './attempts.ts'
 import { isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
+import { progressed, type SchedulingPass } from './scheduling.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
 import type { Member, Mission, Task } from './types.ts'
 
@@ -418,7 +419,7 @@ export class WorkspaceAdmission {
    * configured and unexpired. Removing a root therefore fences the mission at
    * its next prepare or verification checkout.
    */
-  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): Promise<void> {
+  async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> {
     const authorize = this.rt.config.authorizeWorkspace
     if (authorize === undefined) return
     const anchor = mission.workspaceGrantRoot
@@ -442,7 +443,12 @@ export class WorkspaceAdmission {
       const sessionWorkspace = resolved === root && mission.workspaceAuthorizationSource === 'session'
       if (!liveGrant && !sessionWorkspace) diagnostic = `Authorized root ${anchor} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]`
     }
-    if (diagnostic !== undefined) { this.fenceWorkspace(mission.id, diagnostic); throw new WorkspaceRevokedError(diagnostic) }
+    if (diagnostic === undefined) return
+    // The scheduling body awaiting this check (`pass`) stamps its progress
+    // before the fence commits, so the fence publishes as its own commit.
+    progressed(pass)
+    this.fenceWorkspace(mission.id, diagnostic)
+    throw new WorkspaceRevokedError(diagnostic)
   }
 
   /**

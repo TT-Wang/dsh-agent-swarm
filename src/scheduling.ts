@@ -89,11 +89,21 @@ export interface SchedulingPass {
   /**
    * The body's own last progress: when one of its own awaits returned (stamped
    * before it commits the result) or it reached a member boundary (`progressed`).
-   * Only the body stamps it, with the record `kick` handed it, so a worker turn
-   * one of its adapter calls woke commits without crediting the body; progress
-   * proves the body is running, not sitting in an await (`passState`).
+   * A call that commits before its promise settles stamps the record the body
+   * handed it at the instant its adapter call settles, before that commit: the
+   * worker start (`SwarmRuntime.startWorker`), the workspace authorization
+   * check and the preparation's recovery-fallback report. Only the body's own
+   * record is stamped, so a worker turn one of its adapter calls woke commits
+   * without crediting the body; progress proves the body is running, not
+   * sitting in an await (`passState`).
    */
   progressAt?: number
+  /**
+   * The member whose task this body is preparing, while its `prepareTask` await
+   * is in flight: the adapter's recovery-fallback report, committed from inside
+   * that call, stamps the body's progress first (`SwarmRuntime.onRecoveryFallback`).
+   */
+  preparing?: string
   /** The event loop's total idle time at the body's last stamp (`progressed`). */
   idleMs?: number
   /**
@@ -159,10 +169,12 @@ function formatSpan(ms: number): string {
 /**
  * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body
  * calls it itself, with the record `kick` handed it, when it starts, at each
- * member boundary and when one of its own awaits returns (`awaited`). Nothing
- * else stamps it: commits made by a worker turn the body woke inside an adapter
- * call are that turn's, not the body's. Without a record (a direct `schedule`
- * or `dispatch` call) it does nothing.
+ * member boundary and when one of its own awaits returns (`awaited`). A call
+ * that commits before its promise settles is handed the record and stamps it
+ * where its adapter work settles, before that commit (`SchedulingPass.progressAt`).
+ * Nothing else stamps it: commits made by a worker turn the body woke inside an
+ * adapter call are that turn's, not the body's. Without a record (a direct
+ * `schedule` or `dispatch` call) it does nothing.
  *
  * It also records whether the body waited since its previous stamp: the event
  * loop only idles while the body is suspended in an await with nothing left to
@@ -266,7 +278,7 @@ export class Scheduling {
           // dispatching the other members.
           try {
           if (!this.rt.isolationAllows(missionId, member)) continue
-          try { await awaited(pass, this.rt.startWorker(mission, member)) }
+          try { await awaited(pass, this.rt.startWorker(mission, member, { pass })) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
@@ -313,8 +325,13 @@ export class Scheduling {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
             this.rt.assertAdmission(task, member)
-            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId)))
-            await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined))
+            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId), pass))
+            // The adapter reports a recovery fallback from inside this call
+            // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
+            // marked the member it prepares before it commits the report.
+            if (pass !== undefined) pass.preparing = member.id
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)) }
+            finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
