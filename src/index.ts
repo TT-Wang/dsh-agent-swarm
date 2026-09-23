@@ -154,7 +154,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // swap outside any live runtime's ownership.
   const restored = applyPendingRestore(config.statePath)
   const workers = new HarnessWorkers(ctx, { ...config, grants })
-  const runtime = new SwarmRuntime({ ...config, maxTasksPerMember: config.maxAttempts, grants,
+  // The profile passes unknown keys through; the runtime clock is never one of them.
+  const runtime = new SwarmRuntime({ ...config, now: undefined, maxTasksPerMember: config.maxAttempts, grants,
     authorizeWorkspace: (workspace, sessionCwd) => authorizeWorkspace(workspace, sessionCwd, grants) }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))

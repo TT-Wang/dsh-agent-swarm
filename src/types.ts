@@ -1104,6 +1104,7 @@ export interface RuntimeConfig {
    * The runtime clock. Every wall-clock read that decides runtime behaviour
    * (leases, bounds, back-offs, silence, stall and wedge ages, wake budgets,
    * follow-up timing, event `createdAt`) reads it; defaults to `Date.now`.
+   * Only a function is taken, and the plugin never sets it from the profile.
    */
   now?: () => number
   /** Prelaunch watchdog fallback; the owner can extend it with a reason. */

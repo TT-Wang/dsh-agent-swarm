@@ -305,10 +305,11 @@ export class SwarmRuntime {
    */
   readonly store: SwarmStore
   /**
-   * The runtime clock (`RuntimeConfig.now`, default `Date.now`, read late so a
-   * test's `Date.now` mock still applies). Every wall-clock read that decides
-   * runtime behaviour goes through it; the modules read it from the runtime
-   * they are handed, and the store stamps event `createdAt` with it.
+   * The runtime clock (`RuntimeConfig.now` when it is a function, else
+   * `Date.now`, read late so a test's `Date.now` mock still applies). Every
+   * wall-clock read that decides runtime behaviour goes through it; the
+   * modules read it from the runtime they are handed, and the store stamps
+   * event `createdAt` with it.
    */
   readonly now: () => number
   private readonly listeners = new Set<(missionId: string) => void>()
@@ -492,7 +493,7 @@ export class SwarmRuntime {
   get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
-    this.now = config.now ?? (() => Date.now())
+    this.now = typeof config.now === 'function' ? config.now : () => Date.now()
     this.store = new SwarmStore(config.statePath, { ...storeOptions, now: this.now })
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
