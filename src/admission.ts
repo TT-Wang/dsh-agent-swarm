@@ -32,6 +32,16 @@ export function assertScopeSelectors(scopes: readonly string[], location: string
   }
 }
 
+/**
+ * The criteria a repair's stored `acceptance` holds beyond the list its
+ * proposal supplied: what the host inherited from the replaced tasks. An
+ * omitted or malformed proposal list supplied nothing.
+ */
+export function inheritedAcceptance(acceptance: readonly string[], proposed: unknown): string[] {
+  const supplied: readonly unknown[] = Array.isArray(proposed) ? proposed : []
+  return acceptance.filter(criterion => !supplied.includes(criterion))
+}
+
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */
 export function normalizeReviewDependencies(kind: string, reviewOf: string | undefined, dependencies: readonly string[] = []): string[] {
   return dependencies.filter(dependency => kind !== 'verification' || dependency !== reviewOf)
