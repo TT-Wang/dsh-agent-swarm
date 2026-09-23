@@ -214,7 +214,7 @@ export class Scheduling {
         const order = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
         for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (pass !== undefined && index > 0 && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs) {
+          if (pass !== undefined && index > 0 && this.pastBound(pass)) {
             pass.stoppedBefore = member.id
             return false
           }
@@ -591,11 +591,11 @@ export class Scheduling {
   livePass(missionId: string): SchedulingPass | undefined {
     const pass = this.passes.get(missionId)
     if (pass === undefined || pass.escalatedAt !== undefined) return undefined
-    const age = Date.now() - pass.startedAt
-    if (age < this.rt.stallPassTimeoutMs) return pass
+    const now = Date.now()
+    if (!this.pastBound(pass, now)) return pass
     // Past the declared pass bound the body is live only while the mission has
     // live work to progress AND the bounded live-work hold has not elapsed.
-    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
+    if (now - pass.startedAt < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
@@ -634,7 +634,19 @@ export class Scheduling {
    */
   passWedged(missionId: string): boolean {
     const pass = this.passes.get(missionId)
-    return pass !== undefined && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs
+    return pass !== undefined && this.pastBound(pass)
+  }
+
+  /**
+   * The one bound predicate: a body is past its bound once it has held the
+   * mission for a whole `stallPassTimeoutMs`. The watchdog names it by this
+   * (`checkSchedulingPasses`), the notices publish it wedged by this
+   * (`passWedged`, `livePass`, `passState`) and the sweep stops it early by
+   * this, so no instant exists at which one of them already acts on the bound
+   * and another does not yet.
+   */
+  pastBound(pass: SchedulingPass, now = Date.now()): boolean {
+    return now - pass.startedAt >= this.rt.stallPassTimeoutMs
   }
 
   /**
@@ -653,7 +665,7 @@ export class Scheduling {
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     const pass = this.passes.get(missionId)
     const bound = this.rt.stallPassTimeoutMs
-    if (pass?.progressAt !== undefined && pass.progressAt - pass.startedAt > bound && Date.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
+    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && Date.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
     return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
   }
 
@@ -756,11 +768,11 @@ export class Scheduling {
    * stays suppressed after the naming), the off-pass decision sweep (which runs
    * while the body is wedged and names the subjects no live path advances), the
    * notice dedup (one escalation per body and per unchanged board) and the
-   * lease-renewal path (the naming changes no task, attempt or lease).
+   * lease-renewal path (the naming changes no task, attempt or lease). `now` is
+   * the tick's one instant, read once for every body (`pastBound`).
    */
-  checkSchedulingPasses(): void {
+  checkSchedulingPasses(now = Date.now()): void {
     if (this.rt.closed || this.rt.shuttingDown) return
-    const now = Date.now()
     for (const [missionId, pass] of this.passes) {
       if (pass.escalatedAt !== undefined) continue
       const mission = this.rt.store.get('missions', missionId)
@@ -768,13 +780,12 @@ export class Scheduling {
       // the first tick after the owner resumes it names the body if it is still
       // held (the resume does not go through the mission queue).
       if (mission?.status !== 'active') continue
-      const age = now - pass.startedAt
-      if (age < this.rt.stallPassTimeoutMs) continue
+      if (!this.pastBound(pass, now)) continue
       const held = this.hasLiveWork(missionId)
       // Inside the second bound live work keeps the body live: a pass that may
       // legitimately be inside a long adapter await for that work is not named.
       // Past it the window is over, and the notice names the subject that held it.
-      if (held && age < this.rt.stallPassReleaseBoundMs) continue
+      if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
       this.escalateWedge(missionId, pass, held, held ? this.liveWorkHolders(missionId) : [])
     }
   }

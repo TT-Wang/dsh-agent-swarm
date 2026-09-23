@@ -119,11 +119,15 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
     const scheduling = runtime.scheduling
     const check = scheduling.checkSchedulingPasses.bind(scheduling)
     let locked
-    scheduling.checkSchedulingPasses = () => {
-      if (locked !== undefined || !scheduling.passWedged(mission.id)) return check()
+    // The lock is keyed on the watchdog's own predicate at the tick's own
+    // instant, so the tick that first finds the body past its bound is exactly
+    // the one that runs under the lock.
+    scheduling.checkSchedulingPasses = (now = Date.now()) => {
+      const pass = scheduling.passes.get(mission.id)
+      if (locked !== undefined || pass === undefined || !scheduling.pastBound(pass, now)) return check(now)
       const other = new DatabaseSync(statePath)
       other.exec('BEGIN IMMEDIATE')
-      try { return check() } finally {
+      try { return check(now) } finally {
         other.exec('ROLLBACK'); other.close()
         locked = { events: wedges().length, escalatedAt: scheduling.passes.get(mission.id)?.escalatedAt }
       }
@@ -337,6 +341,40 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
     await eventually(() => hanging.every(member => workers.started.lastIndexOf(member.id) > workers.hung.get(member.id).index) ? true : undefined,
       'every member is started again after its hung start settles', 4_000)
   } finally { await f.cleanup() }
+})
+
+test('S1: the watchdog, passWedged and livePass read one bound predicate, so they agree at exactly the bound', async () => {
+  // Before, the watchdog named a body once its age reached the bound while
+  // passWedged reported it wedged only past the bound. At age == bound a body
+  // was named while passWedged still read false, so the writer-lock wrappers
+  // keyed on passWedged (the naming-retry test above and F21 I5) let that
+  // naming tick run unlocked and commit. The clock is frozen for each instant.
+  const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000 } })
+  const scheduling = f.runtime.scheduling
+  const realNow = Date.now
+  let pass
+  try {
+    await eventually(() => scheduling.passes.get(f.mission.id) === undefined ? true : undefined, 'the setup passes settle')
+    const fixed = realNow()
+    pass = { id: scheduling.passKey(f.mission.id), operationId: 'operation_test_boundary', missionId: f.mission.id, startedAt: fixed - 99,
+      revisionBefore: f.runtime.store.revision(), fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0 }
+    scheduling.passes.set(f.mission.id, pass)
+    Date.now = () => fixed
+    const before = { wedged: scheduling.passWedged(f.mission.id), live: scheduling.livePass(f.mission.id) === pass }
+    scheduling.checkSchedulingPasses()
+    assert.deepEqual({ ...before, named: pass.escalatedAt !== undefined }, { wedged: false, live: true, named: false }, 'one tick inside the bound: live, not wedged, not named')
+    pass.startedAt = fixed - 100
+    const at = { wedged: scheduling.passWedged(f.mission.id), live: scheduling.livePass(f.mission.id) === pass }
+    scheduling.checkSchedulingPasses()
+    Date.now = realNow
+    assert.deepEqual({ ...at, named: pass.escalatedAt !== undefined }, { wedged: true, live: false, named: true },
+      'at exactly the bound the body is wedged, no longer live, and the watchdog names it')
+    assert.equal(wedgeEvents(f).filter(item => item.data.runId === pass.operationId).length, 1, 'named once')
+  } finally {
+    Date.now = realNow
+    if (pass !== undefined) scheduling.closePass(f.mission.id, pass)
+    await f.cleanup()
+  }
 })
 
 test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never named; past that bound it is named with its live work preserved', async () => {
