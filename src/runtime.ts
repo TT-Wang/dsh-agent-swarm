@@ -20,7 +20,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { assertDeclaredOutputs, assertScopeSelectors, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -42,9 +42,6 @@ async function abortableStart<T>(operation: Promise<T>, signal: AbortSignal): Pr
   try { return await Promise.race([operation, interrupted]) }
   finally { signal.removeEventListener('abort', abort) }
 }
-/** Closed board kind vocabulary; a free-form kind is a validation error. */
-const POST_KINDS: readonly PostKind[] = ['ASK', 'ANSWER', 'IDEA', 'ALERT', 'ARTIFACT', 'HANDOFF']
-
 /** Board delta reads are bounded to this page size unless the caller asks for less. */
 const BOARD_PAGE_MAX = 100
 const BOARD_PAGE_DEFAULT = 20
@@ -1596,7 +1593,6 @@ export class SwarmRuntime {
     const ceiling = taskCeilingBlock(task)
     if (ceiling !== undefined) { this.blockTaskCeiling(this.mission(missionId), task, ceiling); throw new Error(ceiling.reason) }
     this.bounded(input.claim)
-    if (!['supported', 'disproved', 'inconclusive'].includes(input.outcome)) throw new Error('[invalid_evidence_outcome] Invalid evidence outcome Correct `outcome` with `swarm_publish`, then retry.')
     this.validateRuns(missionId, member.id, task, input.toolRunIds)
     const lineage = this.replacementLineage(missionId, task)
     for (const previous of input.supersedes ?? []) {
@@ -2045,7 +2041,6 @@ export class SwarmRuntime {
    */
   post(actor: Actor, missionId: string, input: PostInput): Post {
     const { key } = this.active(actor, missionId)
-    if (!POST_KINDS.includes(input.kind)) throw new Error(`Post kind must be one of ${POST_KINDS.join(', ')}`)
     const body = this.bounded(input.body)
     if (input.to !== undefined) {
       if (input.to === 'me') throw new Error('Recipient "me" is a board read filter, not a post target')
@@ -2109,7 +2104,6 @@ export class SwarmRuntime {
     }
     if (query.after !== undefined && (!Number.isSafeInteger(query.after) || query.after < 0)) throw new Error('after must be a nonnegative integer')
     if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit < 1)) throw new Error('limit must be a positive integer')
-    if (query.kind !== undefined && !POST_KINDS.includes(query.kind)) throw new Error(`Post kind must be one of ${POST_KINDS.join(', ')}`)
     if (query.taskId !== undefined) this.task(missionId, query.taskId)
     if (query.to !== undefined && query.to !== 'me' && query.to !== 'owner') {
       const target = this.store.get('members', query.to)
@@ -3466,6 +3460,20 @@ export class SwarmRuntime {
       if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
       next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]
       for (const dependency of next.dependencies) this.task(missionId, dependency)
+      // R12-F9: the one live path that bypasses admission. propose() refuses a
+      // task whose text assumes prior work that no content-carrying edge (a
+      // dependency, or the review source `prepareTask` merges like one) brings
+      // into its worktree; this amendment would otherwise strip that edge from
+      // an admitted task, so it is refused here, before anything is written.
+      const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance }, `task ${JSON.stringify(task.id)}`, {
+        dependencies: [...next.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])],
+        replaces: task.replaces,
+        knownContents: new Set(this.store.list('tasks', missionId).map(row => row.id)),
+        amendment: true,
+      })
+      // The code is read from the diagnostic the refusal carries; tool_error is
+      // the category plan validation already gives this code.
+      if (assumed.length) throw new AdmissionError(assumed[0]!.code, 'tool_error', assumed.map(formatDiagnostic).join('\n'), `task ${JSON.stringify(task.id)}`, assumed)
     }
     if (changes.checks !== undefined) {
       if (!Array.isArray(changes.checks) || changes.checks.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_checks_invalid', 'validation_error', 'Invalid checks')

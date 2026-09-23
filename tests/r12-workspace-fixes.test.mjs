@@ -63,14 +63,11 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
   assert.equal(scheduling.unreviewedStall('mission', [{ id: 'new' }]), false)
 })
 
-test('M2-3: dispatch explanations name dependencies/isolation without inventing budget refusals', () => {
+test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {
   const rt = { workers: { isIdle: () => true }, scopesOverlap: () => true }
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
-  const task = { id: 't', title: 'Work', epoch: 0, objective: 'The assembly is already in its worktree; verify the integration.', acceptance: [], dependencies: [], scope: ['**'] }
-  const assumed = scheduling.dispatchQuestion('m', [task], [member], [task])
-  assert.match(assumed.message, /dependency assumptions require repair/)
-  const independent = { ...task, objective: 'Write a new file from the baseline.' }
+  const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
   const isolated = scheduling.dispatchQuestion('m', [independent], [{ ...member, workspace: '' }], [independent])
   assert.match(isolated.message, /Workspace isolation prevents dispatch/)
   const unknown = scheduling.dispatchQuestion('m', [independent], [member], [independent])

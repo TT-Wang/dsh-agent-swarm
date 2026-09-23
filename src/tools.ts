@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { inheritedAcceptance } from './admission.ts'
+import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -95,6 +96,50 @@ function optionalInteger(args: Args, key: string): number | undefined {
   return Number(value)
 }
 function optionalText(args: Args, key: string): string | undefined { return args[key] === undefined ? undefined : text(args, key) }
+
+/** A JSON path the model can act on: every property name backticked, array indices bracketed. */
+const schemaPath = (segments: readonly (string | number)[]): string =>
+  segments.map((segment, index) => typeof segment === 'number' ? `[${segment}]` : `${index === 0 ? '' : '.'}\`${segment}\``).join('')
+
+/**
+ * Every place `value` departs from `schema`: a missing required property, a
+ * value outside its enum, or the wrong primitive type, recursing into declared
+ * object properties and array items. An undefined property is absent, as in
+ * JSON. `additionalProperties` is deliberately not checked: tool calls have
+ * always tolerated undeclared keys, and the runtime refuses the ones it must
+ * (`task_amendment_invalid` for unknown `changes` fields).
+ */
+function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string | number)[], found: string[]): string[] {
+  const at = () => path.length === 0 ? 'the arguments' : schemaPath(path)
+  const type = schema.type
+  const typed = type === undefined ? true
+    : type === 'object' ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : type === 'array' ? Array.isArray(value)
+        : type === 'integer' ? typeof value === 'number' && Number.isInteger(value)
+          : type === 'number' ? typeof value === 'number' && Number.isFinite(value)
+            : type === 'null' ? value === null
+              : typeof value === type
+  if (!typed) { found.push(`${at()} must be ${/^[aeiou]/.test(String(type)) ? 'an' : 'a'} ${type}`); return found }
+  if (schema.enum !== undefined && !schema.enum.includes(value as never)) found.push(`${at()} must be one of ${schema.enum.map(item => JSON.stringify(item)).join(', ')}`)
+  if (type === 'object') {
+    const record = value as Args
+    for (const key of schema.required ?? []) if (record[key] === undefined) found.push(`${schemaPath([...path, key])} is required`)
+    for (const [key, child] of Object.entries(schema.properties ?? {})) if (record[key] !== undefined) schemaViolations(child, record[key], [...path, key], found)
+  }
+  if (type === 'array' && schema.items !== undefined) for (const [index, item] of (value as unknown[]).entries()) schemaViolations(schema.items, item, [...path, index], found)
+  return found
+}
+
+/**
+ * The Harness dispatches a tool call without enforcing its published schema,
+ * so every swarm tool checks its own before anything runs: one typed refusal
+ * naming every offending path, and no state touched. The parameter names are
+ * the caller's own schema paths, rendered in the message.
+ */
+function assertToolArguments(name: string, schema: JsonSchemaNode, args: Args): void {
+  const violations = schemaViolations(schema, args, [], [])
+  if (violations.length) throw new PolicyError('tool_arguments_invalid', 'validation_error', `[tool_arguments_invalid] ${name} was called with arguments its parameters schema refuses: ${violations.join('; ')}. Nothing ran. Correct every listed parameter and retry ${name} with the corrected arguments.`)
+}
 
 /**
  * Bind a model-supplied plan workspace to the calling agent session.
@@ -199,6 +244,27 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         exec.signal.throwIfAborted()
         if (!exec.agent) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
         let args = object(value)
+        const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
+        const step = name as TraceStep
+        const startedAt = Date.now()
+        // D6: one span row per orchestration step. A failed step still records a
+        // row with status=error and a closed error.type before the failure
+        // reaches the model, so the trace is complete even on the error path.
+        // Every registered tool name is a closed TRACE_STEPS member (asserted by
+        // tests/trace-span.test.mjs), so an unknown step fails loudly here
+        // instead of being silently unspanned. The span input is the arguments
+        // the step ran with, after the workspace binding below.
+        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
+          if (trace === undefined) return
+          const context = spanContext(runtime, name, actor.sessionId, args, result)
+          if (context === undefined) { trace.noteUnscoped(name); return }
+          await trace.record({ ...context, actor: actor.sessionId, step, input: { tool: name, arguments: args },
+            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
+            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
+        }
+        // The call is checked against this tool's own published schema before
+        // anything runs; the refused step is still traced.
+        try { assertToolArguments(name, definition.parameters, args) } catch (error) { await recordSpan(undefined, 'error', error); throw error }
         // H4: planning workspaces are bound to the calling session or a root the
         // human configured once, never to the model's word. The matched root is
         // attached for the mission record; the runtime re-derives it when the
@@ -206,24 +272,6 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) {
           const bound = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
           args = { ...args, workspace: bound.workspace, workspaceGrantRoot: bound.grantRoot, workspaceAuthorizationSource: bound.source }
-        }
-        const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
-        const step = name as TraceStep
-        const startedAt = Date.now()
-        const spanInput = { tool: name, arguments: args }
-        // D6: one span row per orchestration step. A failed step still records a
-        // row with status=error and a closed error.type before the failure
-        // reaches the model, so the trace is complete even on the error path.
-        // Every registered tool name is a closed TRACE_STEPS member (asserted by
-        // tests/trace-span.test.mjs), so an unknown step fails loudly here
-        // instead of being silently unspanned.
-        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
-          if (trace === undefined) return
-          const context = spanContext(runtime, name, actor.sessionId, args, result)
-          if (context === undefined) { trace.noteUnscoped(name); return }
-          await trace.record({ ...context, actor: actor.sessionId, step, input: spanInput,
-            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
-            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
         }
         try {
           const result = await run(args, actor)
@@ -278,7 +326,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; pair each deliverable with a verification task via reviewOf. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
-    ...a, budget: object(a.budget), workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+    ...a, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
     workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource'),
   } as unknown as PlanInput))
   const launchProperties: Record<string, JsonSchemaNode> = structuredClone(planProperties)
@@ -287,9 +335,11 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   launchProperties.planningEpoch = { ...positiveInteger, description: 'Current planningEpoch from the swarm-start context; required after retry so a cancelled planner cannot launch.' }
   launchProperties.members!.items!.required = ['key', 'role', 'maxOutputTokens']
   launchProperties.members!.items!.properties!.maxOutputTokens = { type: 'integer', description: 'Per-request output-token allowance for this worker’s role and model.' }
-  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance', 'outputs', 'assigneeKey', 'maxRecoveryAttempts']
+  // assigneeKey is conditional: the automatic plan requires it on every
+  // deliverable and on one independent review of each, not on a further review.
+  launchProperties.tasks!.items!.required = ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance', 'outputs', 'maxRecoveryAttempts']
   launchProperties.tasks!.items!.properties!.key = { type: 'string', description: 'Unique stable identifier such as task_1, required on every task including reviews; dependencies and reviewOf reference it.' }
-  launchProperties.tasks!.items!.properties!.assigneeKey = { type: 'string', description: 'Preferred member key for a new automatic plan. Use assignmentMode=pinned only when this task needs that specific member or model.' }
+  launchProperties.tasks!.items!.properties!.assigneeKey = { type: 'string', description: 'Preferred member key for a new automatic plan. Required on every non-verification task and on at least one verification task reviewing it, with a different member; may be omitted on any further review. Use assignmentMode=pinned only when this task needs that specific member or model.' }
   launchProperties.tasks!.items!.properties!.acceptance = { type: 'array', items: { type: 'string' }, description: 'Mission acceptance strings copied exactly into the deliverable task that satisfies them; a paraphrase does not match.' }
   launchProperties.tasks!.items!.properties!.checkTimeoutMs = { type: 'integer', description: 'Per-check timeout in milliseconds; required for non-verification tasks that declare checks, because the runtime extends the verifier lease by it. Reviews inherit their source’s checks and timeout.' }
   launchProperties.tasks!.items!.properties!.maxRecoveryAttempts = { type: 'integer', description: 'Allowed automatic recovery attempts for this task.' }
@@ -297,15 +347,11 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     const requestId = text(a, 'requestId')
     const request = runtime.starts(actor).find(item => item.id === requestId)
     if (!request) throw new Error('[start_request_unknown] Unknown automatic start request for this owner; list the pending requests with `swarm_observe` (omit `missionId`) and retry `swarm_launch` with the exact `requestId`.')
-    if (!Array.isArray(a.members)) throw new Error('[members_invalid] members must be an array; pass each member with `key` and `role` (name is optional) and retry the same `requestId` launch.')
-    const members = a.members.map(value => {
-      const member = object(value)
-      return { key: text(member, 'key'), ...(member.name === undefined ? {} : { name: text(member, 'name') }), role: text(member, 'role'),
-        ...(member.provider === undefined ? {} : { provider: text(member, 'provider') }),
-        ...(member.model === undefined ? {} : { model: text(member, 'model') }),
-        ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: text(member, 'reasoningEffort') }),
-        ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }
-    })
+    const members = (a.members as Args[]).map(member => ({ key: text(member, 'key'), ...(member.name === undefined ? {} : { name: text(member, 'name') }), role: text(member, 'role'),
+      ...(member.provider === undefined ? {} : { provider: text(member, 'provider') }),
+      ...(member.model === undefined ? {} : { model: text(member, 'model') }),
+      ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: text(member, 'reasoningEffort') }),
+      ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }))
     const plan = validatePlan({ ...a, workspace: request.workspace, members }, { launch: true, dependencyDirs: runtime.config.verificationDependencyDirs })
     // The parse-only check preflight runs at the shared launch boundary
     // (`launchDraft`), so the prelaunch path and the staged path refuse the same
@@ -327,7 +373,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema },
     ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], (a, actor) => runtime.create(actor, {
       title: text(a, 'title'), objective: text(a, 'objective'), workspace: text(a, 'workspace'), scope: array(a, 'scope'), acceptance: array(a, 'acceptance'),
-      budget: object(a.budget) as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+      budget: a.budget as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
       workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
     } satisfies CreateMissionInput))
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id.',
@@ -339,11 +385,12 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, title: string, objective: string, coordinatorId: string }, ['missionId', 'title', 'objective'],
     (a, actor) => runtime.workstream(actor, text(a, 'missionId'), { title: text(a, 'title'), objective: text(a, 'objective'), coordinatorId: a.coordinatorId as string | undefined }))
   register('swarm_propose', 'Propose and admit a task within mission scope and budget. research for audits and synthesis; implementation/integration need real checks; verification names reviewOf. Rejected implementations are repaired with replaces; the repair inherits their acceptance and declared outputs, and explicit outputs replace the inherited ones. Raise an existing task\'s allocation with swarm_budget(taskId, taskBudget, reason); amend its unsubmitted scope, outputs, dependencies, checks or assignee with swarm_control(taskId, action: amend, changes, reason). Correct admission field errors and retry the proposal.',
-    // `acceptance` is required unless `replaces` is given. The Harness schema
-    // subset has no if/then, so the runtime enforces the condition
-    // ([task_acceptance_required]) and the schema leaves it optional.
-    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, outputs: { ...outputsSchema, description: `${outputsSchema.description} On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces.` }, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
-    ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'],
+    // `acceptance` and `outputs` are required unless `replaces` is given. The
+    // Harness schema subset has no if/then, so the runtime enforces the
+    // condition ([task_acceptance_required], [outputs_required]) and the schema
+    // leaves both optional.
+    { ...mission, workstreamId: string, title: string, objective: string, kind: kindSchema, dependencies: dependenciesSchema, scope: scopeSchema, acceptance: { ...strings, description: 'Required unless replaces is given: a repair inherits the replaced tasks\' acceptance, and entries here are added after it.' }, outputs: { ...outputsSchema, description: `${outputsSchema.description} Required unless replaces is given. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces.` }, checks: checksSchema, priority: integer, maxRecoveryAttempts: integer, maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings, checkTimeoutMs: integer, experiment: { type: 'boolean' }, assigneeId: string, assignmentMode: assignmentModeSchema, reviewOf: reviewSchema, replaces: strings },
+    ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope'],
     (a, actor) => {
       const task = runtime.propose(actor, text(a, 'missionId'), a as unknown as ProposeTaskInput)
       // One line naming what a repair inherited: the criteria beyond its own
@@ -361,7 +408,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { ...mission, taskId: string, attemptId: string, claim: string, outcome: { type: 'string', enum: ['supported', 'disproved', 'inconclusive'] }, toolRunIds: strings, supersedes: strings },
     ['missionId', 'taskId', 'attemptId', 'claim', 'outcome', 'toolRunIds'], (a, actor) => runtime.publish(actor, text(a, 'missionId'), a as unknown as PublishInput))
   register('swarm_submit', 'Submit your current task and immutable artifact for independent verification. The declared outputs of the task and any listed deliverables are captured, including ignored files, never whole directories; artifact.files records immutable blobs. A declared output that is not a regular file is refused with [output_missing] and the attempt stays running. Research must cite evidence; actual code changes require checks regardless of kind.',
-    { ...mission, taskId: string, attemptId: string, output: string, deliverables: { ...strings, description: 'Exact relative file paths to capture beyond the task\'s declared outputs, including ignored reports. Files must exist within task scope; no directories or symlinks.' } }, ['missionId', 'taskId', 'attemptId', 'output', 'deliverables'],
+    { ...mission, taskId: string, attemptId: string, output: string, deliverables: { ...strings, description: 'Optional; omit when the task\'s declared outputs are everything to capture. Exact relative file paths to capture beyond the task\'s declared outputs, including ignored reports. Files must exist within task scope; no directories or symlinks.' } }, ['missionId', 'taskId', 'attemptId', 'output'],
     (a, actor) => runtime.submit(actor, text(a, 'missionId'), { taskId: text(a, 'taskId'), attemptId: text(a, 'attemptId'), output: text(a, 'output'), deliverables: a.deliverables === undefined ? undefined : array(a, 'deliverables') }))
   register('swarm_verify', 'Independent verifier: run the source checks on its exact artifact and record accept or reject with a reason. Failed checks reject regardless of verdict; a rejected source stays blocked until repaired. Emits a normalized evidence/verdict event naming the evidence id, verdict and retired reviews.',
     { ...mission, taskId: string, attemptId: string, verdict: { type: 'string', enum: ['accept', 'reject'] }, reason: string, deliverables: { ...strings, description: 'Optional exact relative review report paths to capture in reviewArtifact.files beyond the declared outputs of the review task, which are always captured, including ignored files. Must be inside the review task scope. A declared output not written is refused with [output_missing] and your attempt stays running.' } }, ['missionId', 'taskId', 'attemptId', 'verdict', 'reason'],

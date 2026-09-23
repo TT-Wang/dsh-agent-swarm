@@ -184,9 +184,10 @@ test('the after cursor pages the board without gaps or repeats', async t => {
   assert.equal(newest.page.remaining, 4)
 })
 
-test('invalid posts are rejected: kind, bound, citations, foreign member and reply target', async t => {
+test('invalid posts are rejected: bound, citations, foreign member and reply target', async t => {
+  // An unknown kind is refused by swarm_post's own schema enum before the
+  // runtime is called (see the tool test below); the runtime checks the rest.
   const f = await fixture(t, { maxMessageChars: 64 })
-  assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'GOSSIP', body: 'not a kind' }), /Post kind must be one of/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: '   ' }), /content is required/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'x'.repeat(65) }), /exceeds 64 characters/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'cite', evidenceIds: ['evidence_missing'] }), /Unknown evidence in this mission/)
@@ -353,7 +354,7 @@ test('the registered tools expose the board with a host-derived sender and emit 
     assert.ok(span.parentSpanId === undefined || /^[0-9a-f]{16}$/.test(span.parentSpanId))
   }
   // The error path is traced too, with the closed error.type vocabulary.
-  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'GOSSIP', body: 'x' }, f.bob.sessionId), /Post kind must be one of/)
+  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'GOSSIP', body: 'x' }, f.bob.sessionId), /\[tool_arguments_invalid\] swarm_post was called with arguments its parameters schema refuses: `kind` must be one of "ASK", "ANSWER", "IDEA", "ALERT", "ARTIFACT", "HANDOFF"\./)
   const failed = f.runtime.store.events(f.mission.id, 1000, 0).filter(event => event.type === 'trace/span')
     .map(event => event.data).find(span => span.step === 'swarm_post' && span.status === 'error')
   assert.ok(failed, 'a failed board call records an error span')

@@ -19,7 +19,9 @@ import { refusalSites, assessRefusal, diagnosticProducers, toolSchemaIndex, appl
 /** Codes this branch added, with the file they live in. */
 const ANNOTATED = {
   'src/runtime.ts': [
-    'owner_cannot_claim', 'evidence_tool_runs_required', 'invalid_evidence_outcome', 'supersede_foreign_evidence',
+    // invalid_evidence_outcome left with the runtime check: swarm_publish's
+    // schema enum refuses an unknown outcome as [tool_arguments_invalid].
+    'owner_cannot_claim', 'evidence_tool_runs_required', 'supersede_foreign_evidence',
     'supersede_unrelated_evidence', 'verification_requires_verify', 'research_evidence_required', 'not_a_verification_task',
     'artifact_changed_during_verification', 'evidence_changed_during_verification',
     // L0-L2 owner-reply receipts: every refusal names the id to pass instead.

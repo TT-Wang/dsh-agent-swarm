@@ -24,7 +24,7 @@
  * member board, so a test can classify a real board.
  */
 import { guardTerminal } from '../lib/refusals.js'
-import { dependencyAssumptions, taskCeilingExhaustion } from '../lib/admission.js'
+import { taskCeilingExhaustion } from '../lib/admission.js'
 
 /**
  * The durable board as the guard-chain model sees it. Every field is derived
@@ -66,9 +66,6 @@ export function guardBoard(runtime, missionId, mission) {
         // The recorded preparation failure, not the prose of `task.output`,
         // which a later transition rewrites or leaves stale.
         preparationExhausted: task.status === 'blocked' && runtime.taskBlockCauses(task).has('preparation-failed'),
-        ...(task.dependencies.length === 0 && task.reviewOf === undefined
-          && dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: task.dependencies, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`).length > 0
-          ? { assumedContent: true } : {}),
       }
     }),
     // R17-G6/G7: the member half is READ from the runtime's derived member board,
@@ -95,7 +92,7 @@ export function guardDispatchActions(board) {
   if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
   const actions = []
   for (const task of board.tasks) {
-    if (task.status !== 'pending' || task.ceilingExhausted === true || task.preparationExhausted === true || task.assumedContent === true) continue
+    if (task.status !== 'pending' || task.ceilingExhausted === true || task.preparationExhausted === true) continue
     if (task.dependenciesSatisfied === false || task.dependenciesDead === true) continue
     if (task.reviewOf !== undefined && task.reviewSourceLive === false) continue
     const member = board.members.find(candidate => isLiveMember(candidate) && candidate.isolated !== false
@@ -147,7 +144,6 @@ export function guardTerminalChain(board) {
   if (live.length > 0 && board.mission.workspace !== 'authorized') return 'workspace'
   if (board.tasks.some(task => task.status === 'running' && task.attempt !== undefined && !task.attempt.leaseLive)) return 'attempt_lease'
   if (board.tasks.some(task => task.ceilingExhausted === true && task.status !== 'accepted' && task.status !== 'cancelled')) return 'task_ceiling'
-  if (board.tasks.some(task => task.assumedContent === true && task.status === 'pending')) return 'admission'
   if (board.tasks.some(task => task.status === 'submitted' && task.reviewSourceLive === false)) return 'review_admission'
   return 'dispatch_preconditions'
 }

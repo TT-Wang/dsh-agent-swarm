@@ -149,12 +149,12 @@ test('R24: propose refuses a new task without outputs on every caller path; a re
   }
   // A direct caller: nothing reached the store.
   assert.throws(() => f.propose('Undeclared'), required, 'runtime.propose refuses a task that declares no outputs')
-  // swarm_propose: the schema lists outputs as required, but the Harness
-  // dispatches `execute` without checking that list, so the runtime must refuse.
+  // swarm_propose: outputs is conditional (a repair inherits it), so the
+  // schema cannot require it and the runtime refuses a new task without it.
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, budget)
   const tool = definitions.get('swarm_propose')
-  assert.ok(tool.parameters.required.includes('outputs'))
+  assert.equal(tool.parameters.required.includes('outputs'), false)
   await assert.rejects(tool.execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Report', objective: 'Write the audit to docs/audit.md',
     kind: 'research', scope: ['docs/'], acceptance: ['works'] }, { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }), required)
   assert.deepEqual(f.runtime.store.list('tasks', f.mission.id), [], 'no refused proposal was admitted')

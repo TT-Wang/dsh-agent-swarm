@@ -4,6 +4,10 @@ import { checkSyntaxDetail, declaredPlanChecks } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
 import { Workspaces } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { realpath } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { setup } from './faults/harness.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
 function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget); return definitions }
 test('model-visible renders stay compact: observe passes the focused view through and never repeats the board; launch and stage return identities', () => {
@@ -38,7 +42,7 @@ test('all model plan entry points require their chosen budget; automatic schema 
   for (const name of ['swarm_launch', 'swarm_create', 'swarm_stage']) assert(definitions.get(name).parameters.required.includes('budget'))
   const properties = definitions.get('swarm_launch').parameters.properties
   assert(properties.members.items.required.includes('maxOutputTokens'))
-  for (const key of ['key', 'assigneeKey', 'maxRecoveryAttempts']) assert(properties.tasks.items.required.includes(key))
+  for (const key of ['key', 'maxRecoveryAttempts']) assert(properties.tasks.items.required.includes(key))
   // M9(a): runtime admission requires checkTimeoutMs only for non-verification
   // tasks that declare checks, so the schema must not demand it on every task.
   assert(!properties.tasks.items.required.includes('checkTimeoutMs'), 'checkTimeoutMs is conditional, never universally required')
@@ -50,7 +54,7 @@ test('all model plan entry points require their chosen budget; automatic schema 
 test('swarm_propose leaves acceptance optional for a repair to inherit; every plan entry point still requires it', () => {
   const definitions = tools()
   const propose = definitions.get('swarm_propose').parameters
-  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope', 'outputs'])
+  assert.deepEqual(propose.required, ['missionId', 'workstreamId', 'title', 'objective', 'kind', 'scope'])
   assert.deepEqual(propose.properties.acceptance.items, { type: 'string' }, 'the property stays declared as a string array')
   assert.match(propose.properties.acceptance.description, /Required unless replaces is given/)
   assert(propose.properties.replaces, 'replaces carries the inheritance')
@@ -59,6 +63,24 @@ test('swarm_propose leaves acceptance optional for a repair to inherit; every pl
     assert(definitions.get(name).parameters.required.includes('acceptance'), `${name} mission acceptance`)
     assert(definitions.get(name).parameters.properties.tasks.items.required.includes('acceptance'), `${name} task acceptance`)
   }
+})
+
+test('a schema requires only what the runtime requires on every call, and says when a conditional field may be omitted', () => {
+  const definitions = tools()
+  // swarm_submit: missing deliverables are none; the declared outputs are always captured.
+  const submit = definitions.get('swarm_submit').parameters
+  assert.deepEqual(submit.required, ['missionId', 'taskId', 'attemptId', 'output'])
+  assert.match(submit.properties.deliverables.description, /^Optional; omit when the task's declared outputs are everything to capture\./)
+  // swarm_propose: a repair inherits the replaced tasks' outputs, so outputs is conditional like acceptance.
+  const propose = definitions.get('swarm_propose').parameters
+  assert.equal(propose.required.includes('outputs'), false)
+  assert.match(propose.properties.outputs.description, /Required unless replaces is given\. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
+  // swarm_launch: the automatic plan requires assigneeKey on deliverables and one review of each, not on every task.
+  const launchTask = definitions.get('swarm_launch').parameters.properties.tasks.items
+  assert.equal(launchTask.required.includes('assigneeKey'), false)
+  assert.match(launchTask.properties.assigneeKey.description, /Required on every non-verification task and on at least one verification task reviewing it, with a different member; may be omitted on any further review\./)
+  // The staged plan never required it.
+  assert.equal(definitions.get('swarm_stage').parameters.properties.tasks.items.required.includes('assigneeKey'), false)
 })
 
 test('R24: model-visible text states the declared-outputs rule once and never describes guessing paths from prose', async () => {
@@ -222,4 +244,126 @@ test('observe lists bounded saved requests and permits one owner-scoped focused 
   const focused = await observe.execute({ requestId: 'request-0' }, exec)
   assert.equal(focused.result.request.goal.length, 1000)
   await assert.rejects(observe.execute({ requestId: 'request-0' }, { ...exec, agent: { id: 'stranger' } }), /not owned/)
+})
+
+/* Every swarm_* tool checks its call against its own published parameters schema before anything runs. */
+
+/** A runtime that records every method the tool layer reaches; the validator must reach none of them. */
+function recordingTools() {
+  const calls = [], definitions = new Map()
+  const runtime = new Proxy({}, { get: (_target, key) => typeof key === 'string' && key !== 'then' ? (...args) => { calls.push(key); return undefined } : undefined })
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  return { calls, definitions }
+}
+const refusedBySchema = (schemaIndex, tool, ...fragments) => error => {
+  assert.equal(error.name, 'PolicyError')
+  assert.equal(error.code, 'tool_arguments_invalid')
+  assert.equal(error.category, 'validation_error')
+  assert.ok(error.message.startsWith(`[tool_arguments_invalid] ${tool} was called with arguments its parameters schema refuses: `), error.message)
+  for (const fragment of fragments) assert.ok(error.message.includes(fragment), `${fragment} in ${error.message}`)
+  assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
+  return true
+}
+
+test('swarm_verify without verdict and swarm_message without kind are refused before any state changes', async () => {
+  const f = await setup({ config: { tickMs: 10_000 } })
+  try {
+    const schemaIndex = await toolSchemaIndex()
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = member => ({ agent: { id: member.sessionId }, signal: new AbortController().signal })
+    const source = f.propose({ title: 'Source work' })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review source', objective: 'Independent review',
+      kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: f.mission.acceptance, assigneeId: f.reviewer.id })
+    const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    const evidence = f.runtime.store.list('evidence', f.mission.id).length
+    const deliveries = f.runtime.store.list('deliveries', f.mission.id).length
+    // Without verdict the runtime used to run the checks and record a rejection.
+    await assert.rejects(definitions.get('swarm_verify').execute({ missionId: f.mission.id, taskId: review.id, attemptId: reviewing.attempt.id, reason: 'The artifact looks right' }, as(f.reviewer)),
+      refusedBySchema(schemaIndex, 'swarm_verify', '`verdict` is required'))
+    assert.equal(f.workers.verified.length, 0, 'no declared check ran')
+    assert.equal(f.runtime.store.get('tasks', source.id).status, 'submitted', 'the source is not rejected')
+    assert.equal(f.runtime.store.get('tasks', review.id).attempt?.id, reviewing.attempt.id, 'the review attempt is untouched')
+    assert.equal(f.runtime.store.list('evidence', f.mission.id).length, evidence)
+    // Without kind a question used to be delivered with no kind and open no reply receipt.
+    await assert.rejects(definitions.get('swarm_message').execute({ missionId: f.mission.id, to: 'owner', content: 'Is the scope right?' }, as(f.author)),
+      refusedBySchema(schemaIndex, 'swarm_message', '`kind` is required'))
+    assert.equal(f.runtime.store.list('deliveries', f.mission.id).length, deliveries, 'nothing was delivered')
+  } finally { await f.cleanup() }
+})
+
+test('an invalid enum, a wrong primitive type and a nested launch task missing a field are refused before the runtime is reached', async () => {
+  const schemaIndex = await toolSchemaIndex()
+  const { calls, definitions } = recordingTools()
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  await assert.rejects(definitions.get('swarm_control').execute({ missionId: 'mission_1', action: 'explode', reason: 'r' }, exec),
+    refusedBySchema(schemaIndex, 'swarm_control', '`action` must be one of "pause", "resume", "stop", "complete", "coordinator", "retry", "extend", "amend"'))
+  await assert.rejects(definitions.get('swarm_propose').execute({ missionId: 'mission_1', workstreamId: 'stream_1', title: 'T', objective: 'O', kind: 'research', scope: ['**'], outputs: [], priority: 'high' }, exec),
+    refusedBySchema(schemaIndex, 'swarm_propose', '`priority` must be an integer'))
+  const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'implementation', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1 }
+  const { objective: _objective, ...withoutObjective } = task
+  await assert.rejects(definitions.get('swarm_launch').execute({ requestId: 'request_1', title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget,
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000 }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }],
+    tasks: [task, { ...withoutObjective, key: 'task_2', scope: ['src/', 7] }] }, exec),
+    refusedBySchema(schemaIndex, 'swarm_launch', '`tasks`[1].`objective` is required', '`tasks`[1].`scope`[1] must be a string'))
+  // Every offending path of one call is named in the one refusal.
+  await assert.rejects(definitions.get('swarm_verify').execute({ missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', verdict: 'maybe', reason: 7 }, exec),
+    refusedBySchema(schemaIndex, 'swarm_verify', '`verdict` must be one of "accept", "reject"; `reason` must be a string'))
+  await assert.rejects(definitions.get('swarm_budget').execute({ missionId: 'mission_1', reason: 'r', budget: { maxTokens: 1 } }, exec),
+    refusedBySchema(schemaIndex, 'swarm_budget', '`budget`.`maxSteps` is required'))
+  // The enums whose runtime re-checks were removed: an evidence outcome and a board kind.
+  await assert.rejects(definitions.get('swarm_publish').execute({ missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', claim: 'c', outcome: 'maybe', toolRunIds: ['run_1'] }, exec),
+    refusedBySchema(schemaIndex, 'swarm_publish', '`outcome` must be one of "supported", "disproved", "inconclusive"'))
+  await assert.rejects(definitions.get('swarm_board').execute({ missionId: 'mission_1', kind: 'GOSSIP' }, exec),
+    refusedBySchema(schemaIndex, 'swarm_board', '`kind` must be one of "ASK", "ANSWER", "IDEA", "ALERT", "ARTIFACT", "HANDOFF"'))
+  assert.deepEqual(calls, [], 'no refused call reached the runtime')
+})
+
+test('a representative valid call of every swarm tool passes its schema check and reaches the runtime', async () => {
+  const workspace = await realpath(tmpdir())
+  const plan = {
+    title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget,
+    members: [{ key: 'builder', role: 'implementation' }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }],
+    tasks: [{ key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'] }],
+  }
+  const valid = {
+    swarm_stage: { ...plan, workspace },
+    // A launch task may omit assigneeKey (a further review); outputs and maxRecoveryAttempts are required.
+    swarm_launch: { ...plan, requestId: 'request_1', members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000 }], tasks: [{ ...plan.tasks[0], outputs: [], maxRecoveryAttempts: 1 }] },
+    swarm_budget: { missionId: 'mission_1', budget, reason: 'raise' },
+    swarm_create: { title: 'P', objective: 'O', workspace, scope: ['**'], acceptance: ['works'], budget },
+    swarm_add_member: { missionId: 'mission_1', role: 'reviewer' },
+    swarm_workstream: { missionId: 'mission_1', title: 'W', objective: 'O' },
+    // A repair may omit outputs and acceptance: both are inherited.
+    swarm_propose: { missionId: 'mission_1', workstreamId: 'stream_1', title: 'Repair', objective: 'O', kind: 'research', scope: ['**'], replaces: ['task_old'] },
+    swarm_claim: { missionId: 'mission_1', taskId: 'task_1' },
+    swarm_publish: { missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', claim: 'c', outcome: 'supported', toolRunIds: ['run_1'] },
+    // deliverables may be omitted: the declared outputs are always captured.
+    swarm_submit: { missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', output: 'done' },
+    swarm_verify: { missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', verdict: 'accept', reason: 'checks pass' },
+    swarm_message: { missionId: 'mission_1', to: 'owner', kind: 'question', content: 'q' },
+    swarm_challenge: { missionId: 'mission_1', evidenceId: 'evidence_1', reason: 'r', toolRunIds: ['run_1'] },
+    swarm_handoff: { missionId: 'mission_1', taskId: 'task_1', attemptId: 'attempt_1', summary: 's' },
+    swarm_subscribe: { missionId: 'mission_1', topics: ['*'] },
+    swarm_wait: { missionId: 'mission_1' },
+    swarm_observe: {},
+    swarm_control: { missionId: 'mission_1', taskId: 'task_1', action: 'amend', changes: { dependencies: [], maxSteps: 5 }, reason: 'r' },
+    swarm_cancel: { missionId: 'mission_1', taskId: 'task_1', reason: 'r' },
+    swarm_registry: {},
+    swarm_escalate: { missionId: 'mission_1', body: 'b' },
+    swarm_post: { missionId: 'mission_1', kind: 'ASK', body: 'b' },
+    swarm_board: { missionId: 'mission_1', kind: 'ASK', limit: 5 },
+    swarm_restore: {},
+  }
+  const { SWARM_TOOLS } = await import('../lib/tools.js')
+  assert.deepEqual(Object.keys(valid).sort(), [...SWARM_TOOLS].sort(), 'every registered tool has a representative call')
+  for (const name of SWARM_TOOLS) {
+    const { calls, definitions } = recordingTools()
+    const exec = { agent: { id: 'owner', session: { header: { cwd: workspace } } }, signal: new AbortController().signal }
+    const error = await definitions.get(name).execute(structuredClone(valid[name]), exec).then(() => undefined, failure => failure)
+    assert.notEqual(error?.code, 'tool_arguments_invalid', `${name}: ${error?.message}`)
+    assert.ok(calls.length > 0, `${name} reached the runtime (${error?.message ?? 'ok'})`)
+  }
 })
