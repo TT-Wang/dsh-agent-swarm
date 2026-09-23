@@ -8,9 +8,12 @@
  *   - the worker is spawned detached (POSIX setsid), so it is not in the
  *     process group of the host it stops — launching this script from inside
  *     that host no longer kills the restart half-way;
- *   - the host is whatever listens on the port (scripts/host.mjs), never a
- *     recorded pid: a host restarted by hand is still the one stopped, and the
- *     new host starts only once the port is free.
+ *   - the host is the preview's own dsh host listening on the port
+ *     (scripts/host.mjs), never a recorded pid: a host restarted by hand is
+ *     still the one stopped, and the new host starts only once the port is
+ *     free. Any other listener (another program, another root's host) is
+ *     refused by pid and command line, here before the build and again in the
+ *     worker right before it signals, and is never stopped.
  *
  * Usage:
  *   node scripts/update-preview.mjs [options]
@@ -73,6 +76,9 @@ const pluginDir = noSync ? (args.includes('--plugin') ? resolve(value('--plugin'
 if (pluginDir !== undefined && !existsSync(join(pluginDir, 'package.json'))) fail(`plugin snapshot has no package.json: ${pluginDir}`)
 const port = Number(value('--port', server.url ? new URL(server.url).port : '0'))
 if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('choose a port from 1024 through 65535 with --port')
+// The host this update replaces must be this preview's own before anything is built or synced.
+let oldHost
+if (!noRestart) try { oldHost = findHost(port, preview) } catch (error) { fail(error.message) }
 const patch = resolve(value('--patch', join(preview, 'preview.patch.yml')))
 const home = resolve(value('--home', join(preview, 'home')))
 const workspace = resolve(value('--workspace', join(preview, 'workspace')))
@@ -143,9 +149,8 @@ const summary = { preview, plugin: pluginDir, port, harness: harnessRoot, backup
 if (noRestart) { process.stdout.write(JSON.stringify(summary, null, 2) + '\n'); process.exit(0) }
 
 // ---------------------------------------------------------------- restart
-// The worker stops whatever holds the port when it runs, so nothing here
-// records a pid; the lookup below only names that host in the log.
-const oldHost = findHost(port)
+// The worker looks the host up again when it runs, so nothing here records a
+// pid; the lookup above only names that host in the log.
 if (!dryRun) {
   writeServer(preview, { status: 'restarting', url: `http://127.0.0.1:${port}`, port, home, plugin: pluginDir, harness: harnessRoot, model: server.model, startedAt: now() })
   const statePath = join(preview, `.update-preview-${stamp()}.json`)
@@ -157,13 +162,14 @@ if (!dryRun) {
   summary.restarted = true
   summary.workerPid = worker.pid
   summary.state = statePath
-  log(`restart worker ${worker.pid} scheduled; old host ${oldHost ?? 'none'} will stop in ${Number(value('--delay', '2000'))}ms`)
+  log(`restart worker ${worker.pid} scheduled; old host ${oldHost?.pid ?? 'none'} will stop in ${Number(value('--delay', '2000'))}ms`)
 }
 process.stdout.write(JSON.stringify(summary, null, 2) + '\n')
 
 /**
  * Detached half. Runs in its own session so it survives the host it stops.
- * Order: wait, stop the port's host, start, wait for the launch URL, bookkeep.
+ * Order: wait, stop this preview's host on the port, start, wait for the launch
+ * URL, bookkeep.
  * On failure it restores the previous snapshot and tries exactly once more.
  */
 async function runWorker(statePath) {
@@ -171,7 +177,7 @@ async function runWorker(statePath) {
   const log = message => appendFileSync(join(state.preview, 'restart.log'), `[${now()}] ${message}\n`)
   const record = fields => writeServer(state.preview, { url: `http://127.0.0.1:${state.port}`, port: state.port, home: state.home, plugin: state.pluginDir, harness: state.harnessRoot, model: state.model, startedAt: now(), ...fields })
   const host = { root: state.preview, port: state.port, cli: state.cli, patch: state.patch, cwd: state.workspace, env: hostEnv(state.preview, state.home) }
-  const stop = () => stopHost(state.port, { onStop: pid => log(`stopping host ${pid}`) })
+  const stop = () => stopHost(state.port, state.preview, { onStop: pid => log(`stopping host ${pid}`) })
   // A loaded host (this machine runs the preview AND the agent session that
   // deploys it) can take minutes to print its launch URL. Waiting too little is
   // worse than waiting long: the old 90s window declared a healthy boot a

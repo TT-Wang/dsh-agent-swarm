@@ -1,12 +1,15 @@
 /**
- * update-preview, start-lab and round identify the host by its port, run live
- * against tests/fixtures/fake-host.mjs as the Harness CLI on a throwaway port
- * >= 6100 with a temporary root and HOME: never dsh, ~/.dsh or the live hosts.
+ * update-preview, start-lab and round identify the host as the root's own dsh
+ * host on its port, run live against tests/fixtures/fake-host.mjs as the
+ * Harness CLI on a throwaway port >= 6100 with a temporary root and HOME: never
+ * dsh, ~/.dsh or the live hosts. A hand-started host runs the fake Harness's
+ * apps/cli/lib/bin.js with the root's patch, the command line the scripts
+ * launch.
  *
- * Each test replays the 2026-09-18 incident: the host was restarted by hand, so
- * server.json records a pid that some other process (the decoy) now owns, while
- * the real host holds the port. The pid-file supervisor killed the decoy and
- * started a second host on the held port. The hand-started host and the decoy
+ * The first two tests replay the 2026-09-18 incident: the host was restarted by
+ * hand, so server.json records a pid that some other process (the decoy) now
+ * owns, while the real host holds the port. The pid-file supervisor killed the
+ * decoy and started a second host on the held port. The hand-started host and the decoy
  * are this process's children, so a script's "is it gone yet" poll waits for
  * this process to reap them: their exit status is settled once a script
  * returns. This file uses no helper from scripts/host.mjs, so the same
@@ -15,7 +18,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, spawn, spawnSync } from 'node:child_process'
-import { closeSync, copyFileSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -84,7 +87,7 @@ async function scene(t) {
     /** The host someone restarted by hand: it holds the port and prints its token into `log`. */
     async handStart(patch, log) {
       const out = openSync(join(root, log), 'a')
-      const child = spawn(process.execPath, [fakeHost, '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out] })
+      const child = spawn(process.execPath, [join(harness, 'apps/cli/lib/bin.js'), '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out] })
       closeSync(out)
       children.push(child)
       await until(() => listener(port) === child.pid, `the hand-started host on ${port}`, 20_000)
@@ -176,4 +179,49 @@ test('the host is the listener on 127.0.0.1: unrelated listeners on ::1 and 0.0.
   const server = readJson(join(s.root, 'server.json'))
   assert.equal(server.status, 'running', restartLog)
   assert.equal(listener(s.port), server.pid)
+})
+
+test('update-preview and start-lab refuse a listener that is not this root\'s host, by pid and command line, and never signal it', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace', 'other']) mkdirSync(join(s.root, dir), { recursive: true })
+  writeFileSync(join(s.root, 'home/.credentials.yaml'), '') // already seeded: start-lab reads no .env
+  const record = JSON.stringify({ status: 'running', pid: 1, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness })
+  writeFileSync(join(s.root, 'server.json'), record)
+  const update = () => s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '0'])
+
+  const lab = extra => s.run('start-lab.mjs', ['--root', s.root, '--port', String(s.port), '--harness', s.harness, ...extra])
+  async function refusedBy(victim, what) {
+    for (const [name, result] of [['update-preview', await update()], ['start-lab', await lab([])], ['start-lab --no-start', await lab(['--no-start'])]]) {
+      assert.equal(result.code, 1, `${name} over ${what}: ${result.stdout}`)
+      assert.match(result.stderr, new RegExp(`port ${s.port} is held by process ${victim.pid} \\(.+\\), which is not the dsh host of ${s.root}`), `${name} names ${what}`)
+      assert.ok(running(victim), `${name} never signals ${what}`)
+    }
+    const status = await s.run('round.mjs', ['status', '--lab', s.root])
+    assert.equal(status.code, 0, `round status reports ${what} instead of crashing: ${status.stderr}`)
+    assert.deepEqual([JSON.parse(status.stdout).host.alive, JSON.parse(status.stdout).host.error.includes(`process ${victim.pid} (`)], [false, true])
+  }
+  const unrelated = await s.foreign('127.0.0.1')
+  await refusedBy(unrelated, 'an unrelated program')
+  unrelated.kill('SIGKILL')
+  await until(() => listener(s.port) === undefined, 'the unrelated program to exit')
+  await refusedBy(await s.handStart(s.patch('other/preview.patch.yml'), 'other/server.log'), 'another root\'s host')
+  assert.equal(readFileSync(join(s.root, 'server.json'), 'utf8'), record, 'update-preview refused before recording a restart')
+  assert.equal(existsSync(join(s.root, 'restart.log')), false, 'and before building, syncing or scheduling a worker')
+})
+
+test('the restart worker checks the port again: a program that took it during the delay is refused, never signalled', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
+  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log')
+  writeFileSync(join(s.root, 'server.json'), JSON.stringify({ status: 'running', pid: hand.pid, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness }))
+  const update = await s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '3000'])
+  assert.equal(update.code, 0, update.stderr)
+  hand.kill('SIGTERM')
+  await until(() => listener(s.port) === undefined, 'the host to exit during the delay', 20_000)
+  const taker = await s.foreign('127.0.0.1')
+  await until(() => !readdirSync(s.root).some(name => name.startsWith('.update-preview-')), 'the detached restart worker')
+  const restartLog = readFileSync(join(s.root, 'restart.log'), 'utf8')
+  assert.ok(running(taker), `the program that took the port is never signalled\n${restartLog}`)
+  assert.match(restartLog, new RegExp(`port ${s.port} is held by process ${taker.pid} \\(.+\\), which is not the dsh host of ${s.root}`))
+  assert.doesNotMatch(restartLog, /stopping host|started host/)
 })
