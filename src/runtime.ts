@@ -8,7 +8,7 @@ import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, REJECTION_DECISION_TRIGGER, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
-import { Scheduling, type SchedulingPass } from './scheduling.ts'
+import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -4200,25 +4200,26 @@ export class SwarmRuntime {
    * The record is removed in `closePass` when the body settles, whatever the
    * outcome; the tick watchdog names a body that holds it past its bound.
    *
-   * A body that stopped at a member boundary past its bound
-   * (`Scheduling.dispatch`) is followed at once by the next body, which sweeps
-   * from the member it stopped before (`sweepFrom`). It is opened in the same
-   * synchronous step that closes the stopped body, so the close publishes as
-   * inside that live pass, never as a finished sweep that left the unswept
+   * A body that stopped early at a member boundary (`Scheduling.dispatch`,
+   * handed here as `after`) is followed at once by the next body, which sweeps
+   * from the member it stopped before (`sweepFrom`) and continues its chain
+   * (`chainFrom`, so the chain covers at most one rotation). It is opened in the
+   * same synchronous step that closes the stopped body, so the close publishes
+   * as inside that live pass, never as a finished sweep that left the unswept
    * members' work undispatched. The body is handed its own record (`schedule`),
    * which it stamps with its own progress (`Scheduling.passState`).
    */
-  kick(missionId: string, sweepFrom?: string): void {
+  kick(missionId: string, after?: SchedulingPass): void {
     if (this.shuttingDown || this.closed) return
     const pass = this.openPass(missionId)
     if (pass === undefined) return
-    if (sweepFrom !== undefined) pass.sweepFrom = sweepFrom
+    if (after?.stoppedBefore !== undefined) { pass.sweepFrom = after.stoppedBefore; pass.chainFrom = after.chainFrom }
     this.defer(async () => {
       try { await this.exclusive(missionId, () => this.schedule(missionId, pass)) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
-        if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass.stoppedBefore)
+        if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass)
       }
     })
   }
@@ -4303,6 +4304,9 @@ export class SwarmRuntime {
    */
   private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
     if (this.shuttingDown) return
+    // The body starts: its first progress, and the baseline from which its
+    // later stamps tell waiting from computing (the queue wait is not its own).
+    progressed(pass)
     const mission = this.mission(missionId)
     if (mission.status !== 'active') { await this.flushOutbox(missionId); return }
     if (mission.budgetPause) {

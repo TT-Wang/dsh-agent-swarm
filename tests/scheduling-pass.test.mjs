@@ -343,6 +343,85 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
   } finally { await f.cleanup() }
 })
 
+/** Record every scheduling body as it closes, and count the pass-end outbox flushes. */
+function watchBodies(f) {
+  const scheduling = f.runtime.scheduling
+  const bodies = []
+  let flushes = 0
+  const closePass = scheduling.closePass.bind(scheduling)
+  scheduling.closePass = (missionId, pass) => { bodies.push({ stopped: pass.stoppedBefore !== undefined, sweepFrom: pass.sweepFrom }); return closePass(missionId, pass) }
+  const flushOutbox = f.runtime.flushOutbox.bind(f.runtime)
+  f.runtime.flushOutbox = missionId => { flushes += 1; return flushOutbox(missionId) }
+  return { bodies, flushes: () => flushes }
+}
+
+test('S1: a body past its bound only by computing is not stopped early, so every body still runs the pass-end steps', async () => {
+  // Before, the early stop applied to any body past its bound at a member
+  // boundary. When the members' synchronous work alone outlasted the bound
+  // (here eight members whose adapter start computes for 3ms, against a 10ms
+  // bound) every body stopped early and queued the next at once: no body ever
+  // reached ensureWitness or flushOutbox, and bodies ran back to back without
+  // the tick. Only a body that waited past its bound in one of its own awaits
+  // stops early now; another body cannot shorten computation.
+  class ComputingStartWorkers extends FakeWorkers {
+    async start(spec) {
+      this.started.push(spec.member.id)
+      const end = Date.now() + 3
+      while (Date.now() < end) { /* the adapter's synchronous work */ }
+    }
+    isIdle() { return false }
+  }
+  const f = await setup({ workers: new ComputingStartWorkers(), budget: { maxWorkers: 10 }, config: { tickMs: 10, stallPassTimeoutMs: 10, stallPasses: 1_000 } })
+  try {
+    for (let n = 0; n < 6; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+    await sleep(100)
+    const watched = watchBodies(f)
+    await sleep(500)
+    const bodies = [...watched.bodies]
+    assert.ok(bodies.length >= 3, `bodies kept running (${bodies.length})`)
+    assert.deepEqual(bodies.filter(body => body.stopped), [], 'no body past its bound on computation alone stopped early')
+    assert.ok(watched.flushes() >= bodies.length - 1, `every body ran the pass-end steps (${watched.flushes()} flushes for ${bodies.length} bodies)`)
+  } finally { await f.cleanup() }
+})
+
+test('S1: a chain of early-stopped bodies covers one rotation, and the body that completes it runs the pass-end steps and leaves the next body to the tick', async () => {
+  // Before, a body that stopped early queued the next at once however far the
+  // chain had come. When no body could sweep the whole rotation within its
+  // bound (here every member's start waits 40ms against a 30ms bound) the
+  // chain never ended: no body ran ensureWitness or flushOutbox, and bodies
+  // ran back to back without the tick. A chained body now ends its sweep
+  // before the member its chain started from.
+  class SlowStartWorkers extends FakeWorkers {
+    slow = false
+    async start(spec) {
+      this.started.push(spec.member.id)
+      if (this.slow) await sleep(40)
+    }
+  }
+  const workers = new SlowStartWorkers()
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 30, stallPasses: 1_000 } })
+  try {
+    for (const name of ['C', 'D']) await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 })
+    const members = f.runtime.store.list('members', f.mission.id).length
+    await sleep(100)
+    workers.slow = true
+    await eventually(() => f.runtime.scheduling.passes.get(f.mission.id) === undefined ? true : undefined, 'the body that saw the fast starts settles')
+    const watched = watchBodies(f)
+    await sleep(1_000)
+    const bodies = [...watched.bodies]
+    const completed = bodies.filter(body => !body.stopped).length
+    assert.ok(completed >= 2, `chains end: ${completed} of ${bodies.length} bodies completed the rotation`)
+    assert.ok(watched.flushes() >= completed, 'and each completing body ran the pass-end steps')
+    let chain = 0
+    for (const [index, body] of bodies.entries()) {
+      if (index > 0 && !bodies[index - 1].stopped) assert.equal(body.sweepFrom, undefined, 'the body after a completed rotation is a fresh one from the tick, not a continuation')
+      chain = body.stopped ? chain + 1 : 0
+      assert.ok(chain <= members - 1, `a chain of ${chain} early stops stays within one rotation of ${members} members`)
+    }
+    assert.ok(bodies.some(body => body.stopped), 'bodies did stop early after waiting past their bound')
+  } finally { await f.cleanup() }
+})
+
 test('S1: the watchdog, passWedged and livePass read one bound predicate, so they agree at exactly the bound', async () => {
   // Before, the watchdog named a body once its age reached the bound while
   // passWedged reported it wedged only past the bound. At age == bound a body
