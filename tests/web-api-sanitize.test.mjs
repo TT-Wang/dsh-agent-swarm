@@ -26,6 +26,7 @@ import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
+import { AdmissionError } from '../lib/admission.js'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -327,4 +328,53 @@ test('a typed refusal naming an absolute host path under any system root is an i
   const relative = await f.rpc('control', control)
   assert.equal(relative.result.error.code, 'bad-request', relative.text)
   assert.equal(relative.result.error.details.policyCode, 'probe_refusal')
+})
+
+test('a scope or check echoing the caller\'s own absolute path is a fixed repair, not an internal error', async t => {
+  const f = await fixture(t)
+  const owner = { sessionId: f.ownerId }
+  const mission = f.runtime.create(owner, f.input)
+  const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
+  const task = f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Read', objective: 'Read the code', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  const repair = location => `[scope_selector_invalid] ${location}: the value names an absolute path and is not repeated here. Use a repository-relative path and retry.`
+  const refusal = (response, text, policyCode) => {
+    assert.equal(response.result.ok, false)
+    assert.equal(response.result.error.code, 'bad-request', response.text)
+    assert.equal(response.result.error.message, text)
+    assert.deepEqual(response.result.error.details, { issues: [], policyCode, category: 'budget_error' })
+  }
+  for (const value of ['/workspace/src/', '/Users/x/src/']) {
+    const echoed = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\//g, '\\\\?/'))
+    const amendScope = await f.rpc('control', { sessionId: f.ownerId, missionId: mission.id, action: 'amend', changes: { scope: [value] }, reason: 'narrow' })
+    refusal(amendScope, repair('scope[0]'), 'scope_selector_invalid')
+    assert.doesNotMatch(amendScope.text, echoed)
+    const propose = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id,
+      input: { workstreamId: stream.id, title: 'Read more', objective: 'Read more code', kind: 'research', scope: [value], acceptance: ['works'] } })
+    refusal(propose, repair('task.scope[0]'), 'scope_selector_invalid')
+    assert.doesNotMatch(propose.text, echoed)
+    const amendTask = await f.rpc('control', { sessionId: f.ownerId, missionId: mission.id, taskId: task.id, action: 'amend', changes: { scope: [value] }, reason: 'narrow' })
+    refusal(amendTask, repair('scope[0]'), 'scope_selector_invalid')
+    assert.doesNotMatch(amendTask.text, echoed)
+    // A check naming the caller's absolute path is answered the same way.
+    const check = await f.rpc('propose', { sessionId: f.ownerId, missionId: mission.id,
+      input: { workstreamId: stream.id, title: 'Build', objective: 'Change the code', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: [`node ${value}check.cjs`] } })
+    assert.equal(check.result.error.code, 'bad-request', check.text)
+    assert.equal(check.result.error.message, '[check_absolute_path] task.checks[0]: the value names an absolute path and is not repeated here. Use a repository-relative path and retry.')
+    assert.deepEqual(check.result.error.details, { issues: [], policyCode: 'check_absolute_path', category: 'validation_error' })
+    assert.doesNotMatch(check.text, echoed)
+  }
+  assert.deepEqual(f.runtime.snapshot(owner, mission.id).mission.scope, ['src/'])
+  assert.deepEqual(f.runtime.snapshot(owner, mission.id).tasks.map(row => row.scope), [['src/']])
+  // A location that itself names host detail is dropped from the repair line,
+  // and a refusal with no stable diagnostic code stays an internal error.
+  const control = { sessionId: f.ownerId, missionId: mission.id, action: 'pause', reason: 'test' }
+  f.runtime.control = () => { throw new AdmissionError('probe_refusal', 'validation_error', 'Cannot read "/Users/x/secret"', 'files["/Users/x/secret"]') }
+  const unlocated = await f.rpc('control', control)
+  assert.equal(unlocated.result.error.code, 'bad-request', unlocated.text)
+  assert.equal(unlocated.result.error.message, '[probe_refusal] The value names an absolute path and is not repeated here. Use a repository-relative path and retry.')
+  assert.doesNotMatch(unlocated.text, /secret/)
+  f.runtime.control = () => { throw new AdmissionError('Probe Refusal', 'validation_error', 'Cannot read "/Users/x/secret"', 'files') }
+  const uncoded = await f.rpc('control', control)
+  assert.equal(uncoded.result.error.code, 'internal-error')
+  assert.doesNotMatch(uncoded.text, /secret/)
 })
