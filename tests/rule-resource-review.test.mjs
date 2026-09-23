@@ -173,7 +173,7 @@ test('review: legacy handoff recovery uses the recorded old owner instead of its
   assert.equal(f.rt.task(f.mission.id, f.task.id).assigneeId, f.other.id)
 })
 
-for (const separateBlock of ['none', 'artifact', 'preparation', 'refuted', 'maxSteps']) test(`review: restart clears legacy finding ceilings without clearing ${separateBlock} policy`, async t => {
+for (const separateBlock of ['none', 'recovery', 'artifact', 'preparation', 'refuted', 'maxSteps']) test(`review: restart clears legacy finding ceilings without clearing ${separateBlock} policy`, async t => {
   const f = await fixture(t)
   f.rt.control(f.owner, f.mission.id, 'pause', 'Keep upgrade quiet')
   const old = f.rt.task(f.mission.id, f.task.id)
@@ -181,6 +181,9 @@ for (const separateBlock of ['none', 'artifact', 'preparation', 'refuted', 'maxS
   old.ceiling = { dimension: separateBlock === 'maxSteps' ? 'maxSteps' : 'maxFindings', used: 5, limit: 5, reason: 'Legacy ceiling', at: Date.now() }
   if (separateBlock === 'artifact') old.artifact = { commit: 'immutable-rejected', changedPaths: ['src/a.ts'] }
   if (separateBlock === 'preparation') old.preparationFailure = { reason: 'Workspace requires repair', at: Date.now() }
+  // A host restart never spends or checks recovery credit (R11-07): a spent
+  // recovery limit alone does not keep the retired-ceiling task blocked.
+  if (separateBlock === 'recovery') Object.assign(old, { recoveryCount: 1, maxRecoveryAttempts: 1 })
   if (separateBlock === 'refuted') old.evidenceIds = ['refuted-evidence']
   f.rt.commit(f.mission.id, () => {
     f.rt.store.put('tasks', old)
@@ -189,7 +192,8 @@ for (const separateBlock of ['none', 'artifact', 'preparation', 'refuted', 'maxS
   await f.restart()
   const restored = f.rt.task(f.mission.id, old.id)
   assert.equal(f.rt.mission(f.mission.id).status, 'paused')
-  assert.equal(restored.status, separateBlock === 'none' ? 'pending' : 'blocked')
+  assert.equal(restored.status, separateBlock === 'none' || separateBlock === 'recovery' ? 'pending' : 'blocked')
+  if (separateBlock === 'recovery') assert.equal(restored.recoveryCount, 1, 'the spent credit is preserved, not reset')
   if (separateBlock === 'maxSteps') assert.equal(restored.ceiling.dimension, 'maxSteps')
   else assert.equal(restored.ceiling, undefined)
 })

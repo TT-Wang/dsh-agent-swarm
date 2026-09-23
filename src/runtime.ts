@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, pendingStopOwner, stopPending } from './attempts.ts'
+import { Attempts, blockCauses, pendingStopOwner, stopPending, type BlockCause } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
@@ -571,10 +571,12 @@ export class SwarmRuntime {
         for (const task of this.store.list('tasks', mission.id)) {
           // Finding volume is advisory. Retire only this obsolete ceiling;
           // independent rejection or preparation failures still need repair.
+          // A host restart never spends or checks recovery credit (R11-07), so
+          // the recovery limit alone does not keep the task blocked.
           if (task.ceiling?.dimension === 'maxFindings') {
             delete task.ceiling
-            const refuted = task.evidenceIds.some(evidenceId => this.store.get('evidence', evidenceId)?.status === 'refuted')
-            if (task.status === 'blocked' && task.resumeAfterStop === undefined && task.artifact === undefined && !task.verificationRecovery && !task.preparationFailure && !refuted) task.status = 'pending'
+            const remaining = [...this.taskBlockCauses(task)].filter(cause => cause !== 'recovery-exhausted')
+            if (task.status === 'blocked' && task.resumeAfterStop === undefined && remaining.length === 0) task.status = 'pending'
             this.store.put('tasks', task)
           }
           // A cold host confirms the old process is gone, but a durable stop
@@ -1504,6 +1506,11 @@ export class SwarmRuntime {
     task.status = 'running'; task.assigneeId = member.id
     // Close-out and git-denial markers belong to one attempt; a new attempt starts clean.
     delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    // Every caller prepared this attempt's workspace successfully before
+    // assigning it, so a recorded preparation failure (a transient one whose
+    // backoff retry just succeeded) is stale: carried forward, a later stop of
+    // this attempt would read it as a live block cause.
+    delete task.preparationFailure
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
     try {
       this.commit(task.missionId, () => {
@@ -3379,6 +3386,15 @@ export class SwarmRuntime {
   
   
   
+  /**
+   * Every cause blocking `task` now (see `blockCauses`), read against this
+   * runtime's evidence rows and default recovery limit. The restart
+   * re-derivation and owner task control ask it here; the stop barrier asks the
+   * same `blockCauses` through its own store reads.
+   */
+  taskBlockCauses(task: Task): Set<BlockCause> {
+    return blockCauses(task, evidenceId => this.store.get('evidence', evidenceId)?.status, this.config.maxTasksPerMember)
+  }
   /** Amend execution policy without replacing the task or resetting its accumulated work. */
   controlTask(actor: Actor, missionId: string, taskId: string, action: 'amend' | 'resume', changes: TaskAmendment, reason: string): Task & { dependencyChanges?: { previous: string[]; current: string[]; added: string[]; removed: string[] } } {
     actor.signal?.throwIfAborted()
@@ -3412,7 +3428,8 @@ export class SwarmRuntime {
     // rewritten after the fact.
     const structural = !strengthenSubmittedChecks && ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
     if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', 'Submitted artifact policy is immutable; repair rejected work through a replacement')
-    if (task.status === 'blocked' && task.evidenceIds.some(key => this.store.get('evidence', key)?.status === 'refuted') && !task.verificationRecovery) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
+    const causes = this.taskBlockCauses(task)
+    if (task.status === 'blocked' && causes.has('refuted') && !causes.has('review-deferred')) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
     const next: Task = { ...task }
     for (const key of ['maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs'] as const) {
       const value = changes[key]
@@ -3450,13 +3467,19 @@ export class SwarmRuntime {
       }
     }
     const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next) === undefined)
+    // A blocked task that carries an artifact was rejected, or invalidated after
+    // it submitted: the artifact is immutable, so a resume would only fence the
+    // historical author and re-pend work that can never change. A resume while a
+    // stop is still pending is the advertised cleanup retry, which keeps the
+    // blocked outcome, so it stays allowed.
+    if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] and keeping its acceptance verbatim, or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
       const source = this.task(missionId, task.verificationRecovery.sourceTaskId)
       if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
     }
-    if (resumes && (next.recoveryCount ?? 0) >= (next.maxRecoveryAttempts ?? this.config.maxTasksPerMember)) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
+    if (resumes && this.taskBlockCauses(next).has('recovery-exhausted')) throw new PolicyError('task_recovery_exhausted', 'budget_error', 'Raise maxRecoveryAttempts before resuming exhausted automatic recovery')
     // An explicit owner recovery keeps the stop barrier but records the desired
     // pending state now, so a still-running checkpoint cannot forget the resume.
     if (resumes && next.status === 'blocked' && next.artifact === undefined && next.resumeAfterStop?.reason === 'invalidated') {

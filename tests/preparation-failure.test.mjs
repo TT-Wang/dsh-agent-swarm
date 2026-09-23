@@ -118,3 +118,25 @@ test('R17: deterministic preparation failures wait immediately for cause-changin
   await new Promise(resolve => setTimeout(resolve, 100))
   assert.equal(f.workers.calls, 1, 'unchanged deterministic failure is not retried every tick')
 })
+
+test('a handoff after a successful preparation retry re-pends the task without the stale preparation failure', async t => {
+  const f = await setup(t)
+  f.workers.failures = 1
+  const proposed = f.propose({ maxRecoveryAttempts: 2 })
+  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded')
+  const running = await eventually(() => { const row = f.task(proposed.id); return row.status === 'running' ? row : undefined },
+    'the task was not re-dispatched once the preparation retry succeeded')
+  assert.equal(f.workers.calls, 2)
+  assert.equal(running.preparationFailure, undefined, 'the assignment after a successful retry drops the stale failure')
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.kind === 'assignment' && row.attemptId === running.attempt.id)
+  assert.equal(assignment.length, 1)
+  assert.equal(JSON.parse(assignment[0].content).task.preparationFailure, undefined, 'the worker is not handed the retried failure')
+  // Keep the handed-off task observable as pending: no member is dispatchable.
+  f.workers.isIdle = () => false
+  f.runtime.handoff({ sessionId: f.member.sessionId }, f.mission.id, { taskId: proposed.id, attemptId: running.attempt.id, summary: 'Continue elsewhere' })
+  await eventually(() => f.events('task/handoff-ready').some(event => event.data.taskId === proposed.id), 'the handoff stop barrier did not confirm')
+  const handedOff = f.task(proposed.id)
+  assert.equal(handedOff.status, 'pending', 'a handoff after a recovered preparation re-pends the task instead of blocking it')
+  assert.equal(handedOff.preparationFailure, undefined)
+  assert.equal(f.events('task/blocked').filter(event => event.data.taskId === proposed.id).length, 0)
+})
