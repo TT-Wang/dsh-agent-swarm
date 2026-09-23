@@ -545,10 +545,10 @@ export class Notices {
   private readonly pendingTransitions = new Set<string>()
   private transitionScheduled = false
   /**
-   * R17-G5: missions whose scheduling guard was just released as wedged. The
-   * watchdog's release commit is the transition that owes the dispatch question
-   * the dead pass never reached, so the next publication runs with the wedged
-   * branch even though the pass row is already released.
+   * R17-G5: missions whose scheduling pass was just named wedged. The
+   * watchdog's naming commit is the transition that owes the dispatch question
+   * the wedged pass never reached, so the next publication runs with the wedged
+   * branch even if the body settles before that publication runs.
    */
   private readonly wedgedReleases = new Set<string>()
 
@@ -1144,7 +1144,7 @@ export class Notices {
     })
   }
 
-  /** R17-G5: mark the next publication of a released-wedged pass's mission. */
+  /** R17-G5: mark the next publication of a mission whose wedged pass was just named. */
   expectWedgedRelease(missionId: string): void { this.wedgedReleases.add(missionId) }
 
   /** R17-G5: publish one mission's committed transitions against its settled state. */
@@ -1155,8 +1155,10 @@ export class Notices {
       // A live pass owns the dispatcher's "ready but not dispatched" question
       // (R15-D3: generation must not invent the cause the pass is about to
       // resolve), so a transition inside a pass classifies with `offPass`; the
-      // question is asked by the transition that ends or releases the pass, and
-      // by a wedged pass, which never reached its own question.
+      // question is asked by the transition that ends or names the pass, and
+      // by a wedged pass, which never reached its own question; a body that
+      // committed within the last bound past its bound is running, not wedged
+      // (`Scheduling.passState`).
       const state = this.rt.passState(missionId)
       const released = this.wedgedReleases.delete(missionId)
       // A live, un-wedged pass owns generation: it will publish at its own close
