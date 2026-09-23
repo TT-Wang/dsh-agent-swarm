@@ -21,7 +21,8 @@
  *          profile and pack smokes; --browser adds the live browser smokes
  * promote: --commit <sha> --dry-run; requires a recorded green gate for that
  *          exact commit and a clean tree in its paths; never commits by itself
- * mount:   --harness <dir> (default: the one recorded in the lab's server.json)
+ * mount:   --harness <dir> (default: the running lab host's, else the one
+ *          recorded in the lab's server.json)
  * soak:    verifies the lab is alive, loaded the plugin and started after the build
  * The lab host is the lab's own dsh host on its port, not a recorded pid.
  * new:     --scope "one-line round scope"

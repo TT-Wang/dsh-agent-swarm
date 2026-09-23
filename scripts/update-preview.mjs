@@ -22,9 +22,10 @@
  *   --preview <dir>   preview root (default: ~/.dsh/agent-swarm-v41)
  *   --plugin <dir>    linked plugin snapshot (default: realpath of <preview>/plugin)
  *   --port <n>        host port (default: port from <preview>/server.json)
- *   --harness <dir>   Harness checkout to boot (default: the one recorded in
- *                     <preview>/server.json; required once for a preview whose
- *                     record predates it)
+ *   --harness <dir>   Harness checkout to boot, recorded in server.json
+ *                     (default: the one the preview's running host was
+ *                     launched from, else the one recorded in
+ *                     <preview>/server.json; required when neither exists)
  *   --patch <file>    patch overlay (default: <preview>/preview.patch.yml)
  *   --home <dir>      DSH_HOME (default: <preview>/home)
  *   --workspace <dir> host working directory (default: <preview>/workspace)
@@ -78,15 +79,17 @@ const port = Number(value('--port', server.url ? new URL(server.url).port : '0')
 if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('choose a port from 1024 through 65535 with --port')
 // The host this update replaces must be this preview's own before anything is built or synced.
 let oldHost
-if (!noRestart) try { oldHost = findHost(port, preview) } catch (error) { fail(error.message) }
+try { oldHost = findHost(port, preview) } catch (error) { if (!noRestart) fail(error.message) }
 const patch = resolve(value('--patch', join(preview, 'preview.patch.yml')))
 const home = resolve(value('--home', join(preview, 'home')))
 const workspace = resolve(value('--workspace', join(preview, 'workspace')))
 const logPath = join(preview, 'restart.log')
 const log = message => { const line = `[${now()}] ${message}`; if (dryRun) process.stdout.write(line + '\n'); else appendFileSync(logPath, line + '\n') }
-const recordedHarness = args.includes('--harness') ? value('--harness') : server.harness
-if (!recordedHarness) fail(`${join(preview, 'server.json')} does not record the Harness this preview boots; pass --harness <checkout> once (it is recorded from then on)`)
-const harnessRoot = resolve(recordedHarness)
+// What is live beats the record, which a hand restart never updates.
+const harnessChoice = args.includes('--harness') ? value('--harness') : oldHost?.harness ?? server.harness
+if (!harnessChoice) fail(`no host of ${preview} is running and ${join(preview, 'server.json')} does not record the Harness it boots; pass --harness <checkout> once (it is recorded from then on)`)
+const harnessRoot = resolve(harnessChoice)
+if (server.harness && resolve(server.harness) !== harnessRoot) log(`booting Harness ${harnessRoot}, not the recorded ${server.harness}`)
 const cli = join(harnessRoot, 'apps/cli/lib/bin.js')
 if (!existsSync(cli)) fail(`harness CLI not found: ${cli} (pass --harness <checkout>)`)
 

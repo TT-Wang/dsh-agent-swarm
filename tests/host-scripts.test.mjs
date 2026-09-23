@@ -64,6 +64,12 @@ async function scene(t) {
   const env = { ...process.env, HOME: join(root, 'home') }
   return {
     root, port, harness,
+    /** Another Harness checkout next to the first. */
+    harnessCopy(name) {
+      mkdirSync(join(root, name, 'apps/cli/lib'), { recursive: true })
+      copyFileSync(fakeHost, join(root, name, 'apps/cli/lib/bin.js'))
+      return join(root, name)
+    },
     patch(name) {
       const path = join(root, name)
       writeFileSync(path, JSON.stringify([{ id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees') } }]) + '\n')
@@ -83,9 +89,9 @@ async function scene(t) {
       return child
     },
     /** The host someone restarted by hand: it holds the port and prints its token into `log`. */
-    async handStart(patch, log, env = {}) {
+    async handStart(patch, log, { env = {}, from = harness } = {}) {
       const out = openSync(join(root, log), 'a')
-      const child = spawn(process.execPath, [join(harness, 'apps/cli/lib/bin.js'), '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out], env: { ...process.env, ...env } })
+      const child = spawn(process.execPath, [join(from, 'apps/cli/lib/bin.js'), '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out], env: { ...process.env, ...env } })
       closeSync(out)
       children.push(child)
       await until(() => listener(port) === child.pid, `the hand-started host on ${port}`, 20_000)
@@ -227,7 +233,7 @@ test('the restart worker checks the port again: a program that took it during th
 test('a forked child that inherited the socket is part of its parent\'s host: round names the parent and update-preview stops both', { skip: noLsof }, async t => {
   const s = await scene(t)
   for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
-  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log', { FAKE_HOST_FORK: '1' })
+  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log', { env: { FAKE_HOST_FORK: '1' } })
   await until(() => listeners(s.port).length === 2, 'the forked child on the port')
   const [forked] = listeners(s.port).filter(pid => pid !== hand.pid)
   writeFileSync(join(s.root, 'server.json'), JSON.stringify({ status: 'running', pid: hand.pid, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness, startedAt: new Date(Date.now() + 60_000).toISOString() }))
@@ -246,4 +252,38 @@ test('a forked child that inherited the socket is part of its parent\'s host: ro
   const server = readJson(join(s.root, 'server.json'))
   assert.equal(server.status, 'running', restartLog)
   assert.deepEqual(listeners(s.port), [server.pid])
+})
+
+test('update-preview boots the Harness the running host was launched from, not a stale record; an explicit --harness wins and is recorded', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
+  const h2 = s.harnessCopy('harness-h2')
+  const patch = s.patch('preview.patch.yml')
+  const serverPath = join(s.root, 'server.json')
+  const commandOf = pid => spawnSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).stdout.trim()
+  async function update(extra = []) {
+    const result = await s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '0', '--launch-timeout-ms', '20000', ...extra])
+    assert.equal(result.code, 0, result.stderr)
+    await until(() => !readdirSync(s.root).some(name => name.startsWith('.update-preview-')), 'the detached restart worker')
+    const server = readJson(serverPath)
+    assert.equal(server.status, 'running', readFileSync(join(s.root, 'restart.log'), 'utf8'))
+    return { summary: JSON.parse(result.stdout), server, command: commandOf(listener(s.port)) }
+  }
+  // Restarted by hand from H2 while server.json still records H1.
+  await s.handStart(patch, 'server.log', { from: h2 })
+  writeFileSync(serverPath, JSON.stringify({ status: 'running', pid: 1, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness }))
+  const live = await update()
+  assert.equal(live.summary.harness, h2, 'the running host\'s Harness, not the stale record')
+  assert.equal(live.server.harness, h2)
+  assert.ok(live.command.includes(`${h2}/apps/cli/lib/bin.js`), live.command)
+  assert.match(readFileSync(join(s.root, 'restart.log'), 'utf8'), new RegExp(`booting Harness ${h2}, not the recorded ${s.harness}`))
+
+  const explicit = await update(['--harness', s.harness])
+  assert.deepEqual([explicit.summary.harness, explicit.server.harness], [s.harness, s.harness], 'an explicit --harness wins and is recorded')
+  assert.ok(explicit.command.includes(`${s.harness}/apps/cli/lib/bin.js`), explicit.command)
+
+  const { harness, ...legacy } = explicit.server
+  writeFileSync(serverPath, JSON.stringify(legacy))
+  const unrecorded = await update()
+  assert.equal(unrecorded.summary.harness, harness, 'a record without a Harness needs no --harness while its host runs')
 })
