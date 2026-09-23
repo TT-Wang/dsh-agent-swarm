@@ -487,3 +487,30 @@ test('an undeclared key is refused by name with the keys that object accepts, at
     refusedBySchema(schemaIndex, 'swarm_control', '"objective" is not a field of `changes` (accepted: `maxSteps`,'))
   assert.deepEqual(calls, [], 'no refused call reached the runtime')
 })
+
+test('an empty member id is refused by field instead of binding work to nobody', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const typed = (code, field, tool) => error => error.name === 'PolicyError' && error.code === code && error.category === 'validation_error'
+      && error.message.startsWith(`[${code}] \`${field}\` must be a member id; an empty string names no member`) && error.message.endsWith(`then retry \`${tool}\`.`)
+    const tasks = f.runtime.store.list('tasks', f.mission.id).length
+    const proposal = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Audit', objective: 'Audit the code', kind: 'research', scope: ['**'], acceptance: f.mission.acceptance, outputs: [], assigneeId: '' }
+    await assert.rejects(definitions.get('swarm_propose').execute(proposal, as(f.owner.sessionId)), typed('task_assignee_empty', 'assigneeId', 'swarm_propose'))
+    const { missionId: _missionId, ...input } = proposal
+    assert.throws(() => f.runtime.propose(f.owner, f.mission.id, input), typed('task_assignee_empty', 'assigneeId', 'swarm_propose'))
+    assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasks, 'nothing was admitted')
+    // A handoff to "" used to assign the task to member "".
+    const task = f.propose({ title: 'Work' })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await assert.rejects(definitions.get('swarm_handoff').execute({ missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, to: '', summary: 'Checkpointed' }, as(f.author.sessionId)),
+      typed('handoff_target_empty', 'to', 'swarm_handoff'))
+    const untouched = f.runtime.store.get('tasks', task.id)
+    assert.deepEqual([untouched.status, untouched.attempt?.id, untouched.assigneeId], ['running', claimed.attempt.id, f.author.id], 'the attempt is untouched')
+    // Omitting the member id is still the way to leave work unassigned.
+    await definitions.get('swarm_handoff').execute({ missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, summary: 'Checkpointed' }, as(f.author.sessionId))
+    assert.equal(f.runtime.store.get('tasks', task.id).assigneeId, undefined)
+  } finally { await f.cleanup() }
+})

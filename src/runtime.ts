@@ -1395,6 +1395,9 @@ export class SwarmRuntime {
       const effective = this.effectiveDependency(missionId, dependency, tasks)
       if (effective.status === 'cancelled' || effective.status === 'blocked') throw new PolicyError('dependency_not_live', 'tool_error', `Dependency ${dependency} is ${effective.status} and has no live replacement; depend on an accepted or in-progress task, or propose a repair with replaces`)
     }
+    // An empty id passed the truthiness check below and bound the task to member
+    // "", which no member can ever claim: the task wedged pending.
+    if (input.assigneeId === '') throw new PolicyError('task_assignee_empty', 'validation_error', '[task_assignee_empty] `assigneeId` must be a member id; an empty string names no member and would bind the task to nobody. Omit `assigneeId` to leave the task unassigned, or pass a live member\'s id as `assigneeId`, then retry `swarm_propose`.')
     if (input.assigneeId && !this.store.list('members', missionId).some(m => m.id === input.assigneeId && memberPhaseOf(m) !== 'stopped')) throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown assignee')
     if (input.assignmentMode !== undefined && input.assignmentMode !== 'preferred' && input.assignmentMode !== 'pinned') throw new Error('[assignment_mode_invalid] Set `assignmentMode` to preferred or pinned with `swarm_propose`, then retry.')
     if (input.assignmentMode !== undefined && input.assigneeId === undefined) throw new Error('[assignment_member_required] Supply `assigneeId` with `assignmentMode` in `swarm_propose`, then retry.')
@@ -2272,6 +2275,8 @@ export class SwarmRuntime {
   handoff(actor: Actor, missionId: string, input: { taskId: string; attemptId: string; to?: string; summary: string }): { handoff: string } {
     const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
     this.bounded(input.summary)
+    // "" skipped the member check and was assigned: a task bound to member "" wedges.
+    if (input.to === '') throw new PolicyError('handoff_target_empty', 'validation_error', '[handoff_target_empty] `to` must be a member id; an empty string names no member and would bind the task to nobody. Omit `to` to release the task to the ready queue, or pass a live member\'s id as `to`, then retry `swarm_handoff`.')
     if (input.to && !this.store.list('members', missionId).some(m => m.id === input.to && memberPhaseOf(m) !== 'stopped')) throw new Error('Unknown new owner')
     // F1: a review may only move to a member who can actually own it. Every other
     // assignment path (propose, controlTask, claim and the dispatcher) refuses an

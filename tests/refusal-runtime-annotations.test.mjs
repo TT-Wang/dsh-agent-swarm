@@ -23,6 +23,8 @@ const ANNOTATED = {
     // the browser RPC reach without swarm_*'s schema check (which refuses them
     // first, as [tool_arguments_invalid], on the tool path).
     'invalid_evidence_outcome', 'post_kind_invalid', 'board_kind_invalid', 'task_priority_invalid', 'task_experiment_invalid',
+    // An empty member id binds work to nobody; both paths refuse it by field.
+    'task_assignee_empty', 'handoff_target_empty',
     'owner_cannot_claim', 'evidence_tool_runs_required', 'supersede_foreign_evidence',
     'supersede_unrelated_evidence', 'verification_requires_verify', 'research_evidence_required', 'not_a_verification_task',
     'artifact_changed_during_verification', 'evidence_changed_during_verification',
