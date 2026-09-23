@@ -1245,6 +1245,10 @@ export class SwarmRuntime {
       }
       return prior
     }
+    // A worker repair's policy origin indexes `replaces` before any field is
+    // checked, and the inherited acceptance iterates it: a malformed list is
+    // refused here, typed, before either reads it.
+    if (input.replaces != null && (!Array.isArray(input.replaces) || !input.replaces.every(previousId => typeof previousId === 'string' && previousId.trim() !== ''))) throw new PolicyError('task_replaces_invalid', 'validation_error', '[task_replaces_invalid] `replaces` must list task ids. Pass `replaces` as an array of the blocked or cancelled task ids this repair replaces with `swarm_propose`, or omit it for new work, then retry.')
     if (this.store.list('starts', missionId).length) {
       if (!owner) {
         // Workers may extend the board but cannot enlarge execution policy set
@@ -1263,20 +1267,12 @@ export class SwarmRuntime {
       if (input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
-    // A repair inherits the acceptance of every task it replaces: the host holds
-    // those obligations, so the proposal never has to copy them. The stored list
-    // is each replaced task's criteria in order, then any criteria the proposal
-    // adds, without duplicates; the admission guard below reads the same list.
+    requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (input.acceptance === undefined && !input.replaces?.length) throw new PolicyError('task_acceptance_required', 'validation_error', '[task_acceptance_required] A new task needs its own acceptance criteria. Pass `acceptance` as nonempty strings with `swarm_propose`, or name the rejected task in `replaces` to inherit its criteria, then retry.')
+    // The proposal's own criteria are checked before any replaced task is read;
+    // a repair may supply none.
     const proposed = input.acceptance ?? []
-    const acceptance = input.replaces?.length && Array.isArray(proposed)
-      ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])]
-      : proposed
-    // What the host added beyond the proposal's own list is recorded on the
-    // admission event and named in the swarm_propose result, so a criterion the
-    // proposal left out is carried visibly, never silently.
-    const inherited = input.replaces?.length && Array.isArray(acceptance) ? inheritedAcceptance(acceptance, input.acceptance) : []
-    requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(acceptance, 'acceptance')
+    if (!input.replaces?.length || !Array.isArray(proposed) || proposed.length > 0) requireStrings(proposed, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
@@ -1291,6 +1287,18 @@ export class SwarmRuntime {
       if (inherited !== undefined) input = { ...input, outputs: [...inherited] }
     }
     if (input.outputs !== undefined) input = { ...input, outputs: assertDeclaredOutputs(input.outputs, input.scope, 'task') }
+    // A repair inherits the acceptance of every task it replaces: the host holds
+    // those obligations, so the proposal never has to copy them. The stored list
+    // is each replaced task's criteria in order, then any criteria the proposal
+    // adds, without duplicates; the admission guard below reads the same list.
+    // The replaced tasks are read only after this proposal's own fields passed,
+    // so an unknown `replaces` id never hides a field error.
+    const acceptance = input.replaces?.length ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])] : proposed
+    requireStrings(acceptance, 'acceptance')
+    // What the host added beyond the proposal's own list is recorded on the
+    // admission event and named in the swarm_propose result, so a criterion the
+    // proposal left out is carried visibly, never silently.
+    const inheritedCriteria = input.replaces?.length ? inheritedAcceptance(acceptance, input.acceptance) : []
     // D1: the admission refusals (an assumed dependency, a dangling graph edge)
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The scope and ignore-rule hints are advisory and
@@ -1396,7 +1404,7 @@ export class SwarmRuntime {
     this.assertEffectiveTaskGraph(missionId, task, tasks)
     this.commit(missionId, () => {
       this.store.put('tasks', task)
-      this.store.event(missionId, 'task/proposed', key, inherited.length ? { ...task, inheritedAcceptance: inherited } : task)
+      this.store.event(missionId, 'task/proposed', key, inheritedCriteria.length ? { ...task, inheritedAcceptance: inheritedCriteria } : task)
       for (const change of checkChanges) this.store.event(missionId, 'task/check-changed', key, { taskId: task.id, reason: 'replacement', ...change })
     })
     this.warnBudget(this.mission(missionId))

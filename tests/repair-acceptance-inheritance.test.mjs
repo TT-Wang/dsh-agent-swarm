@@ -142,3 +142,28 @@ test('a repair that leaves out a replaced criterion keeps it and names it on the
   assert.equal(proposed(fresh.task.id).data.inheritedAcceptance, undefined)
   assert.equal(fresh.rendered.note, undefined)
 })
+
+test('a malformed replaces is a typed refusal before any replaced task is read', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original', acceptance: ['works'] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Repair it' })
+  const refusedAs = error => error.code === 'task_replaces_invalid' && error.category === 'validation_error'
+    && /^\[task_replaces_invalid\] .*Pass `replaces`.*`swarm_propose`/.test(error.message)
+  for (const replaces of [original.id, { 0: original.id, length: 1 }, 7, [''], [original.id, 42]]) {
+    assert.throws(() => f.propose({ title: 'Repair', replaces }), refusedAs, `replaces ${JSON.stringify(replaces)} without acceptance`)
+    assert.throws(() => f.propose({ title: 'Repair', replaces, acceptance: ['works'] }), refusedAs, `replaces ${JSON.stringify(replaces)} with acceptance`)
+  }
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 1, 'nothing was admitted')
+})
+
+test('an unknown replaces id never hides an earlier field error, and is itself a typed refusal', async t => {
+  const f = await fixture(t)
+  const replaces = ['task_unknown']
+  assert.throws(() => f.propose({ title: '', replaces }), /title is required/)
+  assert.throws(() => f.propose({ objective: ' ', replaces }), /objective is required/)
+  assert.throws(() => f.propose({ replaces, acceptance: ['works', ''] }), /acceptance must contain nonempty strings/)
+  assert.throws(() => f.propose({ kind: 'bogus', replaces }), error => error.code === 'task_kind_invalid')
+  assert.throws(() => f.propose({ scope: [], replaces }), /task\.scope must contain nonempty strings/)
+  assert.throws(() => f.propose({ replaces }), error => error.code === 'task_not_in_mission', 'with every field valid the unknown id is refused, typed')
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 0, 'nothing was admitted')
+})
