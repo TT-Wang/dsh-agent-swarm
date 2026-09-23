@@ -17,10 +17,10 @@ import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type M
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
-import { proposalAllowance as computeProposalAllowance } from './arena.ts'
+import { hasNotice, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, DEPENDENCY_ASSUMPTION_CODE, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -614,6 +614,7 @@ export class SwarmRuntime {
         for (const member of this.store.list('members', mission.id)) {
           if (member.phase === undefined) { member.phase = 'active'; this.store.put('members', member) }
         }
+        this.holdUncarriedAssumptions(mission.id)
         this.store.event(mission.id, 'mission/recovered', 'runtime', {})
       })
       for (const task of this.store.list('tasks', mission.id)) if (stopPending(task)) this.attempts.resumeStoppedAttempt(mission.id, task)
@@ -981,6 +982,45 @@ export class SwarmRuntime {
   private ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } { return this.attempts.ownAttempt(actor, missionId, taskId, attemptId) }
   private fenceAttempt(mission: Mission, task: Task, windowMs: number): void { return this.attempts.fenceAttempt(mission, task, windowMs) }
   dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
+  /**
+   * R12-F9 for rows this build did not admit, run once when a mission is
+   * opened. The guard refuses where a dependency set is written (plan
+   * validation, propose, the owner's `changes.dependencies` amendment) and
+   * dispatch no longer re-reads prose, but a store written by an earlier build
+   * can hold a pending or blocked task whose text assumes prior work while no
+   * content-carrying edge (its dependencies, or a review source) brings that
+   * work into its worktree: d81a3fb let the owner amend such a task to
+   * `dependencies: []` and relied on a dispatch-time backstop. Each such task
+   * is held from dispatch as a preparation failure the host never retries
+   * (`blockCauses` reads it as `preparation-failed`, the stop barrier lands a
+   * pending stop blocked on it), and the owner gets one coded decision under a
+   * stable dedup key. Amending `changes.dependencies` to a carrying edge
+   * releases it (the amendment re-runs the guard), `swarm_cancel` withdraws it,
+   * and an explicit owner resume is an owner override. The recorded decision is
+   * also the marker that the task was checked: a later open leaves the task to
+   * that decision. Runs inside the mission's recovery transaction.
+   */
+  private holdUncarriedAssumptions(missionId: string): void {
+    const tasks = this.store.list('tasks', missionId)
+    const deliveries = this.store.list('deliveries', missionId)
+    for (const task of tasks) {
+      if ((task.status !== 'pending' && task.status !== 'blocked') || task.kind === 'verification' || task.artifact !== undefined) continue
+      if (task.dependencies.length > 0 || task.reviewOf !== undefined) continue
+      const dedupKey = `dependency-assumption:${missionId}:${task.id}`
+      if (hasNotice(deliveries, { class: 'decision', dedupKey, from: 'runtime' })) continue
+      const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance }, `task ${JSON.stringify(task.id)}`, { dependencies: [], replaces: task.replaces })
+      if (!assumed.length) continue
+      const claims = assumed.map(diagnostic => `its ${/^the (\S+) assumes/.exec(diagnostic.message)?.[1] ?? 'text'} assumes ${JSON.stringify(diagnostic.path)} is already available`).join('; ')
+      const reason = `[${DEPENDENCY_ASSUMPTION_CODE}] Task ${task.id} (${JSON.stringify(task.title)}) was admitted by an earlier build with no dependency that carries the prior work it names (${claims}), so its worktree would be prepared from the bare mission baseline without it. It is held from dispatch. Amend it with \`swarm_control\` using \`taskId\`, \`action\` amend, \`changes\` whose \`dependencies\` name the task that carries that content, and a \`reason\`; or withdraw it with \`swarm_cancel\` and its \`taskId\` and propose it again with \`swarm_propose\`, stating in \`objective\` how it obtains that content.`
+      const blocked = task.status === 'pending' && !stopPending(task)
+      task.preparationFailure = { reason, transient: false, attempts: task.preparationFailure?.attempts ?? 0 }
+      if (blocked) task.status = 'blocked'
+      this.store.put('tasks', task)
+      this.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: task.id, epoch: task.epoch, ...task.preparationFailure, status: task.status })
+      if (blocked) this.store.event(missionId, 'task/blocked', 'runtime', { taskId: task.id, reason })
+      this.notify(missionId, reason, this.interpretation(missionId).subjectsOf([task]), { from: 'runtime', dedupKey, trigger: 'task/preparation-failed', reason: DEPENDENCY_ASSUMPTION_CODE })
+    }
+  }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
   async closeOutIdleAttempt(mission: Mission, member: Member, task: Task): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task) }
   /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
