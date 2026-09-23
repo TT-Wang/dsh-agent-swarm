@@ -1508,6 +1508,11 @@ export class SwarmRuntime {
     task.status = 'running'; task.assigneeId = member.id
     // Close-out and git-denial markers belong to one attempt; a new attempt starts clean.
     delete task.closeout; delete task.idleSignal; delete task.gitWriteDenied
+    // Every caller prepared this attempt's workspace successfully before
+    // assigning it, so a recorded preparation failure (a transient one whose
+    // backoff retry just succeeded) is stale: carried forward, a later stop of
+    // this attempt would read it as a live block cause.
+    delete task.preparationFailure
     const admitted = this.admissionRecord(candidate, decision, latencyMs)
     try {
       this.commit(task.missionId, () => {
