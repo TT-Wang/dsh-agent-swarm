@@ -30,8 +30,11 @@
  * from the site: a coded object literal's `code` (rendered by
  * `formatDiagnostic`), a declared delegate (`DELEGATED_MESSAGES`), or a
  * documented exemption — argument guards (`object`/`text`/`array`/
- * `optionalInteger`) name the parameter they validate dynamically, and a
- * `formatDiagnostic(...)` throw delegates its code to a local coded producer.
+ * `optionalInteger`, and the typed schema guard `assertToolArguments`, whose
+ * parameters are the caller's own schema paths) name the parameter they
+ * validate dynamically, and a `formatDiagnostic(...)` throw delegates its code
+ * to a local coded producer. The schema guard's rendered text is held to the
+ * full `assessText` contract by tests/tool-output.test.mjs.
  */
 import { pathToFileURL } from 'node:url'
 import { codeProperties, refusalNodes } from './source-semantics.mjs'
@@ -39,6 +42,8 @@ import { codeProperties, refusalNodes } from './source-semantics.mjs'
 export const CODE_TOKEN = /\[([a-z][a-z0-9_]{2,63})\]/
 export const CODE_TOKEN_ALL = /\[([a-z][a-z0-9_]{2,63})\]/g
 const GUARDS = ['object', 'text', 'array', 'optionalInteger']
+/** Typed (`PolicyError`) argument guards: the only coded throws the guard exemption covers. */
+const CODED_GUARDS = ['assertToolArguments']
 /**
  * Imperative action verbs a next step may start from. The first group is the
  * list the lexer-era lint enforced (tests/refusal-inventory.mjs at 664222d);
@@ -88,7 +93,7 @@ export function refusalSites(source, file) {
   const sites = refusalNodes(source, file).map(({ functionName, ...node }) => {
     const text = node.text === null ? null : `${node.prefix ?? ''}${node.text}`
     return { ...node, file, source, text, ...(text === null ? { codes: [], tools: [], params: [] } : textFacts(text)),
-      guard: node.kind === 'throw' && GUARDS.includes(functionName ?? ''), guardName: functionName }
+      guard: (node.kind === 'throw' && GUARDS.includes(functionName ?? '')) || (node.kind === 'coded-throw' && CODED_GUARDS.includes(functionName ?? '')), guardName: functionName }
   })
   return sites.sort((left, right) => left.line - right.line || (left.kind === right.kind ? 0 : left.kind === 'throw' ? -1 : 1))
 }

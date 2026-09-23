@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
 import { inheritedAcceptance } from './admission.ts'
+import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -95,6 +96,50 @@ function optionalInteger(args: Args, key: string): number | undefined {
   return Number(value)
 }
 function optionalText(args: Args, key: string): string | undefined { return args[key] === undefined ? undefined : text(args, key) }
+
+/** A JSON path the model can act on: every property name backticked, array indices bracketed. */
+const schemaPath = (segments: readonly (string | number)[]): string =>
+  segments.map((segment, index) => typeof segment === 'number' ? `[${segment}]` : `${index === 0 ? '' : '.'}\`${segment}\``).join('')
+
+/**
+ * Every place `value` departs from `schema`: a missing required property, a
+ * value outside its enum, or the wrong primitive type, recursing into declared
+ * object properties and array items. An undefined property is absent, as in
+ * JSON. `additionalProperties` is deliberately not checked: tool calls have
+ * always tolerated undeclared keys, and the runtime refuses the ones it must
+ * (`task_amendment_invalid` for unknown `changes` fields).
+ */
+function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string | number)[], found: string[]): string[] {
+  const at = () => path.length === 0 ? 'the arguments' : schemaPath(path)
+  const type = schema.type
+  const typed = type === undefined ? true
+    : type === 'object' ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : type === 'array' ? Array.isArray(value)
+        : type === 'integer' ? typeof value === 'number' && Number.isInteger(value)
+          : type === 'number' ? typeof value === 'number' && Number.isFinite(value)
+            : type === 'null' ? value === null
+              : typeof value === type
+  if (!typed) { found.push(`${at()} must be ${/^[aeiou]/.test(String(type)) ? 'an' : 'a'} ${type}`); return found }
+  if (schema.enum !== undefined && !schema.enum.includes(value as never)) found.push(`${at()} must be one of ${schema.enum.map(item => JSON.stringify(item)).join(', ')}`)
+  if (type === 'object') {
+    const record = value as Args
+    for (const key of schema.required ?? []) if (record[key] === undefined) found.push(`${schemaPath([...path, key])} is required`)
+    for (const [key, child] of Object.entries(schema.properties ?? {})) if (record[key] !== undefined) schemaViolations(child, record[key], [...path, key], found)
+  }
+  if (type === 'array' && schema.items !== undefined) for (const [index, item] of (value as unknown[]).entries()) schemaViolations(schema.items, item, [...path, index], found)
+  return found
+}
+
+/**
+ * The Harness dispatches a tool call without enforcing its published schema,
+ * so every swarm tool checks its own before anything runs: one typed refusal
+ * naming every offending path, and no state touched. The parameter names are
+ * the caller's own schema paths, rendered in the message.
+ */
+function assertToolArguments(name: string, schema: JsonSchemaNode, args: Args): void {
+  const violations = schemaViolations(schema, args, [], [])
+  if (violations.length) throw new PolicyError('tool_arguments_invalid', 'validation_error', `[tool_arguments_invalid] ${name} was called with arguments its parameters schema refuses: ${violations.join('; ')}. Nothing ran. Correct every listed parameter and retry ${name} with the corrected arguments.`)
+}
 
 /**
  * Bind a model-supplied plan workspace to the calling agent session.
@@ -199,6 +244,27 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         exec.signal.throwIfAborted()
         if (!exec.agent) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
         let args = object(value)
+        const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
+        const step = name as TraceStep
+        const startedAt = Date.now()
+        // D6: one span row per orchestration step. A failed step still records a
+        // row with status=error and a closed error.type before the failure
+        // reaches the model, so the trace is complete even on the error path.
+        // Every registered tool name is a closed TRACE_STEPS member (asserted by
+        // tests/trace-span.test.mjs), so an unknown step fails loudly here
+        // instead of being silently unspanned. The span input is the arguments
+        // the step ran with, after the workspace binding below.
+        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
+          if (trace === undefined) return
+          const context = spanContext(runtime, name, actor.sessionId, args, result)
+          if (context === undefined) { trace.noteUnscoped(name); return }
+          await trace.record({ ...context, actor: actor.sessionId, step, input: { tool: name, arguments: args },
+            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
+            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
+        }
+        // The call is checked against this tool's own published schema before
+        // anything runs; the refused step is still traced.
+        try { assertToolArguments(name, definition.parameters, args) } catch (error) { await recordSpan(undefined, 'error', error); throw error }
         // H4: planning workspaces are bound to the calling session or a root the
         // human configured once, never to the model's word. The matched root is
         // attached for the mission record; the runtime re-derives it when the
@@ -206,24 +272,6 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) {
           const bound = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
           args = { ...args, workspace: bound.workspace, workspaceGrantRoot: bound.grantRoot, workspaceAuthorizationSource: bound.source }
-        }
-        const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
-        const step = name as TraceStep
-        const startedAt = Date.now()
-        const spanInput = { tool: name, arguments: args }
-        // D6: one span row per orchestration step. A failed step still records a
-        // row with status=error and a closed error.type before the failure
-        // reaches the model, so the trace is complete even on the error path.
-        // Every registered tool name is a closed TRACE_STEPS member (asserted by
-        // tests/trace-span.test.mjs), so an unknown step fails loudly here
-        // instead of being silently unspanned.
-        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
-          if (trace === undefined) return
-          const context = spanContext(runtime, name, actor.sessionId, args, result)
-          if (context === undefined) { trace.noteUnscoped(name); return }
-          await trace.record({ ...context, actor: actor.sessionId, step, input: spanInput,
-            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
-            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
         }
         try {
           const result = await run(args, actor)
@@ -278,7 +326,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
   register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; pair each deliverable with a verification task via reviewOf. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
-    ...a, budget: object(a.budget), workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+    ...a, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
     workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource'),
   } as unknown as PlanInput))
   const launchProperties: Record<string, JsonSchemaNode> = structuredClone(planProperties)
@@ -299,15 +347,11 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     const requestId = text(a, 'requestId')
     const request = runtime.starts(actor).find(item => item.id === requestId)
     if (!request) throw new Error('[start_request_unknown] Unknown automatic start request for this owner; list the pending requests with `swarm_observe` (omit `missionId`) and retry `swarm_launch` with the exact `requestId`.')
-    if (!Array.isArray(a.members)) throw new Error('[members_invalid] members must be an array; pass each member with `key` and `role` (name is optional) and retry the same `requestId` launch.')
-    const members = a.members.map(value => {
-      const member = object(value)
-      return { key: text(member, 'key'), ...(member.name === undefined ? {} : { name: text(member, 'name') }), role: text(member, 'role'),
-        ...(member.provider === undefined ? {} : { provider: text(member, 'provider') }),
-        ...(member.model === undefined ? {} : { model: text(member, 'model') }),
-        ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: text(member, 'reasoningEffort') }),
-        ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }
-    })
+    const members = (a.members as Args[]).map(member => ({ key: text(member, 'key'), ...(member.name === undefined ? {} : { name: text(member, 'name') }), role: text(member, 'role'),
+      ...(member.provider === undefined ? {} : { provider: text(member, 'provider') }),
+      ...(member.model === undefined ? {} : { model: text(member, 'model') }),
+      ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: text(member, 'reasoningEffort') }),
+      ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }))
     const plan = validatePlan({ ...a, workspace: request.workspace, members }, { launch: true, dependencyDirs: runtime.config.verificationDependencyDirs })
     // The parse-only check preflight runs at the shared launch boundary
     // (`launchDraft`), so the prelaunch path and the staged path refuse the same
@@ -329,7 +373,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     { title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema },
     ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], (a, actor) => runtime.create(actor, {
       title: text(a, 'title'), objective: text(a, 'objective'), workspace: text(a, 'workspace'), scope: array(a, 'scope'), acceptance: array(a, 'acceptance'),
-      budget: object(a.budget) as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
+      budget: a.budget as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
       workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
     } satisfies CreateMissionInput))
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id.',
