@@ -24,6 +24,9 @@ const schemaIndex = await toolSchemaIndex()
 /** The refusal is `[output_outside_scope]`, and its rendered text satisfies the refusal contract. */
 const outsideScope = error => {
   assert.match(error.message, /\[output_outside_scope\]/)
+  // One code, one category: a non-array and a bad entry are both malformed caller input.
+  assert.equal(error.code, 'output_outside_scope')
+  assert.equal(error.category, 'validation_error')
   assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
   return true
 }

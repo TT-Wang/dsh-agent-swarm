@@ -1079,7 +1079,7 @@ export class SwarmRuntime {
     assertScopeSelectors(input.scope, 'scope')
     const budget = validatedBudget(input.budget)
     const now = Date.now()
-    if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'tool_error', 'Mission duration exceeds the supported clock range')
+    if (!Number.isSafeInteger(now + budget.maxDurationMs)) throw new PolicyError('mission_duration_invalid', 'validation_error', 'Mission duration exceeds the supported clock range')
     const mission: Mission = { ...input, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, budget, id: initial.id ?? id('mission'), ownerSessionId: actor.sessionId, status: initial.status ?? 'active', usedTokens: 0, usedSteps: 0, createdAt: now, updatedAt: now, executionTime: { usedMs: 0 }, deadline: Math.min(budget.deadlineAt ?? Number.MAX_SAFE_INTEGER, now + budget.maxDurationMs) }
     if (this.store.get('missions', mission.id)) throw new PolicyError('mission_identity_conflict', 'conflict_error', 'Mission already exists')
     this.commit(mission.id, () => {
@@ -1135,7 +1135,7 @@ export class SwarmRuntime {
       // assignment order; the pool is the bound, and its exhaustion is a named
       // refusal that names the caller's own exit rather than an anonymous failure.
       const name = input.name ?? nextWorkerName(members.map(member => member.name))
-      if (name === undefined) throw new Error('[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
+      if (name === undefined) throw new PolicyError('worker_name_pool_exhausted', 'budget_error', '[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
       if (members.some(m => m.name === name)) throw new PolicyError('worker_name_conflict', 'conflict_error', 'Worker name already exists')
       const memberId = admittedId ?? id('member')
       // Re-validate before the first filesystem effect of this mission.
