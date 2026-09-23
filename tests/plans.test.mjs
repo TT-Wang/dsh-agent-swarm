@@ -9,6 +9,7 @@ import { AdmissionError } from '../lib/admission.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { WORKER_NAME_POOL } from '../lib/types.js'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -37,9 +38,9 @@ function plan(workspace) {
       { key: 'reviewer', name: 'Reviewer', role: 'verification' }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     // Deliberately put review first: the runtime must topologically admit it.
-    tasks: [{ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification',
+    tasks: [{ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', outputs: [],
       scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code' },
-    { key: 'code', workstreamKey: 'main', title: 'Deliver', objective: 'Implement change', kind: 'integration',
+    { key: 'code', workstreamKey: 'main', title: 'Deliver', objective: 'Implement change', kind: 'integration', outputs: [],
       scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'] }] }
 }
 async function fixture(t) {
@@ -212,7 +213,7 @@ test('equivalent scope notation and duplicate review edges canonicalize without 
   f.input.tasks[0].scope = ['./src/']
   f.input.tasks[1].scope = ['./src/value.cjs']
   f.input.tasks.push({ key: 'preparation', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository',
-    kind: 'research', scope: ['src/**'], acceptance: ['context recorded'], assigneeKey: 'builder' })
+    kind: 'research', outputs: [], scope: ['src/**'], acceptance: ['context recorded'], assigneeKey: 'builder' })
   f.input.tasks[0].dependencies = ['code', 'preparation', 'code']
   const before = structuredClone(f.input)
   const canonical = validatePlan(f.input)
@@ -376,7 +377,7 @@ test('large valid topology is bounded by the primary-selected budget rather than
   }))
   input.tasks = input.workstreams.flatMap((stream, index) => {
     const source = { key: `source_${index}`, workstreamKey: stream.key, title: stream.title, objective: stream.objective,
-      kind: 'research', scope: ['src/'], acceptance: ['works'], assigneeKey: `member_${index}`, maxRecoveryAttempts: 2 }
+      kind: 'research', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: `member_${index}`, maxRecoveryAttempts: 2 }
     return [source, { ...source, key: `review_${index}`, kind: 'verification', reviewOf: source.key,
       assigneeKey: `member_${(index + 1) % size}` }]
   })
@@ -440,4 +441,37 @@ test('interrupted assembly journals recover without duplicating prior admissions
     assert.equal(workers.prepared.length, 0, 'durable member workspaces must not be admitted twice')
     assert.equal(recovered.list(f.owner.sessionId).length, 1)
   } finally { await recovered.dispose() }
+})
+
+test('R24: a staged draft may omit outputs, but launch refuses each task that does not declare them', async t => {
+  const f = await fixture(t)
+  for (const task of f.input.tasks) delete task.outputs
+  assert.doesNotThrow(() => validatePlan(f.input), 'staging leaves outputs optional')
+  const draft = f.runtime.createDraft(f.owner, f.input)
+  assert.ok(draft.input.tasks.every(task => task.outputs === undefined), 'the staged draft keeps the omission')
+  await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
+    assert.ok(error instanceof AdmissionError)
+    assert.equal(error.category, 'validation_error')
+    assert.deepEqual(error.diagnostics.map(item => [item.code, item.location]),
+      [['outputs_required', 'tasks[0] (review).outputs'], ['outputs_required', 'tasks[1] (code).outputs']], 'one diagnostic names each task')
+    return true
+  })
+  assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
+  assert.equal(f.runtime.drafts(f.owner)[0].status, 'draft', 'the draft stays editable')
+
+  const single = structuredClone(f.input)
+  single.tasks[0].outputs = []
+  const schemaIndex = await toolSchemaIndex()
+  assert.throws(() => validatePlan(single, { launch: true }), error => {
+    assert.equal(error.code, 'outputs_required')
+    assert.equal(error.message, '[outputs_required] tasks[1] (code).outputs is required to launch. Set `outputs` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
+    assert.deepEqual(assessText(error.message, schemaIndex), [], 'the refusal satisfies the refusal contract')
+    return true
+  })
+  const request = f.runtime.requestStart(f.owner, { commandId: 'outputs-required', goal: 'Deliver verified code', workspace: f.directory })
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, single), /\[outputs_required\] tasks\[1\] \(code\)\.outputs/, 'the automatic launch path refuses the same plan')
+
+  const declared = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.map(task => ({ ...task, outputs: [] })) })
+  const snapshot = await f.runtime.launchDraft(f.owner, declared.id, declared.revision)
+  assert.deepEqual(snapshot.tasks.map(task => task.outputs), [[], []], 'an empty declaration launches')
 })

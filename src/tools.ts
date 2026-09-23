@@ -306,7 +306,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         ...(member.reasoningEffort === undefined ? {} : { reasoningEffort: text(member, 'reasoningEffort') }),
         ...(member.maxOutputTokens === undefined ? {} : { maxOutputTokens: member.maxOutputTokens }) }
     })
-    const plan = validatePlan({ ...a, workspace: request.workspace, members })
+    const plan = validatePlan({ ...a, workspace: request.workspace, members }, { launch: true })
     // The parse-only check preflight runs at the shared launch boundary
     // (`launchDraft`), so the prelaunch path and the staged path refuse the same
     // plan at the same point instead of only one of them catching it.

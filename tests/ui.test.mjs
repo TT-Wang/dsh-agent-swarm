@@ -266,6 +266,11 @@ test('draft defaults preserve independent verification and line editing; sidebar
   input.scope = ['src/', '', ' tests/ ']
   assert.deepEqual(cleanPlan(input).scope, ['src/', 'tests/'])
   assert.deepEqual(input.scope, ['src/', '', ' tests/ '], 'normalization does not change an in-progress field')
+  // Every task shows its Outputs field, so saving an empty one declares no
+  // file, which is what launch requires each task to state.
+  input.tasks[0].outputs = [' src/value.cjs ', '']
+  assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], []])
+  assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan saved from the editor launches')
   assert.equal(fitSidebar(480, 1440), 480)
   assert.equal(fitSidebar(900, 1440), 760)
   assert.equal(fitSidebar(900, 1000), 600)

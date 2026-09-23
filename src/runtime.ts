@@ -2681,7 +2681,7 @@ export class SwarmRuntime {
   }
   /** Automatic requests must contain a complete independently verifiable topology. */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
-    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) })
+    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, { launch: true })
     // New automatic plans use preferences; old/manual task rows keep their binding.
     for (const task of plan.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
@@ -3016,7 +3016,7 @@ export class SwarmRuntime {
           || (current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1))) throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
       }
       assertCurrent()
-      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input)
+      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input, { launch: true })
       draft.input = input
       draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
       // P4: the parse-only check preflight runs on EVERY launch path, at the one

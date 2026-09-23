@@ -249,9 +249,9 @@ test('plan validation reports every field problem at once', () => {
   const plan = { title: 'T', objective: 'O', workspace: '/w', scope: ['src/'], acceptance: ['works'], budget,
     members: [{ key: 'a', name: '', role: 'r' }, { key: 'b', name: 'B', role: 'r' }], workstreams: [{ key: 'w', title: 'W', objective: 'W' }],
     tasks: [
-      { key: 't1', workstreamKey: 'missing', title: 'T1', objective: 'x', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeKey: 'a' },
-      { key: 't2', workstreamKey: 'w', title: 'T2', objective: 'x', kind: 'analysis', scope: ['src/'], acceptance: ['works'] },
-      { key: 'r1', workstreamKey: 'w', title: 'R', objective: 'x', kind: 'verification', reviewOf: 't1', assigneeKey: 'a', scope: ['src/'], acceptance: ['works'] },
+      { key: 't1', workstreamKey: 'missing', title: 'T1', objective: 'x', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeKey: 'a' },
+      { key: 't2', workstreamKey: 'w', title: 'T2', objective: 'x', kind: 'analysis', outputs: [], scope: ['src/'], acceptance: ['works'] },
+      { key: 'r1', workstreamKey: 'w', title: 'R', objective: 'x', kind: 'verification', outputs: [], reviewOf: 't1', assigneeKey: 'a', scope: ['src/'], acceptance: ['works'] },
     ] }
   let message
   try { validatePlan(plan) } catch (error) { message = error.message }
@@ -278,8 +278,8 @@ async function automatic(t, tasks, acceptance = ['works']) {
   const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Make the change.', workspace: directory })
   return { runtime, workers, owner, plan, request, directory }
 }
-const codeTask = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 3, checkTimeoutMs: 45000, ...extra })
-const reviewTask = (key, reviewOf) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf, maxRecoveryAttempts: 3 })
+const codeTask = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 3, checkTimeoutMs: 45000, ...extra })
+const reviewTask = (key, reviewOf) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf, maxRecoveryAttempts: 3 })
 async function acceptByKey(f, snapshot, key) {
   const missionId = snapshot.mission.id
   const builder = snapshot.members.find(member => member.name === 'Builder'), reviewer = snapshot.members.find(member => member.name === 'Reviewer')
@@ -323,7 +323,7 @@ test('several implementation branches still require a final integration, and one
 })
 
 test('a stalled automatic board preserves covered leftovers and completes only after explicit withdrawal', async t => {
-  const research = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'research', scope: ['src/'], acceptance: ['documented'], assigneeKey: 'builder', maxRecoveryAttempts: 3, ...extra })
+  const research = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'research', outputs: [], scope: ['src/'], acceptance: ['documented'], assigneeKey: 'builder', maxRecoveryAttempts: 3, ...extra })
   const f = await automatic(t, [codeTask('impl'), reviewTask('review', 'impl'), research('base'), reviewTask('rbase', 'base'), research('follow', { dependencies: ['base'] }), reviewTask('rfollow', 'follow')], ['works', 'documented'])
   const snapshot = await f.runtime.startPlan(f.owner, f.request.id, f.plan)
   const missionId = snapshot.mission.id

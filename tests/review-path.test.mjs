@@ -228,10 +228,10 @@ test('automatic plan admission still rejects a code deliverable without an assig
     budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', scope: ['src/'], acceptance: ['works'],
+    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'],
       assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 }] }
   await assert.rejects(runtime.startPlan(owner, request.id, plan), /requires an assigned independent verification task/)
-  plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', scope: ['src/'],
+  plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'],
     acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 })
   const snapshot = await runtime.startPlan(owner, request.id, plan)
   assert.equal(snapshot.mission.status, 'active')

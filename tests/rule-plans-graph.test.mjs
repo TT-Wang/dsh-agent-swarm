@@ -28,8 +28,8 @@ function plan(workspace) {
   return { title: 'Saved request', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget: { ...budget },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete change' }],
-    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement final change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node old.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
-      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code', maxRecoveryAttempts: 2 }] }
+    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement final change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node old.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code', maxRecoveryAttempts: 2 }] }
 }
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-rule-plan-'))

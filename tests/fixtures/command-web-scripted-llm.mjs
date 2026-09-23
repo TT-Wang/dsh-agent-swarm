@@ -116,8 +116,8 @@ export async function apply(ctx, config) {
         ],
         workstreams: [{ key: 'delivery', title: 'Value delivery', objective: 'Change and independently verify the exported value.' }],
         tasks: [
-          { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], checks: ['node check.cjs'], checkTimeoutMs: 30_000, maxRecoveryAttempts: 3, assigneeKey: 'builder' },
-          { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', reviewOf: 'implement', scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], maxRecoveryAttempts: 3, checkTimeoutMs: 30_000, assigneeKey: 'reviewer' },
+          { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], checks: ['node check.cjs'], checkTimeoutMs: 30_000, maxRecoveryAttempts: 3, assigneeKey: 'builder' },
+          { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', outputs: [], reviewOf: 'implement', scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], maxRecoveryAttempts: 3, checkTimeoutMs: 30_000, assigneeKey: 'reviewer' },
         ],
       }
       if (config.validationRepair) {

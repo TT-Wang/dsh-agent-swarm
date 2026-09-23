@@ -208,7 +208,7 @@ test('R18-2: a staged-plan member edit drops the stale composition so the member
     title: 'Staged plan', objective: 'Deliver', workspace: directory, scope: ['src/'], acceptance: ['done'], budget: { ...BUDGET },
     members: [{ key: 'a', role: 'implementation', maxOutputTokens: 1000 }, { key: 'b', role: 'verification', maxOutputTokens: 1000 }],
     workstreams: [{ key: 'w', title: 'Main', objective: 'Deliver' }],
-    tasks: [{ key: 't1', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], assigneeKey: 'a' }],
+    tasks: [{ key: 't1', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['done'], checks: ['npm test'], assigneeKey: 'a' }],
   }
   const draft = runtime.createDraft(owner, plan)
   // The second member cannot start, so assembly fails AFTER the first member was
@@ -487,8 +487,8 @@ test('R18-5b: the syntax refusal names the broken check and pairs each location 
     members: [{ key: 'a', role: 'implementation', maxOutputTokens: 1000 }, { key: 'b', role: 'verification', maxOutputTokens: 1000 }],
     workstreams: [{ key: 'w', title: 'Main', objective: 'Deliver' }],
     tasks: [
-      { key: 't', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks, assigneeKey: 'a', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 },
-      { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review the feature', kind: 'verification', scope: ['src/'], acceptance: ['done'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 1 },
+      { key: 't', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['done'], checks, assigneeKey: 'a', maxRecoveryAttempts: 1, checkTimeoutMs: 60000 },
+      { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review the feature', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['done'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 1 },
     ],
   })
   const viaDraft = checks => {

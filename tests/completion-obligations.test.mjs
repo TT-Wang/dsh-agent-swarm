@@ -40,7 +40,7 @@ async function fixture(t) {
     maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 20 }, workers)
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'report-owner' }
-  const common = { workstreamKey: 'audit', scope: ['docs/reviews/'], acceptance, maxRecoveryAttempts: 3 }
+  const common = { workstreamKey: 'audit', scope: ['docs/reviews/'], acceptance, outputs: [], maxRecoveryAttempts: 3 }
   const research = (key, dependencies = []) => ({ ...common, key, title: key, objective: key,
     kind: 'research', assigneeKey: 'author', dependencies })
   const review = (key, reviewOf) => ({ ...common, key, title: key, objective: key,

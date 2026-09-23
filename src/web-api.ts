@@ -137,7 +137,7 @@ async function planInput(ctx: Context, body: Record<string, unknown>, header: Se
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
   // The host-derived root always overrides any client-supplied value, so a
   // browser payload cannot widen its own authorization anchor.
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }), true)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching }), true)
   await validateModels(ctx, header.id, plan.members, signal, launching)
   return plan
 }

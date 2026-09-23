@@ -116,8 +116,8 @@ test('registered launch accepts omitted member names and forwards canonical iden
     members: [{ key: 'author', role: 'Inspect the implementation', maxOutputTokens: 1024 }, { key: 'reviewer', name: 'Ada', role: 'Independently review the research', maxOutputTokens: 1024 }],
     workstreams: [{ key: 'main', title: 'Research', objective: 'Understand the module' }],
     tasks: [
-      { key: 'research', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the module', kind: 'research', scope: ['src/'], acceptance: ['understood'], assigneeKey: 'author', maxRecoveryAttempts: 2 },
-      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the evidence', kind: 'verification', scope: ['src/'], acceptance: ['understood'], assigneeKey: 'reviewer', reviewOf: 'research', maxRecoveryAttempts: 2 },
+      { key: 'research', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the module', kind: 'research', outputs: [], scope: ['src/'], acceptance: ['understood'], assigneeKey: 'author', maxRecoveryAttempts: 2 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Review the evidence', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['understood'], assigneeKey: 'reviewer', reviewOf: 'research', maxRecoveryAttempts: 2 },
     ] }
   const execution = { agent: { id: 'owner' }, signal: new AbortController().signal }
   await definitions.get('swarm_launch').execute(input, execution)
@@ -158,8 +158,8 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   const input = { requestId: 'request-one', title: 'Goal', objective: 'Deliver the goal', scope: ['result.txt'], acceptance: ['works'], budget: { ...budget, maxTokens: 12345 },
     members: [{ key: 'a', name: 'A', role: 'delivery', maxOutputTokens: 1024 }, { key: 'b', name: 'B', role: 'review', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'w', title: 'Work', objective: 'Deliver' }], tasks: [
-      { key: 't', workstreamKey: 'w', title: 'Deliver', objective: 'Deliver', kind: 'integration', scope: ['result.txt'], acceptance: ['works'], checks: ['touch result.txt'], assigneeKey: 'a', maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
-      { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review', kind: 'verification', scope: ['result.txt'], acceptance: ['works'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
+      { key: 't', workstreamKey: 'w', title: 'Deliver', objective: 'Deliver', kind: 'integration', outputs: [], scope: ['result.txt'], acceptance: ['works'], checks: ['touch result.txt'], assigneeKey: 'a', maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
+      { key: 'r', workstreamKey: 'w', title: 'Review', objective: 'Review', kind: 'verification', outputs: [], scope: ['result.txt'], acceptance: ['works'], reviewOf: 't', assigneeKey: 'b', maxRecoveryAttempts: 2, checkTimeoutMs: 1000 },
     ] }
   const execution = { agent: { id: 'owner' }, signal: new AbortController().signal }
   await definitions.get('swarm_launch').execute(input, execution)

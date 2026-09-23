@@ -65,8 +65,16 @@ export function checkSyntaxDetail(declared: readonly DeclaredPlanCheck[], issues
  */
 const CATEGORY_PRECEDENCE: readonly PolicyErrorCategory[] = ['authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'validation_error', 'tool_error']
 
+export interface PlanValidationOptions {
+  /**
+   * Validate for launch: every task must declare `outputs` ([] allowed). A
+   * staged draft may omit it; the launch that would store the task may not.
+   */
+  launch?: boolean
+}
+
 /** Fail before any workers or worktrees are created. Returns a detached canonical plan. */
-export function validatePlan(value: unknown): PlanInput {
+export function validatePlan(value: unknown, options: PlanValidationOptions = {}): PlanInput {
   record(value)
   if (Buffer.byteLength(JSON.stringify(value), 'utf8') > 1048576) throw new AdmissionError('plan_too_large', 'tool_error', 'Plan exceeds 1 MiB', 'plan')
   // Canonicalize a detached wire copy so retries and saved caller drafts are unchanged.
@@ -139,12 +147,19 @@ export function validatePlan(value: unknown): PlanInput {
       assertScopeSelectors(task.scope as string[], `tasks[${index}].scope`, value.scope as string[])
     })
     inspectAdmission(() => strings(task.acceptance, `${at}.acceptance`))
-    // A plan states its deliverables; nothing downstream has to read them out of
-    // the objective prose. Empty is legal and means "writes no file". Outputs
-    // are matched only against a scope of strings: a malformed scope is already
-    // refused above, and matching against it would fail on its entries.
+    // A plan states its deliverables: `outputs` is the only record of the files
+    // a task writes, so a launched task must carry it. Empty is legal and means
+    // "writes no file". Outputs are matched only against a scope of strings: a
+    // malformed scope is already refused above, and matching against it would
+    // fail on its entries.
     const stringScope = Array.isArray(task.scope) && task.scope.every(selector => typeof selector === 'string')
-    inspectAdmission(() => { if (task.outputs !== undefined && stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at) })
+    inspectAdmission(() => {
+      if (task.outputs === undefined) {
+        if (options.launch) throw new AdmissionError('outputs_required', 'validation_error', `[outputs_required] ${at}.outputs is required to launch. Set \`outputs\` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.`, `${at}.outputs`)
+        return
+      }
+      if (stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at)
+    })
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new AdmissionError('plan_recovery_limit_invalid', 'validation_error', `${at}.maxRecoveryAttempts must be a positive safe integer`, `${at}.maxRecoveryAttempts`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new AdmissionError('plan_check_timeout_invalid', 'validation_error', `${at}.checkTimeoutMs must be a positive integer within the platform timer range`, `${at}.checkTimeoutMs`) })
     if (validKind) inspectAdmission(() => requireHostChecks(String(task.kind), task.checks as string[] | undefined, `tasks[${index}]`, String(task.key), scripts))

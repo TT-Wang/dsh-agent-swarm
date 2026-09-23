@@ -128,7 +128,7 @@ async function fixture(t) {
   const input = { title: 'Browser plan', objective: 'Prepare reviewable work', workspace, scope: ['src/'], acceptance: ['works'],
     budget, members: [{ key: 'builder', name: 'Builder', role: 'implementation' }],
     workstreams: [{ key: 'main', title: 'Main', objective: 'Build it' }],
-    tasks: [{ key: 'build', workstreamKey: 'main', title: 'Build', objective: 'Make the change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeKey: 'builder' }] }
+    tasks: [{ key: 'build', workstreamKey: 'main', title: 'Build', objective: 'Make the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeKey: 'builder' }] }
   return { ctx, runtime, catalog, workers, ownerId, rpc, workspace, input }
 }
 
