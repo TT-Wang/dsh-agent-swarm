@@ -120,7 +120,9 @@ export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial'
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
  * file effect, so it cannot establish the D7 boundary that a verification
  * check cannot write into the source checkout. Refusing here is fail-closed:
- * the check never runs unconfined and the caller records a check failure.
+ * the check never runs unconfined. `Workspaces.verifyArtifact` records the
+ * refusal as that command's infrastructure row (exit 125), so the review is
+ * deferred for the host to repair, never rejected as an assertion failure.
  */
 export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): Promise<string[]> {
   const confined = await sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })

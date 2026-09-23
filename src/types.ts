@@ -118,6 +118,69 @@ export interface CheckEnvelope {
   totalRunMs: number
   maxRunMs: number
 }
+/** One declared check's outcome, as the host recorded it or, with `failureKind`, as the host failed to execute it. */
+export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
+  failureKind?: 'timeout' | 'infrastructure'
+  /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
+  attribution?: CheckAttribution
+  /** ENV: the environment this check actually ran under. */
+  environment?: CheckEnvironment }
+/**
+ * ENV: the environment a declared check runs under, stated as facts instead of
+ * folklore, so the assignee knows which environment the host check will use and
+ * a verification can tell when the executed check did not reproduce it.
+ *
+ * `home`, the two user cache roots, the sandbox policy and the dependency links
+ * are what an execution must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
+ * scoped roots the envelope itself provides inside the disposable checkout: they
+ * differ by design on every run and are excluded from the reproduction
+ * comparison. Existence flags are recorded and reported but never refuse an
+ * acceptance: a check must not depend on the ambient cache staying warm.
+ *
+ * Declared beside `CheckEnvelope` for the same reason: the adapter interface
+ * and the runtime read it without importing the Node-only workspace module,
+ * which re-exports it.
+ */
+export interface CheckEnvironment {
+  /** HOME the check process receives; null when it inherits none. */
+  home: string | null
+  /** User-level cache directory the check's HOME resolves (`<home>/.cache`); null without a HOME. */
+  userCacheDir: string | null
+  /** `<userCacheDir>/huggingface`, where a user-level model cache lives; null without a HOME. */
+  huggingfaceCacheDir: string | null
+  /** Whether the two user cache roots existed when these facts were recorded. */
+  userCacheDirExists: boolean
+  huggingfaceCacheDirExists: boolean
+  /** XDG_CACHE_HOME in force for this environment (the scoped root for a check). */
+  xdgCacheHome: string | null
+  /** The confinement the host applies: workspace-write rooted at the checkout, full enforcement. */
+  sandboxPolicy: { mode: string; enforcement: string; workspaceRoot: string | null }
+  /** Dependency materialisation policy. dirs is the configured set of directory names. */
+  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[];
+    /** Actual relative paths found and materialised in this execution; absent before execution. */
+    materializedPaths?: string[] }
+  /** Scoped cache root the envelope provides inside the checkout; null for a self-run. */
+  checkCacheRoot: string | null
+  /** Package-manager cache roots the check sets below `checkCacheRoot`. */
+  checkCacheRoots: Record<string, string>
+}
+/** ENV: one check's failure attribution, captured before the output bound can cut it off. */
+export interface CheckAttribution {
+  /** 1-based position of the failing check in the declared sequence. */
+  index: number
+  command: string
+  /** The last stage banner (`> script`, `$ command`, `# stage: name`) before the first failure. */
+  stage: string | null
+  /** The last `# Subtest:` heading before the first failure (the suite that failed). */
+  subtest: string | null
+  /** TAP `not ok` names seen in the stream, bounded; the count is every name seen. */
+  failingTests: string[]
+  failingTestCount: number
+  /** TAP summary lines (`1..N`, `# tests/# pass/# fail/...`), latest value per key. */
+  tapSummary: string[]
+  /** True when the stored output was cut at the host's output bound. */
+  outputTruncated: boolean
+}
 export interface Mission {
   id: string
   ownerSessionId: string
@@ -1038,7 +1101,7 @@ export interface WorkerAdapter {
   /** Read authoritative immutable Git facts, including fields absent from older stored records. */
   inspectArtifact?(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
-  verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<Array<{ command: string; exitCode: number; output: string }>>
+  verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
   checkEnvelope?(): CheckEnvelope
   /** Materialize accepted dependencies or a prior task checkpoint. Stop/fence the old owner before preparing a later epoch. */

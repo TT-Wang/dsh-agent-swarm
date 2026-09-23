@@ -27,7 +27,7 @@ export function excerpt(value: unknown, limit: number): string {
 }
 
 /** One declared check's outcome, as the host recorded it. */
-export type CheckResult = import('./workspaces.js').CheckResult
+export type CheckResult = import('./types.ts').CheckResult
 
 export class DeclaredChecks {
   /**
@@ -141,21 +141,20 @@ export class DeclaredChecks {
     return retry
   }
 
-  /** Only host-identified infrastructure failures defer a verdict; assertion failures still reject. */
+  /**
+   * Only host-identified infrastructure failures defer a verdict; assertion
+   * failures still reject. The adapter reports a check it could not prepare,
+   * confine or start as a row (`failureKind` set), so a throw here is a refusal
+   * unless it carries an errno code: the backstop for an adapter that throws
+   * and for I/O outside its preparation phase.
+   */
   private async execute(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
     try { return await this.rt.workers.verifyArtifact(member, source, artifact, signal) }
     catch (error) {
       if (signal?.aborted) throw error
       const code = error instanceof Error && 'code' in error ? String(error.code) : ''
-      const timeout = error instanceof Error && error.name === 'ProcessTimeoutError'
-      // R19-H2: a dependency directory the host could not materialise into the
-      // clean checkout carries no errno code, but no declared command has run
-      // either: it is the environment, not the artifact, so it defers like a
-      // coded I/O failure instead of escaping the review as a bare throw.
-      const materialisation = error instanceof Error && error.name === 'DependencyMaterialisationError'
-      if (!timeout && !materialisation && !['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
-      return [{ command: '(verification preparation)', exitCode: timeout ? 124 : 125,
-        failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
+      if (!['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
+      return [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
     }
   }
 
