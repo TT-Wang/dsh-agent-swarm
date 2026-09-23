@@ -336,10 +336,13 @@ test('the registered tools expose the board with a host-derived sender and emit 
     const value = await definitions.get(name).execute(args, { signal: controller.signal, agent: { id: sessionId, session: { header: { cwd: f.workspace } } } })
     return JSON.parse(JSON.stringify(value))
   }
-  const posted = await call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool', fromMemberId: 'member_forged', seq: 9999 }, f.bob.sessionId)
+  // A model-supplied sender or sequence is not a parameter: refused by name, nothing posted.
+  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool', fromMemberId: 'member_forged', seq: 9999 }, f.bob.sessionId),
+    /\[tool_arguments_invalid\] swarm_post was called with arguments its parameters schema refuses: "fromMemberId", "seq" are not parameters \(accepted: `missionId`, `kind`, `body`/)
+  const posted = await call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool' }, f.bob.sessionId)
   assert.equal(posted.result.kind, 'ASK')
-  assert.equal(posted.result.fromMemberId, f.bob.id, 'the tool ignores a model-supplied sender')
-  assert.ok(posted.result.seq !== 9999, 'the tool ignores a model-supplied sequence')
+  assert.equal(posted.result.fromMemberId, f.bob.id, 'the sender is host-derived')
+  assert.ok(posted.result.seq !== 9999, 'the sequence is host-assigned')
   const read = await call('swarm_board', { missionId: f.mission.id, to: 'me' }, f.bob.sessionId)
   assert.equal(read.result.posts[0].id, posted.result.id)
   assert.ok(read.result.inbox.memberId === f.bob.id)

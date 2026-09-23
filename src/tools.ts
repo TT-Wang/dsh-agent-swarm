@@ -134,12 +134,13 @@ const typeName = (type: string): string => type === 'null' ? 'null' : `${/^[aeio
 
 /**
  * Every place `value` departs from `schema`: a missing required property, a
- * value outside its enum, the wrong primitive type, or no `oneOf` branch that
- * fits, recursing into declared object properties and array items. An
- * undefined property is absent, as in JSON. `additionalProperties` is
- * deliberately not checked: tool calls have always tolerated undeclared keys,
- * and the runtime refuses the ones it must (`task_amendment_invalid` for
- * unknown `changes` fields).
+ * value outside its enum, the wrong primitive type, no `oneOf` branch that
+ * fits, or a key an object with `additionalProperties: false` does not declare
+ * (every swarm schema declares it), recursing into declared object properties
+ * and array items. An undefined property is absent, as in JSON. An undeclared
+ * key is named by its JSON spelling, never backticked, beside the list of the
+ * keys that object accepts: a misspelled key (`dependsOn` for `dependencies`)
+ * used to be dropped silently, since nothing read it.
  */
 function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string | number)[], found: string[]): string[] {
   const at = () => path.length === 0 ? 'the arguments' : schemaPath(path)
@@ -160,6 +161,10 @@ function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string 
   if (type === 'object') {
     const record = value as Args
     for (const key of schema.required ?? []) if (record[key] === undefined) found.push(`${schemaPath([...path, key])} is required`)
+    const declared = schema.properties ?? {}
+    const unknown = schema.additionalProperties === false ? Object.keys(record).filter(key => record[key] !== undefined && !Object.hasOwn(declared, key)) : []
+    const noun = `${path.length === 0 ? 'parameter' : 'field'}${unknown.length === 1 ? '' : 's'}${path.length === 0 ? '' : ` of ${schemaPath(path)}`}`
+    if (unknown.length) found.push(`${unknown.map(key => JSON.stringify(key)).join(', ')} ${unknown.length === 1 ? 'is not a' : 'are not'} ${noun} (accepted: ${Object.keys(declared).map(key => `\`${key}\``).join(', ')})`)
     for (const [key, child] of Object.entries(schema.properties ?? {})) if (record[key] !== undefined) schemaViolations(child, record[key], [...path, key], found)
   }
   if (type === 'array' && schema.items !== undefined) for (const [index, item] of (value as unknown[]).entries()) schemaViolations(schema.items, item, [...path, index], found)
@@ -403,7 +408,11 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     (a, actor) => {
       if (a.taskId !== undefined) {
         if (a.budget !== undefined) throw new Error('[budget_target_conflict] Update `budget` first, then call swarm_budget with `taskId` and `taskBudget` separately.')
-        return runtime.controlTask(actor, text(a, 'missionId'), text(a, 'taskId'), 'amend', object(a.taskBudget) as TaskAmendment, text(a, 'reason'))
+        // Only the declared ceilings: this tool must never amend structure
+        // (assignee, scope, dependencies, outputs) through controlTask.
+        const taskBudget = object(a.taskBudget)
+        const ceilings = Object.fromEntries(Object.keys(taskBudgetSchema.properties!).filter(key => taskBudget[key] !== undefined).map(key => [key, taskBudget[key]])) as TaskAmendment
+        return runtime.controlTask(actor, text(a, 'missionId'), text(a, 'taskId'), 'amend', ceilings, text(a, 'reason'))
       }
       return runtime.updateBudget(actor, text(a, 'missionId'), object(a.budget) as unknown as Budget, text(a, 'reason'))
     })

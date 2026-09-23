@@ -447,3 +447,43 @@ test('a null optional plan field is an omission inside launch and stage tasks an
   assert.equal(typeof launched[0].members[0].name, 'string', 'a null name takes the host-assigned name')
   assert.equal(Object.hasOwn(staged[0].budget, 'deadlineAt'), false)
 })
+
+/*
+ * Every swarm schema declares additionalProperties: false, and the check now
+ * enforces it: a misspelled key used to be admitted and silently dropped.
+ */
+test('an undeclared key is refused by name with the keys that object accepts, at the top level and nested', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const schemaIndex = await toolSchemaIndex()
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const source = f.propose({ title: 'Source' })
+    const tasks = f.runtime.store.list('tasks', f.mission.id).length
+    // A typo'd dependency key was admitted with no dependency at all.
+    await assert.rejects(definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Follow-on', objective: 'Extend the change once Source lands', kind: 'implementation',
+      scope: ['**'], acceptance: f.mission.acceptance, outputs: [], checks: ['test -d .'], dependsOn: [source.id] }, as(f.owner.sessionId)),
+    refusedBySchema(schemaIndex, 'swarm_propose', '"dependsOn" is not a parameter (accepted: `missionId`, `workstreamId`, `title`, `objective`, `kind`, `dependencies`,'))
+    assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasks, 'nothing was admitted')
+    // swarm_budget used to forward the whole taskBudget to controlTask, so a
+    // structural key (assignee, scope) was applied through the budget tool.
+    await assert.rejects(definitions.get('swarm_budget').execute({ missionId: f.mission.id, taskId: source.id, reason: 'raise', taskBudget: { maxSteps: 20, assigneeId: '', scope: ['src/'] } }, as(f.owner.sessionId)),
+      refusedBySchema(schemaIndex, 'swarm_budget', '"assigneeId", "scope" are not fields of `taskBudget` (accepted: `maxSteps`, `maxFindings`, `maxRecoveryAttempts`, `checkTimeoutMs`)'))
+    const unchanged = f.runtime.store.get('tasks', source.id)
+    assert.deepEqual([unchanged.assigneeId, unchanged.scope, unchanged.maxSteps], [f.author.id, ['**'], source.maxSteps])
+    await definitions.get('swarm_budget').execute({ missionId: f.mission.id, taskId: source.id, reason: 'raise', taskBudget: { maxSteps: 20 } }, as(f.owner.sessionId))
+    assert.equal(f.runtime.store.get('tasks', source.id).maxSteps, 20)
+    assert.equal(f.runtime.store.get('tasks', source.id).assigneeId, f.author.id)
+  } finally { await f.cleanup() }
+  const schemaIndex = await toolSchemaIndex()
+  const { calls, definitions } = recordingTools()
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1 }
+  await assert.rejects(definitions.get('swarm_launch').execute({ requestId: 'request_1', title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget: { ...budget, maxCost: 1 },
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000 }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }], tasks: [{ ...task, dependsOn: ['task_0'] }] }, exec),
+  refusedBySchema(schemaIndex, 'swarm_launch', '"maxCost" is not a field of `budget` (accepted: `maxTokens`,', '"dependsOn" is not a field of `tasks`[0] (accepted: `key`, `workstreamKey`,'))
+  await assert.rejects(definitions.get('swarm_control').execute({ missionId: 'mission_1', taskId: 'task_1', action: 'amend', reason: 'r', changes: { objective: 'new' } }, exec),
+    refusedBySchema(schemaIndex, 'swarm_control', '"objective" is not a field of `changes` (accepted: `maxSteps`,'))
+  assert.deepEqual(calls, [], 'no refused call reached the runtime')
+})
