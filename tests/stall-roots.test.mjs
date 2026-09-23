@@ -442,6 +442,18 @@ for (const repaired of [true, false]) {
     assert.deepEqual(reminders(), [], 'the covered stall root has no reminders of its own')
     const cited = facts().filter(fact => fact.dedupKey.startsWith('obligation-followup:')).map(fact => fact.dedupKey.split(':')[1])
     assert.deepEqual(cited.filter(id => f.runtime.store.get('deliveries', id)?.deliveredAt === undefined), [], 'every reminder cites a delivery the owner received')
+    // cc5bb56: an uncovered stall-root decision reminds while the root its key
+    // names is still a root. This root waits on a live prerequisite, which the
+    // subject rule of every other decision reads as a legitimate wait.
+    const prerequisite = f.propose('Live prerequisite')
+    const root = f.block(f.propose('Root with a live prerequisite', { dependencies: [prerequisite.id] }))
+    await f.runtime.tick()
+    const rootKey = `stall-root:${f.mission.id}:${root.id}@${root.epoch}`
+    // Its own row, or a wake-budget summary that carries it.
+    const decision = f.notices().find(delivery => delivery.notice?.dedupKey === rootKey || delivery.notice?.aggregatedFacts?.some(part => part.dedupKey === rootKey))
+    assert.ok(decision?.deliveredAt !== undefined && decision.notice.coveredBy === undefined, 'the stall-root decision reaches the owner')
+    await reminderIntervals(1)
+    assert.ok(remindersOf(decision).some(fact => fact.subjects.includes(`${root.id}@${root.epoch}`)), 'its reminder names the root, however the root waits')
   })
 }
 
