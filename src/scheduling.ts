@@ -68,7 +68,9 @@ export interface DispatchQuestion {
  * successor starts. The watchdog therefore only names a body past its bound
  * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
  * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
- * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`).
+ * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
+ * and past its own bound it stops at the next member boundary so the next body
+ * resumes from lease recovery (`dispatch`).
  */
 export interface SchedulingPass {
   /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
@@ -89,6 +91,10 @@ export interface SchedulingPass {
    * A commit proves the body is running, not sitting in an await (`passState`).
    */
   committedAt?: number
+  /** The member this body's sweep starts from: the one its predecessor stopped before. */
+  sweepFrom?: string
+  /** Set when this body stopped at a member boundary past its bound: the first member it did not sweep. */
+  stoppedBefore?: string
 }
 
 /**
@@ -175,15 +181,33 @@ export class Scheduling {
    * the original early returns did: on shutdown or on a mission that stopped
    * being active during an adapter await. It runs only inside the mission's
    * serial queue, so no other pass body runs while it awaits.
+   *
+   * A body past its bound (`stallPassTimeoutMs`) also returns false at the next
+   * member boundary, after sweeping at least one member, and records where it
+   * stopped (`stoppedBefore`). `kick` then queues the next body at once, which
+   * starts from lease recovery and sweeps from that member onwards, wrapping
+   * round to the ones before it. Each member's long awaits (a worker start up to
+   * `workerStartTimeoutMs`, task preparation, a close-out capture) therefore
+   * delay lease recovery, automatic completion and the budget check by at most
+   * one such await, not by their sum over every member.
    */
   async dispatch(mission: Mission, missionId: string): Promise<boolean> {
+        const body = this.body.getStore()
+        const pass = body !== undefined && this.passes.get(missionId) === body ? body : undefined
         // R17-G1: the dispatcher reads the SAME shared interpretation every
         // owner-facing generator consumes (`ready`, `dispatchable`, the task and
         // member rows), so no notice can describe a board the dispatcher would
         // act on differently. The view is rebuilt after each await, so it is
         // never staler than the per-step store reads it replaces.
-        for (const member of this.rt.interpretation(missionId).members) {
+        const members = this.rt.interpretation(missionId).members
+        const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
+        const order = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
+        for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
+          if (pass !== undefined && index > 0 && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs) {
+            pass.stoppedBefore = member.id
+            return false
+          }
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.

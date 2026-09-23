@@ -4137,17 +4137,25 @@ export class SwarmRuntime {
    * when it runs, and the queue could not start a second one before it settles.
    * The record is removed in `closePass` when the body settles, whatever the
    * outcome; the tick watchdog names a body that holds it past its bound.
+   *
+   * A body that stopped at a member boundary past its bound
+   * (`Scheduling.dispatch`) is followed at once by the next body, which sweeps
+   * from the member it stopped before (`sweepFrom`). It is opened in the same
+   * synchronous step that closes the stopped body, so the close publishes as
+   * inside that live pass, never as a finished sweep that left the unswept
+   * members' work undispatched.
    */
-  kick(missionId: string): void {
+  kick(missionId: string, sweepFrom?: string): void {
     if (this.shuttingDown || this.closed) return
     const pass = this.openPass(missionId)
     if (pass === undefined) return
+    if (sweepFrom !== undefined) pass.sweepFrom = sweepFrom
     this.defer(async () => {
       try { await this.scheduling.runBody(pass, () => this.exclusive(missionId, () => this.schedule(missionId))) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
-        if (mission?.status === 'active' && mission.budgetPause?.quiesced) this.kick(missionId)
+        if (mission?.status === 'active' && (pass.stoppedBefore !== undefined || mission.budgetPause?.quiesced)) this.kick(missionId, pass.stoppedBefore)
       }
     })
   }

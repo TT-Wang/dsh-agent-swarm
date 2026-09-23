@@ -223,6 +223,50 @@ test('S1/R17-G5: a named body\'s own commits never publish with the wedged branc
   } finally { await f.cleanup() }
 })
 
+test('S1: a body past its bound stops at the next member boundary, so lease recovery waits for one long await, not for every member\'s', async () => {
+  // Three members whose first native start hangs until the declared start
+  // bound aborts it, and a healthy member X whose running task's lease expires
+  // meanwhile. Before, the named body swept every member and then flushed, so
+  // lease-expiry recovery (the first step of every body) waited for all three
+  // hung starts: about (N-1) start bounds after the lease expired. A body past
+  // its bound now stops at the next member boundary; the next body starts from
+  // lease recovery and sweeps from the member the previous one stopped before.
+  const startBoundMs = 400
+  const leaseMs = 450
+  class HangFirstStartWorkers extends FakeWorkers {
+    armed = new Set()
+    hung = new Map()
+    async start(spec, signal) {
+      this.started.push(spec.member.id)
+      if (!this.armed.has(spec.member.id) || this.hung.has(spec.member.id)) return
+      const hang = { from: Date.now(), index: this.started.length - 1 }
+      this.hung.set(spec.member.id, hang)
+      try { await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) }
+      finally { hang.to = Date.now() }
+    }
+  }
+  const workers = new HangFirstStartWorkers()
+  workers.autoIdle = true
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, leaseMs, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: startBoundMs } })
+  try {
+    const hanging = []
+    for (const name of ['A', 'B', 'C']) hanging.push(await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 }))
+    const task = f.propose({ title: 'Task X' })
+    const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined, 'X is dispatched', 4_000)
+    for (const member of hanging) workers.armed.add(member.id)
+    const expired = await eventually(() => events(f.runtime, f.mission.id, 'task/lease-expired').find(item => item.data.taskId === task.id), 'the lease expiry is recovered', 10_000)
+    const latency = expired.createdAt - running.attempt.leaseUntil
+    assert.ok(latency <= startBoundMs + 150, `lease recovery ran ${latency}ms after the lease expired, within one start bound (${startBoundMs}ms) and a tick`)
+    const settled = await eventually(() => hanging.every(member => workers.hung.get(member.id)?.to !== undefined) ? true : undefined, 'every member reaches its hung start', 6_000)
+    assert.equal(settled, true)
+    const [a, b, c] = hanging
+    assert.equal(workers.started[workers.hung.get(a.id).index + 1], b.id, 'the body after A\'s hung start sweeps first from B, the member the stopped body did not reach')
+    assert.equal(workers.started[workers.hung.get(b.id).index + 1], c.id, 'and the one after B\'s from C')
+    await eventually(() => hanging.every(member => workers.started.lastIndexOf(member.id) > workers.hung.get(member.id).index) ? true : undefined,
+      'every member is started again after its hung start settles', 4_000)
+  } finally { await f.cleanup() }
+})
+
 test('S1/R16-D: a long pass inside its declared live-work bound is progress and is never named; past that bound it is named with its live work preserved', async () => {
   // Inside `stallPassReleaseBoundMs` (= stallPassTimeoutMs + stallPassLiveGraceMs,
   // both declared) a live lease is progress: the pass stays live and no stall is
