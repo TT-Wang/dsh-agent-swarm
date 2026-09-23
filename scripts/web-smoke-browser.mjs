@@ -119,7 +119,7 @@ export async function runWebSmoke({ name, scriptedLlm, prepare, observe, report 
       modelBoundary: 'Scripted LLM adapter only; actual CLI web product, browser, native transport, worker lifecycle and sandbox tools.',
       modelRequests: events.filter(event => event.type === 'model/request').length,
       toolCalls: events.filter(event => event.type === 'tool/call').length,
-      passed: !failure, scenario: name, ...report,
+      passed: !failure, scenario: process.argv.includes('--serve-only') ? 'serve-only' : name, ...report,
       ...(failure ? { failure: String(failure) } : {}), build, elapsedMs: (validatedAt ?? Date.now()) - started, checks, rpcResults,
     }, null, 2) + '\n')
     await writeFile(join(artifacts, 'model-trace.jsonl'), modelTrace)
