@@ -1875,7 +1875,9 @@ export class Workspaces {
       // deleted source path too, instead of only the in-scope destination.
       const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean).filter(name => !dependencyContent(name)))
       for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) if (!dependencyContent(name)) changed.add(name)
-      for (const name of changed) if (!withinScope(name, task.scope)) throw new Error(`Artifact changes path outside task scope: ${name}`)
+      // A stray file outside scope (a reviewer's scratch log, an author's
+      // experiment) is the member's to remove; nothing is committed yet.
+      for (const name of changed) if (!withinScope(name, task.scope)) throw new PolicyError('artifact_path_outside_scope', 'tool_error', `[artifact_path_outside_scope] Artifact changes path outside task scope: ${name}. Nothing was committed and your attempt stays running. Remove that file, or move the work inside the task \`scope\` (restore a modified or deleted tracked file to its task-base content), then retry \`${tool}\` with the same \`taskId\`.`)
       // Untracked symlinks are invisible to `git diff`; inspect every changed
       // working-tree path before committing so an escaping link is never
       // recorded in a swarm ref.
@@ -1903,7 +1905,7 @@ export class Workspaces {
         await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
         for (const dependency of record.task.dependencyCommits ?? []) await this.git(member.workspace, ['merge-base', '--is-ancestor', dependency, commit], signal)
         ;({ changedPaths, executablePaths } = await this.artifactChanges(member.workspace, baseCommit, commit, signal))
-        for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new Error(`Committed artifact changes path outside task scope: ${name}`)
+        for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new PolicyError('artifact_path_outside_scope', 'tool_error', `[artifact_path_outside_scope] Committed artifact changes path outside task scope: ${name}. The commit was rolled back and your attempt stays running. Remove that file, or move the work inside the task \`scope\`, then retry \`${tool}\` with the same \`taskId\`.`)
         // The commit is authoritative: re-check the recorded blobs so a working
         // tree edited after staging cannot smuggle a symlink into the artifact.
         await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)

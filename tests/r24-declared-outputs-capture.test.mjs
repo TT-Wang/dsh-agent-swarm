@@ -582,3 +582,39 @@ test('the capture-time output refusals are inventoried as typed sites that satis
     assert.deepEqual(assessRefusal(typed[0], { ...schemaIndex, diagnosticProducers: diagnosticProducers([sites]) }), [], typed[0].text)
   }
 })
+
+test('a stray out-of-scope file in a reviewer or author worktree is a typed refusal that keeps the attempt running, and removing it repairs the call', async t => {
+  // s5e.mjs: a reviewer leaves an experiment log at the repository root.
+  const f = await fixture(t)
+  const scopeRefusal = (error, name, tool) => {
+    assert.equal(error.name, 'PolicyError', error.message)
+    assert.equal(error.code, 'artifact_path_outside_scope')
+    assert.ok(error.message.startsWith('[artifact_path_outside_scope] '), error.message)
+    assert.ok(error.message.includes(`outside task scope: ${name}`), 'the refusal keeps the path')
+    assert.match(error.message, /Nothing was committed and your attempt stays running\. Remove that file, or move the work inside the task `scope`/)
+    assert.ok(error.message.includes(`retry \`${tool}\` with the same \`taskId\``), error.message)
+    assert.deepEqual(assessText(error.message, schemaIndex), [], error.message)
+    return true
+  }
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ objective: 'Write docs/report.md', outputs: ['docs/report.md'] }).id)
+  await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Report\n')
+  await writeFile(path.join(f.author.workspace, 'experiment.log'), 'scratch\n')
+  await f.readEvidence(f.author, task, 'docs/report.md')
+  await assert.rejects(f.submit(f.author, task), error => scopeRefusal(error, 'experiment.log', 'swarm_submit'))
+  assert.equal(f.taskRow(task.id).status, 'running')
+  await rm(path.join(f.author.workspace, 'experiment.log'))
+  assert.equal((await f.submit(f.author, task)).status, 'submitted')
+  const review = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, f.propose({ kind: 'verification', reviewOf: task.id, scope: ['docs/', 'notes/'], objective: 'Review the report', outputs: ['docs/review.md'] }).id)
+  await writeFile(path.join(f.reviewer.workspace, 'docs', 'review.md'), 'fine\n')
+  await writeFile(path.join(f.reviewer.workspace, 'scratch-test.log'), 'experiment\n')
+  await f.readEvidence(f.reviewer, review, 'docs/report.md')
+  const verify = () => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: review.attempt.id, verdict: 'accept', reason: 'Read the immutable artifact' })
+  await assert.rejects(verify(), error => scopeRefusal(error, 'scratch-test.log', 'swarm_verify'))
+  assert.equal(f.taskRow(review.id).status, 'running', 'the review attempt stays live')
+  assert.equal(f.taskRow(review.id).attempt.id, review.attempt.id)
+  assert.equal(f.taskRow(task.id).status, 'submitted', 'no verdict was recorded')
+  await rm(path.join(f.reviewer.workspace, 'scratch-test.log'))
+  const verified = await verify()
+  assert.equal(verified.status, 'accepted')
+  assert.deepEqual(verified.reviewArtifact.files.map(file => file.path), ['docs/review.md'])
+})
