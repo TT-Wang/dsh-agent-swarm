@@ -232,6 +232,26 @@ test('a class throw\'s message is the argument at its constructor\'s declared me
   assert.deepEqual(mismatches, [])
 })
 
+test('a message with dynamic segments is marked partially checked: only its literal parts are assessed', () => {
+  const sites = refusalSites([
+    'export function probe() {',
+    "  if (a) throw new Error('[probe_code] Retry with `taskId`.')",
+    '  if (b) throw new Error(`[probe_code] ${detail} Retry with \\`taskId\\`.`)',
+    "  if (c) throw new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] ' + checkSyntaxDetail(checks, issues) + '\\nRepair every command in the `checks` array.')",
+    "  throw new Error('[probe_code] Retry ' + 'with `taskId`.')",
+    '}',
+  ].join('\n'), 'src/probe.ts')
+  assert.deepEqual(sites.map(site => [site.expressionKind, site.partial]), [['literal', false], ['template', true], ['concat', true], ['concat', false]])
+  // The behaviour is unchanged: the text is the literal parts, so a token or verb the
+  // dynamic segment renders (the command and shell output checkSyntaxDetail quotes) is never seen.
+  assert.equal(sites[2].text, '[check_syntax_invalid]  \nRepair every command in the `checks` array.')
+  assert.deepEqual(sites[2].substitutions, ['checkSyntaxDetail(checks, issues)'])
+  // The verifier's example is one such site.
+  const [syntax] = refusalSites(read('src/runtime.ts'), 'src/runtime.ts').filter(site => site.code === 'check_syntax_invalid')
+  assert.equal(syntax.partial, true)
+  assert.ok(syntax.substitutions.some(substitution => substitution.startsWith('checkSyntaxDetail(')), syntax.expression)
+})
+
 test('the code the throw renderer prefixes is the diagnostic code itself', () => {
   const rendered = formatDiagnostic({ code: 'probe_code', location: 'task "t"', message: 'message body' })
   assert.match(rendered, /^\[probe_code\] task "t": message body$/)

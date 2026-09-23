@@ -129,20 +129,28 @@ export function sourceErrorClasses() {
   return declaredInSource
 }
 
-/** The static text of a message expression: a literal, a template (quasis joined by a gap) or a `+` chain with a gap for each non-literal operand. */
+/**
+ * The static text of a message expression: a literal, a template (quasis joined by a gap) or a `+` chain with a gap for each non-literal operand.
+ * `partial` marks a template or `+` chain with dynamic parts: `text` is its literal parts only, and whatever
+ * `substitutions` render at run time (caller input, adapter output such as check_syntax_invalid's
+ * `checkSyntaxDetail(…)`) is never checked. A `dynamic` or `formatDiagnostic` expression has no text at all.
+ */
 export function messageText(node, tree) {
   node = unwrap(node)
-  if (node === undefined) return { expressionKind: 'dynamic', text: null, substitutions: [] }
-  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'formatDiagnostic') return { expressionKind: 'formatDiagnostic', text: null, substitutions: [] }
-  if (ts.isStringLiteral(node)) return { expressionKind: 'literal', text: node.text, substitutions: [] }
-  if (ts.isNoSubstitutionTemplateLiteral(node)) return { expressionKind: 'template', text: node.text, substitutions: [] }
-  if (ts.isTemplateExpression(node)) return { expressionKind: 'template', text: [node.head.text, ...node.templateSpans.map(span => span.literal.text)].join(' '), substitutions: node.templateSpans.map(span => span.expression.getText(tree)) }
-  if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.PlusToken) return { expressionKind: 'dynamic', text: null, substitutions: [] }
+  if (node === undefined) return { expressionKind: 'dynamic', text: null, substitutions: [], partial: false }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'formatDiagnostic') return { expressionKind: 'formatDiagnostic', text: null, substitutions: [], partial: false }
+  if (ts.isStringLiteral(node)) return { expressionKind: 'literal', text: node.text, substitutions: [], partial: false }
+  if (ts.isNoSubstitutionTemplateLiteral(node)) return { expressionKind: 'template', text: node.text, substitutions: [], partial: false }
+  // Dynamic segments are ignored: each `${…}` becomes a one-space gap, so only the quasis are checked.
+  if (ts.isTemplateExpression(node)) return { expressionKind: 'template', text: [node.head.text, ...node.templateSpans.map(span => span.literal.text)].join(' '), substitutions: node.templateSpans.map(span => span.expression.getText(tree)), partial: true }
+  if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.PlusToken) return { expressionKind: 'dynamic', text: null, substitutions: [], partial: false }
   const operands = [], flatten = item => { item = unwrap(item); if (ts.isBinaryExpression(item) && item.operatorToken.kind === ts.SyntaxKind.PlusToken) { flatten(item.left); flatten(item.right) } else operands.push(item) }
   flatten(node)
+  // Dynamic segments are ignored: a non-literal operand becomes a one-space gap, so only the literal operands are checked.
   const parts = operands.map(item => ts.isStringLiteralLike(item) || ts.isTemplateExpression(item) ? messageText(item, tree) : { expressionKind: 'dynamic', text: ' ', substitutions: [item.getText(tree)] })
-  if (parts.every(part => part.expressionKind === 'dynamic')) return { expressionKind: 'dynamic', text: null, substitutions: [] }
-  return { expressionKind: 'concat', text: parts.map(part => part.text).join(''), substitutions: parts.flatMap(part => part.substitutions) }
+  if (parts.every(part => part.expressionKind === 'dynamic')) return { expressionKind: 'dynamic', text: null, substitutions: [], partial: false }
+  const substitutions = parts.flatMap(part => part.substitutions)
+  return { expressionKind: 'concat', text: parts.map(part => part.text).join(''), substitutions, partial: substitutions.length > 0 }
 }
 
 /**

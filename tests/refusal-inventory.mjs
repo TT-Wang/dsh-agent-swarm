@@ -77,10 +77,12 @@ export function textFacts(text) {
 
 /**
  * Enumerate every refusal site in one source file.
- * Returns `{ kind, file, line, code, property, errorClass, expression, expressionKind, text, codes, tools, params, substitutions, guard, guardName, functionBody, calls, objectRange, advisory }`.
+ * Returns `{ kind, file, line, code, property, errorClass, expression, expressionKind, partial, text, codes, tools, params, substitutions, guard, guardName, functionBody, calls, objectRange, advisory }`.
  * `kind` is `throw` for `throw new Error(...)`, `coded-throw` for a throw of any
  * other class (its `code` is the first argument when that is a code literal),
- * and `message` for a coded object literal.
+ * and `message` for a coded object literal. `partial` marks a site that is
+ * only partially checked: `text` holds the literal parts of a template or `+`
+ * chain, and the text its `substitutions` render is ignored (`messageText`).
  */
 export function refusalSites(source, file) {
   const sites = refusalNodes(source, file).map(({ functionName, ...node }) => {
@@ -246,6 +248,7 @@ export function assessRefusal(site, index) {
   } else if (site.code !== undefined && site.codes[0] !== site.code) {
     violations.push(`inline code ${site.codes[0]} does not match the declared code ${site.code}`)
   }
+  // A `partial` site's text is its literal parts only: what its dynamic segments render is not checked.
   return text === null ? violations : [...violations, ...exitViolations(text, site, index)]
 }
 
