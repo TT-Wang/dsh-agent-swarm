@@ -649,12 +649,12 @@ export class SwarmRuntime {
    * racing the watchdog for the same state.
    */
   private startTicker(): void {
-    if (this.timer !== undefined || this.config.tickMs <= 0) return
+    if (this.timer !== undefined || this.config.manualTick === true) return
     this.timer = setInterval(() => this.runTick(), this.config.tickMs)
     this.timer.unref()
   }
   /**
-   * One tick by hand, for a runtime built with `tickMs: 0` (no timer): the
+   * One tick by hand, for a runtime built with `manualTick` (no timer): the
    * timer's guards, then it resolves once every operation they deferred (a
    * scheduling body, the outbox pump, a stop barrier), and every operation
    * started while it waits, has settled. An operation already in flight when

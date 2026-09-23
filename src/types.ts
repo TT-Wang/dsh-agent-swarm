@@ -1098,8 +1098,17 @@ export interface WorkerAdapter {
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
-  /** Tick timer period; 0 runs no timer, so a test drives `SwarmRuntime.tick()` by hand. */
+  /**
+   * Tick timer period, and the unit of every tick-derived window (the
+   * unreviewed-submission grace, the no-progress window, the back-off bound,
+   * the start retry).
+   */
   tickMs: number
+  /**
+   * Run no tick timer, so a test drives `SwarmRuntime.tick()` by hand; `tickMs`
+   * stays the tick unit. The plugin never sets it from the profile.
+   */
+  manualTick?: boolean
   /**
    * The runtime clock. Every wall-clock read that decides runtime behaviour
    * (leases, bounds, back-offs, silence, stall and wedge ages, wake budgets,

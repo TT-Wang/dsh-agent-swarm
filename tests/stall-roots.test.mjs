@@ -383,7 +383,7 @@ for (const repaired of [true, false]) {
     // while the root's repair was already running. The clock and the ticks are
     // driven by hand: each reminder interval is one clock step and one tick.
     const clock = new FakeClock()
-    const f = await fixture(t, { tickMs: 0, now: clock.now, stallPassTimeoutMs: 60_000 })
+    const f = await fixture(t, { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 })
     const followupMs = f.runtime.notices.obligationFollowupMs = 300
     const reminderIntervals = async count => { for (let step = 0; step < count; step += 1) { clock.advance(followupMs); await f.runtime.tick() } }
     const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })

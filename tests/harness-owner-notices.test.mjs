@@ -81,6 +81,11 @@ for (const now of [5, 'x']) test(`a profile key now: ${JSON.stringify(now)} neve
   assert.equal(f.rt.config.now, undefined, 'the plugin builds the runtime config without the profile key')
 })
 
+test('a profile key manualTick never turns off the tick timer', async t => {
+  const f = await fixture(t, undefined, undefined, { manualTick: true })
+  assert.notEqual(f.rt.timer, undefined, 'the plugin runtime keeps its tick timer')
+})
+
 test('full plugin books first consumed question before the transport flush acknowledges it', async t => {
   const f = await fixture(t, () => text('Ordinary prose is not a receipt answer'))
   const member = await f.rt.addMember(f.owner, f.mission.id, { name: 'Asker', role: 'research' })
