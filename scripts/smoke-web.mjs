@@ -53,6 +53,15 @@ async function writeReport() {
   await writeFile(join(artifacts, 'server.log'), redactWebSecrets(output))
 }
 
+/** A member's conversation button in the overview, expanding the team roster as a user would. */
+async function memberButton(panel, member) {
+  const roster = panel.locator('[data-swarm-team] > button[aria-expanded]')
+  if (await roster.getAttribute('aria-expanded') !== 'true') await roster.click()
+  const button = panel.locator(`button[data-swarm-member="${member.id}"]`)
+  await button.waitFor()
+  return button
+}
+
 async function until(fn, label, timeout = 30_000) {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -248,12 +257,11 @@ try {
       assert.equal(resumed.snapshot.mission.status, 'active')
       checks.push('live mission Pause/Resume controls, cancellation and reassignment')
       await until(() => latestState?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.tasks.every(task => task.status === 'accepted'), 'live accepted task state without owner swarm_observe', 45_000)
-      // The roster is part of the default overview (no disclosure to open), and a
-      // live member row carries the native conversation link.
-      const roster = panel.locator('[data-swarm-team]')
-      await roster.waitFor()
-      assert((await panel.locator('[data-swarm-member]').count()) > 0, 'the default overview shows the team roster')
-      await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
+      // Idle members sit in the overview's collapsed roster, working members in the
+      // live lanes; every row is a button that opens that member's conversation.
+      const builderButton = await memberButton(panel, builder)
+      assert.equal(await panel.locator('button[data-swarm-member]').count(), launched.snapshot.members.length, 'the overview lists every member exactly once')
+      await builderButton.click()
       await until(() => latestState?.ownerSessionId === builder.sessionId && latestState.writable === false, 'native active worker conversation navigation and read-only swarm view')
       await panel.getByText('Mission controls are read-only in worker conversations. Open the owner conversation to manage this mission.', { exact: true }).waitFor()
       await page.getByText('Assignment finished; awaiting further work.', { exact: true }).first().waitFor()
@@ -330,8 +338,7 @@ try {
       await panel.getByRole('combobox', { name: 'Missions', exact: true }).selectOption(`mission:${missionId}`)
       const beforeHistory = (await readFile(tracePath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
       const workerRequests = events => events.filter(event => event.type === 'model/request' && [builder.sessionId, reviewer.sessionId].includes(event.sessionId)).length
-      await panel.locator('[data-swarm-team]').waitFor()
-      await page.locator(`[data-worker-session="${builder.sessionId}"]`).click()
+      await (await memberButton(panel, builder)).click()
       const transcript = panel.locator(`[data-swarm-transcript="${builder.sessionId}"]`)
       await transcript.waitFor()
       await until(async () => (await transcript.innerText()).includes('VERIFIED_TWO'), 'persisted worker transcript contains the actual host tool output')
