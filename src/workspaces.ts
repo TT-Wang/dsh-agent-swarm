@@ -2031,12 +2031,27 @@ export class Workspaces {
       if (entryStat?.isSymbolicLink() && (targetStat === undefined || !targetStat.isDirectory())) throw new DependencyMaterialisationError('dependency_directory_unavailable', 'A dependency link has no readable directory target; repair or reinstall the dependency directory', relative)
       if (targetStat === undefined || !targetStat.isDirectory()) continue
       if (await lstat(link).then(() => true, () => false)) continue
+      // The artifact decides the checkout's tree: when it made a parent of this
+      // directory something other than a directory (a file, or a link that is
+      // never written through), the dependency has no place here. Materialise
+      // nothing for it and let the checks judge the artifact; failing here would
+      // report an immutable artifact as a host condition no repair can change.
+      if (await this.displacedByArtifact(checkout, relative)) continue
       await mkdir(path.dirname(link), { recursive: true })
       if (copy) await this.copyDependencyTree(resolved!, link, source, relative, signal)
       else await symlink(target, link, 'dir')
       linked.push(relative)
     }
     return linked
+  }
+
+  /** Whether an existing parent of `relative` inside the checkout is not a directory. */
+  private async displacedByArtifact(checkout: string, relative: string): Promise<boolean> {
+    for (let parent = path.dirname(relative); parent !== '.'; parent = path.dirname(parent)) {
+      const stat = await lstat(path.join(checkout, parent)).catch(() => undefined)
+      if (stat !== undefined && !stat.isDirectory()) return true
+    }
+    return false
   }
 
   /** Copy into staging, relocate internal links, and materialize external
