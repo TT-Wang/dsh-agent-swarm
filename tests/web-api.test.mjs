@@ -687,6 +687,20 @@ test('authored draft refusals keep a stable category through native RPC when wor
   }
 })
 
+test('launch refusals reach the browser by their policy code, with the legacy wording unchanged', async t => {
+  const f = await fixture(t)
+  const draft = (await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })).result.value.draft
+  const stale = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision + 1 })
+  assert.equal(stale.result.error.code, 'bad-request', stale.text)
+  assert.equal(stale.result.error.message, 'Draft changed; reload before launching')
+  assert.deepEqual(stale.result.error.details, { issues: [], policyCode: 'draft_revision_conflict', category: 'conflict_error' })
+  f.runtime.store.transaction(() => f.runtime.store.put('drafts', { ...draft, status: 'launching' }))
+  const busy = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+  assert.equal(busy.result.error.message, 'Draft cannot be launched in its current state')
+  assert.deepEqual(busy.result.error.details, { issues: [], policyCode: 'draft_not_launchable', category: 'conflict_error' })
+  assert.equal(f.runtime.store.get('drafts', draft.id).status, 'launching', 'a refused launch changes nothing')
+})
+
 test('mission owner refusals carry authorization even when the wording has no legacy match', async t => {
   const f = await fixture(t)
   const mission = f.runtime.create({ sessionId: f.ownerId }, { ...f.input, workspace: f.workspace })
