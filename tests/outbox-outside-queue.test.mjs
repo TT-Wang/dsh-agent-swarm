@@ -32,20 +32,17 @@ class WedgeDeliverWorkers extends WedgeStartWorkers {
   }
 }
 
-const passRow = f => f.runtime.store.get('passes', `pass_${f.mission.id}`)
+/** The scheduling body queued or running on the mission's queue (in memory). */
+const passOf = f => f.runtime.scheduling.passes.get(f.mission.id)
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 /** Hold the mission lock: arm the wedge, wait until a pass owns the guard, and prove it never returns. */
 async function holdLock(f) {
   f.workers.wedgeNext = true
-  const row = await eventually(() => {
-    const current = passRow(f)
-    return current?.status === 'running' ? current : undefined
-  }, 'a pass must hold the mission guard', 4_000)
-  await sleep(120) // more than ten ticks with the row unchanged: the body is wedged, not busy
-  const held = passRow(f)
-  assert.equal(held.runId, row.runId, 'the same pass still owns the guard: the mission lock is held')
-  assert.equal(held.status, 'running', 'a wedged pass is still running, not silently released')
+  const pass = await eventually(() => passOf(f), 'a pass must hold the mission guard', 4_000)
+  await sleep(120) // more than ten ticks with the record unchanged: the body is wedged, not busy
+  const held = passOf(f)
+  assert.equal(held, pass, 'the same pass still owns the guard: the mission lock is held')
   return held
 }
 
@@ -65,8 +62,7 @@ test('S2: a durable owner notice is delivered by the tick pump while the mission
     assert.ok(f.runtime.store.get('deliveries', notice.id).deliveredAt !== undefined,
       'the delivery ledger records the claimed delivery durably')
     // The wedged pass never returned, so the pass cannot have delivered it.
-    assert.equal(passRow(f).runId, held.runId, 'the delivery did not come from a completed pass')
-    assert.equal(passRow(f).status, 'running', 'the mission lock is still held after the delivery')
+    assert.equal(passOf(f), held, 'the delivery did not come from a completed pass: the mission lock is still held')
   } finally { await f.cleanup() }
 })
 
@@ -81,8 +77,8 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
     // uses); otherwise an older queued pass consumes the wedge and the
     // "advanced no durable state" claim would be about a concurrent proposal.
     await eventually(() => {
-      const row = passRow(f)
-      return row?.status === 'running' && row.fingerprintBefore === f.runtime.fingerprint(f.mission.id) ? true : undefined
+      const pass = passOf(f)
+      return pass !== undefined && pass.fingerprintBefore === f.runtime.fingerprint(f.mission.id) ? true : undefined
     }, 'a pass must open on the current durable board before the wedge is armed', 4_000)
     f.workers.wedgeNext = true
     const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
@@ -99,8 +95,8 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
     assert.ok(delivered.content.length > 0)
     // The alarm never depended on the pass returning: the escalation came from
     // the tick-time watchdog while the body was still inside its never-settling
-    // adapter call, and the guard has already moved on.
-    assert.notEqual(passRow(f).runId, event.data.runId, 'the wedged pass was released instead of completing')
+    // adapter call, which still holds the mission.
+    assert.equal(passOf(f)?.operationId, event.data.runId, 'the wedged pass was named while it still held the mission, not after completing')
   } finally { await f.cleanup() }
 })
 

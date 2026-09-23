@@ -1,6 +1,7 @@
 /**
- * The scheduling seam: the readiness and stall predicates, the durable pass guard
- * (open/close/release) and the dispatch sweep of one serialized pass. M1a seam 7/7.
+ * The scheduling seam: the readiness and stall predicates, the in-memory pass
+ * guard (open/close and the wedge watchdog) and the dispatch sweep of one
+ * serialized pass. M1a seam 7/7.
  *
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and `schedule` calls `dispatch` exactly where its
@@ -20,7 +21,7 @@ import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type Task } from './types.ts'
+import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -51,46 +52,53 @@ export interface DispatchQuestion {
 }
 
 /**
- * S5c: the durable release record on the pass row. `SchedulingPass`
- * (src/types.ts) is outside this task's write scope, so the two fields are
- * declared here and travel as plain JSON properties on the same durable row;
- * the integration task records the schema addition. `releasedRunId` is the runId
- * of the most recent pass the watchdog released, carried forward by `openPass`
- * (and preserved by `closePass`) because the row is overwritten once per pass.
+ * The scheduling body that is queued or running for one mission. `openPass`
+ * (called by `kick`) records it before the body is queued on the mission's
+ * serial queue (`SwarmRuntime.exclusive`), and `closePass` removes it when the
+ * body settles, so at most one scheduling body per mission is queued or running.
+ * It is in-memory on purpose: it describes an operation this process owns, and
+ * a restarted process owns none. The durable row it replaces never gated or
+ * named anything after a restart either (it carried the dead process's
+ * instance id); it only carried the no-progress count, which now restarts with
+ * the process.
  *
- * R16-D: the same row also accumulates what the release bound could not keep:
- * `releases` counts every released wedge and `worstRelease` keeps the widest
- * release-to-bound gap seen (with the bound it was measured against). The row is
- * the single durable carrier of these facts for the same reason as
- * `releasedRunId`: the once-per-pass overwrite would otherwise erase the only
- * record of a bounded release. No src/ reader consumes `releases` or
- * `worstRelease` beyond this carry-forward; the test-side silence projection
- * (tests/instruments.mjs) reads them from the row.
+ * Why no release and no fence: the queue is strictly serial and a waiter past
+ * its bound is refused, never run (`boundedQueueWait`), so a successor body
+ * cannot start until this body settles; a wedged body can never write after its
+ * successor starts. The watchdog therefore only names a body past its bound
+ * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
+ * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
+ * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`).
  */
-interface ReleaseRecord {
-  runId: string
+export interface SchedulingPass {
+  /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
+  id: string
+  /** This body's identity; the stall event and the owner notice name it as the run. */
+  operationId: string
+  missionId: string
   startedAt: number
+  /** Store revision and mission digest when the pass was opened. */
+  revisionBefore: number
+  fingerprintBefore: string
+  /** Consecutive earlier passes that changed no durable mission state. */
+  noProgressPasses: number
+  /** Set when the watchdog named this body past its bound; it is then wedged, not live. */
+  escalatedAt?: number
+}
+
+/**
+ * R16-D: what the watchdog measured when it named a wedged body: the whole
+ * time the body had held the mission when it was named, the bound it was
+ * measured against, and the live work that held the naming to its second bound.
+ * The durable `mission/stalled` event carries these facts.
+ */
+interface WedgeRecord {
   releasedAt: number
-  /** `releasedAt - startedAt`: the whole time the wedged pass held the guard. */
+  /** `releasedAt - startedAt`. */
   gapMs: number
-  /** The declared bound this release was measured against. */
-  boundMs: number
-  /** True when live work (a live lease, an in-flight stop acknowledgement) held the release to its second bound. */
-  heldByLiveWork: boolean
-  /** The subjects whose live work held it, preserved by the release. */
+  /** The live subjects that held the naming to its second bound. */
   liveSubjects: string[]
 }
-interface ReleasedPassFields {
-  releasedRunId?: string
-  releasedAt?: number
-  releases?: number
-  worstRelease?: ReleaseRecord
-}
-const releasedPassFields = (row: SchedulingPass): SchedulingPass & ReleasedPassFields => row as SchedulingPass & ReleasedPassFields
-
-/** Keep the wider of two release records; ties keep the earlier one. */
-const widerRelease = (previous: ReleaseRecord | undefined, next: ReleaseRecord): ReleaseRecord =>
-  previous === undefined || next.gapMs > previous.gapMs ? next : previous
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 export const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
@@ -120,18 +128,22 @@ function formatSpan(ms: number): string {
 
 export class Scheduling {
   /**
-   * S1: pass ids the watchdog released after the declared bound, so an
-   * abandoned pass body cannot dispatch into the newer pass's turn. S5c: this
-   * Set is the in-process mirror of the durable `releasedRunId` on the pass row
-   * (`passReleased` reads the row first), so losing it cannot let a released
-   * body resume — it is a fast path for the same durable fact.
+   * The scheduling body queued or running per mission (see `SchedulingPass`).
+   * It is removed only when that body settles, so `kick` never queues a second
+   * body behind one the queue could not run anyway, and the tick watchdog reads
+   * `startedAt` to name a body past its bound.
    */
-  readonly releasedPasses = new Set<string>()
+  readonly passes = new Map<string, SchedulingPass>()
   /**
-   * Identity of this runtime process in the pass row. A row written by a
-   * different instance is a crashed process's leftover: it never gates this
-   * runtime (the next open pass overwrites it), so a restart does not wait out
-   * a dead pass's bound.
+   * Consecutive no-progress passes per mission, carried from one pass to the
+   * next for the S1 no-progress escalation. Its loss only restarts the count;
+   * the escalation's dedup key is durable on the mission row.
+   */
+  private readonly noProgress = new Map<string, number>()
+  /**
+   * Identity of this runtime process in durable claims (the budget stop claim
+   * in src/gates.ts). A claim written by a different instance is a crashed
+   * process's leftover and never gates this runtime.
    */
   readonly instanceId = id('runtime')
 
@@ -140,10 +152,11 @@ export class Scheduling {
   /**
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
    * unchanged). It returns false when the pass must be abandoned exactly where
-   * the original early returns did: on shutdown, on a mission that stopped being
-   * active during an adapter await, or when the pass guard was released.
+   * the original early returns did: on shutdown or on a mission that stopped
+   * being active during an adapter await. It runs only inside the mission's
+   * serial queue, so no other pass body runs while it awaits.
    */
-  async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
+  async dispatch(mission: Mission, missionId: string): Promise<boolean> {
         // R17-G1: the dispatcher reads the SAME shared interpretation every
         // owner-facing generator consumes (`ready`, `dispatchable`, the task and
         // member rows), so no notice can describe a board the dispatcher would
@@ -153,9 +166,6 @@ export class Scheduling {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
           if (memberPhaseOf(member) === 'stopped') continue
           if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
-          // S1: an abandoned pass body (its guard was released after the declared
-          // bound) must never dispatch into the newer pass's turn.
-          if (this.passReleased(pass)) return false
           // Round 14: one member's guard chain must never abort the whole sweep.
           // Before this, a guard that threw here (the field evidence: "Member has
           // uncommitted commits" while an owner tried to preserve a cut-off
@@ -170,15 +180,12 @@ export class Scheduling {
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
-            if (this.passReleased(pass)) return false
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             continue
           }
-          if (this.passReleased(pass)) return false
           this.rt.startFailures.delete(member.id)
           this.rt.clearProviderOutage(missionId, member.id)
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (this.passReleased(pass)) return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
           // precondition can be false for a parked agent (a pending inbox item or a
           // non-idle handle); an assignment is exactly the fresh input that unparks
@@ -241,7 +248,6 @@ export class Scheduling {
             await this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId))
             await this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            if (this.passReleased(pass)) return false
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
               || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
@@ -251,8 +257,6 @@ export class Scheduling {
             if (!this.rt.isolationAllows(missionId, member)) continue
             this.rt.assign(fresh, member)
           } catch (error) {
-            // A watchdog-released pass owns neither successes nor failures.
-            if (this.passReleased(pass)) return false
             // Admission control already wrote the durable refusal; the task stays
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
@@ -294,7 +298,6 @@ export class Scheduling {
             })
           }
           } catch (error) {
-            if (this.passReleased(pass)) return false
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
             this.escalateGuardTerminal(missionId, 'attempt_lease', { memberId: member.id, detail: String(error) })
             continue
@@ -540,44 +543,38 @@ export class Scheduling {
     return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }
   }
 
-  /** One durable pass row per mission; the row is the guard, never an in-memory Set. */
+  /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
   passKey(missionId: string): string { return `pass_${missionId}` }
 
   /**
-   * The pass that may still hold the guard. Re-read from the store on every
-   * call: a `running` row older than the declared bound is NOT a guard, so a
-   * pass that never returns cannot swallow the tick timer's liveness action.
+   * The pass that still owns the dispatcher's decisions: the body queued or
+   * running for the mission, inside its declared bound and not yet named wedged.
    *
    * While the mission has live work (a renewed lease, an in-flight quiescence)
-   * the row keeps gating inside the second, bounded window (`stallPassReleaseBoundMs`
-   * = `stallPassTimeoutMs` + `stallPassLiveGraceMs`): the pass may legitimately
-   * be inside a long adapter await for that live attempt. R16-D closes the half
-   * round 15 left open: past that window the row is not a guard at all, so a
-   * `kick` is never swallowed indefinitely by a healthy sibling's lease. The
-   * watchdog records and names the release; `openPass` records it durably too
-   * when a fresh pass supersedes a still-running wedged row, so the fence
-   * (`passReleased`) is closed on both paths.
+   * the body stays live inside the second, bounded window
+   * (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` + `stallPassLiveGraceMs`):
+   * it may legitimately be inside a long adapter await for that live attempt.
+   * R16-D: past that window it is not live however long a healthy sibling's
+   * lease lives, and the watchdog names it. `kick` does not read this: it skips
+   * while any body is queued or running, because the serial queue could not run
+   * a second one anyway.
    */
   livePass(missionId: string): SchedulingPass | undefined {
-    const row = this.rt.store.get('passes', this.passKey(missionId))
-    if (row === undefined || row.missionId !== missionId) return undefined
-    if (row.instanceId !== this.instanceId) return undefined
-    if (row.status !== 'running') return undefined
-    const age = Date.now() - row.startedAt
-    if (age < this.rt.stallPassTimeoutMs) return row
-    // Past the declared pass bound the row is a guard only while the mission has
-    // live work to progress AND the bounded live-work hold has not elapsed. With
-    // no live work it is not a guard at all, so the tick timer's kick is never
-    // swallowed; the watchdog releases and escalates it.
-    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return row
+    const pass = this.passes.get(missionId)
+    if (pass === undefined || pass.escalatedAt !== undefined) return undefined
+    const age = Date.now() - pass.startedAt
+    if (age < this.rt.stallPassTimeoutMs) return pass
+    // Past the declared pass bound the body is live only while the mission has
+    // live work to progress AND the bounded live-work hold has not elapsed.
+    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
   /**
    * The subjects whose live work keeps `hasLiveWork` true: a running attempt
-   * under a live lease, or a task in its durable stop transition. The release
-   * names them so the owner can see what held the guard and that the release
-   * preserved it (it cancels no task, drops no attempt and changes no lease).
+   * under a live lease, or a task in its durable stop transition. The wedge
+   * notice names them so the owner can see what held it, and that it preserved
+   * them (it cancels no task, drops no attempt and changes no lease).
    */
   liveWorkHolders(missionId: string): Array<{ subject: string; memberId?: string }> {
     const now = Date.now()
@@ -592,139 +589,83 @@ export class Scheduling {
   }
 
   /**
-   * R15-D1/D2: a pass body that is still `running` past its declared bound, from
-   * THIS instance. `livePass` deliberately keeps such a row as a guard while the
-   * mission has live work (a sibling lease, an in-flight stop acknowledgement),
-   * so the watchdog does not abandon a pass that may legitimately be inside a long
-   * adapter await. That gate must not silence another subject's clock: the
-   * queue-external decision sweep reads this predicate and names the subjects the
-   * wedged pass cannot finish, even while a healthy sibling holds its lease.
+   * R15-D1/D2: a pass body that is still queued or running past its declared
+   * bound. `livePass` deliberately keeps such a body live while the mission has
+   * live work (a sibling lease, an in-flight stop acknowledgement), so the
+   * watchdog does not name a pass that may legitimately be inside a long adapter
+   * await. That hold must not silence another subject's clock: the notices
+   * publish with the wedged branch while this is true, and the attempt-silence
+   * escalation says the pass is wedged.
    *
-   * Co-firing guards: `livePass` (still the scheduling gate inside the bounded
-   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which
-   * releases inside the declared bound or the bounded live-work window), the
-   * off-pass decision sweep (the only caller) and `hasLiveWork`. R16-D: the
-   * bounded release does not weaken this predicate — it is still true for every
-   * `running` row past the first bound, so the off-pass sweep keeps naming the
-   * subjects the wedged pass cannot finish.
+   * Co-firing guards: `livePass` (still the generation owner inside the bounded
+   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which names
+   * the body inside the declared bound or the bounded live-work window), the
+   * notice publication (`SwarmRuntime.passState`) and `hasLiveWork`. It stays
+   * true from the first bound until the body settles, named or not.
    */
   passWedged(missionId: string): boolean {
-    const row = this.rt.store.get('passes', this.passKey(missionId))
-    if (row === undefined || row.missionId !== missionId) return false
-    if (row.instanceId !== this.instanceId || row.status !== 'running') return false
-    return Date.now() - row.startedAt > this.rt.stallPassTimeoutMs
+    const pass = this.passes.get(missionId)
+    return pass !== undefined && Date.now() - pass.startedAt > this.rt.stallPassTimeoutMs
   }
 
-  /** Open a pass and record it durably before any scheduling work starts. */
+  /**
+   * Record the scheduling body `kick` is about to queue, or return undefined
+   * when one is already queued or running for the mission: the serial queue
+   * could not start a second body before that one settles.
+   */
   openPass(missionId: string): SchedulingPass | undefined {
     if (this.rt.closed || this.rt.shuttingDown) return undefined
     if (this.rt.store.get('missions', missionId) === undefined) return undefined
-    if (this.livePass(missionId) !== undefined) return undefined
-    const prior = this.rt.store.get('passes', this.passKey(missionId))
-    // R16-D: a still-running predecessor is past every bound (else `livePass`
-    // above would have returned it), so opening this pass SUPERSEDES and
-    // RELEASES it. The slow path (the tick watchdog) normally gets there first;
-    // when it does not — a `kick` from a control path between ticks — the
-    // release must still be durable, fenced and named instead of being silently
-    // overwritten by the row write below.
-    if (prior !== undefined && prior.status === 'running' && prior.instanceId === this.instanceId) {
-      const held = this.hasLiveWork(missionId)
-      this.recordRelease(missionId, prior, releasedPassFields(prior), held, held ? this.liveWorkHolders(missionId) : [])
-    }
-    // Re-read: a supersede released the row above, and the durable release facts
-    // must travel onto this row (the once-per-pass overwrite erases them
-    // otherwise).
-    const carried = this.rt.store.get('passes', this.passKey(missionId))
-    const release = carried === undefined ? undefined : releasedPassFields(carried)
-    const pass: SchedulingPass & ReleasedPassFields = {
-      // One row per mission, overwritten each pass: `get(passKey)` is the gate.
-      id: this.passKey(missionId), runId: id('run'), instanceId: this.instanceId, missionId, status: 'running', startedAt: Date.now(),
+    if (this.passes.has(missionId)) return undefined
+    const pass: SchedulingPass = {
+      id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: Date.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
-      noProgressPasses: carried?.status === 'finished' ? carried.noProgressPasses : 0,
+      noProgressPasses: this.noProgress.get(missionId) ?? 0,
     }
-    // S5c: the durable release record survives the once-per-pass overwrite.
-    if (release?.releasedRunId !== undefined) {
-      pass.releasedRunId = release.releasedRunId
-      pass.releasedAt = release.releasedAt
-    }
-    if (release?.releases !== undefined) pass.releases = release.releases
-    if (release?.worstRelease !== undefined) pass.worstRelease = release.worstRelease
-    this.rt.commit(missionId, () => this.rt.store.put('passes', pass))
+    this.passes.set(missionId, pass)
     return pass
   }
 
   /**
-   * R16-D: release a wedged pass durably and name it. One path for both
-   * generators — the tick watchdog and a superseding `openPass` — so a release
-   * can never happen without the durable `releasedRunId` fence, the accumulated
-   * `releases`/`worstRelease` record and the owner escalation that names the
-   * wedged pass and the live work the release preserved.
+   * R16-D: name a body past its bound. One path, from the tick watchdog: the
+   * durable stall event, the owner notice that names the body and the live
+   * work that held it, and the wedged mark the notices publish with.
    *
-   * This revokes state-write authority, not an in-flight adapter's side effects.
-   * The operation queue retains that physical owner until it actually returns.
-   * Later callers get a bounded refusal while the independent watchdog and
-   * outbox keep reporting the blocker.
+   * This revokes nothing: the operation queue keeps the body as the physical
+   * owner until it actually returns, and a later kick is skipped until then.
+   * The independent watchdog and outbox keep reporting the blocker.
    */
-  private recordRelease(missionId: string, pass: SchedulingPass, previous: ReleasedPassFields, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
+  private escalateWedge(missionId: string, pass: SchedulingPass, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
     const now = Date.now()
+    pass.escalatedAt = now
     const boundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : this.rt.stallPassTimeoutMs
     const unschedulable = this.unschedulable(this.rt.mission(missionId), this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
-    const fingerprintNow = this.rt.fingerprint(missionId)
-    const release: ReleaseRecord = { runId: pass.runId, startedAt: pass.startedAt, releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), boundMs, heldByLiveWork, liveSubjects: holders.map(holder => holder.subject) }
-    const closed: SchedulingPass & ReleasedPassFields = {
-      ...pass, status: 'finished', finishedAt: now, revisionAfter: this.rt.store.revision(), fingerprintAfter: fingerprintNow,
-      stalled: { reason: 'pass-timeout', at: now, boundMs: this.rt.stallPassTimeoutMs, unschedulable },
-    }
-    // S5c: the release is recorded DURABLY on the row before anything else, so
-    // `passReleased` reads it and the fence survives a cleared Set, a restart,
-    // or the once-per-pass overwrite (openPass carries it forward).
-    closed.releasedRunId = pass.runId
-    closed.releasedAt = now
-    closed.releases = (previous.releases ?? 0) + 1
-    closed.worstRelease = widerRelease(previous.worstRelease, release)
-    // Never erase the physical operation tail: a released pass may still be
-    // inside prepareTask, and the next pass must not switch that same checkout.
-    this.releasedPasses.add(pass.runId)
-    this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
+    const wedge: WedgeRecord = { releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), liveSubjects: holders.map(holder => holder.subject) }
     this.escalateSchedulingStall(missionId, {
-      pass: closed, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow,
-      releaseBoundMs: boundMs, heldByLiveWork, release, liveHolders: holders,
+      pass, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: this.rt.store.revision(), fingerprintNow: this.rt.fingerprint(missionId),
+      unschedulable, releaseBoundMs: boundMs, heldByLiveWork, wedge, liveHolders: holders,
     })
   }
 
   /**
-   * Close a pass: record `(fingerprint-before, fingerprint-after)` and
-   * `(revision-before, revision-after)`, count consecutive passes that advanced
-   * nothing and terminated nothing, and escalate once the declared window of
-   * such passes has been reached. Never throws: pass bookkeeping must not break
-   * scheduling.
+   * Close a pass when its body settles: remove the in-memory record first (so
+   * the next kick may queue a successor), then compare the mission digest with
+   * the one it opened on, count consecutive passes that advanced nothing and
+   * terminated nothing, and escalate once the declared window of such passes
+   * has been reached. Never throws: pass bookkeeping must not break scheduling.
    */
   closePass(missionId: string, pass: SchedulingPass): void {
+    if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
     try {
-      // A graceful shutdown must still release the guard: skipping this write
-      // leaves a `running` row behind that the next runtime would treat as live.
       if (this.rt.closed) return
-      const row = this.rt.store.get('passes', this.passKey(missionId))
-      // Compare the per-run identity, never the stable row key: another pass may
-      // have overwritten the row while this body was in flight.
-      if (row?.runId !== pass.runId) return
+      // R17-G5: the close is a transition. While the pass was live, notices left
+      // its mid-pass commits unpublished for the pass end to publish.
+      this.rt.passSettled(missionId)
       const revisionAfter = this.rt.store.revision()
       const fingerprintAfter = this.rt.fingerprint(missionId)
       const progressed = fingerprintAfter !== pass.fingerprintBefore
       const noProgressPasses = progressed ? 0 : pass.noProgressPasses + 1
-      const closed: SchedulingPass & ReleasedPassFields = { ...pass, status: 'finished', finishedAt: Date.now(), revisionAfter, fingerprintAfter, noProgressPasses }
-      // S5c: never erase a release record the watchdog wrote for this same row.
-      const rowRelease = releasedPassFields(row)
-      if (rowRelease.releasedRunId !== undefined && closed.releasedRunId === undefined) {
-        closed.releasedRunId = rowRelease.releasedRunId
-        closed.releasedAt = rowRelease.releasedAt
-      }
-      // R16-D: the accumulated release facts are the only durable record of a
-      // bounded release (the row is overwritten per pass), so a body that closes
-      // after its release must carry them, never drop them.
-      if (rowRelease.releases !== undefined && closed.releases === undefined) closed.releases = rowRelease.releases
-      if (rowRelease.worstRelease !== undefined && closed.worstRelease === undefined) closed.worstRelease = rowRelease.worstRelease
-      this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
+      this.noProgress.set(missionId, noProgressPasses)
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
       const mission = this.rt.store.get('missions', missionId)
@@ -734,68 +675,45 @@ export class Scheduling {
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
       }
       if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {
-        this.escalateSchedulingStall(missionId, { pass: closed, reason: 'no-progress', boundMs: this.rt.config.tickMs * this.rt.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
+        this.escalateSchedulingStall(missionId, { pass: { ...pass, noProgressPasses }, reason: 'no-progress', boundMs: this.rt.config.tickMs * this.rt.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
       }
     } catch { /* A closed store or a concurrent owner transition must not break scheduling. */ }
   }
 
   /**
-   * True while `pass` still owns the mission's guard (used to fence an abandoned
-   * pass body). Only an explicit release after the declared bound stops a body:
-   * a long pass that is still making progress (a live lease, an in-flight
-   * quiescence) keeps running, while an abandoned one must never dispatch into
-   * the newer pass's turn.
-   *
-   * S5c: the DURABLE `releasedRunId` on the pass row is the authority — the
-   * watchdog writes it when it releases, and `openPass` carries it forward
-   * across the once-per-pass overwrite — so clearing the in-memory Set cannot
-   * let a released body resume (the verifier's reproduction). The Set is only
-   * the fast path for the same durable fact.
-   */
-  passReleased(pass: SchedulingPass | undefined): boolean {
-    if (pass === undefined) return false
-    const row = this.rt.store.get('passes', this.passKey(pass.missionId))
-    if (row !== undefined && (row.runId !== pass.runId || releasedPassFields(row).releasedRunId === pass.runId)) return true
-    return this.releasedPasses.has(pass.runId)
-  }
-
-  /**
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
-   * queue and outside the pass it watches. A pass still `running` past the
-   * declared bound is declared stalled: the durable stall event is committed,
-   * the owner notice is delivered by an unqueued flush, and the guard is
-   * revoked durably. The queue keeps any in-flight physical operation fenced;
-   * subsequent calls return a bounded refusal until that operation returns.
+   * queue and outside the pass it watches. A body still queued or running past
+   * the declared bound is named: the durable stall event is committed, the owner
+   * notice is delivered by an unqueued flush, and the mission publishes as
+   * wedged until the body settles. The queue keeps the body as the physical
+   * owner; each await it can be in carries its own bound.
    *
-   * R16-D: the release is bounded even when the mission still has live work. A
-   * live lease or an in-flight quiescence may be progress, so the pass is not
-   * abandoned at the first bound; but a healthy sibling's lease must not own the
-   * whole board's clock forever, so past `stallPassReleaseBoundMs` the pass is
-   * released anyway, with the live work it was held by named on the escalation
-   * and preserved untouched. Co-firing guards, named: `livePass` (mirrors the
-   * same bound, so no `kick` is swallowed after the release), the fence
-   * (`passReleased`, durable before the next pass opens), the off-pass decision
-   * sweep (which runs while the row is wedged and names the subjects no live
-   * path advances), the notice dedup (one escalation per unchanged board) and
-   * the lease-renewal path (a released pass changes no task, attempt or lease).
+   * R16-D: the naming is bounded even when the mission still has live work. A
+   * live lease or an in-flight quiescence may be progress, so the body is not
+   * named at the first bound; but a healthy sibling's lease must not own the
+   * whole board's clock forever, so past `stallPassReleaseBoundMs` it is named
+   * anyway, with the live work it was held by named and preserved untouched.
+   * Co-firing guards, named: `livePass` (mirrors the same bound, so no notice
+   * stays suppressed after the naming), the off-pass decision sweep (which runs
+   * while the body is wedged and names the subjects no live path advances), the
+   * notice dedup (one escalation per body and per unchanged board) and the
+   * lease-renewal path (the naming changes no task, attempt or lease).
    */
   checkSchedulingPasses(): void {
     if (this.rt.closed || this.rt.shuttingDown) return
     const now = Date.now()
-    for (const mission of this.rt.store.list('missions')) {
-      if (this.rt.isMissionTerminal(mission)) continue
-      const pass = this.rt.store.get('passes', this.passKey(mission.id))
-      if (pass === undefined || pass.instanceId !== this.instanceId || pass.status !== 'running') continue
+    for (const [missionId, pass] of this.passes) {
+      if (pass.escalatedAt !== undefined) continue
+      const mission = this.rt.store.get('missions', missionId)
+      if (mission === undefined || this.rt.isMissionTerminal(mission)) continue
       const age = now - pass.startedAt
       if (age < this.rt.stallPassTimeoutMs) continue
-      if (this.rt.store.get('passes', this.passKey(mission.id))?.runId !== pass.runId) continue
-      const held = this.hasLiveWork(mission.id)
-      // Inside the second bound live work keeps the guard: a pass that may
-      // legitimately be inside a long adapter await for that work must not be
-      // abandoned. Past it the window is over, and the release below names the
-      // subject that held it instead of leaving the guard unreleased.
+      const held = this.hasLiveWork(missionId)
+      // Inside the second bound live work keeps the body live: a pass that may
+      // legitimately be inside a long adapter await for that work is not named.
+      // Past it the window is over, and the notice names the subject that held it.
       if (held && age < this.rt.stallPassReleaseBoundMs) continue
-      this.recordRelease(mission.id, pass, releasedPassFields(pass), held, held ? this.liveWorkHolders(mission.id) : [])
+      this.escalateWedge(missionId, pass, held, held ? this.liveWorkHolders(missionId) : [])
     }
   }
 
@@ -815,13 +733,15 @@ export class Scheduling {
     boundMs: number
     revisionNow: number
     fingerprintNow: string
-    /** R16-D: the bound the release was measured against (the live-work window when one applied). */
+    /** What was unschedulable when the wedge was named; computed here when absent. */
+    unschedulable?: string[]
+    /** R16-D: the bound the wedge was measured against (the live-work window when one applied). */
     releaseBoundMs?: number
-    /** R16-D: true when live work held the release to its second bound. */
+    /** R16-D: true when live work held the naming to its second bound. */
     heldByLiveWork?: boolean
-    /** R16-D: the release record written to the pass row, named in the event. */
-    release?: ReleaseRecord
-    /** R16-D: the live work the release preserved, as subjects and members. */
+    /** R16-D: what the watchdog measured when it named the wedge, carried by the event. */
+    wedge?: WedgeRecord
+    /** R16-D: the live work the naming preserved, as subjects and members. */
     liveHolders?: Array<{ subject: string; memberId?: string }>
   }): void {
     const mission = this.rt.store.get('missions', missionId)
@@ -829,8 +749,8 @@ export class Scheduling {
     const fingerprint = info.fingerprintNow
     const noticeKey = info.reason === 'pass-timeout' ? 'schedulingWedgeNotice' : 'schedulingStallNotice'
     if (mission[noticeKey] === fingerprint) return
-    // A pass-timeout wedge is its own subject: the pass body was abandoned and its
-    // guard released. A board-level witness (another notice that announced the
+    // A pass-timeout wedge is its own subject: the pass body is past its bound
+    // and the dispatch question it owes is unasked. A board-level witness (another notice that announced the
     // same fingerprint) must not suppress it — that cross-subject conflation is
     // exactly what round 15 removes, and fault F21 requires the wedge to be named
     // inside the declared bound whether or not the board was already announced.
@@ -840,7 +760,7 @@ export class Scheduling {
       ? false
       : mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
     if (witnessed) return
-    const unschedulable = info.pass.stalled?.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
+    const unschedulable = info.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
     // R15-A1/A2: a wedged or no-progress pass names the work it never reached, so
     // the notice carries subjects even though `unschedulable` is legitimately
     // empty (nothing is unschedulable: the pass simply never ran to a decision).
@@ -864,7 +784,7 @@ export class Scheduling {
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     // R15-D2: when a subject of this escalation is a blocked task whose stop is
     // past its declared bound (or carries no recorded start), the escalation
-    // states that row-supported fact — the pass's release is exactly what makes
+    // states that row-supported fact — the wedged pass is exactly what makes
     // the stop unbounded.
     const stopFacts = unreached.filter(task => task.status === 'blocked' && stopPending(task))
       .map(task => {
@@ -886,7 +806,7 @@ export class Scheduling {
       // distinguishable in the durable log and in every existing read path.
       this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'scheduling-pass',
-        passId: info.pass.id, runId: info.pass.runId,
+        passId: info.pass.id, runId: info.pass.operationId,
         reason: info.reason === 'pass-timeout'
           ? `scheduling pass did not return within its ${info.boundMs}ms bound and advanced no durable state`
           : `no durable state change for ${passes} consecutive scheduling passes`,
@@ -894,25 +814,26 @@ export class Scheduling {
         passStartedAt: info.pass.startedAt, passes, boundMs: info.boundMs,
         revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
         missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
-        // R16-D: what the release was measured against, whether live work held it,
-        // and the subjects whose work the release preserved. `boundMs` keeps its
-        // original meaning (the pass's own stall bound) so every existing reader
-        // is unchanged; the release facts are additive and only present on a
-        // release, never on the no-progress variant.
-        ...(info.release === undefined ? {} : {
-          releasedAt: info.release.releasedAt,
+        // R16-D: what the wedge was measured against, whether live work held it,
+        // and the subjects whose work it preserved. The `release*` names are kept
+        // for every existing reader: the instant is when the watchdog named the
+        // wedge. `boundMs` keeps its original meaning (the pass's own stall bound);
+        // these facts are additive and only present on a wedge, never on the
+        // no-progress variant.
+        ...(info.wedge === undefined ? {} : {
+          releasedAt: info.wedge.releasedAt,
           releaseBoundMs: info.releaseBoundMs ?? info.boundMs,
-          releaseGapMs: info.release.gapMs,
+          releaseGapMs: info.wedge.gapMs,
           releasedWhileLive: info.heldByLiveWork === true,
-          liveSubjects: info.release.liveSubjects,
+          liveSubjects: info.wedge.liveSubjects,
         }),
       })
-      // R17-G5: the release is a transition that still owes the dead pass's own
+      // R17-G5: the naming is a transition that still owes the wedged pass's own
       // dispatch question, so the next fact publication runs with the wedged
-      // branch even though the pass row is released by the time it runs.
+      // branch even if the body settles before that publication runs.
       this.rt.expectWedgedRelease(missionId)
       this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} (run ${info.pass.runId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        ? `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
         : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
         // R17-G5: the pass release is its own fact, not the board's witness. A
         // wedged-pass escalation must not consume the board's W2 witness for a
@@ -985,8 +906,8 @@ export class Scheduling {
    *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
    *    the park is the owner's intent, not silence.
    *  - the budget pause: a deliberate host pause is not a stalled worker.
-   *  - the wedge release (`recordRelease`): the tick this guard runs on is the
-   *    same queue-external tick that releases a wedged pass, so a pass that
+   *  - the wedge watchdog (`checkSchedulingPasses`): the tick this guard runs on
+   *    is the same queue-external tick that names a wedged pass, so a pass that
    *    cannot run its own recovery sweep cannot hide the attempt.
    *  - the notice dedup: the key is `attempt-silent:<attemptId>:<lastDurableAt>`,
    *    so one silence escalates once and a recording re-arms the clock.
@@ -1051,9 +972,9 @@ export class Scheduling {
     // The pass state is part of the honesty of the claim: the same guard fires
     // whether or not the pass is running, and the reader must know which path
     // would otherwise have named the attempt.
-    const pass = this.rt.store.get('passes', this.passKey(mission.id))
-    const passState = pass !== undefined && pass.status === 'running' && this.passWedged(mission.id)
-      ? ` The mission's scheduling pass ${pass.runId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
+    const pass = this.passes.get(mission.id)
+    const passState = pass !== undefined && this.passWedged(mission.id)
+      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
     this.rt.commit(mission.id, () => { this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey }) })

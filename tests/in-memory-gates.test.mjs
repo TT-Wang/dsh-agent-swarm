@@ -5,9 +5,12 @@
  * 120 minutes after `task/lease-expired` while the same host kept serving
  * another mission, because the in-memory `scheduled` Set in `Runtime.kick()`
  * swallowed the tick timer's only liveness action. Round 13's T1 converted that
- * guard to the durable per-mission `passes` row and deleted the Set; this file
+ * guard to a durable per-mission `passes` row and deleted the Set; this file
  * includes that work as the `scheduled` absence claim below and does not
- * duplicate it.
+ * duplicate it. The guard is in memory again (`Scheduling.passes`, the one body
+ * queued or running on the mission's serial queue), labelled `in-flight`: every
+ * await in the body is bounded, so the body releases it, and the tick watchdog
+ * names a body past its bound while it still holds it.
  *
  * The historical table below records the original `new Map`/`new Set`/
  * `new WeakMap`/`new WeakSet` occurrence in `src/` (excluding `src/client`, the
@@ -44,8 +47,7 @@
  * The mission queue refuses waiters past its declared bound while retaining
  * the in-flight operation; the launch's cancellation is re-read from the
  * durable start row before activation, the consecutive-failure count lives on
- * the member row, every deferred body re-derives from durable state, and the
- * pass watchdog stamps `releasedRunId` on the durable pass row.
+ * the member row, and every deferred body re-derives from durable state.
  *
  * Co-firing guards (every guard must name what it can fire with):
  *  - the per-task revision CAS in `SwarmStore.putTask` fires with the mission
@@ -54,9 +56,9 @@
  *  - the fingerprint cache fires with `commitDepth` (bypassed inside a
  *    transaction) — pinned below;
  *  - the notice-dedup sets fire with the durable delivery ledger — pinned below;
- *  - the durable pass-release fence fires with the pass watchdog
- *    (`checkSchedulingPasses`), the mission queue's bound and `openPass`'s
- *    carry-forward — pinned in the `releasedPasses` test below.
+ *  - the in-memory pass guard (`passes`) fires with the pass watchdog
+ *    (`checkSchedulingPasses`) and the mission queue's bound — pinned in the
+ *    `passes` test below.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -213,13 +215,14 @@ const CENSUS = [
   ["src/runtime.ts",38,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",1,"Set","readonly releasedPasses = new Set<string>()","gate","derivable","S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
-  ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
+  ["src/scheduling.ts",2,"Map","private readonly noProgress = new Map<string, number>()","gate","cache-only","consecutive no-progress passes carried to the next pass; losing it restarts the declared window, and the escalation's dedup key is durable on the mission row (probe below)"],
+  ["src/scheduling.ts",3,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",4,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
   // durable rows inside one synchronous, read-only call and discarded with it;
   // it is not retained, not read by a later call and cannot gate one.
-  ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",5,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
@@ -347,10 +350,12 @@ test('S5 census recognizes persistent bindings without turning local refactors i
     [{ name: 'registry', kind: 'Map' }, { name: 'cache', kind: 'Map' }])
 })
 
-test('S5 census: the round-13 `scheduled` Set stays deleted and the guard stays durable (T1, included here)', () => {
+test('S5 census: the round-13 `scheduled` Set stays deleted; the pass guard is the in-flight body record (T1, included here)', () => {
   const found = occurrences(join(PROJECT, 'src'))
   assert.equal(found.filter(([, , , source]) => /scheduled\s*=\s*new Set/.test(source)).length, 0,
-    'the Row-13 in-memory scheduling guard must not come back; the guard is the durable `passes` row')
+    'the Row-13 in-memory scheduling guard must not come back; the guard is the record of the body the mission queue holds')
+  assert.equal(CENSUS.find(entry => entry[0] === 'src/scheduling.ts' && bindingName(entry[3]) === 'passes')?.[5], 'in-flight',
+    'the pass guard is physical ownership, released by its bounded body, never a presence cache')
   const runtime = readFileSync(join(PROJECT, 'src/runtime.ts'), 'utf8')
   assert.match(runtime, /There is deliberately no in-memory `scheduled` Set/,
     'the deletion is documented at the field that used to hold it (T1, Round 13)')
@@ -712,37 +717,52 @@ const GATE_TESTS = {
     } finally { await f.cleanup() }
   },
   'src/scheduling.ts:1': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
+    // In-flight: the record is the one scheduling body the mission queue holds,
+    // and it is released only when that body settles.
+    const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 50 } })
+    const gate = deferred()
+    let starts = 0
     try {
       f.workers.autoIdle = true
-      const task = f.propose({ title: 'Abandoned pass body' })
-      // The abandoned pass body a watchdog released after its bound: the same
-      // object `Scheduling.dispatch(mission, missionId, pass)` receives.
-      const abandonedPass = {
-        id: `pass_${f.mission.id}`, runId: 'abandoned-pass-run', instanceId: f.runtime.instanceId, missionId: f.mission.id,
-        status: 'running', startedAt: Date.now() - 60_000, revisionBefore: f.runtime.store.revision(),
-        fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
-      }
-      f.runtime.releasedPasses.add(abandonedPass.runId)
-      assert.ok(f.runtime.releasedPasses.size > 0, 'the loss must be exercised on a non-empty collection')
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
-        'while the release is recorded, the abandoned pass body is fenced and dispatches nothing')
-      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the fenced body changed no task state')
-      // THE VERIFIER'S REPRODUCTION, closed: the in-memory Set is cleared while
-      // the durable `releasedRunId` on the pass row is present. The watchdog
-      // stamps that field before releasing, so the fence must survive.
-      f.runtime.releasedPasses.clear()
-      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...abandonedPass, status: 'finished', releasedRunId: abandonedPass.runId, releasedAt: Date.now() }))
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
-        'with the Set cleared but the durable release present, the abandoned pass body still dispatches nothing')
-      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'and it still cannot drive a task to running')
-      // Positive control: a pass that was never released is not fenced (the fence
-      // is the durable release record, not a blanket refusal).
-      const live = { ...abandonedPass, runId: 'never-released-run' }
-      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...live, status: 'running' }))
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, live), true, 'a live pass body still dispatches')
-      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'and assigns the work normally')
-      assert.ok(taskOf(f.runtime, task.id).attempt?.leaseUntil > Date.now(), 'with a real attempt')
+      const task = f.propose({ title: 'Work behind an in-flight pass' })
+      f.workers.start = async () => { starts += 1; if (starts === 1) await gate.promise }
+      const held = await eventually(() => starts === 1 ? f.runtime.scheduling.passes.get(f.mission.id) : undefined, 'a pass body is in flight inside the adapter start')
+      await new Promise(resolve => setTimeout(resolve, 120))
+      assert.equal(f.runtime.scheduling.passes.get(f.mission.id), held, 'no tick replaces or duplicates the in-flight body')
+      assert.equal(starts, 1, 'and no second body starts a worker beside it')
+      assert.ok(f.runtime.scheduling.passes.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.scheduling.passes.clear()   // the loss
+      f.runtime.kick(f.mission.id)
+      await new Promise(resolve => setTimeout(resolve, 120))
+      assert.equal(starts, 1, 'a body queued after the loss is refused by the mission queue, never run beside the in-flight one')
+      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'and no durable transition happened behind the in-flight body')
+      gate.resolve()
+      const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
+        'once the in-flight body settles, a later pass dispatches the work')
+      assert.equal(running.attempt.ownerId, f.author.id)
+    } finally { gate.resolve(); await f.cleanup() }
+  },
+  'src/scheduling.ts:2': async t => {
+    // Cache-only: the carried no-progress count. Its loss restarts the declared
+    // window; the escalation still fires, once per unchanged board.
+    const f = await setup({ config: { tickMs: 3_600_000, stallPasses: 3 } })
+    try {
+      const scheduling = f.runtime.scheduling
+      await eventually(() => scheduling.passes.size === 0 ? true : undefined, 'the passes setup kicked must settle')
+      scheduling.boardCannotProgress = () => true
+      const stalls = () => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === false)
+      const unchangedPass = () => { const pass = scheduling.openPass(f.mission.id); scheduling.closePass(f.mission.id, pass) }
+      unchangedPass(); unchangedPass()
+      assert.equal(scheduling.noProgress.get(f.mission.id), 2, 'two unchanged passes are counted')
+      assert.ok(scheduling.noProgress.size > 0, 'the loss must be exercised on a non-empty collection')
+      scheduling.noProgress.clear()   // the loss
+      unchangedPass(); unchangedPass()
+      assert.equal(stalls().length, 0, 'the lost count restarts the window instead of escalating early')
+      unchangedPass()
+      assert.equal(stalls().length, 1, 'the declared window of unchanged passes still escalates')
+      scheduling.noProgress.clear()
+      unchangedPass(); unchangedPass(); unchangedPass()
+      assert.equal(stalls().length, 1, 'and the durable dedup key on the mission row keeps one escalation per unchanged board')
     } finally { await f.cleanup() }
   },
   'src/store.ts:1': async t => {

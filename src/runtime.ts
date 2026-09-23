@@ -8,7 +8,7 @@ import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
-import { Scheduling } from './scheduling.ts'
+import { Scheduling, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
 import { deriveMemberBoard, deriveMemberStatus, memberPhaseOf, memberDeliveryHealth, type MissionBoardMember } from './projection.ts'
 import type { MissionInterpretation } from './notices.ts'
@@ -25,7 +25,7 @@ import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, SchedulingPass, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
@@ -87,13 +87,13 @@ const DEFAULT_STALL_PASS_TIMEOUT_TICKS = 30
  */
 const DEFAULT_ATTEMPT_SILENCE_BOUND_MS = 10 * 60_000
 /**
- * R16-D: the additional declared window a wedged scheduling pass may keep the
- * mission's guard while the mission still has live work. The default is the pass
- * bound itself (so a wedge may hold the guard for at most 2 × `stallPassTimeoutMs`
- * before the release), and it is configuration: `stallPassLiveGraceMs` on the
- * runtime config, `0` meaning "release at the first bound". Without it the
- * release was unbounded — a wedged pass waited for every unrelated lease to
- * lapse, exactly the silent blocking round 16 removes.
+ * R16-D: the additional declared window a wedged scheduling pass stays live
+ * (unnamed) while the mission still has live work. The default is the pass
+ * bound itself (so a wedge is named after at most 2 × `stallPassTimeoutMs`),
+ * and it is configuration: `stallPassLiveGraceMs` on the runtime config, `0`
+ * meaning "name it at the first bound". Without it the naming was unbounded — a
+ * wedged pass waited for every unrelated lease to lapse, exactly the silent
+ * blocking round 16 removes.
  */
 const DEFAULT_STALL_PASS_LIVE_GRACE_TICKS = 1
 /**
@@ -273,7 +273,6 @@ export class SwarmRuntime {
    * docs/known-limitations.md, "Round-13 control-path slices"):
    *
    *  derivable (the gate re-reads the store; the memory value is only a cache):
-   *   - the scheduling pass guard: durable `passes` row (`livePass`/`openPass`);
    *   - the unreviewed-submission grace: age of the durable `task/submitted`
    *     event (`unreviewedStall`; the old `unreviewedSince` timer is removed);
    *   - a withdrawn automatic review: durable `task/review-admitted` events
@@ -284,25 +283,26 @@ export class SwarmRuntime {
    *     (`parkedNotices`, `reviewPathNotices`, `integrationGapWarned`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
-   *   - `releasedPasses`, `idleSignals` (durable `Task.idleSignal`),
+   *   - `idleSignals` (durable `Task.idleSignal`),
    *     `startFailures`, `budgetStops`, `operations`, `startControllers`,
    *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
+   *  The scheduling pass guard (`Scheduling.passes`) is the same kind of state:
+   *  the one scheduling body queued or running on a mission's queue, removed
+   *  when that body settles.
    *
    * There is deliberately no in-memory `scheduled` Set: the Row-13 incident was
    * that Set swallowing the tick timer's only liveness action while the pass it
-   * deduplicated never returned.
+   * deduplicated never returned, unnamed. The pass guard differs in the two ways
+   * that incident lacked: every await in the pass body is bounded, so the body
+   * settles and releases it, and the tick watchdog reads its start time and
+   * names a body past its bound while it is still held.
    */
   readonly store: SwarmStore
   private readonly listeners = new Set<(missionId: string) => void>()
   readonly queues = new Map<string, Promise<unknown> & { operation: { id: string } }>()
-  /**
-   * S5: the scheduling guard is a durable per-mission `passes` row (S1), re-read
-   * from the store on every kick. There is deliberately no in-memory `scheduled`
-   * Set: the Row-13 incident was that Set swallowing the tick timer's only
-   * liveness action while the pass it deduplicated never returned.
-   */
+  /** Deferred bodies in flight; shutdown drains them within the declared pass bound. */
   private readonly operations = new Set<Promise<unknown>>()
   private readonly startControllers = new Map<string, AbortController>()
   private readonly workerStarts = new Map<string, { controller: AbortController; promise: Promise<void>; retryAfter?: number; nativePending?: boolean; admissionSignal?: AbortSignal }>()
@@ -423,12 +423,14 @@ export class SwarmRuntime {
    * so the dispatcher and every generator read the same derived view.
    */
   interpretation(missionId: string): MissionInterpretation { return this.notices.interpretation(missionId) }
-  /** R17-G5: the released pass owed its dispatch question; publish with the wedged branch. */
+  /** R17-G5: the named wedged pass owed its dispatch question; publish with the wedged branch. */
   expectWedgedRelease(missionId: string): void { this.notices.expectWedgedRelease(missionId) }
   /** R17-G5: the scheduling pass state at a committed transition (for publication). */
   passState(missionId: string): { passLive: boolean; wedged: boolean } {
     return { passLive: this.scheduling.livePass(missionId) !== undefined, wedged: this.scheduling.passWedged(missionId) }
   }
+  /** R17-G5: a settled pass is a transition; it publishes what its live window left unpublished. */
+  passSettled(missionId: string): void { this.notices.transition(missionId) }
   notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
   notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
@@ -478,7 +480,6 @@ export class SwarmRuntime {
   get idleSignals() { return this.attempts.idleSignals }
   get budgetStops() { return this.gates.budgetStops }
   get fingerprintCache() { return this.gates.fingerprintCache }
-  get releasedPasses() { return this.scheduling.releasedPasses }
   get parkedNotices() { return this.notices.parkedNotices }
   get reviewPathNotices() { return this.notices.reviewPathNotices }
   get integrationGapWarned() { return this.notices.integrationGapWarned }
@@ -631,13 +632,13 @@ export class SwarmRuntime {
    * other adapter await) cannot swallow it.
    *
    * Co-firing guards, named: the outbox pump (S2, delivers what the witnesses
-   * write), the scheduling-pass watchdog (S1/S2, releases a pass past its bound
-   * and escalates it with the work it never reached), the budget gates (deadline
-   * cancellation must not queue behind a long verification) and
-   * `sweepDecisions` (the off-pass half of the same decision function the pass
-   * runs). `checkSchedulingPasses` runs before `sweepDecisions` on purpose: a
-   * pass that just expired is released and escalated first, and the sweep then
-   * sees the released row rather than racing the watchdog for the same state.
+   * write), the scheduling-pass watchdog (S1/S2, names a pass past its bound
+   * with the work it never reached), the budget gates (deadline cancellation
+   * must not queue behind a long verification) and `sweepDecisions` (the
+   * off-pass half of the same decision function the pass runs).
+   * `checkSchedulingPasses` runs before `sweepDecisions` on purpose: a pass that
+   * just expired is named first, and the sweep then sees it wedged rather than
+   * racing the watchdog for the same state.
    */
   private startTicker(): void {
     if (this.timer !== undefined) return
@@ -687,9 +688,9 @@ export class SwarmRuntime {
 
   /**
    * R15-A2: decision generation that does not depend on a scheduling pass
-   * finishing. For every active mission whose pass is not live — no pass row
-   * inside its declared bound and no pass body in the mission's serialization
-   * chain — the same classifier the pass uses (`ensureWitness`:
+   * finishing. For every active mission whose pass is not live — no pass body
+   * queued or running inside its declared bound — the same classifier the pass
+   * uses (`ensureWitness`:
    * `stallRoots`, `waitsLegitimately`, the W3 stall predicate) is run with
    * `offPass: true`.
    *
@@ -700,8 +701,8 @@ export class SwarmRuntime {
    *
    * Co-firing guards: `openPass`/`livePass` (a live pass owns generation, so the
    * sweep stays out of its way), `kick` (which opens the next pass in the same
-   * tick, after this sweep), the pass watchdog (which deletes the queue entry
-   * when it releases a wedged pass — exactly the state this sweep exists for)
+   * tick, after this sweep), the pass watchdog (which names a wedged pass that
+   * still holds the mission queue — exactly the state this sweep exists for)
    * and the notice dedup (`hasNotice` / the mission witness), which keeps a
    * second generation path from duplicating a decision.
    */
@@ -725,11 +726,11 @@ export class SwarmRuntime {
         // running, wedged or absent. Co-firing guards: F1's operation silence
         // (skipped while an operation is recorded — that guard owns the clock),
         // the W6 idle close-out (skipped for the attempt it is already nudging),
-        // the parked member, the budget pause, the wedged-pass release in
+        // the parked member, the budget pause, the wedged-pass watchdog in
         // `checkSchedulingPasses` (same tick, earlier) and the notice dedup key.
         this.scheduling.sweepSilentAttempts(mission.id)
         // R15-D1/D2: the sweep runs when the pass is WEDGED past its declared
-        // bound even though `livePass` still gates scheduling because the mission
+        // bound even though `livePass` still owns generation because the mission
         // has live work (a healthy sibling's lease, or a stop acknowledgement in
         // flight). A sibling's clock must not own another subject's decision: the
         // classifier below names only what no live path advances. When the pass is
@@ -4041,17 +4042,18 @@ export class SwarmRuntime {
   }
   /**
    * S1: the declared bound on one scheduling pass (default 30 × `tickMs`). A
-   * pass still running past this bound has produced no durable change for the
-   * whole window; the watchdog escalates it and releases the guard.
+   * pass still queued or running past this bound has produced no durable change
+   * for the whole window; the watchdog names it and the mission publishes as
+   * wedged until the body settles.
    */
   get stallPassTimeoutMs(): number {
     const value = Math.trunc(this.config.stallPassTimeoutMs ?? this.config.tickMs * DEFAULT_STALL_PASS_TIMEOUT_TICKS)
     return Number.isSafeInteger(value) && value >= this.config.tickMs ? value : this.config.tickMs
   }
   /**
-   * R16-D: the declared window a wedged pass may still hold the mission guard
-   * while the mission has live work (default: the pass bound itself, read as
-   * `stallPassTimeoutMs`; `stallPassLiveGraceMs: 0` releases at the first bound).
+   * R16-D: the declared window a wedged pass stays live (unnamed) while the
+   * mission has live work (default: the pass bound itself, read as
+   * `stallPassTimeoutMs`; `stallPassLiveGraceMs: 0` names it at the first bound).
    * Structural read: `RuntimeConfig` (src/types.ts) and the plugin `Config`
    * schema (src/index.ts) are outside this task's write scope, so the two schema
    * lines are a recorded hand-off — a runtime handed `stallPassLiveGraceMs` uses
@@ -4064,8 +4066,8 @@ export class SwarmRuntime {
   }
   /**
    * R16-D: the total bound a wedged pass is measured against once it has live
-   * work to progress. Past it the pass is released even though the live work
-   * remains — the work is preserved and named, the guard is not held hostage.
+   * work to progress. Past it the pass is named even though the live work
+   * remains — the work is preserved and named, generation is not held hostage.
    */
   get stallPassReleaseBoundMs(): number { return this.stallPassTimeoutMs + this.stallPassLiveGraceMs }
   /**
@@ -4128,12 +4130,19 @@ export class SwarmRuntime {
   
   
   
+  /**
+   * Queue one scheduling body on the mission's serial queue, unless one is
+   * already queued or running there (`openPass`): that body re-reads the board
+   * when it runs, and the queue could not start a second one before it settles.
+   * The record is removed in `closePass` when the body settles, whatever the
+   * outcome; the tick watchdog names a body that holds it past its bound.
+   */
   kick(missionId: string): void {
     if (this.shuttingDown || this.closed) return
     const pass = this.openPass(missionId)
     if (pass === undefined) return
     this.defer(async () => {
-      try { await this.exclusive(missionId, () => this.schedule(missionId, pass)) }
+      try { await this.exclusive(missionId, () => this.schedule(missionId)) }
       finally {
         this.closePass(missionId, pass)
         const mission = this.closed ? undefined : this.store.get('missions', missionId)
@@ -4215,7 +4224,7 @@ export class SwarmRuntime {
     this.workerStarts.set(member.id, { controller, promise, admissionSignal: options.admission ? options.signal : undefined })
     return promise
   }
-  private async schedule(missionId: string, pass?: SchedulingPass): Promise<void> {
+  private async schedule(missionId: string): Promise<void> {
     if (this.shuttingDown) return
     const mission = this.mission(missionId)
     if (mission.status !== 'active') { await this.flushOutbox(missionId); return }
@@ -4238,7 +4247,7 @@ export class SwarmRuntime {
     // M1a seam 7/7: the dispatch sweep is src/scheduling.ts#dispatch, in the same
     // order as before; a false result abandons the pass where the loop's early
     // returns did.
-    if (!await this.scheduling.dispatch(mission, missionId, pass)) return
+    if (!await this.scheduling.dispatch(mission, missionId)) return
     // Backstop: a full pass that dispatched nothing must still witness the state.
     this.ensureWitness(missionId)
     // S2: the pass flushes its own outbox (bounded per delivery), and the

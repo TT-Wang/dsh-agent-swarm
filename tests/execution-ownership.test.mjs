@@ -14,8 +14,8 @@ async function fixture(options = {}) {
   f.runtime.kick = () => {}
   await f.runtime.exclusive(f.mission.id, async () => {})
   await new Promise(resolve => setImmediate(resolve))
-  const priorPass = f.runtime.store.get('passes', `pass_${f.mission.id}`)
-  if (priorPass?.status === 'running') f.runtime.closePass(f.mission.id, priorPass)
+  const priorPass = f.runtime.scheduling.passes.get(f.mission.id)
+  if (priorPass !== undefined) f.runtime.closePass(f.mission.id, priorPass)
   const keepAlive = setInterval(() => {}, 1000)
   const cleanup = f.cleanup
   f.cleanup = async () => { clearInterval(keepAlive); await cleanup() }
@@ -127,37 +127,43 @@ test('failed idle capture follows the same confirmed stop barrier', async () => 
   } finally { stop.resolve(); await f.cleanup() }
 })
 
-test('old pass error cannot overwrite a newer pass, including after the release cache is cleared', async () => {
+test('a wedged pass body is the only pass body: no newer pass runs beside it, so its own error is the current outcome', async () => {
+  // This replaces the released-pass fence. A newer pass could only overwrite a
+  // wedged body's writes by running beside it; the mission queue refuses that
+  // (and `openPass` does not even queue it), so the body that ran is the one
+  // whose outcome stands, and the next pass starts from it.
   const f = await fixture()
-  const enteredOld = deferred(), enteredNew = deferred(), failOld = deferred(), finishNew = deferred()
-  let old, current
+  const enteredOld = deferred(), failOld = deferred()
+  let old, oldPass
   try {
     const task = f.propose()
     f.workers.isIdle = () => true
     let count = 0
     f.workers.prepareTask = async () => {
-      if (++count === 1) { enteredOld.resolve(); await failOld.promise; throw new Error('stale preparation failed') }
-      enteredNew.resolve(); await finishNew.promise
+      if (++count === 1) { enteredOld.resolve(); await failOld.promise; throw Object.assign(new Error('stale preparation failed'), { code: 'EBUSY' }) }
     }
-    const oldPass = f.runtime.openPass(f.mission.id)
+    oldPass = f.runtime.openPass(f.mission.id)
     assert.ok(oldPass)
-    old = f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id, oldPass)
+    old = f.runtime.exclusive(f.mission.id, () => f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id))
     await enteredOld.promise
     await sleep(70); f.runtime.scheduling.checkSchedulingPasses()
-    assert.equal(f.runtime.scheduling.passReleased(oldPass), true)
-    const currentPass = f.runtime.openPass(f.mission.id)
-    f.runtime.releasedPasses.clear()
-    current = f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id, currentPass)
-    await enteredNew.promise
+    assert.equal(events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.wedged === true && item.data.runId === oldPass.operationId).length, 1, 'the watchdog names the wedged body')
+    assert.equal(f.runtime.openPass(f.mission.id), undefined, 'no newer pass is opened while the wedged body is held')
+    let ranBeside = false
+    await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ranBeside = true }), /mission_operation_pending/)
+    assert.equal(ranBeside, false, 'and the queue refuses any other body instead of running it beside the wedged one')
+    assert.equal(count, 1)
     failOld.resolve(); await old
-    assert.equal(taskOf(f.runtime, task.id).preparationFailure, undefined)
-    finishNew.resolve(); await current
-    assert.equal(taskOf(f.runtime, task.id).status, 'running')
-    assert.equal(events(f.runtime, f.mission.id, 'task/preparation-failed').length, 0)
-  } finally { failOld.resolve(); finishNew.resolve(); await Promise.allSettled([old, current]); await f.cleanup() }
+    f.runtime.closePass(f.mission.id, oldPass)
+    const failed = taskOf(f.runtime, task.id)
+    assert.equal(failed.preparationFailure?.attempts, 1, 'the wedged body records its own transient failure: it was the only body')
+    assert.equal(failed.status, 'pending', 'and leaves the task for bounded retry')
+    assert.equal(events(f.runtime, f.mission.id, 'task/preparation-failed').length, 1)
+    assert.ok(f.runtime.openPass(f.mission.id), 'once it settled, the next pass opens')
+  } finally { failOld.resolve(); await Promise.allSettled([old]); await f.cleanup() }
 })
 
-test('watchdog release cannot discard the queue of a physical preparation still in flight', async () => {
+test('the wedge watchdog cannot discard the queue of a physical preparation still in flight', async () => {
   const f = await fixture()
   const entered = deferred(), finish = deferred()
   let operation
@@ -167,10 +173,10 @@ test('watchdog release cannot discard the queue of a physical preparation still 
     f.workers.prepareTask = async () => { entered.resolve(); await finish.promise }
     const pass = f.runtime.openPass(f.mission.id)
     assert.ok(pass)
-    operation = f.runtime.exclusive(f.mission.id, () => f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id, pass))
+    operation = f.runtime.exclusive(f.mission.id, () => f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id))
     await entered.promise
     await sleep(70); f.runtime.scheduling.checkSchedulingPasses()
-    assert.equal(f.runtime.scheduling.passReleased(pass), true)
+    assert.equal(pass.escalatedAt !== undefined, true, 'the watchdog named the wedged pass')
     let changed = false
     await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { changed = true }), /mission_operation_pending/)
     assert.equal(changed, false)

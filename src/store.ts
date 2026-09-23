@@ -13,7 +13,7 @@ import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unli
 import { dirname, join, basename, resolve } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SchedulingPass, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
 import type { EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
@@ -31,10 +31,13 @@ interface Tables {
   starts: AutoStart
   admissions: AdmissionRecord
   limits: LimitRule
-  passes: SchedulingPass
 }
 export type Table = keyof Tables
-const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits', 'passes']
+/**
+ * A store written before the scheduling pass guard moved into memory also holds
+ * a `passes` table; nothing reads it, and it is left in place untouched.
+ */
+const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits']
 /** Bounded board filters. `inboxFor` means "addressed to this key or mission-wide". */
 export interface PostFilter {
   kind?: PostKind

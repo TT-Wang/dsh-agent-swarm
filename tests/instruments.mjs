@@ -77,13 +77,14 @@ const isAttemptCloser = type => ATTEMPT_FENCING_EVENTS.some(kind => kind === typ
 
 /**
  * R16-D: the silence projection. Read from the durable store alone — the
- * retained event window, the tool-run rows, the delivery rows, the current task
- * rows and the one durable pass row — and it changes nothing.
+ * retained event window, the tool-run rows, the delivery rows and the current
+ * task rows — and it changes nothing.
  *
  * The two numbers it reports:
  *  - the worst per-subject silent gap, each subject carrying the declared bound
- *    it was measured against (a released scheduling pass against the pass
- *    release bound; an escalated attempt against the attempt reporting bound);
+ *    it was measured against (a wedged scheduling pass against the bound the
+ *    watchdog named it under; an escalated attempt against the attempt
+ *    reporting bound);
  *  - the worst per-attempt reporting gap, plus how many attempts ended with no
  *    durable report or escalation at all.
  *
@@ -189,10 +190,13 @@ export function silenceReport(runtime, missionId) {
       subjects.push({ subject: delivery.subjects?.[0] ?? `${interval.taskId}@${interval.epoch}`, kind: 'attempt', gapMs: Math.max(0, delivery.createdAt - silentSince), boundMs: bounds.attemptMs, at: delivery.createdAt })
     }
   }
-  // The released scheduling passes: the durable pass row is the carrier (the
-  // once-per-pass overwrite erases per-run detail, so it accumulates the worst).
-  const passRelease = runtime.store.get('passes', scheduling.passKey(missionId))
-  const worstRelease = passRelease?.worstRelease
+  // The wedged scheduling passes: each naming is a durable `mission/stalled`
+  // event carrying the wedge gap and the bound it was measured against.
+  const wedges = events.filter(event => event.type === 'mission/stalled' && event.data?.cause === 'scheduling-pass' && event.data.wedged === true && Number.isSafeInteger(event.data.releaseGapMs))
+  const worstRelease = wedges.reduce((worst, event) => worst !== undefined && worst.gapMs >= event.data.releaseGapMs ? worst : {
+    runId: event.data.runId, gapMs: event.data.releaseGapMs, boundMs: event.data.releaseBoundMs ?? event.data.boundMs,
+    releasedAt: event.data.releasedAt, heldByLiveWork: event.data.releasedWhileLive === true, liveSubjects: event.data.liveSubjects ?? [],
+  }, undefined)
   if (worstRelease !== undefined) {
     subjects.push({ subject: `pass:${worstRelease.runId}`, kind: 'scheduling-pass', gapMs: worstRelease.gapMs, boundMs: worstRelease.boundMs, at: worstRelease.releasedAt })
   }
@@ -207,6 +211,6 @@ export function silenceReport(runtime, missionId) {
     attemptsEnded: reports.filter(report => report.endedAt !== undefined).length,
     attemptsEndedUnreported: reports.filter(report => report.endedUnreported).length,
     attemptSilenceEscalations: subjects.filter(item => item.kind === 'attempt').length,
-    passReleases: { count: passRelease?.releases ?? 0, worst: worstRelease },
+    passReleases: { count: wedges.length, worst: worstRelease },
   }
 }

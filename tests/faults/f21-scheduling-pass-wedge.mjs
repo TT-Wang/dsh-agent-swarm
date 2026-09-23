@@ -67,12 +67,14 @@ await runScenario({
     try {
       const task = f.propose()
       const key = `pass_${f.mission.id}`
-      // Arm only once the open pass was itself opened on the current durable
-      // board: then "the wedged pass advanced no durable state" is a claim about
-      // that pass, not about a concurrent proposal landing mid-pass.
+      // Arm only once the queued or running pass was itself opened on the
+      // current durable board: then "the wedged pass advanced no durable state"
+      // is a claim about that pass, not about a concurrent proposal landing
+      // mid-pass. (The arming reads the in-memory pass record; every assertion
+      // below reads durable state.)
       await eventually(() => {
-        const row = f.runtime.store.get('passes', key)
-        return row?.status === 'running' && row.fingerprintBefore === f.runtime.fingerprint(f.mission.id) ? true : undefined
+        const pass = f.runtime.scheduling.passes.get(f.mission.id)
+        return pass !== undefined && pass.fingerprintBefore === f.runtime.fingerprint(f.mission.id) ? true : undefined
       }, 'a pass must open on the current durable board before the wedge is armed', 4_000)
       const fingerprintAtWedge = f.runtime.fingerprint(f.mission.id)
       f.workers.wedgeNext = true
@@ -86,7 +88,7 @@ await runScenario({
       assert.equal(event.data.boundMs, boundMs, 'I1: the declared bound is named')
       assert.equal(event.data.missionFingerprint, fingerprintAtWedge, 'I1: the unchanged state digest is named')
       assert.equal(event.data.stateUnchanged, true, 'I1: the wedged pass advanced no durable state')
-      assert.equal(event.data.passId, key, 'I1: the pass row id is named')
+      assert.equal(event.data.passId, key, 'I1: the mission\'s pass is named')
       assert.ok(typeof event.data.runId === 'string' && event.data.runId.length > 0, 'I1: the pass execution identity is named')
       assert.ok(Number.isSafeInteger(event.data.revisionBefore) && Number.isSafeInteger(event.data.revisionAtStall), 'I1: the revision window is named')
       assert.ok(Array.isArray(event.data.unschedulable), 'I1: what was unschedulable is named')
