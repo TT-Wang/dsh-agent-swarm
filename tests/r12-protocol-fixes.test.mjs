@@ -16,7 +16,7 @@ function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const hooks = new Set()
-  const rt = {
+  const rt = { now: () => Date.now(),
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
     isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
     commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
@@ -103,7 +103,7 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
 function refusalFixture() {
   let busy = true
   const admissions = new Map(), events = []
-  const rt = {
+  const rt = { now: () => Date.now(),
     commit: (_id, fn) => { if (busy) throw new WriterBusyError('busy', 2); return fn() },
     store: {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
@@ -177,7 +177,7 @@ function stopFixture(reason, stop) {
   const rows = new Map([['task', { id: 'task', missionId: mission.id, epoch: 2, status: 'blocked', assigneeId: 'planned-new-owner', recoveryCount: 1,
     resumeAfterStop: { epoch: 2, memberId: 'old-owner', reason, at: Date.now() } }]])
   const pending = [], events = [], stopped = []
-  const rt = {
+  const rt = { now: () => Date.now(),
     config: { maxTasksPerMember: 10 }, shuttingDown: false,
     store: {
       list: table => table === 'tasks' ? [...rows.values()].map(row => structuredClone(row)) : [],

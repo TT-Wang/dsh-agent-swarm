@@ -39,7 +39,7 @@ async function fixture(t) {
 
 test('M2-1: no-progress and pass-timeout each record once on the same board', () => {
   const mission = { id: 'mission', status: 'active' }, records = []
-  const rt = { store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
+  const rt = { now: () => Date.now(), store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
     isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} }
   const scheduling = new Scheduling(rt)
   const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3 }, unschedulable: [], reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
@@ -57,14 +57,14 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
     store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'old' }))
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
-  const scheduling = new Scheduling({ store, config: { tickMs: 100, maxEvents: 1 } })
+  const scheduling = new Scheduling({ now: () => Date.now(), store, config: { tickMs: 100, maxEvents: 1 } })
   assert.equal(scheduling.unreviewedStall('mission', [{ id: 'old' }]), true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
   assert.equal(scheduling.unreviewedStall('mission', [{ id: 'new' }]), false)
 })
 
 test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {
-  const rt = { workers: { isIdle: () => true }, scopesOverlap: () => true }
+  const rt = { now: () => Date.now(), workers: { isIdle: () => true }, scopesOverlap: () => true }
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
@@ -79,7 +79,7 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = { store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: { isIdle: () => true } }
+  const rt = { now: () => Date.now(), store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: { isIdle: () => true } }
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
