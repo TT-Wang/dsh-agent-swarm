@@ -63,10 +63,7 @@ class RequestError extends Error {
  * owner-actionable runtime refusal must be added here to become visible.
  */
 const actionableMessages: readonly RegExp[] = [
-  // Runtime task and attempt refusals.
-  /^A task prerequisite is no longer accepted/,
-  /^Stale or unauthorized task attempt/,
-  /^Attempt lease exceeds the supported clock range$/,
+  // Runtime content refusals.
   /^Content exceeds \d+ characters$/,
   // Completion and delivery preconditions.
   /^Complete independent acceptance before applying results$/,
