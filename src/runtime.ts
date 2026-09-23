@@ -445,7 +445,7 @@ export class SwarmRuntime {
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
   private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
-  async flushOutbox(missionId: string, pass?: SchedulingPass): Promise<void> { return this.notices.flushOutbox(missionId, pass) }
+  async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> { return this.notices.flushOutbox(missionId, pass, only) }
   pumpOutbox(): void { return this.notices.pumpOutbox() }
 
   /** M1a seam 7/7: scheduling predicates, pass bookkeeping and the dispatch sweep. */
@@ -3853,6 +3853,7 @@ export class SwarmRuntime {
     // R11-15: a shared-temp rendezvous is decided before the transaction and
     // recorded atomically with the run.
     const rendezvous = this.tempRendezvous(memberId, task.id, input)
+    const typed = firstDenial ? id('msg') : undefined
     this.commit(member.missionId, () => {
       run.seq = this.store.countToolRuns(member.missionId) + 1
       this.store.put('tool_runs', run); this.store.put('tasks', task)
@@ -3866,12 +3867,17 @@ export class SwarmRuntime {
         this.notify(member.missionId, `Two members named the same shared temp path ${rendezvous.path} inside ${Math.round(TEMP_RENDEZVOUS_WINDOW_MS / 60_000)} minute(s): ${rendezvous.first.memberId} then ${rendezvous.second.memberId}. The host temp roots are writable by every workspace-write execution; never use them to pass state between members or missions.`,
           tempRendezvousSubjects(this, member.missionId, rendezvous), { from: memberId })
       }
-      if (!firstDenial) return
+      if (typed === undefined) return
       // Durable audit plus a typed delivery, so the worker learns the supported
       // host capture path without disabling unrelated workspace tools.
       this.store.event(member.missionId, 'task/git-write-denied', memberId, { taskId: task.id, attemptId: task.attempt!.id, command: denied, runId: run.id })
-      this.store.put('deliveries', { id: id('msg'), missionId: member.missionId, from: 'runtime', to: memberId, kind: 'control', content: gitWriteDeniedMessage(denied!), createdAt: this.now() })
+      this.store.put('deliveries', { id: typed, missionId: member.missionId, from: 'runtime', to: memberId, kind: 'control', content: gitWriteDeniedMessage(denied!), createdAt: this.now() })
     })
+    // The adapter awaits this record before it returns the failed result to the
+    // model, so delivering the typed denial here puts it in the worker's inbox
+    // ahead of its next model step instead of whenever the outbox pump runs.
+    // A failed attempt leaves the row queued for the pump; the run stays recorded.
+    if (typed !== undefined) await this.flushOutbox(member.missionId, undefined, typed).catch(() => undefined)
     return run.id
   }
   /**

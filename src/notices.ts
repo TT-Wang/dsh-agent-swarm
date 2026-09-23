@@ -1664,12 +1664,13 @@ export class Notices {
   /**
    * Deliver a mission's queued rows. `pass` is the record of the scheduling
    * body flushing its own outbox: each delivery await is the body's own and is
-   * stamped (`awaited`) before its result commits.
+   * stamped (`awaited`) before its result commits. `only` delivers that one row.
    */
-  async flushOutbox(missionId: string, pass?: SchedulingPass): Promise<void> {
+  async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> {
     if (this.rt.shuttingDown) return
     for (const queued of this.rt.store.list('deliveries', missionId)) {
       if (this.rt.shuttingDown) return
+      if (only !== undefined && queued.id !== only) continue
       // A preceding transport can yield to stop/pause, receipts or another pump.
       // Read both rows again before deciding whether this delivery may start.
       const mission = this.rt.mission(missionId)
