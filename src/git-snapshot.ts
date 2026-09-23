@@ -142,6 +142,17 @@ export async function captureGitSnapshot(source: string, directory: string, git:
         await writeFile(forcedPaths, included.join('\0') + '\0', { mode: 0o600, flag: 'wx' })
         await git(['add', '--force', `--pathspec-from-file=${forcedPaths}`, '--pathspec-file-nul'], env)
       }
+      // `git add` exits 0 when a literal pathspec matches nothing, which is what
+      // a hint spelled in a different letter case than the file on a
+      // case-folding filesystem does: `lstat` finds the file, the pathspec does
+      // not. A present hint missing from the private index would be a silent
+      // loss of the file it names, so it fails the snapshot instead.
+      for (let offset = 0; offset < before.explicitPresent.length; offset += 64) {
+        const batch = before.explicitPresent.slice(offset, offset + 64)
+        const recorded = paths(await git(['ls-files', '--cached', '-z', '--', ...batch], env))
+        const lost = batch.find(name => !recorded.includes(name))
+        if (lost !== undefined) throw new Error(`Snapshot recovery path ${JSON.stringify(lost)} is present in the worktree but was not recorded in the snapshot; name it in the spelling the filesystem stores`)
+      }
       const tree = await git(['write-tree'], env)
       const after = await sourceState(source, git, signal, includePaths)
       if (before.fingerprint !== after.fingerprint) continue

@@ -367,6 +367,8 @@ interface TaskBase { taskId: string; epoch: number; baseCommit: string; captured
 function validRecoveryPath(name: string): boolean {
   return name.length > 0 && !path.isAbsolute(name) && !/[\u0000-\u001f]/.test(name) && !name.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
 }
+/** What stands at a declared output path; `at` is the component that decided it. */
+interface OutputShape { kind: 'file' | 'absent' | 'directory' | 'symlink' | 'other'; at: string }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 /**
@@ -1176,8 +1178,8 @@ export class Workspaces {
           // Preserve all ordinary WIP, including out-of-scope work, separately
           // from accepted artifacts before removing anything from this checkout.
           if (dirty || record.task.preservationPaths?.length || previousHead !== (record.task.preservedCommit ?? record.task.capturedCommit ?? record.task.baseCommit)) {
-            await this.preserveWorkspace(record, signal, { allowSuperseded: true })
-            await this.assertNoIgnoredOverwrite(member.workspace, record.task.preservedCommit!, signal, record.task.preservationPaths)
+            const preserved = await this.preserveWorkspace(record, signal, { allowSuperseded: true })
+            await this.assertNoIgnoredOverwrite(member.workspace, record.task.preservedCommit!, signal, preserved)
             await this.git(member.workspace, ['reset', '--hard', record.task.preservedCommit!], signal)
             previousHead = record.task.preservedCommit!
           }
@@ -1253,6 +1255,7 @@ export class Workspaces {
             } finally { await rm(patchPath, { force: true }) }
           }
           if (conflicts.length && !(recovery?.integrationConflicts?.length && !recompose) && await lstat(path.join(member.workspace, INTEGRATION_CONFLICT_FILE)).then(() => true, () => false)) throw new Error(`Integration conflict manifest path already belongs to repository content: ${INTEGRATION_CONFLICT_FILE}`)
+          if (recovery !== undefined) await this.untrackUndeclaredIgnored(member.workspace, baseCommit, preservationPaths, signal)
           record.task = { taskId: task.id, epoch: task.epoch, baseCommit, preservationPaths,
             ...(recovery?.recovery === undefined ? {} : { recovery: recovery.recovery }),
             ...(dependencyCommits.length ? { dependencyCommits } : {}), ...(conflicts.length ? { integrationConflicts: conflicts } : {}) }
@@ -1426,6 +1429,32 @@ export class Workspaces {
     return resolved.join('/')
   }
 
+  /**
+   * A recovered checkout tracks whatever its snapshot tracked. Preservation
+   * snapshots written before R24 force-included every ignored file the task
+   * prose hinted at, a member-created `.env` among them, so right after such a
+   * checkout those files are tracked here and the replacement's whole-tree
+   * capture would commit them. Every path the recovered commit tracks that is
+   * ignored by pattern, absent from the task base (added since it) and not a
+   * declared output is removed from the index only: the file stays on disk,
+   * untracked and ignored, and is captured only once a declaration names it. A
+   * declared output stays tracked, and an ignored path the base already carries
+   * is real content. Only the declared spelling stays tracked: a draft preserved
+   * under a different stored case goes back to untracked on disk, where capture
+   * finds it through its on-disk spelling if that spelling is in scope, and
+   * refuses it with the rename repair if not, instead of tracking an
+   * out-of-scope spelling the member could never rename away.
+   */
+  private async untrackUndeclaredIgnored(workspace: string, baseCommit: string, outputs: readonly string[], signal: AbortSignal): Promise<void> {
+    const ignored = (await this.git(workspace, ['ls-files', '--cached', '--ignored', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)
+    if (!ignored.length) return
+    const added = new Set((await this.git(workspace, ['diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', baseCommit, 'HEAD', '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean))
+    const stray = ignored.filter(name => added.has(name) && !outputs.includes(name))
+    for (let offset = 0; offset < stray.length; offset += 64) {
+      await this.git(workspace, ['rm', '--cached', '--force', '--quiet', '--', ...stray.slice(offset, offset + 64).map(name => `:(literal)${name}`)], signal)
+    }
+  }
+
   /** A legacy failed claim may have moved the member after saving its old task.
    * Stop has already joined the worker. Only the exact preceding epoch's saved
    * checkpoint permits release; never snapshot or modify the member's new work. */
@@ -1460,11 +1489,26 @@ export class Workspaces {
     if (collisions.length) throw new PolicyError('workspace_ignored_collision', 'conflict_error', `Ignored files would be overwritten at ${collisions.slice(0, 8).map(name => JSON.stringify(name)).join(', ')}. Their contents remain in place. Preserve or move these local files outside the affected paths, then resume the same task; they were not captured as artifacts.`)
   }
 
-  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<void> {
+  /**
+   * Snapshot the member worktree into the preservation refs and return the
+   * recovery paths it force-included, each in the spelling the filesystem
+   * stores. A declared output written in a different letter case answers
+   * `lstat` on a case-folding filesystem, but git matches a literal pathspec in
+   * the declared spelling against nothing and records nothing (S6c), so the
+   * snapshot is asked for the stored spelling, and verifies it recorded it.
+   */
+  private async preserveWorkspace(record: MemberWorkspace, signal: AbortSignal, options?: { allowSuperseded?: boolean }): Promise<string[]> {
     const task = record.task
     if (task === undefined) throw new Error('Cannot preserve a workspace without task ownership')
+    const includePaths: string[] = []
+    for (const name of task.preservationPaths ?? []) {
+      const present = await lstat(path.join(record.workspace, name)).then(() => true, () => false)
+      const spelled = present ? await this.onDiskSpelling(record.workspace, name) : undefined
+      const chosen = spelled !== undefined && validRecoveryPath(spelled) && !this.toolchainName(spelled) ? spelled : name
+      if (!includePaths.includes(chosen)) includePaths.push(chosen)
+    }
     const snapshot = await captureGitSnapshot(record.workspace, path.join(this.missionDir(record.missionId), 'preservation'),
-      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal, task.preservationPaths)
+      (args, env) => this.git(record.workspace, args, signal, env, INVENTORY_BYTES), signal, includePaths)
     const nonce = randomUUID()
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
@@ -1483,6 +1527,7 @@ export class Workspaces {
       await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
       if (ownsTask) await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace)
     })
+    return includePaths
   }
 
   /**
@@ -1540,7 +1585,7 @@ export class Workspaces {
         // owner-visible instead of leaving it in this process's memory.
         const captureFailure = error instanceof Error ? error.message : String(error)
         let preservationFailure: string | undefined
-        try { await this.operation(value.memberId, signal => this.preserveWorkspace(prior, signal, { allowSuperseded: true })) }
+        try { await this.operation(value.memberId, async signal => { await this.preserveWorkspace(prior, signal, { allowSuperseded: true }) }) }
         catch (preservationError) { preservationFailure = preservationError instanceof Error ? preservationError.message : String(preservationError) }
         const preserved = preservationFailure === undefined && commitId(prior.task.preservedCommit) ? prior.task.preservedCommit : undefined
         const commit = preserved ?? (commitId(value.task.capturedCommit) ? value.task.capturedCommit : value.task.baseCommit)
@@ -1671,6 +1716,86 @@ export class Workspaces {
   }
 
   /**
+   * What stands at a declared output path, walked one component at a time
+   * without following a link: the first missing, symlinked or non-directory
+   * component decides, and `at` names it.
+   */
+  private async outputShape(workspace: string, relative: string): Promise<OutputShape> {
+    const parts = relative.split('/')
+    for (let depth = 1; depth <= parts.length; depth++) {
+      const at = parts.slice(0, depth).join('/')
+      const info = await lstat(path.join(workspace, at)).catch(() => undefined)
+      if (info === undefined) return { kind: 'absent', at }
+      if (info.isSymbolicLink()) return { kind: 'symlink', at }
+      if (depth < parts.length) {
+        if (!info.isDirectory()) return { kind: 'other', at }
+        continue
+      }
+      return { kind: info.isFile() ? 'file' : info.isDirectory() ? 'directory' : 'other', at }
+    }
+    return { kind: 'absent', at: relative }
+  }
+
+  /**
+   * One `[output_missing]` sentence for one declared output: why it is not a
+   * regular file and the exit the member can actually take. A path the task
+   * base carries was deleted or renamed by this task, so the declaration is
+   * wrong and recreating the file would only defeat the task; a directory can
+   * never be an output; a symlink, or a path through a symlinked directory, is
+   * never followed by capture.
+   */
+  private async outputMissingCause(workspace: string, baseCommit: string, name: string, shape: OutputShape, tool: string, signal: AbortSignal): Promise<string> {
+    const q = JSON.stringify(name)
+    const retry = `retry \`${tool}\` with the same \`taskId\``
+    const amend = 'escalate with `swarm_escalate` and this `taskId` so the owner amends `outputs` with `swarm_control`'
+    switch (shape.kind) {
+      case 'directory':
+        return `${q} is a directory, and \`outputs\` names regular files only: ${amend} to list the files inside it.`
+      case 'symlink':
+        return shape.at === name
+          ? `${q} is a symlink, and capture records only regular files: replace the link with a regular file at that exact path and ${retry}, or ${amend} to name the file it points to.`
+          : `${q} passes through the symlinked directory ${JSON.stringify(shape.at)}, and capture never follows a symlink: ${amend} to name the real path, or replace the link with a real directory holding the file and ${retry}.`
+      case 'other':
+        return `${q} is not a regular file (${shape.at === name ? 'it is a special file' : `its parent ${JSON.stringify(shape.at)} is a file`}): replace it with a regular file at that exact path and ${retry}, or ${amend}.`
+      default: {
+        const inBase = await this.git(workspace, ['cat-file', '-e', `${baseCommit}:${name}`], signal).then(() => true, () => false)
+        signal.throwIfAborted()
+        return inBase
+          ? `${q} exists in the task base and this task deleted or renamed it, so the declaration no longer describes the work: do not recreate it; ${amend}.`
+          : `${q} does not exist: write it and ${retry}, or, if the task no longer produces it, ${amend}.`
+      }
+    }
+  }
+
+  /**
+   * Save what a capture is about to change in a member worktree: HEAD and the
+   * index file (the working tree itself is never written). `rollback` puts both
+   * back after a refused or failed capture, so the member's next capture diffs
+   * against the HEAD and index it had before, and an index entry removed on
+   * purpose (an ignored file untracked from a recovered snapshot) is not
+   * re-tracked the way a `git reset --mixed` to HEAD would re-track it.
+   * `discard` drops the saved copy.
+   */
+  private async saveCaptureState(member: Member, head: string, signal: AbortSignal): Promise<{ rollback(): Promise<void>; discard(): Promise<void> }> {
+    const indexFile = path.resolve(member.workspace, await this.git(member.workspace, ['rev-parse', '--git-path', 'index'], signal))
+    const directory = path.join(this.missionDir(member.missionId), 'preservation')
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+    const saved = path.join(directory, `capture-index-${randomUUID()}`)
+    const hadIndex = await copyFile(indexFile, saved).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return false; throw error })
+    return {
+      // No abort signal: an aborted capture must still be put back.
+      rollback: async () => {
+        if (await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}']).catch(() => undefined) !== head) await this.git(member.workspace, ['reset', '--soft', '--quiet', head])
+        if (!hadIndex) { await rm(indexFile, { force: true }); return }
+        const staging = `${indexFile}.swarm-restore-${randomUUID()}`
+        await copyFile(saved, staging)
+        await rename(staging, indexFile)
+      },
+      discard: async () => { await rm(saved, { force: true }) },
+    }
+  }
+
+  /**
    * Commit the member worktree as an immutable artifact. The captured files are
    * the whole-tree add of non-ignored changes plus, force-added past ignore
    * rules, the listed `deliverables` and the task's declared `outputs` (a row
@@ -1711,42 +1836,66 @@ export class Workspaces {
       // F4: a name inside a dependency directory or the scratch root is refused
       // even when that directory is ignored and so invisible to `dependencyLinks`.
       // F2: each output is then carried under its on-disk spelling, which is the
-      // spelling git records for it and the one `ls-tree` finds below.
+      // spelling git records for it and the one `ls-tree` finds below. That
+      // spelling is what gets committed, so it passes the same path checks as the
+      // name itself BEFORE any commit: on a case-folding filesystem a declared
+      // `reports/summary.md` written as `Reports/summary.md` answers `lstat`, but
+      // would commit an out-of-scope path.
+      const refusal = (name: string): string | undefined => !withinScope(name, task.scope) ? 'outside the current task `scope`'
+        : name.endsWith('/') || /[\u0000-\u001f]/.test(name) ? 'not a literal file path'
+          : name.split('/').some(part => part.toLowerCase() === '.git') ? 'inside Git metadata'
+            : dependencyContent(name) || this.toolchainName(name) ? 'inside a dependency or member scratch directory the host keeps out of artifacts' : undefined
+      const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
       const outputs: string[] = []
       const missing: string[] = []
+      const refused: string[] = []
+      const misspelled: Array<{ name: string; spelled: string }> = []
       for (const name of [...new Set([...listed, ...owed])]) {
         const declared = owed.includes(name)
         // A checkpoint carries a declared output once it is written and never
         // refuses on one still owed; only submit and verify require it.
         const optional = declared && !listed.includes(name) && options.requireOutputs !== true
-        if (!withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name) || this.toolchainName(name)) {
+        const reason = refusal(name)
+        if (reason !== undefined) {
           if (optional) continue
+          // A declared output the path checks refuse (the owner narrowed
+          // `scope`, or the host configures its directory as a dependency
+          // directory) is the owner's declaration to amend, not a listing error.
+          if (declared) { refused.push(`${JSON.stringify(name)} (${reason})`); continue }
           throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata, dependency and scratch directories. Correct \`deliverables\` with \`swarm_submit\`.`)
         }
-        const parts = name.split('/')
-        let regular = true
-        for (let depth = 1; regular && depth <= parts.length; depth++) {
-          const info = await lstat(path.join(member.workspace, ...parts.slice(0, depth))).catch(() => undefined)
-          if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) regular = false
-        }
-        if (!regular) {
+        const shape = await this.outputShape(member.workspace, name)
+        if (shape.kind !== 'file') {
           if (optional) continue
-          if (declared) { missing.push(name); continue }
+          if (declared) { missing.push(await this.outputMissingCause(member.workspace, baseCommit, name, shape, tool, signal)); continue }
           throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
         }
         const spelled = await this.onDiskSpelling(member.workspace, name) ?? name
+        if (spelled !== name && refusal(spelled) !== undefined) {
+          if (optional) continue
+          misspelled.push({ name, spelled })
+          continue
+        }
         if (!outputs.includes(spelled)) outputs.push(spelled)
       }
+      const recorded = tool === 'swarm_verify' ? 'verification' : 'submission'
+      if (refused.length) {
+        throw new PolicyError('output_path_refused', 'validation_error', `[output_path_refused] The task declares ${refused.join(', ')} in \`outputs\`, but capture cannot record ${refused.length === 1 ? 'that path' : 'those paths'}, so this ${recorded} was not recorded, nothing was committed and your attempt stays running. Call \`swarm_escalate\` with this \`taskId\` so the owner amends \`outputs\` or \`scope\` with \`swarm_control\`; listing ${refused.length === 1 ? 'it' : 'them'} in \`deliverables\` cannot change that.`)
+      }
+      if (misspelled.length) {
+        throw new PolicyError('output_case_mismatch', 'validation_error', `[output_case_mismatch] ${misspelled.map(item => `${JSON.stringify(item.name)} exists in your worktree only as ${JSON.stringify(item.spelled)}`).join('; ')}: a different letter case that capture refuses (outside the task \`scope\`, or inside a dependency or scratch directory), so nothing was committed and your attempt stays running. Rename each file, and every parent directory whose case differs, to exactly the spelling named first, then retry \`${tool}\` with the same \`taskId\`.`)
+      }
       if (missing.length) {
-        const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
-        throw new PolicyError('output_missing', 'validation_error', `[output_missing] The task declares ${missing.map(name => JSON.stringify(name)).join(', ')} in \`outputs\`, but ${missing.length === 1 ? 'it is not a regular file' : 'they are not regular files'} in your worktree, so this ${tool === 'swarm_verify' ? 'verification' : 'submission'} was not recorded and your attempt stays running. Write ${missing.length === 1 ? 'the file' : 'each file'} and retry \`${tool}\` with the same \`taskId\`, or, if the task no longer produces ${missing.length === 1 ? 'it' : 'them'}, escalate with \`swarm_escalate\` so the owner amends \`outputs\` with \`swarm_control\`.`)
+        throw new PolicyError('output_missing', 'validation_error', `[output_missing] ${missing.length === 1 ? 'A path' : `${missing.length} paths`} the task declares in \`outputs\` ${missing.length === 1 ? 'is not a regular file' : 'are not regular files'} in your worktree, so this ${recorded} was not recorded, nothing was committed and your attempt stays running. ${missing.join(' ')} Follow the step named for each path.`)
       }
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the
       // deleted source path too, instead of only the in-scope destination.
       const changed = new Set((await this.git(member.workspace, ['diff', '--name-only', '--no-renames', '-z', baseCommit, '--'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean).filter(name => !dependencyContent(name)))
       for (const name of (await this.git(member.workspace, ['ls-files', '--others', '--exclude-standard', '-z'], signal, undefined, INVENTORY_BYTES)).split('\0').filter(Boolean)) if (!dependencyContent(name)) changed.add(name)
-      for (const name of changed) if (!withinScope(name, task.scope)) throw new Error(`Artifact changes path outside task scope: ${name}`)
+      // A stray file outside scope (a reviewer's scratch log, an author's
+      // experiment) is the member's to remove; nothing is committed yet.
+      for (const name of changed) if (!withinScope(name, task.scope)) throw new PolicyError('artifact_path_outside_scope', 'tool_error', `[artifact_path_outside_scope] Artifact changes path outside task scope: ${name}. Nothing was committed and your attempt stays running. Remove that file, or move the work inside the task \`scope\` (restore a modified or deleted tracked file to its task-base content), then retry \`${tool}\` with the same \`taskId\`.`)
       // Untracked symlinks are invisible to `git diff`; inspect every changed
       // working-tree path before committing so an escaping link is never
       // recorded in a swarm ref.
@@ -1754,27 +1903,43 @@ export class Workspaces {
         const info = await lstat(path.join(member.workspace, name)).catch(() => undefined)
         if (info?.isSymbolicLink()) assertContainedSymlink(member.workspace, name, await readlink(path.join(member.workspace, name)))
       }
-      for (const link of links) await this.git(member.workspace, ['rm', '--cached', '-r', '--force', '--quiet', '--', link], signal).catch(() => undefined)
-      await this.git(member.workspace, ['add', '--all', '--', '.', ...[...links].map(link => `:(exclude,literal)${link}`)], signal)
-      if (outputs.length) await this.git(member.workspace, ['add', '--force', '--', ...outputs.map(name => `:(literal)${name}`)], signal)
-      const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
-      if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
-      const commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
-      await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
-      for (const dependency of record.task.dependencyCommits ?? []) await this.git(member.workspace, ['merge-base', '--is-ancestor', dependency, commit], signal)
-      const { changedPaths, executablePaths } = await this.artifactChanges(member.workspace, baseCommit, commit, signal)
-      for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new Error(`Committed artifact changes path outside task scope: ${name}`)
-      // The commit is authoritative: re-check the recorded blobs so a working
-      // tree edited after staging cannot smuggle a symlink into the artifact.
-      await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
+      // From the first index write until the artifact ref is published, a failure
+      // puts HEAD and the index back exactly as they were: a refused capture must
+      // never leave its commit in the member worktree, where every later capture
+      // would diff against it and fail on the same path again.
+      const previousHead = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
+      const restore = await this.saveCaptureState(member, previousHead, signal)
+      let commit: string
+      let changedPaths: string[]
+      let executablePaths: string[]
       const files: NonNullable<Artifact['files']> = []
-      for (const name of outputs) {
-        const entry = await this.git(member.workspace, ['ls-tree', '--long', '-z', commit, '--', `:(literal)${name}`], signal, undefined, INVENTORY_BYTES, true)
-        const match = /^(100[0-7]{3}) blob ([a-f0-9]+)\s+(\d+)\t/.exec(entry)
-        if (!match) throw new PolicyError('deliverable_not_captured', 'conflict_error', `${JSON.stringify(name)} is not a regular file in the captured commit; correct the file and retry \`swarm_submit\` with \`deliverables\`.`)
-        files.push({ path: name, blob: match[2]!, bytes: Number(match[3]) })
-      }
-      await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
+      try {
+        for (const link of links) await this.git(member.workspace, ['rm', '--cached', '-r', '--force', '--quiet', '--', link], signal).catch(() => undefined)
+        await this.git(member.workspace, ['add', '--all', '--', '.', ...[...links].map(link => `:(exclude,literal)${link}`)], signal)
+        if (outputs.length) await this.git(member.workspace, ['add', '--force', '--', ...outputs.map(name => `:(literal)${name}`)], signal)
+        const staged = await this.git(member.workspace, ['diff', '--cached', '--name-only', '--no-renames', '-z'], signal, undefined, INVENTORY_BYTES)
+        if (staged.length > 0) await this.git(member.workspace, ['commit', '--no-verify', '-m', `swarm: ${task.title.slice(0, 160)}`], signal, undefined, INVENTORY_BYTES)
+        commit = await this.git(member.workspace, ['rev-parse', 'HEAD^{commit}'], signal)
+        await this.git(member.workspace, ['merge-base', '--is-ancestor', baseCommit, commit], signal)
+        for (const dependency of record.task.dependencyCommits ?? []) await this.git(member.workspace, ['merge-base', '--is-ancestor', dependency, commit], signal)
+        ;({ changedPaths, executablePaths } = await this.artifactChanges(member.workspace, baseCommit, commit, signal))
+        for (const name of changedPaths) if (!withinScope(name, task.scope)) throw new PolicyError('artifact_path_outside_scope', 'tool_error', `[artifact_path_outside_scope] Committed artifact changes path outside task scope: ${name}. The commit was rolled back and your attempt stays running. Remove that file, or move the work inside the task \`scope\`, then retry \`${tool}\` with the same \`taskId\`.`)
+        // The commit is authoritative: re-check the recorded blobs so a working
+        // tree edited after staging cannot smuggle a symlink into the artifact.
+        await this.assertCommittedSymlinks(member.workspace, baseCommit, commit, signal)
+        for (const name of outputs) {
+          const entry = await this.git(member.workspace, ['ls-tree', '--long', '-z', commit, '--', `:(literal)${name}`], signal, undefined, INVENTORY_BYTES, true)
+          const match = /^(100[0-7]{3}) blob ([a-f0-9]+)\s+(\d+)\t/.exec(entry)
+          if (!match) throw new PolicyError('deliverable_not_captured', 'conflict_error', `${JSON.stringify(name)} is not a regular file in the captured commit; correct the file and retry \`swarm_submit\` with \`deliverables\`.`)
+          files.push({ path: name, blob: match[2]!, bytes: Number(match[3]) })
+        }
+        await this.publishArtifactRef(member.missionId, member.workspace, commit, `refs/artifacts/${segment(task.id)}/${task.epoch}`, `refs/swarm/${segment(member.missionId)}/${segment(task.id)}/${task.epoch}`, signal)
+      } catch (error) {
+        // The capture's own refusal is what the caller acts on; a failed
+        // rollback must not replace it.
+        await restore.rollback().catch(() => undefined)
+        throw error
+      } finally { await restore.discard() }
       record.task.capturedCommit = commit
       delete record.task.preservedCommit
       await this.saveTaskWorkspace(record)
