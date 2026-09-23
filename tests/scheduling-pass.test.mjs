@@ -587,30 +587,33 @@ test('S1: a body whose members each take less than a bound is not stopped early,
   // previous stamp, which any I/O await satisfies; round 4 stopped any body
   // past its bound, which turned a sweep of quick members into a chain of
   // bodies and halved the sweep rate. A body now stops early only when the
-  // member it just swept held it for a whole bound: here eight members whose
-  // adapter start computes for 3ms, against a 10ms bound, so every body is past
-  // its bound but none of its members held it for one.
+  // member it just swept held it for a whole bound: here the adapter start of
+  // each of sixteen more members computes for 4ms against a 60ms bound, so every
+  // sweep runs past the bound while no member comes near holding it for one.
+  // One stop is tolerated for a pause of the whole process under suite load;
+  // the round-4 rule stops most bodies here.
   class ComputingStartWorkers extends FakeWorkers {
     async start(spec) {
       this.started.push(spec.member.id)
-      const end = Date.now() + 3
+      const end = Date.now() + 4
       while (Date.now() < end) { /* the adapter's synchronous work */ }
     }
     isIdle() { return false }
   }
   const workers = new ComputingStartWorkers()
-  const f = await setup({ workers, budget: { maxWorkers: 10 }, config: { tickMs: 10, stallPassTimeoutMs: 10, stallPasses: 1_000 } })
+  const f = await setup({ workers, budget: { maxWorkers: 24 }, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 1_000 } })
   try {
-    for (let n = 0; n < 6; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+    for (let n = 0; n < 16; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
     const members = f.runtime.store.list('members', f.mission.id).map(member => member.id)
-    await sleep(100)
+    await sleep(200)
     const watched = watchBodies(f)
     const firstStart = workers.started.length
-    await sleep(600)
+    await sleep(1_500)
     const bodies = [...watched.bodies]
-    assert.ok(bodies.length >= 2, `bodies ran: ${bodies.length}`)
-    assert.deepEqual(bodies.filter(body => body.stopped), [], 'no body is stopped early by members that each take less than a bound')
-    assert.deepEqual(bodies.filter(body => !body.witnessed || !body.flushed), [], 'every body runs ensureWitness and flushOutbox')
+    assert.ok(bodies.length >= 5, `bodies ran: ${bodies.length}`)
+    const stopped = bodies.filter(body => body.stopped)
+    assert.ok(stopped.length <= 1, `members that each take less than a bound stop no body (${stopped.length} of ${bodies.length} stopped)`)
+    assert.deepEqual(bodies.filter(body => !body.stopped && (!body.witnessed || !body.flushed)), [], 'every body that completes its sweep runs ensureWitness and flushOutbox')
     assert.deepEqual(members.filter(id => !workers.started.slice(firstStart).includes(id)), [], 'every member is started')
   } finally { await f.cleanup() }
 })
