@@ -378,7 +378,7 @@ export class SwarmRuntime {
 
   /** M1a seam 3/7: owner notices, witnesses and the outbox that delivers them. */
   private readonly notices = new Notices(this)
-  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): void { return this.notices.notify(missionId, content, subjects, options) }
+  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean { return this.notices.notify(missionId, content, subjects, options) }
   ownerDeliveryRelevant(mission: Mission, delivery: Delivery): boolean { return this.notices.ownerDeliveryRelevant(mission, delivery) }
   ownerDeliveryContent(mission: Mission, delivery: Delivery): string { return this.notices.ownerDeliveryContent(mission, delivery) }
   /**

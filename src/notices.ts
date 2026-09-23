@@ -579,8 +579,11 @@ export class Notices {
    * and written into the same durable delivery row as the content (never merged
    * in later). A call site that cannot name one task passes the mission root via
    * `missionSubject`; it can no longer pass nothing.
+   *
+   * Returns whether the fact was recorded for the owner (its own row or a
+   * wake-budget summary constituent); false when the notice dedup suppressed it.
    */
-  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): void {
+  notify(missionId: string, content: string, subjects: string[], options: NotifyOptions = {}): boolean {
     const from = options.from ?? 'runtime'
     const noticeClass = options.noticeClass ?? 'decision'
     const mission = this.rt.store.get('missions', missionId)
@@ -601,7 +604,7 @@ export class Notices {
       mission.witness = { fingerprint: this.rt.fingerprint(missionId), kind: 'W2', at: Date.now() }
       this.rt.store.put('missions', mission)
     }
-    this.enqueueOwnerNotice(missionId, content, from, noticeClass, { subjects: attributed, fact }, dedupe, options.dedupKey)
+    return this.enqueueOwnerNotice(missionId, content, from, noticeClass, { subjects: attributed, fact }, dedupe, options.dedupKey) !== undefined
   }
 
   /** The notice dedup key: F(S) with the owner-notice channel excluded. */
@@ -611,7 +614,8 @@ export class Notices {
 
   /**
    * Record one owner-addressed notice (or an escalation) durably. Returns the
-   * delivery, or undefined when the same class already announced the same
+   * delivery that carries it (over the wake budget, the window's summary), or
+   * undefined when the same class already announced the same
    * fingerprint from the same sender: the runtime's own budget/ceiling refusals
    * are deduplicated per state so an unchanged board never spams the owner.
    * Decision notices are always recorded — the liveness engine deduplicates its
@@ -633,13 +637,12 @@ export class Notices {
     const summary = fact?.coveredBy === undefined ? this.wakeWindowFor(missionId, at) : undefined
     if (summary !== undefined && summary.count >= this.wakeBudget) {
       const facts = fact?.facts ?? [`[${fact?.trigger ?? noticeClass}] ${content}`]
-      this.appendToWakeSummary(missionId, summary, facts, [{
+      return this.appendToWakeSummary(missionId, summary, facts, [{
         class: noticeClass, dedupKey, from, contentDigest: createHash('sha256').update(content).digest('hex'),
       }, ...(fact?.aggregatedIdentities ?? [])], at, {
         class: noticeClass, dedupKey, from, subjects: fact?.subjects ?? [],
         trigger: fact?.trigger ?? noticeClass, reason: fact?.reason ?? '', createdAt: at, questionId: fact?.questionId, deliveryFailureId: fact?.deliveryFailureId,
       })
-      return undefined
     }
     const { fact: _fact, ...deliveryExtra } = extra
     const delivery: Delivery = {
@@ -684,7 +687,7 @@ export class Notices {
    * written with the content: the summary's transport key must never replace
    * the class, sender and key used to deduplicate its constituent facts.
    */
-  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, addedFacts: string[], identities: NonNullable<NoticeRow['aggregatedIdentities']>, at: number, constituent: Omit<NonNullable<NoticeRow['aggregatedFacts']>[number], 'factStart' | 'factCount'>): void {
+  private appendToWakeSummary(missionId: string, window: { startedAt: number; count: number; summaryId?: string }, addedFacts: string[], identities: NonNullable<NoticeRow['aggregatedIdentities']>, at: number, constituent: Omit<NonNullable<NoticeRow['aggregatedFacts']>[number], 'factStart' | 'factCount'>): Delivery {
     const existing = window.summaryId === undefined ? undefined : this.rt.store.get('deliveries', window.summaryId)
     if (existing !== undefined && existing.deliveredAt === undefined && existing.notice !== undefined) {
       const row = noticeRow(existing)!
@@ -695,7 +698,7 @@ export class Notices {
       row.aggregatedFacts = [...(row.aggregatedFacts ?? []), { ...constituent, factStart, factCount: addedFacts.length }]
       existing.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, facts, missionId, existing.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
       this.rt.store.put('deliveries', existing)
-      return
+      return existing
     }
     const summary: Delivery = {
       id: id('msg'), missionId, from: 'runtime', to: 'owner', kind: 'control',
@@ -705,6 +708,7 @@ export class Notices {
     summary.content = renderNoticeFacts(WAKE_SUMMARY_HEADER, addedFacts, missionId, summary.id, Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars))
     window.summaryId = summary.id
     this.rt.store.put('deliveries', summary)
+    return summary
   }
 
   /**
