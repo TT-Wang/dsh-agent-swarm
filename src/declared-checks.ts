@@ -86,7 +86,7 @@ export class DeclaredChecks {
     this.rt.commit(member.missionId, () => {
       let seq = this.rt.store.countToolRuns(member.missionId)
       for (const check of checks) {
-        const run: ToolRun = { id: id('run'), seq: ++seq, missionId: member.missionId, memberId: member.id, taskId: verification.taskId, attemptId: verification.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit, attempt: 1 }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
+        const run: ToolRun = { id: id('run'), seq: ++seq, missionId: member.missionId, memberId: member.id, taskId: verification.taskId, attemptId: verification.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: artifact.commit, attempt: 1 }, result: check, isError: check.exitCode !== 0, createdAt: this.rt.now() }
         this.rt.store.put('tool_runs', run)
       }
     })
@@ -211,7 +211,7 @@ export class DeclaredChecks {
     for (const [index, entry] of recorded.entries()) {
       const deciding = index === recorded.length - 1
       for (const check of entry.checks) {
-        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: Date.now() }
+        const run: ToolRun = { id: id('run'), seq: ++seq, missionId, memberId: where.memberId, taskId: where.taskId, attemptId: where.attemptId, tool: 'swarm.host_verification', arguments: { command: check.command, commit: where.commit, attempt: entry.attempt }, result: check, isError: check.exitCode !== 0, createdAt: this.rt.now() }
         this.rt.store.put('tool_runs', run); if (deciding) ids.push(run.id)
       }
     }

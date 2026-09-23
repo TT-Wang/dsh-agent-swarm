@@ -70,6 +70,8 @@ const DEFAULT_SNAPSHOT_KEEP = 5
 const SNAPSHOT_SUFFIX = '.snapshot.sqlite'
 /** Tuning for the single-writer boundary; tests and the load harness shorten it. */
 export interface StoreOptions {
+  /** The clock event `createdAt` is stamped from; the runtime hands its own (`RuntimeConfig.now`). */
+  now?: () => number
   /** How long SQLite waits for a competing writer before raising SQLITE_BUSY. */
   busyTimeoutMs?: number
   /** Bounded retries after a classified SQLITE_BUSY. */
@@ -144,7 +146,6 @@ export interface StaleTaskRefusal {
   taskId: string
   expected: number
   current: number
-  at: number
 }
 /** The durable event type every refused stale task write is recorded under. */
 export const STALE_TASK_REFUSAL_EVENT = 'task/stale-revision-refused'
@@ -297,6 +298,7 @@ export class SwarmStore {
   private readonly busyTimeoutMs: number
   private readonly writerAttempts: number
   private readonly writerDelayMs: number
+  private readonly now: () => number
   private readonly statePath: string
   private readonly snapshotDir: string
   private readonly snapshotIntervalMs: number
@@ -318,6 +320,7 @@ export class SwarmStore {
     this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
     this.writerAttempts = Math.max(1, Math.trunc(options.writerAttempts ?? DEFAULT_WRITER_ATTEMPTS))
     this.writerDelayMs = Math.max(0, Math.trunc(options.writerDelayMs ?? DEFAULT_WRITER_DELAY_MS))
+    this.now = options.now ?? (() => Date.now())
     this.statePath = path
     this.snapshotDir = options.snapshotDir ?? `${path}.snapshots`
     this.snapshotIntervalMs = Math.max(0, Math.trunc(options.snapshotIntervalMs ?? DEFAULT_SNAPSHOT_INTERVAL_MS))
@@ -542,7 +545,7 @@ export class SwarmStore {
   }
   /** Record the refusal durably and hand the caller the diagnostic to throw. */
   private refuseStaleTask(value: Task, expected: number, current: number): StaleTaskRevisionError {
-    const refusal: StaleTaskRefusal = { missionId: value.missionId, taskId: value.id, expected, current, at: Date.now() }
+    const refusal: StaleTaskRefusal = { missionId: value.missionId, taskId: value.id, expected, current }
     // Inside a caller transaction the record is flushed after its rollback;
     // outside one there is nothing to roll back, so it is committed now.
     if (this.transactionScopes === undefined) this.recordStaleRefusals([refusal])
@@ -577,7 +580,7 @@ export class SwarmStore {
    */
   event(missionId: string, type: EventKind, actor: string, data: unknown): void {
     const statement = this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)')
-    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), Date.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), this.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
   }
   /**

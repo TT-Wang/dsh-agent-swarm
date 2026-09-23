@@ -100,7 +100,7 @@ export const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
  * board page can never flood a model context. TTL expiry is reported, never
  * enforced by mutating the post.
  */
-export function postView(post: Post, full = false): Record<string, unknown> {
+export function postView(post: Post, now: number, full = false): Record<string, unknown> {
   return {
     id: post.id, seq: post.seq, kind: post.kind, fromMemberId: post.fromMemberId,
     ...(post.toMemberId === undefined ? {} : { toMemberId: post.toMemberId }),
@@ -112,7 +112,7 @@ export function postView(post: Post, full = false): Record<string, unknown> {
     ...(post.toolRunIds.length ? { toolRunIds: post.toolRunIds } : {}),
     ...(post.replyTo === undefined ? {} : { replyTo: post.replyTo }),
     createdAt: post.createdAt,
-    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: Date.now() >= post.createdAt + post.ttlMs }),
+    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: now >= post.createdAt + post.ttlMs }),
   }
 }
 
@@ -198,7 +198,7 @@ export class RuntimeGates {
    */
   ownerInstruments(missionId: string, full: boolean): Record<string, unknown> {
     const records = this.fingerprintRecords(missionId)
-    const view = projectArenaView({ ...records, missionId, now: Date.now(), leaseMs: this.rt.config.leaseMs })
+    const view = projectArenaView({ ...records, missionId, now: this.rt.now(), leaseMs: this.rt.config.leaseMs })
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
       // T3d: the owner-visible fingerprint is the no-silent-state F(S) the
@@ -227,7 +227,7 @@ export class RuntimeGates {
         to: delivery.to === 'owner' ? 'owner' : delivery.to,
         from: delivery.from,
         ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
-        ageMs: Math.max(0, Date.now() - (delivery.deliveredAt ?? delivery.createdAt)),
+        ageMs: Math.max(0, this.rt.now() - (delivery.deliveredAt ?? delivery.createdAt)),
         nudges: delivery.replyNudges ?? 0,
         question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
       }))
@@ -250,7 +250,7 @@ export class RuntimeGates {
     return {
       count,
       addressed: this.rt.store.countPosts(missionId, { inboxFor: memberId, afterSeq }),
-      newest: newest.map(post => postView(post)),
+      newest: newest.map(post => postView(post, this.rt.now())),
       ...(count > newest.length ? { omitted: count - newest.length } : {}),
       ...(newest.length ? { nextAfter: newest.at(-1)!.seq } : {}),
     }
@@ -310,13 +310,13 @@ export class RuntimeGates {
     if (this.rt.closed || this.rt.shuttingDown || !validUsage(usage) || this.rt.isWorkerSession(sessionId)) return
     const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !this.rt.isMissionTerminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (mission) {
-      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = Date.now()
+      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = this.rt.now()
       this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
       return
     }
     const request = this.rt.store.list('starts').filter(item => item.ownerSessionId === sessionId && (item.status === 'planning' || item.status === 'launching')).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (!request) return
-    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = Date.now()
+    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = this.rt.now()
     this.rt.commit(request.id, () => this.rt.store.put('starts', request))
   }
 
@@ -325,7 +325,7 @@ export class RuntimeGates {
     const dimensions: string[] = []
     if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
     if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
-    if (Date.now() >= mission.deadline) dimensions.push('maxDurationMs')
+    if (this.rt.now() >= mission.deadline) dimensions.push('maxDurationMs')
     return dimensions
   }
 
@@ -347,7 +347,7 @@ export class RuntimeGates {
     const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
       { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
       { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
-      { dimension: 'maxDurationMs', used: executionElapsed(mission), limit: mission.budget.maxDurationMs, inFlight: 0 },
+      { dimension: 'maxDurationMs', used: executionElapsed(mission, this.rt.now()), limit: mission.budget.maxDurationMs, inFlight: 0 },
       { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },
     ]
     for (const task of tasks) {
@@ -453,10 +453,10 @@ export class RuntimeGates {
     const pause = mission.budgetPause
     if (pause === undefined || pause.id !== pauseId || pause.quiesced) return
     const claim = pause.stopping
-    if (claim !== undefined && claim.instanceId === this.rt.instanceId && Date.now() - claim.at < this.rt.stallPassTimeoutMs) return
+    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.stallPassTimeoutMs) return
     // The durable claim lands BEFORE the first await, so it is the gate for any
     // later caller, whether or not this process still holds the mirror entry.
-    pause.stopping = { instanceId: this.rt.instanceId, at: Date.now() }
+    pause.stopping = { instanceId: this.rt.instanceId, at: this.rt.now() }
     this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
     this.budgetStops.add(pauseId)
     this.rt.defer(async () => {
@@ -497,17 +497,17 @@ export class RuntimeGates {
           this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
           continue
         }
-        task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.rt.config.leaseMs)
+        task.attempt.leaseUntil = Math.min(mission.deadline, this.rt.now() + this.rt.config.leaseMs)
         this.rt.store.putTask(task)
         // The resumed attempt is what makes its owner `working`; the status is
         // derived from that on every read, so there is nothing to write here.
         for (const delivery of this.rt.store.list('deliveries', mission.id)) {
           if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
-            delivery.deliveredAt = Date.now(); this.rt.store.put('deliveries', delivery)
+            delivery.deliveredAt = this.rt.now(); this.rt.store.put('deliveries', delivery)
           }
         }
         this.rt.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt.ownerId, kind: 'assignment',
-          taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now(),
+          taskId: task.id, attemptId: task.attempt.id, createdAt: this.rt.now(),
           content: JSON.stringify({ missionId: mission.id, task, instructions: 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.',
             // ENV-R2: the resumed attempt is the same attempt, so its assignment
             // must carry the same declared-check envelope a first assignment

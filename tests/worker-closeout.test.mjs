@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeClock } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -169,15 +170,15 @@ test('lease expiry checkpoints a quiescent workspace before the task is re-pende
 })
 
 test('an owner cancel during the lease-expiry checkpoint is never overwritten by recovery', async t => {
-  const f = await fixture(t, { leaseMs: 60 })
+  const clock = new FakeClock()
+  const leaseMs = 60
+  const f = await fixture(t, { leaseMs, now: clock.now })
   const task = f.propose()
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   f.workers.idle.add(f.author.id)
   const entered = deferred(), release = deferred()
   f.workers.captureGate = async () => { entered.resolve(); await release.promise }
-  const stored = f.current(task.id)
-  stored.attempt.leaseUntil = Date.now() - 1
-  f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
+  clock.advance(leaseMs + 1)
   f.workers.callbacks.idle(f.author.id)
   await entered.promise
   // The owner withdraws while captureArtifact is in flight; the checkpoint's
@@ -185,12 +186,10 @@ test('an owner cancel during the lease-expiry checkpoint is never overwritten by
   const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Owner withdraws while the checkpoint is in flight' })
   assert.equal(cancelled.status, 'cancelled')
   release.resolve()
-  // The cancel's stop barrier stops the worker asynchronously; wait for that
-  // rather than for a fixed 50 ms, which a loaded parallel run can outlast.
-  // The pause after it gives the released checkpoint time to try its transition,
-  // so the negative assertions below still mean something.
-  await eventually(() => f.workers.stopped.includes(f.author.id), 'the cancel stops the released worker')
-  await new Promise(resolve => setTimeout(resolve, 50))
+  // The released checkpoint's transition and the cancel's stop barrier have
+  // both run once the mission has settled, so the negative assertions below
+  // mean something without a pause.
+  await f.runtime.settle(f.mission.id)
   const final = f.current(task.id)
   assert.equal(final.status, 'cancelled', 'the in-flight checkpoint must not overwrite the owner cancel')
   assert.equal(final.epoch, cancelled.epoch, 'the cancelled epoch is preserved')

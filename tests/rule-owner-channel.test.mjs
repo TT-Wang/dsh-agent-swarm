@@ -376,7 +376,7 @@ function plannerFixture(t) {
   const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
-  const runtime = { config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
+  const runtime = { config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, now: () => Date.now(), store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
     subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() }
   registerAutomaticStart(ctx, runtime)
   t.after(() => disposers.forEach(dispose => dispose()))

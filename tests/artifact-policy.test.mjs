@@ -239,10 +239,9 @@ test('captured review report survives deferred checks and reassignment without l
   const nextReviewer = await f.runtime.addMember(f.owner, f.mission.id, { role: 'independent replacement reviewer' })
   f.runtime.controlTask(f.owner, f.mission.id, review.id, 'resume', { assigneeId: nextReviewer.id }, 'Host repaired; reviewer unavailable')
   // The stop barrier checkpoints the reviewer's workspace with real git before it
-  // re-pends the review. Under a loaded parallel run that takes longer than the
-  // one second this used to allow, so wait for the barrier itself and say so if
-  // it never settles, instead of reading a status the barrier has not decided yet.
-  for (const deadline = Date.now() + 30000; f.runtime.task(f.mission.id, review.id).resumeAfterStop && Date.now() < deadline;) await new Promise(resolve => setTimeout(resolve, 10))
+  // re-pends the review; wait for the barrier itself, however long git takes,
+  // instead of reading a status the barrier has not decided yet.
+  await f.runtime.settle(f.mission.id)
   assert.equal(f.runtime.task(f.mission.id, review.id).resumeAfterStop, undefined, 'the stop barrier settled')
   assert.equal(f.runtime.task(f.mission.id, review.id).status, 'pending', 'saved review record is not a rejected deliverable exhaustion gate')
   const nextActor = { sessionId: nextReviewer.sessionId }

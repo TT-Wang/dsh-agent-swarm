@@ -102,7 +102,7 @@ export class OwnerReplyGuard {
    * ordinary owner turn is never nudged.
    */
   private startTurn(sessionId: string, data?: unknown): void {
-    const at = typeof (data as { createdAt?: unknown } | undefined)?.createdAt === 'number' ? (data as { createdAt: number }).createdAt : Date.now()
+    const at = typeof (data as { createdAt?: unknown } | undefined)?.createdAt === 'number' ? (data as { createdAt: number }).createdAt : this.rt.now()
     const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
     const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
     // Several admitted messages (including the generated context snapshot) can
