@@ -367,6 +367,8 @@ interface TaskBase { taskId: string; epoch: number; baseCommit: string; captured
 function validRecoveryPath(name: string): boolean {
   return name.length > 0 && !path.isAbsolute(name) && !/[\u0000-\u001f]/.test(name) && !name.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git')
 }
+/** What stands at a declared output path; `at` is the component that decided it. */
+interface OutputShape { kind: 'file' | 'absent' | 'directory' | 'symlink' | 'other'; at: string }
 interface MemberWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task?: TaskBase }
 interface TaskWorkspace { version: 1; missionId: string; memberId: string; workspace: string; task: TaskBase }
 /**
@@ -1696,6 +1698,58 @@ export class Workspaces {
   }
 
   /**
+   * What stands at a declared output path, walked one component at a time
+   * without following a link: the first missing, symlinked or non-directory
+   * component decides, and `at` names it.
+   */
+  private async outputShape(workspace: string, relative: string): Promise<OutputShape> {
+    const parts = relative.split('/')
+    for (let depth = 1; depth <= parts.length; depth++) {
+      const at = parts.slice(0, depth).join('/')
+      const info = await lstat(path.join(workspace, at)).catch(() => undefined)
+      if (info === undefined) return { kind: 'absent', at }
+      if (info.isSymbolicLink()) return { kind: 'symlink', at }
+      if (depth < parts.length) {
+        if (!info.isDirectory()) return { kind: 'other', at }
+        continue
+      }
+      return { kind: info.isFile() ? 'file' : info.isDirectory() ? 'directory' : 'other', at }
+    }
+    return { kind: 'absent', at: relative }
+  }
+
+  /**
+   * One `[output_missing]` sentence for one declared output: why it is not a
+   * regular file and the exit the member can actually take. A path the task
+   * base carries was deleted or renamed by this task, so the declaration is
+   * wrong and recreating the file would only defeat the task; a directory can
+   * never be an output; a symlink, or a path through a symlinked directory, is
+   * never followed by capture.
+   */
+  private async outputMissingCause(workspace: string, baseCommit: string, name: string, shape: OutputShape, tool: string, signal: AbortSignal): Promise<string> {
+    const q = JSON.stringify(name)
+    const retry = `retry \`${tool}\` with the same \`taskId\``
+    const amend = 'escalate with `swarm_escalate` and this `taskId` so the owner amends `outputs` with `swarm_control`'
+    switch (shape.kind) {
+      case 'directory':
+        return `${q} is a directory, and \`outputs\` names regular files only: ${amend} to list the files inside it.`
+      case 'symlink':
+        return shape.at === name
+          ? `${q} is a symlink, and capture records only regular files: replace the link with a regular file at that exact path and ${retry}, or ${amend} to name the file it points to.`
+          : `${q} passes through the symlinked directory ${JSON.stringify(shape.at)}, and capture never follows a symlink: ${amend} to name the real path, or replace the link with a real directory holding the file and ${retry}.`
+      case 'other':
+        return `${q} is not a regular file (${shape.at === name ? 'it is a special file' : `its parent ${JSON.stringify(shape.at)} is a file`}): replace it with a regular file at that exact path and ${retry}, or ${amend}.`
+      default: {
+        const inBase = await this.git(workspace, ['cat-file', '-e', `${baseCommit}:${name}`], signal).then(() => true, () => false)
+        signal.throwIfAborted()
+        return inBase
+          ? `${q} exists in the task base and this task deleted or renamed it, so the declaration no longer describes the work: do not recreate it; ${amend}.`
+          : `${q} does not exist: write it and ${retry}, or, if the task no longer produces it, ${amend}.`
+      }
+    }
+  }
+
+  /**
    * Save what a capture is about to change in a member worktree: HEAD and the
    * index file (the working tree itself is never written). `rollback` puts both
    * back after a refused or failed capture, so the member's next capture diffs
@@ -1769,46 +1823,52 @@ export class Workspaces {
       // name itself BEFORE any commit: on a case-folding filesystem a declared
       // `reports/summary.md` written as `Reports/summary.md` answers `lstat`, but
       // would commit an out-of-scope path.
-      const refusedPath = (name: string): boolean => !withinScope(name, task.scope) || name.endsWith('/') || /[\u0000-\u001f]/.test(name)
-        || name.split('/').some(part => part.toLowerCase() === '.git') || dependencyContent(name) || this.toolchainName(name)
+      const refusal = (name: string): string | undefined => !withinScope(name, task.scope) ? 'outside the current task `scope`'
+        : name.endsWith('/') || /[\u0000-\u001f]/.test(name) ? 'not a literal file path'
+          : name.split('/').some(part => part.toLowerCase() === '.git') ? 'inside Git metadata'
+            : dependencyContent(name) || this.toolchainName(name) ? 'inside a dependency or member scratch directory the host keeps out of artifacts' : undefined
+      const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
       const outputs: string[] = []
       const missing: string[] = []
+      const refused: string[] = []
       const misspelled: Array<{ name: string; spelled: string }> = []
       for (const name of [...new Set([...listed, ...owed])]) {
         const declared = owed.includes(name)
         // A checkpoint carries a declared output once it is written and never
         // refuses on one still owed; only submit and verify require it.
         const optional = declared && !listed.includes(name) && options.requireOutputs !== true
-        if (refusedPath(name)) {
+        const reason = refusal(name)
+        if (reason !== undefined) {
           if (optional) continue
+          // A declared output the path checks refuse (the owner narrowed
+          // `scope`, or the host configures its directory as a dependency
+          // directory) is the owner's declaration to amend, not a listing error.
+          if (declared) { refused.push(`${JSON.stringify(name)} (${reason})`); continue }
           throw new PolicyError('invalid_deliverable_path', 'validation_error', `${JSON.stringify(name)} must be a literal file within task scope, outside Git metadata, dependency and scratch directories. Correct \`deliverables\` with \`swarm_submit\`.`)
         }
-        const parts = name.split('/')
-        let regular = true
-        for (let depth = 1; regular && depth <= parts.length; depth++) {
-          const info = await lstat(path.join(member.workspace, ...parts.slice(0, depth))).catch(() => undefined)
-          if (!info || info.isSymbolicLink() || (depth === parts.length ? !info.isFile() : !info.isDirectory())) regular = false
-        }
-        if (!regular) {
+        const shape = await this.outputShape(member.workspace, name)
+        if (shape.kind !== 'file') {
           if (optional) continue
-          if (declared) { missing.push(name); continue }
+          if (declared) { missing.push(await this.outputMissingCause(member.workspace, baseCommit, name, shape, tool, signal)); continue }
           throw new PolicyError('invalid_deliverable_file', 'validation_error', `${JSON.stringify(name)} must exist as a regular file without symlink ancestors; correct \`deliverables\` and retry \`swarm_submit\`.`)
         }
         const spelled = await this.onDiskSpelling(member.workspace, name) ?? name
-        if (spelled !== name && refusedPath(spelled)) {
+        if (spelled !== name && refusal(spelled) !== undefined) {
           if (optional) continue
           misspelled.push({ name, spelled })
           continue
         }
         if (!outputs.includes(spelled)) outputs.push(spelled)
       }
+      const recorded = tool === 'swarm_verify' ? 'verification' : 'submission'
+      if (refused.length) {
+        throw new PolicyError('output_path_refused', 'validation_error', `[output_path_refused] The task declares ${refused.join(', ')} in \`outputs\`, but capture cannot record ${refused.length === 1 ? 'that path' : 'those paths'}, so this ${recorded} was not recorded, nothing was committed and your attempt stays running. Call \`swarm_escalate\` with this \`taskId\` so the owner amends \`outputs\` or \`scope\` with \`swarm_control\`; listing ${refused.length === 1 ? 'it' : 'them'} in \`deliverables\` cannot change that.`)
+      }
       if (misspelled.length) {
-        const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
         throw new PolicyError('output_case_mismatch', 'validation_error', `[output_case_mismatch] ${misspelled.map(item => `${JSON.stringify(item.name)} exists in your worktree only as ${JSON.stringify(item.spelled)}`).join('; ')}: a different letter case that capture refuses (outside the task \`scope\`, or inside a dependency or scratch directory), so nothing was committed and your attempt stays running. Rename each file, and every parent directory whose case differs, to exactly the spelling named first, then retry \`${tool}\` with the same \`taskId\`.`)
       }
       if (missing.length) {
-        const tool = task.kind === 'verification' ? 'swarm_verify' : 'swarm_submit'
-        throw new PolicyError('output_missing', 'validation_error', `[output_missing] The task declares ${missing.map(name => JSON.stringify(name)).join(', ')} in \`outputs\`, but ${missing.length === 1 ? 'it is not a regular file' : 'they are not regular files'} in your worktree, so this ${tool === 'swarm_verify' ? 'verification' : 'submission'} was not recorded and your attempt stays running. Write ${missing.length === 1 ? 'the file' : 'each file'} and retry \`${tool}\` with the same \`taskId\`, or, if the task no longer produces ${missing.length === 1 ? 'it' : 'them'}, escalate with \`swarm_escalate\` so the owner amends \`outputs\` with \`swarm_control\`.`)
+        throw new PolicyError('output_missing', 'validation_error', `[output_missing] ${missing.length === 1 ? 'A path' : `${missing.length} paths`} the task declares in \`outputs\` ${missing.length === 1 ? 'is not a regular file' : 'are not regular files'} in your worktree, so this ${recorded} was not recorded, nothing was committed and your attempt stays running. ${missing.join(' ')} Follow the step named for each path.`)
       }
       // Include tracked changes, staged changes, and new files before any commit.
       // Rename detection is disabled so a `git mv` out of scope reports the

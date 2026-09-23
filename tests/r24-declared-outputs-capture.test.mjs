@@ -15,7 +15,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
@@ -469,4 +469,116 @@ test('a legacy preservation snapshot that tracks an undeclared ignored .env is r
   assert.deepEqual([...submitted.artifact.changedPaths].sort(), ['docs/report.md', 'notes/config.md'])
   assert.equal(await f.inCommit(submitted.artifact.commit, '.env'), false, 'the secret is not in the artifact tree')
   assert.deepEqual(await f.refsCarrying('.env', 'refs/artifacts/'), [], 'no artifact ref tree carries the secret')
+})
+
+/** A typed declared-output refusal whose rendered text satisfies the refusal contract. */
+function typedRefusal(error, code) {
+  assert.equal(error.name, 'PolicyError', error.message)
+  assert.equal(error.code, code)
+  assert.equal(error.category, 'validation_error')
+  assert.ok(error.message.startsWith(`[${code}] `), error.message)
+  assert.match(error.message, /nothing was committed and your attempt stays running/)
+  assert.deepEqual(assessText(error.message, schemaIndex), [], `the rendered refusal satisfies the refusal contract: ${error.message}`)
+  return true
+}
+
+test('a declared output the task deleted or renamed is refused as a wrong declaration: escalate so the owner amends outputs, never recreate it', async t => {
+  const f = await fixture(t)
+  // S1a/S1b: src/index.js is in the task base; the task removes it (deletion) or moves it (rename).
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose({ kind: 'implementation', checks: ['test -s src/main.js'], checkTimeoutMs: 30000, objective: 'Rename src/index.js to src/main.js', scope: ['src/'], outputs: ['src/index.js', 'src/main.js'] }).id)
+  const body = await readFile(path.join(f.author.workspace, 'src', 'index.js'), 'utf8')
+  await rm(path.join(f.author.workspace, 'src', 'index.js'))
+  await writeFile(path.join(f.author.workspace, 'src', 'main.js'), body)
+  await assert.rejects(f.submit(f.author, task), error => {
+    typedRefusal(error, 'output_missing')
+    assert.match(error.message, /^\[output_missing\] A path the task declares in `outputs` is not a regular file/)
+    assert.ok(error.message.includes('"src/index.js" exists in the task base and this task deleted or renamed it'), error.message)
+    assert.match(error.message, /do not recreate it; escalate with `swarm_escalate` and this `taskId` so the owner amends `outputs` with `swarm_control`/)
+    assert.doesNotMatch(error.message, /write it|Write the file|retry `swarm_submit`/, 'the member is never told to recreate a file the task removes')
+    assert.doesNotMatch(error.message, /src\/main\.js/, 'the written output is not named')
+    return true
+  })
+  assert.equal(f.taskRow(task.id).status, 'running')
+  assert.equal(f.taskRow(task.id).attempt.id, task.attempt.id)
+})
+
+test('each non-file shape of a declared output gets its own cause and exit in one output_missing refusal', async t => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-shapes-')))
+  const { source, workspaces } = await repository(root)
+  t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
+  const mission = { id: 'shapes', workspace: source }
+  const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }
+  // S2a/S2e/S2f plus a never-written file.
+  const outputs = ['notes/current.md', 'notes/latest/a.md', 'notes/site', 'notes/new.md']
+  const task = { id: 'shapes', missionId: mission.id, epoch: 1, title: 'Shapes', kind: 'research', scope: ['notes/'], checks: [], status: 'running', objective: 'Write notes', acceptance: ['Reviewed'], outputs }
+  await workspaces.prepareTask(member, task, [])
+  await writeFile(path.join(member.workspace, 'notes', 'target.md'), 'target\n')
+  await symlink('target.md', path.join(member.workspace, 'notes', 'current.md'))
+  await mkdir(path.join(member.workspace, 'notes', 'v2'))
+  await writeFile(path.join(member.workspace, 'notes', 'v2', 'a.md'), 'a\n')
+  await symlink('v2', path.join(member.workspace, 'notes', 'latest'))
+  await mkdir(path.join(member.workspace, 'notes', 'site'))
+  await writeFile(path.join(member.workspace, 'notes', 'site', 'index.html'), 'x\n')
+  await assert.rejects(workspaces.captureArtifact(member, task, [], { requireOutputs: true }), error => {
+    typedRefusal(error, 'output_missing')
+    assert.match(error.message, /^\[output_missing\] 4 paths the task declares in `outputs` are not regular files/)
+    assert.ok(error.message.includes('"notes/current.md" is a symlink, and capture records only regular files: replace the link with a regular file at that exact path and retry `swarm_submit` with the same `taskId`'), error.message)
+    assert.ok(error.message.includes('"notes/latest/a.md" passes through the symlinked directory "notes/latest", and capture never follows a symlink'), error.message)
+    assert.ok(error.message.includes('"notes/site" is a directory, and `outputs` names regular files only: escalate with `swarm_escalate` and this `taskId` so the owner amends `outputs` with `swarm_control` to list the files inside it'), error.message)
+    assert.ok(error.message.includes('"notes/new.md" does not exist: write it and retry `swarm_submit` with the same `taskId`'), error.message)
+    return true
+  })
+  // A checkpoint still skips every owed shape instead of refusing.
+  const checkpoint = await workspaces.captureArtifact(member, task)
+  assert.equal(checkpoint.files, undefined)
+})
+
+test('a declared output outside the scope the owner narrowed is refused as an owner amendment, not as a deliverables correction', async t => {
+  // stuck.mjs A / s3e-scope.mjs: the amendment narrows scope without touching outputs.
+  const f = await fixture(t)
+  const proposed = f.propose({ objective: 'Audit the scheduler', outputs: ['docs/report.md'] })
+  f.runtime.controlTask(f.owner, f.mission.id, proposed.id, 'amend', { scope: ['notes/'] }, 'keep the task out of docs')
+  const task = await f.runtime.claim(f.actor(f.author), f.mission.id, proposed.id)
+  await writeFile(path.join(f.author.workspace, 'notes', 'summary.md'), 'summary\n')
+  await f.readEvidence(f.author, task, 'notes/summary.md')
+  for (const deliverables of [undefined, ['notes/summary.md']]) {
+    await assert.rejects(f.submit(f.author, task, deliverables === undefined ? {} : { deliverables }), error => {
+      typedRefusal(error, 'output_path_refused')
+      assert.ok(error.message.includes('"docs/report.md" (outside the current task `scope`)'), error.message)
+      assert.match(error.message, /Call `swarm_escalate` with this `taskId` so the owner amends `outputs` or `scope` with `swarm_control`/)
+      assert.doesNotMatch(error.message, /Correct `deliverables`/)
+      return true
+    })
+    assert.equal(f.taskRow(task.id).status, 'running')
+  }
+})
+
+test('a declared output under a host-configured dependency directory is refused as an owner amendment', async t => {
+  // stuck.mjs B / s7-depdirs.mjs: admission knows only the default list.
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-depdir-')))
+  const { source } = await repository(root)
+  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, verificationDependencyDirs: ['node_modules', 'gen'] })
+  t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
+  const mission = { id: 'depdir', workspace: source }
+  const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }
+  const task = { id: 'gen', missionId: mission.id, epoch: 1, title: 'Gen', kind: 'implementation', scope: ['gen/', 'notes/'], checks: [], status: 'running', objective: 'Generate', acceptance: ['Reviewed'], outputs: ['gen/out.txt'] }
+  await workspaces.prepareTask(member, task, [])
+  await mkdir(path.join(member.workspace, 'gen'))
+  await writeFile(path.join(member.workspace, 'gen', 'out.txt'), 'generated\n')
+  await assert.rejects(workspaces.captureArtifact(member, task, [], { requireOutputs: true }), error => {
+    typedRefusal(error, 'output_path_refused')
+    assert.ok(error.message.includes('"gen/out.txt" (inside a dependency or member scratch directory the host keeps out of artifacts)'), error.message)
+    assert.match(error.message, /`swarm_escalate`/)
+    return true
+  })
+})
+
+test('the capture-time output refusals are inventoried as typed sites that satisfy the refusal contract', async () => {
+  const file = 'src/workspaces.ts'
+  const sites = refusalSites(await readFile(new URL(`../${file}`, import.meta.url), 'utf8'), file)
+  for (const code of ['output_missing', 'output_path_refused', 'output_case_mismatch']) {
+    const typed = sites.filter(site => site.code === code)
+    assert.deepEqual(typed.map(site => [site.kind, site.errorClass, site.codes]), [['coded-throw', 'PolicyError', [code]]], code)
+    assert.deepEqual(assessRefusal(typed[0], { ...schemaIndex, diagnosticProducers: diagnosticProducers([sites]) }), [], typed[0].text)
+  }
 })
