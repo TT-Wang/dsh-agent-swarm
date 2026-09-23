@@ -78,10 +78,10 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
   await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal')
   // A new dependent is still refused while no live repair exists.
   assert.throws(() => f.research({ title: 'New dependent', dependencies: [original.id] }), /no live replacement/)
-  // The repair must keep the original acceptance obligations verbatim.
-  assert.throws(() => f.propose({ title: 'Bad repair', replaces: [original.id], acceptance: ['other'] }), /Missing: \["works"\]/)
   const before = structuredClone(f.current(original.id))
-  const repair = f.propose({ title: 'Corrected repair', replaces: [original.id] })
+  // The repair inherits the withdrawn obligations; its own criterion is added after them.
+  const repair = f.propose({ title: 'Corrected repair', replaces: [original.id], acceptance: ['other', 'works'] })
+  assert.deepEqual(repair.acceptance, ['works', 'other'], 'replaced criteria first, in order, without duplicates')
   assert.equal(repair.status, 'pending', 'a cancelled task admits one live repair')
   assert.deepEqual(repair.replaces, [original.id])
   assert.deepEqual(f.current(original.id), before, 'the cancelled record is byte-for-byte unchanged by the repair')

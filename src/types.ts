@@ -911,7 +911,8 @@ export interface ProposeTaskInput {
   kind: TaskKind
   dependencies?: string[]
   scope: string[]
-  acceptance: string[]
+  /** Required unless `replaces` names a task: a repair inherits every replaced task's acceptance, and entries here are added after it. */
+  acceptance?: string[]
   /** Declared deliverable files; see `Task.outputs`. A replacement inherits the replaced task's when it omits them. */
   outputs?: string[]
   checks?: string[]

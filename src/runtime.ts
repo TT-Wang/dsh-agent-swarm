@@ -1265,7 +1265,15 @@ export class SwarmRuntime {
       if (input.maxRecoveryAttempts === undefined) throw new PolicyError('task_recovery_limit_required', 'validation_error', '[task_recovery_limit_required] Automatic tasks require a recovery limit chosen by the primary agent. Pass `maxRecoveryAttempts` as a positive safe integer on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
       if (input.kind !== 'verification' && input.checks?.length && input.checkTimeoutMs === undefined) throw new PolicyError('task_check_timeout_required', 'validation_error', '[task_check_timeout_required] Automatic task checks require a timeout chosen by the primary agent. Pass `checkTimeoutMs` in milliseconds on this task with `swarm_propose` (or `swarm_launch` for a new plan), then retry the same task.')
     }
-    requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(input.acceptance, 'acceptance')
+    // A repair inherits the acceptance of every task it replaces: the host holds
+    // those obligations, so the proposal never has to copy them. The stored list
+    // is each replaced task's criteria in order, then any criteria the proposal
+    // adds, without duplicates; the admission guard below reads the same list.
+    const proposed = input.acceptance ?? []
+    const acceptance = input.replaces?.length && Array.isArray(proposed)
+      ? [...new Set([...input.replaces.flatMap(previousId => this.task(missionId, previousId).acceptance), ...proposed])]
+      : proposed
+    requireText(input.title, 'title'); requireText(input.objective, 'objective'); requireStrings(acceptance, 'acceptance')
     if (!['research', 'implementation', 'verification', 'integration'].includes(input.kind)) throw new PolicyError('task_kind_invalid', 'validation_error', 'Unknown task kind')
     requireStrings(input.scope, 'task.scope')
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
@@ -1284,7 +1292,7 @@ export class SwarmRuntime {
     // at the production admission point, so a plan error is rejected here
     // instead of at submit. The scope and ignore-rule hints are advisory and
     // belong to the draft UI (`planAdvisories`); nothing here would read them.
-    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance: input.acceptance }, 'task', {
+    const refused = reconcileTaskAdmission({ objective: input.objective, acceptance }, 'task', {
       // R12-F9: the guard needs the content-carrying edges (the declared
       // dependencies plus a review source, which `prepareTask` merges into the
       // worktree like a dependency) and the durable identities this mission
@@ -1332,7 +1340,7 @@ export class SwarmRuntime {
       if (input.assigneeId !== undefined && authors.has(input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
-    // declared check. Acceptance is already required verbatim above; a check
+    // declared check. Acceptance is already inherited above; a check
     // change is recorded durably so an owner can see that the new check no
     // longer matches the original obligation. A repair that merely supplies
     // checks the replaced task never declared is not a change.
@@ -1356,8 +1364,6 @@ export class SwarmRuntime {
       if (replacement !== undefined) throw new PolicyError('replacement_already_live', 'tool_error', `replaces ${previousId}: that task is ${previous.status}, and is already replaced by ${replacement.id} (${replacement.status}); wait for its verdict, withdraw it with swarm_cancel, or repair that replacement instead of admitting a second one`)
       if (previous.status !== 'cancelled' && stopPending(previous)) throw new PolicyError('replacement_source_reassigning', 'lease_error', `replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
       if (previous.kind !== input.kind) throw new PolicyError('replacement_kind_mismatch', 'tool_error', `replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
-      const missing = previous.acceptance.filter(item => !input.acceptance.includes(item))
-      if (missing.length) throw new PolicyError('replacement_acceptance_dropped', 'tool_error', `replaces ${previousId}: replacement acceptance must include the original obligations verbatim. Missing: ${JSON.stringify(missing)}`)
       if (dependencies.includes(previousId)) throw new PolicyError('replacement_depends_on_source', 'tool_error', `replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
       const nextChecks = Array.isArray(input.checks) ? input.checks as string[] : []
       if (previous.checks.length > 0 && !sameChecks(nextChecks, previous.checks)) {
@@ -1374,7 +1380,7 @@ export class SwarmRuntime {
     // D1: every admitted task carries its own step/finding ceiling; the runtime
     // blocks the task at that limit instead of letting it drain the mission budget.
     const ceilings = normalizeTaskCeilings(input, mission.budget.maxSteps, 'task')
-    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance: input.acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
+    const task: Task = { id: admittedId ?? id('task'), missionId, workstreamId: input.workstreamId, title: input.title, objective: input.objective, kind: input.kind, dependencies, scope: input.scope, acceptance, checks: input.checks ?? [], priority: input.priority ?? 50, experiment: input.experiment ?? false, assigneeId: input.assigneeId, reviewOf: input.reviewOf, status: 'pending', epoch: 0, priorOwnerIds: [], proposedBy: key, evidenceIds: [], createdAt: Date.now(), ...ceilings }
     if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]
     // Absent stays absent: only a declaration is stored, so a row without the
     // field keeps falling back to the text heuristic instead of reading as
