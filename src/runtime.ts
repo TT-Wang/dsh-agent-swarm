@@ -2390,15 +2390,14 @@ export class SwarmRuntime {
         objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
         kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
         // The host-admitted review reads an artifact and records a verdict; it
-        // owes no file. Declaring that is what keeps the source task's own
-        // deliverable names from reading as this review's obligations.
+        // owes no file.
         outputs: [],
         reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, priority: source.priority,
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
       }, this.automaticReviewId(source))
     } catch (error) {
-      // Admission can still refuse (budget race, ignored deliverable). The
-      // submission stands; the owner is told exactly what to admit instead.
+      // Admission can still refuse (a budget race). The submission stands;
+      // the owner is told exactly what to admit instead.
       this.notifyReviewBlocked(mission, source, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
       return
     }

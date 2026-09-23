@@ -2,11 +2,10 @@
  * R20: a task declares the files it must produce.
  *
  * Before this, nothing on a task named its deliverables, so five consumers read
- * them out of the objective and acceptance prose with `deliverablePaths()` — a
- * write-verb heuristic whose edge cases were patched from round 4 to round 19.
- * `outputs` states the same list exactly, validated once at admission, and
- * since R24 it is the only rule the workspace consumers read: a row without the
- * field declares no output.
+ * them out of the objective and acceptance prose with a write-verb heuristic
+ * whose edge cases were patched from round 4 to round 19. `outputs` states the
+ * same list exactly, validated once at admission, and since R24 it is the only
+ * rule: the heuristic is deleted and a row without the field declares no output.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'

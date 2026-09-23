@@ -170,7 +170,7 @@ test('a coded refusal that names a parameter but gives no imperative next step f
     '[task_not_in_mission] `taskId` is not in this mission.',
     '[task_attempt_stale] The attempt for `taskId` is stale.',
     '[guard_terminal] The budget chain has no progress for `missionId`; the owner must decide.',
-    '[deliverable_uncaptured] `swarm_submit` did not capture `deliverables`.',
+    '[output_missing] `swarm_submit` did not capture `deliverables`.',
     '[review_path_missing] No live reviewer exists for `reviewOf`.',
   ]
   for (const text of statements) assert.deepEqual(assessText(text, index), [NO_VERB], text)

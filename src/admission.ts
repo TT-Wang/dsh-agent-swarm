@@ -1,6 +1,5 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
 import { assignmentAllows, type AssignmentCandidate } from './assignment.ts'
-import { spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
@@ -277,147 +276,11 @@ export function taskCeilingBlock(task: TaskCeilingState, now = Date.now()): Task
   }
 }
 
-const WRITE_VERBS = new Set([
-  'add', 'adds', 'added', 'adding', 'append', 'appends', 'appended', 'appending',
-  'commit', 'commits', 'committed', 'committing', 'create', 'creates', 'created', 'creating',
-  'delete', 'deletes', 'deleted', 'deleting', 'deliver', 'delivers', 'delivered', 'delivering',
-  'document', 'documents', 'documented', 'documenting', 'edit', 'edits', 'edited', 'editing',
-  'emit', 'emits', 'emitted', 'emitting', 'generate', 'generates', 'generated', 'generating',
-  'implement', 'implements', 'implemented', 'implementing', 'introduce', 'introduces', 'introduced', 'introducing',
-  'modify', 'modifies', 'modified', 'modifying', 'move', 'moves', 'moved', 'moving',
-  'place', 'places', 'placed', 'placing', 'produce', 'produces', 'produced', 'producing',
-  'publish', 'publishes', 'published', 'publishing', 'record', 'records', 'recorded', 'recording',
-  'remove', 'removes', 'removed', 'removing', 'rename', 'renames', 'renamed', 'renaming',
-  'save', 'saves', 'saved', 'saving', 'ship', 'ships', 'shipped', 'shipping',
-  'store', 'stores', 'stored', 'storing', 'update', 'updates', 'updated', 'updating',
-  'write', 'writes', 'wrote', 'written', 'writing',
-])
-const WRITE_VERB_PATTERN = new RegExp(`\\b(?:${[...WRITE_VERBS].sort((a, b) => b.length - a.length).join('|')})\\b`, 'gi')
-const NEGATION_PATTERN = /\b(?:not|never|no|without|avoid|cannot|can't|don't|doesn't|didn't|mustn't|won't|isn't|aren't|shouldn't|wouldn't|couldn't)\b/i
-const DIRECTIVE_CUE = /\b(?:must|shall|should|will|need(?:s|ed)?\s+to|required\s+to|requires|required|tasked\s+(?:to|with)|responsible\s+for|expected\s+to|ensure|make\s+sure|please|to)\b/i
-const CLAUSE_SPLIT = /(?:[.;!?]\s+|\n+)/
-
-/** A conservative path token: a file with an extension, or a directory prefix ending in "/". */
-export function looksLikePath(token: string): boolean {
-  if (token.length < 3 || token.length > 240) return false
-  if (token.startsWith('-') || token.startsWith('/') || token.includes('*') || token.includes('://')) return false
-  if (!/^[A-Za-z0-9_.@/-]+$/.test(token)) return false
-  const cleaned = token.replace(/^\.\//, '').replace(/\/$/, '')
-  if (!cleaned || cleaned === '.' || cleaned === '..') return false
-  const hasExtension = /\.[A-Za-z][A-Za-z0-9]{0,9}$/.test(cleaned)
-  if (!hasExtension && !token.endsWith('/')) return false
-  const segments = cleaned.split('/')
-  if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment.includes('..'))) return false
-  return true
-}
-
-/** Whether a write verb reads as a directive (imperative, modal or requirement), not a factual statement. */
-function directiveContext(clause: string, verbIndex: number): boolean {
-  const before = clause.slice(0, verbIndex)
-  if (/^\s*(?:[-*•]|\d+[.)])?\s*$/.test(before)) return true
-  if (/[:：]\s*$/.test(before)) return true
-  return DIRECTIVE_CUE.test(before.slice(-80))
-}
-
-export interface WriteDirectiveOptions {
-  /** Strict mode ignores factual/passive statements ("X is committed at ...") and only keeps directives. */
-  strict?: boolean
-}
-
-/**
- * Repository paths that a text names as write targets. Only a write verb that
- * precedes the path in the same clause counts, and a negated verb ("do not
- * edit", "never change") does not: prohibitions are not write directives.
- * Strict mode additionally requires an imperative or modal context, so a
- * factual sentence such as "the file is committed at docs/x.md" is not a
- * directive while "add a file under docs/" is.
- */
-export function writeDirectivePaths(text: string, options: WriteDirectiveOptions = {}): string[] {
-  const strict = options.strict ?? true
-  const found: string[] = []
-  const seen = new Set<string>()
-  for (const clause of text.split(CLAUSE_SPLIT)) {
-    const verbs: Array<{ index: number; end: number; directive: boolean }> = []
-    WRITE_VERB_PATTERN.lastIndex = 0
-    for (let match = WRITE_VERB_PATTERN.exec(clause); match !== null; match = WRITE_VERB_PATTERN.exec(clause)) {
-      verbs.push({ index: match.index, end: match.index + match[0].length, directive: directiveContext(clause, match.index) })
-    }
-    if (!verbs.length) continue
-    const candidates: Array<{ index: number; token: string }> = []
-    const tokenPattern = /[A-Za-z0-9_.@/-]+/g
-    for (let match = tokenPattern.exec(clause); match !== null; match = tokenPattern.exec(clause)) {
-      if (looksLikePath(match[0])) candidates.push({ index: match.index, token: match[0].replace(/^\.\//, '') })
-    }
-    for (const candidate of candidates) {
-      // The nearest preceding verb decides negation; an earlier imperative verb
-      // in the same clause still makes an imperative chain a directive.
-      const preceding = verbs.filter(verb => verb.end <= candidate.index)
-      if (!preceding.length) continue
-      const nearest = preceding[preceding.length - 1]!
-      if (NEGATION_PATTERN.test(clause.slice(0, nearest.index)) || NEGATION_PATTERN.test(clause.slice(nearest.end, candidate.index))) continue
-      const directive = preceding.some(verb => {
-        if (strict && !verb.directive) return false
-        if (NEGATION_PATTERN.test(clause.slice(0, verb.index))) return false
-        return !NEGATION_PATTERN.test(clause.slice(verb.end, candidate.index))
-      })
-      if (!directive) continue
-      if (!seen.has(candidate.token)) { seen.add(candidate.token); found.push(candidate.token) }
-    }
-  }
-  return found
-}
-
-/** Reconcile an objective's write directives with the scope the task may commit. */
-export function reconcileObjectiveScope(objective: string, scope: readonly string[], location: string): AdmissionDiagnostic[] {
-  return writeDirectivePaths(objective).filter(path => !withinScope(path, scope)).map(path => ({
-    code: 'objective_write_outside_scope',
-    severity: 'advisory',
-    location,
-    path,
-    message: `the text may refer to ${JSON.stringify(path)} outside scope ${JSON.stringify(scope)}. This can be a read-only reference; no scope expansion is required by this hint. Actual writes and captured artifact paths must remain within the authorized scope.`,
-  }))
-}
-
-/** Path tokens named anywhere in a text, excluding clauses that prohibit them. */
-export function namedPaths(text: string): string[] {
-  const found: string[] = []
-  const seen = new Set<string>()
-  for (const clause of text.split(CLAUSE_SPLIT)) {
-    const tokenPattern = /[A-Za-z0-9_.@/-]+/g
-    for (let match = tokenPattern.exec(clause); match !== null; match = tokenPattern.exec(clause)) {
-      if (!looksLikePath(match[0])) continue
-      const token = match[0].replace(/^\.\//, '')
-      if (seen.has(token)) continue
-      if (NEGATION_PATTERN.test(clause.slice(0, match.index))) continue
-      seen.add(token); found.push(token)
-    }
-  }
-  return found
-}
-
-/**
- * Deliverable paths named by an objective or its acceptance criteria. Objectives
- * use write directives (including factual ones) so a read-only input reference
- * is not mistaken for a deliverable. Acceptance text uses the same advisory
- * directive heuristic; a bare input path does not imply an output obligation.
- */
-export function deliverablePaths(objective: string, acceptance: readonly string[] = []): string[] {
-  const found: string[] = []
-  const seen = new Set<string>()
-  const add = (path: string): void => { if (!seen.has(path)) { seen.add(path); found.push(path) } }
-  for (const path of writeDirectivePaths(objective, { strict: false })) add(path)
-  for (const text of acceptance) {
-    for (const path of writeDirectivePaths(text, { strict: false })) add(path)
-  }
-  return found
-}
-
 /**
  * Why one declared output is unusable, or undefined when it is exact. The rules
  * are the capture gate's own (`Workspaces.captureArtifact`), stated at
  * admission: literal in-scope file, no directory, no glob, no traversal, no Git
- * metadata, no dependency or scratch directory. Declaring the path is what makes
- * it exact — the `deliverablePaths` heuristic could only guess these from prose.
+ * metadata, no dependency or scratch directory.
  */
 function declaredOutputFault(output: unknown, scope: readonly string[]): string | undefined {
   if (typeof output !== 'string' || !output.trim()) return 'is not a nonempty path string'
@@ -450,58 +313,6 @@ export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[]
     throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
   return [...outputs as string[]]
-}
-
-export interface IgnoredPath { path: string; source: string; line: number; pattern: string }
-
-/**
- * Deliverable paths that the workspace's effective ignore rules would hide from
- * capture. `git check-ignore` without `-v` lists exactly the hidden paths, so a
- * later `!` negation is never reported (verbose mode does report the negation
- * pattern and would falsely reject an un-ignored deliverable). The verbose run
- * only supplies the source, line and pattern for the paths already known to be
- * hidden, and is silent when the workspace is not a git work tree or git is
- * unavailable. That silence is right for an advisory admission hint; the
- * capture gate that relies on this list passes `onFailure` so a run that did
- * not complete (git missing, exit 128, timeout) is surfaced instead of reading
- * as "nothing is ignored".
- */
-export function ignoredDeliverablePaths(workspace: string, paths: readonly string[], onFailure?: (reason: string) => void): IgnoredPath[] {
-  const candidates = [...new Set(paths.map(path => path.replace(/^\.\//, '')).filter(path => path && !path.endsWith('/') && !isAbsolute(path) && !path.includes('*') && !path.split('/').some(part => part === '..')))]
-  if (!candidates.length) return []
-  const input = candidates.map(candidate => `${candidate}\0`).join('')
-  const run = (args: string[]) => spawnSync('git', ['-C', workspace, 'check-ignore', '--stdin', ...args], { input, encoding: 'utf8', timeout: 5000, maxBuffer: 1048576 })
-  const ignored = run(['-z'])
-  // Exit 1 means no candidate is ignored; 128 means git or a work tree is unavailable. Neither is an admission failure.
-  if (ignored.error !== undefined || ignored.status === null || ignored.status > 1) {
-    onFailure?.(`git check-ignore did not complete in ${workspace}: ${ignored.error !== undefined ? ignored.error.message : ignored.status === null ? `terminated by ${ignored.signal ?? 'timeout'}` : `exit ${ignored.status}${String(ignored.stderr ?? '').trim() ? ` (${String(ignored.stderr).trim()})` : ''}`}`)
-    return []
-  }
-  if (ignored.status !== 0) return []
-  const hidden = new Set(String(ignored.stdout).split('\0').filter(Boolean))
-  if (!hidden.size) return []
-  const verbose = run(['-v', '-z'])
-  if (verbose.error || verbose.status !== 0) return [...hidden].map(path => ({ path, source: '.gitignore', line: 0, pattern: '' }))
-  const fields = String(verbose.stdout).split('\0')
-  const hits: IgnoredPath[] = []
-  for (let index = 0; index + 3 < fields.length; index += 4) {
-    const source = fields[index], line = Number(fields[index + 1]), pattern = fields[index + 2], path = fields[index + 3]
-    if (!path || !hidden.has(path)) continue
-    if (pattern?.startsWith('!')) continue
-    hits.push({ path, source: source || '.gitignore', line: Number.isSafeInteger(line) ? line : 0, pattern: pattern ?? '' })
-  }
-  return hits
-}
-
-/** Advisory current-ignore inspection; text does not prove a path is an output. */
-export function reconcileDeliverableIgnores(workspace: string, objective: string, acceptance: readonly string[], location: string): AdmissionDiagnostic[] {
-  return ignoredDeliverablePaths(workspace, deliverablePaths(objective, acceptance)).map(hit => ({
-    code: 'deliverable_path_ignored',
-    severity: 'advisory',
-    location,
-    path: hit.path,
-    message: `the text names ${JSON.stringify(hit.path)}, currently ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). It may be input or a planned ignore-rule repair. If it is an output, ensure the final captured artifact includes it; this hint does not require changing the source workspace before launch.`,
-  }))
 }
 
 /**
@@ -576,6 +387,8 @@ const WORKTREE_PRESENCE = /\b(?:already\s+in|already\s+present\s+in|is\s+already
 const RESUME_PRESENCE = /\b(?:resum(?:e|es|ing)\s+from|continu(?:e|es|ing)\s+from|prepared?\s+from|start(?:s|ing)?\s+from)\b/i
 /** A weaker claim, kept only for a *named* artifact identity. */
 const AVAILABILITY_PRESENCE = /\balready\s+(?:present|available|committed|merged|checked\s+out)\b/i
+/** Sentence and line boundaries: the guard reads one clause at a time. */
+const CLAUSE_SPLIT = /(?:[.;!?]\s+|\n+)/
 const CONTENT_WORD = /\b(?:artifact|assembly|checkpoint|commit|evidence|snapshot|previous\s+attempt|prior\s+work|replaced\s+task)\b/i
 
 /** Named artifact/evidence/task identities and commit-like tokens appearing in a clause. */

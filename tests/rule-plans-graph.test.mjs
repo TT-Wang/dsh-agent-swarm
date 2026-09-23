@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { orchestratorCommands, ReplayGraphError, ReplayTruncationError } from '../lib/trace.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan, planAdvisories } from '../lib/plans.js'
-import { classifyCheck, taskCeilingExhaustion, reconcileObjectiveScope } from '../lib/admission.js'
+import { classifyCheck, taskCeilingExhaustion } from '../lib/admission.js'
 import { taskGraphIndex, selectAcceptedDelivery } from '../lib/task-graph.js'
 import { liveCarrier, proposalAllowance } from '../lib/arena.js'
 import { boardIndex, deliverableTask } from '../lib/types/client/projection.js'
@@ -127,10 +127,10 @@ test('R19 actual target scripts decide confinement; unresolved names are advisor
   assert.equal(classifyCheck('npm run verify').runnable, 'worker')
 })
 
-test('R20 reference paths advise without weakening actual scope; R10 findings preserve submission room', async t => {
+test('R20 reference paths neither refuse nor widen actual scope; R10 findings preserve submission room', async t => {
   const f = await fixture(t); f.input.tasks[0].objective = 'Update src/a.ts using docs/spec.md'
   assert.doesNotThrow(() => validatePlan(f.input))
-  assert.ok(reconcileObjectiveScope(f.input.tasks[0].objective, ['src/'], 'objective').every(item => item.severity === 'advisory'))
+  assert.ok(planAdvisories(f.input).every(item => item.code === 'check_preflight'), 'a read reference in prose yields no path hint')
   f.input.tasks[0].scope = ['../escape']; assert.throws(() => validatePlan(f.input), /scope_selector_invalid/)
   assert.equal(taskCeilingExhaustion({ maxFindings: 1, evidenceIds: ['one'], maxSteps: 10, usedSteps: 1 }), undefined)
   assert.equal(taskCeilingExhaustion({ maxSteps: 1, usedSteps: 1 }).dimension, 'maxSteps')

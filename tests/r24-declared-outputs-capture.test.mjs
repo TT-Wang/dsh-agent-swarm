@@ -3,11 +3,11 @@
  *
  * Rounds 4-19 read a task's deliverables out of its objective and acceptance
  * prose with a write-verb heuristic, and every consumer carried its own patch
- * for what the guess got wrong: an undeclared-deliverable gate
- * (`[deliverable_uncaptured]`, and `[deliverable_gate_unavailable]` when its
- * `git check-ignore` did not answer), an `uncapturedPaths` field and a
- * completion note for it, on-disk spelling for hinted names, a verify-side gate
- * and a recovery step that un-tracked preserved hints. R20 made every planned
+ * for what the guess got wrong: an undeclared-deliverable gate at submit and
+ * at verify (with a second code for when its `git check-ignore` did not
+ * answer), an artifact field listing the paths it missed and a completion note
+ * for it, on-disk spelling for hinted names, and a recovery step that
+ * un-tracked preserved hints. R20 made every planned
  * task declare `outputs`; capture now force-adds exactly the declared outputs
  * plus the `deliverables` a submission lists, and a declared output that was
  * never written is refused with `[output_missing]` while the attempt stays
@@ -189,7 +189,7 @@ test('the output_missing refusal is in the refusal inventory and satisfies its c
   assert.deepEqual(typed.map(site => [site.kind, site.errorClass, site.codes]), [['coded-throw', 'PolicyError', ['output_missing']]], 'one capture-time refusal serves submit and verify')
   assert.deepEqual(assessRefusal(typed[0], { ...schemaIndex, diagnosticProducers: diagnosticProducers([sites]) }), [], typed[0].text)
   const runtimeSites = refusalSites(await readFile(new URL('../src/runtime.ts', import.meta.url), 'utf8'), 'src/runtime.ts')
-  assert.deepEqual(runtimeSites.filter(site => site.code === 'deliverable_uncaptured'), [], 'neither submit nor verify keeps the gate on hinted names')
+  assert.deepEqual(runtimeSites.filter(site => site.code?.startsWith('deliverable_')), [], 'neither submit nor verify keeps a gate on hinted names')
 })
 
 for (const kind of ['research', 'implementation']) {

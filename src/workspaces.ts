@@ -1364,7 +1364,7 @@ export class Workspaces {
         if (await this.hasDurableCheckpoint(member, task, signal)) return
         throw Object.assign(new Error('[workspace_ownership_conflict] Cannot checkpoint a workspace owned by another task; no durable checkpoint proves the stopped task was saved. Preserve both task workspaces and inspect the task workspace records before retrying resume.'), { code: 'WORKSPACE_OWNERSHIP_CONFLICT' })
       }
-      // Older metadata has no path hints; the current task contract supplies them.
+      // Older metadata has no preservation paths; the task's declared outputs supply them.
       record.task.preservationPaths = this.taskRecoveryPaths(task)
       await this.preserveWorkspace(record, signal)
     })
@@ -1384,9 +1384,9 @@ export class Workspaces {
   /**
    * A path with a dependency directory name or the member scratch root as any
    * component is toolchain state by name alone (F4). `dependencyLinks` only
-   * sees the untracked, not-ignored entries of a worktree, so a hinted or
-   * declared `node_modules/x/README.md` inside an IGNORED dependency directory
-   * would otherwise read as an obligation, and be force-captured when declared.
+   * sees the untracked, not-ignored entries of a worktree, so a declared
+   * `node_modules/x/README.md` inside an IGNORED dependency directory would
+   * otherwise read as an obligation and be force-captured.
    */
   private toolchainName(relative: string): boolean {
     const dependencies = this.dependencyNames()
