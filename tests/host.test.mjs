@@ -24,7 +24,7 @@ function stubSystem({ listeners = {}, others = [], ignoresTerm = [], immortal = 
     signals, spawned, lsofCalls,
     lsof: args => {
       lsofCalls.push(args)
-      const pid = listeners[Number(args.find(arg => arg.startsWith('-iTCP:')).slice('-iTCP:'.length))]
+      const pid = listeners[Number(args.find(arg => arg.startsWith('-iTCP@127.0.0.1:')).slice('-iTCP@127.0.0.1:'.length))]
       if (!living.has(pid)) throw Object.assign(new Error('lsof found nothing'), { status: 1 })
       return `${pid}\n`
     },
@@ -43,7 +43,7 @@ function stubSystem({ listeners = {}, others = [], ignoresTerm = [], immortal = 
 test('findHost: the one pid lsof reports for the port; a free port is undefined; two listeners are refused', () => {
   const sys = stubSystem({ listeners: { 6101: 4242 } })
   assert.equal(findHost(6101, sys), 4242)
-  assert.deepEqual(sys.lsofCalls[0], ['-nP', '-iTCP:6101', '-sTCP:LISTEN', '-t'])
+  assert.deepEqual(sys.lsofCalls[0], ['-nP', '-iTCP@127.0.0.1:6101', '-sTCP:LISTEN', '-t'], 'only the address the host binds: a listener on ::1, 0.0.0.0 or :: is not it')
   assert.equal(findHost(6102, sys), undefined)
   assert.equal(findHost(6103, { lsof: () => '11\n11\n' }), 11, 'one process on IPv4 and IPv6 is one host')
   assert.throws(() => findHost(6103, { lsof: () => '11\n12\n' }), /port 6103 has 2 listeners \(11, 12\); stop the extra ones by hand/)

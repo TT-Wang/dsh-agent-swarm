@@ -28,9 +28,9 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const running = child => child.exitCode === null && child.signalCode === null
 const readJson = path => JSON.parse(readFileSync(path, 'utf8'))
 
-/** Independent of scripts/host.mjs on purpose. */
+/** The pid on 127.0.0.1:<port>, the host's one address. Independent of scripts/host.mjs on purpose. */
 function listener(port) {
-  const pid = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).stdout.trim()
+  const pid = spawnSync('lsof', ['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).stdout.trim()
   return pid ? Number(pid) : undefined
 }
 
@@ -72,6 +72,13 @@ async function scene(t) {
     decoy() {
       const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
       children.push(child)
+      return child
+    },
+    /** An unrelated program listening on `address`:<port>. */
+    async foreign(address) {
+      const child = spawn(process.execPath, ['-e', `setTimeout(() => process.exit(0), 120_000).unref(); require('node:http').createServer((q, r) => r.end()).listen(${port}, ${JSON.stringify(address)}, () => console.log('ready'))`], { stdio: ['ignore', 'pipe', 'inherit'] })
+      children.push(child)
+      await new Promise((resolve, reject) => { child.stdout.once('data', resolve); child.once('exit', code => reject(new Error(`the listener on ${address}:${port} exited ${code}`))) })
       return child
     },
     /** The host someone restarted by hand: it holds the port and prints its token into `log`. */
@@ -148,4 +155,25 @@ test('start-lab restarts a hand-restarted lab by its port with a fresh token; ro
   assert.deepEqual(JSON.parse(soak.stdout).checks.map(check => [check.name, check.ok]),
     [['host-alive', true], ['plugin-loaded', true], ['mounted-after-build', true], ['client-bundle-served', true]], soak.stdout)
   assert.equal(soak.code, 0)
+})
+
+test('the host is the listener on 127.0.0.1: unrelated listeners on ::1 and 0.0.0.0 are neither counted nor stopped', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
+  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log')
+  const others = [await s.foreign('::1'), await s.foreign('0.0.0.0')]
+  writeFileSync(join(s.root, 'server.json'), JSON.stringify({ status: 'running', pid: hand.pid, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness }))
+
+  const status = await s.run('round.mjs', ['status', '--lab', s.root])
+  assert.equal(status.code, 0, status.stderr)
+  assert.equal(JSON.parse(status.stdout).host.pid, hand.pid, 'the listeners on other addresses are not a second host')
+  const update = await s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '0', '--launch-timeout-ms', '20000'])
+  assert.equal(update.code, 0, update.stderr)
+  await until(() => !readdirSync(s.root).some(name => name.startsWith('.update-preview-')), 'the detached restart worker')
+  const restartLog = readFileSync(join(s.root, 'restart.log'), 'utf8')
+  assert.equal(running(hand), false, restartLog)
+  assert.ok(others.every(running), `a listener on ::1 or 0.0.0.0 never conflicts with the host and is never signalled\n${restartLog}`)
+  const server = readJson(join(s.root, 'server.json'))
+  assert.equal(server.status, 'running', restartLog)
+  assert.equal(listener(s.port), server.pid)
 })

@@ -26,10 +26,10 @@ export const system = {
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
 }
 
-/** The pid listening on the port, or undefined when the port is free. */
+/** The pid listening on 127.0.0.1:<port>, or undefined when it is free. The host binds only that address, so a listener on ::1, 0.0.0.0 or :: is never it. */
 export function findHost(port, sys = system) {
   let out
-  try { out = sys.lsof(['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']) }
+  try { out = sys.lsof(['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t']) }
   catch (error) { if (error.status === 1) return undefined; throw error } // lsof exits 1 when nothing matches
   const pids = [...new Set(out.split(/\s+/).filter(Boolean).map(Number))]
   if (pids.length > 1) throw new Error(`port ${port} has ${pids.length} listeners (${pids.join(', ')}); stop the extra ones by hand`)
