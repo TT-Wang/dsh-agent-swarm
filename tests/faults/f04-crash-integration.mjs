@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { mkdir, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { withLocalImports } from '../fixtures/local-imports.mjs'
 import { PROJECT, makeRepo, runNode, runScenario } from './harness.mjs'
 
 await runScenario({
@@ -33,9 +34,8 @@ await runScenario({
     // real round script runs from a scratch git checkout with an empty lab, so
     // the refusal does not depend on this tree having a HEAD (from a git archive
     // export promote exited 1 before it could refuse).
-    // round.mjs and the one local module it imports (the port-identified host lookup).
-    const scripts = Object.fromEntries(await Promise.all(['scripts/round.mjs', 'scripts/host.mjs'].map(async path => [path, await readFile(join(PROJECT, path), 'utf8')])))
-    const promotable = await makeRepo('swarm-faults-f4-promote', scripts)
+    // round.mjs and every local module it imports, however many there are.
+    const promotable = await makeRepo('swarm-faults-f4-promote', await withLocalImports(PROJECT, 'scripts/round.mjs'))
     const promoted = await runNode([join(promotable.source, 'scripts/round.mjs'), 'promote', '--commit', 'HEAD', '--lab', join(promotable.root, 'lab')])
     await rm(promotable.root, { recursive: true, force: true })
     assert.equal(promoted.code, 2, `I7: promote refuses without a recorded gate: ${promoted.stderr.slice(0, 400)}`)
