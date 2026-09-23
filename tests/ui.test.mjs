@@ -266,11 +266,17 @@ test('draft defaults preserve independent verification and line editing; sidebar
   input.scope = ['src/', '', ' tests/ ']
   assert.deepEqual(cleanPlan(input).scope, ['src/', 'tests/'])
   assert.deepEqual(input.scope, ['src/', '', ' tests/ '], 'normalization does not change an in-progress field')
-  // Every task shows its Outputs field, so saving an empty one declares no
-  // file, which is what launch requires each task to state.
+  // Saving never declares outputs on the owner's behalf: an Outputs field the
+  // owner never touched stays absent, so launch still refuses that task with
+  // [outputs_required] instead of admitting it as analysis-only work. A field
+  // the owner edited and cleared is an explicit empty declaration.
   input.tasks[0].outputs = [' src/value.cjs ', '']
+  assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], undefined])
+  assert.throws(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), error => error.code === 'outputs_required'
+    && error.diagnostics.map(diagnostic => diagnostic.location).join() === 'tasks[1] (review).outputs', 'the untouched task is refused at launch, and only that one')
+  input.tasks[1].outputs = ['']
   assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], []])
-  assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan saved from the editor launches')
+  assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan whose every Outputs field was set launches')
   assert.equal(fitSidebar(480, 1440), 480)
   assert.equal(fitSidebar(900, 1440), 760)
   assert.equal(fitSidebar(900, 1000), 600)
