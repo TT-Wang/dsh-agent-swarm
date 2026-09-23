@@ -527,6 +527,12 @@ test('task admission refusals reach the browser by their policy code, with the l
     `replaces ${pending.id}: that task is pending, and only blocked or cancelled work can be replaced; wait for its verdict or use swarm_handoff/challenge`,
     'replacement_source_not_blocked', 'tool_error')
   await refused({ ...research, maxRecoveryAttempts: 0 }, 'maxRecoveryAttempts must be a positive safe integer', 'task_recovery_limit_invalid', 'validation_error')
+  // No tool schema types the RPC input: a string priority or experiment used to
+  // be stored, and the client then rejected the whole mission snapshot.
+  await refused({ ...research, priority: '3' }, '[task_priority_invalid] `priority` must be an integer. Pass `priority` as an integer with `swarm_propose`, or omit it for the default, then retry.', 'task_priority_invalid', 'validation_error')
+  await refused({ ...research, priority: 2.5 }, '[task_priority_invalid] `priority` must be an integer. Pass `priority` as an integer with `swarm_propose`, or omit it for the default, then retry.', 'task_priority_invalid', 'validation_error')
+  await refused({ ...research, assigneeId: '' }, "[task_assignee_empty] `assigneeId` must be a member id; an empty string names no member and would bind the task to nobody. Omit `assigneeId` to leave the task unassigned, or pass a live member's id as `assigneeId`, then retry `swarm_propose`.", 'task_assignee_empty', 'validation_error')
+  await refused({ ...research, experiment: 'false' }, '[task_experiment_invalid] `experiment` must be a boolean. Pass `experiment` as true or false with `swarm_propose`, or omit it, then retry.', 'task_experiment_invalid', 'validation_error')
   // The browser RPC is a direct runtime caller with no tool schema in front of
   // it: a task without outputs is refused, typed, instead of being stored.
   const { outputs: _outputs, ...undeclared } = research

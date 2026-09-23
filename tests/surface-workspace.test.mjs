@@ -17,6 +17,8 @@ const plan = workspace => ({
   workstreams: [{ key: 'main', title: 'Main', objective: 'Do the work' }],
   tasks: [{ key: 'inspect', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository', kind: 'research', scope: ['src/'], acceptance: ['works'] }],
 })
+/** swarm_create takes the mission fields only; members, workstreams and tasks are not its parameters. */
+const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
 function definitions(runtime) {
   const registered = new Map()
   registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget)
@@ -39,7 +41,7 @@ test('swarm_stage/swarm_create reject a workspace whose realpath differs from ex
   await mkdir(workspace); await mkdir(other)
   const runtime = fakeRuntime()
   const tools = definitions(runtime)
-  await assert.rejects(tools.get('swarm_create').execute(plan(other), execution(workspace)), /Plan workspace must match the selected session workspace/)
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(other), execution(workspace)), /Plan workspace must match the selected session workspace/)
   assert.deepEqual(runtime.calls.created, [], 'a mismatched workspace never reaches the runtime')
   await assert.rejects(tools.get('swarm_stage').execute(plan(other), execution(workspace)), /Plan workspace must match the selected session workspace/)
   assert.deepEqual(runtime.calls.staged, [], 'a mismatched draft is never saved')
@@ -53,7 +55,7 @@ test('swarm_create/swarm_stage accept a symlinked alias of the session workspace
   const canonical = await realpath(workspace)
   const runtime = fakeRuntime()
   const tools = definitions(runtime)
-  const created = await tools.get('swarm_create').execute(plan(alias), execution(workspace))
+  const created = await tools.get('swarm_create').execute(missionFields(alias), execution(workspace))
   assert.equal(runtime.calls.created.length, 1)
   assert.equal(runtime.calls.created[0].workspace, canonical, 'the mission records the canonical workspace, not the alias')
   assert.equal(created.result.workspace, canonical)
@@ -68,7 +70,7 @@ test('planning tools fail closed when the calling session exposes no workspace',
   t.after(() => rm(directory, { recursive: true, force: true }))
   const runtime = fakeRuntime()
   const tools = definitions(runtime)
-  await assert.rejects(tools.get('swarm_create').execute(plan(directory), execution(undefined)), /session workspace/)
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(directory), execution(undefined)), /session workspace/)
   await assert.rejects(tools.get('swarm_stage').execute(plan(directory), execution(undefined)), /session workspace/)
   assert.deepEqual(runtime.calls.created, [])
   assert.deepEqual(runtime.calls.staged, [])

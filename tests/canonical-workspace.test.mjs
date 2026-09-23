@@ -32,6 +32,8 @@ const plan = workspace => ({
   workstreams: [{ key: 'main', title: 'Main', objective: 'Do the work' }],
   tasks: [{ key: 'inspect', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository', kind: 'research', scope: ['src/'], acceptance: ['works'] }],
 })
+/** swarm_create takes the mission fields only; members, workstreams and tasks are not its parameters. */
+const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
 
 test('swarm_create/swarm_stage canonicalize the workspace so delivery can apply the result', async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-canonical-')))
@@ -42,7 +44,7 @@ test('swarm_create/swarm_stage canonicalize the workspace so delivery can apply 
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const tools = definitions(runtime)
   const exec = { agent: { id: 'canonical-owner', session: { header: { cwd: workspace } } }, signal: new AbortController().signal }
-  const created = await tools.get('swarm_create').execute(plan(alias), exec)
+  const created = await tools.get('swarm_create').execute(missionFields(alias), exec)
   const mission = created.result
   assert.equal(mission.workspace, await realpath(workspace), 'the mission stores the realpath, not the model-supplied alias')
   assert.equal(await realpath(mission.workspace), mission.workspace, 'delivery.ts:65 requires a canonical source')

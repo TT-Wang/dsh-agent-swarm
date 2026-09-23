@@ -367,3 +367,171 @@ test('a representative valid call of every swarm tool passes its schema check an
     assert.ok(calls.length > 0, `${name} reached the runtime (${error?.message ?? 'ok'})`)
   }
 })
+
+/*
+ * JSON null on an optional property is an omission (d81a3fb accepted these
+ * calls with null meaning "unset"); only a field that declares null in its
+ * schema keeps it, because there null means something (changes.assigneeId).
+ */
+test('a null optional property is an omission at every nesting level, and a declared-nullable field keeps its null', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const call = (tool, args, sessionId = f.owner.sessionId) => definitions.get(tool).execute(Object.freeze(args), as(sessionId))
+    // The arguments the Harness hands a tool are frozen; the stored row equals
+    // the one the same call leaves with the property omitted.
+    const proposal = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Audit', objective: 'Audit the code', kind: 'research', scope: ['**'], acceptance: f.mission.acceptance, outputs: [] }
+    const row = id => { const { id: _id, createdAt: _at, ...rest } = f.runtime.store.get('tasks', id); return rest }
+    const omitted = row((await call('swarm_propose', proposal)).result.id)
+    for (const key of ['priority', 'experiment', 'replaces', 'maxSteps', 'maxFindings', 'assigneeId', 'reviewOf', 'dependencies', 'checks', 'assignmentMode', 'checkTimeoutMs', 'maxRecoveryAttempts']) {
+      assert.deepEqual(row((await call('swarm_propose', { ...proposal, [key]: null })).result.id), omitted, `propose ${key}: null is stored as omitted`)
+    }
+    const stream = (await call('swarm_workstream', { missionId: f.mission.id, title: 'W2', objective: 'O2', coordinatorId: null })).result
+    assert.equal(Object.hasOwn(f.runtime.store.get('workstreams', stream.id), 'coordinatorId'), false)
+    await call('swarm_message', { missionId: f.mission.id, to: 'owner', kind: 'finding', content: 'noted', topic: null, dismiss: null, replyTo: null }, f.author.sessionId)
+    const sent = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.from === f.author.id)
+    assert.equal(sent.length, 1); assert.equal(Object.hasOwn(sent[0], 'topic'), false)
+    for (const extra of [{ detail: null }, { vocabulary: null }, { trace: null }, { cursor: null }]) await call('swarm_observe', { missionId: f.mission.id, ...extra })
+    // Nested: budget.deadlineAt null keeps the recorded deadline, as omitting it does.
+    const deadlineAt = Date.now() + 3_600_000
+    f.runtime.updateBudget(f.owner, f.mission.id, { ...f.mission.budget, deadlineAt }, 'set a deadline')
+    await call('swarm_budget', { missionId: f.mission.id, reason: 'raise', budget: { ...f.mission.budget, maxTokens: 900_000, deadlineAt: null } })
+    assert.deepEqual([f.runtime.store.get('missions', f.mission.id).budget.maxTokens, f.runtime.store.get('missions', f.mission.id).budget.deadlineAt], [900_000, deadlineAt])
+    // A member's publish and handoff.
+    const task = f.propose({ title: 'Work' })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.workers.callbacks.toolRun(f.author.id, { tool: 'bash', arguments: { command: 'ls' }, result: { exitCode: 0 }, isError: false })
+    const runId = f.runtime.observe(f.actor(f.author), f.mission.id).toolRuns[0].id
+    const evidence = (await call('swarm_publish', { missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, claim: 'c', outcome: 'supported', toolRunIds: [runId], supersedes: null }, f.author.sessionId)).result
+    assert.deepEqual(f.runtime.store.get('evidence', evidence.id).supersedes, [])
+    await call('swarm_handoff', { missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, to: null, summary: 'Checkpointed' }, f.author.sessionId)
+    const handed = f.runtime.store.get('tasks', task.id)
+    assert.equal(Object.hasOwn(handed, 'assigneeId'), false, 'to: null releases to the ready queue, as omitting it does')
+    assert.equal(handed.plannedAssigneeId, f.author.id)
+    // changes.assigneeId declares null: it is kept and releases the binding.
+    const bound = f.propose({ title: 'Bound' })
+    const nullableSchema = definitions.get('swarm_control').parameters.properties.changes.properties.assigneeId
+    assert.deepEqual(nullableSchema.oneOf, [{ type: 'string' }, { type: 'null' }]); assert.match(nullableSchema.description, /null or an empty string releases/)
+    await call('swarm_control', { missionId: f.mission.id, taskId: bound.id, action: 'amend', reason: 'release', changes: { assigneeId: null, maxSteps: null } })
+    assert.equal(f.runtime.store.get('tasks', bound.id).assigneeId, undefined, 'changes.assigneeId null still releases')
+    assert.equal(f.runtime.store.get('tasks', bound.id).maxSteps, bound.maxSteps, 'changes.maxSteps null is an omission')
+    // Mission control with null optional fields; a null required field is still refused.
+    await call('swarm_control', { missionId: f.mission.id, action: 'pause', reason: 'r', coordinatorId: null, changes: null, timeoutMs: null, taskId: null, requestId: null })
+    assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'paused')
+    const schemaIndex = await toolSchemaIndex()
+    await assert.rejects(call('swarm_claim', { missionId: f.mission.id, taskId: null }, f.author.sessionId), refusedBySchema(schemaIndex, 'swarm_claim', '`taskId` must be a string'))
+    await assert.rejects(call('swarm_control', { missionId: f.mission.id, taskId: bound.id, action: 'amend', reason: 'r', changes: { assigneeId: 7 } }),
+      refusedBySchema(schemaIndex, 'swarm_control', '`changes`.`assigneeId` must be a string or null'))
+  } finally { await f.cleanup() }
+})
+
+test('a null optional plan field is an omission inside launch and stage tasks and members', async () => {
+  const launched = [], staged = []
+  const definitions = new Map()
+  const runtime = { config: {}, starts: () => [{ id: 'request_1', workspace: '/workspace' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, createDraft(_actor, plan) { staged.push(plan); return { id: 'draft_1', revision: 1, status: 'draft' } }, snapshot: () => undefined }
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
+  const workspace = await realpath(tmpdir())
+  const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1, maxSteps: null, maxFindings: null, priority: null, experiment: null, reviewOf: null, dependencies: null, checks: null }
+  const plan = { title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget: { ...budget, deadlineAt: null },
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000, name: null, provider: null }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }], tasks: [task] }
+  const exec = { agent: { id: 'owner', session: { header: { cwd: workspace } } }, signal: new AbortController().signal }
+  await definitions.get('swarm_launch').execute(Object.freeze({ ...plan, requestId: 'request_1', planningEpoch: null }), exec)
+  await definitions.get('swarm_stage').execute(Object.freeze({ ...plan, workspace }), exec)
+  for (const [where, received] of [['launch', launched[0].tasks[0]], ['stage', staged[0].tasks[0]]]) {
+    for (const key of ['maxSteps', 'maxFindings', 'priority', 'experiment', 'reviewOf', 'dependencies', 'checks']) assert.notEqual(received[key], null, `${where} ${key}`)
+  }
+  assert.equal(launched[0].tasks[0].ceilingProvenance.maxSteps.source, 'default', 'a null ceiling takes the admission default')
+  assert.equal(launched[0].budget.deadlineAt, undefined)
+  assert.equal(typeof launched[0].members[0].name, 'string', 'a null name takes the host-assigned name')
+  assert.equal(Object.hasOwn(staged[0].budget, 'deadlineAt'), false)
+})
+
+/*
+ * Every swarm schema declares additionalProperties: false, and the check now
+ * enforces it: a misspelled key used to be admitted and silently dropped.
+ */
+test('an undeclared key is refused by name with the keys that object accepts, at the top level and nested', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const schemaIndex = await toolSchemaIndex()
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const source = f.propose({ title: 'Source' })
+    const tasks = f.runtime.store.list('tasks', f.mission.id).length
+    // A typo'd dependency key was admitted with no dependency at all.
+    await assert.rejects(definitions.get('swarm_propose').execute({ missionId: f.mission.id, workstreamId: f.stream.id, title: 'Follow-on', objective: 'Extend the change once Source lands', kind: 'implementation',
+      scope: ['**'], acceptance: f.mission.acceptance, outputs: [], checks: ['test -d .'], dependsOn: [source.id] }, as(f.owner.sessionId)),
+    refusedBySchema(schemaIndex, 'swarm_propose', '"dependsOn" is not a parameter (accepted: `missionId`, `workstreamId`, `title`, `objective`, `kind`, `dependencies`,'))
+    assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasks, 'nothing was admitted')
+    // swarm_budget used to forward the whole taskBudget to controlTask, so a
+    // structural key (assignee, scope) was applied through the budget tool.
+    await assert.rejects(definitions.get('swarm_budget').execute({ missionId: f.mission.id, taskId: source.id, reason: 'raise', taskBudget: { maxSteps: 20, assigneeId: '', scope: ['src/'] } }, as(f.owner.sessionId)),
+      refusedBySchema(schemaIndex, 'swarm_budget', '"assigneeId", "scope" are not fields of `taskBudget` (accepted: `maxSteps`, `maxFindings`, `maxRecoveryAttempts`, `checkTimeoutMs`)'))
+    const unchanged = f.runtime.store.get('tasks', source.id)
+    assert.deepEqual([unchanged.assigneeId, unchanged.scope, unchanged.maxSteps], [f.author.id, ['**'], source.maxSteps])
+    await definitions.get('swarm_budget').execute({ missionId: f.mission.id, taskId: source.id, reason: 'raise', taskBudget: { maxSteps: 20 } }, as(f.owner.sessionId))
+    assert.equal(f.runtime.store.get('tasks', source.id).maxSteps, 20)
+    assert.equal(f.runtime.store.get('tasks', source.id).assigneeId, f.author.id)
+  } finally { await f.cleanup() }
+  const schemaIndex = await toolSchemaIndex()
+  const { calls, definitions } = recordingTools()
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1 }
+  await assert.rejects(definitions.get('swarm_launch').execute({ requestId: 'request_1', title: 'P', objective: 'O', scope: ['**'], acceptance: ['works'], budget: { ...budget, maxCost: 1 },
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 1000 }], workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }], tasks: [{ ...task, dependsOn: ['task_0'] }] }, exec),
+  refusedBySchema(schemaIndex, 'swarm_launch', '"maxCost" is not a field of `budget` (accepted: `maxTokens`,', '"dependsOn" is not a field of `tasks`[0] (accepted: `key`, `workstreamKey`,'))
+  await assert.rejects(definitions.get('swarm_control').execute({ missionId: 'mission_1', taskId: 'task_1', action: 'amend', reason: 'r', changes: { objective: 'new' } }, exec),
+    refusedBySchema(schemaIndex, 'swarm_control', '"objective" is not a field of `changes` (accepted: `maxSteps`,'))
+  assert.deepEqual(calls, [], 'no refused call reached the runtime')
+})
+
+test('an empty member id is refused by field instead of binding work to nobody', async () => {
+  const f = await setup({ config: { tickMs: 60_000 } })
+  try {
+    const definitions = new Map()
+    registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+    const as = sessionId => ({ agent: { id: sessionId }, signal: new AbortController().signal })
+    const typed = (code, field, tool) => error => error.name === 'PolicyError' && error.code === code && error.category === 'validation_error'
+      && error.message.startsWith(`[${code}] \`${field}\` must be a member id; an empty string names no member`) && error.message.endsWith(`then retry \`${tool}\`.`)
+    const tasks = f.runtime.store.list('tasks', f.mission.id).length
+    const proposal = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Audit', objective: 'Audit the code', kind: 'research', scope: ['**'], acceptance: f.mission.acceptance, outputs: [], assigneeId: '' }
+    await assert.rejects(definitions.get('swarm_propose').execute(proposal, as(f.owner.sessionId)), typed('task_assignee_empty', 'assigneeId', 'swarm_propose'))
+    const { missionId: _missionId, ...input } = proposal
+    assert.throws(() => f.runtime.propose(f.owner, f.mission.id, input), typed('task_assignee_empty', 'assigneeId', 'swarm_propose'))
+    assert.equal(f.runtime.store.list('tasks', f.mission.id).length, tasks, 'nothing was admitted')
+    // A handoff to "" used to assign the task to member "".
+    const task = f.propose({ title: 'Work' })
+    const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await assert.rejects(definitions.get('swarm_handoff').execute({ missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, to: '', summary: 'Checkpointed' }, as(f.author.sessionId)),
+      typed('handoff_target_empty', 'to', 'swarm_handoff'))
+    const untouched = f.runtime.store.get('tasks', task.id)
+    assert.deepEqual([untouched.status, untouched.attempt?.id, untouched.assigneeId], ['running', claimed.attempt.id, f.author.id], 'the attempt is untouched')
+    // Omitting the member id is still the way to leave work unassigned.
+    await definitions.get('swarm_handoff').execute({ missionId: f.mission.id, taskId: task.id, attemptId: claimed.attempt.id, summary: 'Checkpointed' }, as(f.author.sessionId))
+    assert.equal(f.runtime.store.get('tasks', task.id).assigneeId, undefined)
+  } finally { await f.cleanup() }
+})
+
+test('swarm_budget without its conditional object and a non-object call are typed [tool_arguments_invalid] refusals naming what is missing', async () => {
+  const schemaIndex = await toolSchemaIndex()
+  const { calls, definitions } = recordingTools()
+  const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
+  const typed = (...fragments) => error => {
+    assert.equal(error.name, 'PolicyError'); assert.equal(error.code, 'tool_arguments_invalid'); assert.equal(error.category, 'validation_error')
+    assert.ok(error.message.startsWith('[tool_arguments_invalid] '), error.message)
+    for (const fragment of fragments) assert.ok(error.message.includes(fragment), `${fragment} in ${error.message}`)
+    return true
+  }
+  // Used to fail inside object() as a plain Error saying "Expected an object".
+  await assert.rejects(definitions.get('swarm_budget').execute({ missionId: 'mission_1', taskId: 'task_1', reason: 'raise' }, exec), typed('called with `taskId` but no `taskBudget`', 'Pass `taskBudget`'))
+  await assert.rejects(definitions.get('swarm_budget').execute({ missionId: 'mission_1', reason: 'raise' }, exec), typed('called with neither `budget` nor `taskId`', 'Pass `budget`'))
+  for (const message of await Promise.all([{ missionId: 'mission_1', taskId: 'task_1', reason: 'raise' }, { missionId: 'mission_1', reason: 'raise' }]
+    .map(args => definitions.get('swarm_budget').execute(args, exec).catch(error => error.message)))) assert.deepEqual(assessText(message, schemaIndex), [], message)
+  for (const value of ['{"missionId":', [], null, 7]) {
+    await assert.rejects(definitions.get('swarm_observe').execute(value, exec), typed('Expected an object: pass this tool\'s named parameters as one JSON object'))
+  }
+  assert.deepEqual(calls, [], 'no refused call reached the runtime')
+})

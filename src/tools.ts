@@ -75,8 +75,9 @@ Use swarm_propose for bounded work; repairs name replaces and inherit its accept
 export const SWARM_PROMPT = ENTRY_PROMPT
 
 type Args = Record<string, unknown>
+/** The top-level arguments guard: typed like the schema check, the other [tool_arguments_invalid] producer. */
 function object(value: unknown): Args {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
   return value as Args
 }
 function text(args: Args, key: string): string {
@@ -102,15 +103,52 @@ const schemaPath = (segments: readonly (string | number)[]): string =>
   segments.map((segment, index) => typeof segment === 'number' ? `[${segment}]` : `${index === 0 ? '' : '.'}\`${segment}\``).join('')
 
 /**
+ * A field where JSON null carries a runtime meaning of its own, published as
+ * `oneOf` the field's type or null (the Harness schema subset has no type
+ * arrays). Its description must say what null does.
+ */
+const nullable = ({ description, ...type }: JsonSchemaNode): JsonSchemaNode => ({ oneOf: [type, { type: 'null' }], ...(description === undefined ? {} : { description }) })
+const acceptsNull = (schema: JsonSchemaNode): boolean => schema.type === 'null' || (schema.oneOf ?? []).some(acceptsNull)
+
+/**
+ * JSON null on an optional property means "unset": the property is removed,
+ * at every nesting level, before the call is checked or run, exactly as if
+ * the caller had omitted it. A required property keeps its null, so the check
+ * names it, and so does a property whose schema declares null (`nullable`),
+ * where null means something at runtime. The arguments the Harness hands a
+ * tool are frozen, so this returns a copy.
+ */
+function withoutUnsetNulls(schema: JsonSchemaNode, value: unknown): unknown {
+  if (Array.isArray(value)) return schema.type === 'array' && schema.items !== undefined ? value.map(item => withoutUnsetNulls(schema.items!, item)) : value
+  if (value === null || typeof value !== 'object' || schema.type !== 'object') return value
+  const required = new Set(schema.required ?? [])
+  const properties = schema.properties ?? {}
+  return Object.fromEntries(Object.entries(value).flatMap(([key, child]) => {
+    const declared = Object.hasOwn(properties, key) ? properties[key] : undefined
+    if (declared === undefined) return [[key, child]]
+    if (child === null && !required.has(key) && !acceptsNull(declared)) return []
+    return [[key, withoutUnsetNulls(declared, child)]]
+  }))
+}
+
+const typeName = (type: string): string => type === 'null' ? 'null' : `${/^[aeiou]/.test(type) ? 'an' : 'a'} ${type}`
+
+/**
  * Every place `value` departs from `schema`: a missing required property, a
- * value outside its enum, or the wrong primitive type, recursing into declared
- * object properties and array items. An undefined property is absent, as in
- * JSON. `additionalProperties` is deliberately not checked: tool calls have
- * always tolerated undeclared keys, and the runtime refuses the ones it must
- * (`task_amendment_invalid` for unknown `changes` fields).
+ * value outside its enum, the wrong primitive type, no `oneOf` branch that
+ * fits, or a key an object with `additionalProperties: false` does not declare
+ * (every swarm schema declares it), recursing into declared object properties
+ * and array items. An undefined property is absent, as in JSON. An undeclared
+ * key is named by its JSON spelling, never backticked, beside the list of the
+ * keys that object accepts: a misspelled key (`dependsOn` for `dependencies`)
+ * used to be dropped silently, since nothing read it.
  */
 function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string | number)[], found: string[]): string[] {
   const at = () => path.length === 0 ? 'the arguments' : schemaPath(path)
+  if (schema.oneOf !== undefined) {
+    if (schema.oneOf.filter(branch => schemaViolations(branch, value, path, []).length === 0).length !== 1) found.push(`${at()} must be ${schema.oneOf.map(branch => typeName(String(branch.type))).join(' or ')}`)
+    return found
+  }
   const type = schema.type
   const typed = type === undefined ? true
     : type === 'object' ? value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -119,11 +157,15 @@ function schemaViolations(schema: JsonSchemaNode, value: unknown, path: (string 
           : type === 'number' ? typeof value === 'number' && Number.isFinite(value)
             : type === 'null' ? value === null
               : typeof value === type
-  if (!typed) { found.push(`${at()} must be ${/^[aeiou]/.test(String(type)) ? 'an' : 'a'} ${type}`); return found }
+  if (!typed) { found.push(`${at()} must be ${typeName(String(type))}`); return found }
   if (schema.enum !== undefined && !schema.enum.includes(value as never)) found.push(`${at()} must be one of ${schema.enum.map(item => JSON.stringify(item)).join(', ')}`)
   if (type === 'object') {
     const record = value as Args
     for (const key of schema.required ?? []) if (record[key] === undefined) found.push(`${schemaPath([...path, key])} is required`)
+    const declared = schema.properties ?? {}
+    const unknown = schema.additionalProperties === false ? Object.keys(record).filter(key => record[key] !== undefined && !Object.hasOwn(declared, key)) : []
+    const noun = `${path.length === 0 ? 'parameter' : 'field'}${unknown.length === 1 ? '' : 's'}${path.length === 0 ? '' : ` of ${schemaPath(path)}`}`
+    if (unknown.length) found.push(`${unknown.map(key => JSON.stringify(key)).join(', ')} ${unknown.length === 1 ? 'is not a' : 'are not'} ${noun} (accepted: ${Object.keys(declared).map(key => `\`${key}\``).join(', ')})`)
     for (const [key, child] of Object.entries(schema.properties ?? {})) if (record[key] !== undefined) schemaViolations(child, record[key], [...path, key], found)
   }
   if (type === 'array' && schema.items !== undefined) for (const [index, item] of (value as unknown[]).entries()) schemaViolations(schema.items, item, [...path, index], found)
@@ -263,7 +305,9 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
             status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
         }
         // The call is checked against this tool's own published schema before
-        // anything runs; the refused step is still traced.
+        // anything runs; the refused step is still traced. A null on an optional
+        // property is an omission, removed first (`withoutUnsetNulls`).
+        args = withoutUnsetNulls(definition.parameters, args) as Args
         try { assertToolArguments(name, definition.parameters, args) } catch (error) { await recordSpan(undefined, 'error', error); throw error }
         // H4: planning workspaces are bound to the calling session or a root the
         // human configured once, never to the model's word. The matched root is
@@ -359,13 +403,21 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     return runtime.startPlan(actor, requestId, plan, optionalInteger(a, 'planningEpoch'))
   })
   const taskBudgetSchema: JsonSchemaNode = { type: 'object', additionalProperties: false, properties: { maxSteps: positiveInteger, maxFindings: positiveInteger, maxRecoveryAttempts: positiveInteger, checkTimeoutMs: positiveInteger } }
-  const taskChangesSchema: JsonSchemaNode = { type: 'object', additionalProperties: false, properties: { ...taskBudgetSchema.properties, scope: scopeSchema, outputs: outputsSchema, dependencies: { ...strings, description: 'Complete replacement list, not additions; omitted leaves dependencies unchanged. The result reports added and removed dependencies.' }, checks: strings, assigneeId: { type: 'string', description: 'Member id; an empty string releases the binding after confirmed stop.' } } }
+  const taskChangesSchema: JsonSchemaNode = { type: 'object', additionalProperties: false, properties: { ...taskBudgetSchema.properties, scope: scopeSchema, outputs: outputsSchema, dependencies: { ...strings, description: 'Complete replacement list, not additions; omitted leaves dependencies unchanged. The result reports added and removed dependencies.' }, checks: strings, assigneeId: nullable({ type: 'string', description: 'Member id; null or an empty string releases the binding after confirmed stop.' }) } }
   register('swarm_budget', 'Owner: revise a finite mission budget, or one task allocation using taskId and taskBudget. Consumption, task identity, evidence and artifacts remain. Resource-blocked tasks continue once stop is confirmed; explicit mission pauses require resume.',
     { ...mission, budget: budgetSchema, taskId: string, taskBudget: taskBudgetSchema, reason: string }, ['missionId', 'reason'],
     (a, actor) => {
+      // The schema cannot say "taskBudget with taskId, budget without it"; name
+      // the missing object instead of failing on it as a non-object.
+      if (a.taskId !== undefined && a.taskBudget === undefined) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] swarm_budget was called with `taskId` but no `taskBudget`. Nothing ran. Pass `taskBudget` with the task\'s new ceilings, or omit `taskId` and pass `budget` for the mission, then retry swarm_budget.')
+      if (a.taskId === undefined && a.budget === undefined) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] swarm_budget was called with neither `budget` nor `taskId`. Nothing ran. Pass `budget` with every mission ceiling, or `taskId` with `taskBudget` for one task, then retry swarm_budget.')
       if (a.taskId !== undefined) {
         if (a.budget !== undefined) throw new Error('[budget_target_conflict] Update `budget` first, then call swarm_budget with `taskId` and `taskBudget` separately.')
-        return runtime.controlTask(actor, text(a, 'missionId'), text(a, 'taskId'), 'amend', object(a.taskBudget) as TaskAmendment, text(a, 'reason'))
+        // Only the declared ceilings: this tool must never amend structure
+        // (assignee, scope, dependencies, outputs) through controlTask.
+        const taskBudget = object(a.taskBudget)
+        const ceilings = Object.fromEntries(Object.keys(taskBudgetSchema.properties!).filter(key => taskBudget[key] !== undefined).map(key => [key, taskBudget[key]])) as TaskAmendment
+        return runtime.controlTask(actor, text(a, 'missionId'), text(a, 'taskId'), 'amend', ceilings, text(a, 'reason'))
       }
       return runtime.updateBudget(actor, text(a, 'missionId'), object(a.budget) as unknown as Budget, text(a, 'reason'))
     })

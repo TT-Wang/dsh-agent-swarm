@@ -27,6 +27,8 @@ const plan = (workspace, extra = {}) => ({
   tasks: [{ key: 'inspect', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository', kind: 'research', scope: ['src/'], acceptance: ['works'] }],
   ...extra,
 })
+/** swarm_create takes the mission fields only; members, workstreams and tasks are not its parameters. */
+const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
 function definitions(runtime, grants) {
   const registered = new Map()
   registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget, grants)
@@ -90,9 +92,9 @@ test('AC1: a path outside the session cwd and every configured root is refused w
   const runtime = tools.get('swarm_create')
   const calls = []
   const exec = execution(session)
-  await assert.rejects(runtime.execute(plan(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(runtime.execute(missionFields(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   await assert.rejects(tools.get('swarm_stage').execute(plan(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_create').execute(plan(join(session, '..', 'foreign')), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(join(session, '..', 'foreign')), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   assert.deepEqual(calls, [])
 })
 
@@ -108,13 +110,13 @@ test('AC2: a granted repository is accepted and the mission records the matched 
   assert.equal(loaded[0].data.path, await realpath(granted))
   assert.equal(loaded[0].data.note, 'human-approved tree')
   const tools = definitions(runtime, grants)
-  const created = await tools.get('swarm_create').execute(plan(project), execution(session))
-  const mission = runtime.store.get('missions', created.result.id)
-  assert.equal(mission.workspace, await realpath(project), 'the resolved path is recorded')
-  assert.equal(mission.workspaceGrantRoot, await realpath(granted), 'the matched root is recorded durably')
-  const bound = runtime.store.events(mission.id, 50).filter(event => event.type === 'mission/workspace-bound')
+  const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
+  const recorded = runtime.store.get('missions', created.result.id)
+  assert.equal(recorded.workspace, await realpath(project), 'the resolved path is recorded')
+  assert.equal(recorded.workspaceGrantRoot, await realpath(granted), 'the matched root is recorded durably')
+  const bound = runtime.store.events(recorded.id, 50).filter(event => event.type === 'mission/workspace-bound')
   assert.equal(bound.length, 1)
-  assert.deepEqual({ workspace: bound[0].data.workspace, grantRoot: bound[0].data.grantRoot }, { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot })
+  assert.deepEqual({ workspace: bound[0].data.workspace, grantRoot: bound[0].data.grantRoot }, { workspace: recorded.workspace, grantRoot: recorded.workspaceGrantRoot })
   assert.equal(created.result.workspaceGrantRoot, await realpath(granted), 'the tool result exposes the binding')
 })
 
@@ -133,20 +135,27 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
       assert(!properties.includes(forbidden), `${name} must not expose ${forbidden}`)
     }
   }
-  // A model-supplied wider root is ignored: the configured root wins.
-  const created = await tools.get('swarm_create').execute({ ...plan(project), workspaceGrantRoot: '/', authorizedWorkspaces: [{ path: '/' }], grants: { grants: [{ path: '/' }] } }, execution(session))
-  const mission = runtime.store.get('missions', created.result.id)
-  assert.equal(mission.workspaceGrantRoot, await realpath(granted), 'the model cannot widen the recorded root')
-  // An ungranted path stays refused even when the model supplies a root for it.
-  await assert.rejects(tools.get('swarm_create').execute({ ...plan(outside), workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  // A model-supplied root is not a parameter: the schema check refuses it by
+  // name before the workspace is bound, and nothing is created.
+  await assert.rejects(tools.get('swarm_create').execute({ ...missionFields(project), workspaceGrantRoot: '/', authorizedWorkspaces: [{ path: '/' }], grants: { grants: [{ path: '/' }] } }, execution(session)),
+    /\[tool_arguments_invalid\] swarm_create was called with arguments its parameters schema refuses: "workspaceGrantRoot", "authorizedWorkspaces", "grants" are not parameters/)
+  assert.deepEqual(runtime.store.list('missions'), [])
+  // Without them the configured root wins.
+  const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
+  const recorded = runtime.store.get('missions', created.result.id)
+  assert.equal(recorded.workspaceGrantRoot, await realpath(granted), 'the model cannot widen the recorded root')
+  // An ungranted path stays refused, and a root supplied for it never reaches the binding.
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_create').execute({ ...missionFields(outside), workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)), /\[tool_arguments_invalid\]/)
+  await assert.rejects(tools.get('swarm_stage').execute(plan(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), /\[tool_arguments_invalid\]/)
   // swarm_propose accepts no workspace and cannot re-point an existing mission.
-  const stream = runtime.workstream({ sessionId: 'owner' }, mission.id, { title: 'Main', objective: 'Main' })
-  await runtime.propose({ sessionId: 'owner' }, mission.id, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  const stream = runtime.workstream({ sessionId: 'owner' }, recorded.id, { title: 'Main', objective: 'Main' })
+  await runtime.propose({ sessionId: 'owner' }, recorded.id, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   // Extra grant-shaped arguments are ignored: the call may admit an in-mission
   // task or fail for its own reasons, but it can never re-point the mission.
-  await tools.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
-  assert.deepEqual({ workspace: runtime.store.get('missions', mission.id).workspace, root: runtime.store.get('missions', mission.id).workspaceGrantRoot }, { workspace: mission.workspace, root: mission.workspaceGrantRoot })
+  await tools.get('swarm_propose').execute({ missionId: recorded.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
+  assert.deepEqual({ workspace: runtime.store.get('missions', recorded.id).workspace, root: runtime.store.get('missions', recorded.id).workspaceGrantRoot }, { workspace: recorded.workspace, root: recorded.workspaceGrantRoot })
   // The configured set is a snapshot: mutating the caller's array cannot widen it.
   const mutable = [{ path: granted }]
   const snapshot = await loadWorkspaceGrants(mutable)
@@ -245,7 +254,7 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
   assert.throws(() => runtime.create({ sessionId: workerSession }, { title: 'Worker mission', objective: 'Escape', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }), /Workers cannot/)
   assert.throws(() => runtime.createDraft({ sessionId: workerSession }, plan(projectPath, { workspaceGrantRoot: grantedPath })), /Workers cannot/)
   const tools = definitions(runtime, grants)
-  await assert.rejects(tools.get('swarm_create').execute(plan(projectPath), execution(session, workerSession)), /Workers cannot/)
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(projectPath), execution(session, workerSession)), /Workers cannot/)
   // Another owner session of this install cannot re-point the mission, and
   // cannot launch the owner's draft.
   const draft = runtime.createDraft(owner, plan(projectPath, { workspaceGrantRoot: grantedPath }))
