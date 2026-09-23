@@ -65,10 +65,13 @@ class ProdShapeWorkers {
   failStart = new Map()
   constructor(root, subprocess = subprocessSeam) {
     // Same option shape as src/harness-workers.ts: the fallback and cleanup
-    // reports reach the bound runtime callbacks, nothing else is wired.
+    // reports reach the bound runtime callbacks, nothing else is wired. The
+    // callbacks are the whole channel (`Workspaces` keeps no in-memory mirror),
+    // so the test also records every report it was handed, in order.
+    this.reports = { fallbacks: [], cleanups: [] }
     this.workspaces = new Workspaces({ subprocess, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
-      onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info),
-      onCleanupFailure: info => this.callbacks?.verificationCleanupFailure?.(info) })
+      onRecoveryFallback: info => { this.reports.fallbacks.push(info); this.callbacks?.recoveryFallback?.(info) },
+      onCleanupFailure: info => { this.reports.cleanups.push(info); this.callbacks?.verificationCleanupFailure?.(info) } })
   }
   bind(callbacks) { this.callbacks = callbacks }
   async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
@@ -174,7 +177,7 @@ test('A. lease expiry (production stop barrier): no fallback, the replacement in
   await eventually(() => f.events(f.runtime).find(e => e.type === 'task/checkpoint-failed'), 'lease-expiry checkpoint failure audited')
   await f.reviewerTookOver(f.runtime)(task.id)
   const reviewerWs = f.runtime.store.get('members', f.reviewer.id).workspace
-  assert.equal(f.workers.workspaces.recoveryFallbacks().length, 0, 'the stop barrier preserved WIP first; the fallback is never reached')
+  assert.equal(f.workers.reports.fallbacks.length, 0, 'the stop barrier preserved WIP first; the fallback is never reached')
   assert.deepEqual(f.events(f.runtime).filter(e => e.type === 'task/recovery-fallback'), [])
   assert.equal(f.current(f.runtime)(task.id).recovery, undefined)
   assert.equal(await readFile(join(reviewerWs, 'src', 'answer.txt'), 'utf8'), 'in-scope partial\n')
@@ -204,9 +207,9 @@ test('B. host restart + provider outage re-route: the replacement inherits the p
   assert.equal(record.memberId, f.reviewer.id)
   assert.equal(record.task.recovery.commit, snapshot)
   assert.equal(record.task.recovery.preserved, true)
-  const fallbacks = f.workers2.workspaces.recoveryFallbacks()
+  const fallbacks = f.workers2.reports.fallbacks
   assert.equal(fallbacks.length, 1)
-  assert.match(fallbacks[0], /outside task scope/)
+  assert.match(fallbacks[0].reason, /outside task scope/)
   assertSurfaced(surfacing(f.runtime2, f.mission.id, task.id, f.owner), { taskId: task.id, from: f.author.id, to: f.reviewer.id, preserved: true, commit: snapshot })
   const [notice] = surfacing(f.runtime2, f.mission.id, task.id, f.owner).notices
   assert.match(notice.content ?? JSON.stringify(notice.notice), /out-of-scope/, 'the notice tells the owner the inherited work includes what the artifact refused')
@@ -296,9 +299,9 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   const verdict = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: 'accept', reason: 'Independent review' })
   assert.equal(verdict.status, 'accepted', 'the cleanup failure never masks the check result')
   assert.equal(f.current(f.runtime)(source.id).status, 'accepted')
-  const failures = f.workers.workspaces.cleanupFailures()
-  assert.equal(failures.length, 1, failures.join('\n'))
-  assert.match(failures[0], /worktree remove refused/)
+  const failures = f.workers.reports.cleanups
+  assert.equal(failures.length, 1, JSON.stringify(failures))
+  assert.match(failures[0].reason, /worktree remove refused/)
   const verification = join(f.root, 'worktrees', f.mission.id, 'verification')
   assert.deepEqual(await readdir(verification), [], 'the fallback removal still reclaimed the checkout')
   const events = f.events(f.runtime).filter(event => event.type === 'task/verification-cleanup-failed')

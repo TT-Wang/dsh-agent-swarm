@@ -32,7 +32,7 @@ import { requireArtifactChecks } from './artifact-policy.ts'
 // ENV: the declared-check environment is authored by the host's workspace layer
 // and read here through a type-only import, so the policy module never depends
 // on the Node worktree module at runtime.
-import type { CheckAttribution, CheckEnvironment, ObservedCheck } from './workspaces.ts'
+import type { CheckAttribution, CheckEnvironment } from './workspaces.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 const terminal = (mission: Mission) => mission.status === 'stopped' || mission.status === 'completed'
@@ -557,11 +557,10 @@ function recordedCommand(argumentsValue: unknown): string | undefined {
   const command = (argumentsValue as { command?: unknown }).command
   return typeof command === 'string' && command.length > 0 ? command : undefined
 }
-/** ENV: the measured envelope plus the environment facts and observation the adapter attaches. */
+/** ENV: the measured envelope plus the environment facts the adapter attaches. */
 type DeclaredCheckEnvelope = CheckEnvelope & {
   environment?: CheckEnvironment
   selfRunEnvironment?: CheckEnvironment
-  observed?: ObservedCheck
 }
 /** ENV: the environment facts a tool run was recorded under, carried on the durable row. */
 type ToolRunWithEnvironment = ToolRun & { checkEnvironment?: CheckEnvironment; checkEnvironmentSource?: SelfRunEnvironmentProvenance }
@@ -4243,9 +4242,9 @@ export class SwarmRuntime {
   /**
    * H-3 follow-up: a disposable verification checkout could not be removed
    * after its declared checks ran. The same silent channel as the recovery
-   * fallback: `Workspaces` kept it in `cleanupFailures()` and production wired
-   * no callback, so a tree left under the mission's `verification/` directory
-   * or a stale worktree registration in the source repository reached nobody.
+   * fallback: before this wiring, a tree left under the mission's
+   * `verification/` directory or a stale worktree registration in the source
+   * repository reached nobody.
    * The check results were already returned and the verdict is decided from
    * them; this records one durable event and one owner notice naming the
    * checkout and the removal failure, so the leftover is something the owner

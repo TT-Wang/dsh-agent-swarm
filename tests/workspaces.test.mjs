@@ -372,7 +372,6 @@ test('handoff scope failure preserves previous owner files and carries them to t
   assert.notEqual(snapshot, head, 'the new owner starts from the preservation snapshot, not the bare base')
   assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD^'), head, 'the snapshot sits on the recorded base')
   assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner checkout is clean')
-  assert(workspaces.recoveryFallbacks().some(entry => entry.includes(task.id) && /outside task scope/.test(entry)), 'the fallback is recorded for the host')
   assert.equal(reports.length, 1, 'the fallback is reported once to the host callback')
   assert.deepEqual({ ...reports[0], reason: undefined }, { missionId: mission.id, taskId: task.id, epoch: 3, memberId: peer.id, previousOwnerId: member.id, commit: snapshot, preserved: true, reason: undefined })
   assert.match(reports[0].reason, /outside task scope/)
@@ -487,8 +486,9 @@ test('capture refuses symlinks that escape the member workspace and keeps contai
   assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer-link`), 'answer.txt')
 })
 
-test('verification cleanup failure never masks the check result and is recorded', async t => {
-  const { workspaces, member, task, temp } = await fixture(t)
+test('verification cleanup failure never masks the check result and is reported to the host', async t => {
+  const failures = []
+  const { workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
   const artifact = await workspaces.captureArtifact(member, task)
@@ -497,7 +497,12 @@ test('verification cleanup failure never masks the check result and is recorded'
   assert.equal(results.length, 1)
   assert.equal(results[0].exitCode, 0, JSON.stringify(results))
   assert.match(results[0].output, /checked/)
-  assert.ok(workspaces.cleanupFailures().some(issue => /cleanup failed/.test(issue)), 'the cleanup failure is recorded separately')
+  assert.equal(failures.length, 1, 'the cleanup failure is reported separately from the check result')
+  assert.equal(failures[0].missionId, task.missionId)
+  assert.equal(failures[0].taskId, task.id)
+  assert.equal(failures[0].memberId, member.id)
+  assert.match(failures[0].checkout, /verification/, 'the report names the checkout that could not be removed')
+  assert.ok(failures[0].reason.length > 0, 'the removal failure reaches the host')
   assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
 })
 

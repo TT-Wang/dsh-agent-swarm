@@ -67,9 +67,12 @@ async function fixture(t) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const workers = new RealWorkers()
+  // Every fallback report the host was handed, in order. `Workspaces` keeps no
+  // in-memory mirror of its own: the callback is the whole channel.
+  const reports = []
   // Production shape (src/harness-workers.ts): the fallback report reaches the bound runtime callbacks.
   const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
-    onRecoveryFallback: info => workers.callbacks?.recoveryFallback?.(info) })
+    onRecoveryFallback: info => { reports.push(info); workers.callbacks?.recoveryFallback?.(info) } })
   workers.workspaces = workspaces
   const runtime = new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20,
     maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
@@ -84,7 +87,7 @@ async function fixture(t) {
   const actor = member => ({ sessionId: member.sessionId })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
-  return { root, source, workspaces, workers, runtime, owner, mission, stream, author, reviewer, actor, current, events }
+  return { root, source, workspaces, workers, runtime, owner, mission, stream, author, reviewer, actor, current, events, reports }
 }
 
 test('W9: a cross-member recovery from a dirty workspace carries its preserved snapshot to the new owner instead of blocking', async t => {
@@ -117,20 +120,23 @@ test('W9: a cross-member recovery from a dirty workspace carries its preserved s
   const running = await eventually(() => {
     const current = f.current(task.id)
     if (!(current.status === 'running' && current.attempt?.ownerId === f.reviewer.id)) return undefined
-    fallbacksAtRecovery = f.workspaces.recoveryFallbacks().slice()
+    fallbacksAtRecovery = f.reports.slice()
     return current
   }, 'the task is recovered by the other member')
   assert.equal(f.current(task.id).status, 'running')
   // One distinct recovery fact, sampled at the observation above. The runtime may
-  // re-derive the same fallback on each preparation retry (and the epoch is part of
-  // the message), so the assertion is over the distinct fact, not the retry count:
-  // a second, *different* fallback for this handover would still fail here.
-  const distinctFallbacks = new Set(fallbacksAtRecovery.map(message => message.replace(/ \(epoch \d+\)/, '')))
-  assert.equal(distinctFallbacks.size, 1, `one recovery fact, not several: ${[...distinctFallbacks].join(' | ')}`)
-  const [fallback] = distinctFallbacks
-  assert.match(fallback, /outside task scope/, 'the fallback names the real reason')
-  assert.match(fallback, new RegExp(f.author.id), 'the fallback names the previous owner')
-  assert.match(fallback, new RegExp(task.id), 'the fallback names the task')
+  // re-derive the same fallback on each preparation retry (and the epoch differs
+  // between retries), so the assertion is over the distinct fact, not the retry
+  // count: a second, *different* fallback for this handover would still fail here.
+  const factOf = ({ epoch, ...rest }) => JSON.stringify(rest)
+  const distinctFallbacks = new Map(fallbacksAtRecovery.map(info => [factOf(info), info]))
+  assert.equal(distinctFallbacks.size, 1, `one recovery fact, not several: ${[...distinctFallbacks.keys()].join(' | ')}`)
+  const [fallback] = distinctFallbacks.values()
+  assert.match(fallback.reason, /outside task scope/, 'the fallback names the real reason')
+  assert.equal(fallback.previousOwnerId, f.author.id, 'the fallback names the previous owner')
+  assert.equal(fallback.memberId, f.reviewer.id, 'the fallback names the replacement')
+  assert.equal(fallback.taskId, task.id, 'the fallback names the task')
+  assert.equal(fallback.missionId, f.mission.id)
   assert.deepEqual(f.events('task/blocked'), [], 'preparation never dead-ends the task')
   const reviewerWorkspace = f.runtime.store.get('members', f.reviewer.id).workspace
   // H-3: the uncapturable worktree is snapshotted into the preservation refs and
@@ -139,7 +145,8 @@ test('W9: a cross-member recovery from a dirty workspace carries its preserved s
   const snapshot = await git(reviewerWorkspace, 'rev-parse', 'HEAD')
   assert.notEqual(snapshot, base, 'the recovered attempt inherits the preserved snapshot, not the bare base')
   assert.equal(await git(reviewerWorkspace, 'rev-parse', 'HEAD^'), base, 'the inherited snapshot sits on the recorded task base')
-  assert.match(fallback, new RegExp(snapshot), 'the fallback names the preserved snapshot the replacement inherited')
+  assert.equal(fallback.commit, snapshot, 'the fallback names the preserved snapshot the replacement inherited')
+  assert.equal(fallback.preserved, true, 'and reports that the WIP really was preserved')
   assert.equal(await git(reviewerWorkspace, 'status', '--porcelain'), '', 'the inherited checkout is clean')
   assert.equal(await readFile(join(reviewerWorkspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the replacement inherits the uncaptured work')
   assert.equal(await readFile(join(authorWorkspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is preserved untouched')

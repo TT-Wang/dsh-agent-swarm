@@ -82,19 +82,22 @@ export interface WorkspaceOptions {
   allowDependencyLinkReads?: boolean
   /**
    * Called when a disposable verification checkout cannot be removed. Cleanup
-   * failure is recorded here and never masks the check results. The adapter
+   * failure is reported here and never masks the check results. The adapter
    * forwards it to the runtime, which records the event and the owner notice
-   * (H-3 follow-up); without that wiring it reached only `cleanupFailures()`.
+   * (H-3 follow-up). Required: this callback is the ONLY reader of a cleanup
+   * failure, so an unwired construction silently loses it — that gap is a
+   * compile error rather than a quiet hole.
    */
-  onCleanupFailure?(info: VerificationCleanupFailure): void
+  onCleanupFailure(info: VerificationCleanupFailure): void
   /**
    * Called when a cross-owner recovery cannot capture the previous owner's
    * workspace as an artifact (W9). The dirty worktree is left untouched; its
    * WIP is carried to the replacement by a preservation snapshot when that
    * succeeds (H-3), and the report says which. The adapter forwards it to the
    * runtime, which records the event, the owner notice and the task summary.
+   * Required for the same reason as `onCleanupFailure`.
    */
-  onRecoveryFallback?(info: RecoveryFallback): void
+  onRecoveryFallback(info: RecoveryFallback): void
   /**
    * Human-authorized roots loaded once at plugin start. When supplied, every
    * baseline preparation, member workspace and verification checkout
@@ -107,11 +110,9 @@ export interface WorkspaceOptions {
   /**
    * R11-19: maximum declared-check executions per host process. Verifications
    * beyond the limit wait in a FIFO queue; every wait and run is measured and
-   * reported through `checkEnvelope()` / `onCheckEnvelope`. Default 2.
+   * reported through `checkEnvelope()`. Default 2.
    */
   checkConcurrency?: number
-  /** R11-19: called once per declared check with its measured wait and run time. */
-  onCheckEnvelope?(info: CheckEnvelopeSample): void
   /**
    * ENV: the confinement policy the host applies to a declared check. Defaults
    * to the contract every caller must satisfy: `workspace-write` rooted at the
@@ -130,19 +131,6 @@ export interface WorkspaceOptions {
    * spawning an unmanaged process.
    */
   subprocess?: ProcessSeamSource
-}
-/** R11-19: one declared check's measured queue wait and execution time. */
-export interface CheckEnvelopeSample {
-  memberId: string
-  taskId: string
-  command: string
-  waitMs: number
-  runMs: number
-  /** Check executions active when this one started. */
-  active: number
-  /** Checks still waiting when this one started. */
-  queued: number
-  limit: number
 }
 const DEFAULT_CHECK_CONCURRENCY = 2
 /** The stand-in checkout path a declared envelope names before a check has a real one. */
@@ -210,28 +198,19 @@ export interface CheckAttribution {
   /** True when the stored output was cut at the host's output bound. */
   outputTruncated: boolean
 }
-/** ENV: the measured facts of the most recent completed check, carried by the envelope record. */
-export interface ObservedCheck {
-  memberId: string
-  taskId: string
-  at: number
-  environment: CheckEnvironment
-  attribution?: CheckAttribution
-  /** Bounded head of the free-form output; the attribution above it is what must survive a cut. */
-  output: string
-}
 /**
- * ENV: the measured envelope plus the declared-check environment and the last
- * observation. `environment` is the declared envelope the runtime delivers to
- * the assignee and compares with the verification attempt's self-run facts:
- * blocking divergences (HOME, the user cache roots, the sandbox policy, the
- * dependency links) are the ones a self-run cannot reproduce, the existence
- * flags are advisory, because a cold cache is not a wrong environment.
+ * ENV: the measured envelope plus the declared-check environment.
+ * `environment` is the declared envelope the runtime delivers to the assignee
+ * and compares with the verification attempt's self-run facts: blocking
+ * divergences (HOME, the user cache roots, the sandbox policy, the dependency
+ * links) are the ones a self-run cannot reproduce, the existence flags are
+ * advisory, because a cold cache is not a wrong environment. The facts of a
+ * check that actually ran live on its own `CheckResult` row (`environment`,
+ * `attribution`), which is what the durable `tool_runs` record carries.
  */
 export interface DeclaredCheckEnvelope extends CheckEnvelope {
   environment: CheckEnvironment
   selfRunEnvironment: CheckEnvironment
-  observed?: ObservedCheck
 }
 /** Bounded attribution capture: names kept, and the longest name kept. */
 const MAX_ATTRIBUTED_FAILURES = 50
@@ -665,12 +644,6 @@ export async function writePrivateJson(file: string, value: unknown): Promise<vo
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }
 function commitId(value: unknown): value is string { return typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value) }
 
-/** ENV: how much of one check's free-form output the envelope record carries below its attribution. */
-const CHECK_ENVELOPE_OUTPUT_CHARS = 4000
-/** ENV: the bounded output excerpt the envelope carries after the attribution. */
-function boundedOutput(output: string): string {
-  return output.length <= CHECK_ENVELOPE_OUTPUT_CHARS ? output : `${output.slice(0, CHECK_ENVELOPE_OUTPUT_CHARS)}\n[envelope output excerpt truncated]`
-}
 /** ENV: the host process environment as a record; the fallback check env and the self-run baseline. */
 function ambientEnvironment(): Record<string, string> {
   return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
@@ -712,13 +685,8 @@ export class Workspaces {
   private readonly commonDirs = new Map<string, Promise<string>>()
   /** One in-flight self-contained artifact repository creation per mission. */
   private readonly artifactRepos = new Map<string, Promise<string>>()
-  private readonly cleanupIssues: string[] = []
-  private readonly recoveryIssues: string[] = []
   /** R11-19: one per-host semaphore over declared-check executions. */
   private readonly checks: CheckSemaphore
-  private readonly checkSamples: CheckEnvelopeSample[] = []
-  /** ENV: the most recent completed check's own environment and failure attribution. */
-  private lastCheck: ObservedCheck | undefined
   private closing = false
 
   constructor(private readonly options: WorkspaceOptions) {
@@ -730,8 +698,7 @@ export class Workspaces {
 
   /** R11-19: the host's measured check envelope (limit, active, queued, wait and run times). */
   checkEnvelope(): DeclaredCheckEnvelope {
-    return { ...this.checks.state(), environment: this.declaredCheckEnvironment(), selfRunEnvironment: this.selfRunEnvironment(),
-      ...(this.lastCheck === undefined ? {} : { observed: this.lastCheck }) }
+    return { ...this.checks.state(), environment: this.declaredCheckEnvironment(), selfRunEnvironment: this.selfRunEnvironment() }
   }
   /**
    * ENV: the environment the host's declared checks run under, computed without
@@ -790,19 +757,6 @@ export class Workspaces {
       checkCacheRoots: roots,
     }
   }
-  /** R11-19: the most recent measured checks, oldest first (bounded). */
-  checkEnvelopeSamples(): readonly CheckEnvelopeSample[] { return [...this.checkSamples] }
-  private recordCheckEnvelope(member: Member, task: Task, command: string, waitMs: number, runMs: number): void {
-    const state = this.checks.state()
-    const sample: CheckEnvelopeSample = { memberId: member.id, taskId: task.id, command, waitMs, runMs, active: state.active, queued: state.queued, limit: state.limit }
-    this.checkSamples.push(sample)
-    if (this.checkSamples.length > 100) this.checkSamples.splice(0, this.checkSamples.length - 100)
-    try { this.options.onCheckEnvelope?.(sample) } catch { /* host-side recording must not mask check results */ }
-  }
-
-  /** Non-fatal verification-checkout cleanup failures, oldest first (bounded). */
-  cleanupFailures(): readonly string[] { return [...this.cleanupIssues] }
-
   /**
    * Parse every declared check's shell syntax without executing it, through the
    * same host subprocess seam the checks themselves use. This is the preflight
@@ -823,13 +777,6 @@ export class Workspaces {
     }
     return issues
   }
-
-  /**
-   * W9 recoveries that could not capture the previous owner's workspace and
-   * re-created a clean baseline instead, oldest first (bounded). The previous
-   * owner's worktree is never modified by such a fallback.
-   */
-  recoveryFallbacks(): readonly string[] { return [...this.recoveryIssues] }
 
   private missionDir(missionId: string): string { return path.join(this.root, segment(missionId)) }
   metadataPath(missionId: string, memberId: string): string { return path.join(this.missionDir(missionId), `${segment(memberId)}.worker.json`) }
@@ -1706,13 +1653,9 @@ export class Workspaces {
     return { commit: value.task.capturedCommit, baseCommit: value.task.baseCommit, ...composition }
   }
 
-  /** Bounded, host-visible record of a W9 recovery fallback; never masks the recovery. */
+  /** Report a W9 recovery fallback to the host; never masks the recovery. */
   private recordRecoveryFallback(member: Member, task: Task, recovery: TaskRecovery): void {
-    const outcome = recovery.preserved ? `${member.id} inherited its preserved WIP snapshot ${recovery.commit}` : `started from ${recovery.commit}`
-    const message = `Recovery fallback for ${task.id} (epoch ${task.epoch}): could not capture ${recovery.previousOwnerId}'s workspace (${recovery.reason}); ${outcome}`
-    this.recoveryIssues.push(message)
-    if (this.recoveryIssues.length > 50) this.recoveryIssues.splice(0, this.recoveryIssues.length - 50)
-    try { this.options.onRecoveryFallback?.({ missionId: member.missionId, taskId: task.id, epoch: task.epoch, memberId: member.id, previousOwnerId: recovery.previousOwnerId, commit: recovery.commit, preserved: recovery.preserved, reason: recovery.reason }) }
+    try { this.options.onRecoveryFallback({ missionId: member.missionId, taskId: task.id, epoch: task.epoch, memberId: member.id, previousOwnerId: recovery.previousOwnerId, commit: recovery.commit, preserved: recovery.preserved, reason: recovery.reason }) }
     catch { /* reporting must not mask recovery */ }
   }
 
@@ -1957,7 +1900,7 @@ export class Workspaces {
         // beyond the limit waits here in FIFO order (abort-aware), and its wait is
         // measured. The adapter reports `verification` activity for the whole
         // call, so the runtime's lease renewal keeps the queued attempt alive.
-        const waitMs = await this.checks.acquire(signal)
+        await this.checks.acquire(signal)
         const startedAt = Date.now()
         release = () => this.checks.release(Date.now() - startedAt)
         // R16-B: both scoped roots are created before the check starts. The temp
@@ -1973,11 +1916,9 @@ export class Workspaces {
         const environment = this.checkEnvironment(env, checkout, true)
         environment.dependencyLinks = { ...environment.dependencyLinks, materializedPaths: linked }
         const results: CheckResult[] = []
-        let first = true
         for (const command of task.checks) {
           signal.throwIfAborted()
           const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
-          const commandStarted = Date.now()
           let result: Awaited<ReturnType<typeof runProcess>>
           try {
             result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
@@ -2005,13 +1946,6 @@ export class Workspaces {
           const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
             : { index: results.length + 1, command, ...result.attribution }
           results.push({ command, exitCode: result.exitCode, ...([124, 126, 127].includes(result.exitCode) ? { failureKind: result.exitCode === 124 ? 'timeout' as const : 'infrastructure' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
-          // ENV: the most recent completed check, whatever its verdict, so the
-          // measured envelope never carries a stale attribution from an earlier run.
-          this.lastCheck = { memberId: member.id, taskId: task.id, at: Date.now(), environment, ...(attribution === undefined ? {} : { attribution }), output: boundedOutput(output) }
-          // The queue wait belongs to the first check of this verification; the
-          // run time is the check's own execution.
-          this.recordCheckEnvelope(member, task, command, first ? waitMs : 0, Date.now() - commandStarted)
-          first = false
           if (result.exitCode !== 0) break
         }
         return results
@@ -2082,10 +2016,7 @@ export class Workspaces {
 
   private recordCleanupIssue(member: Member, task: Task, checkout: string, failure: unknown): void {
     const reason = failure instanceof Error ? failure.message : String(failure)
-    const message = `Verification checkout cleanup failed for ${checkout}: ${reason}`
-    this.cleanupIssues.push(message)
-    if (this.cleanupIssues.length > 50) this.cleanupIssues.splice(0, this.cleanupIssues.length - 50)
-    try { this.options.onCleanupFailure?.({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
+    try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */
