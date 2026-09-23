@@ -443,6 +443,33 @@ test('interrupted assembly journals recover without duplicating prior admissions
   } finally { await recovered.dispose() }
 })
 
+test('R24: plan staging and launch check declared outputs against the host-configured dependency directories', async t => {
+  const f = await fixture(t)
+  const generated = structuredClone(f.input)
+  generated.tasks[1].outputs = ['src/gen/out.txt']
+  const vendored = structuredClone(f.input)
+  vendored.tasks[1].outputs = ['src/vendor/patch.txt']
+  const refusedFor = name => error => error instanceof AdmissionError && error.code === 'output_outside_scope' && error.message.includes(`"${name}"`)
+  // The option replaces the engine default in both directions.
+  assert.doesNotThrow(() => validatePlan(generated, { launch: true }))
+  assert.throws(() => validatePlan(generated, { launch: true, dependencyDirs: ['node_modules', 'gen'] }), refusedFor('gen'))
+  assert.throws(() => validatePlan(vendored, { launch: true }), refusedFor('vendor'))
+  assert.doesNotThrow(() => validatePlan(vendored, { launch: true, dependencyDirs: ['node_modules', 'gen'] }))
+  // A draft staged under the default set is refused at launch by a host configured with gen/.
+  const draft = f.runtime.createDraft(f.owner, generated)
+  await f.runtime.dispose()
+  const configured = new SwarmRuntime({ ...f.config, verificationDependencyDirs: ['node_modules', 'gen'] }, f.workers)
+  t.after(() => configured.dispose())
+  await assert.rejects(configured.launchDraft(f.owner, draft.id, draft.revision), refusedFor('gen'))
+  assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
+  assert.throws(() => configured.createDraft(f.owner, generated), refusedFor('gen'), 'staging uses the configured set too')
+  const request = configured.requestStart(f.owner, { commandId: 'configured-dirs', goal: 'Deliver verified code', workspace: f.directory })
+  await assert.rejects(configured.startPlan(f.owner, request.id, generated), refusedFor('gen'), 'the automatic launch path uses it too')
+  const admitted = configured.createDraft(f.owner, vendored)
+  const snapshot = await configured.launchDraft(f.owner, admitted.id, admitted.revision)
+  assert.deepEqual(snapshot.tasks.find(task => task.title === 'Deliver').outputs, ['src/vendor/patch.txt'], 'a default name the host removed launches')
+})
+
 test('R24: a staged draft may omit outputs, but launch refuses each task that does not declare them', async t => {
   const f = await fixture(t)
   for (const task of f.input.tasks) delete task.outputs

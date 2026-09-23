@@ -1200,6 +1200,13 @@ export interface RuntimeConfig {
    * re-loaded at runtime.
    */
   grants?: WorkspaceGrantSnapshot
+  /**
+   * The dependency directory names the host's workspace engine treats as
+   * toolchain state (the plugin `verificationDependencyDirs`). Admission checks
+   * declared outputs against the same set capture excludes; absent means the
+   * engine default.
+   */
+  verificationDependencyDirs?: readonly string[]
 }
 
 /**

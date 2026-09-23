@@ -70,10 +70,10 @@ class Workers {
   async dispose() {}
 }
 
-async function runtimeFixture(t) {
+async function runtimeFixture(t, config = {}) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r20-outputs-')))
   const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 25,
-    maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, new Workers())
+    maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r20-outputs-owner' }
@@ -186,6 +186,19 @@ test('R24: a scope amendment that would leave a declared output outside the task
   assert.deepEqual([narrowed.scope, narrowed.outputs], [['src/'], ['src/patch.ts']])
   const widened = amend({ scope: ['src/', 'docs/'] }, 'widen again')
   assert.deepEqual([widened.scope, widened.outputs], [['src/', 'docs/'], ['src/patch.ts']])
+})
+
+test('R24: propose and amend check declared outputs against the host-configured dependency directories', async t => {
+  // The host treats gen/ as a dependency directory and no longer vendor/, so
+  // capture would skip src/gen/out.txt and capture src/vendor/patch.txt.
+  const f = await runtimeFixture(t, { verificationDependencyDirs: ['node_modules', 'gen'] })
+  const generated = error => outsideScope(error) && /"gen"/.test(error.message)
+  assert.throws(() => f.propose('Generated', { outputs: ['src/gen/out.txt'] }), generated, 'propose refuses a configured dependency name')
+  const vendored = f.propose('Vendored patch', { outputs: ['src/vendor/patch.txt'] })
+  assert.deepEqual(f.runtime.store.get('tasks', vendored.id).outputs, ['src/vendor/patch.txt'], 'a default name the host removed is ordinary work')
+  const amend = changes => f.runtime.controlTask(f.owner, f.mission.id, vendored.id, 'amend', changes, 'adjust the declaration')
+  assert.throws(() => amend({ outputs: ['src/gen/out.txt'] }), generated, 'an outputs amendment is checked against the same set')
+  assert.deepEqual(amend({ scope: ['src/'] }).outputs, ['src/vendor/patch.txt'], 'a scope amendment re-checks the stored outputs against the same set')
 })
 
 test('R20: the host-created automatic review declares no outputs', async t => {

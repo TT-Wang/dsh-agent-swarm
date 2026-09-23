@@ -71,6 +71,11 @@ export interface PlanValidationOptions {
    * staged draft may omit it; the launch that would store the task may not.
    */
   launch?: boolean
+  /**
+   * The host-configured dependency directory names declared outputs may not
+   * name (`verificationDependencyDirs`); omitted means the engine default.
+   */
+  dependencyDirs?: readonly string[]
 }
 
 /** Fail before any workers or worktrees are created. Returns a detached canonical plan. */
@@ -158,7 +163,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (options.launch) throw new AdmissionError('outputs_required', 'validation_error', `[outputs_required] ${at}.outputs is required to launch. Set \`outputs\` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.`, `${at}.outputs`)
         return
       }
-      if (stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at)
+      if (stringScope) task.outputs = assertDeclaredOutputs(task.outputs, task.scope as string[], at, { dependencyDirs: options.dependencyDirs })
     })
     inspectAdmission(() => { if (task.maxRecoveryAttempts !== undefined && (!Number.isSafeInteger(task.maxRecoveryAttempts) || Number(task.maxRecoveryAttempts) < 1)) throw new AdmissionError('plan_recovery_limit_invalid', 'validation_error', `${at}.maxRecoveryAttempts must be a positive safe integer`, `${at}.maxRecoveryAttempts`) })
     inspectAdmission(() => { if (task.checkTimeoutMs !== undefined && (!Number.isSafeInteger(task.checkTimeoutMs) || Number(task.checkTimeoutMs) < 1 || Number(task.checkTimeoutMs) > 2147483647)) throw new AdmissionError('plan_check_timeout_invalid', 'validation_error', `${at}.checkTimeoutMs must be a positive integer within the platform timer range`, `${at}.checkTimeoutMs`) })

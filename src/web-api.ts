@@ -131,13 +131,13 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
   return header
 }
 
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, launching = false): Promise<PlanInput> {
+async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined, launching = false): Promise<PlanInput> {
   const input = object(body.input)
   const authorization = await canonicalWorkspace(text(input, 'workspace'), header, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
   // The host-derived root always overrides any client-supplied value, so a
   // browser payload cannot widen its own authorization anchor.
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching }), true)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching, dependencyDirs }), true)
   await validateModels(ctx, header.id, plan.members, signal, launching)
   return plan
 }
@@ -306,9 +306,9 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'discard-draft': {
           const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }
@@ -322,7 +322,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
             return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, draft.id, revision(body))) } }
           }
           if (ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
-          if (draft !== undefined) await planInput(ctx, { input: draft.input }, header, signal, grants, true)
+          if (draft !== undefined) await planInput(ctx, { input: draft.input }, header, signal, grants, runtime.config.verificationDependencyDirs, true)
           return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body))) } }
         }
         case 'control': {

@@ -113,6 +113,7 @@ test('registered launch accepts omitted member names and forwards canonical iden
   const definitions = new Map(), launched = []
   const snapshot = { mission: { id: 'named-mission' } }
   const runtime = {
+    config: {},
     starts: () => [{ id: 'named-request', workspace: '/workspace' }],
     async startPlan(_actor, requestId, plan) { launched.push({ requestId, plan }); return snapshot },
     snapshot: () => snapshot,
@@ -158,7 +159,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
     checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
   t.after(() => workspaces.dispose())
-  const runtime = { starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
+  const runtime = { config: {}, starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
     const declared = declaredPlanChecks(plan.tasks)
     const issues = await workspaces.checkSyntaxPreflight(declared.map(check => check.command), workspace)
     if (issues.length) throw new Error(`[check_syntax_invalid] ${checkSyntaxDetail(declared, issues)}`)
