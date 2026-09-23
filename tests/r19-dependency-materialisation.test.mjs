@@ -119,7 +119,7 @@ test('R19-H2: an escaping dependency link defers the review as infrastructure, a
   assert.deepEqual(await verificationCheckouts(f.repo.root), [])
 })
 
-test('R19-H2: a dangling dependency root is the same typed error, and the checkout is cleaned up', async t => {
+test('R19-H2: a dangling dependency root is the same typed error, returned as a preparation row, and the checkout is cleaned up', async t => {
   const repo = await makeRepo('r19-h2-dangling', { 'src/answer.txt': 'base\n', '.gitignore': 'node_modules\n' })
   await symlink(join(repo.root, 'missing-installation'), join(repo.source, 'node_modules'))
   const workspaces = new Workspaces(workspaceOptions(repo.root))
@@ -130,7 +130,8 @@ test('R19-H2: a dangling dependency root is the same typed error, and the checko
   await workspaces.prepareTask(member, task, [])
   await writeFile(join(member.workspace, 'src', 'answer.txt'), 'changed\n')
   const artifact = await workspaces.captureArtifact(member, task)
-  await assert.rejects(workspaces.verifyArtifact(member, task, artifact), error => {
+  // The materialisation seam throws the typed error ...
+  await assert.rejects(workspaces.linkDependencyDirs(repo.source, join(repo.root, 'probe'), new AbortController().signal), error => {
     assert.ok(error instanceof DependencyMaterialisationError)
     assert.equal(error.name, 'DependencyMaterialisationError')
     assert.match(error.message, /^\[dependency_directory_unavailable\]/)
@@ -138,6 +139,12 @@ test('R19-H2: a dangling dependency root is the same typed error, and the checko
     assert.deepEqual(error.cause, { dependency: 'node_modules' })
     return true
   })
+  // ... and verification returns it as the preparation row the declared-check layer defers on.
+  const results = await workspaces.verifyArtifact(member, task, artifact)
+  assert.deepEqual(results.map(result => [result.command, result.exitCode, result.failureKind]), [['(verification preparation)', 125, 'infrastructure']])
+  assert.match(results[0].output, /^Host verification could not execute: DependencyMaterialisationError: \[dependency_directory_unavailable\]/)
+  assert.match(results[0].output, /\(dependency: node_modules\)/)
+  assert.match(results[0].output, /verificationDependencyDirs/)
   assert.deepEqual(await verificationCheckouts(repo.root), [], 'the checkout is removed on the failure path')
   assert.equal(workspaces.checkEnvelope().completed, 0, 'no check slot was consumed by the refused preparation')
 })

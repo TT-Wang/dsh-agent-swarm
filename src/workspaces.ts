@@ -503,6 +503,16 @@ class ProcessTimeoutError extends Error {
 }
 
 /**
+ * The row for a declared check the host could not execute: exit 124 when the
+ * host's own deadline stopped the preparation, otherwise 125, with the failure
+ * kind the declared-check layer defers on instead of rejecting the artifact.
+ */
+function unexecutedCheck(command: string, error: unknown): CheckResult {
+  const timeout = error instanceof ProcessTimeoutError
+  return { command, exitCode: timeout ? 124 : 125, failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }
+}
+
+/**
  * R19-H2: the two documented ways out of a dependency directory the host cannot
  * copy, written for the operator who reads them from a deferred review. The
  * link opt-in trades the R11-13 read boundary for the real toolchain; the
@@ -514,9 +524,10 @@ const DEPENDENCY_MATERIALISATION_REPAIR = 'Install self-contained dependencies, 
  * R19-H2: a dependency directory that cannot be materialised into the clean
  * checkout. No declared command has run, so this is a host-environment
  * condition (a pnpm/npm workspace symlink farm, a dangling install link), not a
- * verdict on the artifact. It carries no errno `code`; the declared-check layer
- * recognises it by name and defers the review with a durable record instead of
- * letting it escape `swarm_verify` as a bare throw.
+ * verdict on the artifact. `verifyArtifact` returns it as a `(verification
+ * preparation)` infrastructure row, so the declared-check layer defers the
+ * review with a durable record instead of letting it escape `swarm_verify` as a
+ * bare throw.
  */
 export class DependencyMaterialisationError extends Error {
   constructor(code: 'dependency_copy_escape' | 'dependency_directory_unavailable', detail: string, dependency: string) {
@@ -1887,19 +1898,28 @@ export class Workspaces {
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
       let release: (() => void) | undefined
       try {
-        await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
-        await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
-        // R19-M-d: the toolchain copy can be a whole node_modules and has no
-        // deadline of its own, so it lands before the slot is taken. A slow or
-        // refused copy then neither idles a slot another verification is queued
-        // for nor counts against the check deadline and the measured run time,
-        // which both start with the command.
-        const linked = await this.linkDependencyDirs(mission.source, checkout, signal)
-        // R11-19: declared-check executions are bounded per host. A verification
-        // beyond the limit waits here in FIFO order (abort-aware), and its wait is
-        // measured. The adapter reports `verification` activity for the whole
-        // call, so the runtime's lease renewal keeps the queued attempt alive.
-        await this.checks.acquire(signal)
+        let linked: string[]
+        try {
+          await mkdir(path.dirname(checkout), { recursive: true, mode: 0o700 })
+          await this.worktreeAdd(mission.source, checkout, artifact.commit, signal)
+          // R19-M-d: the toolchain copy can be a whole node_modules and has no
+          // deadline of its own, so it lands before the slot is taken. A slow or
+          // refused copy then neither idles a slot another verification is queued
+          // for nor counts against the check deadline and the measured run time,
+          // which both start with the command.
+          linked = await this.linkDependencyDirs(mission.source, checkout, signal)
+          // R11-19: declared-check executions are bounded per host. A verification
+          // beyond the limit waits here in FIFO order (abort-aware), and its wait is
+          // measured. The adapter reports `verification` activity for the whole
+          // call, so the runtime's lease renewal keeps the queued attempt alive.
+          await this.checks.acquire(signal)
+        } catch (error) {
+          // No declared command has run: whatever stopped the host preparing the
+          // checkout (a git exit, a dependency copy, a full disk) is the host's,
+          // not a verdict on the artifact. Cancellation stays cancellation.
+          if (signal.aborted) throw error
+          return [unexecutedCheck('(verification preparation)', error)]
+        }
         const startedAt = Date.now()
         release = () => this.checks.release(Date.now() - startedAt)
         // R16-B: both scoped roots are created before the check starts. The temp
@@ -1917,15 +1937,22 @@ export class Workspaces {
         const results: CheckResult[] = []
         for (const command of task.checks) {
           signal.throwIfAborted()
-          const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
           let result: Awaited<ReturnType<typeof runProcess>>
           try {
+            const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
             result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
           } catch (error) {
             // A check's own deadline is a failed execution, so the declared-check
             // layer can durably record this pass and retry it. Caller cancellation
             // remains cancellation, including when it arrives during timeout drain.
-            if (!(error instanceof ProcessTimeoutError)) throw error
+            if (!(error instanceof ProcessTimeoutError)) {
+              if (signal.aborted) throw error
+              // F-29: a confinement the host refused (partial enforcement) or a
+              // command the seam could not start never ran; record it as this
+              // command's infrastructure row, never as an assertion failure.
+              results.push(unexecutedCheck(command, error))
+              break
+            }
             signal.throwIfAborted()
             const captured = new ProcessOutput(this.options.maxCheckOutputBytes, false)
             captured.push(Buffer.from(`[swarm] ${error.message}\n`))

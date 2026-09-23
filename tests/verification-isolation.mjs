@@ -82,6 +82,9 @@ async function fixture(t, options = {}) {
 const runCheck = async (workspaces, member, task, artifact, command) => {
   const results = await workspaces.verifyArtifact(member, { ...task, checks: [command] }, artifact)
   assert.equal(results.length, 1, JSON.stringify(results))
+  // A refused confinement is now an infrastructure row rather than a throw; a
+  // non-zero row must be the sandbox's denial of a check that ran, never that.
+  assert.doesNotMatch(results[0].output, /^Host verification could not execute: /, `the check did not run: ${JSON.stringify(results[0])}`)
   return results[0]
 }
 
