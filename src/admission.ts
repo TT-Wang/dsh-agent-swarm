@@ -398,6 +398,12 @@ export interface DependencyAssumptionContext {
   replaces?: readonly string[]
   /** Durable task ids, artifact commits and evidence ids this mission already holds. */
   knownContents?: ReadonlySet<string>
+  /**
+   * The dependency set is an owner amendment of an admitted task
+   * (`swarm_control` `changes.dependencies`), whose text can no longer change,
+   * so the diagnostic names the amendment's exits instead of a new proposal's.
+   */
+  amendment?: boolean
 }
 
 /** A clause that claims prior work is already available in the worktree. */
@@ -423,14 +429,22 @@ export function namedContentTokens(text: string): string[] {
 /**
  * The coded diagnostic for one clause that assumes content no dependency
  * carries. `known` is the caller's answer to "does this mission already hold
- * that content"; undefined names both executable exits.
+ * that content"; undefined names both executable exits. `amendment` is an owner
+ * amendment of an admitted task's dependencies: its objective and acceptance
+ * are fixed, so the exits are the amendment itself or a withdrawal.
  */
-export function dependencyAssumptionDiagnostic(named: string, field: string, clause: string, location: string, known?: boolean): AdmissionDiagnostic {
+export function dependencyAssumptionDiagnostic(named: string, field: string, clause: string, location: string, known?: boolean, amendment = false): AdmissionDiagnostic {
   const provenance = known === true
     ? 'That content exists in this mission, so a dependency edge is what carries it into a prepared worktree.'
     : known === false
       ? 'That content is not in the mission baseline, so the worktree will not contain it.'
       : 'No declared dependency carries that content into the prepared worktree.'
+  if (amendment) return {
+    code: 'dependency_assumption_missing',
+    location,
+    path: named,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but this amendment leaves the task no dependency that carries it. ${provenance} Keep the task that carries that content in \`changes\` \`dependencies\` and retry \`swarm_control\` with the same \`taskId\`, or withdraw the task with \`swarm_cancel\` and propose it again with \`swarm_propose\`, stating in \`objective\` how it obtains that content. The task is unchanged.`,
+  }
   return {
     code: 'dependency_assumption_missing',
     location,
@@ -473,7 +487,7 @@ export function dependencyAssumptions(task: DependencyAssumptionInput, location:
       const named = tokens[0] ?? replaced[0] ?? (/(?:artifact|assembly|checkpoint|commit|evidence|snapshot)/i.exec(clause)?.[0] ?? 'the assumed prior work')
       if (seen.has(named)) continue
       seen.add(named)
-      found.push(dependencyAssumptionDiagnostic(named, field, clause.trim(), location, context.knownContents === undefined ? undefined : context.knownContents.has(named)))
+      found.push(dependencyAssumptionDiagnostic(named, field, clause.trim(), location, context.knownContents === undefined ? undefined : context.knownContents.has(named), context.amendment === true))
     }
   }
   return found

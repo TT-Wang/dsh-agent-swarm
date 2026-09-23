@@ -351,6 +351,35 @@ test('R12-F9: the diagnostic distinguishes "add the dependency" from "state how 
   }
 })
 
+test('R12-F9: an owner amendment that strips the content-carrying edge is refused at the call and leaves the row unchanged', async () => {
+  // The one live path that bypasses admission: propose() admitted this task
+  // because its dependency carries the artifact its objective resumes from, and
+  // `swarm_control` `changes.dependencies` could replace that list with [].
+  const f = await setup({ config: { tickMs: 10_000 } })
+  try {
+    const source = f.propose({ title: 'Source work', objective: 'Implement the scoped change in src/answer.txt.' })
+    const resumed = f.propose({ title: 'Resume prior work', objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [source.id] })
+    const before = structuredClone(f.runtime.store.get('tasks', resumed.id))
+    const amendedBefore = events(f.runtime, f.mission.id, 'task/amended').length
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, resumed.id, 'amend', { dependencies: [] }, 'drop the edge'), error => {
+      assert.equal(error.name, 'AdmissionError')
+      assert.equal(error.code, DEPENDENCY_ASSUMPTION_CODE)
+      assert.equal(error.category, 'tool_error', 'the category plan validation gives the same code')
+      assert.match(error.message, /^\[dependency_assumption_missing\] task "task_[^"]+": /)
+      assert.ok(error.message.includes('09883f3'), 'the diagnostic names the content it objects to')
+      assert.match(error.message, /`swarm_control`/, 'the exit is the amendment itself')
+      assert.deepEqual(lintRefusal(error.message), [], 'the refusal resolves through the refusal lint')
+      return true
+    })
+    assert.deepEqual(f.runtime.store.get('tasks', resumed.id), before, 'the refused amendment writes nothing')
+    assert.equal(events(f.runtime, f.mission.id, 'task/amended').length, amendedBefore, 'no amendment is recorded')
+    // An amendment that keeps a content-carrying edge is still admitted.
+    const other = f.propose({ title: 'Other source', objective: 'Implement the other scoped change in src/answer.txt.' })
+    const kept = f.runtime.controlTask(f.owner, f.mission.id, resumed.id, 'amend', { dependencies: [other.id] }, 'retarget the edge')
+    assert.deepEqual(kept.dependencies, [other.id])
+  } finally { await f.cleanup() }
+})
+
 test('R12-F9: the dispatch path is a backstop — a row admitted before the guard is refused before preparation', async () => {
   // Admission now refuses this text at propose() (S4r-D3). The dispatch check
   // remains as defence in depth for a row that reached the store another way

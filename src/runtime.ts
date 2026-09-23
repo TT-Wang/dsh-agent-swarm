@@ -20,7 +20,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { assertDeclaredOutputs, assertScopeSelectors, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { assignmentAllows, canBorrowTask } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -3471,6 +3471,20 @@ export class SwarmRuntime {
       if (!Array.isArray(changes.dependencies) || changes.dependencies.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_dependencies_invalid', 'validation_error', 'Invalid dependencies')
       next.dependencies = [...new Set(normalizeReviewDependencies(task.kind, task.reviewOf, changes.dependencies))]
       for (const dependency of next.dependencies) this.task(missionId, dependency)
+      // R12-F9: the one live path that bypasses admission. propose() refuses a
+      // task whose text assumes prior work that no content-carrying edge (a
+      // dependency, or the review source `prepareTask` merges like one) brings
+      // into its worktree; this amendment would otherwise strip that edge from
+      // an admitted task, so it is refused here, before anything is written.
+      const assumed = dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance }, `task ${JSON.stringify(task.id)}`, {
+        dependencies: [...next.dependencies, ...(task.reviewOf === undefined ? [] : [task.reviewOf])],
+        replaces: task.replaces,
+        knownContents: new Set(this.store.list('tasks', missionId).map(row => row.id)),
+        amendment: true,
+      })
+      // The code is read from the diagnostic the refusal carries; tool_error is
+      // the category plan validation already gives this code.
+      if (assumed.length) throw new AdmissionError(assumed[0]!.code, 'tool_error', assumed.map(formatDiagnostic).join('\n'), `task ${JSON.stringify(task.id)}`, assumed)
     }
     if (changes.checks !== undefined) {
       if (!Array.isArray(changes.checks) || changes.checks.some(value => typeof value !== 'string' || !value.trim())) throw new PolicyError('task_checks_invalid', 'validation_error', 'Invalid checks')
