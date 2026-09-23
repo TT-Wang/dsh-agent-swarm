@@ -213,8 +213,109 @@ test('a real review rejection names its stall root exactly once, with exactly on
   assert.equal(deliveries.length, 1, `exactly one stall-root delivery: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   assert.equal(events.length, 1, `exactly one stall-root event, not one per tick: ${events.length}`)
   assert.equal(events[0].data.taskId, source.id)
-  assert.ok(deliveries[0].deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
+  // The root's obligation reaches the owner, not only the ledger: through the
+  // rejection decision the stall-root row is recorded against (one wake, not two).
+  const cover = f.runtime.store.get('deliveries', deliveries[0].notice.coveredBy)
+  assert.equal(cover?.notice?.trigger, 'task/rejected', 'the stall root is recorded against the verify-site rejection decision')
+  assert.ok(cover.deliveredAt !== undefined, 'the stall-root decision reaches the owner, not only the ledger')
 })
+
+test('one rejection is one owner wake for its root: the stall root is recorded against the rejection decision', async t => {
+  // 5347f5b: one rejection delivered three owner notices within ~10 ms that all
+  // asked for the same repair (the verify-site decision, the W3 board stall and
+  // the stall root), and the stall root spent a wake-budget slot of its own.
+  // Decision: the stall root stays the durable fact (row, event, reminders) but is
+  // not a second wake when the verify site already decided this subject@epoch.
+  const f = await fixture(t, { tickMs: 10 })
+  // Exactly the decision and the board stall fit; a third wake would be summarized.
+  f.runtime.notices.wakeBudget = 2
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  const source = f.propose('Rejected implementation')
+  const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+  await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+    title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+  const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+  const stallRootEvents = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
+  await eventually(() => stallRootEvents().length > 0, 'the stall-root fact is recorded')
+  await sleep(500)
+  const delivered = f.notices().filter(delivery => delivery.deliveredAt !== undefined)
+  const families = delivered.map(delivery => delivery.notice?.dedupKey?.split(':')[0])
+  t.diagnostic(`owner notices delivered for one rejection: ${delivered.length} (${families.join(', ')})`)
+  assert.equal(delivered.length, 2, `two owner wakes per rejection, the decision and the board stall: ${families.join(', ')}`)
+  assert.deepEqual(f.notices().filter(delivery => delivery.notice?.dedupKey?.startsWith('wake-budget:')).map(delivery => delivery.notice.aggregatedFacts?.map(part => part.dedupKey)), [],
+    'the stall root spends no wake-budget slot')
+  const decision = f.notices().find(delivery => delivery.notice?.trigger === 'task/rejected')
+  assert.ok(decision?.deliveredAt !== undefined, 'the verify-site rejection decision reaches the owner under its recorded trigger')
+  assert.deepEqual(delivered.map(delivery => delivery.notice.trigger).sort(), ['mission/stalled', 'task/rejected'])
+  const [root, ...extra] = f.stallRoots()
+  assert.deepEqual(extra, [], 'one stall-root row')
+  assert.equal(root.notice.dedupKey, `stall-root:${f.mission.id}:${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`)
+  assert.equal(root.notice.coveredBy, decision.id, 'the stall root is recorded against the rejection decision')
+  assert.equal(root.deliveredAt, undefined, 'the stall root is not a second wake')
+  assert.equal(stallRootEvents().length, 1, 'the stall root stays a durable fact')
+})
+
+test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
+  // The same generic `decision` notice shape the verify site used before, from
+  // the scheduler's permanent preparation failure: it never covers a stall root.
+  const f = await fixture(t)
+  const research = { kind: 'research', checks: undefined }
+  const sibling = f.propose('Healthy sibling', research)
+  await f.runtime.claim(f.actor, f.mission.id, sibling.id)
+  const failing = f.propose('Cannot prepare', research)
+  f.runtime.commit(f.mission.id, () => {
+    const row = f.runtime.store.get('tasks', failing.id)
+    row.epoch++; row.status = 'blocked'
+    row.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
+    row.output = 'Workspace or worker preparation failed: EACCES'
+    f.runtime.store.put('tasks', row)
+    f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { from: 'runtime' })
+  })
+  const root = await eventually(() => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake')
+  assert.equal(root.notice.coveredBy, undefined, 'only a verify-site rejection decision covers a stall root')
+})
+
+for (const repaired of [true, false]) {
+  test(`stall-root reminders judge the root the key names: ${repaired ? 'none while the repair runs' : 'one arrives when no repair is proposed'}`, async t => {
+    // 5347f5b: delivery judged a stall-root by its root alone, but its reminders
+    // judged every listed subject; the rejecting review (a listed dependent) is
+    // never a live wait, so two "still unresolved" reminders reached the owner
+    // while the root's repair was already running.
+    const f = await fixture(t, { tickMs: 10 })
+    f.runtime.notices.obligationFollowupMs = 300
+    const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+    const source = f.propose('Rejected implementation')
+    const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
+    await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
+      title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
+    const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+    await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+    const rootSubject = `${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`
+    // Delivered itself, or (a rejected root) through the decision it is recorded against.
+    const handed = delivery => (delivery.notice.coveredBy === undefined ? delivery : f.runtime.store.get('deliveries', delivery.notice.coveredBy))?.deliveredAt !== undefined
+    const stallRoot = await eventually(() => f.stallRoots().find(handed), 'the stall-root decision reaches the owner')
+    assert.ok(stallRoot.subjects.includes(`${review.id}@${f.runtime.store.get('tasks', review.id).epoch}`), 'the rejecting review is a listed dependent')
+    // Reminders of this stall-root: their own rows or wake-budget constituents.
+    const prefix = `obligation-followup:${stallRoot.id}:`
+    const reminders = () => f.notices().flatMap(delivery => [
+      ...(delivery.notice?.dedupKey?.startsWith(prefix) ? [{ delivery, subjects: delivery.subjects }] : []),
+      ...(delivery.notice?.aggregatedFacts ?? []).filter(part => part.dedupKey.startsWith(prefix)).map(part => ({ delivery, subjects: part.subjects })),
+    ])
+    if (repaired) {
+      const repair = f.propose('Repair', { replaces: [source.id] })
+      await eventually(() => f.runtime.store.get('tasks', repair.id).status === 'running', 'the repair runs')
+      await sleep(1200)
+      assert.equal(f.runtime.store.get('tasks', repair.id).status, 'running', 'the repair is still running')
+      assert.deepEqual(reminders().map(item => item.subjects), [], 'no stall-root reminder while the repair runs')
+      return
+    }
+    const reminder = await eventually(() => reminders().find(item => item.delivery.deliveredAt !== undefined), 'a stall-root reminder reaches the owner', 3000)
+    assert.deepEqual(reminder.subjects, [rootSubject], 'the reminder names the root, not the rejecting review')
+  })
+}
 
 test('a pending task in preparation back-off is a bounded live wait, and a named fall-through once the bound passes without a retry', async t => {
   // Before, any `preparationFailure` made a pending task "not legitimately
@@ -260,3 +361,60 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const { retryAt: _retryAt, ...permanent } = f.runtime.store.get('tasks', backoff.id).preparationFailure
   assert.equal(waitsLegitimately(f.runtime, { ...f.runtime.store.get('tasks', backoff.id), preparationFailure: { ...permanent, transient: false } }, board()), false)
 })
+
+for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
+  test(`a W2 witness stamped during a preparation back-off (${coStamp}) does not hide the back-off once its bound passes`, async t => {
+    // 5347f5b: the back-off wait ends on a timer that changes nothing in F(S), so
+    // a W2 stamped inside the window (the row-7b stamp after a stall-root notice,
+    // or another task's permanent preparation-failure notice) matched F(S) forever
+    // and the fall-through never named the task nothing would retry.
+    const f = await fixture(t)
+    const tickMs = f.runtime.config.tickMs
+    const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+    const research = { kind: 'research', checks: undefined }
+    const sibling = f.propose('Healthy sibling', research)
+    await f.runtime.claim(f.actor, f.mission.id, sibling.id)
+    const other = f.propose('Unrelated dead end', research)
+    const backoff = f.propose('Backing off', { ...research, assigneeId: second.id })
+    const retryAt = Date.now() + 400
+    f.runtime.commit(f.mission.id, () => {
+      const row = f.runtime.store.get('tasks', backoff.id)
+      row.epoch++
+      row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+      f.runtime.store.put('tasks', row)
+      const dead = f.runtime.store.get('tasks', other.id)
+      dead.status = 'blocked'; dead.epoch++
+      if (coStamp === 'permanent-preparation-failure') {
+        // The scheduler's own permanent-failure shape (src/scheduling.ts), notice included.
+        dead.preparationFailure = { reason: 'Workspace or worker preparation failed: EACCES', transient: false, attempts: 1 }
+        dead.output = 'Workspace or worker preparation failed: EACCES'
+        f.runtime.store.put('tasks', dead)
+        f.runtime.notify(f.mission.id, dead.output, [`${dead.id}@${dead.epoch}`], { from: 'runtime' })
+      } else {
+        dead.output = 'blocked for repair'
+        f.runtime.store.put('tasks', dead)
+      }
+      const member = f.runtime.store.get('members', second.id)
+      member.phase = 'stopped'
+      f.runtime.store.put('members', member)
+    })
+    const epoch = f.runtime.store.get('tasks', backoff.id).epoch
+    const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
+    // The co-stamp happened inside the window and the board did not change after it.
+    const stamped = await eventually(() => {
+      const witness = f.runtime.store.get('missions', f.mission.id).witness
+      return witness?.kind === 'W2' && witness.at <= retryAt + tickMs && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+    }, 'a W2 witness is stamped during the back-off window')
+    assert.ok(stamped.at <= retryAt, `stamped inside the window (${retryAt - stamped.at} ms before retryAt)`)
+    assert.equal(named().length, 0, 'the live back-off is not named')
+    const notice = await eventually(() => named()[0], 'the expired back-off is named despite the earlier W2 for the same F(S)', 3000)
+    assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
+    assert.deepEqual(notice.subjects, [`${backoff.id}@${epoch}`], 'only the expired back-off is named')
+    assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
+    await sleep(150)
+    assert.equal(named().length, 1, 'named exactly once: the fall-through re-stamps the witness past the bound')
+    const witness = f.runtime.store.get('missions', f.mission.id).witness
+    assert.equal(witness.fingerprint, f.runtime.fingerprint(f.mission.id), 'the witness is still keyed by F(S) alone')
+    assert.ok(witness.at > retryAt + tickMs, 'the current witness post-dates the bound')
+  })
+}

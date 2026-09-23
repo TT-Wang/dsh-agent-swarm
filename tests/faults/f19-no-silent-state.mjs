@@ -289,6 +289,83 @@ await runScenario({
       } finally { await f.cleanup() }
     }
 
+    // Row 7c — a BLOCKED prerequisite under running work. The prerequisite hits
+    // its own step ceiling (no verify-site rejection decision covers it), so its
+    // stall-root decision is the owner's wake: it must be DELIVERED, not only
+    // written to the ledger, and name the dependent it strands. The dependent
+    // waits on the root, so no fall-through re-names either task.
+    {
+      const f = await setup({ config: { leaseMs: 60_000 } })
+      try {
+        const research = { kind: 'research', checks: undefined }
+        const runner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Runner', role: 'implementation', maxOutputTokens: 5_000 })
+        const first = f.propose({ title: 'Running work', ...research, assigneeId: runner.id })
+        await f.runtime.claim(f.actor(runner), f.mission.id, first.id)
+        const prerequisite = f.propose({ title: 'Ceilinged prerequisite', ...research, maxSteps: 1 })
+        await f.runtime.claim(f.actor(f.author), f.mission.id, prerequisite.id)
+        const dependent = { ...taskOf(f.runtime, first.id), id: 'task_f19_blocked_dependent', title: 'Dependent of a blocked prerequisite',
+          dependencies: [prerequisite.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
+          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
+        f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
+        await f.workers.callbacks.beforeStep(f.author.id)
+        assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
+        const blocked = taskOf(f.runtime, prerequisite.id)
+        assert.equal(blocked.status, 'blocked', 'row 7c: the prerequisite is blocked by its ceiling')
+        assert.equal(taskOf(f.runtime, first.id).status, 'running', 'row 7c: unrelated work keeps running')
+        const key = `stall-root:${f.mission.id}:${prerequisite.id}@${blocked.epoch}`
+        const root = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey === key && delivery.deliveredAt !== undefined),
+          'row 7c: the stall-root decision for a blocked prerequisite under running work must be delivered')
+        assert.equal(root.notice.coveredBy, undefined, 'row 7c: no rejection decision carries this root; it is its own wake')
+        assert.ok(root.subjects.includes(`${dependent.id}@0`), `row 7c: the stranded dependent is named: ${JSON.stringify(root.subjects)}`)
+        assert.deepEqual(ownerNotices(f).filter(delivery => delivery.notice?.dedupKey?.startsWith('fallthrough:')), [], 'row 7c: the root speaks for its dependent')
+        assertWitness(f, 'W2', 'row 7c')
+        rows.row7c = { witness: 'W2', taskId: prerequisite.id, delivered: true }
+      } finally { await f.cleanup() }
+    }
+
+    // Row 7d — a pending task in preparation back-off is a bounded wait until one
+    // tick past retryAt. A W2 stamped inside that window (here the row-7b stamp
+    // after an unrelated stall root) must not hide the back-off once the bound
+    // passes with nothing left to retry it: its expiry changes nothing in F(S).
+    {
+      const f = await setup({ config: { leaseMs: 60_000 } })
+      try {
+        const research = { kind: 'research', checks: undefined }
+        const tickMs = f.runtime.config.tickMs
+        const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation', maxOutputTokens: 5_000 })
+        const first = f.propose({ title: 'Running work', ...research })
+        await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
+        const other = f.propose({ title: 'Unrelated dead end', ...research })
+        const backoff = f.propose({ title: 'Backing off', ...research, assigneeId: second.id })
+        const retryAt = Date.now() + 400
+        f.runtime.commit(f.mission.id, () => {
+          const row = taskOf(f.runtime, backoff.id)
+          row.epoch++
+          row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+          f.runtime.store.put('tasks', row)
+          const dead = taskOf(f.runtime, other.id)
+          dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked by the injected fault'
+          f.runtime.store.put('tasks', dead)
+          const member = f.runtime.store.get('members', second.id)
+          member.phase = 'stopped'
+          f.runtime.store.put('members', member)
+        })
+        const subject = `${backoff.id}@${taskOf(f.runtime, backoff.id).epoch}`
+        const naming = () => ownerNotices(f).filter(delivery => delivery.notice?.dedupKey?.startsWith('fallthrough:') && delivery.subjects?.includes(subject))
+        const stamped = await eventually(() => {
+          const witness = witnessOf(f)
+          return witness?.kind === 'W2' && witness.at <= retryAt && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+        }, 'row 7d: a W2 is stamped for this F(S) inside the back-off window')
+        assert.deepEqual(naming(), [], 'row 7d: the live back-off is not named')
+        const notice = await eventually(() => naming()[0], 'row 7d: the expired back-off must be named despite the earlier W2 for the same F(S)', 3_000)
+        assert.ok(notice.createdAt > retryAt + tickMs, 'row 7d: named only once the bound has passed')
+        assert.deepEqual(notice.subjects, [subject], 'row 7d: only the expired back-off is named')
+        assertWitness(f, 'W2', 'row 7d')
+        assert.ok(witnessOf(f).at > stamped.at, 'row 7d: the fall-through is the new witness for F(S)')
+        rows.row7d = { witness: 'W2', taskId: backoff.id }
+      } finally { await f.cleanup() }
+    }
+
     // Row 8 — R10-14: coverage complete, mission still active: one durable owner
     // notice, no silent return, and no auto-completion of an owner-assembled plan.
     {
