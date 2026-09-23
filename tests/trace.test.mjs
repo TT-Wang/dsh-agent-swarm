@@ -22,7 +22,10 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { EVENT_VOCABULARY, canonicalJson, digestText, orchestratorCommands, payloadRef, spanContractViolation, traceMetrics } from '../lib/trace.js'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { EVENT_VOCABULARY, TraceRecorder, canonicalJson, digestText, orchestratorCommands, payloadRef, spanContractViolation, traceMetrics } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 /** Every field a durable span row may carry; the census reads this contract. */
@@ -91,4 +94,23 @@ test('a payload reference is the canonical digest of its payload and retains no 
   assert.equal(ref.digest, digestText(canonicalJson({ a: 1, b: 2 })), 'key order cannot change the digest')
   assert.equal(ref.bytes, Buffer.byteLength(canonicalJson({ a: 1, b: 2 }), 'utf8'))
   assert.notEqual(payloadRef({ a: 1 }).digest, ref.digest, 'a different payload gets a different digest')
+})
+
+test('a recorder removes the payload directory earlier builds kept beside the state file', async t => {
+  // Builds before round 20 spilled span payloads into <state dir>/trace-payloads
+  // and bounded it with a startup sweep. The spill and the sweep are gone, so an
+  // upgraded host would otherwise keep those copies of swarm_* arguments forever.
+  const directory = await mkdtemp(join(tmpdir(), 'trace-legacy-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const legacy = join(directory, 'trace-payloads', 'ab')
+  await mkdir(legacy, { recursive: true })
+  await writeFile(join(legacy, 'cdef.json'), '{"tool":"swarm_publish"}')
+  const store = { event() {}, transaction(body) { return body() }, events() { return [] } }
+  const recorder = TraceRecorder.forRuntime({ config: { statePath: join(directory, 'state.sqlite') }, store })
+  assert.ok(recorder, 'a runtime with a durable store and state path gets a recorder')
+  await recorder.legacyCleanup
+  await assert.rejects(stat(join(directory, 'trace-payloads')), { code: 'ENOENT' }, 'the legacy payload directory is gone')
+  // A host that never had the directory starts the same way.
+  const fresh = TraceRecorder.forRuntime({ config: { statePath: join(directory, 'state.sqlite') }, store })
+  await fresh.legacyCleanup
 })

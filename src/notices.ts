@@ -300,7 +300,7 @@ export interface MissionInterpretation {
   subjectsOf: (tasks: readonly Pick<Task, 'id' | 'epoch'>[]) => string[]
 }
 /** The states that leave a task no future. */
-const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
+export const TERMINAL_STATES: ReadonlySet<string> = new Set(['accepted', 'cancelled'])
 
 /**
  * R16-A: the durable families of owner decisions. A family is read from the
@@ -314,7 +314,7 @@ const DECISION_FAMILIES = ['stall-root', 'fallthrough', 'dispatch-question', 'gu
  * `dispatch-question` or `guard-terminal` names a subject for a different claim
  * and is deliberately not judged by the wake-precision predicate.
  */
-const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])
+export const NO_LIVE_PATH_FAMILIES: ReadonlySet<string> = new Set(['stall-root', 'fallthrough'])
 const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])
 
 /** R16-A: the family of one durable owner notice, from its dedup key or class. */

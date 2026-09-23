@@ -171,8 +171,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   // calling session's own cwd — the pre-feature H4 boundary, never wider.
   const authorized: WorkspaceGrantSnapshot = grants ?? { grants: [], loadedAt: Date.now(), unresolved: [] }
   // One recorder per runtime: every mission-scoped orchestration step emits a
-  // durable `trace/span` row whose input/output bytes live in a
-  // content-addressed directory beside the state file.
+  // durable `trace/span` row carrying the digest and size of its input and
+  // output; the bytes themselves are not retained.
   const trace = TraceRecorder.forRuntime(runtime)
   const register = (name: string, description: string, properties: Record<string, JsonSchemaNode>, required: string[],
     run: (args: Args, actor: Actor) => Promise<unknown> | unknown, missionKey = 'missionId') => {

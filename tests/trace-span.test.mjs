@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { SWARM_TOOLS } from '../lib/tools.js'
-import { TRACE_OPERATIONS, TRACE_STEPS, TRACE_ERROR_TYPES, canonicalJson, digestText, isTraceOperation, isTraceStep, spanContractViolation, traceIdFor, traceMetrics } from '../lib/trace.js'
+import { TRACE_OPERATIONS, TRACE_STEPS, TRACE_ERROR_TYPES, canonicalJson, digestText, payloadRef, isTraceOperation, isTraceStep, spanContractViolation, traceIdFor, traceMetrics } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 test('the span vocabulary is closed and covers every orchestration step', () => {
@@ -59,6 +59,9 @@ test('every orchestration step emits a contract-valid span with digests outside 
   assert.equal(publish.input.stored, false, 'no payload bytes are retained anywhere')
   assert(publish.input.bytes > f.bigClaim.length, 'the reference still measures the payload it names')
   assert.notEqual(publish.input.digest, publish.output.digest, 'input and output are digested separately')
+  const called = payloadRef({ tool: 'swarm_publish', arguments: { missionId: f.missionId, taskId: f.source.id, attemptId: f.claim.attempt.id, claim: f.bigClaim, outcome: 'supported', toolRunIds: [f.runId] } })
+  assert.equal(publish.input.digest, called.digest, 'the input digest names exactly the payload swarm_publish was called with')
+  assert.equal(publish.input.bytes, called.bytes)
   // The digest is still the canonical digest of the payload it names: the same
   // bytes hash to the same reference, and a different payload to a different one.
   assert.equal(digestText(canonicalJson({ ok: 1 })), digestText(canonicalJson({ ok: 1 })))

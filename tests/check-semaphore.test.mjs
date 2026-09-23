@@ -73,6 +73,8 @@ test('R11-19: checkConcurrency 1 serializes declared checks and records the meas
   // "never more than the limit was active", and `maxWaitMs >= 100` is the per-check
   // "the queue wait is really measured", both maximised over the same three checks.
   assert.ok(envelope.totalWaitMs >= envelope.maxWaitMs, 'the wait total accumulates every check, not only the longest')
+  assert.equal(envelope.active, 0, 'every slot was released: a leak here would queue every later check forever')
+  assert.equal(envelope.queued, 0, 'no check is left waiting for a slot')
 })
 
 test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', async t => {

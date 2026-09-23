@@ -155,7 +155,9 @@ test('R12: pending readiness requires a submitted source and an idle independent
   assert.equal(pendingReadiness([source, review], members).ready, 1)
 })
 
-test('R12: ordinary owner questions are excluded from decision metrics', async t => {
+// Instrument self-test: the decision metric lives in tests/instruments.mjs since
+// round 20, so this pins the audit instrument, not a production classifier.
+test('R12 instrument: ordinary owner questions are excluded from the decision metric', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'r12-decisions-'))
   const rt = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
     maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, new QuietWorkers())

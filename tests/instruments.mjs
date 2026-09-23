@@ -5,13 +5,9 @@
  * production classifiers it measures (they stay in src/ because the live
  * notice paths use them) and writes nothing.
  */
-import { noticeFamily, taskFromSubject, taskSubject } from '../lib/notices.js'
+import { NO_LIVE_PATH_FAMILIES, TERMINAL_STATES, noticeFamily, taskFromSubject, taskSubject } from '../lib/notices.js'
 import { ATTEMPT_FENCING_EVENTS } from '../lib/types.js'
 
-/** Mirrors `TERMINAL_STATES` in src/notices.ts. */
-const TERMINAL_STATES = new Set(['accepted', 'cancelled'])
-/** Mirrors `NO_LIVE_PATH_FAMILIES` in src/notices.ts: the families whose claim is "no live path will advance this subject". */
-const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])
 
 /**
  * R16-A: the wake precision of one mission's owner decisions, projected from

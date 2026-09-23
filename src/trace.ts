@@ -20,12 +20,19 @@
  *   because replay, the trace tests and the reader census read it and the sink
  *   has no read-back; the retained bespoke pieces and the reason that decided
  *   each are named at their definitions below.
- * - The payload bytes themselves are not retained by this layer: a worker's tool
- *   arguments and results are durable in the `ToolRun` rows and an owner tool
- *   call is in the harness session log, so the digest is a link into a record
- *   that already exists rather than into a cache this plugin has to sweep.
+ * - The payload bytes themselves are not retained: a span keeps only the digest
+ *   and size of its input and output. Spans are recorded for the swarm_* tools,
+ *   which the worker adapter deliberately does not record as `ToolRun` rows, and
+ *   the digested input of a workspace-bound call carries host-added fields no
+ *   session log holds, so a span digest cannot be resolved back to its payload.
+ *   It identifies a step and orders the causal chain; it is not an audit copy.
+ *   Builds before round 20 kept the bytes in a `trace-payloads` directory beside
+ *   the state file; `forRuntime` removes that directory once, since nothing
+ *   reads it and the retention sweep that bounded it is gone.
  */
 import { createHash, randomUUID } from 'node:crypto'
+import { rm } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
 import { EVENT_VOCABULARY, type EventKind } from './events.ts'
 import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
@@ -287,6 +294,12 @@ interface SpanIndex {
 export class TraceRecorder {
   private readonly indexes = new Map<string, SpanIndex>()
   private readonly unscoped = new Map<string, number>()
+  /**
+   * The best-effort removal of the payload directory earlier builds kept beside
+   * the state file. Exposed so a caller can await it; a failure is swallowed,
+   * because a leftover directory is inert and must never block plugin start.
+   */
+  legacyCleanup?: Promise<void>
   constructor(readonly store: TraceStore, readonly telemetry?: HostTelemetryLink) {}
   /** A recorder exists only when the runtime owns a durable store and state path. */
   static forRuntime(runtime: unknown): TraceRecorder | undefined {
@@ -295,7 +308,9 @@ export class TraceRecorder {
     const store = candidate?.store
     if (typeof statePath !== 'string' || !statePath) return undefined
     if (!store || typeof store.event !== 'function' || typeof store.transaction !== 'function' || typeof store.events !== 'function') return undefined
-    return new TraceRecorder(store as TraceStore, hostTelemetryFor(runtime))
+    const recorder = new TraceRecorder(store as TraceStore, hostTelemetryFor(runtime))
+    recorder.legacyCleanup = rm(join(dirname(statePath), 'trace-payloads'), { recursive: true, force: true }).catch(() => undefined)
+    return recorder
   }
   private index(missionId: string): SpanIndex {
     const existing = this.indexes.get(missionId)
