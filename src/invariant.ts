@@ -17,7 +17,7 @@
  * (`source.kind === 'swarm'`) carrying an owner delivery whose family claims "no
  * live path will advance this subject" (`stall-root`, `fallthrough`) while any
  * subject it names still has a live path. The judgement is the SAME predicate the
- * emission site uses and the same rule `Notices.wakePrecision` counts after the
+ * emission site uses and the same rule the test-side wake-precision projection counts after the
  * fact (`liveLineageSubject`, src/notices.ts): the false-wake condition, judged
  * before the write instead of after it. `src/index.ts` supplies the mapping from a
  * relayed message to that predicate, so this module knows nothing about the store.

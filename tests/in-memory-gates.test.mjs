@@ -158,11 +158,8 @@ const CENSUS = [
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
   ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
   ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
-  ["src/notices.ts",11,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",12,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",13,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",14,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",15,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",11,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // L2 owner-reply guard: a plugin-side observer of host session events, not a
   // participant in the runtime's decision path. Every durable fact it reports
   // (the open receipt, its nudge count, the guard terminal) lives on the

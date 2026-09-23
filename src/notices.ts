@@ -83,8 +83,8 @@ export interface NotifyOptions {
   reason?: string
   /**
    * R17-G3: the notice family the dedup key is prefixed with. Existing readers
-   * (`noticeFamily`, the wake-precision projection, owner-side filters) read the
-   * family from the key prefix, so a fact-keyed notice keeps it.
+   * (`noticeFamily`, owner-side filters) read the family from the key prefix, so
+   * a fact-keyed notice keeps it.
    */
   family?: string
   /** Full facts and their original identities when one notice presents a batch. */
@@ -167,7 +167,7 @@ function reasonDigest(reason: string): string {
  * - When a `family` is present (an explicit `NotifyOptions.family`, or the prefix
  *   of an explicit `dedupKey`), the key is prefixed with that family and the
  *   trigger does NOT participate: the family is the identity the retained family
- *   readers (`noticeFamily`, the wake-precision projection) resolve, so two facts
+ *   readers (`noticeFamily`) resolve, so two facts
  *   of one family with different triggers but the same subjects and recorded
  *   reason share one key. The per-site reviewed table in
  *   `tests/r17-notices.test.mjs` names every site that relies on this.
@@ -336,18 +336,6 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
 }
 
 /**
- * R16-A: the durable wake-precision projection. Counts owner decisions by family,
- * false wakes and missed obligations from the store alone.
- */
-export interface WakePrecision {
-  missionId: string
-  decisions: { total: number; byFamily: Record<string, number> }
-  falseWakes: { total: number; byFamily: Record<string, number>; subjects: string[] }
-  missedObligations: { total: number; subjects: string[] }
-  note: string
-}
-
-/**
  * F2: how long a submitted code deliverable may stay without a live review
  * before the runtime concludes none is coming. One scheduler period gives the
  * author the turn in which it submitted to propose its own review; the floor
@@ -357,8 +345,8 @@ export const AUTO_REVIEW_GRACE_MS = 1000
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers, the
- * wake-precision projection, the emission-time refusal and the host pre-append
- * invariant all consume ONE implementation (`SwarmRuntime` satisfies it
+ * emission-time refusal and the host pre-append invariant all consume ONE
+ * implementation (`SwarmRuntime` satisfies it
  * structurally; a test can supply the same shape).
  */
 export interface LineageRuntime {
@@ -419,8 +407,8 @@ export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs'>, ta
 /**
  * R14-F2(c) / R16-A: whether an unfinished task is waiting on something still
  * alive — a live lease, the bounded review grace, a stop inside its bound, or an
- * unfinished dependency/predecessor edge. One implementation for the classifiers,
- * the wake-precision projection and the R17-G9 refusal predicate.
+ * unfinished dependency/predecessor edge. One implementation for the classifiers
+ * and the R17-G9 refusal predicate.
  *
  * Co-firing guards, named: this classifier x the stall-root classifier (a blocked
  * predecessor is the ROOT's subject, named by the root notice with its
@@ -481,7 +469,8 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 
 /**
  * R17-G9: the emission-time counterpart of the wake-precision classifier — the
- * exact false-wake condition `Notices.wakePrecision` counts after the fact,
+ * exact false-wake condition the test-side wake-precision projection
+ * (tests/instruments.mjs) counts after the fact,
  * judged before the write. A candidate decision in a family whose claim is "no
  * live path will advance this subject" is illegal while any subject it names
  * still resolves (at its current epoch) to a task with a live path: a `stall-root`
@@ -773,11 +762,10 @@ export class Notices {
   }
 
   /**
-   * R16-A: the single owner gate for the read-only owner instruments. The notice
-   * ledger and the wake-precision projection ask the same question, so the second
-   * instrument reuses this one refusal site instead of adding another: the
-   * retained S3 inventory counts uncoded throw sites and may only shrink, and the
-   * ledger's observable message is preserved verbatim through `instrument`.
+   * R16-A: the single owner gate for the read-only owner instruments (the notice
+   * ledger). One refusal site: the retained S3 inventory counts uncoded throw
+   * sites and may only shrink, and the ledger's observable message is preserved
+   * verbatim through `instrument`.
    */
   private requireOwner(actor: Actor, missionId: string, instrument: string): void {
     const { owner } = this.rt.participant(actor, missionId)
@@ -833,74 +821,6 @@ export class Notices {
     requireText(text, 'content')
     if (text.length > this.rt.config.maxMessageChars) throw new Error(`Content exceeds ${this.rt.config.maxMessageChars} characters`)
     return text
-  }
-
-  /**
-   * R16-A precision instrument: the wake precision of one mission's owner
-   * decisions, projected from durable rows only (deliveries, tasks and the
-   * submission events), never from a cache or from notice prose. It answers three
-   * questions the round's outcome report needs as numbers:
-   *
-   * - decisions by family: how many owner notices of each durable family the
-   *   mission produced (the family is the dedup key the runtime itself wrote);
-   * - false wakes: a decision of a family that claims "no live path will advance
-   *   this subject" (fall-through, stall-root) naming a subject whose lineage
-   *   still has a live path on the durable board. `waitsLegitimately` is the
-   *   classifier; for a stall root the question is whether the same row is still
-   *   a root now (`stallRoots`), because a blocked root may legitimately wait on
-   *   a live predecessor while still owing a repair decision;
-   * - missed obligations: a non-terminal task with no live path that no owner
-   *   decision names at its current epoch.
-   *
-   * Boundary (stated, not hidden): the judgement is made against the durable rows
-   * at READ time. A decision whose subject has since advanced to another epoch is
-   * not judged — its epoch is gone from the board — so historical false wakes are
-   * not reconstructed here; the projection measures whether the decisions still
-   * standing on the board are true now. Read-only: it changes no task, member,
-   * budget or delivery state.
-   */
-  wakePrecision(actor: Actor, missionId: string): WakePrecision {
-    this.requireOwner(actor, missionId, 'wake-precision projection')
-    const tasks = this.rt.store.list('tasks', missionId)
-    const deliveries = this.rt.store.list('deliveries', missionId).filter(delivery => delivery.to === 'owner'
-      && (delivery.notice?.class === 'decision' || delivery.notice?.class === 'escalation' || delivery.kind === 'escalation'))
-    const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))
-    const byFamily: Record<string, number> = {}
-    const falseByFamily: Record<string, number> = {}
-    const falseSubjects: string[] = []
-    const named = new Set<string>()
-    for (const delivery of deliveries) {
-      const family = noticeFamily(delivery)
-      byFamily[family] = (byFamily[family] ?? 0) + 1
-      for (const subject of delivery.subjects ?? []) named.add(subject)
-      if (!NO_LIVE_PATH_FAMILIES.has(family)) continue
-      for (const subject of delivery.subjects ?? []) {
-        const task = taskFromSubject(subject, tasks)
-        if (task === undefined) continue
-        const falseWake = family === 'stall-root'
-          ? task.status === 'blocked' && !roots.has(subject)
-          : this.waitsLegitimately(task, tasks)
-        if (!falseWake) continue
-        falseByFamily[family] = (falseByFamily[family] ?? 0) + 1
-        falseSubjects.push(subject)
-      }
-    }
-    const missed: string[] = []
-    for (const task of tasks) {
-      if (TERMINAL_STATES.has(task.status)) continue
-      if (this.waitsLegitimately(task, tasks)) continue
-      const subject = taskSubject(task)
-      if (named.has(subject)) continue
-      missed.push(subject)
-    }
-    const uniqueFalseSubjects = [...new Set(falseSubjects)]
-    return {
-      missionId,
-      decisions: { total: deliveries.length, byFamily },
-      falseWakes: { total: uniqueFalseSubjects.length, byFamily: falseByFamily, subjects: uniqueFalseSubjects },
-      missedObligations: { total: missed.length, subjects: missed },
-      note: 'Read-only projection over the durable rows at read time. `byFamily` comes from the notice dedup keys the runtime wrote. A false wake is a fall-through naming a subject `waitsLegitimately` still recognises, or a stall-root whose row is still blocked at that epoch and is no longer in `stallRoots`. A missed obligation is a non-terminal task with no live path that no owner decision names at its current epoch. A decision whose subject has advanced epochs is not judged against the current board.',
-    }
   }
 
   /**

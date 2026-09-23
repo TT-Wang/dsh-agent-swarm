@@ -10,6 +10,7 @@ import { RefusalRegistry, emitGuardTerminal } from '../lib/refusals.js'
 import { WriterBusyError } from '../lib/store.js'
 import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
+import { wakePrecision } from './instruments.mjs'
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
@@ -165,8 +166,8 @@ test('R12: ordinary owner questions are excluded from decision metrics', async t
   rt.commit(mission.id, () => {
     rt.store.put('deliveries', { id: 'ordinary-question', missionId: mission.id, from: 'member', to: 'owner', kind: 'question', content: 'API?', createdAt: 1, replyExpected: true })
   })
-  assert.equal(rt.wakePrecision(owner, mission.id).decisions.byFamily.unknown, undefined)
-  assert.equal(rt.wakePrecision(owner, mission.id).decisions.total, 0)
+  assert.equal(wakePrecision(rt, mission.id).decisions.byFamily.unknown, undefined)
+  assert.equal(wakePrecision(rt, mission.id).decisions.total, 0)
 })
 
 function stopFixture(reason, stop) {
