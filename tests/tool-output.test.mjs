@@ -61,6 +61,17 @@ test('swarm_propose leaves acceptance optional for a repair to inherit; every pl
   }
 })
 
+test('R24: model-visible text states the declared-outputs rule once and never describes guessing paths from prose', async () => {
+  const { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT } = await import('../lib/tools.js')
+  const definitions = tools()
+  const texts = [OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT]
+  const collect = node => { if (node && typeof node === 'object') for (const [key, value] of Object.entries(node)) key === 'description' && typeof value === 'string' ? texts.push(value) : collect(value) }
+  for (const definition of definitions.values()) { texts.push(definition.description); collect(definition.parameters) }
+  for (const text of texts) assert.doesNotMatch(text, /inferred|objective text|uncaptured|names that exists/i, text)
+  const outputs = definitions.get('swarm_propose').parameters.properties.outputs.description
+  assert.match(outputs, /The host captures exactly these, including ignored files, and refuses a submission missing one\./)
+})
+
 test('repair guidance says a repair inherits acceptance instead of asking the model to copy it', async () => {
   const { OWNER_PROMPT, WORKER_PROMPT, ENTRY_PROMPT } = await import('../lib/tools.js')
   const { NOTICE_TEMPLATES } = await import('../lib/notices.js')
