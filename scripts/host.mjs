@@ -8,10 +8,13 @@
  * hand and can be reused by an unrelated process; and nothing signals a
  * listener that is not the root's host (another program, another root's host).
  *
- *   findHost(port, root)      that host as { pid, command, harness }, or undefined
- *                             when the port is free; refuses any other listener
- *   stopHost(port, root)      TERM that host, KILL it after a grace period,
- *                             re-checking its command line before each signal
+ *   findHost(port, root)      that host as { pid, pids, command, harness }, or
+ *                             undefined when the port is free; refuses any other
+ *                             listener. A forked child that inherited the socket
+ *                             is part of its parent's host (pids)
+ *   stopHost(port, root)      TERM every pid of that host, KILL them after a
+ *                             grace period, re-checking each command line
+ *                             right before each signal
  *   startHost({ root, ... })  refuse a held port, give the host a fresh
  *                             <root>/server.log, spawn it detached
  *   awaitLaunchUrl(...)       the launch URL that host prints, kept in <root>/launch.url
@@ -41,10 +44,13 @@ function listeners(port, sys) {
   return [...new Set(out.split(/\s+/).filter(Boolean).map(Number))]
 }
 
-/** A live pid's command line; '' once it has exited. */
-function commandOf(pid, sys) {
-  try { return sys.ps(['-ww', '-o', 'command=', '-p', String(pid)]).trim() }
-  catch (error) { if (error.status === 1) return ''; throw error } // ps exits 1 for a pid that is gone
+/** A live pid's parent pid and command line; {} once it has exited. */
+function processOf(pid, sys) {
+  let out
+  try { out = sys.ps(['-ww', '-o', 'ppid=', '-o', 'command=', '-p', String(pid)]) }
+  catch (error) { if (error.status === 1) return {}; throw error } // ps exits 1 for a pid that is gone
+  const [, ppid, command] = out.trim().match(/^(\d+)\s+(.*)$/s) ?? []
+  return { ppid: Number(ppid), command }
 }
 
 const ENTRY = '/apps/cli/lib/bin.js'
@@ -58,34 +64,37 @@ export function hostHarness(command, root) {
 }
 
 /**
- * The host of `root` on the port as { pid, command, harness }, or undefined when nothing listens
- * on 127.0.0.1:<port>. Any other listener is refused by pid and command line, never returned.
+ * The host of `root` on the port as { pid, pids, command, harness }, or undefined when nothing
+ * listens on 127.0.0.1:<port>. Every listener must be that host: any other is refused by pid and
+ * command line, never returned. Several listeners are one host when one is the parent of the
+ * others (a forked child inherited the socket): `pid` is the parent, `pids` all of them.
  */
 export function findHost(port, root, sys = system) {
-  const pids = listeners(port, sys)
-  if (pids.length > 1) throw new Error(`port ${port} has ${pids.length} listeners (${pids.join(', ')}); stop the extra ones by hand`)
-  const [pid] = pids
-  const command = pid === undefined ? '' : commandOf(pid, sys)
-  if (!command) return undefined // free, or the listener exited since the lookup
-  const harness = hostHarness(command, root)
-  if (!harness) throw new Error(`port ${port} is held by process ${pid} (${command}), which is not the dsh host of ${root}; stop it by hand or choose another --port`)
-  return { pid, command, harness }
+  const found = listeners(port, sys).map(pid => ({ pid, ...processOf(pid, sys) })).filter(entry => entry.command) // a listener may exit meanwhile
+  if (found.length === 0) return undefined
+  const foreign = found.filter(entry => !hostHarness(entry.command, root))
+  if (foreign.length) throw new Error(`port ${port} is held by ${foreign.map(({ pid, command }) => `process ${pid} (${command})`).join(' and ')}, which is not the dsh host of ${root}; stop it by hand or choose another --port`)
+  const parents = found.filter(entry => !found.some(other => other.pid === entry.ppid))
+  if (parents.length > 1) throw new Error(`port ${port} has ${parents.length} separate hosts of ${root} (${parents.map(entry => entry.pid).join(', ')}); stop them by hand`)
+  const [{ pid, command }] = parents
+  return { pid, pids: found.map(entry => entry.pid), command, harness: hostHarness(command, root) }
 }
 
 const alive = (pid, sys) => { try { sys.kill(pid, 0); return true } catch { return false } }
 
-/** Stop the host of `root` on the port and wait until it is gone. Resolves with its pid, or undefined for a free port. */
+/** Stop every pid of the host of `root` on the port and wait until they are gone. Resolves with its pid, or undefined for a free port. */
 export async function stopHost(port, root, { graceMs = 12_000, onStop = () => {} } = {}, sys = system) {
   const host = findHost(port, root, sys)
   if (host === undefined) return undefined
-  onStop(host.pid)
+  onStop(host.pids.join(', '))
+  const living = () => host.pids.filter(pid => alive(pid, sys))
   for (const [signal, boundMs] of [['SIGTERM', graceMs], ['SIGKILL', 5_000]]) {
     // Checked again right before each signal: a pid that exited, or that another program now owns, is left alone.
-    if (hostHarness(commandOf(host.pid, sys), root)) try { sys.kill(host.pid, signal) } catch { /* already gone */ }
-    for (let waited = 0; waited < boundMs && alive(host.pid, sys); waited += 200) await sys.sleep(200)
-    if (!alive(host.pid, sys)) return host.pid
+    for (const pid of living()) if (hostHarness(processOf(pid, sys).command ?? '', root)) try { sys.kill(pid, signal) } catch { /* already gone */ }
+    for (let waited = 0; waited < boundMs && living().length; waited += 200) await sys.sleep(200)
+    if (!living().length) return host.pid
   }
-  throw new Error(`host ${host.pid} on port ${port} is still running after SIGKILL`)
+  throw new Error(`host ${living().join(', ')} on port ${port} is still running after SIGKILL`)
 }
 
 /** Start a host on a free port with a fresh server.log. Returns the child; the caller owns it. */

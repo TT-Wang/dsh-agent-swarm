@@ -177,7 +177,7 @@ async function runWorker(statePath) {
   const log = message => appendFileSync(join(state.preview, 'restart.log'), `[${now()}] ${message}\n`)
   const record = fields => writeServer(state.preview, { url: `http://127.0.0.1:${state.port}`, port: state.port, home: state.home, plugin: state.pluginDir, harness: state.harnessRoot, model: state.model, startedAt: now(), ...fields })
   const host = { root: state.preview, port: state.port, cli: state.cli, patch: state.patch, cwd: state.workspace, env: hostEnv(state.preview, state.home) }
-  const stop = () => stopHost(state.port, state.preview, { onStop: pid => log(`stopping host ${pid}`) })
+  const stop = () => stopHost(state.port, state.preview, { onStop: pids => log(`stopping host ${pids}`) })
   // A loaded host (this machine runs the preview AND the agent session that
   // deploys it) can take minutes to print its launch URL. Waiting too little is
   // worse than waiting long: the old 90s window declared a healthy boot a

@@ -21,22 +21,25 @@ const ROOT = '/roots/lab'
 /** The command line of the host these scripts launch for `root`. */
 const hostCommand = (root = ROOT, harness = '/code/harness') => `/usr/local/bin/node --expose-internals ${harness}/apps/cli/lib/bin.js --profile web --patch ${root}/lab.patch.yml --port 6101 --no-open`
 
-/** Process layer with `listeners` ({ port: pid }) on 127.0.0.1 and `commands` ({ pid: command line }, ROOT's host by default); `others` are live pids on no port. */
-function stubSystem({ listeners = {}, commands = {}, others = [], ignoresTerm = [], immortal = [] } = {}) {
-  const living = new Set([...Object.values(listeners), ...others])
+/**
+ * Process layer with `listeners` ({ port: pid or [pids] }) on 127.0.0.1, `commands` ({ pid: command line },
+ * ROOT's host by default) and `parents` ({ pid: ppid }); `others` are live pids on no port.
+ */
+function stubSystem({ listeners = {}, commands = {}, parents = {}, others = [], ignoresTerm = [], immortal = [] } = {}) {
+  const living = new Set([...Object.values(listeners).flat(), ...others])
   const signals = [], spawned = [], lsofCalls = []
   return {
     signals, spawned, lsofCalls,
     ps: args => {
       const pid = Number(args.at(-1))
       if (!living.has(pid)) throw Object.assign(new Error('ps found nothing'), { status: 1 })
-      return `${commands[pid] ?? hostCommand()}\n`
+      return `${parents[pid] ?? 1} ${commands[pid] ?? hostCommand()}\n`
     },
     lsof: args => {
       lsofCalls.push(args)
-      const pid = listeners[Number(args.find(arg => arg.startsWith('-iTCP@127.0.0.1:')).slice('-iTCP@127.0.0.1:'.length))]
-      if (!living.has(pid)) throw Object.assign(new Error('lsof found nothing'), { status: 1 })
-      return `${pid}\n`
+      const pids = [listeners[Number(args.find(arg => arg.startsWith('-iTCP@127.0.0.1:')).slice('-iTCP@127.0.0.1:'.length))]].flat().filter(pid => living.has(pid))
+      if (!pids.length) throw Object.assign(new Error('lsof found nothing'), { status: 1 })
+      return pids.map(pid => `${pid}\n`).join('')
     },
     kill: (pid, signal) => {
       if (!living.has(pid)) throw Object.assign(new Error(`kill ${pid}: ESRCH`), { code: 'ESRCH' })
@@ -50,13 +53,12 @@ function stubSystem({ listeners = {}, commands = {}, others = [], ignoresTerm = 
   }
 }
 
-test('findHost: the one pid lsof reports for the port; a free port is undefined; two listeners are refused', () => {
+test('findHost: this root\'s host is the pid lsof reports for 127.0.0.1:<port>; a free port is undefined; a missing lsof is an error', () => {
   const sys = stubSystem({ listeners: { 6101: 4242 } })
-  assert.deepEqual(findHost(6101, ROOT, sys), { pid: 4242, command: hostCommand(), harness: '/code/harness' })
+  assert.deepEqual(findHost(6101, ROOT, sys), { pid: 4242, pids: [4242], command: hostCommand(), harness: '/code/harness' })
   assert.deepEqual(sys.lsofCalls[0], ['-nP', '-iTCP@127.0.0.1:6101', '-sTCP:LISTEN', '-t'], 'only the address the host binds: a listener on ::1, 0.0.0.0 or :: is not it')
   assert.equal(findHost(6102, ROOT, sys), undefined)
   assert.equal(findHost(6103, ROOT, { ...sys, lsof: () => '4242\n4242\n' }).pid, 4242, 'one process listed twice is one host')
-  assert.throws(() => findHost(6103, ROOT, { lsof: () => '11\n12\n' }), /port 6103 has 2 listeners \(11, 12\); stop the extra ones by hand/)
   assert.throws(() => findHost(6104, ROOT, { lsof: () => { throw Object.assign(new Error('spawnSync lsof ENOENT'), { code: 'ENOENT' }) } }), /ENOENT/,
     'a missing lsof is an error, never "the port is free"')
 })
@@ -66,7 +68,7 @@ test('stopHost signals only the process on the port, never a recorded pid, and e
   const sys = stubSystem({ listeners: { 6101: 4242 }, others: [recorded], ignoresTerm: [4242] })
   const announced = []
   assert.equal(await stopHost(6101, ROOT, { graceMs: 1000, onStop: pid => announced.push(pid) }, sys), 4242)
-  assert.deepEqual(announced, [4242])
+  assert.deepEqual(announced, ['4242'])
   assert.deepEqual(sys.signals, [[4242, 'SIGTERM'], [4242, 'SIGKILL']])
   assert.equal(await stopHost(6101, ROOT, {}, sys), undefined, 'a free port stops nothing')
   assert.equal(sys.signals.length, 2)
@@ -109,16 +111,33 @@ test('stopHost checks the command line again right before each signal: a pid ano
   const reused = stubSystem({ listeners: { 6101: 4242 } })
   const lookup = reused.ps
   let psCalls = 0
-  reused.ps = args => psCalls++ === 0 ? lookup(args) : 'python3 -m http.server 6101\n'
+  reused.ps = args => psCalls++ === 0 ? lookup(args) : '1 python3 -m http.server 6101\n'
   await assert.rejects(stopHost(6101, ROOT, { graceMs: 400 }, reused), /still running after SIGKILL/)
   assert.deepEqual(reused.signals, [], 'neither SIGTERM nor SIGKILL reaches the new owner')
 
   // The host ignores SIGTERM, then its pid is reused before SIGKILL.
   const late = stubSystem({ listeners: { 6102: 5151 }, ignoresTerm: [5151] })
   const hostPs = late.ps
-  late.ps = args => late.signals.length ? 'python3 -m http.server 6102\n' : hostPs(args)
+  late.ps = args => late.signals.length ? '1 python3 -m http.server 6102\n' : hostPs(args)
   await assert.rejects(stopHost(6102, ROOT, { graceMs: 400 }, late), /still running after SIGKILL/)
   assert.deepEqual(late.signals, [[5151, 'SIGTERM']], 'SIGKILL is not sent to the process that took the pid over')
+})
+
+test('several listeners are one host when the others are forks of the parent; stopHost stops them all', async () => {
+  const forked = stubSystem({ listeners: { 6101: [4242, 4243] }, parents: { 4243: 4242 } })
+  assert.deepEqual(findHost(6101, ROOT, forked), { pid: 4242, pids: [4242, 4243], command: hostCommand(), harness: '/code/harness' }, 'the parent is the host')
+  const announced = []
+  assert.equal(await stopHost(6101, ROOT, { onStop: pids => announced.push(pids) }, forked), 4242)
+  assert.deepEqual(announced, ['4242, 4243'])
+  assert.deepEqual(forked.signals, [[4242, 'SIGTERM'], [4243, 'SIGTERM']])
+
+  const joined = stubSystem({ listeners: { 6102: [4242, 4243] }, parents: { 4243: 4242 }, commands: { 4243: '/usr/bin/python3 -m http.server 6102' } })
+  assert.throws(() => findHost(6102, ROOT, joined), { message: 'port 6102 is held by process 4243 (/usr/bin/python3 -m http.server 6102), which is not the dsh host of /roots/lab; stop it by hand or choose another --port' })
+  await assert.rejects(stopHost(6102, ROOT, {}, joined), /held by process 4243/)
+  assert.deepEqual(joined.signals, [], 'a foreign listener next to the host stops nothing')
+
+  const separate = stubSystem({ listeners: { 6103: [11, 12] } })
+  assert.throws(() => findHost(6103, ROOT, separate), { message: `port 6103 has 2 separate hosts of /roots/lab (11, 12); stop them by hand` })
 })
 
 test('startHost refuses a held port: nothing is spawned and the old log is left alone', t => {

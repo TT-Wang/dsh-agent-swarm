@@ -31,11 +31,10 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const running = child => child.exitCode === null && child.signalCode === null
 const readJson = path => JSON.parse(readFileSync(path, 'utf8'))
 
-/** The pid on 127.0.0.1:<port>, the host's one address. Independent of scripts/host.mjs on purpose. */
-function listener(port) {
-  const pid = spawnSync('lsof', ['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).stdout.trim()
-  return pid ? Number(pid) : undefined
-}
+/** The pids on 127.0.0.1:<port>, the host's one address. Independent of scripts/host.mjs on purpose. */
+const listeners = port => spawnSync('lsof', ['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' }).stdout.split(/\s+/).filter(Boolean).map(Number)
+const listener = port => listeners(port)[0]
+const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
 async function until(check, what, timeoutMs = 60_000) {
   for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(100)) if (check()) return
@@ -59,8 +58,7 @@ async function scene(t) {
   const children = []
   t.after(() => {
     for (const child of children) child.kill('SIGKILL')
-    const host = listener(port)
-    if (host) process.kill(host, 'SIGKILL') // the scripts' host is detached, not our child
+    for (const pid of listeners(port)) process.kill(pid, 'SIGKILL') // the scripts' host is detached, not our child
     rmSync(root, { recursive: true, force: true })
   })
   const env = { ...process.env, HOME: join(root, 'home') }
@@ -85,9 +83,9 @@ async function scene(t) {
       return child
     },
     /** The host someone restarted by hand: it holds the port and prints its token into `log`. */
-    async handStart(patch, log) {
+    async handStart(patch, log, env = {}) {
       const out = openSync(join(root, log), 'a')
-      const child = spawn(process.execPath, [join(harness, 'apps/cli/lib/bin.js'), '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out] })
+      const child = spawn(process.execPath, [join(harness, 'apps/cli/lib/bin.js'), '--profile', 'web', '--patch', patch, '--port', String(port), '--no-open'], { stdio: ['ignore', out, out], env: { ...process.env, ...env } })
       closeSync(out)
       children.push(child)
       await until(() => listener(port) === child.pid, `the hand-started host on ${port}`, 20_000)
@@ -224,4 +222,28 @@ test('the restart worker checks the port again: a program that took it during th
   assert.ok(running(taker), `the program that took the port is never signalled\n${restartLog}`)
   assert.match(restartLog, new RegExp(`port ${s.port} is held by process ${taker.pid} \\(.+\\), which is not the dsh host of ${s.root}`))
   assert.doesNotMatch(restartLog, /stopping host|started host/)
+})
+
+test('a forked child that inherited the socket is part of its parent\'s host: round names the parent and update-preview stops both', { skip: noLsof }, async t => {
+  const s = await scene(t)
+  for (const dir of ['home', 'workspace']) mkdirSync(join(s.root, dir), { recursive: true })
+  const hand = await s.handStart(s.patch('preview.patch.yml'), 'server.log', { FAKE_HOST_FORK: '1' })
+  await until(() => listeners(s.port).length === 2, 'the forked child on the port')
+  const [forked] = listeners(s.port).filter(pid => pid !== hand.pid)
+  writeFileSync(join(s.root, 'server.json'), JSON.stringify({ status: 'running', pid: hand.pid, url: `http://127.0.0.1:${s.port}`, port: s.port, home: join(s.root, 'home'), harness: s.harness, startedAt: new Date(Date.now() + 60_000).toISOString() }))
+
+  const status = await s.run('round.mjs', ['status', '--lab', s.root])
+  assert.equal(status.code, 0, status.stderr)
+  assert.deepEqual([JSON.parse(status.stdout).host.pid, JSON.parse(status.stdout).host.alive], [hand.pid, true])
+  const soak = await s.run('round.mjs', ['soak', '--lab', s.root])
+  assert.deepEqual(JSON.parse(soak.stdout).checks.slice(0, 2).map(check => [check.name, check.ok]), [['host-alive', true], ['plugin-loaded', true]], soak.stdout + soak.stderr)
+  const update = await s.run('update-preview.mjs', ['--preview', s.root, '--no-sync', '--skip-build', '--delay', '0', '--launch-timeout-ms', '20000'])
+  assert.equal(update.code, 0, update.stderr)
+  await until(() => !readdirSync(s.root).some(name => name.startsWith('.update-preview-')), 'the detached restart worker')
+  const restartLog = readFileSync(join(s.root, 'restart.log'), 'utf8')
+  assert.match(restartLog, new RegExp(`stopping host ${hand.pid}, ${forked}\\n`))
+  assert.deepEqual([running(hand), alive(forked)], [false, false], `both the parent and its fork are stopped\n${restartLog}`)
+  const server = readJson(join(s.root, 'server.json'))
+  assert.equal(server.status, 'running', restartLog)
+  assert.deepEqual(listeners(s.port), [server.pid])
 })
