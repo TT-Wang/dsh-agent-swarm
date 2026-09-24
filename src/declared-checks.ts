@@ -158,8 +158,7 @@ export class DeclaredChecks {
   /** Uncertain execution is not evidence that the artifact's assertions failed. */
   recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
     const failures = checks.filter(check => check.exitCode !== 0)
-    return failures.length > 0 && failures.every(check => check.failureKind === 'timeout' || check.failureKind === 'infrastructure'
-      || [124, 126, 127].includes(check.exitCode))
+    return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
   }
 
   /**

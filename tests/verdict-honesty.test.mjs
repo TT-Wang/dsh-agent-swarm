@@ -105,7 +105,7 @@ test('an infrastructure-deferred verification names the actual failed check and 
   const { source } = await f.submittedSourceWithEvidence()
   const verdict = f.proposeReview(source, 'Verdict review')
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, verdict.id)
-  f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
+  f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, failureKind: 'infrastructure', output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: verdict.id, attemptId: claimed.attempt.id,
     verdict: 'accept', reason: 'passed every acceptance criterion' })
   assert.equal(f.current(source.id).status, 'submitted')

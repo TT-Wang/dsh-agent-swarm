@@ -129,7 +129,7 @@ test('a deferred review of the rejected commit is retired with the rework, so th
   const source = f.propose('Implement')
   await f.submit(author, source)
   const deferred = f.proposeReview(source)
-  f.workers.checks = [{ command: 'test', exitCode: 124, output: 'timed out' }]
+  f.workers.checks = [{ command: 'test', exitCode: 124, failureKind: 'timeout', output: 'timed out' }]
   await f.verify(reviewer, deferred, 'accept', 'checks timed out')
   f.workers.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   assert.equal(f.current(deferred).status, 'blocked')
