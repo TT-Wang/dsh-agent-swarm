@@ -30,6 +30,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { TraceRecorder, bindHostTelemetry, hostTelemetryRecord } from '../lib/trace.js'
 import { installHostTelemetry } from '../lib/index.js'
 import { tempDirectory } from './temp-root.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 /** A durable-store stub: the trace layer's structural slice, with the rows kept for assertions. */
 function memoryStore() {
@@ -44,7 +45,7 @@ function memoryStore() {
 
 /** A span-shaped runtime: the recorder reads `config.statePath` and `store` only. */
 function runtimeFor(root, limits = {}) {
-  return { config: { statePath: join(root, 'db.sqlite'), ...limits }, store: memoryStore() }
+  return makeRuntimeStub({ config: { statePath: join(root, 'db.sqlite'), ...limits }, store: memoryStore() })
 }
 
 const spanContext = (missionId, overrides = {}) => ({

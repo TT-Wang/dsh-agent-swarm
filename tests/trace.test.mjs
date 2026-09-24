@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EVENT_VOCABULARY, TraceRecorder, canonicalJson, digestText, orchestratorCommands, payloadRef, spanContractViolation, traceMetrics } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 /** Every field a durable span row may carry; the census reads this contract. */
 const SPAN_FIELDS = new Set(['traceId', 'spanId', 'parentSpanId', 'missionId', 'attemptId', 'taskId', 'operation', 'step',
@@ -106,11 +107,11 @@ test('a recorder removes the payload directory earlier builds kept beside the st
   await mkdir(legacy, { recursive: true })
   await writeFile(join(legacy, 'cdef.json'), '{"tool":"swarm_publish"}')
   const store = { event() {}, transaction(body) { return body() }, events() { return [] } }
-  const recorder = TraceRecorder.forRuntime({ config: { statePath: join(directory, 'state.sqlite') }, store })
+  const recorder = TraceRecorder.forRuntime(makeRuntimeStub({ config: { statePath: join(directory, 'state.sqlite') }, store }))
   assert.ok(recorder, 'a runtime with a durable store and state path gets a recorder')
   await recorder.legacyCleanup
   await assert.rejects(stat(join(directory, 'trace-payloads')), { code: 'ENOENT' }, 'the legacy payload directory is gone')
   // A host that never had the directory starts the same way.
-  const fresh = TraceRecorder.forRuntime({ config: { statePath: join(directory, 'state.sqlite') }, store })
+  const fresh = TraceRecorder.forRuntime(makeRuntimeStub({ config: { statePath: join(directory, 'state.sqlite') }, store }))
   await fresh.legacyCleanup
 })

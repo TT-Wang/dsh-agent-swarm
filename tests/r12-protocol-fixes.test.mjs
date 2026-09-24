@@ -11,16 +11,17 @@ import { WriterBusyError } from '../lib/store.js'
 import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
 import { wakePrecision } from './instruments.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const hooks = new Set()
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
     isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
     commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
-  }
+  })
   const ctx = { on: () => () => {}, agents: { get: () => ({ ctx: { on: (_name, hook) => {
     hooks.add(hook); return () => hooks.delete(hook)
   } } }) } }
@@ -103,14 +104,14 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
 function refusalFixture() {
   let busy = true
   const admissions = new Map(), events = []
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     commit: (_id, fn) => { if (busy) throw new WriterBusyError('busy', 2); return fn() },
     store: {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
     }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
-  }
+  })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
 
@@ -177,7 +178,7 @@ function stopFixture(reason, stop) {
   const rows = new Map([['task', { id: 'task', missionId: mission.id, epoch: 2, status: 'blocked', assigneeId: 'planned-new-owner', recoveryCount: 1,
     resumeAfterStop: { epoch: 2, memberId: 'old-owner', reason, at: Date.now() } }]])
   const pending = [], events = [], stopped = []
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     config: { maxTasksPerMember: 10 }, shuttingDown: false,
     store: {
       list: table => table === 'tasks' ? [...rows.values()].map(row => structuredClone(row)) : [],
@@ -190,7 +191,7 @@ function stopFixture(reason, stop) {
     isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
     kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
-  }
+  })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }
 

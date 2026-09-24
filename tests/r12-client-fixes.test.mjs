@@ -6,6 +6,7 @@ import { readSnapshot } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 const flush = () => new Promise(resolve => setImmediate(resolve))
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
@@ -184,7 +185,7 @@ function webFixture({ release = async () => {}, listModels = async () => [] } = 
     logger: { warn: (...args) => warnings.push(args) },
     connection: { fetch: { register(route) { const index = routes.push(route) - 1; return () => release(index) } } },
   }
-  registerWebApi(ctx, {}, { defaultBudget: uiSnapshot().mission.budget, maxPayloadBytes: 8192 })
+  registerWebApi(ctx, makeRuntimeStub(), { defaultBudget: uiSnapshot().mission.budget, maxPayloadBytes: 8192 })
   const rpc = async endpoint => {
     const route = routes.find(route => route.path.endsWith('/' + endpoint))
     const response = await route.fetch(new Request('http://localhost' + route.path, { method: 'POST', headers: { 'content-type': 'application/json' },

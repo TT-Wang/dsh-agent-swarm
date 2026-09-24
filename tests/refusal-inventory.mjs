@@ -135,8 +135,9 @@ export function schemaPropertyNames(schema, into = new Set()) {
  */
 export async function toolSchemaIndex(budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }) {
   const { registerTools, SWARM_TOOLS } = await import('../lib/tools.js')
+  const { makeRuntimeStub } = await import('./faults/harness.mjs')
   const definitions = new Map()
-  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget)
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, makeRuntimeStub(), budget)
   const toolNames = new Set(SWARM_TOOLS)
   const propertyNames = new Set()
   for (const definition of definitions.values()) schemaPropertyNames(definition.parameters, propertyNames)

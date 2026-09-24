@@ -10,6 +10,7 @@ import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice } from '../lib/arena.js'
 import { tempDirectory } from './temp-root.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 class Workers {
@@ -376,8 +377,8 @@ function plannerFixture(t) {
   const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
-  const runtime = { config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, now: () => Date.now(), store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
-    subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() }
+  const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
+    subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() })
   registerAutomaticStart(ctx, runtime)
   t.after(() => disposers.forEach(dispose => dispose()))
   return { requests, sent, retry: () => { failFlush = false; for (const handler of handlers) handler() } }

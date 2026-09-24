@@ -18,7 +18,7 @@ import { registerTools } from '../lib/tools.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Config } from '../lib/index.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { FakeClock, makeWorkspaces } from './faults/harness.mjs'
+import { FakeClock, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 const plan = (workspace, extra = {}) => ({
@@ -37,11 +37,11 @@ function definitions(runtime, grants) {
 }
 function fakeRuntime() {
   const calls = { created: [], staged: [] }
-  return { calls,
+  return makeRuntimeStub({ calls,
     create: (_actor, input) => { calls.created.push(input); return { id: 'mission-1', ...input } },
     createDraft: (_actor, input) => { calls.staged.push(input); return { id: 'draft-1', revision: 1, status: 'draft', input } },
     snapshot: () => undefined,
-  }
+  })
 }
 const execution = (cwd, id = 'owner') => ({ agent: { id, ...(cwd === undefined ? {} : { session: { header: { cwd } } }) }, signal: new AbortController().signal })
 class Workers {
