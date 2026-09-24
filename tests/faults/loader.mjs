@@ -19,11 +19,15 @@ const catalogs = new Map()
 /**
  * The release gates' own selection (scripts/harness-target.mjs), with the fault
  * suite's message, and their support check: an explicitly supplied checkout of
- * a release outside compatibility.json is refused, never booted.
+ * a release outside compatibility.json is refused, never booted. The generic
+ * message is for an empty default search only; a supplied root that cannot be
+ * used (a missing path, say) reports its own cause.
  */
 export function resolveHarnessRoot(explicit) {
+  const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
   let root
-  try { root = resolveTarget(explicit) } catch {
+  try { root = resolveTarget(explicit) } catch (error) {
+    if (supplied) throw new Error(`The fault suite cannot use the Harness checkout ${supplied}: ${error.message}`, { cause: error })
     throw new Error('The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
   }
   assertSupportedHarness(root)

@@ -11,11 +11,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveHarnessRoot as resolveFaultHarness } from './faults/loader.mjs'
+import { withLocalImports } from './fixtures/local-imports.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const UNSUPPORTED = /Unsupported Harness 0\.1\.6-alpha\.2; supported: 0\.1\.5-rc\.3, 0\.1\.7-rc\.1/
@@ -111,4 +112,29 @@ test('round mount forwards --allow-unsupported-harness to update-preview, and on
   }
   assert.ok((await mount(['--allow-unsupported-harness'])).includes('--allow-unsupported-harness'))
   assert.ok(!(await mount([])).includes('--allow-unsupported-harness'))
+})
+
+test('the fault loader keeps the real cause for a supplied root it cannot use, and the generic message only for an empty default search', async t => {
+  const s = scene(t)
+  // A copy with no sibling checkouts and a scratch HOME, so the default search finds nothing.
+  const copy = join(s.root, 'project')
+  for (const [path, source] of Object.entries(await withLocalImports(project, 'tests/faults/loader.mjs'))) { mkdirSync(dirname(join(copy, path)), { recursive: true }); writeFileSync(join(copy, path), source) }
+  copyFileSync(join(project, 'compatibility.json'), join(copy, 'compatibility.json'))
+  for (const entry of ['lib', 'node_modules']) symlinkSync(join(project, entry), join(copy, entry))
+  const probe = `import(${JSON.stringify(join(copy, 'tests/faults/loader.mjs'))}).then(({ resolveHarnessRoot }) => { try { resolveHarnessRoot(process.argv[1]); console.log('resolved') } catch (error) { console.log(error.message) } })`
+  const missing = join(s.root, 'missing/harness')
+  const resolve = async (explicit, env) => {
+    const result = await new Promise(done => execFile(process.execPath, ['-e', probe, ...(explicit ? [explicit] : [])], { env: { PATH: process.env.PATH, HOME: join(s.root, 'home'), ...env } }, (error, stdout, stderr) => done({ error, stdout, stderr })))
+    assert.equal(result.error, null, result.stderr)
+    return result.stdout.trim()
+  }
+  for (const [label, message] of [
+    ['DSH_HARNESS_ROOT', await resolve(undefined, { DSH_HARNESS_ROOT: missing })],
+    ['DSH_SOURCE', await resolve(undefined, { DSH_SOURCE: missing })],
+    ['an explicit root', await resolve(missing, {})],
+  ]) {
+    assert.match(message, new RegExp(`^The fault suite cannot use the Harness checkout ${missing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: ENOENT`), `${label}: ${message}`)
+    assert.doesNotMatch(message, /set DSH_HARNESS_ROOT/, label)
+  }
+  assert.equal(await resolve(undefined, {}), 'The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
 })
