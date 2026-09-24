@@ -16,7 +16,7 @@ import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
+import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -335,17 +335,8 @@ export class Scheduling {
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            // A withdrawn authorization is terminal for this host process, not a
-            // transient preparation failure: fence the mission now, never retry.
-            if (error instanceof WorkspaceRevokedError) {
-              this.rt.fenceWorkspace(missionId, error.diagnostic)
-              // Round 14: the workspace chain's terminal element. `fenceWorkspace`
-              // blocks the work and records the raw diagnostic; this adds the coded
-              // decision request naming the executable exits, so a fenced mission
-              // never ends with a record that has no way forward in it.
-              this.escalateGuardTerminal(missionId, 'workspace', { taskId: task.id, detail: error.diagnostic })
-              return false
-            }
+            // A withdrawn authorization was fenced where it was detected, which
+            // blocked this task, so the changed-task rule below skips it.
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
               || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue

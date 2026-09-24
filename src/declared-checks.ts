@@ -149,6 +149,8 @@ export class DeclaredChecks {
    * and for I/O outside its preparation phase.
    */
   private async execute(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
+    // Every checkout, the retry's included, is created only after the runtime re-validates.
+    await this.rt.assertWorkspaceAuthorized(this.rt.mission(source.missionId))
     try { return await this.rt.workers.verifyArtifact(member, source, artifact, signal) }
     catch (error) {
       if (signal?.aborted) throw error

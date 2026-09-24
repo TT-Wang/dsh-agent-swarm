@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
-import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization } from './authorization.ts'
 import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -15,7 +15,7 @@ import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, Mission, PlanInput, PlanMember, TaskAmendment } from './types.ts'
+import type { Actor, Budget, Mission, PlanInput, PlanMember, TaskAmendment, WorkspaceGrantSnapshot } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -154,9 +154,7 @@ async function canonicalWorkspace(input: string, header: SessionHeader, grants: 
 
 /** Re-validate a mission already recorded against its own durable grant root. */
 async function missionWorkspace(mission: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, grants: WorkspaceGrantSnapshot): Promise<string> {
-  // A mission recorded before this feature has no anchor; its workspace is its
-  // own anchor, matching the pre-feature session-cwd authorization.
-  const authorization = await reauthorizeWorkspace(mission.workspace, mission.workspaceGrantRoot ?? mission.workspace, grants, mission.workspaceAuthorizationSource)
+  const authorization = await reauthorizeWorkspace(mission, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
   return authorization.workspace
 }

@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
 import { Attempts, blockCauses, currentEvidenceIds, pendingStopOwner, stopPending, type BlockCause } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
-import type { WorkspaceGrantSnapshot } from './authorization.ts'
+export { WorkspaceRevokedError } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
@@ -16,7 +16,7 @@ export { emptyUsage, addUsage, missionFingerprint, type MissionFingerprintBoard 
 import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type MissionFingerprintBoard } from './gates.ts'
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
-export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
+export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
 import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
@@ -26,7 +26,7 @@ import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
-import { nextWorkerName } from './types.ts'
+import { nextWorkerName, type WorkspaceGrantSnapshot } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
@@ -1769,8 +1769,6 @@ export class SwarmRuntime {
         this.ownAttempt(actor, missionId, task.id, input.attemptId)
       }
       const evidenceRevision = JSON.stringify(source.evidenceIds.map(eid => this.store.get('evidence', eid)))
-      // Re-validate before the verification checkout is created.
-      await this.assertWorkspaceAuthorized(this.mission(missionId))
       if (input.deliverables !== undefined) requireStrings(input.deliverables, 'deliverables')
       // The review artifact carries the review task's declared outputs plus any
       // listed deliverables; a declared output never written is refused at
@@ -2747,20 +2745,12 @@ export class SwarmRuntime {
       if (!['planning', 'failed'].includes(request.status) || request.planningFenced || (request.planningEpoch ?? 1) !== admittedEpoch) throw new Error('Request is no longer awaiting planning; inspect the saved request and retry through swarm_control')
       if (request.baseline) return request
       if (!this.workers.prepareBaseline) throw new Error('This worker adapter cannot snapshot a project for automatic planning')
+      await this.assertWorkspaceAuthorized(request)
       const controller = new AbortController()
       this.startControllers.set(requestId, controller)
       const signal = actor.signal ? AbortSignal.any([actor.signal, controller.signal]) : controller.signal
       try {
-        // T3e: the synthetic baseline record must carry the request's recorded
-        // authorization. Dropping the source makes the X3 fail-closed rule fence a
-        // session-cwd request before planning (the native /agent-swarm path);
-        // dropping the root loses the grant anchor for a granted request.
-        const baseline = await abortableStart(this.workers.prepareBaseline({
-          id: `mission_draft_${request.id}`,
-          workspace: request.workspace,
-          ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }),
-          ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }),
-        }, signal), signal)
+        const baseline = await abortableStart(this.workers.prepareBaseline({ id: `mission_draft_${request.id}`, workspace: request.workspace }, signal), signal)
         signal.throwIfAborted()
         const current = this.ownedStart(actor, requestId)
         if (!['planning', 'failed'].includes(current.status) || current.planningFenced || (current.planningEpoch ?? 1) !== admittedEpoch) throw new Error('Snapshot preparation was interrupted')
@@ -4483,6 +4473,10 @@ export class SwarmRuntime {
     let failed = false
     const promise = Promise.resolve().then(async () => {
       try {
+        // A start may adopt the member worktree, so it is re-validated first,
+        // outside the start failure boundary: a revocation fences the mission,
+        // not this member. What follows re-reads the state after the await.
+        await this.assertWorkspaceAuthorized(mission, options.pass)
         controller.signal.throwIfAborted()
         const current = this.store.get('missions', mission.id)
         const latest = this.store.get('members', member.id)

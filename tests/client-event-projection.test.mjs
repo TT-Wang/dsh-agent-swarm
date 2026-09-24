@@ -30,7 +30,7 @@ import { mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { authorizeWorkspace, loadWorkspaceGrants } from '../lib/authorization.js'
+import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { recentProgress } from '../lib/types/client/progress.js'
 import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
@@ -54,7 +54,7 @@ async function fixture(t) {
   return { temp, session, granted, project }
 }
 const runtimeConfig = { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined }
-const granting = grants => ({ ...runtimeConfig, grants, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants) })
+const granting = grants => ({ ...runtimeConfig, grants })
 
 test('the real runtime snapshot projects the workspace binding into the compact panel with its payload', async t => {
   const { granted, project } = await fixture(t)

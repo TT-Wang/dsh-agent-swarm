@@ -3,7 +3,7 @@ import type { Context, Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
-import { authorizeWorkspace, loadWorkspaceGrants, type WorkspaceGrant } from './authorization.ts'
+import { loadWorkspaceGrants } from './authorization.ts'
 import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
 import { HarnessWorkers, installOwnerDeliveryFilter } from './harness-workers.ts'
@@ -15,7 +15,7 @@ import { OwnerReplyGuard } from './owner-reply.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
-import type { Budget } from './types.ts'
+import type { Budget, WorkspaceGrant } from './types.ts'
 import { reportHarnessSupport } from './host-version.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
@@ -156,11 +156,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // instead of starting empty. Applying here (not in a model tool) keeps the
   // swap outside any live runtime's ownership.
   const restored = applyPendingRestore(config.statePath)
-  const workers = new HarnessWorkers(ctx, { ...config, grants })
+  const workers = new HarnessWorkers(ctx, config)
   // The profile passes unknown keys through; the runtime clock and the manual
   // tick are never among them.
-  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants,
-    authorizeWorkspace: (workspace, sessionCwd, now) => authorizeWorkspace(workspace, sessionCwd, grants, now) }, workers)
+  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')

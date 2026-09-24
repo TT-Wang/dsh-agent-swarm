@@ -5,7 +5,6 @@ import { StringDecoder } from 'node:string_decoder'
 import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
@@ -91,15 +90,6 @@ export interface WorkspaceOptions {
    * Required for the same reason as `onCleanupFailure`.
    */
   onRecoveryFallback(info: RecoveryFallback): void
-  /**
-   * Human-authorized roots loaded once at plugin start. When supplied, every
-   * baseline preparation, member workspace and verification checkout
-   * re-validates the mission's recorded `workspaceGrantRoot`, so a root the
-   * human removed from configuration fences the mission instead of letting it
-   * continue against an unauthorized root. Absent in unit fixtures that drive
-   * `Workspaces` directly; the recorded admission result then stands.
-   */
-  grants?: WorkspaceGrantSnapshot
   /**
    * R11-19: maximum declared-check executions per host process. Verifications
    * beyond the limit wait in a FIFO queue; every wait and run is measured and
@@ -359,7 +349,7 @@ export async function assertContainedSymlinkChain(relative: string, target: stri
     queue.unshift(...next.split('/'))
   }
 }
-interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline; workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
+interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
 const INTEGRATION_CONFLICT_FILE = '.swarm-integration-conflicts.json'
 interface IntegrationConflict { dependencyId: string; commit: string; paths: string[] }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; preservedCommit?: string; recovery?: TaskRecovery
@@ -836,21 +826,6 @@ export class Workspaces {
   }
 
   /**
-   * Re-validate the human authorization behind a mission before its first
-   * filesystem effect (baseline snapshot, member worktree, verification
-   * checkout). The recorded `workspaceGrantRoot` — falling back to the mission
-   * record, then to the workspace itself for records written before this
-   * feature — anchors the check, and the loaded grant snapshot decides whether
-   * that root is still configured and unexpired. A root the human removed
-   * therefore fences the mission here instead of silently continuing.
-   */
-  private async assertWorkspaceAuthorized(workspace: string, recordedRoot: string | undefined, source?: 'session' | 'grant'): Promise<void> {
-    const grants = this.options.grants
-    if (grants === undefined) return
-    const authorization = await reauthorizeWorkspace(workspace, recordedRoot ?? workspace, grants, source)
-    if (!authorization.ok) throw new Error(authorization.diagnostic)
-  }
-  /**
    * Host git operations (worktree add, capture, commit) are not the declared
    * check and must not inherit its budget. Round 14 lost three verdicts because
    * they did: a verification checkout under load exceeded the 60 s check budget
@@ -942,13 +917,12 @@ export class Workspaces {
       if (!isRecord(saved) || !commitId(saved.sourceHead) || saved.snapshotCommit !== value.baseCommit || typeof saved.planningWorkspace !== 'string' || !Array.isArray(saved.changedPaths) || saved.changedPaths.some(item => typeof item !== 'string') || !Number.isSafeInteger(saved.createdAt)) throw new Error('Invalid mission snapshot metadata')
       baseline = { sourceHead: saved.sourceHead, snapshotCommit: value.baseCommit, planningWorkspace: saved.planningWorkspace, changedPaths: saved.changedPaths as string[], createdAt: saved.createdAt as number }
     }
-    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }), ...(typeof value.workspaceGrantRoot === 'string' ? { workspaceGrantRoot: value.workspaceGrantRoot } : {}), ...(value.workspaceAuthorizationSource === 'session' || value.workspaceAuthorizationSource === 'grant' ? { workspaceAuthorizationSource: value.workspaceAuthorizationSource } : {}) }
+    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }) }
   }
 
   /** Freeze one source baseline before planning; all members and restarts reuse it. */
-  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
+  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
     signal?.throwIfAborted()
-    await this.assertWorkspaceAuthorized(mission.workspace, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
     const existing = this.baselines.get(mission.id)
     if (existing !== undefined) {
       const baseline = await existing
@@ -970,17 +944,10 @@ export class Workspaces {
         // Full repository path inventories need a metadata bound independent
         // of the much smaller user-visible check-output retention limit.
         const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, INVENTORY_BYTES), ownedSignal)
-        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace }, ...(mission.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: mission.workspaceGrantRoot }), ...(mission.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: mission.workspaceAuthorizationSource }) }
+        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace } }
         await writePrivateJson(manifest, record)
       } else record = await this.missionRecord(mission.id)
       if (record.source !== source) throw new Error('Mission source workspace changed')
-      // Re-validate the persisted root, not just the in-memory mission: a
-      // manifest written before the root was recorded still fences correctly.
-      await this.assertWorkspaceAuthorized(source, record.workspaceGrantRoot ?? mission.workspaceGrantRoot, record.workspaceAuthorizationSource ?? mission.workspaceAuthorizationSource)
-      if ((record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined) || (record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined)) {
-        record = { ...record, ...(record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined ? { workspaceGrantRoot: mission.workspaceGrantRoot } : {}), ...(record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined ? { workspaceAuthorizationSource: mission.workspaceAuthorizationSource } : {}) }
-        await writePrivateJson(manifest, record)
-      }
       // Older manifests must retain their original baseline even if the source
       // now has unrelated edits. Add only the planning-view metadata.
       const baseline = record.baseline ?? { sourceHead: record.baseCommit, snapshotCommit: record.baseCommit, planningWorkspace, changedPaths: [], createdAt: Date.now() }
@@ -1961,9 +1928,6 @@ export class Workspaces {
         return [unexecutedCheck('(verification preparation)', error)]
       }
       const mission = await this.missionRecord(member.missionId)
-      // Revocation fencing: the verification checkout is created only after the
-      // persisted mission manifest still authorizes its recorded root.
-      await this.assertWorkspaceAuthorized(mission.source, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
       signal.throwIfAborted()
       // Research can require independent review without declaring host commands.
       // Keep the validation above, but reserve execution capacity only for checks.

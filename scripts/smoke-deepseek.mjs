@@ -104,7 +104,7 @@ try {
   })
   const mission = ctx.swarm.create(actor, {
     title: 'Actual DeepSeek collaboration smoke', objective: 'Deliver an independently verified change making value.cjs export two.',
-    workspace, scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], budget,
+    workspace, workspaceAuthorizationSource: 'session', scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], budget,
   })
   missionId = mission.id
   const stream = ctx.swarm.workstream(actor, missionId, { title: 'Value change', objective: 'Make and independently review the small delivery.' })

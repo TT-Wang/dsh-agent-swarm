@@ -15,7 +15,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspaces.js'
-import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
+import { isContained } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
@@ -80,14 +80,6 @@ export interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
-  /**
-   * The human-authorized roots loaded once at plugin start. When supplied, the
-   * owned `Workspaces` re-validates every workspace preparation and verification
-   * checkout against them, so a revoked root fences the mission instead of
-   * silently continuing. Absent in unit fixtures that drive `Workspaces`
-   * directly, where the recorded admission result stands.
-   */
-  grants?: WorkspaceGrantSnapshot
   /** Ignored dependency directories linked from the source into verification checkouts. */
   verificationDependencyDirs?: string[]
   /** M6/R11-13: `link` symlinks those directories read-through; `copy` (the effective default) clones them into each checkout. */
@@ -410,7 +402,6 @@ export class HarnessWorkers implements WorkerAdapter {
       // check — goes through the host's managed-process seam, resolved at each
       // start so the provider's mount order never decides whether a mission can run.
       subprocess: () => ctx.get('subprocess'),
-      ...(options.grants === undefined ? {} : { grants: options.grants }),
       // H-3: a recovery fallback is an owner-visible durable fact, not a host
       // log line; the bound runtime records it (read at call time: the callbacks
       // are bound after construction).
@@ -662,7 +653,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return { root, path: relative, kind: 'file', content: buffer.subarray(0, bytesRead).toString('utf8'), bytes: bytesRead, truncated: info.size > bytesRead }
   }
   prepareWorkspace(mission: Mission, memberId: string): Promise<string> { return this.workspaces.prepareWorkspace(mission, memberId) }
-  prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
+  prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal) { return this.workspaces.prepareBaseline(mission, signal) }
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal) {
     if (!mission.baseline) throw new Error('This mission has no saved delivery baseline')
     return inspectDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)

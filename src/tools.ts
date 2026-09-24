@@ -1,7 +1,7 @@
 /** Model tools are thin, authenticated consumers of the swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
 import { inheritedAcceptance } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
@@ -9,7 +9,7 @@ import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { SwarmStore } from './store.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, type TraceStep } from './trace.ts'
-import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task, TaskAmendment } from './types.ts'
+import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
