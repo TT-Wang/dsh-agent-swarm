@@ -9,6 +9,48 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-26 simplification batch 6, wave A: fault suite, runtime clock, web smokes and host scripts (2026-09-24)
+
+- **The fault suite passes again: 24 of 24**, in a worktree and from a `git archive` export, where it was
+  17 of 24 on main and 15 of 24 on the round-19 main. Every failure was a stale fixture, bisected to the
+  commit that changed the behaviour on purpose: F1, F14 and F18 to 69211b9 (a pause re-pends only after the
+  stop barrier; a denied git write is a delivered typed error; a start failure spends no task credit),
+  F3a-c and F4 to 8b16913 (their `checks: ['true']` became `[check_noop]`), and F3c's stray key to 00e0e55.
+  F4 now runs `scripts/round.mjs promote` from a scratch git repository with every local module it
+  imports, so it no longer needs this tree to be a git checkout.
+- **A runtime clock and an awaitable pass for tests.** `RuntimeConfig.now` (a function; never taken from
+  profile config) is read for leases, pass bounds, back-offs, silence, stall and wedge ages, wake budgets,
+  follow-up timing, event `createdAt`, the owner turn boundary, the grant-expiry fence and the task-ceiling
+  stamp. `manualTick: true` installs no tick timer while `tickMs` stays the unit of every tick-derived
+  window; a test drives `await runtime.tick()` and `await runtime.settle(missionId)` and moves time with
+  `FakeClock.advance(ms)` (`setup({ clock })` in `tests/faults/harness.mjs`). Five tests that flaked in
+  this programme now run on it without sleeps or polling.
+- **Start failures are bounded and named.** When no live member can start a task because every capable
+  route was retired for start failures, the owner gets one notice naming the task, each retired member's
+  consecutive failures and last error, and the exits. During a recorded provider outage a member is probed
+  once per outage window instead of every tick, and the owner is told once per outage.
+- **The typed git-denial error reaches the worker before its next model step**: the runtime delivers it
+  into the worker's inbox before the failed tool result returns.
+- **The browser smokes run through one `runWebSmoke`** with one scripted model; `npm run test:web` passes
+  again (its roster selectors had gone stale in a7547ae; the client was correct).
+- **The preview and lab host is identified by its port and its command line.** `scripts/host.mjs` finds
+  the listener on `127.0.0.1:<port>`, accepts it only when its command line is the dsh web host these
+  scripts launch for that root, and re-reads it before every signal; `update-preview` boots the Harness the
+  running host was launched from unless `--harness` is given, and records a failed restart as failed.
+
+The adversarial verification of this wave found that stopping a host signalled whatever listened on the
+port, including another program or another root's host (high), that the recorded Harness could restart a
+hand-started host onto a stale checkout, that a profile key `now` crashed the runtime, that a task whose
+every route failed to start stayed pending with a stall notice reading "Unschedulable: none" and no bound
+under a provider outage, and that the rebuilt F1, F14 and F18 assertions could not fail. Each is fixed with
+a regression that fails before it; F1, F14 and F18 were mutation-tested.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: 1408 tests at e6daa64, all passed. An earlier run at f49b545 found eleven R12 tests whose hand-built partial runtimes lacked the new clock; they were given one (9bf2e50).
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness` (smoke snapshot unchanged
+  under `UPDATE_SMOKE_SNAPSHOT=1`), `test:pack` and `test:profile`: passed.
+- `npm run test:faults`: 24 of 24. `npm run test:web`: passed.
+
 ## Round-25 simplification batch 5: one owner per notice and scheduling rule (2026-09-24)
 
 Batch 5 removed duplicated owner-notice and scheduling machinery and added one schema check for every
@@ -997,7 +1039,7 @@ npm run test:command-web
 npm run test:validation-repair-web
 ```
 
-Browser checks need the matching Harness Web build and Playwright browser environment. Set `DSH_WEB_SMOKE_ARTIFACTS` to retain separate evidence directories for different host versions. Test profiles and repositories are isolated. Running the large Harness suites and multiple browsers concurrently can increase load enough to exceed small fixture timeouts; run them sequentially when reproducing. Optional `test:deepseek` and `test:command-deepseek` scripts use real provider credentials and are separate, billable checks.
+Browser checks need the matching Harness Web build and Playwright browser environment. Set `DSH_WEB_SMOKE_ARTIFACTS` to retain separate evidence directories for different host versions. Test profiles and repositories are isolated. Running the large Harness suites and multiple browsers concurrently can increase load enough to exceed small fixture timeouts; run them sequentially when reproducing. Optional `test:deepseek` and `test:command-deepseek` scripts use real provider credentials and are separate, billable checks. All three browser smokes run through `runWebSmoke` in `scripts/web-smoke-browser.mjs` with one scripted model, `tests/fixtures/web-scripted-llm.mjs`. Without `DSH_WEB_SMOKE_ARTIFACTS`, evidence goes to `artifacts/<smoke>`: `artifacts/web` (formerly `artifacts/sidebar`), `artifacts/command-web` and `artifacts/validation-repair-web`. A `--serve-only` run writes `report.json` with `scenario: "serve-only"` and no checks: it is a served host, not a passed scenario.
 
 The behavioral tests import the built `lib/` output. `npm test` builds first; a bare `node --test tests/*.test.mjs` needs `npm run link:dsh` and `npm run build` first, otherwise it stops at `ERR_MODULE_NOT_FOUND .../lib/runtime.js`. A clean checkout without linked dependencies stops earlier at `tsc: command not found`.
 
