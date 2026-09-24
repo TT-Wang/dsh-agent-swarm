@@ -24,13 +24,14 @@ import { DatabaseSync } from 'node:sqlite'
 import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS, errorTypeFor, spanContractViolation } from '../lib/trace.js'
-import { FakeWorkers } from './faults/harness.mjs'
+import { FakeWorkers, budget as sharedBudget } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
 
 const newWorkers = () => new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] })
 
 async function fixture(t, options = {}) {
+  // fixture gap: a caller-chosen state directory and file name; the store-backed test lists state/ and filters db.sqlite.
   const root = await mkdtemp(join(tmpdir(), 'swarm-board-'))
   const stateDirectory = join(root, 'state')
   const workspace = join(root, 'workspace')
