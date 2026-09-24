@@ -11,7 +11,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -137,4 +137,27 @@ test('the fault loader keeps the real cause for a supplied root it cannot use, a
     assert.doesNotMatch(message, /set DSH_HARNESS_ROOT/, label)
   }
   assert.equal(await resolve(undefined, {}), 'The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
+})
+
+test('the default search skips an unbuilt checkout of a supported release and takes the built sibling', async t => {
+  const s = scene(t)
+  // harness-target resolves its siblings from its own project, so a copy puts them in the scratch root.
+  const copy = join(s.root, 'project')
+  mkdirSync(join(copy, 'scripts'), { recursive: true })
+  copyFileSync(join(project, 'scripts/harness-target.mjs'), join(copy, 'scripts/harness-target.mjs'))
+  copyFileSync(join(project, 'compatibility.json'), join(copy, 'compatibility.json'))
+  const checkout = (dir, built) => {
+    mkdirSync(join(dir, 'apps/cli/lib'), { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version: '0.1.5-rc.3' }))
+    if (built) writeFileSync(join(dir, 'apps/cli/lib/bin.js'), '')
+    return realpathSync(dir)
+  }
+  const unbuilt = checkout(join(s.root, 'unbuilt'), false)
+  mkdirSync(join(s.root, 'home/.dsh/source'), { recursive: true })
+  symlinkSync(unbuilt, join(s.root, 'home/.dsh/source/current'))
+  const probe = `import(${JSON.stringify(join(copy, 'scripts/harness-target.mjs'))}).then(({ resolveHarnessRoot }) => { try { console.log(resolveHarnessRoot()) } catch (error) { console.log(error.message) } })`
+  const resolve = () => new Promise(done => execFile(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH, HOME: join(s.root, 'home') } }, (error, stdout, stderr) => { assert.equal(error, null, stderr); done(stdout.trim()) }))
+  assert.equal(await resolve(), 'Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json', 'an unbuilt checkout alone is no candidate')
+  const built = checkout(join(s.root, 'deepseek-harness-015rc3'), true)
+  assert.equal(await resolve(), built, 'the built sibling, not the unbuilt ~/.dsh/source/current ahead of it')
 })
