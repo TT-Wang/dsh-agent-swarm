@@ -66,9 +66,12 @@ await runWebSmoke({
     const panel = page.locator('[data-swarm-panel]').filter({ visible: true })
     const launcher = page.locator('[data-swarm-native-launcher]')
     const goal = '把 value.cjs 的导出值改为 2，不要修改 check.cjs。运行 node check.cjs，并安排独立审查。'
+    // The runner starts this scenario only once the selected workspace's session
+    // has loaded its native command catalog, so the menu renders from that
+    // catalog; the wait below bounds rendering, not loading.
     await writeComposerDraft(page, composer, '/agent-sw')
     const candidate = page.getByRole('option').filter({ hasText: 'agent-swarm' })
-    await candidate.waitFor({ timeout: 30_000 })
+    await candidate.waitFor()
     assert.match(await candidate.innerText(), /自动组织智能体协作完成任务/)
     await page.screenshot({ path: join(artifacts, 'autocomplete.png'), fullPage: true })
     await candidate.click()

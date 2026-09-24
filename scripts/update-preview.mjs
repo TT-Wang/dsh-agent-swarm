@@ -25,7 +25,15 @@
  *   --harness <dir>   Harness checkout to boot, recorded in server.json
  *                     (default: the one the preview's running host was
  *                     launched from, else the one recorded in
- *                     <preview>/server.json; required when neither exists)
+ *                     <preview>/server.json; required when neither exists).
+ *                     A checkout whose release is not in compatibility.json is
+ *                     refused with harness-target's message
+ *   --allow-unsupported-harness
+ *                     update a preview pinned to an unsupported Harness anyway,
+ *                     with a warning on stderr and in restart.log. The 5202
+ *                     preview still boots 0.1.6-alpha.2 and its snapshot links
+ *                     that release's SDK packages, so refusing it outright
+ *                     would strand it; the flag makes that choice explicit
  *   --patch <file>    patch overlay (default: <preview>/preview.patch.yml)
  *   --home <dir>      DSH_HOME (default: <preview>/home)
  *   --workspace <dir> host working directory (default: <preview>/workspace)
@@ -50,6 +58,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { awaitLaunchUrl, findHost, hostEnv, readServer, startHost, stopHost, writeServer } from './host.mjs'
+import { assertSupportedHarness } from './harness-target.mjs'
 import { changedPaths, summarizePaths } from './preview-log.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -92,6 +101,14 @@ const harnessRoot = resolve(harnessChoice)
 if (server.harness && resolve(server.harness) !== harnessRoot) log(`booting Harness ${harnessRoot}, not the recorded ${server.harness}`)
 const cli = join(harnessRoot, 'apps/cli/lib/bin.js')
 if (!existsSync(cli)) fail(`harness CLI not found: ${cli} (pass --harness <checkout>)`)
+// Only the releases in compatibility.json are supported; anything else is
+// refused before the build, unless the operator names the override.
+try { assertSupportedHarness(harnessRoot) } catch (error) {
+  if (!flag('--allow-unsupported-harness')) fail(`${error.message} (${harnessRoot}); pass --allow-unsupported-harness to update this preview on it anyway`)
+  const warning = `WARNING: ${error.message} (${harnessRoot}); continuing only because --allow-unsupported-harness was passed. This plugin is neither supported nor tested on that Harness.`
+  process.stderr.write(`update-preview: ${warning}\n`)
+  log(warning)
+}
 
 /** Exactly the paths the published tarball carries, so the snapshot mirrors a release. */
 function packagedEntries() {
