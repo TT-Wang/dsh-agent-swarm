@@ -6,7 +6,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, re
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeRuntimeStub, workspaceOptions } from './faults/harness.mjs'
+import { FakeWorkers, makeRuntimeStub, workspaceOptions } from './faults/harness.mjs'
 
 // Source mode permits parallel development without rebuilding shared lib/.
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
@@ -66,7 +66,7 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
 })
 
 test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {
-  const rt = makeRuntimeStub({ workers: { isIdle: () => true }, scopesOverlap: () => true })
+  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
@@ -81,7 +81,7 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: { isIdle: () => true } })
+  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)

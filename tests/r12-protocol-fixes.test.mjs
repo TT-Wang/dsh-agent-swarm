@@ -162,6 +162,9 @@ test('R12 instrument: ordinary owner questions are excluded from the decision me
 
 function stopFixture(reason, stop) {
   const mission = { id: 'mission', status: 'active' }
+  // The fenced owner's row, already stopped: the adapter checkpoints it and the
+  // release leaves it (and, on close-out, the task's assignee) as it is.
+  const oldOwner = { id: 'old-owner', missionId: mission.id, status: 'stopped' }
   const rows = new Map([['task', { id: 'task', missionId: mission.id, epoch: 2, status: 'blocked', assigneeId: 'planned-new-owner', recoveryCount: 1,
     resumeAfterStop: { epoch: 2, memberId: 'old-owner', reason, at: Date.now() } }]])
   const pending = [], events = [], stopped = []
@@ -169,11 +172,12 @@ function stopFixture(reason, stop) {
     config: { maxTasksPerMember: 10 }, shuttingDown: false,
     store: {
       list: table => table === 'tasks' ? [...rows.values()].map(row => structuredClone(row)) : [],
-      get: (table, id) => table === 'missions' ? mission : table === 'tasks' ? structuredClone(rows.get(id)) : undefined,
+      get: (table, id) => table === 'missions' ? mission : table === 'tasks' ? structuredClone(rows.get(id))
+        : table === 'members' && id === oldOwner.id ? structuredClone(oldOwner) : undefined,
       put: (table, row) => { if (table === 'tasks') rows.set(row.id, structuredClone(row)) },
       event: (_mission, type, _actor, data) => events.push({ type, data }),
     },
-    workers: { stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } },
+    workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),

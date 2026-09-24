@@ -14,8 +14,7 @@ async function fixture(t) {
   // Registered first, so the current (possibly reloaded) runtime is disposed before makeRuntime removes the state dir.
   t.after(async () => { await runtime?.dispose() })
   const made = await makeRuntime(t, {
-    // No currentActivity: R06 writes the member's activity row directly, and only the durable row counts as in flight.
-    workers: new FakeWorkers({ currentActivity: undefined, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
     config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 20, maxTasksPerMember: 100, checkTimeoutMs: undefined },
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
@@ -393,6 +392,8 @@ test('R06: in-flight usage triggers durable mission review with a larger recomme
   const f = await fixture(t)
   const member = f.runtime.store.get('members', f.member.id)
   member.accountedTokens = 10000; member.usage = { requests: 1 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+  // The adapter reports that model request as live; the row itself is written directly, with no activity event.
+  f.workers.activity = member.activity
   const mission = f.runtime.mission(f.mission.id); mission.usedTokens = 65000
   f.runtime.commit(mission.id, () => { f.runtime.store.put('members', member); f.runtime.store.put('missions', mission) })
   f.runtime.gates.warnBudget(f.runtime.mission(mission.id))

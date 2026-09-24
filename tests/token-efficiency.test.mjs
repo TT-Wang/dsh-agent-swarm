@@ -10,9 +10,14 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 60))
 /** Only the external execution adapter is replaced; store, admission, scheduling and outbox are real. */
 class ControlledWorkers extends FakeWorkers {
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  // No currentActivity: the in-flight test reports a model request through the callback alone,
-  // so the durable member row is the only live view (FakeWorkers' activity is not per member).
-  currentActivity = undefined
+  // The live view is per member, as the Harness adapter's is: the in-flight test has two members on
+  // the board and only the builder has a model request open (FakeWorkers' `activity` is one value).
+  live = new Map()
+  currentActivity(memberId) { return this.live.get(memberId) }
+  reportActivity(memberId, activity) {
+    if (activity === undefined) this.live.delete(memberId); else this.live.set(memberId, activity)
+    this.callbacks?.activity?.(memberId, activity)
+  }
   async captureArtifact(member, task) { return { commit: `c-${task.id.slice(-8)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/a.ts'] } }
 }
 async function manual(t, overrides = {}, acceptance = ['works']) {
@@ -223,7 +228,7 @@ test('usage buckets accumulate per worker without double counting and owner usag
 test('in-flight requests are estimated from each worker’s average and gate new steps before the pool overruns', async t => {
   const f = await manual(t, { maxTokens: 500 })
   await f.workers.callbacks.usageSnapshot(f.a.id, 400, { uncachedInputTokens: 100, cacheReadTokens: 300, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 2 })
-  f.workers.callbacks.activity(f.a.id, { id: 'op', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() })
+  f.workers.reportActivity(f.a.id, { id: 'op', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() })
   assert.equal(f.runtime.observe(f.owner, f.mission.id).mission.inFlightTokensEstimate, 200)
   await assert.rejects(f.workers.callbacks.beforeStep(f.b.id), /budget exhausted/)
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).mission.status, 'blocked')

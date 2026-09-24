@@ -35,6 +35,7 @@ import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers } from './faults/harness.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -50,24 +51,13 @@ async function eventually(fn, message, timeoutMs = 5000) {
   }
 }
 
-class Workers {
-  constructor(ctx) { this.ctx = ctx; this.started = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start(spec) { this.started.push(spec.member.id) }
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+/** Always idle, no host checks; `ctx` is the host context the notices subscribe to for consumption. */
+const newWorkers = ctx => new FakeWorkers({ ctx, autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
 
 async function fixture(t, config = {}) {
   const dir = await tempDirectory('swarm-r17-notices-')
   const ctx = new Context()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers(ctx))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, newWorkers(ctx))
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
