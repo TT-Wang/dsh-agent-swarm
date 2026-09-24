@@ -62,8 +62,9 @@ await runWebSmoke({
     })
     page.on('requestfailed', request => { if (request === latestObserverRequest) continuousObserver = false })
     const composer = composerFor(page)
-    const panel = page.locator('[data-swarm-panel]')
-    const dock = page.locator('[data-swarm-dock]')
+    // The host's right sidebar carries the panel as a native tab; its footer launcher reopens it.
+    const panel = page.locator('[data-swarm-panel]').filter({ visible: true })
+    const launcher = page.locator('[data-swarm-native-launcher]')
     const goal = '把 value.cjs 的导出值改为 2，不要修改 check.cjs。运行 node check.cjs，并安排独立审查。'
     await writeComposerDraft(page, composer, '/agent-sw')
     const candidate = page.getByRole('option').filter({ hasText: 'agent-swarm' })
@@ -133,9 +134,9 @@ await runWebSmoke({
     assert(running.tasks.every(task => task.checkTimeoutMs === 30_000), 'the primary agent sets every task check deadline')
     assert.equal(running.members.length, 2)
     assert(running.members.every(member => member.maxOutputTokens === 4096), 'the primary agent chooses each worker response allowance')
-    const dockBox = await dock.boundingBox()
-    const shellBox = await page.locator('#root').boundingBox()
-    assert(dockBox && shellBox && shellBox.x + shellBox.width <= dockBox.x + 1, 'automatic opening reserves native conversation space')
+    const panelBox = await panel.boundingBox()
+    const composerBox = await composer.boundingBox()
+    assert(panelBox && composerBox && composerBox.x + composerBox.width <= panelBox.x + 1, 'automatic opening places the panel beside the conversation without covering its input')
     await assertSimplifiedSwarm(panel)
     await page.screenshot({ path: join(artifacts, 'running.png'), fullPage: true })
     checks.push('swarm_launch admits the complete topology and primary-agent-selected budget; no configuration, Save or Launch gesture')
@@ -152,7 +153,7 @@ await runWebSmoke({
     assert(watchTimings.some(item => item.receivedAt - item.eventCreatedAt < 1500), 'a new committed event must reach the browser through watch before the former two-second polling interval')
     await page.screenshot({ path: join(artifacts, 'thinking.png'), fullPage: true })
     checks.push('actual pending Harness model activity is visible with a real elapsed clock; watch includes a committed update below 1.5 seconds, with all timing samples retained and no latency guarantee')
-    await panel.getByRole('button', { name: 'Collapse sidebar', exact: true }).click()
+    await page.getByRole('button', { name: 'Collapse right sidebar', exact: true }).click()
     await until(async () => !await panel.isVisible(), 'collapsed sidebar is hidden')
     // Let a cancelled request settle, then complete actual worker activity while
     // no user-visible panel is subscribed. Native model execution keeps running.
@@ -162,7 +163,7 @@ await runWebSmoke({
     await until(async () => (await readFile(tracePath, 'utf8')).includes('"name":"swarm_verify"'), 'workers continue to independent verification while the sidebar is hidden', 120_000)
     await new Promise(resolve => setTimeout(resolve, 2300))
     assert.equal(stateRequests.length, hiddenRequestCount, 'hidden sidebar must not maintain a polling or watch request loop')
-    await page.locator('[data-swarm-launcher]').click()
+    await launcher.click()
     await panel.waitFor()
     await until(() => ctx.state?.snapshots.some(snapshot => snapshot.mission.id === missionId && snapshot.mission.status === 'completed'), 'worker acceptance automatically completes the mission', 120_000)
     await until(() => ctx.state?.snapshots.find(snapshot => snapshot.mission.id === missionId)?.members.every(member => member.status !== 'working'), 'completed workers settle to non-working durable status', 30_000)
