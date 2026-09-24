@@ -19,6 +19,9 @@ let sourceIndex
 await runWebSmoke({
   name: validationRepair ? 'validation-repair-web' : 'command-web',
   scriptedLlm: { owner: 'command', validationRepair },
+  // A manual-plan default below the generated allowance, so a generated field
+  // clamped to it fails the budget assertion below.
+  pluginConfig: { defaultBudget: { maxTokens: 50_000, maxSteps: 60, maxWorkers: 2, maxDurationMs: 180_000, maxTasks: 6, maxExperiments: 1 } },
   report: {
     watchTimingMethod: 'Each previously unseen mission/event sequence delivered in a delta on an uninterrupted observer is sampled once. Full snapshots, eventless deltas and the first response after interruption are excluded.',
     watchTimings,

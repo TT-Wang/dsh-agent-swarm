@@ -21,9 +21,10 @@
  *          profile and pack smokes; --browser adds the live browser smokes
  * promote: --commit <sha> --dry-run; requires a recorded green gate for that
  *          exact commit and a clean tree in its paths; never commits by itself
- * mount:   --harness <dir> (default: the one recorded in the lab's server.json)
+ * mount:   --harness <dir> (default: the running lab host's, else the one
+ *          recorded in the lab's server.json)
  * soak:    verifies the lab is alive, loaded the plugin and started after the build
- * The lab host is whatever listens on its port, not a recorded pid.
+ * The lab host is the lab's own dsh host on its port, not a recorded pid.
  * new:     --scope "one-line round scope"
  * record:  --gate pass|fail --revision <sha> --findings <n> --fixed <n> --notes "..."
  */
@@ -44,7 +45,8 @@ const roundsPath = join(lab, 'rounds.json')
 const ledgerPath = join(project, 'docs/improvement-rounds.md')
 const readRounds = () => existsSync(roundsPath) ? JSON.parse(readFileSync(roundsPath, 'utf8')) : []
 const writeRounds = rounds => { mkdirSync(lab, { recursive: true }); writeFileSync(roundsPath, JSON.stringify(rounds, null, 2) + '\n', { mode: 0o600 }) }
-const hostPid = server => findHost(Number(server.port ?? new URL(server.url).port))
+/** This lab's host on its port ({} when the port is free), or { error } when the lookup fails or another process holds the port. */
+const labHost = server => { try { return findHost(Number(server.port ?? new URL(server.url).port), lab) ?? {} } catch (error) { return { error: error.message } } }
 const fail = message => { process.stderr.write(`round: ${message}\n`); process.exit(2) }
 const stamp = () => new Date().toISOString()
 
@@ -52,9 +54,9 @@ if (!command || command === '--help' || command === '-h') { process.stdout.write
 
 if (command === 'status') {
   const server = readServer(lab)
-  const pid = server && hostPid(server)
+  const host = server ? labHost(server) : {}
   const rounds = readRounds()
-  process.stdout.write(JSON.stringify({ lab, host: server ? { ...server, pid: pid ?? null, alive: pid !== undefined } : null, rounds: rounds.slice(-3), roundCount: rounds.length }, null, 2) + '\n')
+  process.stdout.write(JSON.stringify({ lab, host: server ? { ...server, pid: host.pid ?? null, alive: host.pid !== undefined, ...(host.error && { error: host.error }) } : null, rounds: rounds.slice(-3), roundCount: rounds.length }, null, 2) + '\n')
   process.exit(0)
 }
 
@@ -186,14 +188,14 @@ if (command === 'promote') {
 if (command === 'soak') {
   const server = readServer(lab)
   if (!server) fail(`no lab host provisioned at ${lab}`)
-  const pid = hostPid(server)
+  const { pid, error } = labHost(server)
   const lockPath = join(lab, 'swarm.sqlite.lock')
   const lock = existsSync(lockPath) ? JSON.parse(readFileSync(lockPath, 'utf8')) : undefined
   const buildPath = join(project, 'lib/index.js')
   const buildMtime = existsSync(buildPath) ? statSync(buildPath).mtimeMs : 0
   const startedAt = server.startedAt ? Date.parse(server.startedAt) : 0
   const checks = [
-    { name: 'host-alive', ok: pid !== undefined, detail: `pid ${pid ?? 'none'}` },
+    { name: 'host-alive', ok: pid !== undefined, detail: error ?? `pid ${pid ?? 'none'}` },
     { name: 'plugin-loaded', ok: pid !== undefined && lock?.pid === pid, detail: `store lock owner ${lock?.pid ?? 'none'}` },
     { name: 'mounted-after-build', ok: startedAt > buildMtime, detail: `build ${new Date(buildMtime).toISOString()} < host ${server.startedAt}` },
   ]

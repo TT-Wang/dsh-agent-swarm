@@ -78,6 +78,7 @@ export async function writeComposerDraft(page, input, text) {
  *
  * - `scriptedLlm`: config for tests/fixtures/web-scripted-llm.mjs beyond the paths
  *   supplied here (`owner` picks the owner script).
+ * - `pluginConfig`: extra dsh-external-agent-swarm config, over the isolated state paths.
  * - `prepare(ctx)`: optional workspace changes after the baseline commit, before the host starts.
  * - `observe({ endpoint, value, state, response })`: optional hook on every successful
  *   /api/agent-swarm response, before `ctx.state` takes `state`.
@@ -88,7 +89,7 @@ export async function writeComposerDraft(page, input, text) {
  * `--serve-only` stops after the host is ready; `--keep-alive` keeps a verified host
  * until SIGINT or SIGTERM.
  */
-export async function runWebSmoke({ name, scriptedLlm, prepare, observe, report = {}, scenario }) {
+export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, observe, report = {}, scenario }) {
   const harnessRoot = resolveHarnessRoot()
   const bin = join(harnessRoot, 'apps/cli/lib/bin.js')
   await access(join(harnessRoot, 'apps/web/dist/index.html'))
@@ -119,7 +120,7 @@ export async function runWebSmoke({ name, scriptedLlm, prepare, observe, report 
       modelBoundary: 'Scripted LLM adapter only; actual CLI web product, browser, native transport, worker lifecycle and sandbox tools.',
       modelRequests: events.filter(event => event.type === 'model/request').length,
       toolCalls: events.filter(event => event.type === 'tool/call').length,
-      passed: !failure, scenario: name, ...report,
+      passed: !failure, scenario: process.argv.includes('--serve-only') ? 'serve-only' : name, ...report,
       ...(failure ? { failure: String(failure) } : {}), build, elapsedMs: (validatedAt ?? Date.now()) - started, checks, rpcResults,
     }, null, 2) + '\n')
     await writeFile(join(artifacts, 'model-trace.jsonl'), modelTrace)
@@ -169,7 +170,7 @@ export async function runWebSmoke({ name, scriptedLlm, prepare, observe, report 
       { id: 'session-title-llm', disabled: true },
       { id: 'directory-picker', disabled: true },
       { id: 'agent-default-model', config: { provider: 'deepseek-official', model: 'swarm-web-primary' } },
-      { id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees'), tickMs: 100 } },
+      { id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees'), tickMs: 100, ...pluginConfig } },
       { insert: [
         { id: 'directory-picker-browse', name: '@deepseek-ai/dsh-host-directory-picker-browse' },
         { id: 'ui-directory-picker-browse', name: '@deepseek-ai/dsh-client-ui-directory-picker-browse' },

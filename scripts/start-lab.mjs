@@ -112,8 +112,9 @@ if (!existsSync(join(workspace, '.git'))) {
 }
 
 // ---------------------------------------------------------------- restart
-// The lab host is whatever listens on the port, however it was last started.
-await stopHost(port, { onStop: pid => log(`stopping previous lab host ${pid}`) })
+// The lab host is this root's dsh host on the port, however it was last
+// started; any other listener is refused, never stopped.
+try { await stopHost(port, root, { onStop: pids => log(`stopping previous lab host ${pids}`) }) } catch (error) { fail(error.message) }
 if (noStart) { process.stdout.write(JSON.stringify({ ...plan, started: false }, null, 2) + '\n'); process.exit(0) }
 
 writeServer(root, { status: 'starting', url: `http://127.0.0.1:${port}`, root, home, plugin, harness: harnessRoot, port, startedAt: new Date().toISOString() })

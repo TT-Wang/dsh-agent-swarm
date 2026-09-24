@@ -1,12 +1,20 @@
 /**
  * The one supervisor behind start-preview, start-lab, update-preview and round.
  *
- * The port is the host's identity: whatever process listens on it IS the host,
- * no matter who started it. Nothing trusts a recorded pid, which goes stale when
- * a host is restarted by hand and can be reused by an unrelated process.
+ * A root's host is the process listening on 127.0.0.1:<port> whose command
+ * line is the dsh web host these scripts launch for that root:
+ * <harness>/apps/cli/lib/bin.js ... --profile web ... --patch <root>/<file>.
+ * Nothing trusts a recorded pid, which goes stale when a host is restarted by
+ * hand and can be reused by an unrelated process; and nothing signals a
+ * listener that is not the root's host (another program, another root's host).
  *
- *   findHost(port)            the pid listening on the port, or undefined
- *   stopHost(port)            TERM that pid, KILL it after a grace period
+ *   findHost(port, root)      that host as { pid, pids, command, harness }, or
+ *                             undefined when the port is free; refuses any other
+ *                             listener. A forked child that inherited the socket
+ *                             is part of its parent's host (pids)
+ *   stopHost(port, root)      TERM every pid of that host, KILL them after a
+ *                             grace period, re-checking each command line
+ *                             right before each signal
  *   startHost({ root, ... })  refuse a held port, give the host a fresh
  *                             <root>/server.log, spawn it detached
  *   awaitLaunchUrl(...)       the launch URL that host prints, kept in <root>/launch.url
@@ -17,44 +25,82 @@
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { closeSync, existsSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 
+const quiet = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
 export const system = {
-  lsof: args => execFileSync('lsof', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }),
+  lsof: args => execFileSync('lsof', args, quiet),
+  ps: args => execFileSync('ps', args, quiet),
   kill: (pid, signal) => process.kill(pid, signal),
   spawn: (args, options) => spawn(process.execPath, args, options),
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
 }
 
-/** The pid listening on the port, or undefined when the port is free. */
-export function findHost(port, sys = system) {
+/** The pids listening on 127.0.0.1:<port>. The host binds only that address, so a listener on ::1, 0.0.0.0 or :: is never it. */
+function listeners(port, sys) {
   let out
-  try { out = sys.lsof(['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']) }
-  catch (error) { if (error.status === 1) return undefined; throw error } // lsof exits 1 when nothing matches
-  const pids = [...new Set(out.split(/\s+/).filter(Boolean).map(Number))]
-  if (pids.length > 1) throw new Error(`port ${port} has ${pids.length} listeners (${pids.join(', ')}); stop the extra ones by hand`)
-  return pids[0]
+  try { out = sys.lsof(['-nP', `-iTCP@127.0.0.1:${port}`, '-sTCP:LISTEN', '-t']) }
+  catch (error) { if (error.status === 1) return []; throw error } // lsof exits 1 when nothing matches
+  return [...new Set(out.split(/\s+/).filter(Boolean).map(Number))]
+}
+
+/** A live pid's parent pid and command line; {} once it has exited. */
+function processOf(pid, sys) {
+  let out
+  try { out = sys.ps(['-ww', '-o', 'ppid=', '-o', 'command=', '-p', String(pid)]) }
+  catch (error) { if (error.status === 1) return {}; throw error } // ps exits 1 for a pid that is gone
+  const [, ppid, command] = out.trim().match(/^(\d+)\s+(.*)$/s) ?? []
+  return { ppid: Number(ppid), command }
+}
+
+const ENTRY = '/apps/cli/lib/bin.js'
+/** The Harness checkout when `command` is the dsh web host of `root` as these scripts launch it, else undefined. */
+export function hostHarness(command, root) {
+  const argv = command.split(/\s+/)
+  const entry = argv.findIndex(arg => isAbsolute(arg) && arg.endsWith(ENTRY))
+  const option = name => { const at = argv.indexOf(name, entry + 1); return at > entry ? argv[at + 1] : undefined }
+  if (entry < 0 || option('--profile') !== 'web' || dirname(option('--patch') ?? '') !== root) return undefined
+  return argv[entry].slice(0, -ENTRY.length)
+}
+
+/**
+ * The host of `root` on the port as { pid, pids, command, harness }, or undefined when nothing
+ * listens on 127.0.0.1:<port>. Every listener must be that host: any other is refused by pid and
+ * command line, never returned. Several listeners are one host when one is the parent of the
+ * others (a forked child inherited the socket): `pid` is the parent, `pids` all of them.
+ */
+export function findHost(port, root, sys = system) {
+  const found = listeners(port, sys).map(pid => ({ pid, ...processOf(pid, sys) })).filter(entry => entry.command) // a listener may exit meanwhile
+  if (found.length === 0) return undefined
+  const foreign = found.filter(entry => !hostHarness(entry.command, root))
+  if (foreign.length) throw new Error(`port ${port} is held by ${foreign.map(({ pid, command }) => `process ${pid} (${command})`).join(' and ')}, which is not the dsh host of ${root}; stop it by hand or choose another --port`)
+  const parents = found.filter(entry => !found.some(other => other.pid === entry.ppid))
+  if (parents.length > 1) throw new Error(`port ${port} has ${parents.length} separate hosts of ${root} (${parents.map(entry => entry.pid).join(', ')}); stop them by hand`)
+  const [{ pid, command }] = parents
+  return { pid, pids: found.map(entry => entry.pid), command, harness: hostHarness(command, root) }
 }
 
 const alive = (pid, sys) => { try { sys.kill(pid, 0); return true } catch { return false } }
 
-/** Stop whatever listens on the port and wait until it is gone. Resolves with its pid, or undefined for a free port. */
-export async function stopHost(port, { graceMs = 12_000, onStop = () => {} } = {}, sys = system) {
-  const pid = findHost(port, sys)
-  if (pid === undefined) return undefined
-  onStop(pid)
+/** Stop every pid of the host of `root` on the port and wait until they are gone. Resolves with its pid, or undefined for a free port. */
+export async function stopHost(port, root, { graceMs = 12_000, onStop = () => {} } = {}, sys = system) {
+  const host = findHost(port, root, sys)
+  if (host === undefined) return undefined
+  onStop(host.pids.join(', '))
+  const living = () => host.pids.filter(pid => alive(pid, sys))
   for (const [signal, boundMs] of [['SIGTERM', graceMs], ['SIGKILL', 5_000]]) {
-    try { sys.kill(pid, signal) } catch { /* already gone */ }
-    for (let waited = 0; waited < boundMs && alive(pid, sys); waited += 200) await sys.sleep(200)
-    if (!alive(pid, sys)) return pid
+    // Checked again right before each signal: a pid that exited, or that another program now owns, is left alone.
+    for (const pid of living()) if (hostHarness(processOf(pid, sys).command ?? '', root)) try { sys.kill(pid, signal) } catch { /* already gone */ }
+    for (let waited = 0; waited < boundMs && living().length; waited += 200) await sys.sleep(200)
+    if (!living().length) return host.pid
   }
-  throw new Error(`host ${pid} on port ${port} is still running after SIGKILL`)
+  throw new Error(`host ${living().join(', ')} on port ${port} is still running after SIGKILL`)
 }
 
 /** Start a host on a free port with a fresh server.log. Returns the child; the caller owns it. */
 export function startHost({ root, port, cli, patch, cwd, env }, sys = system) {
-  const holder = findHost(port, sys)
-  if (holder !== undefined) throw new Error(`port ${port} is held by process ${holder}; stop it before starting a host`)
+  const holders = listeners(port, sys)
+  if (holders.length) throw new Error(`port ${port} is held by process ${holders.join(', ')}; stop it before starting a host`)
   const logPath = join(root, 'server.log')
   try { renameSync(logPath, join(root, `server-${new Date().toISOString().replace(/[:.]/g, '-')}.log`)) }
   catch (error) { if (error.code !== 'ENOENT') throw error }
