@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
+import { FakeWorkers } from '../../tests/faults/harness.mjs'
 
 const BUDGET = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 /**
@@ -21,19 +22,25 @@ const BUDGET = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs
  */
 const LEASE_MS = 60000
 
-/** Records every adapter command and counts any provider invocation (always zero). */
-export class RecordingWorkers {
-  constructor(root) { this.root = root; this.commands = []; this.providerCalls = 0; this.deliveries = []; this.checks = [{ command: 'replay-check', exitCode: 0, output: 'ok' }]; this.artifacts = 0 }
-  bind(callbacks) { this.callbacks = callbacks }
+/**
+ * Records every adapter command and counts any provider invocation (always
+ * zero); the shared FakeWorkers answers every other adapter method. Like it,
+ * this adapter deliberately has no `prepareBaseline` and no `checkEnvelope`:
+ * either would add `workspace/snapshot` or `task/check-envelope` events to the
+ * durable log the golden digest is taken from.
+ */
+export class RecordingWorkers extends FakeWorkers {
+  commands = []
+  providerCalls = 0
+  checks = [{ command: 'replay-check', exitCode: 0, output: 'ok' }]
+  artifacts = 0
+  autoIdle = true
+  constructor(root) { super(); this.root = root }
   async prepareWorkspace(_mission, memberId) { return join(this.root, 'worktrees', memberId) }
-  async start() {}
-  async deliver(_member, delivery) { this.deliveries.push(delivery) }
   async stop(memberId) { this.commands.push({ kind: 'stop', memberId }) }
-  isIdle() { return true }
   async captureArtifact() { this.artifacts++; return { commit: `commit-${this.artifacts}`, baseCommit: 'base', workspace: join(this.root, 'worktrees', 'capture'), changedPaths: ['src/a.ts'] } }
   async verifyArtifact(_member, source) { this.commands.push({ kind: 'verify', sourceTaskId: source.id }); return this.checks }
   async prepareTask(member, task) { this.commands.push({ kind: 'dispatch', taskId: task.id, memberId: member.id }) }
-  async dispose() {}
 }
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
