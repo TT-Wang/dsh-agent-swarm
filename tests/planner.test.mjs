@@ -35,7 +35,7 @@ function fakeInbox(session) {
   }
 }
 import { SubprocessLocal } from './subprocess-seam.mjs'
-import { FakeWorkers, eventually as poll, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually as poll, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 const eventually = read => poll(read, 'Expected native planner recovery transition did not occur', 3000)
 async function fixture(t, options = {}) {
   // Registered before makeRuntime's own cleanup, so the plugin, the idle gates,
@@ -277,17 +277,26 @@ test('an unrepaired validation failure becomes one fenced recovery notice when p
 })
 
 test('retry snapshot preparation uses the planning deadline rather than the shorter outbox timeout', async t => {
-  let snapshots = 0
-  const f = await fixture(t, { config: { tickMs: 10, stallPassTimeoutMs: 20, planningTimeoutMs: 10000 },
-    async beforeSnapshot(signal) { snapshots++; await new Promise(resolve => setTimeout(resolve, 60)); signal.throwIfAborted() },
+  // Order, not speed. The preparation holds on a timer armed after the dispatch
+  // started, and longer than the outbox timeout, so under the old rule that
+  // timeout's abort always lands first; the hold records what its signal saw.
+  // The planning deadline runs on a frozen fake clock, so a slow host can
+  // neither expire it nor abort the preparation through it, and the wait for
+  // the delivery below bounds a hang, not the speed of the Git snapshot.
+  const clock = new FakeClock()
+  const preparations = []
+  const f = await fixture(t, { config: { tickMs: 10, stallPassTimeoutMs: 20, planningTimeoutMs: 10000, now: clock.now },
+    async beforeSnapshot(signal) { await new Promise(resolve => setTimeout(resolve, 60)); preparations.push(signal.aborted ? 'aborted' : 'held past the outbox timeout'); signal.throwIfAborted() },
   })
   const actor = { sessionId: f.agent.id }
   const request = f.runtime.requestStart(actor, { commandId: 'slow-snapshot', goal: 'finish a slow snapshot', workspace: f.root })
   f.runtime.failStart(actor, request.id, 'snapshot needs a retry', 1)
   f.runtime.controlStart(actor, request.id, 'retry', 'allow the snapshot to finish')
-  await eventually(() => f.messages.some(message => message.source.phase === 'planning' && message.source.planningEpoch === 2)
-    && !f.runtime.store.get('starts', request.id).planningDispatchPending)
-  assert.equal(snapshots, 1, 'the short transport timeout must not repeatedly abort a healthy preparation')
+  await poll(() => preparations.length > 0, 'the retried preparation never reached its snapshot', 30_000)
+  assert.deepEqual(preparations, ['held past the outbox timeout'], 'the short transport timeout must not abort a healthy preparation')
+  await poll(() => f.messages.some(message => message.source.phase === 'planning' && message.source.planningEpoch === 2)
+    && !f.runtime.store.get('starts', request.id).planningDispatchPending, 'the prepared planning message was never delivered', 30_000)
+  assert.deepEqual(preparations, ['held past the outbox timeout'], 'and it ran once, never repeated')
   assert.ok(f.runtime.store.get('starts', request.id).baseline)
   assert.equal(f.runtime.store.get('starts', request.id).status, 'planning')
 })
