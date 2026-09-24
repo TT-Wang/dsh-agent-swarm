@@ -77,12 +77,11 @@ for (const status of ['completed', 'stopped']) test(`R02: ${status} receipt clos
 })
 
 test('R01: the reply guard leaves owner tool execution available to answer', async t => {
-  const f = await fixture(t), question = await f.question(), hooks = []
-  const guard = new OwnerReplyGuard({ on: () => () => {}, agents: { get: () => ({ ctx: { on: (...args) => { hooks.push(args); return () => {} } } }) } }, f.runtime, { maxNudges: 2 })
+  const f = await fixture(t), question = await f.question()
+  const guard = new OwnerReplyGuard({ on: () => () => {} }, f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
   guard.observe('owner', 'user/message', { createdAt: Date.now() + 1 })
   guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
-  assert.equal(hooks.length, 0)
   assert.equal(f.runtime.store.get('deliveries', question.id).replyNudges, 1)
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', replyTo: question.id, content: 'Now answered' })
   assert.equal(f.runtime.openAsks(f.mission.id).length, 0)

@@ -13,16 +13,12 @@ import { FakeWorkers, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
-  const hooks = new Set()
   const rt = makeRuntimeStub({
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
     isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
     commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
   })
-  const ctx = { on: () => () => {}, agents: { get: () => ({ ctx: { on: (_name, hook) => {
-    hooks.add(hook); return () => hooks.delete(hook)
-  } } }) } }
-  return { mission, question, hooks, rt, guard: new OwnerReplyGuard(ctx, rt, { maxNudges: 2 }) }
+  return { mission, question, rt, guard: new OwnerReplyGuard({ on: () => () => {} }, rt, { maxNudges: 2 }) }
 }
 
 test('R12: aborted, failed and blocked turns leave the owner reply opportunity intact', () => {
@@ -35,18 +31,7 @@ test('R12: aborted, failed and blocked turns leave the owner reply opportunity i
   f.guard.observe('owner', 'user/message', { createdAt: 2 })
   f.guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.question.replyNudges, 1)
-  assert.equal(f.hooks.size, 0, 'the reply guard never installs an owner pre-step rejection')
   f.guard.dispose()
-  f.guard.dispose()
-  assert.equal(f.hooks.size, 0, 'all lazy pre-step hooks are disposed')
-})
-
-test('R12: the reply guard keeps active and terminal owner work executable', async () => {
-  const f = guardFixture()
-  f.guard.observe('owner', 'user/message', { createdAt: 2 })
-  f.guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
-  f.mission.status = 'stopped'
-  assert.equal(f.hooks.size, 0, 'there is no owner execution gate to release')
   f.guard.dispose()
 })
 

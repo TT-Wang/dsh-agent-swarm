@@ -3,27 +3,6 @@ import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
 import { emitGuardTerminal } from './refusals.ts'
 
-/**
- * L2: the owner-side half of the reply protocol.
- *
- * A question delivered to the owner is a receipt (L0/L1). The worker side already
- * has a silence protocol — a quiet attempt is nudged, checkpointed and finally
- * abandoned with an event. The owner side had nothing: the question reached the
- * conversation, the owner answered in prose, and the asker never heard anything,
- * because the owner's chat text is not part of this store and cannot be
- * reconciled with the delivery.
- *
- * This guard closes that gap where it can actually be observed: at the end of an
- * owner turn. Questions that were delivered before the turn started, are still
- * open when it ends, and were not settled by any tool call during it leave a
- * durable `owner/reply-missing` event and a bounded instruction naming the exact
- * call. When the bound is spent, the existing guard-terminal vocabulary reports
- * the decision instead of nudging forever.
- *
- * The guard never edits the owner's answer and never sends on its behalf: it
- * makes the missing receipt visible and executable, which is the invariant the
- * board already keeps for task state.
- */
 /** One question booked at turn start, with everything the nudge must name. */
 interface Booking {
   missionId: string
@@ -47,22 +26,43 @@ function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking
   ].join('\n')
 }
 
+/**
+ * L2: the owner-side half of the reply protocol.
+ *
+ * A question delivered to the owner is a receipt (L0/L1). The worker side already
+ * has a silence protocol — a quiet attempt is nudged, checkpointed and finally
+ * abandoned with an event. The owner side had nothing: the question reached the
+ * conversation, the owner answered in prose, and the asker never heard anything,
+ * because the owner's chat text is not part of this store and cannot be
+ * reconciled with the delivery.
+ *
+ * This guard closes that gap where it can actually be observed: at the end of an
+ * owner turn. Questions that were delivered before the turn started, are still
+ * open when it ends, and were not settled by any tool call during it leave a
+ * durable `owner/reply-missing` event and a bounded instruction naming the exact
+ * call. When the bound is spent, the existing guard-terminal vocabulary reports
+ * the decision instead of nudging forever.
+ *
+ * The guard never edits the owner's answer and never sends on its behalf: it
+ * makes the missing receipt visible and executable, which is the invariant the
+ * board already keeps for task state.
+ */
 export class OwnerReplyGuard {
   private readonly bookings = new Map<string, Map<string, Booking>>()
-  private readonly removals: Array<() => void> = []
+  private readonly removal: () => void
   private closed = false
 
-  constructor(private readonly ctx: Context, private readonly rt: SwarmRuntime, private readonly options: { /** Nudges spent on one question before the guard terminal. */ maxNudges: number }) {
-    this.removals.push(ctx.on('session/event', (session, event) => {
+  constructor(ctx: Context, private readonly rt: SwarmRuntime, private readonly options: { /** Nudges spent on one question before the guard terminal. */ maxNudges: number }) {
+    this.removal = ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }
       catch { /* An observer must never break a turn; the next turn re-derives the miss. */ }
-    }))
+    })
   }
 
   dispose(): void {
     this.closed = true
-    for (const remove of this.removals.splice(0)) { try { remove() } catch { /* Continue releasing the other registrations. */ } }
+    this.removal()
     this.bookings.clear()
   }
 
