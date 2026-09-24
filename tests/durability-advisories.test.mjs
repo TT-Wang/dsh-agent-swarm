@@ -1,11 +1,13 @@
 /**
  * Round-4 advisory regressions.
  *
- * A1: `checkpointAbandonedTask` read the shared task record, decided, and wrote
- * without mutual exclusion, so a checkpoint overlapping an ownership switch
- * could clobber the newer owner's record. The fix serializes the read-check-write
- * with a per-record lock; this test holds that lock and proves the checkpoint
- * waits, then declines to write over the newer owner.
+ * A1: a task record is shared by the previous attempt, the recovering attempt
+ * and capture. A checkpoint that read the record, decided it still owned it and
+ * wrote after a newer attempt's write would clobber that write. Every writer of
+ * a task record runs in this process (the store's runtime lock admits one per
+ * store and a mission belongs to one store), so the writes of one record are
+ * serialized in memory: this test holds an older checkpoint inside its write and
+ * proves the newer attempt's write waits behind it instead of being lost.
  *
  * A2: `git status --untracked-files=all` lists the files inside an untracked
  * dependency directory and never the directory name, so the `isDirectory`
@@ -15,12 +17,13 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import filesystem, { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
+import { eventually, makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -46,42 +49,49 @@ async function fixture(t, options = {}) {
 }
 const taskRecordPath = (temp, missionId, taskId) => path.join(temp, 'worktrees', missionId, 'tasks', `${taskId}.json`)
 const readJson = async file => JSON.parse(await readFile(file, 'utf8'))
-const peer = async (mission, workspaces, id) => ({ id, missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, id) })
 
-test('A1: a checkpoint waits for the task-record lock and never clobbers a newer owner', async t => {
-  const { temp, head, workspaces, mission, member: first, task } = await fixture(t)
-  await workspaces.prepareTask(first, task, [])
-  const second = await peer(mission, workspaces, 'member-two')
-  const recordPath = taskRecordPath(temp, mission.id, task.id)
-  const before = await readJson(recordPath)
-  // Hold the record lock exactly as a competing owner's write would.
-  await writeFile(`${recordPath}.lock`, 'competing owner')
-  let finished = false
-  const switching = workspaces.prepareTask(first, { ...task, id: 'task-next' }, []).then(() => { finished = true })
-  // Synchronize on the observable, never on a fixed sleep: the pre-fix
-  // checkpoint writes the shared record without honouring the lock, while the
-  // fixed checkpoint blocks until the lock is released. Poll the record for a
-  // generous bounded interval so a slow pre-fix write cannot escape detection
-  // (the verifier measured the pre-fix blind write well inside 3 s).
-  const waitUntil = Date.now() + 5000
-  let changedWhileLockHeld = false
-  while (!changedWhileLockHeld && !finished && Date.now() < waitUntil) {
-    changedWhileLockHeld = await readJson(recordPath).then(current => JSON.stringify(current) !== JSON.stringify(before), () => true)
-    if (!changedWhileLockHeld && !finished) await new Promise(resolve => setTimeout(resolve, 10))
+/**
+ * Hold the first write of `file` in flight until released: a private JSON write
+ * publishes by renaming its temporary over the record. `landed` lists the epoch
+ * of each write of the record in the order the writes took effect.
+ */
+function holdFirstWrite(t, file) {
+  const rename = filesystem.rename
+  let reach, release
+  const reached = new Promise(resolve => { reach = resolve })
+  const released = new Promise(resolve => { release = resolve })
+  const landed = []
+  filesystem.rename = async (from, to) => {
+    if (to !== file) return await rename(from, to)
+    const epoch = JSON.parse(await readFile(from, 'utf8')).task.epoch
+    if (reach !== undefined) { const signal = reach; reach = undefined; signal(); await released }
+    await rename(from, to)
+    landed.push(epoch)
   }
-  assert.equal(changedWhileLockHeld, false, 'the abandoned-task checkpoint must not write the shared record while the lock is held')
-  assert.equal(finished, false, 'the abandoned-task checkpoint waits instead of writing blind')
-  // The newer owner's record lands while the checkpoint waits.
-  await writeFile(recordPath, JSON.stringify({ version: 1, missionId: mission.id, memberId: second.id, workspace: second.workspace,
-    task: { taskId: task.id, epoch: 2, baseCommit: head } }))
-  await rm(`${recordPath}.lock`, { force: true })
-  await switching
+  syncBuiltinESMExports()
+  t.after(() => { filesystem.rename = rename; syncBuiltinESMExports() })
+  return { reached, release, landed }
+}
+
+test('A1: writes of one task record serialize in this process, so an older checkpoint never lands over a newer attempt', async t => {
+  const { temp, workspaces, mission, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  const recordPath = taskRecordPath(temp, mission.id, task.id)
+  const write = holdFirstWrite(t, recordPath)
+  // Attempt 1's checkpoint has read the record and decided it still owns it; its write is in flight.
+  const checkpoint = workspaces.checkpointTask(member, task)
+  await write.reached
+  // Attempt 2 of the same task takes the record over while that write is in flight.
+  const takeover = workspaces.prepareTask(member, { ...task, epoch: 2 }, [])
+  const memberRecord = path.join(temp, 'worktrees', mission.id, `${member.id}.workspace.json`)
+  await eventually(async () => (await readJson(memberRecord)).task.epoch === 2, 'attempt 2 reaches its task record write')
+  assert.equal((await readJson(recordPath)).task.epoch, 1, 'the newer write waits behind the one in flight')
+  write.release()
+  await Promise.all([checkpoint, takeover])
+  assert.deepEqual(write.landed, [1, 2], 'the writes took effect one at a time, in the order they began')
   const after = await readJson(recordPath)
-  assert.equal(after.memberId, second.id, 'the newer owner keeps the task record')
-  assert.equal(after.task.epoch, 2)
-  assert.equal(after.task.capturedCommit, undefined, 'the stale checkpoint never wrote its base over the new owner')
-  const memberRecord = await readJson(path.join(temp, 'worktrees', mission.id, `${first.id}.workspace.json`))
-  assert.equal(memberRecord.task.taskId, 'task-next', 'the switching member still moves on to its next task')
+  assert.equal(after.task.epoch, 2, 'the newer attempt keeps the record: no lost update')
+  assert.match(after.task.preservedCommit, /^[a-f0-9]{40,64}$/, 'the checkpoint it waited behind is carried forward')
 })
 
 test('A2: a real untracked dependency directory is excluded from preparation and capture', async t => {

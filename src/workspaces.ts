@@ -389,14 +389,22 @@ export interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandl
 export type ProcessSeamSource = () => ProcessSeam | undefined
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean; subprocess?: ProcessSeamSource }
 /**
- * Worktree metadata mutation queues keyed by canonical git common dir. Git
- * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
- * `git worktree add` calls in one repository can observe a half-written file
- * and fail with `git worktree failed (128): failed to read .../commondir`,
- * which blocks the task. Module scope makes every Workspaces instance in one
- * process share the queue for a repository.
+ * One promise chain per path, shared by every Workspaces instance in this
+ * process. It serializes worktree metadata mutation per canonical git common
+ * dir (git publishes `.git/worktrees/<name>/commondir` non-atomically, so
+ * concurrent `git worktree add` calls can read a half-written file and fail
+ * with `failed to read .../commondir`) and each task record's read-check-write
+ * (advisory A1). A task record has no writer outside this process: it lives
+ * under `workspacesRoot/<missionId>`, and a mission id is minted from a random
+ * UUID by the one runtime that holds its store's lock.
  */
-const worktreeQueues = new Map<string, Promise<void>>()
+const pathQueues = new Map<string, Promise<void>>()
+async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T> {
+  const result = (pathQueues.get(key) ?? Promise.resolve()).then(callback)
+  const tail = result.then(() => undefined, () => undefined)
+  pathQueues.set(key, tail)
+  try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
+}
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
 
 /**
@@ -905,12 +913,7 @@ export class Workspaces {
 
   /** Serialize worktree metadata mutation for one repository, never per member or mission. */
   private async queueWorktree<T>(cwd: string, callback: () => Promise<T>): Promise<T> {
-    const key = await this.commonDir(cwd)
-    const previous = worktreeQueues.get(key) ?? Promise.resolve()
-    const result = previous.then(callback)
-    const tail = result.then(() => undefined, () => undefined)
-    worktreeQueues.set(key, tail)
-    try { return await result } finally { if (worktreeQueues.get(key) === tail) worktreeQueues.delete(key) }
+    return await serialized(await this.commonDir(cwd), callback)
   }
 
   /** Serialized `git worktree add` with one retry for a cross-process metadata race. */
@@ -1320,40 +1323,12 @@ export class Workspaces {
     return missing
   }
 
-  /**
-   * Serialize one task record's read-check-write across members and processes.
-   * The member record is per member, but the task record is shared by the
-   * previous owner, the recovering owner and capture; without mutual exclusion
-   * a repair could read a stale record and clobber a newer owner's write (W1
-   * advisory A1). The lock is a leaf lock: it is never held while another lock
-   * or a git operation runs.
-   */
-  private async withTaskRecordLock<T>(taskPath: string, callback: () => Promise<T>): Promise<T> {
-    const lockPath = `${taskPath}.lock`
-    const staleAfterMs = 30_000
-    const started = Date.now()
-    await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 })
-    for (;;) {
-      try { await writeFile(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); break }
-      catch (error) {
-        const code = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
-        if (code !== 'EEXIST') throw error
-        const info = await lstat(lockPath).catch(() => undefined)
-        if (info === undefined) continue
-        if (Date.now() - info.mtimeMs > staleAfterMs) { await rm(lockPath, { force: true }).catch(() => undefined); continue }
-        if (Date.now() - started > staleAfterMs) throw new Error(`Timed out waiting for the task workspace record lock: ${taskPath}`)
-        await new Promise(resolve => setTimeout(resolve, 5))
-      }
-    }
-    try { return await callback() } finally { await rm(lockPath, { force: true }).catch(() => undefined) }
-  }
-
   private async saveTaskWorkspace(record: MemberWorkspace): Promise<void> {
     await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
     const task = record.task
     if (task === undefined) return
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
+    await serialized(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
   }
 
   /** Preserve quiescent WIP without applying artifact scope or changing the checkout. */
@@ -1513,7 +1488,7 @@ export class Workspaces {
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const current = await readJson(taskPath)
       const ownsTask = isRecord(current) && current.memberId === record.memberId && isRecord(current.task) && current.task.epoch === task.epoch
       // Preparation may revisit a member's previous checkout after this task
@@ -1546,9 +1521,9 @@ export class Workspaces {
     const previous = record.task
     if (previous === undefined || previous.taskId === nextTaskId) return
     const taskPath = this.taskPath(record.missionId, previous.taskId)
-    // Read, compare and write under one lock: a newer owner's record written
+    // Read, compare and write as one serialized step: a newer owner's record written
     // while this checkpoint was deciding can never be clobbered (advisory A1).
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const saved = await readJson(taskPath)
       if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
       await writePrivateJson(taskPath, {
