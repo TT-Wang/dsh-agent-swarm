@@ -7,9 +7,9 @@
  *
  * Pinned here: a dependent admitted before the rejection runs on the reworked
  * artifact with no replacement row; the claims the rejection refuted are never
- * verified or re-stamped again; the reworked artifact gets a fresh independent
- * review through the existing review path, from a member who authored none of
- * its attempts; the rework bound refuses with its exit; and the rework attempt
+ * verified or re-stamped again; the rejecting review re-opens in place and
+ * re-reviews the reworked artifact, from a member who authored none of its
+ * attempts (tests/rework-review.test.mjs); the rework bound refuses with its exit; and the rework attempt
  * starts from the rejected commit in a real worktree. A rejected experiment is
  * not reworkable (tests/task-needs-replacement.test.mjs).
  */
@@ -101,14 +101,18 @@ test('a dependent admitted before the rejection runs on the reworked artifact, w
   assert.equal(reopened.reworkCount, 1)
   assert.deepEqual(reopened.rejections, [{ commit: rejected.artifact.commit, epoch: rejected.epoch, reviewTaskId: firstReview.id,
     reason: 'The artifact misses the acceptance criterion', evidenceIds: [refuted.id] }])
-  assert.match(reopened.handoff, new RegExp(`Rejected by review ${firstReview.id} at ${rejected.artifact.commit}: The artifact misses the acceptance criterion`), 'the author reads the rejection')
+  assert.ok(reopened.handoff.includes(`Rejected by review ${firstReview.id} at ${rejected.artifact.commit}; its reason is rejections[0].reason.`), 'the author is pointed at the rejection')
   assert.equal(f.workers.stopped.includes(f.author.id), false, 'the author holds no live attempt, so it is not stopped')
-  const retired = f.current(firstReview)
-  assert.equal(retired.status, 'cancelled', 'the rejecting review is retired')
-  assert.equal(retired.reviewedCommit, rejected.artifact.commit, 'and keeps the commit it judged')
-  assert.match(retired.output, /^The artifact misses the acceptance criterion/, 'and its verdict')
-  assert.ok(f.events('task/review-retired').some(event => event.data.taskId === firstReview.id && event.data.reviewOf === source.id))
-  assert.equal(f.events('task/amended').at(-1).data.rework.reviewTaskId, firstReview.id, 'the rework is durable')
+  const judged = f.current(firstReview)
+  assert.equal(judged.status, 'pending', 'the rejecting review re-opens for the next submission')
+  assert.equal(judged.assigneeId, f.reviewer.id, 'with the rejecting reviewer as its assignee')
+  assert.equal(judged.reviewedCommit, undefined)
+  assert.equal(judged.output, undefined)
+  assert.deepEqual(judged.rejections.map(entry => [entry.commit, entry.reviewTaskId, entry.reason]), [[rejected.artifact.commit, firstReview.id, 'The artifact misses the acceptance criterion']], 'its verdict is archived on its own history')
+  assert.deepEqual(f.events('task/review-retired'), [], 'nothing is retired')
+  const amended = f.events('task/amended')
+  assert.equal(amended.find(event => event.data.taskId === source.id).data.rework.reviewTaskId, firstReview.id, 'the rework is durable')
+  assert.equal(amended.find(event => event.data.taskId === firstReview.id).data.rework.commit, rejected.artifact.commit, 'and so is the review re-open')
 
   // The reviewer cannot take the author's rework, so it stays independent of it.
   await assert.rejects(f.runtime.claim(f.actor(f.reviewer), f.mission.id, source.id), /not ready/)
@@ -121,9 +125,9 @@ test('a dependent admitted before the rejection runs on the reworked artifact, w
 
   await f.pastReviewGrace()
   const freshReview = f.pendingReviewOf(source)
-  assert.ok(freshReview, 'the reworked artifact gets its own review through the existing path')
-  assert.notEqual(freshReview.id, firstReview.id)
-  assert.deepEqual(f.events('task/review-blocked'), [], 'the retired review is not read as a withdrawn one')
+  assert.equal(freshReview.id, firstReview.id, 'the paired review re-reviews the reworked artifact')
+  assert.deepEqual(f.tasks().filter(task => task.reviewOf === source.id).map(task => task.id), [firstReview.id], 'no review is admitted per rework')
+  assert.deepEqual(f.events('task/review-blocked'), [])
   await assert.rejects(f.runtime.claim(f.actor(f.author), f.mission.id, freshReview.id), /not ready/, 'the author never reviews its own rework')
   await f.verify(freshReview, 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
@@ -153,23 +157,69 @@ test('a reworked task that is handed off re-pends: the claims its rejection refu
   assert.equal(f.current(source).status, 'pending', 'the handoff lands pending, not blocked by history')
 })
 
-test('a claim a rework archived is not revived by a later challenge: the next acceptance leaves it alone', async t => {
+test('a claim a rework archived cannot be challenged: the refusal names the live claims, and the accepted rework stays accepted', async t => {
+  const f = await fixture(t)
+  const index = await toolSchemaIndex()
+  const source = f.propose('Implement')
+  const dependent = f.propose('Build on it', { dependencies: [source.id], assigneeId: f.reviewer.id })
+  const archived = await f.submit(source, 'The first attempt works')
+  const rejecting = await f.reject(source)
+  const rejectedCommit = f.current(source).artifact.commit
+  f.resume(source)
+  const challenge = evidenceId => f.runtime.challenge(f.owner, f.mission.id, { evidenceId, reason: 'Re-open the old dispute', toolRunIds: [] })
+  const refusal = (live, message) => error => {
+    assert.ok(error instanceof PolicyError)
+    assert.equal(error.code, 'evidence_archived')
+    assert.equal(error.category, 'conflict_error')
+    assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
+    assert.ok(error.message.includes(`refuted with the rejected commit ${rejectedCommit} of task ${source.id} (review ${rejecting.id})`), error.message)
+    assert.match(error.message, live)
+    assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
+    message.push(error.message)
+    return true
+  }
+  const messages = []
+  assert.throws(() => challenge(archived.id), refusal(/has no live claim yet; wait for its next claim, then use `swarm_challenge`/, messages))
+  assert.equal(f.evidence(archived.id).status, 'refuted', 'the refused challenge leaves the history claim refuted')
+  const kept = await f.submit(source, 'The reworked attempt works')
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(`Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${kept.id}\\.`), messages))
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, dependent.id)
+  assert.equal(claimed.status, 'running')
+
+  // Disputing the rejected commit's claim after the rework was accepted neither
+  // re-opens the accepted task nor invalidates work built on it.
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(kept.id), messages))
+  assert.equal(f.current(source).status, 'accepted', 'the accepted rework is not re-opened')
+  assert.equal(f.current(dependent).status, 'running', 'its dependent keeps running')
+  assert.deepEqual(f.events('task/invalidated'), [])
+  assert.equal(f.evidence(archived.id).status, 'refuted')
+  assert.equal(f.evidence(archived.id).challenges.length, 0, 'no dispute was recorded')
+  assert.equal(f.events('evidence/challenged').length, 0)
+  // The live claim of the accepted artifact can still be disputed.
+  challenge(kept.id)
+  assert.equal(f.current(source).status, 'submitted')
+})
+
+test('a dispute of an archived claim recorded before the refusal blocks neither the verdict nor completion', async t => {
   const f = await fixture(t)
   const source = f.propose('Implement')
   const archived = await f.submit(source, 'The first attempt works')
   await f.reject(source)
-  f.resume(source)
-  // Disputing history flips the stored status away from refuted.
-  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: archived.id, reason: 'Re-open the old dispute', toolRunIds: [] })
-  assert.equal(f.evidence(archived.id).status, 'challenged')
+  assert.deepEqual(f.resume(source).rejections.at(-1).evidenceIds, [archived.id])
+  // A build before the refusal recorded this dispute; the row stays in the store.
+  const row = f.evidence(archived.id)
+  f.runtime.store.put('evidence', { ...row, status: 'challenged', challenges: [...row.challenges, { authorId: 'owner', reason: 'Re-open the old dispute', toolRunIds: [] }] })
   const kept = await f.submit(source, 'The reworked attempt works')
-  const review = f.proposeReview(source)
-  await f.verify(review, 'accept', 'The rework meets the criterion')
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
   assert.equal(f.evidence(kept.id).status, 'verified')
   assert.equal(f.evidence(archived.id).status, 'challenged', 'the archived claim is not judged by the rework verdict')
   assert.equal(f.events('evidence/verified').filter(event => event.data.evidenceId === archived.id).length, 0, 'it is never verified')
   assert.notEqual(f.evidence(archived.id).artifact.commit, f.current(source).artifact.commit, 'nor re-stamped with the reworked artifact')
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined, 'history of a rejected commit is not an open dispute')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted rework covers the mission').status, 'completed')
 })
 
 test('a reworked research task needs a live claim before it resubmits', async t => {
@@ -231,6 +281,64 @@ test('the rework bound refuses with its exit, and raising maxRework through swar
   assert.equal(raised.rejections.length, 3)
 })
 
+test('the reworking author reads each rejection reason once', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  const reasons = ['First rejection: ' + 'a'.repeat(400), 'Second rejection: ' + 'b'.repeat(400)]
+  for (const reason of reasons) {
+    await f.submit(source)
+    await f.reject(source, reason)
+    f.resume(source)
+  }
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === claimed.attempt.id)
+  for (const reason of reasons) assert.equal(assignment.content.split(reason).length - 1, 1, 'the reason travels once, in rejections')
+  assert.deepEqual(JSON.parse(assignment.content).task.rejections.map(rejection => rejection.reason), reasons)
+})
+
+test('the artifact registry keeps a rework\'s rejected commit with its refuting verdict, and the archived review record', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  await f.submit(source)
+  const review = f.proposeReview(source)
+  const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'reject', reason: 'Misses the criterion', deliverables: ['src/review.md'] })
+  const rejected = f.current(source).artifact.commit
+  const record = f.current(review).reviewArtifact.commit
+  f.resume(source)
+  await f.submit(source)
+  const resubmitted = f.current(source).artifact.commit
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
+  const rows = f.runtime.artifacts(f.owner, { missionId: f.mission.id }).artifacts
+  const sourceRows = rows.filter(row => row.taskId === source.id)
+  assert.deepEqual(sourceRows.map(row => [row.artifact.commit, row.archived === true, row.review.taskId, row.review.verdict]),
+    [[rejected, true, review.id, 'refuted'], [resubmitted, false, review.id, 'verified']], 'the rejected commit stays listed with its refuting verdict')
+  assert.equal(sourceRows[0].review.reason, 'Misses the criterion')
+  assert.equal(sourceRows[0].taskStatus, 'accepted')
+  const reviewRows = rows.filter(row => row.taskId === review.id)
+  assert.deepEqual(reviewRows.map(row => [row.artifact.commit, row.artifactRole, row.reviewedCommit]), [[record, 'review-record', rejected]], 'the review record of the rejected commit stays listed')
+})
+
+test('a budget-only amendment of a rejected task stores the ceiling and leaves it blocked; only a resume reworks it', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement', { maxRecoveryAttempts: 2 })
+  await f.submit(source)
+  const review = await f.reject(source)
+  const rejected = f.current(source)
+  // The call swarm_budget(taskId, taskBudget) makes.
+  const amended = f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { maxRecoveryAttempts: 4 }, 'Give the task more recovery headroom')
+  assert.equal(amended.status, 'blocked', 'the rejected task is not re-opened')
+  assert.equal(amended.maxRecoveryAttempts, 4, 'the ceiling is stored')
+  assert.deepEqual(amended.artifact, rejected.artifact, 'its artifact stays')
+  assert.equal(amended.epoch, rejected.epoch)
+  assert.equal(amended.reworkCount, undefined, 'no rework was spent')
+  assert.equal(f.current(review).status, 'blocked', 'its rejecting review keeps its verdict')
+  assert.equal(f.events('task/amended').at(-1).data.rework, undefined)
+  const reopened = f.resume(source)
+  assert.equal(reopened.status, 'pending', 'the explicit resume reworks it')
+  assert.equal(reopened.reworkCount, 1)
+})
+
 test('the rejection decision names the rework first and a replacement second, to the owner and to the author', async t => {
   const f = await fixture(t)
   const deliveries = () => f.runtime.store.list('deliveries', f.mission.id)
@@ -263,6 +371,21 @@ test('the rejection decision names the rework first and a replacement second, to
   assert.ok(!decisionFor(experiment).includes('swarm_control'), decisionFor(experiment))
   assert.ok(authorNoticeFor(experiment).includes(replacement(experiment)))
   assert.ok(!authorNoticeFor(experiment).includes('swarm_control'))
+})
+
+test('every owner notice about a rejected task with a waiting dependent offers the rework before a replacement', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  f.propose('Build on it', { dependencies: [source.id], assigneeId: f.reviewer.id })
+  await f.submit(source)
+  await f.reject(source)
+  for (let i = 0; i < 6; i++) { f.clock.advance(7000); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.content.includes(source.id) && delivery.content.includes('replaces'))
+  assert.ok(notices.length >= 2, 'the rejection decision and the stall root both reach the owner')
+  for (const { content } of notices) {
+    const rework = content.search(/\brework/i)
+    assert.ok(rework >= 0 && rework < content.indexOf('replaces'), `the rework comes first: ${content}`)
+  }
 })
 
 test('a real rework attempt starts from the rejected commit, whether or not its author moved on', async t => {

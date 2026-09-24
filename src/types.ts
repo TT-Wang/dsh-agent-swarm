@@ -392,9 +392,11 @@ export interface TaskAmendment {
  * One independent rejection a task was re-opened from: the rejected artifact
  * commit, the task epoch it was submitted at, the review that rejected it and
  * that review's reason, and the claims the rejection refuted (history, not a
- * block cause, once the task is reworked).
+ * block cause, once the task is reworked). On the review row a rework re-opens,
+ * the same record archives its own verdict: the commit it rejected, its epoch,
+ * itself, its reason, no claims, and the review artifact it captured.
  */
-export interface TaskRejection { commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[] }
+export interface TaskRejection { commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[]; reviewArtifact?: Artifact }
 export interface Task {
   id: string
   missionId: string
@@ -449,7 +451,7 @@ export interface Task {
   /** Owner re-opens of this task after an independent rejection, bounded by `maxRework` (default 2). */
   reworkCount?: number
   maxRework?: number
-  /** Rejections this task was re-opened from, oldest first. */
+  /** Rejections this task was re-opened from, oldest first; on a review, the verdicts a rework of its source archived. */
   rejections?: TaskRejection[]
   /** Per-task model-step ceiling admitted with the task; the runtime blocks the task at this limit. */
   maxSteps?: number

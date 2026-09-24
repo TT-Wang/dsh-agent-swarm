@@ -291,7 +291,7 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
       dependents: dependents.map(dependent => dependent.id), recordedReason: root.output }), 'the body is the template rebuilt from the blocked row and its dependents')
     assert.ok(notice.content.includes(notice.notice.reason), 'the body states the recorded cause')
     assert.ok(notice.content.includes(root.output), 'the body quotes the reason recorded on the blocked row')
-    assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
+    assert.ok(notice.content.includes(`swarm_control(action: "resume", taskId: "${root.id}")`), 'repair advice names the existing task')
     assert.equal(notice.content.includes('depend on it'), dependents.length > 0, 'the body states a dependent count only when the rows hold one')
     if (dependents.length) assert.ok(notice.content.includes(`${dependents.length} task(s) depend on it (${dependents.map(dependent => dependent.id).join(', ')})`), 'the body states the dependent count and names each dependent')
     assertDecision(notice, 'stall-root')
