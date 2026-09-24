@@ -2,7 +2,7 @@
 
 This is an experimental, single-host plugin. The current compatibility tests do not establish that all collaboration, isolation or acceptance problems are solved.
 
-This page lists the limitations that are true of the current tree, one section per gap. It is not a history: [validation.md](validation.md) records each round and its evidence, and the round-by-round text of this page (including rounds 13-17, which validation.md does not record) is in git history at `fa6a507` (`git show fa6a507:docs/known-limitations.md`).
+This page lists the limitations that are true of the current tree, one section per gap. It is not a history: [validation.md](validation.md) records each round and its evidence (its round-28 entry lists the items this page dropped as resolved that no other entry records), and the round-by-round text of this page (including rounds 13-17, which validation.md does not record) is in git history at `fa6a507` (`git show fa6a507:docs/known-limitations.md`).
 
 ## Index
 

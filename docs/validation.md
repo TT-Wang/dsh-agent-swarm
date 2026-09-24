@@ -76,6 +76,20 @@ smoke process can stay alive after `passed` while Chrome shuts down; the result 
 Not exercised: a real-provider mission (`test:deepseek`, `test:command-deepseek`), `test:load`, `test:replay` and
 the attended preview.
 
+**Items the known-limitations rewrite dropped as resolved.** `docs/known-limitations.md` was reorganised by gap
+(`c0523a8`) and now states only what is true of the current tree. These four statements it dropped as resolved had
+no record in this file; each is resolved in the tree at `73cf4fb`:
+
+- R17-G13, no checkpoint for a ceiling-blocked attempt: `blockTaskCeiling` (`src/runtime.ts`) installs a `resource`
+  stop marker, and the stop barrier (`Attempts.resumeStoppedAttempt`) calls `workers.checkpointTask` once the stop is
+  confirmed.
+- `swarm_escalate` checked a supplied `taskId` only together with an `attemptId` (round 11, T1bv):
+  `SwarmRuntime.escalate` now refuses a `taskId` whose attempt owner, or else assignee, is not the caller.
+- The attempt-closer set duplicated between the scheduling code and `src/trace.ts` (round-17 hand-off): `trace.ts`
+  builds its closer set from `ATTEMPT_FENCING_EVENTS` in `src/types.ts`.
+- The residual member-status writers in `src/attempts.ts` and `src/gates.ts` (round-17 hand-off): no `src/` code
+  assigns a member's `status`; it is derived from the phase on every read, and the store strips it on write.
+
 ## Round-27 simplification batch 7: rework in place, whole-lineage retirement, host-added reviews (2026-09-24)
 
 - **Rework in place.** `swarm_control` `action: "resume"` on a task its own independent review rejected
@@ -941,7 +955,7 @@ page error is logged (`~/.dsh/agent-swarm-native015/verify/right-sidebar-5196-op
 The left column's Global panels list is empty again — the plugin registers one
 surface, not two.
 
-## Native sidebar adaptation (2026-09-12) — current
+## Native sidebar adaptation (2026-09-12)
 
 Harness 0.1.5 introduced the host's own sidebar (`@deepseek-ai/dsh-client-ui-sidebar`).
 Its extension point is the root-scoped `sidebar.panellist` list plus the layout's
@@ -970,7 +984,7 @@ The isolated host has no conversation of its own, so the panel reports its
 no-session state there ("Select a conversation to manage its missions"); the
 session-scoped RPC path is the one already measured on the running preview.
 
-## Second UI pass (2026-09-11, client only) — current
+## Second UI pass (2026-09-11, client only)
 
 The owner asked for the remaining items of the 2026-09-11 UI review and then for the attended
 preview restart. The pass changes `src/client/` only (feed grouping, lane counts and empty-lane
@@ -1148,7 +1162,7 @@ The native command browser submits one `/agent-swarm` goal. Its initial and runn
 
 The same workflow starts from staged and untracked source edits. It checks that one frozen project snapshot includes both, runs actual worker tools, accepts the integration artifact independently, and then edits the source again. **View changes** presents only the snapshot-to-result delta. **Apply result** changes the requested code while preserving the later source edit, the real Git index byte for byte and the original HEAD. The invalid-plan variant additionally rejects missing code checks and invalid scopes, then repairs the original request without partial workers, a duplicate mission or changed acceptance/budget decisions.
 
-The full sidebar browser opens the advanced editor explicitly, saves a native model/reasoning choice, and checks resizing plus unsaved draft retention across collapse/reopen. It exercises Pause/Resume, native live-worker navigation, owner-only controls, Stop confirmation, the technical graph disclosure, a 390-pixel viewport and cold transcripts containing actual host tool output without another model request. Recorded screenshots of thinking, reconnecting, applied results and the responsive layout were visually inspected.
+The full sidebar browser opens the advanced editor explicitly, saves a native model/reasoning choice, and checks that unsaved draft edits survive collapsing and reopening the sidebar (the 0.6.0 run also resized the dock, which round 28 deleted). It exercises Pause/Resume, native live-worker navigation, owner-only controls, Stop confirmation, the technical graph disclosure, a 390-pixel viewport and cold transcripts containing actual host tool output without another model request. Recorded screenshots of thinking, reconnecting, applied results and the responsive layout were visually inspected.
 
 Activity and runtime regressions cover native model/tool operation boundaries, provider retry backoff, cancellation, long-operation renewal, ordinary expiry without a live adapter operation, pause, restart and deadline cancellation while the mission queue is occupied. Store/watch tests cover transaction-only revision changes, rollback, bounded replay, cancellation, owner isolation, mission delta merging, native owner lifecycle and metadata updates without an invented database revision.
 
@@ -1162,7 +1176,7 @@ Provider responses in the regression suites were **scripted**. Harness, browser 
 
 A separate minimal live connection check used the installed final artifact and native Harness session creation, prompt and follow APIs with `deepseek-official/deepseek-v4-flash`. It returned the expected fixed response, and the authenticated plugin state recognized the live owner. That check requested no tools and created no swarm mission; it verifies provider connectivity through Harness, not full real-provider swarm planning or acceptance.
 
-Browser checks exercise the dock fallback; Better Sidebar's public service contract was validated separately on the earlier release, and its registration path is unchanged here.
+The 0.6.0 browser checks exercised the dock fallback; Better Sidebar's public service contract was validated separately on the earlier release, and its registration path was unchanged there. Round 28 deleted the dock: `test:web` and `test:command-web` now open the panel as the host's native right-sidebar tab (see the round-28 entry).
 
 ## Reproduce
 
@@ -1190,7 +1204,7 @@ The behavioral tests import the built `lib/` output. `npm test` builds first; a 
 
 `npm run test:harness`, `npm run test:pack` and `npm run test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they require a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt the composition anyway. `npm run test:harness` runs the composition directly and reports the same `SandboxUnavailableError`.
 
-`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or else the first of `~/.dsh/source/current` and the siblings `deepseek-harness-015rc3`/`deepseek-harness-017rc1` whose version is in [compatibility.json](../compatibility.json), with built `lib/` entries. Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only the built entry points, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`, so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
+`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or else the first of `~/.dsh/source/current` and the siblings `deepseek-harness-015rc3`/`deepseek-harness-017rc1` whose version is in [compatibility.json](../compatibility.json), with built `lib/` entries. Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only `package.json` and its `files` list (built `lib/`, `cordis.patch.yml`, the profile bundle, both READMEs, the five `docs/` documents and their images, `compatibility.json`, the naming manifest, `LICENSE`, `NOTICE` and `scripts/packed-smoke.mjs`), so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
 
 `npm run test:web` and `npm run test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host, without other large suites or browsers in parallel, and re-run a timeout before treating it as a product defect.
 
