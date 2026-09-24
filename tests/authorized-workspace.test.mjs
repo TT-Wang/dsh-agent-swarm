@@ -218,7 +218,7 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
 
   // The native command path records a session authorization for the session cwd.
   const owner = { sessionId: 'owner-t3e', agent: { id: 'owner-t3e', session: { header: { cwd: session } } } }
-  const request = runtime.requestStart(owner, { commandId: 't3e-session', goal: 'Plan the change', workspace: session })
+  const request = runtime.requestStart(owner, { commandId: 't3e-session', goal: 'Plan the change', workspace: session, workspaceAuthorizationSource: 'session' })
   assert.equal(request.workspaceAuthorizationSource, 'session', 'a session-cwd request records source session')
   assert.equal(request.workspaceGrantRoot, session)
   const prepared = await runtime.prepareStart(owner, request.id)
@@ -235,6 +235,26 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
   grants.grants.length = 0
   await assert.rejects(runtime.prepareStart(owner2, grantedRequest.id), revokedError)
   assert.equal(runtime.store.get('starts', grantedRequest.id).baseline, undefined, 'a fenced baseline records no snapshot')
+})
+
+/**
+ * A missing authorization source means the same at admission as at
+ * re-validation (X3): it never takes the session branch. A workspace outside
+ * every configured root is admitted only as an explicit session workspace.
+ */
+test('Admission never reads a missing source as a session authorization', async t => {
+  const { session, granted } = await fixture(t)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
+  const sessionPath = await realpath(session)
+  const input = extra => ({ title: 'Session work', objective: 'Work in the session cwd', workspace: sessionPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget }, ...extra })
+  assert.throws(() => runtime.create({ sessionId: 'owner-no-source' }, input({})), new RegExp(WORKSPACE_AUTHORIZATION_CODE), 'create refuses a source-less workspace no root contains')
+  assert.throws(() => runtime.create({ sessionId: 'owner-grant-source' }, input({ workspaceAuthorizationSource: 'grant' })), new RegExp(WORKSPACE_AUTHORIZATION_CODE), 'a grant source needs a configured root')
+  assert.throws(() => runtime.requestStart({ sessionId: 'owner-no-source' }, { commandId: 'no-source', goal: 'Plan', workspace: sessionPath }), new RegExp(WORKSPACE_AUTHORIZATION_CODE), 'requestStart refuses it too')
+  const admitted = runtime.create({ sessionId: 'owner-session' }, input({ workspaceAuthorizationSource: 'session' }))
+  assert.deepEqual({ root: admitted.workspaceGrantRoot, source: admitted.workspaceAuthorizationSource }, { root: sessionPath, source: 'session' })
+  const request = runtime.requestStart({ sessionId: 'owner-session-start' }, { commandId: 'session', goal: 'Plan', workspace: sessionPath, workspaceAuthorizationSource: 'session' })
+  assert.equal(request.workspaceAuthorizationSource, 'session')
 })
 
 /** Criterion 5: workers never create missions or use grants; missions cannot be re-pointed. */

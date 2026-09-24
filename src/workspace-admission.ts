@@ -383,7 +383,7 @@ export class WorkspaceAdmission {
     if (grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
     // A session authorization wins over a root that happens to contain the
     // session cwd: the human authorized that directory directly, so removing a
-    // root must not fence it. The admission site computed this source.
+    // root must not fence it. Only an explicit source counts, as at re-validation (X3).
     if (source === 'session' && claimed === workspace) return { grantRoot: workspace, source: 'session' }
     // The recorded root is the configured root that actually contains the
     // workspace — never the caller's claim. A caller that fabricates a wider
@@ -391,7 +391,6 @@ export class WorkspaceAdmission {
     // refused by the containment check above.
     const matched = grantFor(workspace, grants, this.rt.now())
     if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
-    if (claimed === workspace) return { grantRoot: claimed, source: source ?? 'session' }
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
   }
 

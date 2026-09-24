@@ -945,7 +945,7 @@ export interface RequestStartInput {
   workspace: string
   /** Human-authorization anchor for `workspace`; defaults to the workspace itself. */
   workspaceGrantRoot?: string
-  /** Host-derived authorization origin; defaults from the anchor for automatic starts. */
+  /** Host-derived authorization origin; the native command passes `session` for its own cwd. */
   workspaceAuthorizationSource?: 'session' | 'grant'
   /** Optional legacy hint. The primary agent supplies the actual plan budget. */
   budget?: Budget
