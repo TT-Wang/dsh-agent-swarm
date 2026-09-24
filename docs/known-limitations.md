@@ -2,767 +2,211 @@
 
 This is an experimental, single-host plugin. The current compatibility tests do not establish that all collaboration, isolation or acceptance problems are solved.
 
-## Execution and resources
+This page lists the limitations that are true of the current tree, one section per gap. It is not a history: [validation.md](validation.md) records each round and its evidence, and the round-by-round text of this page (including rounds 13-17, which validation.md does not record) is in git history at `fa6a507` (`git show fa6a507:docs/known-limitations.md`).
 
-- The default attempt lease is 120 seconds. The runtime renews it only while the adapter identifies an owned, uncancelled native model/tool/verification operation or provider retry, and renewal is bounded by the mission deadline. A live model stream republishes its operation every `activityHeartbeatMs` (default 1000 ms; 0 disables the republish timer), so a long chunking stream cannot let the lease expire, while a claimed task with no live operation still expires. This identifies operation liveness, not useful progress. A stuck operation still relies on its provider/tool timeout, cancellation or mission deadline. Persisted activity alone never authorizes renewal after restart.
-- The primary agent chooses and can revise resource budgets. Token accounting uses provider-reported worker usage; cache-read input is charged at `cacheReadWeight` (default 0.1, bounded 0..1) while every raw bucket stays exact for display, and the runtime emits an approaching-limit warning at each `budgetWarnAt` fraction (default 0.7 and 0.9). A step is refused when consumed usage plus an estimate for requests still streaming (each worker's average per-request usage) reaches the ceiling, so an unusually large in-flight request can still exceed it. Usage buckets (uncached input, cache read, cache write, output including reasoning, physical requests) are recorded per worker and per mission; the owner conversation's usage is attributed to its newest live mission or planning request by time window and is not charged to the pool. Failed provider attempts that report no usage remain uncounted.
-- Boundary compaction calls the host compaction engine after a verdict closes a unit of work, only for an idle worker whose last request exceeded `boundaryCompactionTokens` prompt tokens (default 250000). The summary request costs tokens once and is accounted like any other; without a loaded compaction engine no compaction happens.
-- Mission duration measures execution time excluding pauses and idle waits; an explicit deadlineAt remains a fixed wall-clock deadline. Budget warning suggestedLimit is a threshold-headroom floor, not an estimate of all remaining work.
-- **Open correctness and structure items from the 2026-09-11 external reviews** (each verified against the tree; the ones that were release blockers are fixed and named in `docs/local/review-response-2026-09-11.md`). Still open, deliberately, before the next version: `src/admission.ts` still runs `spawnSync git check-ignore` on the plan-validation path (two 5 s-bound calls on the browser save/launch path, bypassing the `ctx.subprocess` seam the rest of the plugin moved to in `f65f5bb`); `Mission`/`Member`/`Delivery` rows have no compare-and-swap (only `tasks` do), so any read-modify-write across an `await` on those rows can lose an update even though the mission queue is now fork-free; `completeAutomatic` writes the completion state and its notification in two transactions, so a crash between them loses the notice; `watch` long-polling is woken by every pass commit, so a live mission wakes it about once per second; the browser RPC derives its actor from the client-supplied `sessionId` (no plugin-side session binding; single-user profiles mitigate it); a research verification is accepted on one non-error tool call from the review attempt, so independent reproduction is encouraged but not required (since round-19 an ignored in-scope output the task text names and the member wrote must be listed in `deliverables` or the submission is refused with `[deliverable_uncaptured]`); the trace span index grows without bound in a long-lived host. The 2026-09-13 correction closes the outbox acknowledgement race by re-reading mission and delivery rows in its acknowledgement transaction, and rechecking lifecycle before each send. Other asynchronous whole-row writers still require individual review. Three client-lifecycle items from the same reviews are closed: the first UI pass moved the `ActivityPanel` selection fence out of render into an effect (React 18 could discard a render and advance the fence past the committed one, so an in-flight pause/stop/apply result looked stale and vanished with no error); the second pass added the `DisposalRegistry`, which registers every pane-owned monitor/history so a render React discards before commit cannot leave a poller behind and plugin unload drains what unmount did not; and the dock now reserves its space by inline style on the host root it discovers by walking up from its own position, so no stylesheet rule names the host's `#root` and no dock rule needs `!important`.
-- **The plugin writes nothing into a session log, and owns no session projection.** The host's session format keeps a closed event vocabulary (`KNOWN_SESSION_EVENT_TYPES`, no registration path for a plugin) and refuses to decode a stored log that carries an unknown type unless its envelope is marked `ignorable: true`, which `Session.append()` cannot set. Round 17's registered projection published the derived board as a plugin-owned `swarm/mission` event and therefore made the owner session log unreadable to every host, including its writer (`SessionFormatUnsupportedError`, measured on 0.1.2-rc.1, 0.1.3-alpha.2 and 0.1.5-rc.1; `test:harness`, `test:profile` and `test:pack` refused). The event and the host registration are deleted (owner pass 2026-09-11): the board is derived from `swarm.sqlite` on demand, which is the same single derivation the runtime's read face, the guard model and the owner views consume. The consequence is named rather than hidden: the client reads the board through this plugin's own RPC/live path, and no host projection key carries it.
-- Git plumbing for managed worktrees, a worker's shell-syntax probe and every declared check are spawned through the host's subprocess service (`ctx.subprocess`), which owns the process range, its TERM-before-KILL escalation and host-exit force termination. Delivery Git operations still use `execFile`, and admission Git-ignore probes still use `spawnSync`; the universal subprocess-seam claim does not cover these paths. A host that mounts no subprocess provider refuses a managed command with `[subprocess_service_required]` instead of spawning an unmanaged process; the base profile always mounts one, and a resolver is read at each start so the provider's mount order never decides whether a mission can run. The provider creates a private spill directory under the ambient temp root on every spawn, so a `TMPDIR` that cannot be created fails a command inside the host before any plugin fallback runs (measured with `TMPDIR=/nonexistent-swarm-tmp`, fault scenario F8). Declared checks and the syntax probe execute through `/bin/sh`, and delivery relies on POSIX link/`lstat` semantics, so Windows execution is not supported.
-- The real-Harness composition checks (`npm run test:harness`, `test:pack`, `test:profile`) require a host that permits nested `sandbox_apply`, because the composition fixture requests `workspace-write`. Inside an outer workspace-write sandbox, macOS denies the nested sandbox (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect this before the composition and abort with the prerequisite; `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` attempts the composition anyway. This is a host prerequisite, not a product defect. `npm run test:isolation` is host-only for the same reason: it drives the real `@deepseek-ai/dsh-sandbox-local` provider through `confinedCheckArgv`, so it needs a built supported Harness checkout and a host that permits the platform sandbox; it lives outside `tests/*.test.mjs` and is not a worker check.
-- Worker sessions add the same constraint to every worker bash/tool call, because the adapter confines them with the mission's sandbox mode. A real Loader composition driven from inside a worker session therefore fails with `SANDBOX_UNAVAILABLE` even when the outer host is otherwise healthy; this is worker-side only. The fault-injection suite's provider-fault tier (F3a/F3b/F3c) registers an identity sandbox provider and an unsandboxed `bash-local` shell for that tier, because the provider-fault invariants do not depend on OS confinement; no assertion was weakened. The host gate runs unsandboxed, where `npm run test:harness`, `test:web` and `npm run test:command-web` pass.
-- The worker close-out nudge bound `maxIdleCloseouts` (default 2) is accepted by `RuntimeConfig` and used by the close-out path and the fault suite, but it is not exposed in the plugin `Config`, so plugin users cannot shorten or lengthen it yet.
-- Round 9-C liveness, review detection and verdict honesty. A mission created with `swarm_create` (rather than launched from a saved plan) now completes automatically once independently accepted work covers every acceptance criterion, and a board that can never be scheduled again is reported to the owner as a stall naming the exact parked task. A submitted task with no live review is detected and recorded; when the board would otherwise stall, the runtime admits an independent verification automatically if a live member who did not author the submission exists and task budget remains, and admitting that review wakes a parked member. Residual: with no eligible independent member, or with the task budget exhausted, the submission is not reviewed and the owner is woken once with the task id and the reason instead. A rejected verification's durable reason carries the failing check's run ids alongside the reviewer's prose (bounded by the message limit), while a judgement rejection without a failing check keeps the reviewer's reason; evidence state is single-valued, so a claim that is verified and then challenged and rejected reports one refuted state, and a superseding acceptance does not refute it again.
-- The fault-injection suite runs from any checkout of the tree, including a `git archive` export: F4 runs the real `scripts/round.mjs promote --commit HEAD` from a scratch git repository it creates (with every local module `round.mjs` imports) and an empty lab, and asserts exit 2 with a refusal naming that commit's missing gate. Tier B (F3a/F3b/F3c) additionally needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or a `~/.dsh/source/current` (or sibling `deepseek-harness-rc1`/`deepseek-harness-latest`) checkout whose packages are built and match `compatibility.json`. Without one, `npm run test:faults` fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)`.
+## Index
 
-## Tool authority and verification
+1. [Supported Harness versions](#supported-harness-versions)
+2. [Scope: one host, one writer](#scope-one-host-one-writer)
+3. [Harness integration](#harness-integration)
+4. [Tool authority and tool schemas](#tool-authority-and-tool-schemas)
+5. [Workspace authorization](#workspace-authorization)
+6. [Isolation and sandbox](#isolation-and-sandbox)
+7. [Declared checks and verification](#declared-checks-and-verification)
+8. [Workspace capture, outputs and preservation](#workspace-capture-outputs-and-preservation)
+9. [Review independence, pairing and rework](#review-independence-pairing-and-rework)
+10. [Lineage and repairs](#lineage-and-repairs)
+11. [Scheduling passes, leases and liveness](#scheduling-passes-leases-and-liveness)
+12. [Owner notices and wakes](#owner-notices-and-wakes)
+13. [Refusals and diagnostics](#refusals-and-diagnostics)
+14. [Resources and budgets](#resources-and-budgets)
+15. [Storage, recovery and durability](#storage-recovery-and-durability)
+16. [Interface and observation](#interface-and-observation)
+17. [Clocks, tests and instruments](#clocks-tests-and-instruments)
+18. [Host prerequisites and verification suites](#host-prerequisites-and-verification-suites)
+19. [Host scripts, preview and mounting](#host-scripts-preview-and-mounting)
+20. [Model-dependent behaviour](#model-dependent-behaviour)
 
-- The worker guard is a name-based deny list, not a complete capability allowlist. Other profile tools, including scheduling tools such as `cron_add`, may have external effects that the list does not cover. No separate network/credential policy or adversarial multi-tenant isolation is provided.
+<!-- BEGIN supported-harness-versions: replaceable section. The Harness-version change supplies its own text for this section; nothing outside the BEGIN/END markers depends on its wording. -->
+## Supported Harness versions
+
+- The supported releases are `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2`, each pinned to an exact source commit in [compatibility.json](../compatibility.json), whose `defaultHost` is `0.1.5-rc.1`. The package's peer dependencies and the profile bundle's `dsh.bundle.requires.harness` list the same four. All four are prereleases; matching a version string does not establish compatibility with an arbitrary checkout or profile, and `0.1.0-rc.5`, unreleased commits and custom profiles are not claimed.
+- The native right sidebar exists only on `0.1.5-rc.1` and `0.1.6-alpha.2` (on 0.1.6 also from the sidebar's Start page). Earlier supported hosts use Better Sidebar when installed (exercised against 0.18.0), otherwise the plugin's dock, whose residuals are under [Interface and observation](#interface-and-observation).
+- The session-format refusal described under [Harness integration](#harness-integration) was measured on `0.1.2-rc.1`, `0.1.3-alpha.2` and `0.1.5-rc.1`.
+<!-- END supported-harness-versions -->
+
+## Scope: one host, one writer
+
+- **Single-host, single-writer.** Admission, lease and budget accounting is durable but scoped to one host and one writer process: every mutation serializes through one SQLite writer connection. A competing writer is classified as `writer_busy` and retried with bounded backoff; progress is not guaranteed under sustained contention. Two writers against one store file, or one store shared across hosts, are unsupported; multi-host scaling needs external coordination and is out of scope.
+- Separate hosts must configure distinct `statePath` and `workspacesRoot`. The plugin defaults (`~/.dsh/agent-swarm/…`) ignore `DSH_HOME`; the profile bundle uses `$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm`. A live owner's lock normally rejects a second host, but stale-lock reclamation is a read/check/unlink sequence, so simultaneous recovery processes can race; the process birth check distinguishes PID reuse without making reclamation atomic, and unknown or legacy live identities stay conservatively locked. Do not start or restore several hosts against one state path.
+- Windows execution, distributed workers and non-Git projects are unsupported. Declared checks and the syntax probe execute through `/bin/sh`, and delivery relies on POSIX link/`lstat` semantics.
+
+## Harness integration
+
+- **The plugin writes nothing into a session log and owns no session projection.** The host's session vocabulary is closed (`KNOWN_SESSION_EVENT_TYPES`) and a log carrying an unknown type fails to decode (`SessionFormatUnsupportedError`) unless its envelope is `ignorable: true`, which `Session.append()` cannot set. The board is derived from `swarm.sqlite` on demand, so the client reads it only through this plugin's RPC/live path and no host projection key carries it.
+- Swarm tools are registered globally and hidden per session by role (entry, management, member, or none for subagents). Hiding is presentation through the host's scoped restriction; the runtime guard and owner checks remain the authority boundary. A session's cached prompt prefix changes once, when it becomes an owner.
+- Managed-worktree Git plumbing, the shell-syntax probe and every declared check spawn through the host subprocess service (`ctx.subprocess`), which owns TERM-before-KILL escalation and host-exit termination; delivery Git operations (`execFile` in `src/delivery.ts`) and the store's lock-owner birth check (`ps` via `execFileSync`) do not. Without a subprocess provider a managed command is refused with `[subprocess_service_required]` (the base profile always mounts one). The provider creates a spill directory under the ambient temp root on every spawn, so an uncreatable `TMPDIR` fails a command inside the host before any plugin fallback (fault scenario F8).
+- Every `WorkerAdapter` method except `prepareBaseline` and `checkEnvelope` is required; a JavaScript adapter that skips type checking and omits one fails with a TypeError. An operation counts as live only while the adapter's `currentActivity` confirms the durable activity, and `[delivery_unsupported]` comes only from an adapter that throws it.
+- A non-cooperative native operation stays fenced until it settles (it is not charged again as a startup failure), and an adapter teardown that cannot finish within its cleanup bound reports failure rather than claiming every handle was released.
+
+## Tool authority and tool schemas
+
+- The worker guard is a name-based deny list, not a capability allowlist. Other profile tools, including scheduling tools such as `cron_add`, may have external effects it does not cover. No separate network/credential policy or adversarial multi-tenant isolation is provided.
+- Workers cannot write git metadata: a member worktree's index, refs and `.git/worktrees/<name>/` live under the shared common directory outside the writable path, so worker `git add`/`git commit` fails with `index.lock: Operation not permitted`. The worker gets a typed error naming `swarm_submit` before its next model step; publication is host-side capture.
+- Tool calls are checked against their schema: required properties, enums, primitive types, `oneOf` and undeclared keys are refused with `[tool_arguments_invalid]` naming each path and the accepted keys, so a model that adds an undeclared key needs one retry. Numeric minimums stay runtime checks. JSON null on an optional property is an omission, except `swarm_control` `changes.assigneeId`, where null or an empty string releases the binding. `swarm_launch` ignores a top-level `workspace` and uses the frozen request workspace.
+- Advice that names a role-hidden tool (for example `swarm_budget` or `swarm_cancel`, which a worker cannot call) is phrased for the mission owner rather than the caller; the refusal lint has no role-aware check.
+- The owner protocol is at its prompt budget: `tests/roles.test.mjs` caps `OWNER_PROMPT` below 5,531 characters and it is 5,476 at `fa6a507` (`WORKER_PROMPT` 1,507 of 1,600). A new protocol sentence must replace one, or state something no tool schema description can carry.
+
+## Workspace authorization
+
+- **Authorized per-mission workspace (human-only authorization surface).** A mission may target a repository outside the calling session's cwd only when it resolves inside a root configured in `authorizedWorkspaces`, loaded once at plugin start from the profile/`cordis.patch.yml`. No model-callable tool can create, widen or revoke a root; a change needs a human edit plus a host restart. Containment is decided on `realpath`-resolved path components. The matched root is recorded (`mission.workspaceGrantRoot`, `mission/workspace-bound`, `workspace/grant-loaded`) and re-checked at every workspace preparation and verification checkout, so removing a root and restarting refuses new missions and fences a running one with a durable blocked reason and an owner notice. Workers can never create a mission or use a grant.
+- Residual risks: **(1)** a model running with full filesystem access on the host could edit the plugin configuration file to add a root (a restart is still required), which is why the target design is a human-only command surface (`/swarm-workspace add|remove|list`) that tool calls cannot invoke; **(2)** the containment check and the following git operation are separate syscalls, so a root replaced by a symlink or remounted in that TOCTOU window is not caught; **(3)** authorization is write/execute authorization, **not confidentiality**: an authorized root can hold secrets the swarm may read.
+
+## Isolation and sandbox
+
+- **Isolation invariant.** `SwarmRuntime.isolationViolations(missionId)` requires every non-stopped member to have its own provisioned worktree and two running tasks sharing a worktree to declare disjoint scope; dispatch checks it before starting a member and after `prepareTask`, and a violation leaves the task pending with a durable refusal (`isolationRefusal`) and an owner notice. Disjointness is asserted only inside one worktree; tasks in distinct worktrees are isolated by construction, not serialized.
 - Declared scopes are checked when artifacts are captured; they are not per-shell-write allowlists.
-- Workers cannot write git metadata. A member worktree's index, refs and `.git/worktrees/<name>/` live under the shared git common directory outside the worker-writable path, so a worker-side `git add`/`git commit` fails with `index.lock: Operation not permitted`. Publication is host-side: the assignment instructions state the constraint, a denied write is reported as a typed error naming `swarm_submit`, in the worker's inbox before its next model step, and `swarm_submit` captures the workspace without any worker-side commit.
-- The dependency link a member creates to run declared checks (a `node_modules` symlink, a Python `.venv` symlink) is toolchain state, not work. `.gitignore` declares `node_modules/` (a directory-only pattern), so that symlink stays untracked; an untracked dependency link would otherwise refuse the next task preparation and fail artifact capture. Preparation treats an untracked dependency link (symlink or directory, including every default and configured `verificationDependencyDirs` name) as toolchain state. Real uncommitted work and lookalike regular files remain work: switching tasks requires confirmed stop and a preserved recovery checkpoint. Capture excludes the dependency link from the changed set, unstages a previously staged link, and keeps it out of the commit. A path tracked in HEAD is always ordinary work. The workspace-escape symlink guard resolves the whole link chain against the committed tree, not just the target string, so a link that points at a pre-existing escaping link is refused by capture as well (F-C1); delivery applies the same chain resolution before its first write.
-- Verification checkouts make ignored dependency directories available to declared checks instead of installing their own. The default set is `node_modules`, `.venv`, `venv`, `vendor` and `.tox` (`DEFAULT_VERIFICATION_DEPENDENCY_DIRS`), so a foreign toolchain check such as `.venv/bin/python -m pytest …` runs in the clean checkout; configure `verificationDependencyDirs` to replace the set, or `[]` to disable materialisation. Each name is matched as a path component at any depth, and only a gitignored directory is materialised, so a tracked `vendor/` remains ordinary work. A check therefore runs against committed files plus the installed toolchain, which is not part of the artifact and may differ from a fresh install; build outputs and other ignored paths are never provided. Every declared check runs under the Harness sandbox rooted at the disposable checkout, and it is refused unless the host reports **full** enforcement (F-29), so a partial backend (Windows ACL, an older Landlock ABI) cannot silently weaken the boundary. The effective default is `verificationDependencyMode: 'copy'`: the ignored directory is copied into the checkout, so `node_modules/..` and `node_modules/pkg/../..` resolve inside the disposable checkout and a declared check cannot read uncommitted source state (R11-13). A configured `'link'` is honored only with the explicit `allowDependencyLinkReads: true` opt-in, because a read-through symlink lets `..` resolve to the symlink target's parent chain — the source checkout — and the check can then read uncommitted files; the F-29 sandbox governs writes, not reads. Copy mode supports symlinked dependency roots and relocates internal links into the copied tree. A link to an external regular executable, such as a virtualenv interpreter, is materialized as a regular file with its executable mode; system libraries may still be required. Broken or cyclic links, links into other source checkout contents, and external directory or non-executable file links defer the review as an infrastructure failure (a `(verification preparation)` check row, exit 125) whose output carries the repair; the retry rule copies the tree once more before it defers, and because materialisation now runs outside the check slot, concurrent copies are bounded by the number of running verifications rather than by `checkConcurrency`. This prevents the copied links themselves from reading through to the source checkout; it is not a hermetic toolchain or independent process sandbox. Unsupported dependency layouts require a self-contained installation or the explicit host link-read opt-in. An unconfined `Workspaces` (the identity `confineCheck` that unit tests inject) has no such boundary, and reads still depend on mutable toolchain state either way. Exit 127 is annotated as a missing command rather than an artifact defect. `npm run test:isolation` is the host-only proof that a declared check cannot write into the source checkout; it is not part of the worker check set.
-- **Shared temp roots are a cross-member channel (R11-15).** The workspace-write file policy also allows writes under the host `/tmp` and `os.tmpdir()` (`@deepseek-ai/dsh-sandbox-policy` / the Harness sandbox `roots.ts`), and those roots are shared by every member and mission on the host. Two members can therefore rendezvous through a well-known temp path (write by one, read by the other) even though their worktrees are isolated; the channel is not confined, and file contents are not attributable. The runtime records a bounded detection: when two different members name the same shared-temp absolute path in host-recorded tool input within `TEMP_RENDEZVOUS_WINDOW_MS` (default 10 minutes), it writes a durable `isolation/temp-rendezvous` event naming the path and both members, wakes the owner once per pair and window, and the row appears in the bounded `swarm_observe` event window. The detector is a heuristic over command/file-path mentions, not proof of a write, and it does not scan the temp directories; members must not use the shared temp roots to pass state, and a host that needs a hard boundary must remove those roots from the sandbox policy.
-- Admission refuses a declared check that names an absolute path outside a small documented system allowlist (`/bin`, `/usr/bin`, `/sbin`, `/usr/sbin` and the standard `/dev` streams), with a field-level `[check_absolute_path]` diagnostic naming the path and the repair (round 9-C; hardened in round 11). The scanner is a bounded POSIX-ish tokenizer over the words a shell would execute: quotes and backslash escapes are resolved, so a backslash-escaped leading slash (`cat \/Users/…`) and a doubled leading slash (`cat //Users/…`) are normalized to the same host path the shell resolves and refused, while a `<scheme>://…` URL stays admitted. Every candidate is then lexically normalized (collapse runs of slashes, drop `.` segments, resolve `..` against the resolved prefix) and the system exemption is decided on the normalized path, so `/usr/bin/../..//Users/…` and `/usr/bin/./../..//Users/…` are judged as `/Users/…` instead of inheriting the `/usr/bin/` exemption. A quoted, backtick or `eval` body resolves to one shell word, but the scanner still looks for candidates after whitespace and inner shell punctuation, so `sh -c "cat /abs"`, `sh -c 'cat /abs'`, `cat \`echo /abs\``, `eval "cat /abs"`, `node -e "require('/abs')"` and `echo "test -f /abs"` are refused. Pattern, regex and separator arguments are not host paths and stay admitted: `awk -F/`, `sort -t/` and `tr / _` name the bare root, `grep -E '/(src|tests)/'` and `--test-name-pattern='/x/'` are patterns, a slash inside a word (`echo "a and/or b"`) is prose, and a glob path such as `/Users/*/secret` is treated as a pattern too — a documented residual, because admission cannot tell a glob or regex from a literal host path without executing the shell. A `<scheme>://…` value stays admitted even as an assignment or option value (`--url=https://…`, `PATH=x:https://…`), while a single-slash host path after a colon (`PATH=x:/abs`) is refused. The rule also refuses an absolute path inside the mission workspace: a check runs in a fresh verification worktree of the artifact commit under a random path, so the source checkout's own `.venv/bin/python` or a host `uv` is not the checkout under test. Relative paths, `$PWD` expansions and `PATH`-style lists of allowed system directories are unaffected. When a task that declared checks is replaced or re-submitted with a different declared check, the runtime records a durable `task/check-changed` event naming the previous and new checks (and the replaced task) instead of silently swapping it; a first proposal that merely supplies checks the original task never declared is not a change. The check change is recorded, not refused, and the re-submission keeps the original stored check. Residual: a home-relative path (`~/.local/bin/uv`) or a `$HOME` expansion is not absolute and is not refused, so a check can still name a host tool that way; the tokenizer does not resolve ANSI-C quoting (`$'\x2f…'`), a `file://` URL, `$IFS`, a `$(…)` substitution that constructs a path from data, `${VAR}` indirection, `eval`, or shell aliases and functions; admission cannot judge whether a relative check is *meaningful* for the acceptance — a repair can still declare a weaker relative command, which the durable event makes visible but does not block — and a check can still rely on mutable host state the clean checkout happens to share.
-- Independent host verification proves that the declared checks ran against the exact artifact. It does not prove those checks are meaningful. Initial automatic checks come from the primary, but participant proposals remain possible and there is no mandatory mission-wide acceptance baseline imposed on every artifact.
-- **Refusals carry a stable code and a schema-resolvable exit (round 13, S3).** `tests/refusal-diagnostics.test.mjs` walks the refusal inventory of `src/tools.ts` and `src/admission.ts` mechanically through `tests/refusal-inventory.mjs` (every `throw new Error(...)` message and every object literal carrying `code` plus `message`/`reason`; the walker resolves strings, template substitutions, comments and regex literals, and the parsed throw count is cross-checked against the raw `throw new Error(` count for every scanned file, while every `code:` literal must be inventoried or be a classification marker), and asserts for each site a stable `[diagnostic_code]` plus an imperative next step that names a parameter, with every named `swarm_*` tool and parameter resolved against the schema captured from the real `registerTools` registration path (never a hand-written property list). `swarm_propose`, `swarm_stage` and `swarm_launch` now expose `maxSteps`/`maxFindings`, so the durable `[task_ceiling_exhausted]` refusal's exit — `swarm_propose` with `replaces` and a raised ceiling — is executable instead of only "replace the task"; a ceiling above the mission budget stays refused by `[task_ceiling_exceeds_mission_budget]`, and `tests/task-ceiling-surface.test.mjs` proves the block-and-repair path through the tool surface. The in-scope allowlist is empty. Residuals: the out-of-scope runtime/workspace refusals (295 refusal sites at this head — 186 in `src/runtime.ts`, 49 in `src/workspaces.ts`, 29 in `src/plans.ts`, 16 in `src/store.ts`, 9 in `src/planner.ts`, 4 in `src/authorization.ts`, 2 in `src/web-api.ts` — none coded yet) are enumerated live by the same helper over the 382-site whole-tree inventory — `node tests/refusal-inventory.mjs src/runtime.ts src/workspaces.ts` — and reported with file and line, never pinned into the test by line, because the serialized T3 branch edits those files in parallel; that branch drives the count to zero with its own coded annotations. Two placement/composition exceptions are deliberate and mechanically declared in the lint: (1) `[scope_selector_invalid]`, `[scope_selector_out_of_scope]` and the three `requireHostChecks` messages keep their legacy leading text with the code token trailing, because `src/web-api.ts`'s `actionableMessages` allowlist (outside this task's scope) decides what the browser sees and its patterns are anchored at the message start — consequently a newly coded admission or runtime message whose leading text matches no legacy pattern is sanitized to "Swarm request failed unexpectedly" in the browser, a declared projection gap for the next round; (2) `missingReviewDiagnostic` stays a byte-identical stable code carrier because `tests/review-path-admission.test.mjs` pins its exact render, and the lint's `CALLER_COMPOSED_MESSAGES` entry names `src/runtime.ts` as the composer of its imperative exit, probed against that source. Round 22 deleted that allowlist: a refusal now reaches the browser by its `PolicyError` type, so exception (1) no longer constrains where a code token sits. Advice that names a role-hidden tool (for example `swarm_budget` or `swarm_cancel`, which a worker session cannot call) is phrased for the mission owner rather than the caller; a mechanical role-aware check is not part of this lint and is next round's input.
-- **Authorized per-mission workspace (human-only authorization surface).** A mission may target a repository outside the calling session's cwd only when the target resolves inside a root configured in `authorizedWorkspaces`. The roots are loaded once at plugin start from the profile/`cordis.patch.yml`; no model-callable tool (`swarm_create`, `swarm_stage`, `swarm_propose`, or any other) can create, widen or revoke one, and a change requires a human edit plus a host restart. Admission canonicalizes both sides with `realpath` (symlinks resolved) and decides containment on resolved path components, so prefix confusion (`/a/b` vs `/a/bc`), `..` traversal and symlink escape are refused; the matched root and the resolved path are recorded durably (`mission.workspaceGrantRoot`, `mission/workspace-bound`, `workspace/grant-loaded`). The same check is re-run at every workspace preparation and verification checkout, so removing a root and restarting refuses new missions and fences a running mission with a durable blocked reason and an owner notice instead of continuing silently. Worker sessions can never create a mission or use a grant; a mission cannot be re-pointed by another session. Residual risks, stated rather than claimed closed: **(1)** a model that runs with full filesystem access on the host could edit the plugin configuration file to add a root — the file lives outside the mission workspace and a restart is required, but on such a host the configuration file is inside the model's reach, which is why the target design is a human-only harness command surface (`/swarm-workspace add|remove|list`) that model tool calls cannot invoke; **(2)** the containment check and the following git operation are separate syscalls, so a root replaced by a symlink or remounted inside that TOCTOU window is not caught by the re-validation; **(3)** authorization is a write/execute authorization, **not confidentiality**: an authorized root can contain secrets the swarm may then read, and the grant does not restrict what a worker reads inside the repository it is pointed at.
-- Automatic planning uses the owner's ordinary Harness agent and tools. The prompt supplies a frozen planning directory, while the owner's native cwd remains its source project; following the read-only snapshot path is not a separate OS enforcement boundary. Worker baselines are enforced by the runtime. Advanced `swarm_create`/staging tools bind their workspace to the calling session's working directory or to a configured `authorizedWorkspaces` root, like the native command's workflow; a plan that names a different real path is rejected before any work starts with the field-level authorization diagnostic.
-
-## Storage and recovery
-
-- Default plugin state paths use `~/.dsh/agent-swarm`, independently of `DSH_HOME`. Separate hosts must configure distinct `statePath` and `workspacesRoot`; a live owner's lock normally rejects a second host. Stale-lock reclamation still uses a read/check/unlink sequence, so simultaneous recovery processes can race after the last check. Do not concurrently start or restore multiple hosts against the same state path; process birth checks distinguish PID reuse but do not make reclamation atomic.
-- Live update cursors upgrade the database from schema 1 to schema 2. Older plugin builds reject schema 2, so downgrade requires a consistent pre-upgrade database backup or separate state path. Keep the matching workspaces, recovery journals and Git refs.
-- Automatic startup snapshots tracked files and non-ignored untracked files without moving the branch or changing the real index. Ignored untracked files, including dependencies or local environment files, are not included. Unsupported states such as unresolved conflicts, or dirty or diverged submodules, must be resolved first. A clean uninitialized submodule whose recorded gitlink matches the parent commit is accepted. The capture checks for concurrent edits and retries; it is not a filesystem-wide atomic snapshot.
-- Worker worktrees, planning snapshots and artifact refs are retained after stop/completion. Startup preserves source working files, index and branch; **Apply result** explicitly updates only working files. Result comparison uses the saved snapshot, and conflicts are returned without source changes. Shared Git objects, refs and metadata remain under `.git`; cleanup remains explicit.
-- Stable IDs and a durable inbox recovery journal cover tested stop/restart paths. They do not guarantee exactly-once external tool side effects or recovery from arbitrary disk faults.
-- Applying a result is not a filesystem-wide atomic transaction. Concurrent edits trigger rollback; if later edits prevent restoration, the error identifies retained recovery copies. A hard process or disk failure during the write phase may require recovering those copies manually. Submodule changes and directory/file conversions are not automatically applied. Snapshot storage must be outside the source repository.
-- Outbox delivery failures retain their message identity and record a durable diagnostic; a complete per-route failure-counter and backoff policy is still absent. Offline-owner notifications can remain pending. New process locks include a process birth identity where the operating system exposes one; unknown or legacy live identities remain conservatively locked. A full WAL/umask permission matrix has not been validated.
-- Snapshot restore now writes a validated, durable restore intent before replacing the main database. Startup finishes interrupted replacement and WAL cleanup before opening SQLite. This covers the tested process-interruption points; it does not guarantee recovery from arbitrary filesystem corruption or a storage device that ignores durability requests.
-- Native worker startups are independently bounded and cancellable. A non-cooperative native operation remains fenced until it settles; it is not repeatedly charged as a new startup failure. An exceptional adapter teardown that cannot finish within its cleanup bound reports failure rather than claiming all handles were released.
-- Trace metrics report their retained span window and truncation; they are not whole-history totals after that window fills. Parent lookup can still consult exact durable task/attempt records beyond the in-memory window.
-
-## Interface and model behavior
-
-- The live sidebar observes committed changes through native RPC long polling, with bounded change history and keepalives. Updates carry changed mission snapshots rather than individual text tokens. There is no fixed two-second refresh delay, but a busy host, browser or network can still delay delivery; this is not a hard real-time guarantee. A disconnected panel marks its retained activity as stale; reconnecting or reopening fetches authoritative state, with full-snapshot fallback when its cursor cannot be replayed. Conversation cards remain historical snapshots; an explicit observation creates a new snapshot.
-- Cold worker history is a read-only text/tool projection, not the complete native chat UI. Media is represented by type, and long entries are explicitly truncated. A live worker's native chat composer may remain writable; mission-management permissions are checked separately.
-- Swarm tools are registered globally, then hidden per session by role: ordinary sessions see the entry set, sessions that own a request or mission see the management set, workers see member tools, subagent sessions see none. Hiding is presentation through the host's scoped restriction; the runtime guard and owner checks remain the authority boundary. Role changes alter the cached prompt prefix once, when a session becomes an owner.
-- Observation output is focused (current task, prerequisites, review source, run references, recent events) with cursors and by-id paging, but it is not bounded by one fixed byte limit: a task record with very long acceptance or objective text is returned whole up to the excerpt limits.
-- Owner notices are sent for decisions, blockers, failures, budget exhaustion, a stalled or coverage-complete board, a parked holder, an integration gap, a provider outage, a bounded proposal refusal, a shared-temp rendezvous, typed escalations and completion. Submission and acceptance appear in the panel and event log only; an owner who wants routine progress must observe explicitly.
-- Owner sessions now see the owner-only `swarm_cancel` tool and the assignment instructions state the git-write constraint, so the model-visible golden snapshot (`tests/fixtures/model-visible.expected.json`) changed with the runtime-integrity artifact; the round 9-B board registers `swarm_post`/`swarm_board`, which changed the same snapshot again. `npm run test:harness` owns that snapshot and must be re-run on a sandbox-capable host to confirm it; this worker host cannot run it (see Execution and resources).
-- The sanctioned mission board (`swarm_post`, `swarm_board`) is a store-backed, append-only, typed channel: the host derives the sender, monotonic sequence and mission, the six kinds are a closed set (`ASK`, `ANSWER`, `IDEA`, `ALERT`, `ARTIFACT`, `HANDOFF`), cited evidence and tool-run ids must already exist in the mission, and a reply must name an existing post. The sequence is global across the missions in one store, not per-mission (A2-07), so a post's number is not a per-mission ordinal. Reads are bounded pages with body excerpts and a gap-free `after` cursor; read state is client-side, so identical reads return identical pages, and `swarm_observe` surfaces new posts in its delta. A post is data, never authority: it changes no task state, queues no delivery, writes no file, and posting emits no event row of its own. The event vocabulary now names every type the runtime emits, including the `mission/<action>` and `delivery/<status>` families, so `eventVocabularyReport` reports only genuinely unknown types; The event kind is a type: `src/events.ts` holds one row per kind, `SwarmStore.event` takes `EventKind`, and an unregistered kind is a compile error; `tests/reader-census.test.mjs` keeps the converse check, that every registered kind without `historical: true` has a writer.
-- **The client panel is a projection of a bounded event window, and the board is model-tool-only.** `tests/client-findings.test.mjs` (F-14/F-33) re-derives every emitted event type from `src/` and fails unless each one is either labeled by the compact projection with a `zh` token for every path segment or named in an explicit omission list with a reason. The labeled R11-08 families are the review path (`task/review-missing`, `task/review-admitted`, `task/review-blocked`), check change (`task/check-changed`), restart recovery (`member/resume-failed`, `task/start-failed`, `task/reassigned`), mission control (`mission/pause|resume|stop|complete|coordinator`) and the promoted workspace authorization (`workspace/grant-loaded`, `mission/workspace-bound`, `mission/workspace-revoked`); the Activity view's `eventSummary` carries `previousChecks`, `checks`, `reviewOf` and the workspace-audit keys (`path`, `grantRoot`, `source`, `loaded`, `blockedTasks`). The board remains **model-tool-only** in the client: `swarm_board` and `swarm_observe` return posts and the caller's inbox to a model session, but the client `Snapshot` carries no `posts`/`inbox` field and the panel renders no board posts, so a browser panel would need an explicit per-mission board projection with its own read cursor (a declared projection gap, not an authorization boundary). `workspace/grant-loaded` is install-scoped (recorded under the `swarm/install` audit id), so it can never appear in a mission snapshot; `mission/workspace-bound` and `mission/workspace-revoked` are mission-scoped and render in the compact panel and Activity view.
-- **Round-11 arena, host-cap and isolation residuals.** The per-member proposal allowance, the notice ledger and the read-only registry are durable; three non-blocking review findings remain (T1bv `evidence_7d3e71c6`): `swarm_escalate` enforces caller ownership of a supplied `taskId` only when an `attemptId` is also supplied (the sender is still host-derived and no authority changes); two different refusals in one board state record two `task/proposal-refused` events but one owner notice, because budget-class notices dedup per (class, fingerprint, sender) and ignore the reason; and `swarm_observe`/the arena view expose at most the newest 20 owner notices, so an older escalation is durable but not surfaced in that page. The host-only classifier (T2b2cv `evidence_b6aa3726`) still admits a host path whose segments contain shell glob or expansion characters (`+`, `[`, `]`, `{`, `}`, `$`, `^`) because admission cannot tell a glob from a literal without executing the shell; the escaped and doubled-slash spellings from A2-01 are refused. The declared-check envelope (`task/check-envelope`) and the install-scoped `store/*` rows are deliberately off the compact panel (the F-14 omission list names each reason). The no-silent-state backstop witnesses a dispatchable-but-undispatched task only when at least one eligible member is startable (parked, or idle by the adapter's contract); a board whose eligible members are all busy by that contract is not silent. `npm run test:harness` still cannot run on this worker host; the model-visible golden snapshot is updated by hand for `swarm_escalate`, `swarm_registry` and `swarm_restore` and must be re-confirmed on a sandbox-capable host.
-- Correct plan generation and useful acceptance criteria still depend on the model and task description. The primary can repair validation errors, but deterministic test fixtures do not establish a general real-model success rate.
-
-## Round-13 control-path slices (S1 progress-or-terminate, S5 gate sets, S7 isolation)
-
-Round 13 replaced a scheduling guard that was in-memory evidence with durable state, after a first-party defect on 2026-09-10: the only active mission produced zero durable events for 120 minutes while the same process kept serving another mission, because `Runtime.kick()` deduplicated a mission with the in-memory `scheduled` Set and the pass it deduplicated was wedged inside a worker adapter call. The tick timer's only liveness action was that same `kick()`, so the mission became invisible to its own watchdog.
-
-- **S1 — the guard is a durable pass row** (superseded in round 25: the guard is the in-memory record of the one body queued or running on the mission queue, and nothing releases it; see the round-25 section). One row per mission (`passes`, key `pass_<missionId>`, overwritten per pass) records `(revision-before, revision-after)`, `(fingerprint-before, fingerprint-after)` and the consecutive no-progress count. `kick()` re-reads it; there is no in-memory `scheduled` Set. A `running` row older than the declared bound is not a guard unless the mission still has live work (a renewed lease or an in-flight stop acknowledgement), so a pass that never returns cannot swallow a tick.
-- **S1 — declared, configurable bounds.** `RuntimeConfig.stallPasses` (default 3, a window of 3 × `tickMs`) is the number of consecutive passes that may advance no durable state and terminate nothing; `RuntimeConfig.stallPassTimeoutMs` (default 30 × `tickMs`) is the bound on one pass. When either bound is exceeded with no live work, the runtime commits a durable `mission/stalled` event (`cause: 'scheduling-pass'`, `wedged`, pass run, bound, revision window, unchanged state digest, unschedulable list) naming what happened, records an owner notice (delivered by an unqueued flush, so the notice path does not share the fate of the pass it reports on), and releases the guard. Repeated stalls for one unchanged board are deduplicated by the state fingerprint and re-arm when the board changes.
-- **S1 — a false stall notice is treated as a defect.** A live lease renewed by recorded operations, or a stop whose acknowledgement is in flight, suppresses both the no-progress and the wedge escalation; a pass that is still progressing past the bound keeps its guard and is re-evaluated on later ticks. A state another witness (W2 notice, board-level `mission/stalled`, coverage notice) already announced for the same fingerprint gets the audit event but not a duplicate notice.
-- **Intermittent (recorded, with the measurement):** `tests/durability-w9-recovery.test.mjs` (the W9 recovery case) failed in two of three full-suite runs on the merged baseline and in one of three on this branch under the same load, so it is pre-existing load sensitivity, not a regression. While the pass handed delivery entirely to the asynchronous pump, `tests/liveness-create-path.test.mjs` ("a create-path stall notice ...") and `tests/liveness-create-path.test.mjs`'s R10-09 case also flaked under load (three of three runs, different tests each time); restoring the bounded in-pass flush (see S2 above) returned the profile to the baseline's. F4 in the fault suite fails on both trees in this environment. (Measured in batch 6: at the round-13 commit 1224217, F4 passes in a git clone and fails from a `git archive` export at its promote step, exit 1 instead of 2. Since batch 6, F4 no longer depends on a git checkout.)
-- **S1 residual** (superseded in round 25: no pass is released). A pass wedged while the mission still has live work is released only once that work lapses (at latest after `leaseMs`), because the runtime cannot distinguish a slow adapter call from a hung one while the lease says progress. `dispose()` now drains within `stallPassTimeoutMs` instead of waiting forever on a wedged pass body.
-- **S5 — every in-memory `Set`/`Map` outside `src/client` is classified, and no behaviour-gating entry is left unlabelled.** `tests/in-memory-gates.test.mjs` scans every `new Map`/`new Set`/`new WeakMap`/`new WeakSet` in `src/` (106 occurrences), fails on any occurrence it has not classified, and asserts BY NAME that every gate is either *derivable* (it re-reads the store before it gates) or *cache-only* (clearing it cannot change a durable outcome), with one test per entry that clears a NON-EMPTY collection and shows the durable result. *Derivable:* the pass guard (durable `passes` row); the pass-release fence (`releasedRunId` stamped on the `passes` row by the watchdog and carried forward by `openPass`/`closePass`, so clearing the in-memory Set cannot let a released body resume and dispatch); the unreviewed-submission grace (age of the durable `task/submitted` event); a withdrawn automatic review (durable `task/review-admitted` events, with the map as a fallback); the parked-holder, review-blocked and integration-gap notice dedup sets (durable delivery ledger keyed by class + dedup key); the launch-cancellation decision (`launchDraft` re-reads the durable `starts` row immediately before activation, so the abort controller is an accelerator and a cancelled launch cannot come active without it); the consecutive start-failure count (durable `startFailures` field on the member row, read by the retirement gate and cleared by the same successful start that clears a provider outage; the last start error rides on the same row as `startError` and is cleared with it); the budget stop claim (durable `budgetPause.stopping`). *Cache-only:* `queues` (the mission queue waits for a predecessor only up to `stallPassTimeoutMs` and then starts the next operation, so a wedged body cannot swallow it; two bodies that overlap after the bound cannot lose an update because every commit is a synchronous single-writer transaction and every task write is a compare-and-swap on the task's own revision); `operations` (the drain registry orders shutdown only — every deferred body re-derives its work from durable state: the pass row, the budget stop claim, the durable outbox); `idleSignals` (durable `Task.idleSignal`); `fingerprintCache` (keyed by store revision); `observeCursors`; the per-attempt notice claim (`delivering`); the shared-temp mention windows. The census test's predecessor (S5) reported `queues`, `operations`, `startControllers`, `startFailures` and `releasedPasses` as neither label with hand-offs; S5c closed all five structurally, and the census asserts each one's label by name so a regression cannot hide behind an edited count. **Events:** `task/stale-revision-refused` is emitted through the exported constant `STALE_TASK_REFUSAL_EVENT`, and since round 20 a constant emission is checked by the `EventKind` type exactly like a literal, with the row registered in `src/events.ts`; `eventVocabularyReport` over a real mission log recognizes it.
-- **S2 — the notice path no longer shares the fate of the pass.** A tick-driven, queue-external pump (`pumpOutbox`) walks the durable outbox and never takes `exclusive`, so a pass wedged in an adapter call, or a mission lock held for any reason, still delivers a durable owner notice: `tests/outbox-outside-queue.test.mjs` holds the lock with a never-resolving adapter `start` and shows an inserted durable notice delivered while the same pass row stays `running`, and shows a wedged pass's own `mission/stalled` escalation (`cause: 'scheduling-pass'`) delivered inside the declared bound without the pass returning. The scheduling pass still flushes its own outbox (bounded per delivery) because delivery *ordering* is semantic: a stale assignment must not wake a member, and the repair wake must be observable with the assignment — restoring that flush removed the load flake this branch had widened. Each delivery attempt is claimed individually and bounded by `stallPassTimeoutMs`; an attempt the adapter never settles is abandoned, retried by a later pump, and recorded durably on the mission row (`outboxStarved`), so one hung `deliver` cannot starve another notice — not even another notice of the same mission. Pump requests coalesce only inside that bound, so a pump whose deliveries hang past it never suppresses the next one. The replay suite (`npm run test:replay`) is unchanged and green, so event ordering did not move.
-- **S6 — critical-path accounting.** `SwarmRuntime.criticalPath(missionId)` projects the longest chain of dependent steps (`length`, `remaining`, `usedSteps`, `taskIds`) over the durable task graph; it is reported next to the mission spend in the observe payload (`mission.criticalPath` beside `usedSteps`/`usedTokens`) and in the client snapshot, and rendered as a CRITICAL PATH metric beside STEPS USED. It is accounting only: no budget enforcement reads it, and a cyclic or dangling graph cannot throw. `tests/critical-path.test.mjs` pins a known graph (A→B→C longest), shows that adding a worker never shortens it and that accepting an off-path task leaves it open, and injects a cycle to prove the projection stays total.
-- **S3 runtime half — annotated refusals, the RPC boundary and the deferred inventory.** 17 control-path refusals outside the browser sanitizer's reach are annotated: 10 in `src/runtime.ts` (evidence identity and tool-run citations, verification/independence, supersede rules) and 7 in `src/workspaces.ts` (workspace root/ownership/uncommitted work, verification source, review source, baseline). Each carries one stable `[diagnostic_code]` and an imperative exit whose named tool/parameter resolves in the real schema. **The other 35 annotations the first T3 attempt made were reverted, because `src/web-api.ts` classifies a refusal as actionable by matching its message against an ANCHORED allowlist** (`actionableMessages`, 64 patterns, 103 RPC-actionable messages on the merge baseline): a `[code]`-prefixed or advice-appended message no longer matches, so the cancel RPC returned `internal-error` instead of `bad-request` and every affected refusal silently lost its actionable classification. Those messages now keep the allowlist's authored text byte-for-byte and are recorded as intentionally unannotated here and by `tests/rpc-refusal-classification.test.mjs`, which re-derives the allowlist from `src/web-api.ts` and fails if any classified message carries a diagnostic prefix, if an annotated message is a template (its rendering cannot be proven), or if the classified inventory shrinks below 103. The shipped attempt did not extend the allowlist: its `$` anchors exist to stop suffix injection of host detail, and tolerating an appended advice sentence would weaken that boundary for a cosmetic gain. Round 22 deleted the RPC allowlist and typed these refusals, so the reverted annotations are no longer blocked by it. T2's allowlist stays empty and the lint stays green (`tests/refusal-diagnostics.test.mjs` 7/7); the uncoded inventory on the two serialized files is 218 of 235, all reported by the inherited deferred inventory — most are internal invariant, corruption and argument-guard throws a model cannot trigger.
-- **S7 — the isolation invariant is asserted, not inspected.** `SwarmRuntime.isolationViolations(missionId)` re-derives from durable state that (a) every non-stopped member has a provisioned workspace and no two live members share one, so live workers can never exceed provisioned isolated worktrees, and (b) two concurrently running tasks that share one worktree declare disjoint scope. The dispatch path checks it before starting a member and again after `prepareTask` before assigning; a violation is a durable refusal on the mission row (`isolationRefusal`) plus a durable owner notice naming the executable exit, and the task stays pending; a repaired board clears the key so a recurrence re-notifies. `tests/isolation-invariant.test.mjs` runs a property test over generated member/task sets and injects a shared worktree to prove the refusal. Per-member worktrees are never weakened; scope disjointness is asserted inside one worktree, while tasks in distinct worktrees remain isolated by construction rather than serialized.
-
-## Round-14 M1a — the control path is split along its seams
-
-Round 14 opens by extracting the control path out of `src/runtime.ts`, because every slice of the three preceding rounds declared that one file and preparation merges per file: the plan's file-collapsed width was 1, so declared breadth could never run. The seven seams, each in its own module, with the runtime keeping thin forwarding methods so no call site changed:
-
-| seam | module |
-| --- | --- |
-| lease and attempt accounting | `src/attempts.ts` |
-| gates and caches (fingerprint cache, usage accounting, budget gate) | `src/gates.ts` |
-| notices, witnesses and the outbox | `src/notices.ts` |
-| the refusal registry | `src/refusals.ts` |
-| the declared-check execution path | `src/declared-checks.ts` |
-| the workspace/admission surface | `src/workspace-admission.ts` |
-| decision/scheduling (predicates, pass guard, dispatch sweep) | `src/scheduling.ts` |
-
-No two seams share a file. Behaviour is unchanged: `npm run test:replay` still compares the committed golden sequence (39 events as of round 26; 38 events / 13 spans / 6 commands, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`), no event type or payload moved, and no test was deleted, skipped or relaxed.
-
-- **Payment.** `src/runtime.ts` 4657 → 2783 lines (round 13's own pre-growth baseline was 4107) and `await`s inside `schedule()` 14 → 6. Of those six, four are the bounded outbox flush and two are the named sweeps `Attempts.recoverExpired` and `Scheduling.dispatch`; the `schedule` body itself names no worker adapter, no spawn, no network and no subprocess. The `\bthrow\b` count over `src/runtime.ts`, `src/workspaces.ts`, `src/admission.ts`, `src/harness-workers.ts`, `src/tools.ts` and `src/authorization.ts` is reported with the artifact, and refusals that moved are counted in their new modules rather than laundered out of the six-file number.
-- **Residual (named, not hidden).** The serialized pass still *holds the mission lock* across adapter work: `recoverExpired` (checkpoint, stop), `dispatch` (start, prepare, assign) and `flushOutbox` (deliver) run inside `exclusive`. The seam is now a module boundary, so the awaits are countable and owned, but the wedge class is not eliminated — a pass can still be slow inside the adapter. Making those effects queue-external changes event ordering, which the replay digest pins, so it is deliberately not done here.
-- **Caches** (round 25 deleted `releasedPasses`, `parkedNotices`, `reviewPathNotices` and `integrationGapWarned`). The in-memory collections that moved with their seam (`idleSignals`, `budgetStops`, `fingerprintCache`, `releasedPasses`, `parkedNotices`, `reviewPathNotices`, `integrationGapWarned`, `instanceId`) stay reachable on the runtime as live getters, so `tests/scheduling-pass.test.mjs` clears exactly the objects the scheduling path reads and its cache-only proof keeps its original assertions.
-- **The refusal inventory follows the split, it is not narrowed.** Three lint tests derive their counts from a file list, and the moved refusals would have silently dropped out of it: `tests/refusal-diagnostics.test.mjs` (deferred sources), `tests/refusal-runtime-annotations.test.mjs` (the 235-site property over the two serialized files) and `tests/rpc-refusal-classification.test.mjs` (the 103-actionable floor). Each list now names the module that received the sites, so every assertion is evaluated over the *union* of the split files: the site total is still exactly 235, the annotated codes are still found exactly once each, the uncoded delta is still the 17 codes S3 added, and the classified floor is still 103 — the same thresholds, measured over more files. The composer probe for `review_path_missing` now reads `src/notices.ts`, which is where `notifyReviewBlocked` moved. No assertion was deleted, skipped, loosened or re-pinned to a line.
-
-
-
-Round 2 deferred four defects and accepted two advisories without ranking them. Round 4 fixes or bounds them; this packaged list exists so consumers do not have to read the non-packaged remediation ledgers.
-
-- **W8 (a provider-rejected reasoning effort was admitted) — fixed in round 4.** A start rejection that names an unsupported `reasoningEffort` is retried once without that field and records a durable `member/effort-downgraded` event; the admitted member keeps no effort. If the retry is rejected too, admission fails with a typed message, the member is stopped, and durable `member/effort-rejected` and `member/failed` events are written. Residual: the downgrade clears the requested effort rather than selecting a supported one.
-- **W9 (a preparation failure was terminal) — fixed in round 4.** A failed preparation is recovered instead of blocking the task permanently: since round-19 the previous owner's uncapturable worktree is snapshotted into the preservation refs and the replacement starts from that snapshot (inheriting every uncaptured change, including out-of-scope edits it must revert before submitting), and only when preservation itself fails does it start from the last checkpoint or the task base; either way a `task/recovery-fallback` event and an owner notice record it. A regression test fails on the pre-fix head. Residual: a real repeated failure still consumes recovery credit until the attempt limit.
-- **W12 (a pending task's dependency set could not be extended) — fixed in round 4.** Cancellation now has a lineage repair path: a replacement may cover a cancelled task and dependents re-resolve to it, and a running sibling review is retired both by a verdict and by cancellation with a durable event.
-- **W14 (declared checks were not reconciled with the execution environment) — addressed in round 4.** Admission reconciles an objective's write directives with the declared scope and named deliverables with the effective ignore rules, so a plan that cannot run is rejected before work starts. Residual: a check that needs a host capability (a built Harness checkout, nested sandbox or browser) remains a documented host prerequisite, not something admission can detect.
-- **A1 advisory (read-check-write race in the abandoned-task repair) — covered in round 4.** The repair now has a deterministic regression test: the checkpoint takes a per-record lock, waits for a competing owner and declines to overwrite a newer owner's record. The window only opened on an ownership switch within one epoch, and the observed manifestation was a spurious handoff failure rather than a clobber.
-- **A2 advisory (a real non-symlink untracked dependency directory was not excluded) — fixed in round 4.** Preparation and capture now recognize the dependency directory by its ancestor component, so an untracked dependency tree never blocks preparation or enters an artifact, and a staged dependency directory is unstaged. Residual: a regular file that merely shares the dependency name is ordinary work and is still refused as uncommitted work.
-
-**Single-host, single-writer.** Admission, lease and budget accounting is durable but scoped to one host and one writer process at a time: every mutation serializes through a single SQLite writer connection. A competing writer is classified as `writer_busy` and retried with bounded backoff; progress is not guaranteed under sustained contention. Two writers against one store file, or one store shared across hosts, are unsupported. Multi-host horizontal scaling requires external coordination and is out of scope for this release.
-
-**The full verification suite requires the repository checkout, not the installed tarball.** The published tarball ships built `lib/`, the manifest, `cordis.patch.yml`, the `profile/` mount bundle, four documents and `scripts/packed-smoke.mjs`. `npm run test:packed` verifies that shipped layout. `test`, `test:harness`, `test:faults`, `test:pack`, `test:profile`, `test:bundle`, `test:web`, `test:command-web` and the host-only `test:isolation` need `src/`, `tsconfig*.json`, `scripts/` and `tests/` from the repository; fault tier B additionally needs a built Harness checkout.
-
-## Round 15 Pass 2 — the reader census and what it deleted
-
-The census is a repository fact, not a note: `tests/reader-census.test.mjs` records one decision per
-`SWARM_TOOLS` entry, one per `EVENT_VOCABULARY` kind and one per examined payload field, and fails when a
-registry addition has no decision, when a recorded proof does not exist or does not name its kind, or when a
-deleted kind comes back. Counts measured on this artifact: **24 tools, 89 event kinds, 44 examined payload
-fields**. The historical 24/92 figures are not a baseline and were not a quota.
-
-**Deleted (proven dead surface).** Four vocabulary entries were removed — `mission/paused`, `mission/resumed`,
-`mission/stopped`, `mission/completed`. Each is the `-ed` twin of a live *dynamic* kind (`mission/pause`,
-`mission/resume`, `mission/stop`, `mission/complete`); the runtime emits only the dynamic form
-(`src/runtime.ts`: ``event(missionId, `mission/${action}`)``), the client labels only the dynamic form, and the
-`-ed` names never had a writer in this repository's history (checked at the promoted import commit, where they
-appeared only in `src/trace.ts`). No store this plugin produced can contain them, so no historical reader is
-lost; `tests/reader-census.test.mjs` additionally replays a legacy row carrying one of them and asserts that the
-event still returns with its payload (only the description is reported missing), so a future decoder that needs
-the old names has to say so explicitly.
-
-**Kept with a compatibility reason.** `src/client/progress.ts` still labels `attempt/started`, which no writer in
-this repository emits (the live kind is `task/claimed`). It is kept because a historical card can still hold such
-rows, and the readers that keep it live in that same file: the label map (`meaningfulEvents`, where it renders as
-"Task started") and `recoveryEventTypes`, which treats such a row as a recovery step. The census records it as a
-named compatibility label rather than an undocumented exception; the label-coverage check fails if a new label
-appears with neither a vocabulary kind nor such an entry, and the compatibility-reader check fails if the row's
-recorded reason cites a file that does not itself mention the label (the R16-G7 defect: the row claimed
-`tests/ui-progress.test.mjs` rendered it, and that string occurs nowhere in that file or in `tests/fixtures/`).
-
-**Kept because a reader exists.** All 24 tools keep their decision and their named reader (the worker or owner
-decision that uses them). 22 of the 24 rows are proven by a test that exercises the tool's handler; the two
-exceptions are `swarm_challenge` and `swarm_subscribe`, whose proof is their registration in `src/tools.ts` plus
-the model-visible golden fixture `tests/fixtures/model-visible.expected.json` — both appear in its
-`workerSwarmTools` set, which `tests/harness-composition.mjs` and `tests/roles.test.mjs` read — so the census now
-states the split mechanically instead of a blanket claim that was false for those two rows (R16-G7). Event kinds
-whose only reader is the durable log itself are recorded as `audit` rows and are accepted only because the same
-kind has a writer — a vocabulary description alone is not treated as proof of value, and a test-only reference is
-rejected by the census rule.
-
-**Boundary of the payload examination.** The payload census is deliberately bounded to the four densest durable
-payloads (the three `mission/stalled` shapes, `task/check-envelope`, `tool/recorded` and
-`isolation/temp-rendezvous`). Fields outside those payloads were not examined and therefore carry no decision;
-the census is honest about that rather than implying full coverage.
-
-## Round-16 integration (assembled head, base `b4c9516`)
-
-**What the assembled tree carries.** Four accepted branches merged onto `b4c9516`: the wake-precision branch
-(lineage-resolved waiting through the runtime's own `effectiveDependency` seam, `dependentsOf` review edges, the
-`wakePrecision` projection and the predicate enumeration that fails when the lineage resolution is removed), the
-check-environment branch (TMPDIR/TMP/TEMP inside the disposable checkout, the durable declared-check retry pair,
-`HarnessWorkers.readScratch`), the delivery-temp-root and census branch, and the bounded-release/reporting branch.
-The union of changed paths is exactly the branches' declared scopes; no path outside them changed against the base.
-
-**Bounds and their tree** (round 25: a wedged pass is named, not released). A scheduling pass whose body does not return is released past
-`stallPassTimeoutMs + stallPassLiveGraceMs` (defaults: 30 ticks plus one grace period of the same length —
-7,500 ms and 15,000 ms under a 250 ms tick), with the release recorded on the durable pass row and the live work
-it preserved named in the escalation; an attempt whose durable progress passes `attemptSilenceBoundMs`
-(default 600,000 ms) escalates with `taskId@epoch` and its member. Both are configuration. **These instruments
-were not live on the deployed round-15 build**, so the round's live-mission silence numbers are read-time
-projections of the fixed artifact over deployed-build rows, not a record that the escalation fired on the live
-mission; a direct live proof requires redeploying onto this head.
-
-**The wake-precision instrument is a read-time judgement.** `wakePrecision`, which moved to `tests/instruments.mjs` in round 21 because no production code read it, counts a fall-through notice
-false only when `waitsLegitimately` still recognises its subject at read time, and it does not judge a decision
-whose subject has advanced epochs. A historical false wake whose whole lineage has since terminated therefore
-reads as not-false: on the round-15 mission the instrument reports zero false wakes over 17 fall-through
-decisions, while the at-the-time measurement found the same family naming a subject with a live replacement seven
-times in 28 minutes. The fixed-build proof is the shipped predicate enumeration plus the emission pairs, re-run on
-the assembled head; the live-ledger counts remain a qualified observation about the deployed build.
-
-**The three facts stay separate.** Deliveries carry a transport state (`sent`/`queued`/`claimed`); consumption is
-recorded as `unknown` in the runtime ledger, and the host instrument that can observe it is the inbound
-`user/message` (after native pre-step admission) event plus its durable `user/message` twin. No host signal shows that a notice was acted on,
-so **"handled" is UNTESTABLE with the missing instrument**; resolutions remain task or mission transitions. A
-recorded design hazard for wiring consumption: `flushOutbox` writes the whole delivery row after `deliver()`
-returns, so a stale whole-row put can clobber a concurrently recorded `consumedAt`.
-
-**Member phase vs. derived status (R17-G7).** The durable member `phase` (`active`/`parked`/`stopped`) is the only
-member lifecycle state the store persists; the live `status` (`idle`/`working`/`waiting`/`stopped`) is derived on
-every read from the phase plus the tasks that name the member as the owner of a running attempt, and the store
-drops any presented status on write. Rows written before the phase existed are mapped by the one rule in
-`src/projection.ts#memberPhaseOf` (used by both the read hydration and the write funnel): a recorded `stopped` stays
-stopped and a recorded `waiting` stays parked, while a recorded `idle` or `working` maps to `active`, because those
-two were live facts rather than durable intent. **One intent is therefore not recoverable from the row itself:** a
-legacy `working` row that owns no running attempt now reads `idle` — the R17-G7 rule that no stored field mirrors a
-live fact, applied to the fact that is gone. Phase-less rows keep their old `status` field in the file until their
-next write, which normalizes the row to a phase; no migration runs at open and no durable migration event is
-recorded. The live store at the time of the round was exactly this shape (142 member rows, 0 with a phase, 114 of
-them `stopped`), and `tests/r17-projection.test.mjs` seeds that shape and pins that none of the 114 becomes
-dispatchable.
-
-**Wake generation (R17-B2/B2r): what the budget, the replay check and the absence net do not cover.** The per-owner
-wake budget is a default of 6 individual owner notices per 5-second window per mission; facts beyond it are carried
-by one degraded summary delivery that lists every fact (nothing is dropped), and the summary is updated in place
-while it is still undelivered — a burst that spans several windows therefore produces one summary per window rather
-than a single merged report, and the bound is a burst bound, not a lifetime quota. The fact check covers ALL SEVEN
-families in `NOTICE_TEMPLATES` (stall-root, fall-through, stall, parked, review-blocked, integration-gap,
-coverage-complete). Since round 26 every reviewed body is rendered through `renderNotice`, which records the
-statement (the rendering family and the counts the body states) from the same input the body is built from, and
-`tests/r17-notices.test.mjs` checks the statement, subjects and reason against the durable rows, requires every body
-except review-blocked to equal its production template rebuilt from those rows, checks the stated counts in the
-text and a per-family table of tool and exit anchors. Because the rebuild calls the production template, a template
-edit that adds a claim outside those counts and anchors is not caught; wording between the anchors can change
-without a test edit. The remaining `notify(` sites are enumerated PER SITE with the fact each one
-reads instead of the shared interpretation in `tests/r17-notices.test.mjs` (the guard-terminal, dispatch-question
-and budget/ceiling refusals compose their body from the refusal registry; the pass and attempt escalations read
-their own rows; the rendezvous reads two tool runs; the guard nudge reads the adapter handle); they are not
-replayable from a single template. Fact identity is keyed on the event TYPE (a second distinct same-type transition
-at the same subject@epoch and recorded reason is the same fact and is suppressed) and an explicit family replaces the
-trigger in the key; both rules are stated at `factKey` in `src/notices.ts`, where the key is defined.
-Cause-bearing generation is TRANSITION-DRIVEN: the runtime's commit funnel
-coalesces the commits of one operation and publishes the decision facts against the settled state, with the pass
-state selecting the one pass-end branch (a wedged or just-named pass asks its dispatch question; a live pass, or a body that made progress of its
-own within the last bound past its bound, does not). **The sampled tick (`sweepDecisions`) emits exactly two absence instruments and no cause:** the absence net —
-the absence of a durable transition and the elapsed clock (default bound 600,000 ms, `Notices.absenceBoundMs`) —
-and the retained attempt-silence escalation (`Scheduling.sweepSilentAttempts`, one bounded `stall`-class notice per
-silent attempt, declared bound `attemptSilenceBoundMs`, default 600,000 ms), which states the silence and the
-elapsed clock rather than a cause. No cause-bearing classifier runs from a sampled tick.
-`Delivery`'s declared `claimedAt` field in `src/types.ts` is dead: no code writes or reads it (the field remains
-declared for compatibility with rows written by the deployed build). The ledger's transport `state` label `claimed` is retained for the gate/reader surfaces and
-is derived from `deliveredAt` only — it is never a consumption assertion; consumption is the separate `consumedAt`
-fact recorded from `user/message` (after native pre-step admission) with a compare-and-swap.
-
-**Open hand-offs.** The attempt-closer vocabulary in the scheduling branch duplicates the private attempt-closer
-set in `src/trace.ts` (the replay truncation check is the cross-check; the duplication is recorded here rather
-than silently shared). The six host-only suites (`test:harness`, `test:pack`, `test:profile`, `test:isolation`,
-`test:web`, `test:command-web`) are blocked by the nested-sandbox environment — measured `SandboxUnavailableError`
-(`sandbox-exec: sandbox_apply: Operation not permitted`) and, for isolation, an `EPERM` `mkdtemp` under `$HOME` —
-so the accept-host-only-or-change-policy decision is owed to the owner rather than silently declared. The residual
-member-status writers outside this branch's scope (`src/attempts.ts`, `src/gates.ts`) are inert because the store
-drops the derived field; they are tracked by the round's own follow-up task rather than silently left unnamed.
-
-## Round-17 declarative mount (bundle profile, R17-G11)
-
-**What ships.** `profile/` is the bundle package `@dsh-external/dsh-agent-swarm-profile`: its runtime content is its
-patch document plus its dependency on the plugin. It inserts the `dsh-external-agent-swarm` row with both roots stated
-explicitly and portably (`$DSH_AGENT_SWARM_ROOT`, else `$DSH_HOME/agent-swarm`, which is `~/.dsh/agent-swarm` by
-default), and it names its prerequisites (`@deepseek-ai/dsh-base`, `@deepseek-ai/dsh-web-app`), the supported Harness
-releases and its conflicting bundle layer (the plugin package itself) in its own `dsh.bundle` metadata. The Web client
-UI mounts with the same row, through the package's `dsh.client` declaration; no second row exists.
-`tests/r17-profile.test.mjs` proves the metadata, the portable roots, the host profile loader composing the bundle
-into exactly one row, the conflict being a real duplicate-row composition, and a real `dsh --profile web` boot at the
-default, overlay-supplied and environment-supplied roots.
-
-**What remains hand-run.**
-
-- The payload dependency is `file:..` because the platform is distributed as a source checkout and is not published to
-  a registry; a registry publication of the same release would carry the version range instead, and the mount command
-  would be `dsh plugin --profile web add @dsh-external/dsh-agent-swarm-profile`. Until then a `file:` mount packs the
-  payload, so the mount command must be re-run (or `dsh plugin --profile web install` run) after rebuilding the plugin;
-  the verified source command is in [README](../README.md#mount-by-declaration-bundle-profile).
-- **The preview deployment still uses the direct mount**: the plugin package as the profile's bundle layer, with
-  `preview.patch.yml` supplying absolute roots through the bespoke `scripts/update-preview.mjs`. Swapping it to the
-  declared mount is the campaign's attended deployment step, and it requires removing the direct plugin dependency
-  from the profile before adding the bundle, because both layers insert the `dsh-external-agent-swarm` row — the
-  conflict the bundle declares in its metadata. Until that swap, the hand-written overlay and the update script remain
-  the deployment's real mount path, and this round does not change them.
-- The composition states the two roots it owns explicitly; every other plugin setting keeps the plugin's documented
-  default in [`src/index.ts`](../src/index.ts), so the composition is a mount declaration, not a full configuration
-  mirror.
-- `tests/r17-profile.test.mjs` mounts the profile the way the CLI install leaves it (the bundle in the profile's
-  `node_modules` with its payload resolvable beside it) without invoking a package manager, so the declared check needs
-  no pnpm binary; the `file:` install command itself is exercised by the attended deployment and by the round's
-  recorded mounting evidence, not by that check.
-
-## Round-17 integration (seven accepted artifacts, base `f265919`)
-
-**What the assembled tree carries.** Seven accepted artifacts composed by hand onto the round-16 head `f265919`:
-B1r2 `6cdd426d` (registered mission projection, durable `phase` plus derived status, no stored status mirror), B2r4
-`00cfe0c3` (one shared interpretation, replayable notices, fact-keyed repetition, one per-owner wake budget, the
-absence net, real consumption from the host claimed signal), Cr `0e7d12f8` (host telemetry sink, and the spill bound
-as a real ceiling), D `46a69294` (pre-append invariant), E2 `5ab322cd` (declarative bundle profile), Fr3 `cabae21f`
-(human worker names and pixel avatars, tool boundary included) and F19r2 `969c40a4` (the no-silent-state report
-restored). B2r4 was composed on B1r2, and D and F19r2 on B2r4, so the composition order follows that lineage: B1r2,
-B2r4, D, F19r2, then the independent Cr, Fr3 and E2. The tool surface is unchanged at 24 `SWARM_TOOLS`; the suite
-grew from 109 to 116 test files, and two new source modules carry the projection and the invariant.
-
-**Containment (measured, not assumed).** The assembled changed-path set is exactly the union of the seven deltas — 43
-paths, 0 extra, 0 missing — and the 34 paths an artifact touched exclusively are byte-identical to that artifact's
-tree. Every added line of every branch survives on the shared paths except six lines resolved by intent in three
-pairs (below); 21 lines that a composed successor rewrote are superseded by that successor's accepted tree, not lost.
-
-**The conflicts, resolved by intent.**
-- `src/runtime.ts` (B1r2 x Fr3, on member admission): the merged admission keeps B1r2's durable-phase predicate and
-  Fr3's resolved pool name — `memberPhaseOf(prior) === 'stopped'` with Fr3's optional-name guard, the worker budget
-  counted over non-stopped phases, and the member literal carrying the resolved `name` plus `phase` and
-  `status: deriveMemberStatus(...)` with the phase-only durable record.
-- `tests/in-memory-gates.test.mjs` (B1r2/B2r4/D x Cr x Fr3): the census keeps every side — B1r2's store entries, D's
-  renumbered notices entries, Cr's trace entries and Fr3's `src/types.ts` entry — and its `src/runtime.ts:22` line was
-  rewritten to pin the merged member literal exactly.
-- `docs/known-limitations.md` (B1r2/B2r4 x F19r2 x E2): F19r2's artifact replaced the two sibling paragraphs with the
-  base text and trimmed the residual-writer sentence. The assembly keeps both paragraphs, the trimmed sentence and
-  E2's mount section, because those paragraphs are the durable record of B1r2's and B2r4's fixes and F19r2's delta
-  adds no documentation text of its own.
-
-**Retained checks.** On a committed checkout of the assembled tree in the host dependency layout at 3-8 load average:
-typecheck, build, the declared check, the full unit suite (823/823), the fault suite (24/24 — F19 5,136 ms, F4
-3,047-3,128 ms), replay (26/26 payloads, contract compliance 1.000, causal closure 1.000) and the packed-artifact
-smoke all pass. The untouched base at the same load gives the same declared check (34/34) and fault suite (24/24), so
-no failure needed attributing. Three suites are **blocked by the nested sandbox and claimed by none**:
-`test:harness` fails with `SandboxUnavailableError` (`sandbox-exec: sandbox_apply: Operation not permitted`), and
-`test:pack` and `test:profile` are refused by `assertSandboxPrerequisite` with the same errno; `test:isolation`,
-`test:web` and `test:command-web` were not attempted and are named here for the same reason. The retained suite runs
-in the **ambient environment**, and no claim is made that the whole unit suite passes through the deployed check
-runner, which predates R16-B's scoped temp root (owner decision, board seq 170; row R17-G18).
-
-**Outcome against the frozen baseline (R0r2; R0's own numbers corrected by the author's R0r correction).** Every count
-below states its tree, because the host still runs the deployed round-15-line build. *Baseline families* (owner
-notices, deployed build): R15 49 = decision 23, fall-through 17, stall-root 4, unknown 2, escalation 2, guard-terminal
-1; R16 43 = decision 18, fall-through 14, stall-root 4, integration-gap 3, dispatch-question 2, guard-terminal 2; R17
-live 7 = integration-gap 5, dispatch-question 1, fall-through 1 in its first 100 s. *False wakes*: the shipped
-read-time predicate reports 0 on all 24 missions, but only 14/72 (R15) and 14/37 (R16) named no-live-path subjects
-remain judgeable at their epoch, so 0 is not evidence about the historical decisions. *Repetition* (strictly recorded
-subjects): R15 47 rows / 21 with subjects / 38 facts / 14 repeated / 34 extra / max 6; R16 43 / 43 / 107 / 8 / 14 /
-max 5; R17 live 7 / 7 / 18 / 4 / 4 / max 2; store-wide 464 / 71 / 163 / 26 / 52 / max 6, with 393 rows recording no
-subject at all, so per-fact repetition is unmeasurable for them. *Consumption*: 726/726 owner deliveries known
-through the durable `user/message` twin instrument while the ledger reports 464/464 unknown and `claimedAt ==
-deliveredAt` for all 464; the assembled tree records consumption from `user/message` (after native pre-step admission) with a compare-and-swap,
-so delivered, consumed and resolved stay three facts. *Silence*: the deployed build writes neither attempt-silence
-escalations nor pass releases and its bound in force was 30,000/60,000 ms, so the baseline's worst per-subject silent
-gap is NONE MEASURED; its worst per-attempt gap is R16 1,575,049 ms (2.63x the 600,000 ms bound) against R15 221,235
-ms and R17's 85,441 ms at the read instant. On the assembled tree the bound is the absence net's declared 600,000 ms
-plus the retained attempt-silence escalation, both with pair tests. The round's live ledger (deployed build) keeps
-showing the families being fixed, exactly as the mission's measurement caveat predicts.
-
-**Open hand-offs.** The corrected baseline numbers replace R0's withdrawn repetition figures and snapshot instant
-(R0r/R0r2, accepted); F19r2's documentation deletion is resolved in this assembly as described above. Open rows:
-R17-G13 (no checkpoint for a ceiling-blocked attempt; measured twice this round), R17-G14 (a cancellation names
-already-resolved dependents as stranded; seven instances in two rounds), R17-G15 (a shared temp path and a path inside
-another member's attempt scope are reported identically; four rendezvous notices this round), R17-G16 (a task's
-declared check is not preflighted against its composed base — B1x and B1xr2 both proved it), R17-G17 (a declared check
-is not preflighted in the execution sandbox — Fr2's EPERM verdict), R17-G18 (which check path the scoped temp covers;
-to be answered on the deployed build). The leaked payload spill was swept by the owner outside the worker sandbox
-(4,737 files / 23,178,654 B to 2,048 files / 11,173,294 B, exactly the declared bound) and a startup sweep kept it at
-that bound until round 21, which removed the spill and deletes the directory at the first host start; growth resumes on the deployed build until deployment. The census documentation defects stayed fixed, and
-the sandbox-suite classification stands as the owner's decision to scope the claim rather than sweep 76 test files.
-
-## Owner pass 2026-09-11, second UI pass (client only)
-
-The owner asked for the remaining items of the 2026-09-11 UI review, then for the attended
-preview restart. Everything in this pass lives under `src/client/` (plus its tests, the locale
-catalogue and the stylesheet); the runtime, store, adapter, admission and worker paths are
-untouched, which is why the replay digest is unchanged.
-
-- **Grouped activity feed.** `activityGroups(snapshot)` groups the retained event window by durable
-  actor in one pass: the group with the newest event leads, each group is newest-first inside, an
-  actor that is a member carries its member row so the header draws the same sprite as the roster,
-  and the non-member writers (`owner`, `runtime`, `config`, `host`) get stable labels. The row no
-  longer repeats the actor its header already names.
-- **Board at a glance.** A lane-count strip prints all seven lanes with their counts ahead of the
-  board, the board itself buckets the filtered tasks in one pass instead of rescanning per lane, an
-  empty lane collapses to its header plus a thin rule instead of a dashed placeholder box, and the
-  lane sections finally carry `data-lane`, which is what the lane-title colour rules were written
-  against. The tab bar counts the tasks each view holds.
-- **Clamped card reasons.** A durable reason longer than 96 characters becomes a one-line
-  `<summary>` (clip visible as `…`) with the full text one disclosure away; a short reason stays
-  inline as before. Both keep `data-swarm-task-reason`, so the F-35 surface and its test are intact.
-- **The sidebar states its derivation.** `SidebarStateView.label`/`note`/`evidence` and
-  `OwnerDecisionView.content` were derived and then dropped; they now render inside one
-  `data-swarm-owner-state` disclosure ("Why this state"), and every count that a label or note
-  quantifies travels in a new `count` field instead of being folded into a sentence no catalogue can
-  translate. The strings that the focus line had been leaking in English in the Chinese locale
-  (`Waiting for you`, `Waiting for your decision`, `consumption unknown`, `start time unknown`, …)
-  now have catalogue entries.
-- **Client lifecycle (C2/C3).** `src/client/lifecycle.ts` holds the `DisposalRegistry`; the plugin
-  scope drains it on unload and a resource registered after the drain is disposed immediately.
-  `hostShiftTarget`/`dockShift` replace the `#root`/`!important` layout coupling with an inline-style
-  shift on the host root discovered from the dock's own position, restoring the host's previous
-  inline values on unload.
-
-**Residuals, stated rather than hidden.** (1) If a host ever renders the dock as a direct child of
-`<body>`, `hostShiftTarget` returns undefined — there is no host root to move — and the dock overlays
-the application instead of sharing space with it; the previous `#root` rule had exactly the same
-failure mode with a narrower trigger (any rename of that id). (2) The shift is written as inline
-styles on a host element, so a host that sets `width`/`height` with `!important` on the same element
-wins over it; the dock's own geometry is unaffected. (3) The activity grouping is over the bounded
-snapshot window (`snapshot.events`), not the whole durable log, so a group's count is a count of
-retained events.
-
-**Load sensitivity of the timing suites (measured, not new).** While this pass was measured, the
-full suite was run once with a browser and a second full-suite run in parallel; five timing-sensitive
-cases failed there (registry-mutation snapshot in `arena-visibility`, the S15 repeated-failure pair,
-the F1 in-timeout check pair, the R16-A4 off-pass sweep pair, and the S1/R16-D live-work-bound pass)
-and all 48 cases in those five files pass when the same files are run alone. A subsequent serial,
-unloaded run of the complete suite is the number published in `docs/validation.md`; the five cases
-are wall-clock-bound (a scheduling tick or a declared-check timeout lands inside the measured
-window), and no assertion was changed to make them pass.
-
-## Round-18 workflow audit and fixes (2026-09-17)
-
-A second deep pass over the same four questions the round-12 audit asked (does the workflow run
-through, is each member's environment complete, do handoffs preserve work, and does the merged
-delivery lose anything) found and fixed seven defects. The regressions live in
-`tests/r18-workflow-fixes.test.mjs`; each fails on the pre-fix head.
-
-- **Delivery coverage now follows the composed artifact, not a withdrawn carrier's plan.**
-  `taskGraphIndex().covers` is the predicate `completionError`, the completion control and the
-  client's delivery target all share. It used to expand every cancelled/blocked intermediate's own
-  `dependencies`, while `prepareTask` merges only the lineage ENDPOINT of each declared dependency
-  and a repair (`replaces`) never inherits the replaced task's dependencies. A linear pipeline
-  `A → X(deps[A]) → I(integration deps[X])` whose middle task was cancelled and repaired by `Z`
-  (`replaces[X]`, no dependencies — the repair shape `swarm_propose` itself advertises) therefore
-  reported `covers(I, A) = true` although `I` merged only `Z`: the mission could complete and apply
-  an artifact that silently omitted `A`, with no owner-visible signal (`warnIntegrationGap` returns
-  early once any integration exists). The predicate now counts an identity only when the carrier's
-  accepted endpoint subsumes it through replacement lineage, and otherwise recurses into the
-  endpoint's own declared dependencies. A repair that does not re-declare the content-carrying edge
-  now blocks completion with the existing "unique accepted integration" refusal instead of
-  delivering incomplete work.
-- **A staged-plan member edit no longer bricks the member.** `repairDraftAdmissions` rotates a
-  changed member's `sessionId` (its durable worker identity) but left the adapter's persisted
-  composition (`<workspacesRoot>/<mission>/<member>.worker.json`) naming the old one. The adapter
-  composes afresh only when that file is ABSENT and refuses a sessionId mismatch, so after any
-  member-field edit the member could never start again — not even after the owner reverted the edit,
-  because the rotation had already happened. The launch path now drops the stale composition
-  (`WorkerAdapter.invalidateComposition`, after the old handle stopped) before committing the new
-  identity.
-- **`swarm_handoff` refuses a review target that could never own it** (round 27: every assignment path now decides independence through `canOwnReview`/`authorIdsOf`/`strandedReview` in src/assignment.ts). Every other assignment path
-  (propose, `swarm_control` amend, claim and the dispatcher) refuses an author of the reviewed
-  source; handoff only checked that the target existed. Handing a review to its source's author left
-  it bound to that member, unclaimable by everyone, pending forever and blocking completion while
-  the dispatcher reported the member as "eligible". The independence rule is now shared.
-- **The stop barrier no longer discards a durable park.** `resumeStoppedAttempt` set every released
-  member `active`, which undid the park `blockTaskCeiling` commits moments earlier to protect the
-  budget (and a member's own `swarm_wait`) for a barrier that belongs to a different task. A
-  `handoff` barrier now leaves a park in place, and since round-19 the `resource` barrier keeps the
-  task-ceiling park while the task is at its ceiling; the park is consumed when the owner raises the
-  ceiling (by `controlTask`, or by the barrier itself when the raise lands before the stop confirms),
-  and it survives a host restart.
-- **The parse-only check preflight runs on every launch path.** The `/bin/sh -n` probe existed only
-  in the `swarm_launch` tool handler, so the staged plan path (`swarm_stage` → launch) admitted,
-  launched and executed a whole task with a shell-syntax-error check before failing at verification.
-  It now runs at the shared launch boundary (`SwarmRuntime.launchDraft`), before any worker,
-  worktree or model step exists.
-- **Mission-scope amend is reachable and names its own shape.** `swarm_control` declares `changes`
-  optional (every other action omits it) but the handler, and the browser `control` RPC, reported a
-  generic "Expected an object" for the documented mission-scope amend. Both now name the one shape
-  that action needs (`changes.scope`, or `taskId` for a task amendment) with a stable code.
-- **The member scratch root is writable and stays out of the work.** The persona tells each member to
-  keep temporary state in a "private scratch root", but that root was a sibling of the worktree,
-  which no `workspace-write` rule covers (the sandbox grants the session's workspace root, `/tmp` and
-  `os.tmpdir()`), so a member following its own instructions got EPERM and fell back to the shared
-  temp roots the private root exists to replace. The root now lives at
-  `<member worktree>/.swarm-scratch` and is excluded exactly like a dependency directory (never
-  part of `status`, a checkpoint or an artifact) while never being materialised into a verification
-  checkout. Residual: because the root is inside the member's retained worktree, its temporary state
-  now survives stop/completion with that worktree and is never collected; a mission whose members
-  write large temporary trees there should be cleaned up with the worktree. A composition persisted
-  by the round-16 layout (the old sibling root) is recognized on resume and rewritten with the
-  current root, so upgrading does not refuse an in-flight member; a root that is neither is still
-  refused.
-- **Composition fidelity is checked, not assumed.** After each dependency merge the host compares
-  every path that dependency commit changed against the composed working tree
-  (`Workspaces.droppedDependencyPaths`); a path whose content is missing is recorded as an
-  integration conflict instead of passing as a successful composition. This closes the class where a
-  merge exits 0 while keeping one side (a repository-configured merge driver, a one-sided conflict
-  resolution). **Residual:** the driver case could not be reproduced on the measured git
-  (`git version 2.50.1`, where a custom `merge=<driver>` attribute did not engage for a conflicting
-  single-line edit), so the check is verified directly against a composed tree that keeps the wrong
-  side, not through a driver-driven end-to-end scenario.
-- **Automatic-mission proposal contract is named.** `swarm_propose` on a mission with a saved start
-  request requires `maxRecoveryAttempts` (and `checkTimeoutMs` for a task that declares checks), but
-  the schema required neither and gave them no description while `swarm_launch` did. Both refusals
-  now carry stable codes naming the parameter, and the shared plan schema describes when each is
-  required.
-
-## Round-19 workflow audit and fixes (2026-09-18)
-
-- **Deliverables the task text does not name, or names without writing** (superseded in round 24, which deleted the text heuristic and this gate; see the round-24 entry). `[deliverable_uncaptured]`
-  covers only literal in-scope file paths that `deliverablePaths()` finds in the objective or
-  acceptance text (a path followed directly by a sentence-ending period is not recognised) and that
-  exist as ignored regular files in the member worktree at submit time. A report the text describes
-  without a path is captured only when listed in `swarm_submit.deliverables`; unnamed ignored files
-  are never swept because they are indistinguishable from scratch and secrets; a named path the member
-  never wrote is a review question, not a capture refusal. Rows accepted before this round whose
-  stored artifact still lists `uncapturedPaths` are named in the completion notice. A verification that passes no `deliverables` captures nothing and is therefore not gated: a
-  hinted ignored review report is checked only when at least one review deliverable is declared.
-- **Inherited preservation snapshots.** A replacement that inherits the previous owner's preservation
-  snapshot also inherits out-of-scope changes the artifact refused and must revert or move them before
-  `swarm_submit`; the fallback notice says so. When preservation itself fails the uncaptured work still
-  exists only in the previous owner's worktree until that member is next prepared, and the
-  `task/recovery-fallback` event records `preserved: false`.
-- **Cancelled and withdrawn task rows still count toward `maxTasks`** (round-19 M-c, unchanged): a
-  repair plan that would exceed the ceiling is refused at launch; raise the mission's plan budget
-  instead of expecting `swarm_budget` to make room.
-- **Read-only audit tasks need a capturable report path** (round-19 H-4, mission layout): scope is the
-  commit allow-list, so a research task that only reads named files must still scope its report path
-  (or a directory prefix ending in `/`) and name it literally in the acceptance text; put the
-  read-only instruction in the objective. Admission computes this hint but `propose()` and
-  `validatePlan` do not surface it to the owner.
-
-## Round-20 simplifications (2026-09-18)
-
-- **The task-ceiling guarantee now has a shorter durable window.** D1 says a handle whose task hit its
-  own ceiling takes no further mission-charged step. Until round 20 that was enforced by a durable
-  park on the member, which held forever but was bypassed by fresh input, a hole the round-20 review
-  reproduced. It is now enforced by the step brake from the moment of the fence until `workers.stop`
-  confirms, which covers every fence cause and cannot be lifted by fresh input. Past that point the
-  handle has been stopped, so the guarantee rests on the adapter's stop contract rather than on a
-  durable row. The in-flight window is strictly stronger than before; the post-stop window is weaker.
-- **`outputs` is a declaration with a fallback, not yet the only rule** (superseded in round 24: the fallback is deleted). A task that declares
-  `outputs` has an exact deliverable list. A row that does not, meaning a legacy mission, a staged
-  draft that omits the field, or a hand-assembled `swarm_create` mission, still falls back to the
-  write-verb heuristic in `src/admission.ts` and keeps every caveat recorded for rounds 4 through 19.
-  The heuristic is retained deliberately and is scheduled for deletion once a live round confirms
-  planners fill the field.
-- **`swarm_registry` can still over-report a refutation in one case.** A review that was deferred,
-  resumed by the owner and then blocked for an unrelated reason keeps its `reviewedCommit`, so the
-  cross-mission registry reads it as refuted. The common case, a review blocked short of a verdict,
-  now reports correctly.
-- **The owner protocol is at the ceiling of its prompt budget.** `tests/roles.test.mjs` caps
-  `OWNER_PROMPT`, and after round 20 it sits within a few characters of that cap (round 24: 5528 characters, 2 below the cap; round 25: 5520). A new protocol
-  sentence must replace an existing one, or state something no tool schema description can carry.
-- **`npm run test:web` fails on the team-roster assertion** (resolved in round 26: the smoke's roster selectors had gone stale in a7547ae; it passes again) in `scripts/smoke-web.mjs`, both before and
-  after round 20. It is not part of the gate the validation entries record, which is why it went
-  unnoticed; the browser smoke needs its own repair round.
-
-## Round-21 simplification batch 1 (2026-09-23)
-
-- **Span payloads are digest-only.** A `trace/span` row records the digest and size of its input and
-  output and nothing else. Spans cover the swarm_* tools, which are not recorded as `ToolRun` rows,
-  and a workspace-bound call's digested input carries host-added fields no session log holds, so a
-  digest identifies a step and orders the causal chain but cannot be resolved back to its payload.
-  Decisions remain reconstructable from the durable event and row history, not from span payloads.
-  The `traceSpill*` configuration keys are still accepted and ignored.
-- **Self-run environment divergence is no longer recorded.** For a verification with declared checks
-  the `task/check-envelope` event compares the delivered envelope with the host check rows only; the
-  diagnostic record of the reviewer's own run (`diagnosticOnly`, `selfRunSource` of `tool-run` or
-  `host-ambient`) is gone, so in rows written from round 21 on `selfRun`/`selfRunSource` describe the
-  host check environment, while older rows describe the reviewer's own run. A task without declared
-  checks can no longer be refused with `check_environment_mismatch`; there is no host check to compare
-  with, and zero-check acceptance still requires a host-recorded independent tool run.
-- **Two instruments are now tests of test code.** The dead-end census and the decision-metric test
-  exercise models in `tests/guard-model.mjs` and `tests/instruments.mjs`. The instruments import the
-  production sets they depend on, so they cannot drift silently, but they no longer prove a
-  production classifier; the owner-decision and silence-bound tests still do.
-- **One more load-sensitive case.** Case F of \`tests/r19-recovery-fallback.test.mjs\` (a verification
-  checkout that cannot be removed) failed once in a full parallel run and passes in isolation and under
-  a ten-file parallel load. It joins the round-15 and round-18 cases that fail only under full load; the
-  runtime has no injectable clock or awaitable scheduling pass, which is the shared cause.
-
-## Round-22 simplification batch 2: typed refusals (2026-09-23)
-
-- **More refusals reach the browser than before.** About 28 refusals that the deleted allowlist did
-  not match, and that therefore reached the browser as `internal-error`, are now typed and visible,
-  among them the task-ceiling, declared-output, host-only-check and draft-repair refusals. One of them,
-  `[check_requires_host]`, quotes the body of the workspace `package.json` script it classifies; that
-  is workspace content the owner controls, and plan validation already showed it before this round.
-- **Stringified refusals read `Error: …`.** `PolicyError.toString` renders like a plain `Error` so that
-  persisted and model-visible stringified failures keep their bytes; a refusal that was typed before
-  this round, such as a draft refusal recorded as a failed start request, now reads `Error: …` where it
-  read `PolicyError: …`.
-- **Trace categories are authored per site.** A refusal's span `error.type` is its declared category
-  rather than what the text classifier made of its wording, which had depended on echoed input such as
-  a task key containing `budget`. Some categories therefore moved, in both directions. The classifier
-  remains as the fallback for failures that are not typed.
-- **The lint does not see dynamic text.** For a template or concatenation, only the literal parts are
-  checked; sites whose substitutions contribute text are marked `partial`. `[check_syntax_invalid]` is
-  one such site, and in practice it never reaches the browser because the shell's own diagnostic
-  starts with `/bin/sh:`, which the host-path scrub matches.
-- **Plain `Error` refusals that remain.** About 420 refusal sites are still untyped internal invariant,
-  corruption and argument-guard throws a caller cannot trigger; they reach the browser as
-  `internal-error`. `prepareTask`'s two `Dependency …` refusals are untyped too; they run only during
-  scheduled dispatch and `swarm_claim`, never under a browser RPC.
-- **One load-sensitive case was a test defect.** The round-18 report-survives case gave a stop barrier
-  that runs a real git checkpoint a fixed second to settle, so under a full parallel run it read a
-  status the barrier had not decided yet. It now waits for the barrier. The other load-sensitive cases
-  recorded in earlier rounds still share the absence of an injectable clock.
-
-## Round-23 simplification batch 3 (2026-09-23)
-
-- **Deferred verification has no bound.** A review deferred for host infrastructure stays blocked until
-  the owner resumes it, and every resume that meets the same failure defers again. A failure that is in
-  fact caused by the artifact or its check and is not one of the two cases now kept out of that path
-  would be reported as an environment problem each time; the owner's exit is to cancel or replace the
-  source.
-- **An invalidated submission is repaired by replacement.** A dependent whose submitted work was
-  invalidated by a challenged prerequisite now refuses `resume` with `task_needs_replacement`, as a
-  rejected source does; its own output already tells the owner to propose a replacement. Earlier builds
-  re-pended it in place.
-- **A repair cannot withdraw an inherited criterion.** Every criterion of the replaced task is carried
-  into its repair. An owner who cancelled a task because one criterion was a mistake must amend the
-  mission plan rather than drop the criterion through `replaces`; the criteria the host added are named
-  in the `swarm_propose` result.
-- **An accepted repair retires only the task it names** (resolved in round 27: accepting a replacement retires its
-  whole blocked or pending lineage and their reviews; see the round-27 section). In a chain A, R1, R2, accepting R2 cancels R1
-  but leaves A and A's rejecting review blocked, so mission completion is refused until the owner
-  cancels them. This predates round 23; it belongs to the planned rework of replacement lineage.
-- **A retried preparation still reads as an obstacle to the owner-notice classifier** (resolved in round 25: a back-off is a bounded live wait). The preparation
-  failure count now survives a successful retry, as it did before round 23, so a pending task that
-  recovered from a transient preparation failure is not counted as legitimately waiting until it is
-  dispatched again. This matches the pre-round-23 behaviour and belongs to the owner-notice rework.
-
-## Round-24 simplification batch 4: declared outputs only (2026-09-23)
-
-- **Nothing is inferred from task text.** An ignored file a task writes is captured only when it is a
-  declared output or a listed deliverable; one that is neither is silently left out, as any unlisted
-  ignored file always was. The planner must declare every file a task produces, and a path the prose
-  names outside the task scope now surfaces only when the submission is refused, not as a draft hint.
-- **A declared output only has to exist.** `[output_missing]` checks that each declared output is a
-  regular file at submission, not that the task changed it; a declared file already present in the base
-  passes unchanged and is listed in `artifact.files`.
-- **Rows written before this round.** A task stored without `outputs` reads as `[]`: it captures and
-  preserves no ignored file. Accepted rows whose stored artifact still lists `uncapturedPaths` are no
-  longer named in the completion notice.
-- **Case-folding filesystems.** A tracked (not ignored) file written under an out-of-scope case of the
-  scope directory, for example `Reports/x.md` with scope `reports/`, is carried by the handoff
-  snapshot, and on a case-folding filesystem renaming the directory cannot remove the index entry, so the
-  replacement stays wedged; this predates round 24. Declared outputs that differ only in case resolve to
-  one file there, and a declared output written in a different case whose stored spelling is in scope is
-  captured under the stored spelling.
-- **Repair and editor edges.** A repair that omits `outputs` and narrows its scope past an inherited
-  output gets the generic `[output_outside_scope]` exit that tells it to correct `outputs`. The draft
-  editor has no control that declares `[]` on an untouched task; the owner edits the field and clears it.
-- **Other required schema fields the runtime does not check** (resolved in round 25: every swarm tool call is checked against its schema). The Harness does not enforce a tool
-  schema's required list. `swarm_verify` without `verdict` is treated as a rejection and recorded with
-  `verdict: undefined`; `swarm_message` without `kind` is delivered with no kind, so a question sent
-  that way opens no reply receipt; `swarm_submit` treats missing `deliverables` as none; and
-  `swarm_launch` enforces `tasks[].assigneeKey` only for reviewed deliverables and their reviews.
-- **The fault suite has drifted** (round 25: F19 and F21 were stale fixtures and are rebuilt; 17 of 24 pass; round 26: the other seven were stale fixtures too, and 24 of 24 pass). `npm run test:faults` passes 15 of 24 scenarios; F1, F3a-c, F4, F14,
-  F18, F19 and F21 fail identically on the round-19 main 98c6657. Some fixtures are stale (F3a-c declare
-  a check admission now refuses as a no-op); whether F19 (no-silent-state row 7b) and F21 (wedged-pass
-  release) are stale fixtures or real regressions is not yet established.
-
-## Round-25 simplification batch 5 (2026-09-24)
-
-- **The false-wake rule is judged only at delivery.** `ownerDeliveryRelevant` withholds a notice whose
-  subject a live lineage covers, at delivery and at native consumption; nothing refuses it at emission. A
-  withheld row stays durable and is delivered once its lineage closes.
-- **A covered stall root is never sent.** A rejected root that strands nothing beyond its rejecting review
-  is recorded against the rejection decision's own row (`coveredBy`): it takes no wake-budget slot, has no
-  reminders and no notice-ledger entry, and the decision's reminders carry the root. A decision carried by a
-  wake-budget summary covers nothing; the root is then its own fact, and every summarized fact keeps its own
-  reminder allowance. A rejecting review is cancelled
-  only when its repair is accepted; until then it is not named on its own.
-- **Clock-bounded waits other than a back-off.** Only an expired preparation back-off bypasses the witness
-  dedup. A stop bound, a lease end or the review grace that expires with `F(S)` unchanged stays covered by
-  an earlier witness for that `F(S)` until the board changes. `Scheduling.stalled()` still reports a board
-  whose only work is in back-off as a W3 stall.
-- **Dispatch does not re-read task prose.** A store written by d81a3fb or earlier in which the owner
-  amended a prose-assuming task's dependencies to `[]` dispatches that task from the bare mission
-  baseline. The cost is one wasted attempt the independent review rejects, not a safety property; none of
-  the 1,029 task rows in the 17 profile stores checked on 2026-09-24 is affected.
-- **Tool calls are checked against their schema, not against `minimum`.** Required properties, enums,
-  primitive types, `oneOf` and undeclared keys are refused with `[tool_arguments_invalid]` naming each
-  path and the accepted keys; a model that adds an undeclared key needs one retry. Numeric minimums stay
-  runtime checks. JSON null on an optional property is an omission, except `swarm_control`
-  `changes.assigneeId`, where null or an empty string releases the binding. `swarm_launch` ignores a
-  top-level `workspace` and always uses the frozen request workspace.
-- **A wedged scheduling pass holds its mission until its await returns.** The watchdog names it past
-  `stallPassTimeoutMs`, once per body (a body that wedges on a board an earlier naming left unchanged only
-  when that naming reached the owner), but nothing releases it: lease recovery, completion and the budget
-  check for that mission wait for the await's own bound (`workerStartTimeoutMs`, the per-attempt delivery
-  bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`). Capture and preparation have no overall bound beyond
-  their git subprocesses. A body stops early only when one member held it for a whole bound: a body whose members
-  each take less than a bound finishes its sweep however long the sweep takes, and lease recovery for that
-  mission waits for it.
-  The notice clause "produced no durable state change" is unconditional. An old database keeps an unread
-  `passes` table.
-- **Decide-then-act is not done.** Adapter calls (start, prepare, capture, deliver) still run inside the
-  mission's serial queue.
-
-## Round-26 simplification batch 6, wave A (2026-09-24)
-
-- **The runtime clock is for tests.** The plugin always runs on `Date.now` and ignores profile keys named
-  `now` and `manualTick`. A fake clock does not reach the Harness worker adapter, the workspace engine or
-  the tool-entry workspace checks: adapter activity `startedAt`/`retryAt`, check timing, lock staleness,
-  the engine's re-authorization of a verification checkout and the first grant check of `swarm_create`,
-  `swarm_launch` and the browser use host time, so a runtime given a fake clock is coherent only with a fake
-  adapter. Timers are not virtualised: the mission-queue wait bound, the outbox delivery bound, the dispose
-  drain, the worker start timeout, planner expiry and store snapshots run on real timers.
-- **`settle(missionId)` waits for in-flight work, not for quiescence.** A kick coalesced into an open
-  scheduling body runs at the next tick, so a test calls `tick()` after `settle()`. Awaiting `settle()`
-  from inside a scheduling body, or from an adapter call a body awaits, blocks until the worker start
-  timeout aborts that start; the runtime does not detect that call.
-- **Wall-clock tests remain outside two files** (wave B). Every test in `tests/scheduling-pass.test.mjs` and
-  `tests/stall-roots.test.mjs` runs on the fake clock except `a rejected root whose decision was summarized is
-  its own fact, and is named again when its repair is withdrawn`, whose held owner delivery ends only on the real
-  outbox delivery bound (about 11 s of wall time; it waits on order, not latency). Other test files still poll
-  real timers and can flake under heavy host load.
-- **A task whose every capable member was retired for start failures stays pending.** The retirement notice
-  names it with each member's consecutive failures and last error, but a later stall notice for the same
-  board still reads "Unschedulable: none", because the unschedulable set counts only work bound to a retired
-  assignee. Provider-outage start pacing is held in process memory: after a host restart a member inside a
-  recorded outage window is probed once immediately, then once per window, and work whose preferred
-  assignee is such a member waits for that member's next probe (at most one 5-minute window) unless the
-  owner amends `assigneeId`.
-- **The preview and lab host is the root's own dsh host on its port.** `scripts/host.mjs` looks only at
-  `127.0.0.1:<port>` (`lsof` and `ps` are required: macOS, or Linux with both installed) and accepts a
-  listener only when its command line is an absolute `<harness>/apps/cli/lib/bin.js` with `--profile web`
-  and `--patch <root>/<file>`. Any other listener, including a host restarted by hand without that
-  `--patch`, is refused and never signalled, and the refusal names its pid and command line; restart such
-  a host by hand as `node --expose-internals "$H/apps/cli/lib/bin.js" --profile web --patch
-  <root>/preview.patch.yml --port <p> --no-open`. A root or Harness path containing whitespace is never
-  recognised. `update-preview` and `node scripts/round.mjs mount` boot `--harness`, else the Harness in
-  the running host's command line, else the one recorded in `server.json`, and refuse only when none
-  exists: a root whose host is stopped and whose record predates the field needs `--harness <checkout>`
-  once. A host that has not bound its port yet is invisible, so two concurrent restarts of one root can
-  still race. Earlier boots' logs are kept as `server-<stamp>.log` and never pruned.
-- **A browser smoke can pass and then take about 15 minutes to exit after Google Chrome updates itself.**
-  Chrome then starts `GoogleUpdater --wake-all`, which inherits the browser's stdout and stderr, and
-  Playwright's `browser.close()` waits for those streams. The checks and `report.json` are complete when
-  `passed` is printed. Observed on 2026-09-24 with Chrome 153.0.8010.53, identically on 91857ca. The
-  DeepSeek smoke pair is still duplicated, because it cannot be verified without billable provider calls.
-
-## Round-26 simplification batch 6, wave B (2026-09-24)
-
-- **Every `WorkerAdapter` method except `prepareBaseline` and `checkEnvelope` is required.** A JavaScript
-  adapter that skips type checking and omits one fails with a TypeError where the runtime used to fall back.
-  An operation counts as live only while the adapter's `currentActivity` confirms the durable activity;
-  `[delivery_unsupported]` now comes only from an adapter that throws it.
-- **A stop whose recorded owner has no member row is refused as unconfirmable** (`mission/stalled`, cause
-  `worker-stop-failed`, `deterministic: true`), and its task stays fenced. The store never deletes a member,
-  so only a corrupted or hand-edited row reaches this. The owner notice names the missing member and says a
-  `swarm_control` resume only repeats the refusal; the exit is `swarm_cancel` on the task and a repair
-  proposed with `swarm_propose` naming `replaces`.
-- **The assignment-instruction invariants are checked only under `npm run test:harness`,** which needs a
-  supported Harness checkout; no node:test covers them. The snapshot records assignment and peer-question
-  recipients, not control deliveries, and the owner-leak check matches the whole instruction, so a leaked
-  fragment would pass.
-- **The in-memory census is partly historical.** `tests/in-memory-gates.test.mjs` checks its classified
-  rows by name, but 78 of its 144 local rows no longer match the source text by position; they are history,
-  not checked against `src/`.
-- **`scripts/load/run.mjs` and `scripts/replay/scenario.mjs` import their adapter from
-  `tests/faults/harness.mjs`,** so those scripts need the test tree.
-
-## Round-27 simplification batch 7 (2026-09-24)
-
-- **Resume re-opens a rejected task and its review.** It applies when `swarm_control` `action: "resume"`
-  targets a task whose own review rejected its exact commit, the task is not an experiment and no stop is
-  pending; a budget-only amendment never reworks. The rejecting review is re-pended with the same reviewer;
-  its verdict, review artifact, the claims its reviewer published that round and what the round consumed
-  (`spent`) move into its own `rejections[]`, and every other open review of the source is retired. A
-  rejected experiment, or work invalidated after it was submitted, still needs a replacement.
-- **Budget asymmetry.** The source's `usedSteps` and `recoveryCount` are cumulative across rounds, so a
-  resume can be refused with `task_budget_exhausted` until the owner raises the allowance; the re-opened
-  review starts each round at zero. Advisory budget warnings are keyed on task, dimension and limit, so a
-  review that crossed a threshold while rejecting is not warned again at that threshold in its next round.
-- **Same-commit resubmission.** A no-edit capture reproduces the rejected commit; `swarm_submit` refuses it
-  with `[rework_unchanged]` unless the round has a live claim. An evidence-only rework (every research
-  rework, or an author disputing a rejection with host-backed evidence) is re-reviewed and recorded as
-  `repeatsRejection` on `task/submitted` and `repeatsRejectedCommit` in the artifact registry; the
-  re-opened review then holds a refuted and a verified verdict for the same commit.
-- **Withdrawing the re-opened review.** Cancelling the automatic review that was live for the current
-  submission (admitted or re-opened for it) is a withdrawal: no review is admitted and the owner gets the
-  `review_path_missing` "was withdrawn" decision. Cancelling a re-opened owner- or member-proposed review
-  is not a withdrawal: after the grace period the host admits one automatic review.
-- **The bound reviewer never authors the rework.** If the bound reviewer is the only live member left, the
-  source is listed as unschedulable in the owner's stall decision until the owner adds a member or
-  reassigns the review; the stall text does not name that cause.
-- **Lineage.** One obligation has one live carrier: `[task_replaced]` refuses resuming or amending a task
-  while any replacement of it is not cancelled, `[replacement_already_live]` refuses a repair whose target
-  is live again or accepted, and a restart keeps a replaced row blocked. A fork through a withdrawn repair
-  can still admit a second live carrier of the same ancestor, and the owner is not notified when the first
-  branch is accepted. An older store's duplicate carrier that is later rejected gets a rejection notice
-  offering a resume that `[task_replaced]` refuses; `swarm_cancel` is the working exit.
-- **Host-added reviews.** The runtime's later automatic review of a submitted artifact without a live review
-  (for example after a worker proposal) keeps its own defaults: two recovery attempts and a copy of the
-  source checks. The witness path's review-blocked notice defers to the runtime's review admission on a board
-  with no other progress.
+- **Shared temp roots are a cross-member channel (R11-15).** The workspace-write policy also allows writes under `/tmp` and `os.tmpdir()`, shared by every member and mission on the host, so two members can rendezvous through a well-known temp path; the channel is not confined and contents are not attributable. Detection is a heuristic over host-recorded tool input naming `/tmp`, `/var/tmp` or `os.tmpdir()`: two members naming one path within `TEMP_RENDEZVOUS_WINDOW_MS` (10 minutes) write an `isolation/temp-rendezvous` event and wake the owner once per pair and window. It proves no write, scans no directory, and keeps its mention history in process memory (2,048 paths, 8 mentions each), so a restart forgets it. A hard boundary requires removing those roots from the sandbox policy. Recorded open, not re-verified at `fa6a507` (R17-G15): a shared temp path and a path inside another member's attempt scope are reported identically.
+- The member scratch root is `<member worktree>/.swarm-scratch` (the adapter's `TMPDIR`/`TMP`/`TEMP`), excluded like a dependency directory and never materialised into a verification checkout. It lives in the retained worktree, so its contents survive stop/completion and are never collected. A composition persisted with the round-16 sibling root is accepted on resume and rewritten; any other root is refused.
+- Worker sessions confine every bash/tool call with the mission's sandbox mode, so a real Loader composition driven from inside a worker fails with `SANDBOX_UNAVAILABLE` even on a healthy host. The fault suite's provider-fault tier (F3a/F3b/F3c) therefore registers an identity sandbox provider and an unsandboxed `bash-local` shell; its invariants do not depend on OS confinement.
+
+## Declared checks and verification
+
+- Independent host verification proves that the declared checks ran against the exact artifact, not that they are meaningful. Initial automatic checks come from the primary, participants can propose others, and no mission-wide acceptance baseline is imposed on every artifact. Accepted history is not re-reviewed after an upgrade.
+- Whether an artifact needs host checks is a file-format rule, not program analysis (`src/artifact-policy.ts`): whatever the task kind, an artifact with an executable path, or with a changed file outside the report extensions (`.md`, `.markdown`, `.txt`, `.rst`, `.adoc`, `.pdf`, `.csv`, `.tsv`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) and README/LICENSE-style names, is refused without checks (`[artifact_checks_required]`). Literal no-op checks are refused (`[check_noop]`); any other always-passing check is left to the reviewer.
+- An acceptance without declared checks needs only one non-error host-recorded tool run by the reviewer on that attempt, so independent reproduction of a research result is encouraged, not required.
+- **Host-absolute paths in checks (`[check_absolute_path]`).** Admission refuses a check naming an absolute path outside `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin` and the four standard `/dev` streams, or any absolute path inside the mission workspace, because checks run in a fresh verification worktree under a random path. The scanner is a bounded POSIX-ish tokenizer (quotes, escapes, doubled slashes, `.`/`..` segments, quoted, backtick and `eval` bodies and `PATH`-style lists are resolved; `<scheme>://…` values are admitted), not a shell parser. Residuals: a candidate containing any of `^ $ [ ] ( ) ? + { } | * \` counts as a pattern and is admitted (a glob such as `/Users/*/secret` passes), as do separators (`awk -F/`) and `/word/` regex literals; home-relative paths (`~/.local/bin/uv`, `$HOME/…`), ANSI-C quoting (`$'\x2f…'`), `file://` URLs, `$IFS`, `$(…)` output that is not a literal path word, `${VAR}` indirection, aliases and functions are not resolved; and a check can rely on mutable host state the clean checkout shares.
+- A declared check that changes on replacement or re-submission is recorded (`task/check-changed`, previous and new checks), not refused. A re-submission keeps the stored check, but a replacement can declare a weaker relative command. Supplying checks a task never declared is not a change.
+- Admission detects one host requirement only: a nested sandbox invocation (`sandbox-exec`, `dsh sandbox`), written directly or reached through `npm run` scripts resolved up to four levels, is refused with `[check_requires_host]`. Any other host capability a check needs (a built Harness checkout, a browser, network) fails at verification; an unresolved `npm run` name is only a preflight hint.
+- Launch preflights checks only for shell syntax (`/bin/sh -n`, `[check_syntax_invalid]`, on every launch path). A check is not run against its task's composed base or inside the execution sandbox beforehand (recorded open rows R17-G16, R17-G17), so a check that cannot pass there is found at verification.
+- **Verification dependencies.** Verification checkouts materialise gitignored dependency directories instead of installing: `node_modules`, `.venv`, `venv`, `vendor` and `.tox` by default (`DEFAULT_VERIFICATION_DEPENDENCY_DIRS`; `verificationDependencyDirs` replaces the set, `[]` disables it), matched as a path component at any depth. A check therefore runs against committed files plus an installed toolchain that is not part of the artifact and may differ from a fresh install; build outputs and other ignored paths are never provided. Checks run sandboxed in the disposable checkout, refused unless the host reports **full** enforcement (F-29). The effective mode is copy: the schema default `verificationDependencyMode: 'link'` is honoured only with `allowDependencyLinkReads: true`, because a read-through link lets `..` reach the source checkout and F-29 governs writes, not reads (R11-13). Copy mode copies a link to an external regular executable (a virtualenv interpreter) as an executable file, but system libraries may still be needed; broken or cyclic links, links into other source-checkout content and external directory or non-executable links defer the review as an infrastructure failure (`(verification preparation)`, exit 125) after one retry; such layouts need a self-contained installation or the link-read opt-in. Concurrent copies are bounded by running verifications, not `checkConcurrency`. This is not a hermetic toolchain, and an unconfined `Workspaces` (the identity `confineCheck` unit tests inject) has no boundary at all.
+- **Deferred verification has no bound.** A review deferred for host infrastructure stays blocked until the owner resumes it, and each resume meeting the same failure defers again, so a failure actually caused by the artifact or its check (outside the two cases kept off that path) reads as an environment problem every time; the owner's exit is to cancel or replace the source.
+- `task/check-envelope` compares the delivered envelope with the host check rows only; the reviewer's own run is not recorded. From round 21 on, `selfRun`/`selfRunSource` describe the host check environment (older rows: the reviewer's run). A task without declared checks cannot be refused with `check_environment_mismatch`.
+
+## Workspace capture, outputs and preservation
+
+- **Nothing is inferred from task text.** An ignored file is captured only as a declared output (`outputs`) or a listed `swarm_submit`/`swarm_verify` `deliverables` entry; any other ignored file, secrets included, is never swept into a snapshot. A path the prose names outside the task scope surfaces only when the submission is refused. A read-only audit task still needs its report path in `scope` and `outputs` (`[output_outside_scope]`); `[]` marks analysis-only work.
+- A declared output only has to exist: `[output_missing]` checks for a regular file at submission, not that the task changed it, so a file already in the base passes unchanged and is listed in `artifact.files`.
+- Rows written before round 24: a task stored without `outputs` reads as `[]` and captures and preserves no ignored file; accepted artifacts still listing `uncapturedPaths` are not named in the completion notice.
+- Case-folding filesystems: a tracked file written under an out-of-scope case of the scope directory (`Reports/x.md` with scope `reports/`) is carried by the handoff snapshot, and renaming the directory cannot remove the index entry, so the replacement stays wedged. Declared outputs differing only in case resolve to one file; one written in a different case whose stored spelling is in scope is captured under the stored spelling.
+- A repair that omits `outputs` and narrows scope past an inherited output gets the generic `[output_outside_scope]` exit. The draft editor has no control that declares `[]` on an untouched task; the owner edits the field and clears it.
+- An untracked dependency link or directory a member creates to run checks (any `verificationDependencyDirs` name, by ancestor component) is toolchain state: it does not block preparation, and capture excludes and unstages it. A path tracked in HEAD is always work, and a regular file that merely shares a dependency name is uncommitted work that blocks preparation. The workspace-escape guard resolves the whole link chain against the committed tree, at capture and before delivery's first write.
+- Switching a worktree to another task needs a confirmed stop and a preserved recovery checkpoint when it holds real uncommitted work. An unlisted ignored file the target tree would overwrite stops the switch with `[workspace_ignored_collision]` (up to eight paths named); it is not captured.
+- **Inherited preservation snapshots.** After a failed preparation the replacement starts from a preservation snapshot of the previous owner's worktree and inherits every uncaptured change, including out-of-scope edits it must revert or move before `swarm_submit`. When preservation itself fails, it starts from the last checkpoint or the task base, the uncaptured work stays only in the previous owner's worktree until that member is next prepared, and `task/recovery-fallback` records `preserved: false`. A genuinely repeated failure still consumes recovery credit until the attempt limit.
+- After each dependency merge the host compares every path the dependency commit changed with the composed tree (`Workspaces.droppedDependencyPaths`) and records a missing one as an integration conflict. The merge-driver case could not be reproduced on git 2.50.1, so this is verified against a tree that keeps the wrong side, not through a driver end to end.
+
+## Review independence, pairing and rework
+
+- **Host-added reviews.** A deliverable the plan does not pair gets one unassigned independent review at launch, at draft save and when a draft saved by an older build is listed; added reviews count against `maxTasks`. Omitted `review` override fields default to unassigned, the host's review objective, the deliverable's acceptance and `maxRecoveryAttempts`, and the default `maxSteps`. A review is a live review path only while a non-stopped member may own it independently (`src/assignment.ts`), so a plan whose only live members authored a deliverable wakes the owner with `[review_path_missing]` after submission.
+- A submitted artifact with no live review is recorded (`task/review-missing`) after a one-tick grace; when the board would otherwise stall, the runtime admits one automatic review (two recovery attempts, a copy of the source checks). With no eligible independent member, or the task budget exhausted, the submission is not reviewed and the owner is woken once with the task id and reason; on a board with no other progress the witness path's review-blocked notice defers to this admission.
+- **Withdrawing a review.** Cancelling the automatic review live for the current submission (admitted or re-opened for it) is a withdrawal: no review is admitted and the owner gets the `review_path_missing` "was withdrawn" decision. Cancelling a re-opened owner- or member-proposed review is not: after the grace the host admits one automatic review.
+- **Rework in place.** `swarm_control` `action: "resume"` re-opens only a task whose own review rejected its exact commit, when it is not an experiment and no stop is pending; a budget-only amendment never reworks, and re-opens are bounded by `maxRework` (default 2). The rejecting review is re-pended with the same reviewer, archiving its verdict, review artifact, claims and `spent` into `rejections[]`, and other open reviews of the source are retired. A rejected experiment, or a dependent whose submitted work a challenged prerequisite invalidated (`task_needs_replacement`), still needs a replacement.
+- **Budget asymmetry.** The source's `usedSteps` and `recoveryCount` accumulate across rounds, so a resume can be refused with `task_budget_exhausted` until the owner raises the allowance, while the re-opened review starts each round at zero. Budget warnings are keyed on task, dimension and limit, so a review that crossed a threshold while rejecting is not warned at that threshold again.
+- **Same-commit resubmission.** `swarm_submit` refuses a no-edit capture of the rejected commit with `[rework_unchanged]` unless the round has a live claim. An evidence-only rework (every research rework, or an author disputing a rejection with host-backed evidence) is re-reviewed and recorded as `repeatsRejection` on `task/submitted` and `repeatsRejectedCommit` in the registry, so the re-opened review can hold a refuted and a verified verdict for one commit.
+- The bound reviewer never authors the rework. If it is the only live member left, the source is listed as unschedulable in the owner's stall decision until the owner adds a member or reassigns the review; the stall text does not name that cause.
+- `swarm_registry` over-reports one refutation: a review deferred, resumed by the owner and then blocked for an unrelated reason keeps its `reviewedCommit`, so the cross-mission registry reads it as refuted.
+
+## Lineage and repairs
+
+- One obligation has one live carrier: `[task_replaced]` refuses resuming or amending a task while any replacement of it is not cancelled, `[replacement_already_live]` refuses a repair whose target is live again or accepted, and a restart keeps a replaced row blocked. A fork through a withdrawn repair can still admit a second live carrier of the same ancestor; accepting one branch leaves the other live, named only in `task/superseded` (`liveReplacements`), with no owner notice. An older store's duplicate carrier that is later rejected gets a notice offering a resume `[task_replaced]` refuses; `swarm_cancel` is the working exit.
+- A repair cannot withdraw an inherited criterion: every criterion of the replaced task is carried into its repair, and the host-added ones are named in the `swarm_propose` result. To drop a mistaken criterion, amend the mission plan.
+- Cancelled and withdrawn task rows (and host-added reviews) count toward `maxTasks`, so a repair plan that would exceed the ceiling is refused at launch; raise the mission's plan budget rather than expecting `swarm_budget` to make room.
+- A cancellation's `strandedDependents` names every pending dependent that references the cancelled task and has any unsatisfied dependency, including one whose reference already resolves to a live replacement and that waits only on another prerequisite (R17-G14); its notice still asks for a replacement.
+- Dispatch does not re-read task prose. In a store written by `d81a3fb` or earlier where the owner amended a prose-assuming task's dependencies to `[]`, that task dispatches from the bare mission baseline; the cost is one attempt the independent review rejects, not a safety property (none of the 1,029 task rows in 17 profile stores checked on 2026-09-24 is affected).
+
+## Scheduling passes, leases and liveness
+
+- **A wedged scheduling pass holds its mission until its await returns.** The watchdog names it past `stallPassTimeoutMs` (default 30 × `tickMs`), once per body (a re-wedge on an unchanged board only if the earlier naming reached the owner), but nothing releases it: lease recovery, completion and the budget check wait for the await's own bound (`workerStartTimeoutMs`, the per-attempt delivery bound, or `HOST_GIT_TIMEOUT_MS`, 5 minutes per git subprocess), and capture and preparation have no overall bound. A body stops early only when one member held it for a whole bound, so a sweep of members that each take less runs however long it takes. The notice clause "produced no durable state change" is unconditional. Another operation on that mission that waits past `stallPassTimeoutMs` is refused with `[mission_operation_pending]`.
+- **Decide-then-act is not done.** Adapter calls (start, prepare, capture, deliver) run inside the mission's serial queue; moving them out changes event ordering, which the replay digest pins.
+- The default attempt lease is 120 seconds, renewed only while the adapter identifies an owned, uncancelled native operation or provider retry (a live stream republishes every `activityHeartbeatMs`, default 1000 ms), and never past the mission deadline. This is operation liveness, not useful progress: a stuck operation relies on its own timeout, cancellation or the deadline, and persisted activity never renews a lease after a restart.
+- `maxIdleCloseouts` (default 2), `stallPasses` (default 3), `stallPassTimeoutMs`, `stallPassLiveGraceMs` (default: `stallPassTimeoutMs`) and `attemptSilenceBoundMs` (default 600,000 ms, `0` disables) are runtime configuration the plugin `Config` schema does not declare: a profile key of that name passes through unvalidated. The runtime falls back to its default for an invalid value, except for `maxIdleCloseouts`, which it uses as given.
+- Only an expired preparation back-off bypasses the witness dedup. A stop bound, lease end or review grace that expires with `F(S)` unchanged stays covered by an earlier witness until the board changes, and `Scheduling.stalled()` reports a board whose only work is in back-off as a W3 stall.
+- The no-silent-state backstop witnesses a dispatchable-but-undispatched task only when an eligible member is startable (parked, or idle by the adapter's contract); a board whose eligible members are all busy is not silent.
+- A task whose every capable member was retired for start failures (three consecutive failures reroute a member's work) stays pending. The retirement notice names each member's failures and last error, but a later stall notice for that board reads "Unschedulable: none", because that set counts only work bound to a retired assignee. Provider-outage start pacing is in process memory: after a restart a member inside a recorded outage window is probed once immediately, then once per window, and work preferring it waits up to one 5-minute window unless the owner amends `assigneeId`.
+- A stop whose recorded owner has no member row is refused as unconfirmable (`mission/stalled`, cause `worker-stop-failed`, `deterministic: true`) and its task stays fenced. Only a corrupted or hand-edited row reaches this (members are never deleted); a `swarm_control` resume repeats the refusal, and the exit is `swarm_cancel` plus a repair via `swarm_propose` with `replaces`.
+
+## Owner notices and wakes
+
+- Owner notices cover decisions, blockers, failures, budgets, stalls and exceptions (a parked holder, an integration gap, provider outages, a rendezvous, a deferred verification, a challenge, a recovery fallback, a duplicate carrier, typed escalations) and completion. Submission and acceptance appear only in the panel and event log; routine progress must be observed explicitly.
+- A worker's budget or ceiling proposal refusal wakes the owner at most once per proposing member per mission: the notice's fact key carries the mission root and no reason (`refuseProposal`, `src/refusals.ts`), so that member's later refusals record `task/proposal-refused` events but no further notice.
+- `swarm_observe` and the arena view expose at most the newest 20 owner notices (`noticeLedger`); an older escalation is durable but not surfaced there.
+- **Wake budget.** Each mission's owner gets at most 6 individual notices per 5-second window (`DEFAULT_WAKE_BUDGET`, `DEFAULT_WAKE_WINDOW_MS`); further facts ride one summary per window that lists every fact, so it bounds bursts, not a lifetime. The window is in process memory, so a restart opens a fresh one. A rendered fact list is bounded at 3,200 characters (or `maxMessageChars`, if smaller), each fact compacted to 440; full facts stay on the durable delivery (`swarm_observe` with `deliveryId`).
+- Fact identity is keyed on the event type: a second distinct same-type transition at the same subject@epoch with the same recorded reason is suppressed, and an explicit family replaces the trigger (both at `factKey` in `src/notices.ts`).
+- `tests/r17-notices.test.mjs` rebuilds reviewed bodies from durable rows with the production template (`renderNotice`), checks their stated counts and keeps tool/exit anchors for seven of the eight `NOTICE_TEMPLATES` families (`duplicate-carrier` is rebuilt in `tests/lineage-retirement.test.mjs` without anchors). Because the rebuild calls the production template, a template edit that adds a claim outside those counts and anchors is not caught. The other `notify(` sites are enumerated per site and are not replayable from one template.
+- Cause-bearing notices are transition-driven. The sampled tick (`sweepDecisions`) emits exactly two absence instruments and no cause: the absence net (default 600,000 ms, `Notices.absenceBoundMs`) and the attempt-silence escalation (`Scheduling.sweepSilentAttempts`, `attemptSilenceBoundMs`), which state silence and elapsed time, not a cause.
+- The false-wake rule is judged only at delivery: `ownerDeliveryRelevant` withholds a notice whose subject a live lineage covers, at delivery and at native consumption, never at emission; the withheld row stays durable and is delivered once its lineage closes.
+- A rejected stall root that strands nothing beyond its rejecting review is never sent: it is recorded against the rejection decision's row (`coveredBy`), whose reminders carry it, unless that decision rode a wake-budget summary, in which case the root is its own fact. A rejecting review is cancelled only when its repair is accepted and is not named on its own before then.
+- Delivery, consumption and resolution are three facts. Transport state (`sent`/`queued`/`claimed`) is derived from `deliveredAt` and never asserts consumption; consumption is `consumedAt`, recorded from the host's inbound `user/message` after native pre-step admission. No host signal shows a notice was acted on, so "handled" is untestable; resolutions are task or mission transitions. `NoticeEnvelope.claimedAt` (`src/types.ts`) is dead, declared only for rows older builds wrote.
+- Outbox failures keep their message identity and a durable diagnostic, but there is no per-route failure counter or backoff policy, and offline-owner notifications can remain pending. Each delivery attempt is bounded by `stallPassTimeoutMs`; one the adapter never settles is abandoned, recorded (`outboxStarved`) and retried by a later pump, so adapter acceptance must be idempotent.
+- `completeAutomatic` commits the completion and its `automatic/completed` event plus owner notice in two transactions; a crash between them loses the notice.
+- An owner-assembled mission (no saved start request) never completes automatically: at full coverage it sends one coverage-complete decision per board state and stays active until the owner completes it.
+
+## Refusals and diagnostics
+
+- Only a `PolicyError` (or subclass) reaches the browser with its message and code; every plain `Error`, even one carrying a `[code]`, arrives as `internal-error` ("Swarm request failed unexpectedly"). `src/` has 285 `throw new Error(` sites at `fa6a507`, mostly invariant, corruption and argument-guard throws a caller cannot trigger. `prepareTask`'s two `Dependency …` refusals are untyped; they run only in scheduled dispatch and `swarm_claim`, never under a browser RPC.
+- A `PolicyError` whose text names host detail (`/Users/`, `/tmp/`, `SQLITE` and similar) or exceeds 4,000 characters also arrives as `internal-error`, except an admission refusal, which gets a fixed repair text built from its diagnostics' codes and locations. `[check_requires_host]` quotes the classified `package.json` script body, which is owner-controlled workspace content plan validation already shows.
+- The refusal lint (`tests/refusal-diagnostics.test.mjs`) holds only `src/tools.ts` and `src/admission.ts` to the full contract (one stable `[diagnostic_code]`, an imperative next step, parameters resolved against the schema from the real `registerTools` path), with an empty allowlist. Thirteen other files are only inventoried: at `fa6a507` the report reads 472 sites, 415 not coded to that contract (`node --test --test-name-pattern='refusals outside this branch' tests/refusal-diagnostics.test.mjs` prints the live count). Only the literal parts of a template are checked (`partial` sites such as `[check_syntax_invalid]`, whose `/bin/sh:` diagnostic the host-path scrub hides), and `missingReviewDiagnostic`'s exit is composed by its caller in `src/notices.ts` (`CALLER_COMPOSED_MESSAGES`).
+- `PolicyError.toString` renders like a plain `Error`, so stringified failures read `Error: …`; rows recorded before round 22 for refusals that were already typed read `PolicyError: …`.
+- A refusal's trace span `error.type` is its declared category, not the text classifier's reading; the classifier remains the fallback for untyped failures.
+
+## Resources and budgets
+
+- The primary agent chooses and can revise budgets. Token accounting uses provider-reported worker usage, with cache-read input charged at `cacheReadWeight` (default 0.1, bounded 0..1) and warnings at each `budgetWarnAt` fraction (default 0.7 and 0.9). A step is refused when consumed usage plus an estimate for requests still streaming (each worker's average per-request usage) reaches the ceiling, so an unusually large in-flight request can still exceed it. The owner conversation's usage is attributed to its newest live mission or planning request by time window and not charged to the pool, and failed provider attempts that report no usage stay uncounted.
+- A budget warning's `suggestedLimit` is a threshold-headroom floor, not an estimate of remaining work. Mission duration measures execution time excluding pauses and idle waits; an explicit `deadlineAt` stays a fixed wall-clock deadline.
+- Boundary compaction runs the host compaction engine after a verdict closes a unit of work, only for an idle worker whose last request exceeded `boundaryCompactionTokens` prompt tokens (default 250000); the summary is accounted like any request, and without a loaded engine nothing is compacted.
+- **The task-ceiling guarantee has a durable window and a contract window.** A handle whose task hit its own ceiling takes no further mission-charged step: the step brake enforces this from the fence until `workers.stop` confirms, for every fence cause and regardless of fresh input; after that it rests on the adapter's stop contract, not a durable row.
+- A start rejection naming an unsupported `reasoningEffort` is retried once without it (`member/effort-downgraded`); the downgrade clears the effort rather than choosing a supported one, and a second rejection stops the member (`member/effort-rejected`, `member/failed`).
+- `SwarmRuntime.criticalPath(missionId)` (the CRITICAL PATH metric) is accounting only; no budget enforcement reads it.
+
+## Storage, recovery and durability
+
+- Opening a store upgrades schema 0, 1 or 2 to schema 3, which older builds reject; a downgrade needs a consistent pre-upgrade backup or a separate state path, with the matching workspaces, recovery journals and Git refs. A database from before round 25 keeps an unread `passes` table.
+- Only task rows are compare-and-swap writes (`stale_task_revision`). `Mission`, `Member` and `Delivery` rows are whole-row puts, so a read-modify-write across an `await` on them can lose an update. The outbox acknowledgement and consumption re-read their rows inside their transactions; other asynchronous whole-row writers still need individual review.
+- Automatic startup snapshots tracked and non-ignored untracked files without moving the branch or changing the index; ignored files (dependencies, local environment files) are left out, conflicts and dirty or diverged submodules must be resolved first, and the capture retries on concurrent edits but is not a filesystem-wide atomic snapshot.
+- Worker worktrees, planning snapshots and artifact refs are retained after stop/completion, with shared Git objects and refs under `.git`; cleanup is explicit. **Apply result** updates only working files and is not a filesystem-wide atomic transaction: concurrent edits trigger rollback, later edits that prevent restoration leave identified recovery copies, and a hard process or disk failure mid-write may need them recovered by hand. Submodule changes and directory/file conversions are not applied. Snapshot storage must be outside the source repository.
+- Stable IDs and a durable inbox recovery journal cover the tested stop/restart paths; they do not guarantee exactly-once external side effects or recovery from arbitrary disk faults.
+- Snapshot restore records a durable restore intent and startup finishes an interrupted replacement; this covers the tested interruption points, not arbitrary filesystem corruption or a device that ignores durability requests. A full WAL/umask permission matrix has not been validated.
+- Trace metrics describe the retained span window (at most 20,000 spans per mission) and its truncation, not whole-history totals; parent lookup can still read exact durable task/attempt records. The recorder keeps one index per mission for the process lifetime, so its memory grows with the missions a long-lived host traces.
+- Span payloads are digest-only (digest and size of input and output). Spans cover the `swarm_*` tools, which have no `ToolRun` rows, and a workspace-bound call's input carries host-added fields no session log holds, so a digest orders a step but cannot be resolved to its payload; decisions are reconstructed from events and rows. The `traceSpill*` keys are accepted and ignored.
+- **Member phase vs. derived status.** Only the member `phase` (`active`/`parked`/`stopped`) is persisted; `status` is derived on every read. Legacy rows without a phase are mapped by `src/projection.ts#memberPhaseOf` (`stopped` stays stopped, `waiting` becomes parked, `idle` and `working` become `active`), so a legacy `working` row that owns no running attempt now reads `idle`. Such rows keep their old `status` until their next write; no migration runs at open and none is recorded.
+
+## Interface and observation
+
+- The live sidebar observes committed changes through native RPC long polling with bounded change history. Updates carry changed mission snapshots, not individual tokens, and no completion time is guaranteed; a busy host, browser or network can delay delivery, so this is not real-time. A disconnected panel marks its activity stale until it refetches. Conversation cards are historical snapshots; an explicit observation makes a new one.
+- `watch` long polling returns on any commit in a visible scope, and a live model stream commits its member row at each `activityHeartbeatMs` republish, so a panel watching a busy mission wakes about once per second.
+- The browser RPC derives its actor from the client-supplied `sessionId`; there is no plugin-side session binding (single-user profiles mitigate it).
+- Cold worker history is a read-only text/tool projection, not the native chat UI: media is represented by type and long entries are truncated. A live worker's native composer may remain writable; mission-management permissions are checked separately.
+- Observation output is focused and paged but has no fixed byte limit: a task with very long acceptance or objective text is returned whole up to the excerpt limits.
+- The mission board (`swarm_post`, `swarm_board`) is an append-only channel of six closed kinds (`ASK`, `ANSWER`, `IDEA`, `ALERT`, `ARTIFACT`, `HANDOFF`) whose sequence is global across the missions in one store (A2-07), not a per-mission ordinal; read state is client-side. A post is data, never authority: it changes no task state, queues no delivery, writes no file and emits no event row.
+- **The client panel is a projection of a bounded event window, and the board is model-tool-only.** `tests/client-findings.test.mjs` (F-14/F-33) fails unless every emitted event type is labeled by the compact projection or named in an omission list with a reason; `task/check-envelope` and the install-scoped `store/*` rows are omitted. `swarm_board` and `swarm_observe` return posts and the caller's inbox to a model session, but the client `Snapshot` carries no `posts`/`inbox` field and the panel renders no board posts; a browser board would need its own per-mission projection and read cursor (a projection gap, not an authorization boundary). `workspace/grant-loaded` is install-scoped (`swarm/install`) and never in a mission snapshot, while `mission/workspace-bound` and `mission/workspace-revoked` render in the compact panel and Activity view.
+- The Activity view groups the bounded snapshot window (`snapshot.events`), so a group's count is of retained events, not the whole log.
+- The plugin dock shifts the host root it discovers from its own position with inline styles. If a host renders the dock as a direct child of `<body>`, `hostShiftTarget` finds no root and the dock overlays the application; a host that sets `width`/`height` with `!important` on that element wins over the shift.
+
+## Clocks, tests and instruments
+
+- **The runtime clock is for tests.** The plugin always runs on `Date.now` and ignores profile keys `now` and `manualTick`. A fake clock does not reach the worker adapter, the workspace engine or the tool-entry workspace checks (activity timestamps, check timing, lock staleness, checkout re-authorization and the first grant check of `swarm_create`, `swarm_launch` and the browser use host time), so it is coherent only with a fake adapter. Timers are not virtualised: the queue wait, outbox delivery bound, dispose drain, worker start timeout, planner expiry and store snapshots use real timers.
+- `settle(missionId)` waits for in-flight work, not quiescence: a kick coalesced into an open body runs at the next tick, so tests call `tick()` after `settle()`. Awaiting `settle()` inside a scheduling body, or inside an adapter call a body awaits, blocks until the worker start timeout aborts that start, undetected.
+- Wall-clock tests remain. In `tests/scheduling-pass.test.mjs` and `tests/stall-roots.test.mjs` only the summarized-rejected-root case waits on a real timer (about 11 s). Other files poll real timers and can fail under heavy load; the recorded cases are the W9 recovery case (`tests/durability-w9-recovery.test.mjs`), the `arena-visibility` registry-mutation snapshot, the S15 repeated-failure, F1 in-timeout check and R16-A4 off-pass sweep pairs, the S1/R16-D live-work-bound pass, the R15-D1/R15-D2 hung-worker cases (`tests/owner-decisions.test.mjs`) and case F of `tests/r19-recovery-fallback.test.mjs`; each passes when its file runs alone.
+- Two instruments are tests of test code: the dead-end census and the decision-metric test exercise models in `tests/guard-model.mjs` and `tests/instruments.mjs`, which import the production sets they depend on but prove no production classifier (the owner-decision and silence-bound tests still do). `wakePrecision` is a read-time judgement: it counts a fall-through notice false only while `waitsLegitimately` still recognises its subject, so a false wake whose lineage has since terminated reads as not-false.
+- `tests/in-memory-gates.test.mjs` classifies every `new Map`/`Set`/`WeakMap`/`WeakSet` in `src/` by name as derivable or cache-only, but 78 of its 144 local rows no longer match the source by position; they are history, not checked against `src/`.
+- `tests/reader-census.test.mjs` records one decision per `SWARM_TOOLS` entry (24), event kind (103 at `fa6a507`) and examined payload field (43). 22 of the 24 tool rows are proven by a test that exercises the tool; `swarm_challenge` and `swarm_subscribe` only by their registration in `src/tools.ts` plus the model-visible golden fixture. The payload census covers only four payloads (the `mission/stalled` shapes, `task/check-envelope`, `tool/recorded`, `isolation/temp-rendezvous`). The deleted kinds `mission/paused`, `mission/resumed`, `mission/stopped` and `mission/completed` still decode from old rows but are reported undescribed, and `src/client/progress.ts` still labels `attempt/started` (no writer; the live kind is `task/claimed`) for historical cards.
+- The model-visible golden snapshot (`tests/fixtures/model-visible.expected.json`) is compared with a real composition, and the assignment-instruction invariants checked, only by `npm run test:harness`; no node:test covers them. The snapshot records assignment and peer-question recipients, not control deliveries, and the owner-leak check matches the whole instruction, so a leaked fragment would pass.
+
+## Host prerequisites and verification suites
+
+- The real-Harness composition checks (`npm run test:harness`, `test:pack`, `test:profile`) need a host that permits nested `sandbox_apply`, because the fixture requests `workspace-write`. Inside an outer workspace-write sandbox macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`, `SandboxUnavailableError`); `test:pack` and `test:profile` detect this first and abort, and `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` attempts it anyway. `npm run test:isolation` drives the real `@deepseek-ai/dsh-sandbox-local` provider through `confinedCheckArgv`, so it needs a built supported Harness checkout and a host that permits the platform sandbox (in a worker sandbox it also meets an `EPERM` `mkdtemp` under `$HOME`); `test:web` and `test:command-web` drive a browser. All are host-only prerequisites, not product defects, and none is a worker check.
+- The fault suite runs from any checkout, including a `git archive` export (F4 runs `scripts/round.mjs promote --commit HEAD` in a scratch repository it creates and expects exit 2). Tier B (F3a/F3b/F3c) needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or `~/.dsh/source/current` (or sibling `deepseek-harness-rc1`/`deepseek-harness-latest`) with built packages matching `compatibility.json`. Without one, `npm run test:faults` fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)`.
+- **The full verification suite requires the repository checkout, not the installed tarball.** The tarball ships only the `files` listed in `package.json` (built `lib/`, the profile bundle, the READMEs and `docs/` documents, and `scripts/packed-smoke.mjs`, which `npm run test:packed` verifies). Every other test script needs `src/`, `tsconfig*.json`, `scripts/` and `tests/`, and `scripts/load/run.mjs` and `scripts/replay/scenario.mjs` import their adapter from `tests/faults/harness.mjs`.
+- A browser smoke can pass and then take about 15 minutes to exit after Google Chrome updates itself: `GoogleUpdater --wake-all` inherits the browser's stdout and stderr, and Playwright's `browser.close()` waits for them. The checks and `report.json` are complete once `passed` is printed (observed with Chrome 153.0.8010.53). The DeepSeek smoke pair is still duplicated, because verifying it needs billable provider calls.
+
+## Host scripts, preview and mounting
+
+- **The preview and lab host is the root's own dsh host on its port.** `scripts/host.mjs` inspects only `127.0.0.1:<port>` (needs `lsof` and `ps`) and accepts a listener only if its command line is an absolute `<harness>/apps/cli/lib/bin.js` with `--profile web` and `--patch <root>/<file>`; any other listener, including a host restarted by hand without that `--patch`, is refused by pid and command line and never signalled. Restart such a host as `node --expose-internals "$H/apps/cli/lib/bin.js" --profile web --patch <root>/preview.patch.yml --port <p> --no-open`. Paths containing whitespace are never recognised. `update-preview` and `node scripts/round.mjs mount` boot `--harness`, else the running host's Harness, else the one in `server.json`, so a stopped root with an older record needs `--harness <checkout>` once. A host that has not bound its port is invisible, so concurrent restarts of one root can race. Old `server-<stamp>.log` files are never pruned.
+- The profile bundle's payload dependency is `file:..`, because the platform ships as a source checkout, not a registry package. A `file:` mount packs the payload, so the mount command must be re-run (or `dsh plugin --profile web install` run) after rebuilding the plugin; see the [declarative bundle mount](operations.md#declarative-bundle-mount).
+- The preview deployment still uses the direct mount (the plugin package as the profile's bundle layer, `preview.patch.yml` supplying absolute roots through `scripts/update-preview.mjs`). Swapping to the declared mount requires removing the direct plugin dependency first, because both layers insert the `dsh-external-agent-swarm` row.
+- The bundle's composition states only the two roots it owns; every other setting keeps the plugin default in [`src/index.ts`](../src/index.ts). `tests/r17-profile.test.mjs` mounts the profile without a package manager, so the `file:` install command itself is exercised only by an attended deployment.
+
+## Model-dependent behaviour
+
+- Correct plan generation and useful acceptance criteria still depend on the model and the task description. The primary can repair validation errors, but deterministic fixtures do not establish a real-model success rate.
+- Automatic planning uses the owner's ordinary Harness agent and tools with a frozen planning directory, while the owner's native cwd remains the source project; following the read-only snapshot path is not an OS enforcement boundary. Worker baselines are enforced by the runtime.
