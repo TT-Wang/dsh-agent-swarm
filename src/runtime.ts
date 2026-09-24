@@ -347,18 +347,6 @@ export class SwarmRuntime {
   private timer?: ReturnType<typeof setInterval>
   closed = false
   shuttingDown = false
-  /**
-   * Exact owner notices already sent for an unreviewable source. Automatic
-   * review admissions are read directly from durable task events; the set
-   * keeps a persistent blocker from waking the owner on
-   * every tick.
-   */
-  
-  /** Missing-review records already written, keyed by mission:source:submission seq. */
-  private readonly reviewPathReported = new Set<string>()
-  
-  
-  
   /** Open runtime transactions; a cached F(S) is not trusted inside one. */
   commitDepth = 0
   /** R11-15: bounded per-path shared-temp mentions, newest last. */
@@ -2408,13 +2396,10 @@ export class SwarmRuntime {
   }
   /** Record the missing review once per submission; false when it is already recorded. */
   private reportMissingReview(mission: Mission, source: Task, submissionSeq: number): boolean {
-    const key = `${mission.id}:${source.id}:${submissionSeq}`
-    // S5: the durable `task/review-missing` event for this exact submission is
-    // the gate; this re-read makes the in-memory set a pure cache.
+    // S5: the durable `task/review-missing` event for this exact submission is the gate.
     if (this.missingReviewRecorded(mission.id, source.id, submissionSeq)) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
-    this.reviewPathReported.add(key)
     return true
   }
   /**

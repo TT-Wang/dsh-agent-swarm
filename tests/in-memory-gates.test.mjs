@@ -183,7 +183,6 @@ const CENSUS = [
   ["src/runtime.ts",8,"Map","private readonly startControllers = new Map<string, AbortController>()","gate","derivable","S5c: the abort handle is an accelerator. `failStart` records the failed request durably and `launchDraft` re-reads that row immediately before it activates the mission, so a cancelled launch cannot come active even when the registry is lost or raced (probe below)"],
   ["src/runtime.ts",9,"Map","readonly startFailures = new Map<string, number>()","gate","derivable","S5c: the count is read from and written to the durable member row (`startFailures` field) and cleared there by the same successful start that clears the provider outage; the Map is the in-process mirror, so a lost map or a restart continues the count instead of resetting the route budget (probe below)"],
   ["src/runtime.ts",10,"Map","private readonly observeCursors = new Map<string, DeliveredCursor>()","gate","cache-only","delivered-position context cache; loss re-sends one bounded focused view and a cursor can never exceed the durable log"],
-  ["src/runtime.ts",12,"Set","private readonly reviewPathReported = new Set<string>()","gate","derivable","the durable task/review-missing event for the exact submission is re-read before the set is trusted"],
   ["src/runtime.ts",13,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",14,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",15,"Map","const byId = new Map(rows.map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -504,19 +503,6 @@ const GATE_TESTS = {
       assert.equal(f.runtime.store.events(f.mission.id, 500).length, durableEvents.length, 'and no durable event is changed or lost')
       const cursor = f.runtime.observeCursors.get(f.author.id)
       assert.ok(cursor.eventSeq <= durableEvents.at(-1).seq, 'a cursor can never exceed the durable log, so presence cannot hide an event')
-    } finally { await f.cleanup() }
-  },
-  'src/runtime.ts:12': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Missing review record' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const submission = await eventually(() => events(f.runtime, f.mission.id, 'task/submitted').at(-1), 'the submission is recorded durably')
-      f.runtime.reviewPathReported.add(`${f.mission.id}:${task.id}:${submission.seq}`)   // phantom presence
-      const missing = await eventually(() => events(f.runtime, f.mission.id, 'task/review-missing').at(-1),
-        'the missing-review record is written from the durable submission even though the cache claims it was reported')
-      assert.equal(missing.data.taskId, task.id, 'the set cannot swallow the durable missing-review record')
     } finally { await f.cleanup() }
   },
   'src/gates.ts:1': async t => {
