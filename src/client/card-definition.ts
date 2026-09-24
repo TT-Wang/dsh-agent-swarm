@@ -14,6 +14,11 @@ declare module '@deepseek-ai/dsh-client-ui-chat/client' {
 
 export interface SwarmCardState { snapshot?: Snapshot }
 
+/** 0.1.7 flags the tool-role message itself; 0.1.5 flags the one tool-result block it carries. */
+function isErrorResult(message: { isError?: boolean; content: readonly { type: string; isError?: boolean }[] }): boolean {
+  return message.isError === true || message.content.some(block => block.type === 'tool-result' && block.isError === true)
+}
+
 /** One versioned snapshot per explicit create/observe call, replayed through native history access. */
 export const swarmCardDefinition: ConversationNodeDefinition<SwarmCardState> = {
   kind: 'agent-swarm', target: 'chat',
@@ -28,8 +33,7 @@ export const swarmCardDefinition: ConversationNodeDefinition<SwarmCardState> = {
   },
   start: () => ({}),
   update(context, match) {
-    if (match.event.type !== 'tool/result' || match.event.data.error !== undefined
-      || match.event.data.message.content.some(block => block.type === 'tool-result' && block.isError === true)) return context.state
+    if (match.event.type !== 'tool/result' || match.event.data.error !== undefined || isErrorResult(match.event.data.message)) return context.state
     const snapshot = snapshotFromResult(match.event.data.meta, match.event.data.message.content)
     return snapshot === undefined ? context.state : { snapshot }
   },

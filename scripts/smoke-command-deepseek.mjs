@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv, promisify } from 'node:util'
-import { bootHarness, harnessEntry, importHarness } from '../tests/fixtures/built-harness.mjs'
+import { bootHarness, harnessEntry, importHarness, toolResultBlocks } from '../tests/fixtures/built-harness.mjs'
 
 const execute = promisify(execFile)
 const project = fileURLToPath(new URL('../', import.meta.url))
@@ -146,7 +146,7 @@ try {
       }
     }
     if (['command/run', 'command/done', 'turn/start', 'turn/end', 'step/start', 'step/end'].includes(event.type)) lifecycle.push({ sessionId, seq: event.seq, type: event.type, data: event.data, phase: disposing ? 'cleanup' : 'execution', atMs: Date.now() - started })
-    if (event.type === 'tool/result') for (const block of event.data.message.content.filter(item => item.type === 'tool-result')) {
+    if (event.type === 'tool/result') for (const block of toolResultBlocks([event.data.message])) {
       const call = calls.find(item => item.sessionId === sessionId && item.callId === block.toolCallId)
       const resultText = redact(textContent(block.content))
       toolResults.push({ sessionId, seq: event.seq, name: call?.name, callId: block.toolCallId, isError: Boolean(block.isError), text: resultText.slice(0, 16000), textCharacters: resultText.length, reportTextTruncated: resultText.length > 16000 })

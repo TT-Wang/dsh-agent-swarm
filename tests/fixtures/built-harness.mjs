@@ -40,6 +40,17 @@ export async function harnessEntry(root, name) {
   return pathToFileURL(target).href
 }
 
+/**
+ * Tool results of a message list as tool-result blocks: 0.1.5 nests one in a
+ * user message, 0.1.7 sends a tool-role message that carries the call id and
+ * the error flag itself.
+ */
+export function toolResultBlocks(messages) {
+  return messages.flatMap(message => message.role === 'tool'
+    ? [{ type: 'tool-result', toolCallId: message.toolCallId, content: message.content, isError: message.isError === true }]
+    : message.content.filter(block => block.type === 'tool-result'))
+}
+
 export async function importHarness(root, name) {
   return import(await harnessEntry(root, name))
 }

@@ -1,7 +1,7 @@
 /** Optional native browser RPC consumers of the durable swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import { RpcId } from '@deepseek-ai/dsh-client-connection'
-import type { ConnectionRpcHandler, ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
 import { isAppendSurfaceEvent, SessionId, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
@@ -207,7 +207,8 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
     } }
   }
-  const handler: ConnectionRpcHandler = async (endpoint, payload, signal) => {
+  // The routes below call this directly; 0.1.7's ConnectionRpcHandler adds a peer argument no route needs.
+  const handler = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
     try {
       signal.throwIfAborted()
       if (Buffer.byteLength(JSON.stringify(payload) ?? '', 'utf8') > options.maxPayloadBytes) throw new RequestError('Swarm request exceeds the payload limit')

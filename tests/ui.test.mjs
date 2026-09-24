@@ -99,6 +99,10 @@ test('native conversation fold presents only successful explicit swarm observati
   context.state = swarmCardDefinition.update(context, result)
   assert.equal(swarmCardDefinition.buildViewNode(context).data.mission.id, snapshot.mission.id)
   assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, { event: { ...result.event, data: { ...result.event.data, error: { name: 'Error' } } } }), {})
+  // A failed tool result: 0.1.7 flags the tool-role message, 0.1.5 its nested tool-result block.
+  const failedResult = message => ({ event: { ...result.event, data: { ...result.event.data, message: { ...result.event.data.message, ...message } } } })
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ role: 'tool', toolCallId: 'call-1', isError: true })), {})
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ content: [{ type: 'tool-result', toolCallId: 'call-1', isError: true, content: [] }] })), {})
 })
 
 test('current native Conversation assembler rebuilds swarm cards from durable tool events', async () => {
@@ -347,6 +351,9 @@ test('cold worker history paginates native events, renders inert tool results, a
   await older
   assert.deepEqual(history.getSnapshot().entries.map(entry => entry.event.seq), [2, 8])
   assert.equal(transcriptEntry(history.getSnapshot().entries[0]).text, 'Assignment')
+  const toolMessage = isError => ({ event: { seq: 9, type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'call-9', isError, content: [{ type: 'text', text: 'output' }] } } } })
+  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a 0.1.7 tool-role failure is labelled correctly')
+  assert.deepEqual(transcriptEntry(toolMessage(false)), { role: 'Tool result', text: 'output' })
   history.open('worker-b', 'Reviewer')
   history.close()
   pending[2]({ events: [{ event: { seq: 1, type: 'user/message', data: { content: 'late' } } }], hasMore: false })

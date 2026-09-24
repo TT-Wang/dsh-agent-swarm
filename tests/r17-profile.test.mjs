@@ -211,7 +211,8 @@ test('the host profile loader composes the declared bundle into one plugin row, 
     const profile = loadProfile('r17-profile-test', 'web', join(harnessRoot, 'apps/cli/package.json'), home)
     const layer = profile.layers.find(candidate => candidate.packageName === bundle.name)
     assert.ok(layer, 'the declared bundle must resolve from the profile directory')
-    assert.equal(realpathSync(layer.patchPath), realpathSync(join(bundleDir, 'cordis.patch.yml')), 'the composed layer must be the declared patch document')
+    // 0.1.5 names one `patchPath`; 0.1.7 accepts an ordered list and names `patchPaths`.
+    assert.deepEqual((layer.patchPaths ?? [layer.patchPath]).map(path => realpathSync(path)), [realpathSync(join(bundleDir, 'cordis.patch.yml'))], 'the composed layer must be the declared patch document')
     const rows = composeEntries(profile.layers.map(candidate => candidate.patches))
     const inserted = rows.filter(row => row.id === 'dsh-external-agent-swarm')
     assert.equal(inserted.length, 1, 'the declared composition must insert the plugin row exactly once')
@@ -254,7 +255,8 @@ test('a real dsh web host mounts the declared bundle at the portable default roo
     const graph = bootGraph(await authenticatedIndex(running.url))
     const client = graph.entries.find(entry => entry.id === plugin.name)
     assert.ok(client, 'the client module system must mount the plugin package scanned from the composed row')
-    assert.match(client.url, /\/plugins\/.*dsh-agent-swarm\/client\.js/, 'the boot graph must serve the client bundle of the inserted row')
+    // 0.1.7 serves the boot graph's module URLs relative to the application mount.
+    assert.match(client.url, /(^|\/)plugins\/.*dsh-agent-swarm\/client\.js/, 'the boot graph must serve the client bundle of the inserted row')
     assert.deepEqual(client.inject, plugin.dsh.client.inject, 'the mounted client half must carry the declared inject list')
     const store = join(home, 'agent-swarm', 'swarm.sqlite')
     await until(() => existsSync(store), 'the store under the portable default root')

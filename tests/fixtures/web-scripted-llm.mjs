@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { access, appendFile } from 'node:fs/promises'
-import { importHarness } from './built-harness.mjs'
+import { importHarness, toolResultBlocks } from './built-harness.mjs'
 
 export const name = 'swarm-web-scripted-llm'
 export const inject = ['llm']
@@ -65,7 +65,7 @@ export async function apply(ctx, config) {
   let nextCall = 0
   const trace = entry => appendFile(config.tracePath, JSON.stringify(entry) + '\n')
   const texts = message => message.content.filter(block => block.type === 'text').map(block => block.text)
-  const blocks = messages => messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
+  const blocks = toolResultBlocks
   const resultBody = block => JSON.parse(texts(block).join('\n'))
   const tool = (name, args) => ({ kind: 'tool', name, args })
   const answer = text => ({ kind: 'text', text })

@@ -6,7 +6,6 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type {} from '@deepseek-ai/dsh-agent-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -31,6 +30,21 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 /**
+ * The `agentPresets` service, declared structurally: 0.1.5 provides it from
+ * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
+ * with the same two methods this adapter uses.
+ */
+interface AgentPresets {
+  composedPreset(agentCtx: Context): string | undefined
+  mount(agentCtx: Context, id?: string): Promise<unknown>
+}
+
+/** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
+export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
+  return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+}
+
+/**
  * Keep lifecycle policy in the runtime, but apply it at the native consumer
  * boundary too: transport acknowledgement can precede consumption by a turn.
  * Returning an empty admitted batch lets Harness finish a completed turn while
@@ -50,7 +64,7 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
     const admitted = decision.messages.filter(message => !stale(agent, message)
       // A changed generated context is not an independent user request. Let it
       // be regenerated for the next genuine turn instead of reviving this one.
-      && !(onlyStale && message.source.kind === 'plugin' && message.source.plugin === '@deepseek-ai/dsh-system-prompt'))
+      && !(onlyStale && isRuntimeContext(message.source)))
     return { ...decision, messages: admitted.map(message => {
       if (message.source.kind !== 'swarm') return message
       const content = project(String(agent.id), message.source.deliveryId)
@@ -691,7 +705,7 @@ export class HarnessWorkers implements WorkerAdapter {
     }
     const owner = this.ctx.agents.get(SessionId(spec.ownerSessionId))
     if (owner === undefined) throw new Error('First worker creation requires its owner session to seed a durable composition')
-    const preset = this.ctx.get('agentPresets')?.composedPreset(owner.ctx)
+    const preset = (this.ctx.get('agentPresets') as AgentPresets | undefined)?.composedPreset(owner.ctx)
     const inherited = await ownerModelSelection(this.ctx, owner, signal)
     const selection = inherited === undefined && spec.member.provider === undefined && spec.member.model === undefined && spec.member.reasoningEffort === undefined
       ? undefined : workerModelSelection(inherited, spec.member)
@@ -744,7 +758,7 @@ export class HarnessWorkers implements WorkerAdapter {
     // release instead of forking the adapter by host version.
     const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
       abort.signal.throwIfAborted()
-      const presets = this.ctx.get('agentPresets')
+      const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
       if (composition.preset !== undefined) {
         if (presets === undefined) throw new Error('Saved worker composition requires agent-presets')
         await presets.mount(agentCtx, composition.preset)

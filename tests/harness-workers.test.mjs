@@ -18,7 +18,7 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
-import { HarnessWorkers } from '../lib/harness-workers.js'
+import { HarnessWorkers, isRuntimeContext } from '../lib/harness-workers.js'
 import { registerTools } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
@@ -50,6 +50,14 @@ async function appendStoredEvents(persistence, id, events) {
   try { await handle.append(events); await handle.flush() }
   finally { await handle.close() }
 }
+
+test('the owner filter recognizes regenerated runtime context on both supported hosts', () => {
+  assert.equal(isRuntimeContext({ kind: 'runtime-context', form: 'snapshot', sections: [] }), true, '0.1.7 names its own producer kind')
+  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }), true, '0.1.5 attributes it to the system-prompt plugin')
+  assert.equal(isRuntimeContext({ kind: 'plugin', plugin: '@deepseek-ai/dsh-other' }), false)
+  assert.equal(isRuntimeContext({ kind: 'user' }), false)
+  assert.equal(isRuntimeContext({ kind: 'swarm', deliveryId: 'd1' }), false)
+})
 
 test('session metadata supports both public persistence contracts without activating sessions', async () => {
   const id = SessionId('metadata-owner')
