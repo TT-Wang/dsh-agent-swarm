@@ -153,23 +153,69 @@ test('a reworked task that is handed off re-pends: the claims its rejection refu
   assert.equal(f.current(source).status, 'pending', 'the handoff lands pending, not blocked by history')
 })
 
-test('a claim a rework archived is not revived by a later challenge: the next acceptance leaves it alone', async t => {
+test('a claim a rework archived cannot be challenged: the refusal names the live claims, and the accepted rework stays accepted', async t => {
+  const f = await fixture(t)
+  const index = await toolSchemaIndex()
+  const source = f.propose('Implement')
+  const dependent = f.propose('Build on it', { dependencies: [source.id], assigneeId: f.reviewer.id })
+  const archived = await f.submit(source, 'The first attempt works')
+  const rejecting = await f.reject(source)
+  const rejectedCommit = f.current(source).artifact.commit
+  f.resume(source)
+  const challenge = evidenceId => f.runtime.challenge(f.owner, f.mission.id, { evidenceId, reason: 'Re-open the old dispute', toolRunIds: [] })
+  const refusal = (live, message) => error => {
+    assert.ok(error instanceof PolicyError)
+    assert.equal(error.code, 'evidence_archived')
+    assert.equal(error.category, 'conflict_error')
+    assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
+    assert.ok(error.message.includes(`refuted with the rejected commit ${rejectedCommit} of task ${source.id} (review ${rejecting.id})`), error.message)
+    assert.match(error.message, live)
+    assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
+    message.push(error.message)
+    return true
+  }
+  const messages = []
+  assert.throws(() => challenge(archived.id), refusal(/has no live claim yet; wait for its next claim, then use `swarm_challenge`/, messages))
+  assert.equal(f.evidence(archived.id).status, 'refuted', 'the refused challenge leaves the history claim refuted')
+  const kept = await f.submit(source, 'The reworked attempt works')
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(`Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${kept.id}\\.`), messages))
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, dependent.id)
+  assert.equal(claimed.status, 'running')
+
+  // Disputing the rejected commit's claim after the rework was accepted neither
+  // re-opens the accepted task nor invalidates work built on it.
+  assert.throws(() => challenge(archived.id), refusal(new RegExp(kept.id), messages))
+  assert.equal(f.current(source).status, 'accepted', 'the accepted rework is not re-opened')
+  assert.equal(f.current(dependent).status, 'running', 'its dependent keeps running')
+  assert.deepEqual(f.events('task/invalidated'), [])
+  assert.equal(f.evidence(archived.id).status, 'refuted')
+  assert.equal(f.evidence(archived.id).challenges.length, 0, 'no dispute was recorded')
+  assert.equal(f.events('evidence/challenged').length, 0)
+  // The live claim of the accepted artifact can still be disputed.
+  challenge(kept.id)
+  assert.equal(f.current(source).status, 'submitted')
+})
+
+test('a dispute of an archived claim recorded before the refusal blocks neither the verdict nor completion', async t => {
   const f = await fixture(t)
   const source = f.propose('Implement')
   const archived = await f.submit(source, 'The first attempt works')
   await f.reject(source)
-  f.resume(source)
-  // Disputing history flips the stored status away from refuted.
-  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: archived.id, reason: 'Re-open the old dispute', toolRunIds: [] })
-  assert.equal(f.evidence(archived.id).status, 'challenged')
+  assert.deepEqual(f.resume(source).rejections.at(-1).evidenceIds, [archived.id])
+  // A build before the refusal recorded this dispute; the row stays in the store.
+  const row = f.evidence(archived.id)
+  f.runtime.store.put('evidence', { ...row, status: 'challenged', challenges: [...row.challenges, { authorId: 'owner', reason: 'Re-open the old dispute', toolRunIds: [] }] })
   const kept = await f.submit(source, 'The reworked attempt works')
-  const review = f.proposeReview(source)
-  await f.verify(review, 'accept', 'The rework meets the criterion')
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
   assert.equal(f.evidence(kept.id).status, 'verified')
   assert.equal(f.evidence(archived.id).status, 'challenged', 'the archived claim is not judged by the rework verdict')
   assert.equal(f.events('evidence/verified').filter(event => event.data.evidenceId === archived.id).length, 0, 'it is never verified')
   assert.notEqual(f.evidence(archived.id).artifact.commit, f.current(source).artifact.commit, 'nor re-stamped with the reworked artifact')
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined, 'history of a rejected commit is not an open dispute')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted rework covers the mission').status, 'completed')
 })
 
 test('a reworked research task needs a live claim before it resubmits', async t => {

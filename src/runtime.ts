@@ -2239,6 +2239,17 @@ export class SwarmRuntime {
     const { key } = this.active(actor, missionId)
     const evidence = this.store.get('evidence', input.evidenceId)
     if (!evidence || evidence.missionId !== missionId) throw new Error('Unknown evidence')
+    // A claim a rework archived is history of a rejected commit: that rejection
+    // already refuted it and no later verdict judges it, so a dispute of it could
+    // never be resolved, and it would re-open the reworked task.
+    const owning = this.task(missionId, evidence.taskId)
+    const archivedBy = owning.rejections?.find(rejection => rejection.evidenceIds.includes(evidence.id))
+    if (archivedBy !== undefined) {
+      const live = currentEvidenceIds(owning)
+      throw new PolicyError('evidence_archived', 'conflict_error', `[evidence_archived] Evidence ${evidence.id} was already refuted with the rejected commit ${archivedBy.commit} of task ${owning.id} (review ${archivedBy.reviewTaskId}); the rework archived it, so no verdict can judge it again. ${live.length
+        ? `Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${live.join(', ')}.`
+        : 'That task has no live claim yet; wait for its next claim, then use `swarm_challenge` with that `evidenceId`.'}`)
+    }
     this.bounded(input.reason)
     for (const runId of input.toolRunIds) { const run = this.store.get('tool_runs', runId); if (!run || run.missionId !== missionId) throw new Error('Unknown counterevidence tool run') }
     evidence.status = 'challenged'; evidence.challenges.push({ authorId: key, reason: input.reason, toolRunIds: input.toolRunIds })
@@ -3487,9 +3498,12 @@ export class SwarmRuntime {
       try { this.selectDeliveryTarget(mission.id, tasks) }
       catch (error) { return error instanceof Error ? error.message : String(error) }
     }
-    // Evidence of explicitly cancelled work no longer supports an accepted result; live disputes still block.
+    // Evidence of explicitly cancelled work no longer supports an accepted result,
+    // and a claim a rework archived is history of a rejected commit that no
+    // verdict judges again; live disputes still block.
     const dead = new Set(tasks.filter(task => task.status === 'cancelled').map(task => task.id))
-    const disputed = this.store.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId))
+    const archived = new Set(tasks.flatMap(task => task.rejections?.flatMap(rejection => rejection.evidenceIds) ?? []))
+    const disputed = this.store.list('evidence', mission.id).filter(evidence => evidence.status === 'challenged' && !dead.has(evidence.taskId) && !archived.has(evidence.id))
     if (disputed.length) return `Unresolved evidence challenges prevent completion: ${disputed.map(evidence => evidence.id).join(', ')}`
     return undefined
   }
