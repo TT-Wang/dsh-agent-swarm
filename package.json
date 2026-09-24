@@ -74,7 +74,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "verify": "npm run typecheck && npm test && npm run test:harness && npm run test:pack && npm run test:profile && npm run test:bundle && npm run test:web && npm run test:command-web",
-    "test:harness": "node --expose-internals tests/harness-composition.mjs",
+    "test:harness": "node --expose-internals tests/harness-composition.mjs && node --expose-internals tests/harness-boundary-compaction.mjs",
     "test:faults": "node scripts/faults/run.mjs",
     "test:replay": "node scripts/replay/replay.mjs",
     "test:isolation": "node --test tests/verification-isolation.mjs",
