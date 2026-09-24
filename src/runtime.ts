@@ -602,6 +602,11 @@ export class SwarmRuntime {
           mission.executionTime = { usedMs: executionElapsed(mission, lastEvent) }; executionClock(mission, false, this.now()); this.store.put('missions', mission)
         }
         if (mission.budgetPause) { mission.budgetPause.quiesced = true; this.store.put('missions', mission) }
+        // Replay the lineage retirement only for a replacement accepted before
+        // the verdict ran it, and before anything below re-pends a row, so it
+        // judges each row as the crash left it: work that was running,
+        // submitted or stopping stays live exactly as on the verdict path.
+        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length && !task.lineageRetired) this.retireReplacedLineage(mission.id, task)
         for (const task of this.store.list('tasks', mission.id)) {
           // Finding volume is advisory. Retire only this obsolete ceiling;
           // independent rejection or preparation failures still need repair.
@@ -637,10 +642,6 @@ export class SwarmRuntime {
             })
           }
         }
-        // A store written before an accepted replacement retired its whole
-        // lineage may still hold the chain blocked; retired rows are terminal,
-        // so this replay retires nothing twice.
-        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length) this.retireReplacedLineage(mission.id, task)
         // R17-G7: recovery used to rewrite every non-stopped member row to
         // `idle`, which is exactly how a member could read `idle` while the
         // attempt it owns was still live (R15-F2). There is nothing to write:
@@ -2382,22 +2383,23 @@ export class SwarmRuntime {
   /**
    * An accepted replacement carries every obligation of its replaced lineage
    * (`replacedLineage`: the `replaces` chain back to its roots, both parents of
-   * a multi-parent repair included). Each row of it still blocked or pending is
-   * cancelled with one `task/superseded` naming the replacement, and every
-   * cancelled row's open reviews are retired. Accepted, running and submitted
-   * rows are never retired; another live replacement of a retired row (a fork)
-   * is left alone and named. Terminal rows are skipped, so a replay retires
-   * nothing twice. Returns the retired reviews. Must be called inside a mission
-   * transaction.
+   * a multi-parent repair included). Each row of it still blocked or pending
+   * with no stop in flight is cancelled with one `task/superseded` naming the
+   * replacement, and every cancelled row's open reviews are retired. Accepted,
+   * running, submitted and stopping rows are never retired; another live
+   * replacement of a retired row (a fork) is left alone and named. The accepted
+   * row is marked `lineageRetired`, so host recovery never runs this again for
+   * it. Returns the retired reviews. Must be called inside a mission transaction.
    */
   private retireReplacedLineage(missionId: string, accepted: Task): { retired: Task[]; released: Set<string> } {
     const graph = taskGraphIndex(this.store.list('tasks', missionId))
     const lineage = graph.replacedLineage(accepted.id)
     const carried = new Set(lineage.map(row => row.id))
     const retired: Task[] = [], released = new Set<string>()
+    if (lineage.length > 1) { accepted.lineageRetired = true; this.store.put('tasks', accepted) }
     for (const previous of lineage.slice(1)) {
       const previousStatus = previous.status
-      if (previousStatus === 'blocked' || previousStatus === 'pending') {
+      if ((previousStatus === 'blocked' || previousStatus === 'pending') && !stopPending(previous)) {
         const liveReplacements = graph.replacementDescendants(previous.id).filter(row => !carried.has(row.id) && !TERMINAL_STATES.has(row.status)).map(row => row.id)
         previous.status = 'cancelled'
         previous.output = `${previous.output ?? ''}\nSuperseded by independently accepted task ${accepted.id}${liveReplacements.length ? `; live replacement ${liveReplacements.join(', ')} left alone` : ''}`
