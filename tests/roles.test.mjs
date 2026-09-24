@@ -368,3 +368,48 @@ test('boundary compaction uses the native engine only when idle and over the pro
     assert.equal(compacted.length, expected, 'the same boundary never compacts twice without a new request')
   }
 })
+
+test('a boundary requested mid-turn compacts at the next idle, before a re-woken tail starts the next unit', async t => {
+  // The member is inside a tool when its unit closes, parks itself, and a next-turn
+  // input is already queued: its turn ends on a rejected step and the idle handler
+  // re-wakes that tail. The compaction must run first, while the agent is idle,
+  // and the tail's turn must wait for it; before the fix the tail ran first.
+  const timeline = []
+  let releaseHold
+  const held = new Promise(resolve => { releaseHold = resolve })
+  const f = await fixture(t, options => {
+    if (options.sessionId === 'owner-session') return prompt('owner idle')
+    const all = JSON.stringify(options.messages)
+    if (all.includes('NEXT_UNIT')) { timeline.push('next-unit-request'); return prompt('next unit done') }
+    return all.includes('held released') ? prompt('unit done') : { kind: 'tool', name: 'swarm_hold', arguments: {} }
+  }, { boundaryCompactionTokens: 10 })
+  // A swarm_-prefixed name: the runtime guard admits it for a member with no claimed task.
+  f.ctx.tools.register(defineContentToolFixture({ name: 'swarm_hold', description: 'Hold', parameters: {}, execute: async () => { await held; return [{ type: 'text', text: 'held released' }] } }))
+  f.ctx.provide('compaction', { compactNow(agent) {
+    timeline.push(`compact-while-${agent.status}`)
+    return agent.runMaintenance(async () => { await new Promise(resolve => setTimeout(resolve, 50)); timeline.push('compact-end'); return null })
+  } })
+  const actor = { sessionId: 'owner-session' }
+  await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Compact at the next idle', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const builder = await f.runtime.addMember(actor, mission.id, { name: 'Builder', role: 'implementation' })
+  const worker = f.ctx.agents.get(SessionId(builder.sessionId))
+  await f.workers.deliver(builder, { id: 'd1', missionId: mission.id, from: 'owner', to: builder.id, kind: 'question', content: 'Hold.', createdAt: 1 })
+  const deadline = Date.now() + 20000
+  while (!f.requests.some(request => request.sessionId === builder.sessionId) || worker.status !== 'running') {
+    assert.ok(Date.now() < deadline, 'the worker enters its held tool'); await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  await new Promise(resolve => setTimeout(resolve, 50))
+  f.workers.compactAtBoundary(builder.id)
+  f.runtime.wait({ sessionId: builder.sessionId }, mission.id)
+  worker.send({ id: 'next-unit', role: 'user', content: [{ type: 'text', text: 'NEXT_UNIT' }], source: { kind: 'user' } }, 'next-turn', true)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.deepEqual(timeline, [], 'a running member keeps the request instead of compacting')
+  releaseHold()
+  while (!timeline.includes('next-unit-request') || worker.status !== 'idle') {
+    assert.ok(Date.now() < deadline, `the tail's unit runs: ${JSON.stringify(timeline)}`); await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  await worker.whenIdle()
+  assert.ok(worker.session.snapshotEvents().some(event => event.type === 'turn/end' && event.data.reason.kind === 'blocked'), 'the held unit ended on the parked member\'s rejected step')
+  assert.deepEqual(timeline, ['compact-while-idle', 'compact-end', 'next-unit-request'], 'the compaction runs once, while idle, before the next unit')
+})

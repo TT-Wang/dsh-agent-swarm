@@ -23,6 +23,7 @@ export async function apply(ctx, config) {
       assert(responder, 'scripted model requires a scenario')
       requests.push({
         sessionId: options.sessionId,
+        purpose: options.purpose,
         messages: structuredClone(options.messages),
         system: options.system,
         tools: structuredClone(options.tools),
@@ -42,7 +43,7 @@ export async function apply(ctx, config) {
         yield { type: 'block-start', index: 0, blockType: 'tool-call' }
         yield { type: 'tool-call-delta', index: 0, id, name: action.name, argumentsDelta: args }
         yield { type: 'block-end', index: 0, block: { type: 'tool-call', id, name: action.name, arguments: args } }
-        yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 8 } }
+        yield { type: 'usage', usage: action.usage ?? { inputTokens: 12, outputTokens: 8 } }
         yield { type: 'finish', reason: { kind: 'tool-calls' } }
         return
       }
@@ -50,7 +51,7 @@ export async function apply(ctx, config) {
       yield { type: 'block-start', index: 0, blockType: 'text' }
       yield { type: 'text-delta', index: 0, text: action.text }
       yield { type: 'block-end', index: 0, block: { type: 'text', text: action.text } }
-      yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 8 } }
+      yield { type: 'usage', usage: action.usage ?? { inputTokens: 12, outputTokens: 8 } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     }
   }

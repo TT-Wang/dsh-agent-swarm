@@ -91,6 +91,12 @@ try {
   ], { cwd: temporary, timeout: 90_000, maxBuffer: 4 * 1024 * 1024 })
   process.stdout.write(result.stdout)
   process.stderr.write(result.stderr)
+  const compaction = await execute(process.execPath, [
+    '--expose-internals', join(project, 'tests/harness-boundary-compaction.mjs'),
+    '--artifact', artifactRoot, '--harness', harnessRoot,
+  ], { cwd: temporary, timeout: 90_000, maxBuffer: 4 * 1024 * 1024 })
+  process.stdout.write(compaction.stdout)
+  process.stderr.write(compaction.stderr)
   process.stdout.write(`Packed artifact smoke passed (${files.length} published files).\n`)
 } finally {
   await rm(temporary, { recursive: true, force: true })

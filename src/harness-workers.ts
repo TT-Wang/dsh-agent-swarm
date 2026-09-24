@@ -242,6 +242,19 @@ function accumulateUsage(target: UsageBuckets, usage: { inputTokens: number; out
   return Math.ceil(usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) * cacheRead + (usage.cacheWriteTokens ?? 0))
 }
 const emptyBuckets = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
+type ProviderUsage = Parameters<typeof accumulateUsage>[1]
+/**
+ * Provider usage a session event charges to its worker: every model response,
+ * and the summary request of a compaction (the boundary one or the host's own
+ * pressure path), which runs outside the agent loop and so logs no assistant
+ * message. Compaction events belong to an optional host package, hence the
+ * structural read.
+ */
+function chargedUsage(event: { type: string; data: unknown }): ProviderUsage | undefined {
+  if (event.type !== 'assistant/message' && event.type !== 'compaction/summary') return undefined
+  const usage = isRecord(event.data) ? event.data.usage : undefined
+  return isRecord(usage) && typeof usage.inputTokens === 'number' && typeof usage.outputTokens === 'number' ? usage as ProviderUsage : undefined
+}
 /** The durable run keeps the model-visible content; the execution-local canonical value is deliberately not persisted. */
 function durableResult(result: { isError: boolean; content: unknown; error?: unknown; meta?: unknown }): Record<string, unknown> {
   return { isError: result.isError, content: result.content, ...(result.error === undefined ? {} : { error: result.error }), ...(result.meta === undefined ? {} : { meta: result.meta }) }
@@ -377,6 +390,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private readonly activityHeartbeatMs: number
   private readonly activityPublishIntervalMs: number
   private closing = false
+  private compactionUnavailableWarned = false
   private disposal: Promise<void> | undefined
   private readonly removeStreamObserver: () => void
 
@@ -764,8 +778,8 @@ export class HarnessWorkers implements WorkerAdapter {
       this.removeRevokedPending(resident, agent)
       resident.usage = emptyBuckets()
       resident.totalTokens = agent.session.snapshotEvents().reduce((total, event) => {
-        if (event.type !== 'assistant/message' || event.data.usage === undefined) return total
-        return total + accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
+        const usage = chargedUsage(event)
+        return usage === undefined ? total : total + accumulateUsage(resident.usage, usage, this.cacheReadWeight)
       }, 0)
       // Reconcile a session-log commit whose runtime budget transaction was
       // interrupted, before publication can release pending model requests.
@@ -865,7 +879,10 @@ export class HarnessWorkers implements WorkerAdapter {
         if (event.type === 'user/message') resident.recoveryInbox.delete(event.data.id)
         if (event.type === 'assistant/message' && event.data.usage !== undefined) {
           resident.lastPromptTokens = event.data.usage.inputTokens + (event.data.usage.cacheReadTokens ?? 0) + (event.data.usage.cacheWriteTokens ?? 0)
-          const tokens = accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
+        }
+        const charged = chargedUsage(event)
+        if (charged !== undefined) {
+          const tokens = accumulateUsage(resident.usage, charged, this.cacheReadWeight)
           resident.totalTokens += tokens
           const total = resident.totalTokens, buckets = { ...resident.usage }
           this.observe(resident, async () => {
@@ -884,8 +901,10 @@ export class HarnessWorkers implements WorkerAdapter {
       agentCtx.on('agent/status', ({ status }) => {
         if (status !== 'idle') return
         this.clearActivities(resident)
-        if (this.continueAfterRejectedStep(resident, agent)) return
+        // The unit closed before this idle: compact first. A tail re-woken below
+        // then waits behind the compaction, so the next unit starts on the summary.
         this.compactIfRequested(resident)
+        if (this.continueAfterRejectedStep(resident, agent)) return
         void this.drainObservations(resident).then(() => {
           if (resident.stopping === undefined && !this.closing && !abort.signal.aborted && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
@@ -924,6 +943,8 @@ export class HarnessWorkers implements WorkerAdapter {
    * no longer needs. Only the native compaction engine is used, only while the
    * worker is idle, and only when its last request's prompt pressure exceeds
    * the configured threshold; the summary request is accounted like any other.
+   * A worker still in its turn keeps the request until its next idle, which
+   * compacts before any queued input starts the next unit.
    */
   compactAtBoundary(memberId: string): void {
     const resident = this.residents.get(memberId)
@@ -962,15 +983,44 @@ export class HarnessWorkers implements WorkerAdapter {
     const agent = resident.handle?.agent
     if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
-    // The compaction engine is an optional host service; structural access avoids a hard package dependency.
-    const compaction = (this.ctx.get as (name: string) => unknown)('compaction') as { compactNow(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
-    if (compaction === undefined || typeof compaction.compactNow !== 'function') { resident.compactionRequested = false; return }
     resident.compactionRequested = false
+    const compact = this.compactionFor(agent)
+    if (compact === undefined) {
+      if (!this.compactionUnavailableWarned) this.ctx.logger.warn(`Swarm boundary compaction is unavailable: ${resident.spec.member.id}'s composition has no /compact command and the host has no compaction service`)
+      this.compactionUnavailableWarned = true
+      return
+    }
     resident.lastPromptTokens = 0
     this.observe(resident, async () => {
-      try { await compaction.compactNow(agent, resident.abort.signal) }
-      catch (error) { if (!resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${errorText(error)}`) }
+      // Maintenance starts synchronously inside `compact`, so input woken after this returns waits behind it.
+      try {
+        const refusal = await compact(resident.abort.signal)
+        if (refusal !== undefined && !resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${refusal}`)
+      } catch (error) { if (!resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${errorText(error)}`) }
     })
+  }
+  /**
+   * The compaction engine this member's own composition uses. Both supported
+   * web profiles disable the host-plane `compaction-basic` row and mount it in
+   * each agent preset's isolated `compaction` realm, where `ctx.get` from this
+   * plugin cannot see it; the realm's public handle is the `/compact` command it
+   * registers for the agents on that preset. That command runs the engine's
+   * idle-only `compactNow` and reports an expected failure as an error result.
+   * A composition that mounts the engine on the host plane without the command
+   * is reached through the service. Resolves to a refusal text, or undefined.
+   */
+  private compactionFor(agent: Agent): ((signal: AbortSignal) => Promise<string | undefined>) | undefined {
+    const get = this.ctx.get as (name: string) => unknown
+    const commands = get('commands') as { find?(agent: Agent, name: string): { handler(invocation: object): unknown } | undefined } | undefined
+    const command = typeof commands?.find === 'function' ? commands.find(agent, 'compact') : undefined
+    if (command !== undefined) return async signal => {
+      // No command id: nobody typed this, so the host records an uncommanded compaction.
+      const result: unknown = await command.handler(Object.freeze({ agent, rawInput: '', attachments: [], signal }))
+      return isRecord(result) && result.kind === 'error' ? String(result.text) : undefined
+    }
+    const compaction = get('compaction') as { compactNow?(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
+    if (typeof compaction?.compactNow !== 'function') return undefined
+    return async signal => { await compaction.compactNow!(agent, signal); return undefined }
   }
 
   async deliver(member: Member, delivery: Delivery): Promise<void> {
