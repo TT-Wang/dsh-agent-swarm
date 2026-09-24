@@ -23,34 +23,21 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runProcess } from '../lib/workspaces.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MANAGEMENT_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
+import { FakeWorkers, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
 const gitFails = async (cwd, ...args) => {
   const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 10000 })
   return result.exitCode !== 0
 }
 async function gitFixture(t) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-arena-visibility-')))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'src'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
+  const { root: temp, source } = await makeRepo('swarm-arena-visibility')
   const workspaces = makeWorkspaces(temp)
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   return { temp, source, workspaces, artifactsOf: missionId => path.join(temp, 'worktrees', missionId, 'artifacts.git') }
@@ -137,31 +124,19 @@ test('T1c2: the per-mission artifact repository is self-contained, so a source g
   assert.ok(tree.includes('src/answer.txt'), 'an unchanged base blob is readable without the source')
 })
 
-/** Fake adapter: deterministic artifacts, no auto-dispatch, no filesystem effects. */
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'artifact-commit', baseCommit: 'base-commit', workspace: '/isolated', changedPaths: ['src/a.txt'] } }
-  async verifyArtifact(_member, task) { return task.checks.map(command => ({ command, exitCode: 0, output: 'fixture check passed' })) }
-  async prepareTask() {}
-  async dispose() {}
-}
+/** A runtime whose fake adapter gives deterministic artifacts, no auto-dispatch and no filesystem effects. */
 async function runtimeFixture(t) {
-  const root = await mkdtemp(path.join(tmpdir(), 'swarm-arena-registry-'))
-  const stateDirectory = path.join(root, 'state')
+  const { dir: root, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      artifact: { commit: 'artifact-commit', baseCommit: 'base-commit', workspace: '/isolated', changedPaths: ['src/a.txt'] },
+      async verifyArtifact(_member, task) { return task.checks.map(command => ({ command, exitCode: 0, output: 'fixture check passed' })) },
+    }),
+    config: { maxEvents: 500, maxTasksPerMember: 4, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 8, maxExperiments: 1 },
+  })
   const workspace = path.join(root, 'workspace')
-  await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(path.join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: path.join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 4 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
-  const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 8, maxExperiments: 1 }
   const owner = { sessionId: `owner-${randomUUID()}` }
   const mission = runtime.create(owner, { title: 'Arena visibility', objective: 'Exercise the registry and arena view', workspace, scope: ['src/'], acceptance: ['arena works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Arena work' })
@@ -176,9 +151,9 @@ async function runtimeFixture(t) {
     aliceActor: { sessionId: alice.sessionId }, bobActor: { sessionId: bob.sessionId }, carolActor: { sessionId: carol.sessionId },
   }
 }
-function definitions(runtime) {
+function definitions(runtime, budget) {
   const registered = new Map()
-  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 8, maxExperiments: 1 })
+  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget)
   return registered
 }
 const execution = sessionId => ({ signal: new AbortController().signal, agent: { id: sessionId } })
@@ -302,7 +277,7 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
 test('swarm_registry joins the single registry as an owner-only read tool and a closed trace step', async t => {
   const f = await runtimeFixture(t)
   await submitArtifact(f, f.aliceActor, f.stream, 'Registry artifact')
-  const tools = definitions(f.runtime)
+  const tools = definitions(f.runtime, f.budget)
   assert.deepEqual([...tools.keys()], [...SWARM_TOOLS], 'registration order is the cached schema prefix')
   for (const name of SWARM_TOOLS) assert(TRACE_STEPS.includes(name), `${name} must be a closed trace step`)
   assert(SWARM_TOOLS.includes('swarm_registry'))

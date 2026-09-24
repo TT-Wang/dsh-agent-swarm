@@ -6,21 +6,12 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, realpath, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
+import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
-  async start() {}
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
-}
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 function definitions(runtime) {
   const registered = new Map()
   registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget)
@@ -36,12 +27,12 @@ const plan = workspace => ({
 const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
 
 test('swarm_create/swarm_stage canonicalize the workspace so delivery can apply the result', async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-canonical-')))
+  const { dir: directory, runtime } = await makeRuntime(t, {
+    workers: new FakeWorkers({ autoIdle: true, async prepareWorkspace(mission, id) { return join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined },
+  })
   const workspace = join(directory, 'workspace'), alias = join(directory, 'workspace-alias')
   await mkdir(workspace); await symlink(workspace, alias)
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }, new Workers())
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const tools = definitions(runtime)
   const exec = { agent: { id: 'canonical-owner', session: { header: { cwd: workspace } } }, signal: new AbortController().signal }
   const created = await tools.get('swarm_create').execute(missionFields(alias), exec)
