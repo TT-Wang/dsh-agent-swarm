@@ -25,7 +25,7 @@ class ControlledWorkers extends FakeWorkers {
   verification
   artifact = {commit:'artifact',baseCommit:'base',workspace:'/isolated',changedPaths:['src/a']}
   checks = [{command:'check',exitCode:0,output:'ok'}]
-  async stop(id) { this.activity=undefined; this.stopped.push(id); this.verification?.resolve() }
+  async stop(id) { this.activities.delete(id); this.stopped.push(id); this.verification?.resolve() }
   async verifyArtifact() { if(this.verification) await this.verification.promise; return this.checks }
 }
 async function runtimeFixture(t,clock) {

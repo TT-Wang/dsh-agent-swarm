@@ -32,7 +32,7 @@ test('a live model stream renews the lease with output-token headroom; a stale a
   assert.equal(runtime.store.events(mission.id, 100).some(event => event.type === 'task/lease-expiring'), false)
 
   // The adapter no longer reports the operation: renewal stops, one warning is emitted, then expiry.
-  workers.activity = undefined
+  workers.activities.delete(member.id)
   const shortened = runtime.store.get('tasks', task.id)
   shortened.attempt.leaseUntil = Date.now() + 5
   runtime.store.transaction(() => runtime.store.put('tasks', shortened))
