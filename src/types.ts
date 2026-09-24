@@ -386,7 +386,15 @@ export interface TaskAmendment {
   maxFindings?: number
   maxRecoveryAttempts?: number
   checkTimeoutMs?: number
+  maxRework?: number
 }
+/**
+ * One independent rejection a task was re-opened from: the rejected artifact
+ * commit, the task epoch it was submitted at, the review that rejected it and
+ * that review's reason, and the claims the rejection refuted (history, not a
+ * block cause, once the task is reworked).
+ */
+export interface TaskRejection { commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[] }
 export interface Task {
   id: string
   missionId: string
@@ -438,6 +446,11 @@ export interface Task {
   recoveryCount?: number
   /** Primary-agent choice; absent only on legacy/manual tasks. */
   maxRecoveryAttempts?: number
+  /** Owner re-opens of this task after an independent rejection, bounded by `maxRework` (default 2). */
+  reworkCount?: number
+  maxRework?: number
+  /** Rejections this task was re-opened from, oldest first. */
+  rejections?: TaskRejection[]
   /** Per-task model-step ceiling admitted with the task; the runtime blocks the task at this limit. */
   maxSteps?: number
   /** Per-task finding (published evidence) ceiling admitted with the task. */

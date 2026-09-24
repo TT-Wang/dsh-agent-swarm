@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type PendingRestore, type PostFilter, type StoreOptions } from './store.ts'
-import { Attempts, blockCauses, pendingStopOwner, stopPending, type BlockCause } from './attempts.ts'
+import { Attempts, blockCauses, currentEvidenceIds, pendingStopOwner, stopPending, type BlockCause } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
@@ -115,6 +115,31 @@ const START_FAILURE_REROUTE_LIMIT = 3
  * consume an unbounded share of the mission budget.
  */
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
+/**
+ * Owner re-opens of one rejected task (`maxRework` when the task sets none).
+ * Past it the task stays blocked until the owner raises `maxRework` or
+ * repairs it another way, so a task the reviewers keep rejecting cannot loop.
+ */
+export const DEFAULT_MAX_REWORK = 2
+/**
+ * The repair path the verify site's rejection decision names to the owner and
+ * to the author: rework in place first, a replacement second. A rejected
+ * experiment stays blocked, so it is offered the replacement alone; a task past
+ * its rework bound is offered the raise.
+ */
+function rejectionRepair(source: Task): { owner: string; author: string } {
+  const replaces = `swarm_propose naming replaces: ["${source.id}"]`
+  if (source.experiment) return { owner: 'Repair it with a replacement task or adjust the plan.',
+    author: `Repair path: propose a replacement with ${replaces} and the same kind (${source.kind}); the replacement inherits its acceptance. Do not resubmit this task; it stays blocked until its replacement is independently accepted.` }
+  const resume = `swarm_control(action: "resume", taskId: "${source.id}", reason)`
+  const used = source.reworkCount ?? 0
+  const max = source.maxRework ?? DEFAULT_MAX_REWORK
+  return {
+    owner: `${used < max ? `Rework it in place with ${resume} (rework ${used + 1}/${max}): its author resumes from the rejected commit and the resubmission is reviewed afresh`
+      : `It was reworked ${used}/${max} times; raise changes.maxRework in ${resume} to rework it again`}. Otherwise propose a replacement with ${replaces}, or adjust the plan.`,
+    author: `Repair path: the owner can re-open this task for you with ${resume}; then rework it from your rejected commit and resubmit. Otherwise a replacement repairs it: ${replaces} and the same kind (${source.kind}), inheriting its acceptance. Until then do not resubmit; it stays blocked.`,
+  }
+}
 /**
  * The instructions every assignment delivery carries to its worker, verbatim.
  * Exported so the model-visible snapshot (`tests/harness-composition.mjs`)
@@ -1689,7 +1714,8 @@ export class SwarmRuntime {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind === 'verification') throw new Error('[verification_requires_verify] Verification tasks must use swarm_verify Call `swarm_verify` with `taskId` and `verdict`, then retry.')
       this.bounded(input.output)
-      if (task.kind === 'research' && task.evidenceIds.length === 0) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
+      // A refuted claim, or one a rework archived, supports nothing.
+      if (task.kind === 'research' && currentEvidenceIds(task).every(evidenceId => this.store.get('evidence', evidenceId)?.status === 'refuted')) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
       this.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       // A declared output that is not written is refused at capture with
       // [output_missing] before any commit, while the attempt is still running.
@@ -1716,7 +1742,8 @@ export class SwarmRuntime {
       const missingReview = this.missingReviewPath(task)
       this.commit(missionId, () => {
         this.store.put('tasks', task)
-        for (const evidenceId of task.evidenceIds) { const e = this.store.get('evidence', evidenceId)!; e.artifact = artifact; this.store.put('evidence', e) }
+        // A refuted or archived claim stays pinned to the artifact it was judged on (F3-B).
+        for (const evidenceId of currentEvidenceIds(task)) { const e = this.store.get('evidence', evidenceId)!; if (e.status === 'refuted') continue; e.artifact = artifact; this.store.put('evidence', e) }
         // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
         this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact,
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
@@ -1855,8 +1882,13 @@ export class SwarmRuntime {
           for (const memberId of oldReviews.released) released.add(memberId)
         }
         const verdictEvidence: Array<{ id: string; outcome: string }> = []
-        for (const evidenceId of source.evidenceIds) {
+        for (const evidenceId of currentEvidenceIds(source)) {
           const evidence = this.store.get('evidence', evidenceId)!
+          // F3-B: a claim is never both refuted and verified. One refuted by an
+          // earlier verdict or a superseding claim stays refuted, and one a
+          // rework archived stays with the rejection that refuted it: this
+          // verdict neither verifies it again nor records a second refutation.
+          if (evidence.status === 'refuted') continue
           // F-12: the durable log must reconstruct which claim became verified or
           // refuted and which reviews the verdict retired; `task/accepted` alone
           // names neither the evidence nor the retired tasks.
@@ -1865,10 +1897,8 @@ export class SwarmRuntime {
             // the stored status matches the `evidence/refuted` event. Leaving
             // the record `challenged` made the board show an unresolved dispute
             // while the durable log already said the claim was refuted.
-            if (evidence.status !== 'refuted') {
-              evidence.status = 'refuted'
-              this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
-            }
+            evidence.status = 'refuted'
+            this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
             this.store.put('evidence', evidence)
             verdictEvidence.push(evidence)
             continue
@@ -1902,7 +1932,8 @@ export class SwarmRuntime {
         }
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
-          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, this.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
+          const repair = rejectionRepair(source)
+          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, this.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
           // R11-18: the rejection reason and the repair path must reach the
           // source author, not only the owner. The author's re-claim is refused
           // (the task is blocked), so without this delivery the only exit is
@@ -1910,7 +1941,7 @@ export class SwarmRuntime {
           const authorId = source.attempt?.ownerId ?? source.assigneeId
           const author = authorId === undefined ? undefined : this.store.get('members', authorId)
           if (author !== undefined && memberPhaseOf(author) !== 'stopped') this.store.put('deliveries', { id: id('msg'), missionId, from: member.id, to: author.id, kind: 'control', createdAt: this.now(),
-            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"] and the same kind (${source.kind}); the replacement inherits its acceptance. Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
+            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\n${repair.author}` })
         }
       })
       // Retired reviewers carry durable stop/checkpoint markers; retirement
@@ -2347,6 +2378,51 @@ export class SwarmRuntime {
     return { retired, released }
   }
   /**
+   * The review whose negative verdict on this exact artifact blocked `task`: it
+   * is blocked on that `reviewedCommit` with no deferred-recovery record.
+   * Undefined for every other task, including work invalidated after it
+   * submitted, whose own review never rejected it.
+   */
+  private rejectingReview(task: Task): Task | undefined {
+    const commit = task.status === 'blocked' ? task.artifact?.commit : undefined
+    if (commit === undefined) return undefined
+    return this.store.list('tasks', task.missionId).find(review => review.reviewOf === task.id && review.status === 'blocked'
+      && review.verificationRecovery === undefined && review.reviewedCommit === commit)
+  }
+  /**
+   * Re-open an independently rejected task in place (owner resume). The
+   * rejection moves into `rejections` with the claims it refuted, which stay
+   * refuted; the artifact is released, so scope, checks and assignee can be
+   * amended again; the rejected attempt's owner joins `priorOwnerIds` and stays
+   * the assignee. The author therefore resumes from the rejected commit (the
+   * same-task workspace recovery), and no member who could review the rejected
+   * attempt loses the right to review the reworked one.
+   */
+  private reopenForRework(task: Task, review: Task): void {
+    const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
+    const commit = task.artifact!.commit
+    const reason = review.output ?? ''
+    task.rejections = [...task.rejections ?? [], { commit, epoch: task.epoch, reviewTaskId: review.id, reason, evidenceIds: task.evidenceIds.filter(evidenceId => !archived.has(evidenceId)) }]
+    task.reworkCount = (task.reworkCount ?? 0) + 1
+    task.assigneeId = task.attempt?.ownerId ?? task.assigneeId
+    delete task.artifact
+    this.dropAttempt(task); task.epoch++
+    task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}: ${reason}\nRework it from that commit, then resubmit.`.trim()
+  }
+  /**
+   * Retire the review whose rejection a rework superseded. Its verdict,
+   * `reviewedCommit` and review artifact stay on the row (and in the source's
+   * `rejections`); the reworked artifact gets its own independent review. The
+   * verdict ended its attempt, so no reviewer is stopped. Call inside a mission
+   * transaction.
+   */
+  private retireRejectingReview(review: Task, reason: string): void {
+    const retired: Task = { ...review, status: 'cancelled', output: `${review.output ?? ''}\nSuperseded: ${reason}`.trim() }
+    this.dropAttempt(retired)
+    this.store.put('tasks', retired)
+    this.store.event(review.missionId, 'task/review-retired', 'runtime', { taskId: review.id, reviewOf: review.reviewOf, previousStatus: 'blocked', reason })
+  }
+  /**
    * F2: the live independent review of a submitted source, if one can still
    * reach a verdict. Uses the shared admission predicate so admission,
    * scheduling and the owner notice agree on what "has a review" means.
@@ -2440,7 +2516,9 @@ export class SwarmRuntime {
     const admittedId = current?.id ?? admitted
     if (admittedId === undefined) return undefined
     const review = this.store.get('tasks', admittedId)
-    if (review === undefined || review.status !== 'cancelled') return undefined
+    // A review that recorded its verdict on an earlier artifact (retired when
+    // the owner re-opened the source for rework) was not withdrawn from this one.
+    if (review === undefined || review.status !== 'cancelled' || (review.reviewedCommit !== undefined && review.reviewedCommit !== source.artifact?.commit)) return undefined
     return `the automatically admitted review ${admittedId} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
   }
   private automaticReviewId(source: Task): string {
@@ -3486,7 +3564,7 @@ export class SwarmRuntime {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (!['amend', 'resume'].includes(action)) throw new PolicyError('task_action_invalid', 'validation_error', 'Task control supports amend or resume')
     this.bounded(reason)
-    const allowed = ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs']
+    const allowed = ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId', 'maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs', 'maxRework']
     if (changes === null || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !allowed.includes(key))) throw new PolicyError('task_amendment_invalid', 'validation_error', 'Unknown task amendment field')
     // An amendment naming no field would still record task/amended and append
     // `Owner amend: <reason>` to the handoff workers read, changing nothing.
@@ -3513,16 +3591,21 @@ export class SwarmRuntime {
     // the scope it must sit inside: a submitted artifact's obligations cannot be
     // rewritten after the fact.
     const structural = !strengthenSubmittedChecks && ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
-    if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', 'Submitted artifact policy is immutable; repair rejected work through a replacement')
+    if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', `[artifact_policy_immutable] Task ${task.id} holds a submitted or rejected artifact, so its scope, outputs, dependencies, checks and assignee are fixed. Resume a rejected task with \`swarm_control\` and \`action\` resume first, then amend it; otherwise propose a replacement with \`swarm_propose\` naming \`replaces\`.`)
     const causes = this.taskBlockCauses(task)
-    if (task.status === 'blocked' && causes.has('refuted') && !causes.has('review-deferred')) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
+    // An independently rejected source re-opens in place when it resumes (the
+    // rework below). A rejected experiment stays blocked, and a pending stop
+    // keeps its resume as the cleanup retry.
+    const rejection = task.experiment || stopPending(task) ? undefined : this.rejectingReview(task)
+    if (rejection === undefined && task.status === 'blocked' && causes.has('refuted') && !causes.has('review-deferred')) throw new PolicyError('task_refuted', 'conflict_error', 'Refuted work requires a replacement preserving its original acceptance')
     const next: Task = { ...task }
-    for (const key of ['maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs'] as const) {
+    for (const key of ['maxSteps', 'maxFindings', 'maxRecoveryAttempts', 'checkTimeoutMs', 'maxRework'] as const) {
       const value = changes[key]
       if (value === undefined) continue
       if (!Number.isSafeInteger(value) || value < 1 || (key === 'checkTimeoutMs' && value > 2147483647)) throw new PolicyError('task_allocation_invalid', 'validation_error', `${key} must be a positive safe allocation`)
       if (key === 'maxSteps' && (value > mission.budget.maxSteps || value < (task.usedSteps ?? 0))) throw new PolicyError('task_step_allocation_invalid', 'budget_error', 'Task maxSteps must cover consumed steps and fit the mission budget')
       if (key === 'maxRecoveryAttempts' && value < (task.recoveryCount ?? 0)) throw new PolicyError('task_recovery_allocation_invalid', 'budget_error', 'maxRecoveryAttempts cannot be below consumed recovery attempts')
+      if (key === 'maxRework' && value < (task.reworkCount ?? 0)) throw new PolicyError('task_rework_allocation_invalid', 'budget_error', `[task_rework_allocation_invalid] Task ${task.id} was already reworked ${task.reworkCount} time(s). Pass \`maxRework\` of at least ${task.reworkCount} in \`changes\` to \`swarm_control\`, then retry.`)
       next[key] = value
     }
     if (changes.scope !== undefined) {
@@ -3570,12 +3653,16 @@ export class SwarmRuntime {
       }
     }
     const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next, this.now()) === undefined)
-    // A blocked task that carries an artifact was rejected, or invalidated after
-    // it submitted: the artifact is immutable, so a resume would only fence the
-    // historical author and re-pend work that can never change. A resume while a
-    // stop is still pending is the advertised cleanup retry, which keeps the
-    // blocked outcome, so it stays allowed.
-    if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
+      || (rejection !== undefined && changes.maxRework !== undefined && (task.reworkCount ?? 0) < changes.maxRework)
+    const rework = resumes ? rejection : undefined
+    const maxRework = next.maxRework ?? DEFAULT_MAX_REWORK
+    if (rework !== undefined && (task.reworkCount ?? 0) >= maxRework) throw new PolicyError('task_rework_exhausted', 'budget_error', `[task_rework_exhausted] Task ${task.id} was already reworked ${task.reworkCount}/${maxRework} time(s) after independent rejection, so it stays blocked. Raise \`maxRework\` in \`changes\` with \`swarm_control\` to resume it again, or withdraw it with \`swarm_cancel\` and its \`taskId\` and propose a replacement with \`swarm_propose\` naming \`replaces\`: ["${task.id}"].`)
+    // Any other blocked task that carries an artifact (a rejected experiment, or
+    // work invalidated after it submitted) keeps it immutable: a resume would
+    // only fence the historical author and re-pend work that can never change.
+    // A resume while a stop is still pending is the advertised cleanup retry,
+    // which keeps the blocked outcome, so it stays allowed.
+    if (resumes && rework === undefined && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact that resume cannot rework: ${task.experiment ? 'a rejected experiment stays blocked' : 'its submitted work was invalidated after submission'}. \`swarm_control\` with \`action\` resume re-opens in place only an independently rejected task that is not an experiment. Repair this one with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next, this.now()) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
@@ -3590,7 +3677,9 @@ export class SwarmRuntime {
     }
     if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
-    const activeOwner = task.attempt?.ownerId
+    if (rework !== undefined) this.reopenForRework(next, rework)
+    // A rejected submission holds no live attempt: its author is not stopped.
+    const activeOwner = rework === undefined ? task.attempt?.ownerId : undefined
     if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
       next.status = 'blocked'; next.epoch++; this.dropAttempt(next)
       next.resumeAfterStop = { epoch: next.epoch, memberId: activeOwner, reason: 'handoff', at: this.now() }
@@ -3606,7 +3695,9 @@ export class SwarmRuntime {
     // one task has no business clearing.
     this.commit(missionId, () => {
       this.store.put('tasks', next)
-      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])) })
+      if (rework !== undefined) this.retireRejectingReview(rework, `${taskId} was re-opened for rework by the mission owner`)
+      this.store.event(missionId, 'task/amended', 'owner', { taskId, action, reason, changes, epoch: next.epoch, status: next.status, ...(activeOwner !== undefined && (structural || (resumes && task.status === 'blocked')) ? { fencedAttemptId: task.attempt!.id } : {}), previous: Object.fromEntries(Object.keys(changes).map(key => [key, task[key as keyof Task] ?? null])),
+        ...(rework === undefined ? {} : { rework: next.rejections!.at(-1), reworkCount: next.reworkCount }) })
     })
     this.attempts.resumeStoppedAttempt(missionId, next, { force: action === 'resume' })
     if (mission.status === 'active') this.kick(missionId)

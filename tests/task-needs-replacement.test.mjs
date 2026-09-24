@@ -1,11 +1,12 @@
 /**
- * A blocked task that carries an artifact (a rejected source, or submitted work
- * invalidated after submission) can only be repaired by a replacement. Owner
- * task control used to accept `resume` on it: the first resume bumped the epoch
- * and fenced the historical author's handle, the second re-pended work whose
- * artifact is immutable. Both are refused now with a coded next step naming
- * `swarm_propose` with `replaces`; the existing `task_refuted` guard is pinned
- * beside it.
+ * A blocked task that carries an artifact resume cannot rework (a rejected
+ * experiment, or submitted work invalidated after submission) can only be
+ * repaired by a replacement. Owner task control used to accept `resume` on it:
+ * the first resume bumped the epoch and fenced the historical author's handle,
+ * the second re-pended work whose artifact is immutable. Both are refused with a
+ * coded next step naming `swarm_propose` with `replaces`; the existing
+ * `task_refuted` guard is pinned beside it. An independently rejected
+ * non-experiment re-opens in place instead (tests/rework-in-place.test.mjs).
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -24,7 +25,7 @@ async function fixture(t) {
       async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
     }),
     config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
-    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 },
   })
   const owner = { sessionId: 'replacement-owner' }
   const mission = runtime.create(owner, { title: 'Replacement', objective: 'Repair rejected work', workspace: directory,
@@ -65,13 +66,15 @@ const needsReplacement = taskId => error => {
   assert.equal(error.category, 'conflict_error')
   assert.ok(error.message.startsWith('[task_needs_replacement] '), error.message)
   assert.match(error.message, /`swarm_propose`[^.]*`replaces`/)
+  const resumeAt = error.message.indexOf('`action` resume')
+  assert.ok(resumeAt >= 0 && resumeAt < error.message.indexOf('`swarm_propose`'), 'the in-place rework is named before the replacement')
   assert.ok(error.message.includes(`["${taskId}"]`), 'the exit names the task the replacement must cover')
   return true
 }
 
-test('resume of a rejected implementation is refused every time: no epoch bump, no author stop, never pending', async t => {
+test('resume of a rejected experiment is refused every time: no epoch bump, no author stop, never pending', async t => {
   const f = await fixture(t)
-  const task = f.propose()
+  const task = f.propose({ experiment: true })
   const rejected = await f.reject(task)
   const stopsBefore = f.workers.stopped.length
   for (const attempt of [1, 2]) {
@@ -89,9 +92,9 @@ test('resume of a rejected implementation is refused every time: no epoch bump, 
   assert.equal(f.events('task/handoff-ready').length, 0)
 })
 
-test('an amendment that would implicitly resume a rejected implementation is refused the same way', async t => {
+test('an amendment that would implicitly resume a rejected experiment is refused the same way', async t => {
   const f = await fixture(t)
-  const task = f.propose()
+  const task = f.propose({ experiment: true })
   const rejected = await f.reject(task)
   assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { maxRecoveryAttempts: 5 }, 'More recovery room'), needsReplacement(task.id))
   await settle()
@@ -144,9 +147,9 @@ test('a resume while the stop is still pending stays the cleanup retry and keeps
   assert.ok(f.workers.stopped.includes(f.author.id), 'the cleanup retry stops the recorded handle')
 })
 
-test('task_refuted: a rejected task whose evidence was refuted refuses resume and amendment', async t => {
+test('task_refuted: a rejected experiment whose evidence was refuted refuses resume and amendment', async t => {
   const f = await fixture(t)
-  const task = f.propose()
+  const task = f.propose({ experiment: true })
   const rejected = await f.reject(task, { publish: true })
   assert.equal(rejected.evidenceIds.length, 1)
   assert.equal(f.runtime.store.get('evidence', rejected.evidenceIds[0]).status, 'refuted')
@@ -165,9 +168,26 @@ test('task_refuted: a rejected task whose evidence was refuted refuses resume an
   assert.equal(f.workers.stopped.includes(f.author.id), false)
 })
 
-test('the task_needs_replacement refusal meets the refusal contract against the real tool schema', async t => {
+test('a structural amendment of a rejected task names the resume before the replacement and meets the refusal contract', async t => {
   const f = await fixture(t)
   const task = f.propose()
+  await f.reject(task)
+  let message
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: ['test', 'test -d .'] }, 'Stronger checks before the rework'), error => {
+    assert.equal(error.code, 'artifact_policy_immutable')
+    assert.ok(error.message.startsWith('[artifact_policy_immutable] '), error.message)
+    const resumeAt = error.message.indexOf('`action` resume')
+    assert.ok(resumeAt >= 0 && resumeAt < error.message.indexOf('`swarm_propose`'), error.message)
+    message = error.message
+    return true
+  })
+  assert.deepEqual(assessText(message, await toolSchemaIndex()), [])
+  assert.deepEqual(f.current(task).checks, ['test'], 'nothing of the refused amendment is written')
+})
+
+test('the task_needs_replacement refusal meets the refusal contract against the real tool schema', async t => {
+  const f = await fixture(t)
+  const task = f.propose({ experiment: true })
   await f.reject(task)
   let message
   try { f.runtime.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'Retry') } catch (error) { message = error.message }
