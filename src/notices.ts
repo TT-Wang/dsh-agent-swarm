@@ -410,18 +410,12 @@ export interface LineageRuntime {
  * Co-fires with: the lineage-resolved dependency rule (both read the same durable
  * `replaces` edges the dispatcher's `effectiveDependency` walks) and the
  * fall-through, which may name a subject only when this set does not contain it.
+ * The walk is the task graph's `replacedLineage`.
  */
 export function replacementCoverage(tasks: Task[]): Set<string> {
+  const graph = taskGraphIndex(tasks)
   const replaced = new Set<string>()
-  const cover = (task: Task): void => {
-    for (const source of task.replaces ?? []) {
-      if (replaced.has(source)) continue
-      replaced.add(source)
-      const origin = tasks.find(candidate => candidate.id === source)
-      if (origin !== undefined) cover(origin)
-    }
-  }
-  for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) cover(task)
+  for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
   return replaced
 }
 

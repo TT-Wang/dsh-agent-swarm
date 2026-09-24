@@ -6,7 +6,7 @@ import { Attempts, blockCauses, currentEvidenceIds, pendingStopOwner, stopPendin
 import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, REJECTION_DECISION_TRIGGER, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -649,6 +649,10 @@ export class SwarmRuntime {
             })
           }
         }
+        // A store written before an accepted replacement retired its whole
+        // lineage may still hold the chain blocked; retired rows are terminal,
+        // so this replay retires nothing twice.
+        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length) this.retireReplacedLineage(mission.id, task)
         // R17-G7: recovery used to rewrite every non-stopped member row to
         // `idle`, which is exactly how a member could read `idle` while the
         // attempt it owns was still live (R15-F2). There is nothing to write:
@@ -1062,22 +1066,6 @@ export class SwarmRuntime {
   dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
   async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task, pass) }
-  /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
-  private replacementLineage(missionId: string, task: Task): Set<string> {
-    const tasks = this.store.list('tasks', missionId)
-    const seen = new Set<string>([task.id])
-    for (let frontier = [task]; frontier.length;) {
-      const next: Task[] = []
-      for (const item of frontier) for (const replacedId of item.replaces ?? []) {
-        if (seen.has(replacedId)) continue
-        seen.add(replacedId)
-        const replaced = tasks.find(candidate => candidate.id === replacedId)
-        if (replaced) next.push(replaced)
-      }
-      frontier = next
-    }
-    return seen
-  }
   
   
   
@@ -1693,7 +1681,8 @@ export class SwarmRuntime {
     this.bounded(input.claim)
     if (!EVIDENCE_OUTCOMES.includes(input.outcome)) throw new PolicyError('invalid_evidence_outcome', 'validation_error', '[invalid_evidence_outcome] Evidence `outcome` must be supported, disproved or inconclusive; it describes the hypothesis, not task success. Correct `outcome` and retry `swarm_publish`.')
     this.validateRuns(missionId, member.id, task, input.toolRunIds)
-    const lineage = this.replacementLineage(missionId, task)
+    // A repair may only supersede evidence of its own replaced lineage.
+    const lineage = new Set(taskGraphIndex(this.store.list('tasks', missionId)).replacedLineage(task.id).map(row => row.id))
     for (const previous of input.supersedes ?? []) {
       const evidence = this.store.get('evidence', previous)
       if (!evidence || evidence.missionId !== missionId) throw new Error('[supersede_foreign_evidence] Superseded evidence must belong to this mission. Correct `supersedes` with `swarm_publish`, then retry.')
@@ -1868,18 +1857,10 @@ export class SwarmRuntime {
         const siblings = this.retireReviewSiblings(missionId, source.id, { exclude: task.id, reason: verdictReason })
         const retired = siblings.retired.map(review => review.id)
         for (const memberId of siblings.released) released.add(memberId)
-        if (passed) for (const previousId of source.replaces ?? []) {
-          const previous = this.task(missionId, previousId)
-          // A replacement repairs blocked work or restores a cancelled task; any
-          // other status change during verification is a conflict.
-          if (previous.status !== 'blocked' && previous.status !== 'cancelled') throw new Error('Replacement target changed during verification')
-          if (previous.status === 'blocked') {
-            previous.status = 'cancelled'; previous.output = `${previous.output ?? ''}\nSuperseded by independently accepted task ${source.id}`
-            this.store.put('tasks', previous)
-          }
-          const oldReviews = this.retireReviewSiblings(missionId, previousId, { exclude: source.id, reason: `Superseded by review of replacement ${source.id}` })
-          retired.push(...oldReviews.retired.map(review => review.id))
-          for (const memberId of oldReviews.released) released.add(memberId)
+        if (passed) {
+          const lineage = this.retireReplacedLineage(missionId, source)
+          retired.push(...lineage.retired.map(review => review.id))
+          for (const memberId of lineage.released) released.add(memberId)
         }
         const verdictEvidence: Array<{ id: string; outcome: string }> = []
         for (const evidenceId of currentEvidenceIds(source)) {
@@ -2421,6 +2402,37 @@ export class SwarmRuntime {
     this.dropAttempt(retired)
     this.store.put('tasks', retired)
     this.store.event(review.missionId, 'task/review-retired', 'runtime', { taskId: review.id, reviewOf: review.reviewOf, previousStatus: 'blocked', reason })
+  }
+  /**
+   * An accepted replacement carries every obligation of its replaced lineage
+   * (`replacedLineage`: the `replaces` chain back to its roots, both parents of
+   * a multi-parent repair included). Each row of it still blocked or pending is
+   * cancelled with one `task/superseded` naming the replacement, and every
+   * cancelled row's open reviews are retired. Accepted, running and submitted
+   * rows are never retired; another live replacement of a retired row (a fork)
+   * is left alone and named. Terminal rows are skipped, so a replay retires
+   * nothing twice. Returns the retired reviews. Must be called inside a mission
+   * transaction.
+   */
+  private retireReplacedLineage(missionId: string, accepted: Task): { retired: Task[]; released: Set<string> } {
+    const graph = taskGraphIndex(this.store.list('tasks', missionId))
+    const lineage = graph.replacedLineage(accepted.id)
+    const carried = new Set(lineage.map(row => row.id))
+    const retired: Task[] = [], released = new Set<string>()
+    for (const previous of lineage.slice(1)) {
+      const previousStatus = previous.status
+      if (previousStatus === 'blocked' || previousStatus === 'pending') {
+        const liveReplacements = graph.replacementDescendants(previous.id).filter(row => !carried.has(row.id) && !TERMINAL_STATES.has(row.status)).map(row => row.id)
+        previous.status = 'cancelled'
+        previous.output = `${previous.output ?? ''}\nSuperseded by independently accepted task ${accepted.id}${liveReplacements.length ? `; live replacement ${liveReplacements.join(', ')} left alone` : ''}`
+        this.store.put('tasks', previous)
+        this.store.event(missionId, 'task/superseded', 'runtime', { taskId: previous.id, supersededBy: accepted.id, previousStatus, ...(liveReplacements.length ? { liveReplacements } : {}) })
+      } else if (previousStatus !== 'cancelled') continue
+      const reviews = this.retireReviewSiblings(missionId, previous.id, { exclude: accepted.id, reason: `Superseded by review of replacement ${accepted.id}` })
+      retired.push(...reviews.retired)
+      for (const memberId of reviews.released) released.add(memberId)
+    }
+    return { retired, released }
   }
   /**
    * F2: the live independent review of a submitted source, if one can still

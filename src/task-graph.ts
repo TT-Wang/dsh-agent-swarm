@@ -22,6 +22,24 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     }
     return result
   }
+  /**
+   * `id` and every task it replaces, transitively: the one backward walk over
+   * `replaces`, both parents of a `replaces: [a, b]` repair included, in
+   * breadth-first order from `id`. Only indexed rows are returned, so an id
+   * outside this mission ends its branch. Evidence supersession, the owner-notice
+   * coverage and the retirement an accepted replacement performs all read it.
+   */
+  const replacedLineage = (id: string): Task[] => {
+    const start = byId.get(id)
+    if (start === undefined) return []
+    const result = [start], seen = new Set([id])
+    for (let index = 0; index < result.length; index++) for (const previousId of result[index]!.replaces ?? []) {
+      const previous = byId.get(previousId)
+      if (previous === undefined || seen.has(previousId)) continue
+      seen.add(previousId); result.push(previous)
+    }
+    return result
+  }
   // A cancelled branch may converge with another branch on the same accepted
   // repair. Count accepted task identities, not the number of incoming paths.
   // Live rows stop this traversal: an accepted historical descendant behind a
@@ -132,7 +150,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants }
+  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, replacedLineage }
 }
 
 /** Reuse only while the indexed task rows remain unchanged within one synchronous read. */
