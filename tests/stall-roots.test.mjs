@@ -9,8 +9,6 @@ import { waitsLegitimately } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
 import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
 /**
  * A started runtime with one member, on the shared fixture. With a `clock`
  * (FakeClock) the runtime reads it and runs no tick timer: the test moves the
@@ -44,7 +42,7 @@ async function ticksUntil(f, read, message, limit = 200) {
 }
 
 test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sibling runs', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, { clock: new FakeClock() })
   const sibling = f.propose('Healthy sibling')
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)
   // The dependent is admitted before the root dies (admission refuses a
@@ -54,7 +52,8 @@ test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sib
   const dependentRow = f.runtime.store.get('tasks', dependent.id)
   dependentRow.dependencies = [root.id]
   f.runtime.store.put('tasks', dependentRow)
-  await sleep(200)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   const roots = f.stallRoots()
   assert.equal(roots.length, 1, `exactly one stall-root notice: ${JSON.stringify(roots.map(delivery => delivery.notice.dedupKey))}`)
   const notice = roots[0]
@@ -66,43 +65,49 @@ test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sib
   const event = f.runtime.store.events(f.mission.id, 200).filter(item => item.type === 'mission/stalled' && item.data?.cause === 'stall-root').at(-1)
   assert.ok(event, 'the stall root is durable with its own cause')
   assert.equal(event.data.taskId, root.id)
-  await sleep(150)
+  await ticks(f, 6)
   assert.equal(f.stallRoots().length, 1, 'the same root@epoch never repeats')
 })
 
 test('R14-F2(b): a blocked task with a live replacement is lineage, not a root', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, { clock: new FakeClock() })
   const source = f.block(f.propose('Superseded'))
   const replacement = f.propose('Live replacement', { replaces: [source.id] })
   await f.runtime.claim(f.actor, f.mission.id, replacement.id)
-  await sleep(200)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   assert.equal(f.stallRoots().length, 0, 'a live replacement covers its lineage')
 })
 
 test('R14-F2(b/d): a stop awaited past the declared bound is a stall root', async t => {
-  const f = await fixture(t, { stallPassTimeoutMs: 40 })
+  const f = await fixture(t, { clock: new FakeClock(), stallPassTimeoutMs: 40 })
   const root = f.propose('Stuck stop')
   const row = f.runtime.store.get('tasks', root.id)
   row.status = 'blocked'; row.epoch++
-  row.resumeAfterStop = { epoch: row.epoch, reason: 'handoff', at: Date.now() - 5000 }
+  row.resumeAfterStop = { epoch: row.epoch, reason: 'handoff', at: f.clock.now() - 5000 }
   f.runtime.store.put('tasks', row)
-  await sleep(150)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 6)
   const roots = f.stallRoots()
   assert.equal(roots.length, 1, 'an expired stop is a root')
   assert.match(roots[0].content, /awaited/, `the notice names the awaited stop: ${roots[0].content}`)
 })
 
 test('R14-F2(c): the runtime stays silent while every unfinished task is legitimately waiting', async t => {
-  const f = await fixture(t)
-  const running = f.propose('Running')
+  const f = await fixture(t, { clock: new FakeClock() })
+  // Research kind keeps the integration-gap diagnostic off the board, whose
+  // witness would otherwise stand for it: the classifier itself must judge it.
+  const research = { kind: 'research', checks: undefined }
+  const running = f.propose('Running', research)
   await f.runtime.claim(f.actor, f.mission.id, running.id)
-  f.propose('Waiting on the running task', { dependencies: [running.id] })
-  await sleep(200)
+  f.propose('Waiting on the running task', { ...research, dependencies: [running.id] })
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   assert.equal(f.fallthroughs().length, 0, 'a live dependency is legitimate waiting, not silence')
 })
 
 test('R14-F2(c): a pending task whose predecessor is dead escalates and is named', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, { clock: new FakeClock() })
   // A healthy sibling keeps the board out of the W3 stall class, so the
   // fall-through escalation itself is what must name the dead-ended task.
   const sibling = f.propose('Healthy sibling')
@@ -113,7 +118,8 @@ test('R14-F2(c): a pending task whose predecessor is dead escalates and is named
   waitingRow.dependencies = [dead.id]
   f.runtime.store.put('tasks', waitingRow)
   f.cancel(dead)
-  await sleep(200)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   const fallthroughs = f.fallthroughs()
   assert.equal(fallthroughs.length, 1, 'the unnamed fallback is replaced by a named escalation')
   const notice = fallthroughs[0]
@@ -124,11 +130,12 @@ test('R14-F2(c): a pending task whose predecessor is dead escalates and is named
 })
 
 test('R14-F2v D1: the stall-root event carries the unschedulable shape later readers use', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, { clock: new FakeClock() })
   const sibling = f.propose('Healthy sibling')
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)
   const root = f.block(f.propose('Dead end'))
-  await sleep(200)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   const events = f.runtime.store.events(f.mission.id, 200).filter(event => event.type === 'mission/stalled')
   const latest = events.at(-1)
   assert.equal(latest.data.cause, 'stall-root', 'the latest stall event is the stall root')
@@ -137,7 +144,7 @@ test('R14-F2v D1: the stall-root event carries the unschedulable shape later rea
 })
 
 test('R14-F2v D2: a stop with no recorded start is a root, never silence', async t => {
-  const f = await fixture(t)
+  const f = await fixture(t, { clock: new FakeClock() })
   const sibling = f.propose('Healthy sibling')
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)
   const stuck = f.propose('Untimestamped stop')
@@ -145,7 +152,8 @@ test('R14-F2v D2: a stop with no recorded start is a root, never silence', async
   row.status = 'blocked'; row.epoch++
   row.resumeAfterStop = { epoch: row.epoch, reason: 'handoff' }
   f.runtime.store.put('tasks', row)
-  await sleep(200)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 8)
   const roots = f.stallRoots()
   assert.equal(roots.length, 1, `an untimestamped stop escalates instead of staying silent: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
   assert.equal(f.fallthroughs().length, 0, `the recovered root waits for its selected member without a duplicate fallthrough: ${JSON.stringify(f.fallthroughs().map(delivery => ({ subjects: delivery.subjects, content: delivery.content })))}`)
@@ -185,7 +193,8 @@ test('a real review rejection names its stall root exactly once, with exactly on
   // a dependent that is not itself a root), while the stall event was written on
   // every tick: ~62 events and 0 deliveries. The event now exists only with its
   // delivery row, and delivery judges the root the key names, not its dependents.
-  const f = await fixture(t, { tickMs: 10 })
+  // The clock and the ticks are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const source = f.propose('Rejected implementation')
   const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
@@ -196,7 +205,8 @@ test('a real review rejection names its stall root exactly once, with exactly on
   await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
   const rejected = f.runtime.store.get('tasks', source.id)
   assert.equal(rejected.status, 'blocked', 'the reviewed source is blocked by the rejection')
-  await sleep(1500)
+  await f.runtime.settle(f.mission.id)
+  await ticks(f, 150)
   const key = `stall-root:${f.mission.id}:${source.id}@${rejected.epoch}`
   const deliveries = f.stallRoots().filter(delivery => delivery.notice.dedupKey === key)
   const events = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
@@ -218,7 +228,8 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   // the stall root), and the stall root spent a wake-budget slot of its own.
   // Decision: the stall root stays the durable fact (row, event, reminders) but is
   // not a second wake when the verify site already decided this subject@epoch.
-  const f = await fixture(t, { tickMs: 10 })
+  // The clock and the ticks are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   // Exactly the decision and the board stall fit; a third wake would be summarized.
   f.runtime.notices.wakeBudget = 2
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
@@ -230,8 +241,9 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
   await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
   const stallRootEvents = () => f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data?.cause === 'stall-root')
-  await eventually(() => stallRootEvents().length > 0, 'the stall-root fact is recorded')
-  await sleep(500)
+  await f.runtime.settle(f.mission.id)
+  await ticksUntil(f, () => stallRootEvents().length > 0, 'the stall-root fact is recorded', 800)
+  await ticks(f, 50)
   const delivered = f.notices().filter(delivery => delivery.deliveredAt !== undefined)
   const families = delivered.map(delivery => delivery.notice?.dedupKey?.split(':')[0])
   t.diagnostic(`owner notices delivered for one rejection: ${delivered.length} (${families.join(', ')})`)
@@ -264,7 +276,8 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   // 12b12a6: the rejected root's stall-root row was recorded against the
   // rejection decision, which names the source only; while other work ran, the
   // stranded dependent first reached the owner in a reminder (600 s by default).
-  const f = await fixture(t, { tickMs: 10 })
+  // The clock and the ticks are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   f.runtime.notices.obligationFollowupMs = 1e9
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
@@ -281,7 +294,8 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   const dependent = f.propose('Downstream of the rejected source', { kind: 'research', checks: undefined, assigneeId: other.id })
   f.runtime.store.transaction(() => { const row = f.runtime.store.get('tasks', dependent.id); row.dependencies = [source.id]; f.runtime.store.put('tasks', row) })
   await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
-  const naming = await eventually(() => f.notices().find(delivery => delivery.deliveredAt !== undefined && delivery.content.includes(dependent.id)), 'a delivered notice names the stranded dependent', 2000)
+  await f.runtime.settle(f.mission.id)
+  const naming = await ticksUntil(f, () => f.notices().find(delivery => delivery.deliveredAt !== undefined && delivery.content.includes(dependent.id)), 'a delivered notice names the stranded dependent', 200)
   assert.equal(f.runtime.store.get('tasks', sibling.id).status, 'running', 'other work is running')
   assert.equal(f.runtime.store.get('tasks', dependent.id).status, 'pending')
   assert.ok(naming.notice.dedupKey.startsWith(`stall-root:${f.mission.id}:${source.id}@`), `the root's own stall-root notice names it: ${naming.notice.dedupKey}`)
@@ -297,6 +311,17 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   // task while the repair ran, they left nothing to name the root once the
   // owner withdrew the repair. A summarized decision now covers nothing, and
   // each summarized fact has its own reminder allowance.
+  //
+  // This test stays on the real clock and the tick timer. The held owner
+  // transport is what keeps the summary open, and a scheduling body's pass-end
+  // flush waits in it holding the mission queue, which the claims below need:
+  // only the outbox's real delivery bound (stallPassTimeoutMs of wall time)
+  // abandons that delivery, twice, and no clock or test release can end it
+  // without delivering the summary before the repair. Each wait below is on an
+  // order (the transport is entered, the unrelated fact's reminders are spent,
+  // the root is named), not on a latency; the one bound left (the root's
+  // reminder, about 60ms after the withdrawal on an idle host) has a margin of
+  // two orders of magnitude.
   const f = await fixture(t, { tickMs: 10, stallPassTimeoutMs: 5000 })
   const rt = f.runtime
   rt.notices.wakeBudget = 1
@@ -306,15 +331,16 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   let release
   const gate = new Promise(resolve => { release = resolve })
   let hold = true
+  let held = 0
   const deliver = rt.workers.deliver.bind(rt.workers)
-  rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) await gate; return deliver(member, delivery) }
+  rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) { held += 1; await gate } return deliver(member, delivery) }
   const reviewer = await rt.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await rt.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
   const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
   await rt.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
   rt.commit(f.mission.id, () => rt.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
   const unrelated = f.propose('Unrelated dead end', { kind: 'research', checks: undefined, assigneeId: other.id })
-  await sleep(100)
+  await eventually(() => held > 0, 'the first owner fact is held in transport')
   const source = f.propose('Source')
   const claimed = await rt.claim(f.actor, f.mission.id, source.id)
   await rt.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -333,23 +359,26 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   const root = await eventually(() => facts().find(fact => fact.dedupKey === `stall-root:${f.mission.id}:${rootSubject}`), 'the stall root is recorded')
   assert.equal(root.coveredBy, undefined, 'a rejection decision carried by a summary covers nothing: the root is its own fact')
   // The owner repairs the root before the notices arrive; the unrelated fact
-  // stays open while the repair runs.
+  // stays open while the repair runs, and is reminded until its allowance is spent.
   const repair = f.propose('Repair', { replaces: [source.id] })
   await rt.claim(f.actor, f.mission.id, repair.id)
   hold = false; release()
-  await sleep(1200)
+  const unrelatedSubject = `${unrelated.id}@${rt.store.get('tasks', unrelated.id).epoch}`
+  const unrelatedReminders = () => facts().filter(fact => fact.dedupKey.startsWith('obligation-followup:') && fact.subjects.includes(unrelatedSubject))
+  await eventually(() => unrelatedReminders().length >= rt.notices.maxObligationFollowups, 'the unrelated fact is reminded while the repair runs')
   assert.equal(rt.store.get('tasks', repair.id).status, 'running', 'the repair ran past two reminder intervals')
   const withdrawnAt = Date.now()
   rt.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'withdraw the repair' })
   assert.ok(rt.notices.stallRoots(rt.store.list('tasks', f.mission.id)).some(task => task.id === source.id), 'the root is a stall root again')
-  const naming = await eventually(() => facts().find(fact => fact.createdAt >= withdrawnAt && fact.subjects.includes(rootSubject)), 'a fact names the root after the withdrawal', 2000)
+  const naming = await eventually(() => facts().find(fact => fact.createdAt >= withdrawnAt && fact.subjects.includes(rootSubject)), 'a fact names the root after the withdrawal', 8000)
   assert.ok(naming.dedupKey.startsWith('obligation-followup:'), `a reminder names the root: ${naming.dedupKey}`)
 })
 
 test('a stall root with no rejection decision (a permanent preparation failure) is still its own owner wake', async t => {
   // The same generic `decision` notice shape the verify site used before, from
   // the scheduler's permanent preparation failure: it never covers a stall root.
-  const f = await fixture(t)
+  // The clock and the ticks are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock() })
   const research = { kind: 'research', checks: undefined }
   const sibling = f.propose('Healthy sibling', research)
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)
@@ -362,7 +391,8 @@ test('a stall root with no rejection decision (a permanent preparation failure) 
     f.runtime.store.put('tasks', row)
     f.runtime.notify(f.mission.id, row.output, [`${row.id}@${row.epoch}`], { from: 'runtime' })
   })
-  const root = await eventually(() => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake')
+  await f.runtime.settle(f.mission.id)
+  const root = await ticksUntil(f, () => f.stallRoots().find(delivery => delivery.deliveredAt !== undefined), 'the stall root is delivered as its own wake', 320)
   assert.equal(root.notice.coveredBy, undefined, 'only a verify-site rejection decision covers a stall root')
 })
 
