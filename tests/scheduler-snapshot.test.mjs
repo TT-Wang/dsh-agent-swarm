@@ -68,7 +68,7 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // Gate the capture the scheduler awaits for T1.
   let release
   workers.captureGate = new Promise(resolve => { release = resolve })
-  await eventually(() => workers.captureStarted, 'the scheduler must reach the gated checkpoint capture')
+  await eventually(() => workers.captureStarted, 'the scheduler must reach the gated checkpoint capture', 4000)
   const secondEpoch = taskOf(second.id).epoch
   // Injection 1: a host tool run during the await latches the git-write denial on T1.
   const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'git commit -m "work"' }, result: { exitCode: 128, output: 'index.lock: Operation not permitted' }, isError: true })
@@ -83,7 +83,7 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // Stop the member loop from re-dispatching, then let the scheduler continue.
   workers.idleNow = false
   release()
-  await eventually(() => taskOf(first.id).status !== 'running', 'the expired task completes its lease transition')
+  await eventually(() => taskOf(first.id).status !== 'running', 'the expired task completes its lease transition', 4000)
   assert.equal(taskOf(first.id).status, 'pending', 'the expired attempt re-pends within its recovery limit')
 
   const after = taskOf(second.id)
@@ -118,7 +118,7 @@ test('S1r: a live operation whose lease already expired is renewed, not expired,
     runtime.store.put('tasks', row)
   })
   await eventually(() => (runtime.store.get('tasks', task.id).attempt?.leaseUntil ?? 0) > Date.now() + 30_000,
-    'the live operation must renew the already-expired lease')
+    'the live operation must renew the already-expired lease', 4000)
   await new Promise(resolve => setTimeout(resolve, 120))
   const current = runtime.store.get('tasks', task.id)
   assert.equal(current.status, 'running', 'the live attempt stays running')

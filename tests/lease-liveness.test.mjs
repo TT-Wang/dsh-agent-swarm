@@ -27,16 +27,16 @@ test('a live model stream renews the lease with output-token headroom; a stale a
   const renewed = await eventually(() => {
     const value = runtime.store.get('tasks', task.id).attempt?.leaseUntil ?? 0
     return value > Date.now() + 400 ? value : undefined
-  }, 'a live model stream must renew the lease')
+  }, 'a live model stream must renew the lease', 2500)
   assert(renewed >= before + 400 + Math.floor(5000 * 20 * 0.5), 'the renewal scales with maxOutputTokens')
   assert.equal(runtime.store.events(mission.id, 100).some(event => event.type === 'task/lease-expiring'), false)
 
   // The adapter no longer reports the operation: renewal stops, one warning is emitted, then expiry.
-  workers.activity = undefined
+  workers.activities.delete(member.id)
   const shortened = runtime.store.get('tasks', task.id)
   shortened.attempt.leaseUntil = Date.now() + 5
   runtime.store.transaction(() => runtime.store.put('tasks', shortened))
-  await eventually(() => runtime.store.get('tasks', task.id).status !== 'running', 'a stale activity must not keep the lease alive')
+  await eventually(() => runtime.store.get('tasks', task.id).status !== 'running', 'a stale activity must not keep the lease alive', 2500)
   assert.equal(runtime.store.get('tasks', task.id).attempt, undefined)
   assert.equal(runtime.store.get('tasks', task.id).recoveryCount, 1)
   assert.equal(runtime.store.events(mission.id, 100).filter(event => event.type === 'task/lease-expiring').length, 1)

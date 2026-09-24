@@ -66,7 +66,7 @@ test('the assignment instructions state the git-write constraint before the work
   const f = await fixture(t)
   await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose().id)
   const assignment = await eventually(() => f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.memberId === f.author.id),
-    'the worker received its assignment')
+    'the worker received its assignment', 2500)
   const { instructions } = JSON.parse(assignment.delivery.content)
   assert.match(instructions, /cannot write git metadata/)
   assert.match(instructions, /index\.lock EPERM/)
@@ -93,7 +93,7 @@ test('a new attempt starts without the previous attempt git-write denial', async
   await eventually(() => {
     const current = f.runtime.store.get('tasks', task.id)
     return current.status === 'pending' ? current : undefined
-  }, 'the handoff re-pends the task')
+  }, 'the handoff re-pends the task', 2500)
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, task.id)
   assert.equal(claimed.gitWriteDenied, undefined, 'the marker is cleared when the new attempt is admitted')
   assert.equal(f.workers.callbacks.guard(f.reviewer.id, 'bash'), undefined, 'the new owner is not denied for the old attempt')

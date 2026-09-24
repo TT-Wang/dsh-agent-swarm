@@ -16,7 +16,7 @@ import JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import { SubprocessLocal } from './subprocess-seam.mjs'
-import { FakeWorkers, SwarmRuntime, eventually, makeRepo, makeRuntime } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, SwarmRuntime, eventually, makeRepo, makeRuntime } from './faults/harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const gate = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
@@ -25,11 +25,11 @@ class ControlledWorkers extends FakeWorkers {
   verification
   artifact = {commit:'artifact',baseCommit:'base',workspace:'/isolated',changedPaths:['src/a']}
   checks = [{command:'check',exitCode:0,output:'ok'}]
-  async stop(id) { this.activity=undefined; this.stopped.push(id); this.verification?.resolve() }
+  async stop(id) { this.activities.delete(id); this.stopped.push(id); this.verification?.resolve() }
   async verifyArtifact() { if(this.verification) await this.verification.promise; return this.checks }
 }
-async function runtimeFixture(t) {
-  const {dir:root,runtime,workers,config,budget}=await makeRuntime(t,{workers:new ControlledWorkers(),config:{leaseMs:100,maxEvents:100,checkTimeoutMs:undefined},budget:{maxTokens:100000,maxSteps:100,maxWorkers:2,maxDurationMs:60000,maxTasks:10,maxExperiments:1}})
+async function runtimeFixture(t,clock) {
+  const {dir:root,runtime,workers,config,budget}=await makeRuntime(t,{workers:new ControlledWorkers(),clock,config:{leaseMs:100,maxEvents:100,checkTimeoutMs:undefined},budget:{maxTokens:100000,maxSteps:100,maxWorkers:2,maxDurationMs:60000,maxTasks:10,maxExperiments:1}})
   await runtime.start()
   const owner={sessionId:'owner'}, mission=runtime.create(owner,{title:'Activity',objective:'Work',workspace:'/source',scope:['src/'],acceptance:['works'],budget})
   const stream=runtime.workstream(owner,mission.id,{title:'Code',objective:'Work'})
@@ -37,7 +37,7 @@ async function runtimeFixture(t) {
   const propose=(extra={})=>runtime.propose(owner,mission.id,{ outputs: [],workstreamId:stream.id,title:'Task',objective:'Work',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['check'],maxRecoveryAttempts:1,...extra})
   const task=await runtime.claim(actor,mission.id,propose().id)
   const snapshot=()=>runtime.snapshot(owner,mission.id)
-  const activity={id:'owned-operation',kind:'tool',tool:'slow-tool',startedAt:Date.now(),updatedAt:Date.now()}
+  const activity={id:'owned-operation',kind:'tool',tool:'slow-tool',startedAt:runtime.now(),updatedAt:runtime.now()}
   return {root,runtime,workers,config,owner,mission,member,actor,task,propose,snapshot,activity}
 }
 
@@ -49,13 +49,16 @@ test('owned long tools renew their original attempt without inventing progress; 
   assert.equal(snapshot.members[0].activity.attemptId,f.task.attempt.id)
   assert.equal(snapshot.members[0].activity.updatedAt,f.activity.updatedAt,'lease bookkeeping is not fresh work')
   f.workers.reportActivity(f.member.id,undefined)
-  await eventually(()=>f.snapshot().tasks[0].status==='blocked','the expired attempt is blocked')
+  await eventually(()=>f.snapshot().tasks[0].status==='blocked','the expired attempt is blocked',3000)
   snapshot=f.snapshot(); assert.equal(snapshot.members[0].activity,undefined); assert.equal(snapshot.tasks[0].recoveryCount,1)
 })
 
 test('persisted activity without a matching live adapter operation cannot prevent lease expiry',async t=>{
-  const f=await runtimeFixture(t); f.workers.callbacks.activity(f.member.id,f.activity)
-  await eventually(()=>f.snapshot().tasks[0].status==='blocked','the durable-only activity does not hold the lease')
+  // On a FakeClock the lease ends at its own instant: a slow host cannot expire it before the activity is
+  // recorded, and a grace for durable-only activity cannot outlast a wall-clock wait.
+  const clock=new FakeClock(), f=await runtimeFixture(t,clock); f.workers.callbacks.activity(f.member.id,f.activity)
+  await f.runtime.settle(f.mission.id); clock.advance(f.config.leaseMs+1); await f.runtime.tick()
+  assert.equal(f.snapshot().tasks[0].status,'blocked','the durable-only activity does not hold the lease')
   assert.equal(f.snapshot().tasks[0].attempt,undefined)
 })
 
@@ -76,7 +79,7 @@ test('deadline cancellation does not queue behind an active host verification',a
   f.workers.verification=gate()
   const operation=f.runtime.verify({sessionId:reviewer.sessionId},f.mission.id,{taskId:review.id,attemptId:review.attempt.id,verdict:'accept',reason:'verified'})
   const outcome=operation.catch(error=>error)
-  await eventually(()=>f.workers.stopped.length>0,'the deadline stops the worker')
+  await eventually(()=>f.workers.stopped.length>0,'the deadline stops the worker',3000)
   assert.equal(f.snapshot().mission.status,'blocked')
   assert.ok(await outcome instanceof Error)
 })
@@ -118,15 +121,15 @@ test('actual native streams and tool dispatch expose live activity and clear it 
   const model=gate(), tool=gate();t.after(()=>{model.resolve();tool.resolve()})
   const f=await nativeFixture(t,async function*(options,count){if(count===1){await model.promise;yield* toolChunks('slow_probe')}else yield* textChunks('done')})
   f.ctx.tools.register(defineContentToolFixture({name:'slow_probe',description:'A gated tool',parameters:{},execute:async()=>{await tool.promise;return [{type:'text',text:'finished'}]}}))
-  await f.deliver();await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='model','the model stream is live')
-  model.resolve();await eventually(()=>f.adapter.currentActivity(f.member.id)?.tool==='slow_probe','the tool dispatch is live')
+  await f.deliver();await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='model','the model stream is live',3000)
+  model.resolve();await eventually(()=>f.adapter.currentActivity(f.member.id)?.tool==='slow_probe','the tool dispatch is live',3000)
   tool.resolve();await f.worker.whenIdle();assert.equal(f.adapter.currentActivity(f.member.id),undefined)
   assert.ok(f.observed.some(item=>item?.kind==='model'));assert.ok(f.observed.some(item=>item?.kind==='tool'));assert.equal(f.observed.at(-1),undefined)
 })
 
 test('native retry backoff has its own activity, then hands back to the next model request',async t=>{
   const f=await nativeFixture(t,async function*(_options,count){if(count===1) throw new LlmError('transient','TIMEOUT');yield* textChunks('recovered')},true)
-  await f.deliver();const retry=await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='retry' && f.adapter.currentActivity(f.member.id),'the retry backoff is live')
+  await f.deliver();const retry=await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='retry' && f.adapter.currentActivity(f.member.id),'the retry backoff is live',3000)
   assert.equal(retry.retryAttempt,1);assert.ok(retry.retryAt>retry.startedAt)
   await f.worker.whenIdle();assert.equal(f.adapter.currentActivity(f.member.id),undefined)
   assert.ok(f.observed.filter(item=>item?.kind==='model').length>=2)
@@ -134,7 +137,7 @@ test('native retry backoff has its own activity, then hands back to the next mod
 
 test('cancelling an actual native model stream ends its liveness immediately',async t=>{
   const f=await nativeFixture(t,async function*(options){await new Promise(resolve=>{if(options.signal.aborted)resolve();else options.signal.addEventListener('abort',resolve,{once:true})});yield* textChunks('cancelled')})
-  await f.deliver();await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='model','the model stream is live')
+  await f.deliver();await eventually(()=>f.adapter.currentActivity(f.member.id)?.kind==='model','the model stream is live',3000)
   const stopping=f.adapter.stop(f.member.id);assert.equal(f.adapter.currentActivity(f.member.id),undefined);await stopping
   assert.equal(f.observed.at(-1),undefined)
 })

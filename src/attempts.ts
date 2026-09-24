@@ -233,7 +233,7 @@ export class Attempts {
         if (this.rt.shuttingDown) return
         const stoppedTask = this.rt.task(missionId, task.id)
         if (stoppedTask.epoch !== state.epoch || stoppedTask.resumeAfterStop?.epoch !== state.epoch || stoppedTask.resumeAfterStop.memberId !== state.memberId) return
-        if (candidates.length === 0) throw new Error('The recorded stop owner is missing; its workspace checkpoint cannot be confirmed')
+        if (candidates.length === 0) throw new Error(`The recorded stop owner is missing: ${state.memberId ?? 'this mission'} has no member row, so its workspace checkpoint can never be confirmed`)
         for (const candidate of candidates) await this.rt.workers.checkpointTask(candidate, stoppedTask, state.memberId === undefined ? { ifOwned: true } : undefined)
         await this.rt.exclusive(missionId, async () => {
           const mission = this.rt.mission(missionId)
@@ -296,12 +296,16 @@ export class Attempts {
   private reportStopFailure(missionId: string, task: Task): void {
     const marker = task.resumeAfterStop
     if (!marker?.failure || this.rt.mission(missionId).status !== 'active') return
-    const digest = createHash('sha256').update(marker.failure.message).digest('hex')
+    const { message, deterministic } = marker.failure
+    const digest = createHash('sha256').update(message).digest('hex')
+    // No row can ever confirm a missing owner's checkpoint, so for it a resume only repeats the refusal.
+    const exit = !deterministic ? 'The member remains fenced. The host will retry this temporary failure with bounded backoff.'
+      : /recorded stop owner is missing/.test(message)
+        ? `A resume only repeats this refusal. Withdraw the task with swarm_cancel (taskId "${task.id}"); if its work is still needed, propose its repair with swarm_propose naming replaces: ["${task.id}"].`
+        : `The member remains fenced. Repair the recorded workspace condition, then retry cleanup with swarm_control(action: "resume", taskId: "${task.id}"); its cancelled or blocked outcome is preserved.`
     emitGuardTerminal(this.rt, missionId, 'attempt_lease', { taskId: task.id, memberId: marker.memberId,
       localKey: `stop:${task.id}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${digest}`,
-      detail: `Stopping or preserving this attempt failed: ${marker.failure.message}. The member remains fenced. ${marker.failure.deterministic
-        ? `Repair the recorded workspace condition, then retry cleanup with swarm_control(action: "resume", taskId: "${task.id}"); its cancelled or blocked outcome is preserved.`
-        : 'The host will retry this temporary failure with bounded backoff.'}` })
+      detail: `Stopping or preserving this attempt failed: ${message}. ${exit}` })
   }
 
   ownAttempt(actor: Actor, missionId: string, taskId: string, attemptId: string): { task: Task; member: Member } {
@@ -501,7 +505,7 @@ export class Attempts {
     if (!task.attempt || task.attempt.leaseUntil >= this.rt.now() + this.rt.config.leaseMs / 2) return
     // A live operation is liveness for its full duration: match by member and
     // activity id, never by the attempt the operation happens to be stored under.
-    // Adapters that report current activity must confirm the operation is live.
+    // The adapter must confirm the operation is live; a durable activity alone never renews.
     const activity = this.liveOperation(task)
     if (activity === undefined) {
       if (task.leaseWarned !== task.attempt.leaseUntil) {

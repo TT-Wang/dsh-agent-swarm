@@ -200,7 +200,7 @@ const CENSUS = [
   ["src/runtime.ts",26,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",27,"Set","const ids = new Set(task.priorOwnerIds ?? [])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",28,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",29,"Set","if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",29,"Set","for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",30,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",31,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",32,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -483,10 +483,8 @@ const GATE_TESTS = {
     try {
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
-      const statePath = join(g.dir, 'swarm.sqlite')
       await g.runtime.dispose()
-      // fixture gap: setup() returns no RuntimeConfig to reopen its state file with.
-      restarted = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10, messageChars: 16000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, new FakeWorkers())
+      restarted = new SwarmRuntime(g.runtime.config, new FakeWorkers())
       assert.equal(restarted.store.get('members', g.author.id).startFailures, 2, 'the count survives a restart')
       restarted.onStartFailure(restarted.mission(g.mission.id), restarted.store.get('members', g.author.id), new Error('injected start failure'))
       assert.equal(restarted.store.get('members', g.author.id).status, 'stopped', 'and the restarted runtime retires on the third failure')

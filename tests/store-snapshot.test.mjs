@@ -14,20 +14,18 @@ import { basename, dirname, join, sep } from 'node:path'
 import { SwarmStore, StoreRecoveryError, applyPendingRestore, isSqliteNotADatabase, pendingRestore } from '../lib/store.js'
 import { MANAGEMENT_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
 import { tempDirectory } from './temp-root.mjs'
-import { FakeWorkers, SwarmRuntime, budget as defaultBudget, eventually } from './faults/harness.mjs'
+import { FakeWorkers, budget as defaultBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 }
 
 async function fixture(t, { storeOptions = {}, workspace } = {}) {
-  const directory = await tempDirectory('swarm-store-snapshot-')
   const workers = new FakeWorkers({
     artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
     checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
     async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
   })
-  // fixture gap: makeRuntime cannot pass SwarmRuntime's store options (snapshotIntervalMs, snapshotKeep) nor export its default RuntimeConfig.
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 10 }, workers, storeOptions)
+  const { dir: directory, config, runtime } = await makeRuntime(t, { workers, storeOptions,
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 10, checkTimeoutMs: undefined } })
   await runtime.start()
   const owner = { sessionId: 'snapshot-owner' }
   const mission = runtime.create(owner, { title: 'Snapshot', objective: 'Prove snapshot and restore', workspace: workspace ?? directory,
@@ -35,8 +33,7 @@ async function fixture(t, { storeOptions = {}, workspace } = {}) {
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test'] })
-  t.after(async () => { await runtime.dispose().catch(() => undefined); await rm(directory, { recursive: true, force: true }) })
-  return { directory, statePath: join(directory, 'state.sqlite'), runtime, owner, mission }
+  return { directory, statePath: config.statePath, runtime, owner, mission }
 }
 
 test('R11-02: the periodic snapshot is written outside the mission source and contains the board', async t => {

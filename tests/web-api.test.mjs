@@ -265,11 +265,12 @@ test('delivery routes require owner, completed acceptance and the exact session 
   const source = { id: 'delivery-source', missionId: mission.id, kind: 'implementation', status: 'accepted', dependencies: [], artifact: { commit: 'c'.repeat(40) } }
   const final = { id: 'delivery-final', missionId: mission.id, kind: 'integration', status: 'accepted', dependencies: [source.id], artifact: { commit: 'd'.repeat(40) } }
   f.runtime.store.put('tasks', source); f.runtime.store.put('tasks', final)
+  // A PolicyError the adapter throws reaches the browser typed, with its own code and category.
   const adapter = f.workers.inspectDelivery
-  delete f.workers.inspectDelivery
-  const unsupported = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
-  assert.equal(unsupported.result.error.message, 'This worker adapter does not support delivery inspection')
-  assert.deepEqual(unsupported.result.error.details, { issues: [], policyCode: 'delivery_unsupported', category: 'tool_error' })
+  f.workers.inspectDelivery = async () => { throw new PolicyError('adapter_refused', 'tool_error', 'The adapter refused this inspection') }
+  const refused = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(refused.result.error.message, 'The adapter refused this inspection')
+  assert.deepEqual(refused.result.error.details, { issues: [], policyCode: 'adapter_refused', category: 'tool_error' })
   f.workers.inspectDelivery = adapter
   const inspected = await f.rpc('delivery', { sessionId: f.ownerId, missionId: mission.id, resultCommit: 'forged' })
   assert.equal(inspected.result.value.delivery.resultCommit, final.artifact.commit, 'caller cannot choose an unaccepted commit')

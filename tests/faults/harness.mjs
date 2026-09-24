@@ -135,12 +135,12 @@ export function runNode(args, options = {}) {
  *    `task/check-envelope` events that the seq/count assertions and the replay
  *    digest do not expect; a test that needs them passes them as overrides (or
  *    uses `WorkspaceWorkers`).
- *  - `currentActivity` reads `activity`, so an operation is live only while the
- *    adapter reports it: the durable member activity alone is never live.
- *    `reportActivity(id, activity)` moves the adapter's view and the durable
- *    member activity together; a test that writes the member row directly sets
- *    `activity` to the same operation. `activity` is one value for every member;
- *    a test with several live members keeps a per-member subclass.
+ *  - `currentActivity(id)` reads that member's entry in `activities`, so an
+ *    operation is live only while the adapter reports it for that member: the
+ *    durable member activity alone is never live. `reportActivity(id, activity)`
+ *    moves that member's adapter view and durable activity together. A
+ *    single-member test that writes the member row directly may instead set
+ *    `activity`, which answers for every member without an `activities` entry.
  */
 export class FakeWorkers {
   callbacks
@@ -152,6 +152,7 @@ export class FakeWorkers {
   prepared = []
   idle = new Set()
   autoIdle = false
+  activities = new Map()
   activity
   artifact = { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/answer.txt'] }
   checks = [{ command: 'host-check', exitCode: 0, output: 'ok' }]
@@ -175,9 +176,9 @@ export class FakeWorkers {
     return this.checks
   }
   async prepareTask(member, task) { this.prepared.push({ memberId: member.id, taskId: task.id, epoch: task.epoch }) }
-  currentActivity() { return this.activity }
-  /** Report a live operation (or its end, with `undefined`) the way the Harness adapter does. */
-  reportActivity(id, activity) { this.activity = activity; this.callbacks?.activity?.(id, activity) }
+  currentActivity(id) { return this.activities.has(id) ? this.activities.get(id) : this.activity }
+  /** Report one member's live operation (or its end, with `undefined`) the way the Harness adapter does. */
+  reportActivity(id, activity) { this.activities.set(id, activity); this.callbacks?.activity?.(id, activity) }
   inspectArtifact(_member, artifact) { return artifact }
   checkpointTask() {}
   compactAtBoundary() {}

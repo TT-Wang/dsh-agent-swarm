@@ -245,3 +245,33 @@ test('R12: cancellation before a deferred stop starts cannot stop a replacement 
   await Promise.all(f.pending)
   assert.equal(f.stopped.length, 0)
 })
+
+test('R12: a stop whose recorded owner has no member row is refused, and the owner is given an exit that works', async t => {
+  const { dir, runtime, budget } = await makeRuntime(t)
+  await runtime.start()
+  const owner = { sessionId: 'owner' }
+  const mission = runtime.create(owner, { title: 'Ghost owner', objective: 'Refuse an unconfirmable stop', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const work = { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
+  const task = runtime.propose(owner, mission.id, work)
+  // The store never deletes a member, so the ghost owner is written onto the stop marker directly.
+  const row = runtime.store.get('tasks', task.id)
+  row.status = 'blocked'; row.epoch++
+  row.resumeAfterStop = { epoch: row.epoch, memberId: 'member_ghost', reason: 'handoff', at: runtime.now() }
+  runtime.store.transaction(() => runtime.store.put('tasks', row))
+  runtime.attempts.resumeStoppedAttempt(mission.id, runtime.store.get('tasks', task.id))
+  await runtime.settle(mission.id)
+  const refused = runtime.store.events(mission.id, 500).filter(event => event.type === 'mission/stalled' && event.data.cause === 'worker-stop-failed')
+  assert.equal(refused.length, 1, 'the stop is refused once')
+  assert.equal(refused[0].data.deterministic, true, 'no retry can confirm a missing owner')
+  assert.match(refused[0].data.reason, /member_ghost has no member row/)
+  assert.equal(runtime.store.get('tasks', task.id).status, 'blocked')
+  assert.ok(runtime.store.get('tasks', task.id).resumeAfterStop, 'nothing is released without a confirmed checkpoint')
+  const notice = runtime.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && /member_ghost has no member row/.test(delivery.content))
+  assert.ok(notice, 'the owner is told which owner is missing')
+  assert.doesNotMatch(notice.content, /Repair the recorded workspace condition/, 'no advice a resume cannot satisfy')
+  assert.match(notice.content, new RegExp(`swarm_cancel \\(taskId "${task.id}"\\).*replaces: \\["${task.id}"\\]`))
+  // The named exit works: the task is withdrawn and its repair is admitted.
+  runtime.cancel(owner, mission.id, { taskId: task.id, reason: 'The recorded stop owner is gone' })
+  assert.deepEqual(runtime.propose(owner, mission.id, { ...work, replaces: [task.id] }).replaces, [task.id])
+})

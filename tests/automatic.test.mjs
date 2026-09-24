@@ -245,9 +245,9 @@ test('independent host verification automatically completes the mission and jour
   const f = await fixture(t)
   const { request, snapshot } = await launch(f)
   await accept(f, snapshot)
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status === 'completed', 'the mission completes')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status === 'completed', 'the mission completes', 2500)
   assert.equal(f.runtime.starts(f.owner)[0].status, 'completed')
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).events.some(event => event.type === 'automatic/completed'))
   const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
   assert.equal(replay.mission.status, 'completed')
@@ -308,7 +308,7 @@ test('budget resume waits for quiescence then promptly wakes the same long-lived
     const actor = { sessionId: builder.sessionId }
     const source = snapshot.tasks.find(task => task.kind === 'integration')
     const claimed = await f.runtime.claim(actor, snapshot.mission.id, source.id)
-    await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered')
+    await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered', 2500)
     await f.workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'inspect working tree' }, result: 'existing evidence', isError: false })
     const run = f.runtime.observe(actor, snapshot.mission.id).toolRuns[0]
     const gate = deferred(), entered = deferred()
@@ -334,7 +334,7 @@ test('budget resume waits for quiescence then promptly wakes the same long-lived
     assert.throws(() => f.runtime.publish(actor, snapshot.mission.id, { taskId: claimed.id, attemptId: claimed.attempt.id, claim: 'too early', outcome: 'supported', toolRunIds: [run.id] }), /quiescence/)
     assert.equal(await f.workers.callbacks.beforeStep(builder.id, true), false)
     gate.resolve()
-    const resumed = await eventually(() => f.workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id && !oldAssignments.has(delivery.id)), 'the resumed assignment is delivered')
+    const resumed = await eventually(() => f.workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id && !oldAssignments.has(delivery.id)), 'the resumed assignment is delivered', 2500)
     assert.equal(resumed.delivery.attemptId, claimed.attempt.id)
     assert.match(JSON.parse(resumed.delivery.content).instructions, /same task and attempt/)
     const current = f.runtime.snapshot(f.owner, snapshot.mission.id).tasks.find(task => task.id === source.id)
@@ -356,7 +356,7 @@ test('an explicit stop during budget quiescence prevents a queued resume assignm
   const builder = snapshot.members.find(member => member.name === 'Builder')
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   await f.runtime.claim({ sessionId: builder.sessionId }, snapshot.mission.id, source.id)
-  await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered')
+  await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered', 2500)
   const assignments = f.workers.delivered.filter(({ delivery }) => delivery.kind === 'assignment').length
   const gate = deferred(); f.workers.stopGate = gate.promise
   await f.workers.callbacks.usage(builder.id, budget.maxTokens + 1)
@@ -364,7 +364,7 @@ test('an explicit stop during budget quiescence prevents a queued resume assignm
   f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Resume requested')
   f.runtime.control(f.owner, snapshot.mission.id, 'stop', 'User stopped before quiescence')
   gate.resolve()
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status, 'stopped')
   assert.equal(f.workers.delivered.filter(({ delivery }) => delivery.kind === 'assignment').length, assignments)
 })
@@ -377,7 +377,7 @@ test('a restarted budget pause promptly assigns a recovered epoch instead of wai
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const claimed = await f.runtime.claim({ sessionId: builder.sessionId }, snapshot.mission.id, source.id)
   await f.workers.callbacks.usage(builder.id, budget.maxTokens + 1)
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.budgetPause?.quiesced, 'the budget pause quiesces')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.budgetPause?.quiesced, 'the budget pause quiesces', 2500)
   await f.runtime.dispose()
   const workers = new Workers(), recovered = new SwarmRuntime(f.config, workers)
   try {
@@ -389,7 +389,7 @@ test('a restarted budget pause promptly assigns a recovered epoch instead of wai
     recovered.updateBudget(f.owner, snapshot.mission.id, { ...budget, maxTokens: budget.maxTokens * 2 })
     workers.isIdle = () => true
     recovered.control(f.owner, snapshot.mission.id, 'resume', 'Continue after host restart')
-    const delivered = await eventually(() => workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id), 'the recovered epoch is assigned')
+    const delivered = await eventually(() => workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id), 'the recovered epoch is assigned', 2500)
     assert.notEqual(delivered.delivery.attemptId, claimed.attempt.id)
     assert.equal(recovered.snapshot(f.owner, snapshot.mission.id).mission.budgetPause, undefined)
   } finally { await recovered.dispose() }
@@ -403,7 +403,7 @@ test('terminal worker status waits for actual quiescence and late idle events ca
   await new Promise(resolve => setImmediate(resolve))
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status !== 'stopped'))
   gate.resolve()
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   for (const member of snapshot.members) f.workers.callbacks.idle(member.id)
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
 })
@@ -511,7 +511,7 @@ test('paused and budget-blocked automatic missions do not silently complete', as
     assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
     if (state === 'paused') {
       f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Continue')
-      await eventually(() => f.runtime.starts(f.owner)[0].status === 'completed', 'the start completes')
+      await eventually(() => f.runtime.starts(f.owner)[0].status === 'completed', 'the start completes', 2500)
     }
   }
 })
@@ -582,7 +582,7 @@ test('prelaunch deadline releases the session without a mission and queues durab
   const request = f.runtime.requestStart(f.owner, f.requestInput)
   request.planningDeadlineAt = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('starts', request))
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails', 2500)
   const failed = f.runtime.starts(f.owner)[0]
   assert.equal(failed.planningFenced, true)
   assert.equal(failed.recoveryNoticePending, true)
@@ -659,7 +659,7 @@ test('an expired launch settles before an uncooperative adapter and cannot resur
   const launching = f.runtime.starts(f.owner)[0]
   launching.planningDeadlineAt = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('starts', launching))
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails', 2500)
   await rejected
   const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Resume retained assembly')
   gate.resolve(); await new Promise(resolve => setImmediate(resolve))
@@ -696,7 +696,7 @@ test('retry can activate the saved draft while its cancelled adapter call is sti
   const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover without waiting for old adapter')
   f.workers.onStart = async () => {}
   const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs', 2500)
   const snapshot = await launch
   assert.equal(snapshot.mission.id, saved.missionId)
   gate.resolve(); await new Promise(resolve => setImmediate(resolve))
@@ -740,7 +740,7 @@ test('late failure from a superseded startup cannot stop the successfully retrie
       await rejected
       launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
     }
-    await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs')
+    await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs', 2500)
     const snapshot = await launch
     const reviewer = snapshot.members.find(member => member.name === 'Reviewer')
     gate.reject(new Error('old provider startup eventually failed'))
