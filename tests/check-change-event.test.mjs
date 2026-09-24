@@ -14,24 +14,15 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 async function runtimeFixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-check-events-'))
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(mission, id) { return join(mission.workspace, id) },
-    async start() {}, async prepareTask() {}, async deliver() {}, async stop() {},
-    isIdle() { return false }, async dispose() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 10 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, id) { return join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 10, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 200, maxTasks: 20 },
+  })
   const owner = { sessionId: 'check-events-owner' }
   const mission = runtime.create(owner, { title: 'Check lineage', objective: 'Track declared checks', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget })

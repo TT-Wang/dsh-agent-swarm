@@ -9,15 +9,12 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { FakeWorkers, budget as sharedBudget, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
 const schemaIndex = await toolSchemaIndex()
 /** The refusal is `[output_outside_scope]`, and its rendered text satisfies the refusal contract. */
@@ -30,17 +27,7 @@ const outsideScope = error => {
   return true
 }
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function eventually(read, message, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    const value = read()
-    if (value) return value
-    if (Date.now() > deadline) assert.fail(message)
-    await sleep(10)
-  }
-}
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 
 function plan(workspace, overrides = {}) {
   return {
@@ -57,24 +44,11 @@ function plan(workspace, overrides = {}) {
   }
 }
 
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
-
 async function runtimeFixture(t, config = {}) {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r20-outputs-')))
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 25,
-    maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime } = await makeRuntime(t, {
+    workers: new FakeWorkers({ autoIdle: true, artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] }, checks: [] }),
+    config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
+  })
   await runtime.start()
   const owner = { sessionId: 'r20-outputs-owner' }
   const mission = runtime.create(owner, { title: 'Outputs', objective: 'Declare deliverables', workspace: directory,
@@ -216,22 +190,8 @@ test('R20: the host-created automatic review declares no outputs', async t => {
 })
 
 async function workspaceFixture(t) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r20-recovery-')))
-  const source = path.join(temp, 'source')
-  await mkdir(source)
-  const git = async (cwd, ...args) => {
-    const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args],
-      { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-    assert.equal(result.exitCode, 0, result.output)
-    return result.output.trim()
-  }
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, '.gitignore'), 'review/\n')
-  await writeFile(path.join(source, 'tracked.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const { root: temp, source } = await makeRepo('swarm-r20-recovery', { '.gitignore': 'review/\n', 'tracked.txt': 'base\n' })
+  const workspaces = makeWorkspaces(temp)
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   const mission = { id: 'mission-r20', workspace: source }
   const member = { id: 'first', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'first') }

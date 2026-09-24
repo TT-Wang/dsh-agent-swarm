@@ -1,32 +1,21 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { executionClock, executionElapsed } from '../lib/resource-time.js'
 import { guardTerminal } from '../lib/refusals.js'
 import { registerTools } from '../lib/tools.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  stops = []; checkpoints = []; delivered = []
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
+class Workers extends FakeWorkers {
+  stops = []; checkpoints = []
   async stop(id) { this.stops.push(id); await this.stopping }
   async checkpointTask(member, task) { this.checkpoints.push({ memberId: member.id, taskId: task.id, epoch: task.epoch }) }
-  async prepareTask() {}
-  async deliver(member, delivery) { this.delivered.push(delivery) }
-  isIdle() { return this.idle ?? false }
-  async dispose() {}
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-resource-rules-'))
   const workers = new Workers()
-  const config = { statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }
-  const rt = new SwarmRuntime(config, workers)
-  t.after(async () => { workers.stopping = undefined; await rt.dispose(); await rm(directory, { force: true, recursive: true }) })
+  // Registered first, so a held stop is released before makeRuntime's cleanup disposes the runtime.
+  t.after(() => { workers.stopping = undefined })
+  const { config, runtime: rt } = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }
   const mission = rt.create(owner, { title: 'Continue the obligation', objective: 'Same work with revised estimates', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget })
   const ws = rt.workstream(owner, mission.id, { title: 'Core', objective: 'Build it' })
@@ -35,10 +24,6 @@ async function fixture(t) {
   const actor = { sessionId: member.sessionId }
   const propose = (extra = {}) => rt.propose(owner, mission.id, { outputs: [], workstreamId: ws.id, title: `Work ${rt.store.list('tasks', mission.id).length}`, objective: 'Implement source', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], maxSteps: 2, maxFindings: 2, maxRecoveryAttempts: 2, checkTimeoutMs: 1000, assigneeId: member.id, ...extra })
   return { rt, config, workers, owner, mission, member, other, actor, propose }
-}
-async function eventually(read) {
-  for (let index = 0; index < 150; index++) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail('Expected recovery transition')
 }
 
 test('task budget increase before stop confirmation preserves identity, usage and work then resumes', async t => {
@@ -49,7 +34,7 @@ test('task budget increase before stop confirmation preserves identity, usage an
   await f.workers.callbacks.beforeStep(f.member.id)
   await f.workers.callbacks.beforeStep(f.member.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.member.id), false)
-  await eventually(() => f.workers.stops.length)
+  await eventually(() => f.workers.stops.length, 'Expected recovery transition')
   const held = f.rt.task(f.mission.id, task.id)
   assert.equal(held.resumeAfterStop.reason, 'resource')
   const revised = f.rt.controlTask(f.owner, f.mission.id, task.id, 'amend', { maxSteps: 8 }, 'The useful implementation needs more work')
@@ -59,7 +44,7 @@ test('task budget increase before stop confirmation preserves identity, usage an
   assert.equal(revised.ceiling, undefined)
   assert.equal(revised.evidenceIds.length, 0)
   release(); f.workers.stopping = undefined
-  await eventually(() => f.rt.task(f.mission.id, task.id).status === 'pending')
+  await eventually(() => f.rt.task(f.mission.id, task.id).status === 'pending', 'Expected recovery transition')
   assert.equal(f.workers.checkpoints[0].taskId, task.id)
   const resumed = await f.rt.claim(f.actor, f.mission.id, task.id)
   assert.notEqual(resumed.attempt.id, task.attempt.id)
@@ -75,7 +60,7 @@ test('ceiling remains recoverable after confirmed stop and explicit pause is not
   const task = await f.rt.claim(f.actor, f.mission.id, f.propose({ maxSteps: 1 }).id)
   await f.workers.callbacks.beforeStep(f.member.id)
   await f.workers.callbacks.beforeStep(f.member.id)
-  await eventually(() => !f.rt.task(f.mission.id, task.id).resumeAfterStop)
+  await eventually(() => !f.rt.task(f.mission.id, task.id).resumeAfterStop, 'Expected recovery transition')
   assert.equal(f.rt.task(f.mission.id, task.id).status, 'blocked')
   f.rt.control(f.owner, f.mission.id, 'pause', 'User pause')
   f.rt.controlTask(f.owner, f.mission.id, task.id, 'amend', { maxSteps: 5 }, 'Review estimate')
@@ -91,7 +76,7 @@ test('owner can fence and reassign a running task without a member attempt argum
   const changed = f.rt.controlTask(f.owner, f.mission.id, task.id, 'amend', { assigneeId: f.other.id }, 'Change route')
   assert.equal(changed.status, 'blocked')
   assert.equal(changed.attempt, undefined)
-  await eventually(() => f.rt.task(f.mission.id, task.id).status === 'pending')
+  await eventually(() => f.rt.task(f.mission.id, task.id).status === 'pending', 'Expected recovery transition')
   const resumed = await f.rt.claim({ sessionId: f.other.sessionId }, f.mission.id, task.id)
   assert.ok(resumed.priorOwnerIds.includes(f.member.id))
   assert.equal(resumed.attempt.ownerId, f.other.id)
@@ -196,12 +181,12 @@ test('tool surface adjusts one task allocation and guard notices only name owner
   t.mock.method(Date, 'now', () => now)
   const task = await f.rt.claim(f.actor, f.mission.id, f.propose().id)
   now += 1000
-  f.workers.idle = true
+  f.workers.autoIdle = true
   f.rt.commit(f.mission.id, () => {})
   now += 120000
   assert.equal(f.rt.task(f.mission.id, task.id).status, 'running')
   assert.equal(executionElapsed(f.rt.mission(f.mission.id)), 1000)
-  f.workers.idle = false
+  f.workers.autoIdle = false
   f.rt.commit(f.mission.id, () => {})
   now += 500
   assert.equal(executionElapsed(f.rt.mission(f.mission.id)), 1500)

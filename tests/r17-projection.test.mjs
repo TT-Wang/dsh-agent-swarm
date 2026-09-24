@@ -43,8 +43,8 @@ import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 import { guardActions, guardBoard, guardProgressActions } from './guard-model.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
@@ -54,44 +54,19 @@ const projection = await import('../lib/projection.js').then(module => module, (
 const MISSING = 'src/projection.ts is not built: the mission projection / member-status split is absent'
 
 const OWNER = 'r17-owner'
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-
-async function eventually(fn, message, timeoutMs = 5000) {
-  const end = Date.now() + timeoutMs
-  for (;;) {
-    const value = await fn()
-    if (value) return value
-    if (Date.now() > end) throw new Error(`timed out: ${message}`)
-    await sleep(10)
-  }
-}
-
-class Workers {
-  constructor(ctx, options = {}) { this.ctx = ctx; this.options = options; this.started = []; this.stopped = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start(spec) { this.started.push(spec.member.id) }
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
+/** Always idle unless the test passes its own `isIdle`. */
+const projectionWorkers = (overrides = {}) => new FakeWorkers({ autoIdle: true, artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [], ...overrides })
+const runtimeConfig = { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined }
 
 async function fixture(t, { workers: provided, registry } = {}) {
-  const dir = await tempDirectory('swarm-r17-projection-')
+  const { dir, config, runtime, workers } = await makeRuntime(t, { workers: provided ?? projectionWorkers(), config: runtimeConfig })
   const ctx = new Context()
   // A provided registry is the test's own host unit: the consumers must read it.
   if (registry === undefined) await ctx.plugin(SessionProjectionRegistry)
   else ctx.provide('sessionProjections', registry)
   const session = Session.create(SessionId(OWNER))
   ctx.provide('sessions', { get: id => String(id) === OWNER ? session : undefined })
-  const workers = provided ?? new Workers(ctx)
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: OWNER }
   const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
@@ -102,7 +77,7 @@ async function fixture(t, { workers: provided, registry } = {}) {
   const memberRow = member => runtime.store.get('members', member.id)
   const taskRow = task => runtime.store.get('tasks', task.id)
   const storedMember = member => {
-    const db = new DatabaseSync(join(dir, 'db.sqlite'), { readOnly: true })
+    const db = new DatabaseSync(config.statePath, { readOnly: true })
     try {
       const row = db.prepare('SELECT value FROM members WHERE id=?').get(member.id)
       return JSON.parse(String(row.value))
@@ -122,7 +97,7 @@ test('no session event: the plugin appends nothing to the owner log, and the der
   const working = await eventually(() => {
     const row = f.runtime.memberBoard(f.mission.id).find(candidate => candidate.id === member.id)
     return row?.status === 'working' ? row : undefined
-  }, 'the live attempt is visible through the derivation')
+  }, 'the live attempt is visible through the derivation', 5000)
   assert.equal(working.phase, 'active')
   assert.deepEqual(f.session.snapshotEvents().map(event => event.type).filter(type => !KNOWN_SESSION_EVENT_TYPES.has(type)), [], 'a live transition writes no plugin-owned type either')
 
@@ -183,7 +158,7 @@ test('pair: the board guard and the dispatch decision read the one derivation', 
   // The adapter's handle reports busy, so only the durable park can make this
   // member dispatchable (the parked-member hatch).
   let busy = true
-  const f = await fixture(t, { workers: new Workers(undefined, { idle: () => !busy }) })
+  const f = await fixture(t, { workers: projectionWorkers({ isIdle: () => !busy }) })
   const member = await f.addMember('Ada')
   const task = f.propose('Dispatch me')
   f.runtime.wait({ sessionId: member.sessionId }, f.mission.id)
@@ -191,7 +166,7 @@ test('pair: the board guard and the dispatch decision read the one derivation', 
   assert.equal(f.memberRow(member).phase, 'parked')
 
   // Dispatch decision x parked-member hatch: the busy handle does not strand it.
-  const dispatched = await eventually(() => f.taskRow(task).status === 'running' ? f.taskRow(task) : undefined, 'a parked member is dispatched despite a busy handle')
+  const dispatched = await eventually(() => f.taskRow(task).status === 'running' ? f.taskRow(task) : undefined, 'a parked member is dispatched despite a busy handle', 5000)
   assert.equal(dispatched.attempt.ownerId, member.id)
 
   // While the durable park stands, the park wins over the attempt (the hatch and
@@ -229,7 +204,7 @@ test('pair: the W6 idle close-out owns the attempt and the derived status agrees
   const fenced = await eventually(() => {
     const row = f.taskRow(task)
     return row.attempt?.id === undefined || row.attempt.id !== f.runtime.store.get('tasks', task.id).id ? true : undefined
-  }, 'the close-out re-pends the attempt')
+  }, 'the close-out re-pends the attempt', 5000)
   assert.ok(fenced)
   const status = f.memberRow(member).status
   assert.ok(status === 'working' || status === 'idle', 'the derived status follows the surviving attempt')
@@ -276,6 +251,7 @@ test('a mounted projection registry cannot change the read face: the derivation 
 
 test('a phase-less legacy member row keeps its recorded intent: the live-store shape stays stopped', async t => {
   assert.ok(projection, MISSING)
+  // fixture gap: a state file seeded before any runtime opens it.
   const dir = await tempDirectory('swarm-r17-legacy-')
   t.after(() => rm(dir, { recursive: true, force: true }))
   const statePath = join(dir, 'db.sqlite')
@@ -302,7 +278,7 @@ test('a phase-less legacy member row keeps its recorded intent: the live-store s
   const ctx = new Context()
   await ctx.plugin(SessionProjectionRegistry)
   ctx.provide('sessions', { get: () => undefined })
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, new Workers(ctx))
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, projectionWorkers())
   t.after(async () => { await runtime.dispose() })
   await runtime.start()
 

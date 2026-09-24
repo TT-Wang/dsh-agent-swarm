@@ -1740,7 +1740,7 @@ export class SwarmRuntime {
       // The reviewer's own reason is required and bounded; the check-failure
       // report is appended to it, never substituted for it.
       this.bounded(input.reason)
-      const artifact = await this.workers.inspectArtifact?.(member, source.artifact, actor.signal) ?? source.artifact
+      const artifact = await this.workers.inspectArtifact(member, source.artifact, actor.signal)
       if (task.attempt?.sourceCommit !== undefined && task.attempt.sourceCommit !== artifact.commit) throw new Error('[artifact_changed_before_verification] Source no longer matches this review attempt. Reassign this same review to read the current immutable artifact before recording a verdict.')
       if (input.verdict === 'accept') requireArtifactChecks(source, artifact)
       if (source.checks.length) {
@@ -1910,7 +1910,7 @@ export class SwarmRuntime {
       // Retired reviewers carry durable stop/checkpoint markers; retirement
       // starts recovery outside the transaction so a slow stop holds no state lock.
       // A verdict closes a unit of work for both sessions: let the adapter trim history it no longer needs.
-      if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
+      for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)
       this.kick(missionId)
       return task
     })
@@ -3029,7 +3029,7 @@ export class SwarmRuntime {
       // composed afresh, so the stale metadata must be dropped here — after the
       // old handle has stopped and before the next start — or this member can
       // never start again, even if the owner reverts the edit.
-      if (latest.sessionId !== previousSessionId) await this.workers.invalidateComposition?.(mission.id, latest.id)
+      if (latest.sessionId !== previousSessionId) await this.workers.invalidateComposition(mission.id, latest.id)
       assertStaged()
       this.commit(mission.id, () => {
         this.store.put('members', latest)
@@ -3097,7 +3097,7 @@ export class SwarmRuntime {
       // the failure surfaced at verification. No worker, worktree or model step
       // exists yet at this point.
       const declaredChecks = declaredPlanChecks(input.tasks)
-      if (declaredChecks.length && this.workers.checkSyntaxPreflight !== undefined) {
+      if (declaredChecks.length) {
         actor.signal?.throwIfAborted()
         // The adapter result is located; `checkSyntaxDetail` pairs each issue
         // with the check it refuses by that index.
@@ -3364,7 +3364,7 @@ export class SwarmRuntime {
     let total = 0
     for (const member of members) {
       if (memberPhaseOf(member) === 'stopped') continue
-      const activity = this.workers.currentActivity ? this.workers.currentActivity(member.id) : member.activity
+      const activity = this.workers.currentActivity(member.id)
       if (activity?.kind !== 'model') continue
       const requests = member.usage?.requests ?? 0
       if (requests > 0) total += Math.ceil((member.accountedTokens ?? 0) / requests)
@@ -3375,7 +3375,6 @@ export class SwarmRuntime {
   
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
-    if (!this.workers.inspectDelivery) throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support delivery inspection')
     return this.workers.inspectDelivery(mission, task.artifact!.commit, actor.signal)
   }
   async applyDelivery(actor: Actor, missionId: string) {
@@ -3383,7 +3382,6 @@ export class SwarmRuntime {
     // Different completed missions for one source must not apply concurrently.
     return this.exclusive(`delivery:${target.mission.workspace}`, async () => {
       const { mission, task } = this.deliveryTarget(actor, missionId)
-      if (!this.workers.applyDelivery) throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support applying results')
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
       this.commit(missionId, () => {
         // The projection states what is currently in effect, so a conflicts result

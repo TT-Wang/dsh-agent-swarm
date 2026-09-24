@@ -2,8 +2,7 @@
 import assert from 'node:assert/strict'
 import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { makeRepo, Workspaces, WorkspaceWorkers, events, eventually, git, runScenario, setup, taskOf } from './harness.mjs'
-import { subprocessSeam } from '../subprocess-seam.mjs'
+import { makeRepo, WorkspaceWorkers, events, eventually, git, runScenario, setup, taskOf, makeWorkspaces } from './harness.mjs'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 
@@ -11,7 +10,7 @@ await runScenario({
   id: 'F17', title: 'Close-out ordering holds while the worker stop is still in flight', invariants: ['I13'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f17', { 'src/answer.txt': 'base\n' })
-    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = makeWorkspaces(root)
     const workers = new WorkspaceWorkers(workspaces)
     const f = await setup({ workspace: source, workers, config: { tickMs: 3_600_000, maxIdleCloseouts: 1, leaseMs: 600_000 } })
     try {

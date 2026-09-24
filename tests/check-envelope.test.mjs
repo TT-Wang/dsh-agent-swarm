@@ -31,20 +31,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime, compareCheckEnvironments } from '../lib/runtime.js'
-import { Workspaces, checkTempEnvironment, runProcess } from '../lib/workspaces.js'
+import { compareCheckEnvironments } from '../lib/runtime.js'
+import { checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
 const DEFAULT_DEPENDENCY_DIRS = ['node_modules', '.venv', 'venv', 'vendor', '.tox']
-
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
 
 /** A real failing node:test file whose interesting lines arrive after any small bound. */
 const FAILING_SUITE = [
@@ -114,21 +108,9 @@ async function cacheHome(root, warm) {
  * executed check records.
  */
 async function workspaceFixture(t, options = {}) {
-  const temp = await realpath(await tempDirectory('swarm-check-envelope-'))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'src'), { recursive: true })
-  await mkdir(path.join(source, 'tests'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await writeFile(path.join(source, FIXTURE_TEST), FAILING_SUITE)
-  await writeFile(path.join(source, TMP_PROBE), TMP_PROBE_SOURCE)
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'fixture baseline')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam,
-    workspacesRoot: path.join(temp, 'worktrees'),
-    checkTimeoutMs: 30000,
+  const { root: temp, source } = await makeRepo('swarm-check-envelope', { 'src/answer.txt': 'base\n', [FIXTURE_TEST]: FAILING_SUITE, [TMP_PROBE]: TMP_PROBE_SOURCE })
+  const workspaces = makeWorkspaces(temp, {
     maxCheckOutputBytes: options.maxCheckOutputBytes ?? 4096,
-    confineCheck: argv => argv,
     checkEnv: options.checkEnv ?? checkEnvFor(process.env.HOME),
     ...(options.checkConcurrency === undefined ? {} : { checkConcurrency: options.checkConcurrency }),
   })
@@ -137,14 +119,10 @@ async function workspaceFixture(t, options = {}) {
 }
 
 /** The adapter the runtime drives, with every effectful workspace call really executed by `Workspaces`. */
-class EnvelopeWorkers {
-  constructor(workspaces) { this.workspaces = workspaces; this.verifications = []; this.binds = 0 }
-  bind(callbacks) { this.callbacks = callbacks; this.binds++ }
+class EnvelopeWorkers extends FakeWorkers {
+  // Never idle (FakeWorkers' default): the fixture claims its tasks explicitly, so the tick must not race the test.
+  constructor(workspaces) { super(); this.workspaces = workspaces; this.verifications = [] }
   async prepareWorkspace(mission, memberId) { return await this.workspaces.prepareWorkspace(mission, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false } // the fixture claims its tasks explicitly, so the tick must not race the test
   async prepareTask(member, task, dependencies, reviewSource) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
   async captureArtifact(member, task) {
     await writeFile(path.join(member.workspace, 'src', 'answer.txt'), `answer ${task.id}\n`)
@@ -176,12 +154,10 @@ class EnvelopeWorkers {
 /** One mission with an implementation task, an independently submitted artifact and N review tasks. */
 async function missionFixture(t, options = {}) {
   const base = await workspaceFixture(t, options)
-  const workers = new EnvelopeWorkers(base.workspaces)
-  const directory = path.join(base.temp, 'state')
-  await mkdir(directory, { recursive: true })
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 120000, tickMs: 50, maxMessageChars: 20000, maxEvents: 500, maxTasksPerMember: 5 }, workers)
+  const { runtime, workers, budget } = await makeRuntime(t, { workers: new EnvelopeWorkers(base.workspaces),
+    config: { leaseMs: 120000, tickMs: 50, maxMessageChars: 20000, maxEvents: 500, maxTasksPerMember: 5, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
-  t.after(async () => { await runtime.dispose() })
   const owner = { sessionId: 'envelope-owner' }
   const mission = runtime.create(owner, { title: 'Envelope', objective: 'State the check environment', workspace: base.source, scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })

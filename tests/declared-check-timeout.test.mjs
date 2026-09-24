@@ -3,14 +3,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
-import { makeRepo, setup, Workspaces, WorkspaceWorkers, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeRepo, setup, WorkspaceWorkers, MISSION_ACCEPTANCE, makeWorkspaces } from './faults/harness.mjs'
 
 async function fixture(t, checks, options = {}) {
   const repo = await makeRepo('check-timeout')
-  const workspaces = new Workspaces({
-    subprocess: subprocessSeam, workspacesRoot: join(repo.root, 'worktrees'),
-    checkTimeoutMs: 500, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+  const workspaces = makeWorkspaces(repo.root, {
+    checkTimeoutMs: 500,
     // A fixture-owned marker injects a deadline on only the first pass when requested.
     checkEnv: { SWARM_TEST_MARKER: join(repo.root, 'first-pass') }, ...options,
   })

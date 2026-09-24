@@ -24,46 +24,25 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
+import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MEMBER_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
 import { arenaLedgerDigest, hasNotice, noticeFingerprint, noticeLedger, pendingReadiness, proposalAllowance } from '../lib/arena.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const DEFAULT_BUDGET = { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 600000, maxTasks: 6, maxExperiments: 1 }
-
-/** Fake adapter: no auto-dispatch, records every delivery, no filesystem effects. */
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+const DEFAULT_BUDGET = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxTasks: 6, maxExperiments: 1 }
 
 async function fixture(t, options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-arena-'))
-  const stateDirectory = join(root, 'state')
+  // Fake adapter: no auto-dispatch, records every delivery, no filesystem effects.
+  const { dir: root, config, runtime, workers } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] }),
+    config: { maxEvents: 500, maxTasksPerMember: 4, checkTimeoutMs: undefined } })
   const workspace = join(root, 'workspace')
-  await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
-  const config = { statePath: join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 4 }
-  // Production composition: src/index.ts spreads the plugin config into the
-  // runtime and adds maxTasksPerMember, the loaded grants and the authorization
-  // predicate. Nothing below injects a value the production path does not get.
-  const runtime = new SwarmRuntime({ ...config, maxTasksPerMember: config.maxTasksPerMember }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const budget = { ...DEFAULT_BUDGET, ...(options.budget ?? {}) }
   const owner = { sessionId: `owner-${randomUUID()}` }
   const mission = runtime.create(owner, {
@@ -74,7 +53,7 @@ async function fixture(t, options = {}) {
   const alice = await runtime.addMember(owner, mission.id, { name: 'alice', role: 'implementation' })
   const bob = await runtime.addMember(owner, mission.id, { name: 'bob', role: 'reviewer' })
   return {
-    root, stateDirectory, workspace, workers, runtime, config, owner, mission, stream, alice, bob,
+    root, workspace, workers, runtime, config, owner, mission, stream, alice, bob,
     budget, aliceActor: { sessionId: alice.sessionId }, bobActor: { sessionId: bob.sessionId },
   }
 }
@@ -104,12 +83,6 @@ const authorityRecords = f => JSON.stringify({
   members: f.runtime.store.list('members', f.mission.id),
   evidence: f.runtime.store.list('evidence', f.mission.id),
 })
-async function eventually(read, message, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-
 test('proposal capacity is the aggregate mission budget and never shrinks when the roster expands', async t => {
   const f = await fixture(t, { budget: { maxTasks: 6, maxWorkers: 2 } })
   const propose = definitions(f.runtime).get('swarm_propose')
@@ -152,7 +125,7 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   // belongs to the refusal. This used to happen implicitly: each tool call awaited
   // a trace payload file write, and that I/O yielded to the scheduler pass. The
   // trace now records only the digest, so the wait is stated instead of implied.
-  await eventually(() => f.runtime.store.list('deliveries', f.mission.id).every(delivery => delivery.deliveredAt !== undefined), 'the proposals\' deliveries never drained')
+  await eventually(() => f.runtime.store.list('deliveries', f.mission.id).every(delivery => delivery.deliveredAt !== undefined), 'the proposals\' deliveries never drained', 5000)
   // Trigger the refusal synchronously so the outbox has not drained its notice yet:
   // the same call through the tool would yield to the scheduler before the read.
   assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger over capacity' })), /task budget exhausted/)
@@ -182,7 +155,7 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   const deliveredEntry = await eventually(() => {
     const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.class === 'budget')
     return entry?.state === 'claimed' ? entry : undefined
-  }, 'the owner notice was never delivered')
+  }, 'the owner notice was never delivered', 5000)
   assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
   const delivered = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.id === deliveredEntry.deliveryId)
   assert.equal(delivered.deliveredAt, deliveredEntry.deliveredAt, 'the transport fact is the adapter delivery timestamp')

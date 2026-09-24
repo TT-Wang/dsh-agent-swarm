@@ -6,6 +6,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, re
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, makeRuntimeStub, workspaceOptions } from './faults/harness.mjs'
 
 // Source mode permits parallel development without rebuilding shared lib/.
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
@@ -28,7 +29,8 @@ async function fixture(t) {
   await writeFile(path.join(source, '.gitignore'), 'node_modules\nignored.txt\n')
   git(source, ['add', '.']); git(source, ['commit', '-m', 'baseline'])
   const baseline = git(source, ['rev-parse', 'HEAD'])
-  const options = { subprocess: subprocessSeam, workspacesRoot: path.join(root, 'workspaces'), checkTimeoutMs: 10000, maxCheckOutputBytes: 32000, confineCheck: argv => argv }
+  // The shared option bag; the engine stays this file's own `Workspaces` so SWARM_TEST_SOURCE=1 still builds it from src/.
+  const options = workspaceOptions(root, { workspacesRoot: path.join(root, 'workspaces'), checkTimeoutMs: 10000 })
   const workspaces = new Workspaces(options)
   const mission = { id: 'mission', workspace: source }
   const member = { id: 'member', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member') }
@@ -39,8 +41,8 @@ async function fixture(t) {
 
 test('M2-1: no-progress and pass-timeout each record once on the same board', () => {
   const mission = { id: 'mission', status: 'active' }, records = []
-  const rt = { now: () => Date.now(), store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
-    isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} }
+  const rt = makeRuntimeStub({ store: { get: () => structuredClone(mission), list: () => [], put: (_table, row) => Object.assign(mission, row), event: (_m, _t, _a, data) => records.push(data) },
+    isMissionTerminal: () => false, commit: (_id, fn) => fn(), expectWedgedRelease() {}, notify() {}, pumpOutbox() {} })
   const scheduling = new Scheduling(rt)
   const info = { pass: { id: 'pass', operationId: 'one', startedAt: 0, fingerprintBefore: 'same', revisionBefore: 0, noProgressPasses: 3 }, unschedulable: [], reason: 'no-progress', boundMs: 1000, revisionNow: 0, fingerprintNow: 'same' }
   for (const reason of ['no-progress', 'pass-timeout', 'no-progress', 'pass-timeout']) scheduling.escalateSchedulingStall('mission', { ...info, reason })
@@ -57,14 +59,14 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
     store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'old' }))
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
-  const scheduling = new Scheduling({ now: () => Date.now(), store, config: { tickMs: 100, maxEvents: 1 } })
+  const scheduling = new Scheduling(makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } }))
   assert.equal(scheduling.unreviewedStall('mission', [{ id: 'old' }]), true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
   assert.equal(scheduling.unreviewedStall('mission', [{ id: 'new' }]), false)
 })
 
 test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {
-  const rt = { now: () => Date.now(), workers: { isIdle: () => true }, scopesOverlap: () => true }
+  const rt = makeRuntimeStub({ workers: new FakeWorkers({ autoIdle: true }), scopesOverlap: () => true })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   const member = { id: 'one', name: 'One', phase: 'ready', status: 'idle', workspace: '/one' }
   const independent = { id: 't', title: 'Work', epoch: 0, objective: 'Write a new file from the baseline.', acceptance: [], dependencies: [], scope: ['**'] }
@@ -79,7 +81,7 @@ test('stop recovery owns its member until quiescence, including before native st
   const stopping = { id: 'old-task', status: 'blocked', epoch: 3, resumeAfterStop: { epoch: 3, memberId: member.id } }
   const ready = { id: 'new-task', title: 'New task', epoch: 0, status: 'pending', dependencies: [], acceptance: [], scope: ['**'], objective: 'New work' }
   let starts = 0
-  const rt = { now: () => Date.now(), store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: { isIdle: () => true } }
+  const rt = makeRuntimeStub({ store: { list: () => [stopping, ready] }, interpretation: () => ({ members: [member], tasks: [stopping, ready] }), mission: () => ({ status: 'active' }), startWorker: async () => { starts++ }, workers: new FakeWorkers({ autoIdle: true }) })
   const scheduling = new Scheduling(rt); scheduling.ready = () => true
   assert.equal(await scheduling.dispatch({ status: 'active' }, 'm'), true)
   assert.equal(starts, 0)
@@ -231,7 +233,7 @@ test('M2-9: external executables are frozen files; external directory/data and c
 })
 
 test('M2-10: inline # remains word data, while actual shell comments remain ignored', () => {
-  const admission = new WorkspaceAdmission({})
+  const admission = new WorkspaceAdmission(makeRuntimeStub())
   const classify = command => admission.deniedGitWrite({ tool: 'bash', arguments: { command }, result: 'Operation not permitted', isError: true })
   for (const command of ['echo foo#bar; git add .', 'curl http://h/p#frag && git commit -m x', 'echo foo\\ #bar; git add .', 'echo foo\\\n#bar; git add .']) assert.equal(classify(command), command)
   for (const command of ['echo foo # git add .', 'echo "# git add ."', '# git add .']) assert.equal(classify(command), undefined)
@@ -239,7 +241,7 @@ test('M2-10: inline # remains word data, while actual shell comments remain igno
 
 test('M2-11: isolation uses explicit member IDs including task workspace conflicts', () => {
   const members = [{ id: 'bad', name: 'victim', workspace: '', status: 'idle' }, { id: 'victim', name: 'Safe', workspace: '/safe', status: 'idle' }]
-  const admission = new WorkspaceAdmission({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, refuseIsolation() {}, scopesOverlap: () => false })
+  const admission = new WorkspaceAdmission(makeRuntimeStub({ store: { list: table => table === 'members' ? members : [], get: () => undefined }, refuseIsolation() {}, scopesOverlap: () => false }))
   assert.equal(admission.isolationAllows('m', members[1]), true)
   assert.equal(admission.isolationAllows('m', members[0]), false)
   const tasks = ['a', 'b'].map(id => ({ id, status: 'running', scope: ['**'], attempt: { ownerId: 'victim' } }))

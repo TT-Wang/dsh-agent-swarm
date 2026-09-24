@@ -10,13 +10,11 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { classifyCheck, loadPackageScripts } from '../lib/admission.js'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
 test('target script and file names alone never deny admission', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
   for (const [name, body] of Object.entries(manifest.scripts)) {
@@ -27,21 +25,16 @@ test('target script and file names alone never deny admission', async () => {
 })
 
 test('R11-06: runtime.propose refuses a host-only body behind a neutral script name', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-host-scripts-'))
-  t.after(async () => rm(directory, { recursive: true, force: true }))
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, id) { return join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 200, maxTasks: 20 },
+  })
   await writeFile(join(directory, 'package.json'), JSON.stringify({
     name: 'host-scripts-fixture', private: true,
     scripts: { smoke: 'sandbox-exec -p rule node --test', unit: 'node --test tests/*.test.mjs', chain: 'npm run smoke' },
   }))
   assert.deepEqual(Object.keys(loadPackageScripts(directory) ?? {}), ['smoke', 'unit', 'chain'])
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(mission, id) { return join(mission.workspace, id) },
-    async start() {}, async prepareTask() {}, async deliver() {}, async stop() {},
-    isIdle() { return false }, async dispose() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose() })
   const owner = { sessionId: 'host-scripts-owner' }
   const mission = runtime.create(owner, { title: 'Scripts', objective: 'Classify scripts', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })

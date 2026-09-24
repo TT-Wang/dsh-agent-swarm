@@ -23,43 +23,45 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
 import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
 import { wakePrecision } from './instruments.mjs'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-class Workers {
-  constructor(options = {}) { this.options = options; this.started = []; this.delivered = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
+/** `options`: hangStart, hangStop, an `idle(memberId)` predicate (always idle without one) and an `onDeliver` hook. */
+class Workers extends FakeWorkers {
+  artifact = { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }
+  checks = []
+  delivered = []
+  constructor(options = {}) { super(); this.options = options }
   async start(spec) { this.started.push(spec.member.id); if (this.options.hangStart === true) return new Promise(() => {}) }
   async deliver(member, delivery) { this.delivered.push({ memberId: member.id, deliveryId: delivery.id }); if (this.options.onDeliver) await this.options.onDeliver(member, delivery) }
   async stop() { if (this.options.hangStop === true) return new Promise(() => {}) }
   isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
 }
 
-async function fixture(t, config = {}, workers = undefined, directory = undefined) {
-  const dir = directory ?? await tempDirectory('swarm-owner-decisions-')
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, workers ?? new Workers())
-  t.after(async () => { await runtime.dispose(); if (directory === undefined) await rm(dir, { recursive: true, force: true }) })
-  return { directory: dir, runtime }
+/** A runtime on a fresh fixture state, or, with `reopen` (an earlier fixture's config), on that same state file. */
+async function fixture(t, config = {}, workers = new Workers(), reopen = undefined) {
+  if (reopen !== undefined) {
+    const runtime = new SwarmRuntime({ ...reopen, ...config }, workers)
+    t.after(async () => { await runtime.dispose() })
+    return { runtime }
+  }
+  const { dir: directory, config: settings, runtime } = await makeRuntime(t, { workers,
+    config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config } })
+  return { directory, config: settings, runtime }
 }
 
-async function scenario(t, { workers = new Workers(), config = {}, directory } = {}) {
-  const f = await fixture(t, config, workers, directory)
+async function scenario(t, { workers = new Workers(), config = {} } = {}) {
+  const f = await fixture(t, config, workers)
   await f.runtime.start()
   const owner = { sessionId: 'owner-decisions' }
   const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
@@ -141,12 +143,10 @@ test('R15-A1: the W3 stall notice names an unschedulable subject, and an escalat
 })
 
 test('R15-A2: a hung workers.start still names the pending task in a durable decision notice (failure-first)', async t => {
-  const directory = await tempDirectory('swarm-hung-start-')
-  t.after(async () => { await rm(directory, { recursive: true, force: true }) })
   // Phase 1: a durable board with a running task a pending dependent waits on.
   // That state is legitimately waiting — no escalation and no witness yet — so
   // phase 2 cannot be suppressed by a stale witness from the previous life.
-  const first = await scenario(t, { directory })
+  const first = await scenario(t)
   const builder = await first.addMember('Builder')
   const pending = first.propose('Runs across the restart', { assigneeId: builder.id })
   await first.runtime.claim(first.actorFor(builder), first.mission.id, pending.id)
@@ -159,7 +159,7 @@ test('R15-A2: a hung workers.start still names the pending task in a durable dec
 
   // Phase 2: the same durable store, an adapter whose start() never settles.
   const workers = new Workers({ hangStart: true })
-  const second = await fixture(t, { stallPassTimeoutMs: 60 }, workers, directory)
+  const second = await fixture(t, { stallPassTimeoutMs: 60 }, workers, first.config)
   const startedAt = Date.now()
   void second.runtime.start().catch(() => undefined)
   await sleep(500)

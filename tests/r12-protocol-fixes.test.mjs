@@ -1,9 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { RefusalRegistry, emitGuardTerminal } from '../lib/refusals.js'
@@ -11,16 +8,17 @@ import { WriterBusyError } from '../lib/store.js'
 import { pendingReadiness } from '../lib/arena.js'
 import { Attempts, pendingStopOwner } from '../lib/attempts.js'
 import { wakePrecision } from './instruments.mjs'
+import { FakeWorkers, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 
 function guardFixture() {
   const mission = { id: 'm', ownerSessionId: 'owner', status: 'active' }
   const question = { id: 'q', missionId: 'm', from: 'worker', to: 'owner', content: 'Choose an API', replyExpected: true, deliveredAt: 1 }
   const hooks = new Set()
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     store: { list: () => [mission], get: table => table === 'missions' ? mission : question, put() {}, event() {} },
     isMissionTerminal: value => ['completed', 'stopped'].includes(value.status), openAsks: () => [question],
     commit: (_id, fn) => fn(), notify() {}, noticeSubjectsFor: () => [],
-  }
+  })
   const ctx = { on: () => () => {}, agents: { get: () => ({ ctx: { on: (_name, hook) => {
     hooks.add(hook); return () => hooks.delete(hook)
   } } }) } }
@@ -66,25 +64,18 @@ test('R12: muted stopped questions do not retain the full owner role; completed 
   assert.equal(scoper.roleOf(owner), 'owner')
 })
 
-class QuietWorkers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async dispose() {}
-}
+const quietRuntime = t => makeRuntime(t, {
+  workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+  config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+  budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 10 },
+})
 
 test('R12: owner can settle a receipt in paused, blocked and terminal missions without restarting work', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'r12-receipts-'))
-  const rt = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, new QuietWorkers())
-  t.after(async () => { await rt.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime: rt, budget } = await quietRuntime(t)
   const owner = { sessionId: 'owner' }
   for (const status of ['paused', 'blocked', 'completed', 'stopped']) {
     const mission = rt.create(owner, { title: status, objective: 'Settle a receipt', workspace: directory, scope: ['**'], acceptance: ['answer'],
-      budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 10, maxExperiments: 0 } })
+      budget: { ...budget } })
     const questionId = `question-${status}`
     rt.commit(mission.id, () => {
       const row = rt.mission(mission.id); row.status = status; rt.store.put('missions', row)
@@ -103,14 +94,14 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
 function refusalFixture() {
   let busy = true
   const admissions = new Map(), events = []
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     commit: (_id, fn) => { if (busy) throw new WriterBusyError('busy', 2); return fn() },
     store: {
       get: (table, id) => table === 'missions' ? { id, status: 'active' } : admissions.get(id), list: () => [],
       recordAdmission: row => admissions.set(row.id, structuredClone(row)),
       event: (missionId, type, actor, data) => events.push({ missionId, type, actor, data }),
     }, fingerprint: () => 'stable', isMissionTerminal: () => false, noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
-  }
+  })
   return { rt, registry: new RefusalRegistry(rt), admissions, events, release: () => { busy = false } }
 }
 
@@ -158,13 +149,10 @@ test('R12: pending readiness requires a submitted source and an idle independent
 // Instrument self-test: the decision metric lives in tests/instruments.mjs since
 // round 20, so this pins the audit instrument, not a production classifier.
 test('R12 instrument: ordinary owner questions are excluded from the decision metric', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'r12-decisions-'))
-  const rt = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, new QuietWorkers())
-  t.after(async () => { await rt.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime: rt, budget } = await quietRuntime(t)
   const owner = { sessionId: 'owner' }
   const mission = rt.create(owner, { title: 'Metrics', objective: 'Count decisions', workspace: directory, scope: ['**'], acceptance: ['accurate'],
-    budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 10, maxExperiments: 0 } })
+    budget: { ...budget } })
   rt.commit(mission.id, () => {
     rt.store.put('deliveries', { id: 'ordinary-question', missionId: mission.id, from: 'member', to: 'owner', kind: 'question', content: 'API?', createdAt: 1, replyExpected: true })
   })
@@ -174,23 +162,27 @@ test('R12 instrument: ordinary owner questions are excluded from the decision me
 
 function stopFixture(reason, stop) {
   const mission = { id: 'mission', status: 'active' }
+  // The fenced owner's row, already stopped: the adapter checkpoints it and the
+  // release leaves it (and, on close-out, the task's assignee) as it is.
+  const oldOwner = { id: 'old-owner', missionId: mission.id, status: 'stopped' }
   const rows = new Map([['task', { id: 'task', missionId: mission.id, epoch: 2, status: 'blocked', assigneeId: 'planned-new-owner', recoveryCount: 1,
     resumeAfterStop: { epoch: 2, memberId: 'old-owner', reason, at: Date.now() } }]])
   const pending = [], events = [], stopped = []
-  const rt = { now: () => Date.now(),
+  const rt = makeRuntimeStub({
     config: { maxTasksPerMember: 10 }, shuttingDown: false,
     store: {
       list: table => table === 'tasks' ? [...rows.values()].map(row => structuredClone(row)) : [],
-      get: (table, id) => table === 'missions' ? mission : table === 'tasks' ? structuredClone(rows.get(id)) : undefined,
+      get: (table, id) => table === 'missions' ? mission : table === 'tasks' ? structuredClone(rows.get(id))
+        : table === 'members' && id === oldOwner.id ? structuredClone(oldOwner) : undefined,
       put: (table, row) => { if (table === 'tasks') rows.set(row.id, structuredClone(row)) },
       event: (_mission, type, _actor, data) => events.push({ type, data }),
     },
-    workers: { stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } },
+    workers: new FakeWorkers({ stop: async memberId => { stopped.push(memberId); await stop(stopped.length) } }),
     task: (_mission, id) => structuredClone(rows.get(id)), mission: () => mission,
     isMissionTerminal: value => ['stopped', 'completed'].includes(value.status),
     defer: fn => { pending.push(Promise.resolve().then(fn)) }, exclusive: (_id, fn) => fn(), commit: (_id, fn) => fn(),
     kick() {}, fingerprint: () => 'stable', noticeSubjectsFor: () => [], notify() {}, pumpOutbox() {},
-  }
+  })
   return { mission, rows, pending, events, stopped, attempts: new Attempts(rt) }
 }
 

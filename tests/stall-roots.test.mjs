@@ -5,39 +5,22 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { waitsLegitimately } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
-import { tempDirectory } from './temp-root.mjs'
-import { FakeClock } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function eventually(read, message, timeoutMs = 5000) {
-  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(5)) { const value = read(); if (value) return value }
-  assert.fail(`timed out: ${message}`)
-}
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
 
-async function fixture(t, config = {}) {
-  const directory = await tempDirectory('swarm-stall-roots-')
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
+/**
+ * A started runtime with one member, on the shared fixture. With a `clock`
+ * (FakeClock) the runtime reads it and runs no tick timer: the test moves the
+ * clock and drives `runtime.tick()` itself (`ticks`).
+ */
+async function fixture(t, { clock, ...config } = {}) {
+  const workers = new FakeWorkers({ autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers, clock, config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 } })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'stall-owner' }
   const mission = runtime.create(owner, { title: 'Stall roots', objective: 'Name the root', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
@@ -49,7 +32,15 @@ async function fixture(t, config = {}) {
   const notices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const stallRoots = () => notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('stall-root:'))
   const fallthroughs = () => notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
-  return { directory, runtime, owner, mission, member, actor, propose, block, cancel, notices, stallRoots, fallthroughs }
+  return { directory, runtime, clock, owner, mission, member, actor, propose, block, cancel, notices, stallRoots, fallthroughs }
+}
+
+/** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
+async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
+/** Tick until `read` returns a value, as the timer would until it holds; fail after `limit` ticks. */
+async function ticksUntil(f, read, message, limit = 200) {
+  for (let n = 0; n <= limit; n += 1) { const value = read(); if (value) return value; if (n < limit) await ticks(f, 1) }
+  assert.fail(`not within ${limit} ticks: ${message}`)
 }
 
 test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sibling runs', async t => {
@@ -383,7 +374,7 @@ for (const repaired of [true, false]) {
     // while the root's repair was already running. The clock and the ticks are
     // driven by hand: each reminder interval is one clock step and one tick.
     const clock = new FakeClock()
-    const f = await fixture(t, { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 })
+    const f = await fixture(t, { clock })
     const followupMs = f.runtime.notices.obligationFollowupMs = 300
     const reminderIntervals = async count => { for (let step = 0; step < count; step += 1) { clock.advance(followupMs); await f.runtime.tick() } }
     const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
@@ -460,8 +451,9 @@ for (const repaired of [true, false]) {
 test('a pending task in preparation back-off is a bounded live wait, and a named fall-through once the bound passes without a retry', async t => {
   // Before, any `preparationFailure` made a pending task "not legitimately
   // waiting", so the host's own transient back-off woke the owner through the
-  // fall-through while the retry was still scheduled.
-  const f = await fixture(t)
+  // fall-through while the retry was still scheduled. The clock and the ticks
+  // are driven by hand.
+  const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
   // A healthy sibling keeps the board out of the W3 stall class; research kind
@@ -472,7 +464,7 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const backoff = f.propose('Backing off', { ...research, assigneeId: second.id })
   // The scheduler's transient back-off (src/scheduling.ts) and then the loss of
   // the only member it could retry on: nothing will retry once retryAt passes.
-  const retryAt = Date.now() + 400
+  const retryAt = f.clock.now() + 400
   f.runtime.store.transaction(() => {
     const row = f.runtime.store.get('tasks', backoff.id)
     row.epoch++
@@ -486,12 +478,12 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
   const board = () => f.runtime.store.list('tasks', f.mission.id)
   assert.equal(waitsLegitimately(f.runtime, f.runtime.store.get('tasks', backoff.id), board()), true, 'the back-off is a live wait')
-  await sleep(250)
+  await ticks(f, 10)
   assert.equal(named().length, 0, `no fall-through while the host's retry is scheduled: ${JSON.stringify(f.notices().map(delivery => delivery.notice?.dedupKey))}`)
-  const notice = await eventually(() => named()[0], 'the overdue retry is named once the bound passes')
+  const notice = await ticksUntil(f, () => named()[0], 'the overdue retry is named once the bound passes')
   assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
   assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
-  await sleep(100)
+  await ticks(f, 4)
   assert.equal(named().length, 1, 'named exactly once')
   // Past the bound the back-off explains nothing: the row is judged like any
   // other ready work, so an assignee holding a live lease is still a live wait.
@@ -507,8 +499,9 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
     // 5347f5b: the back-off wait ends on a timer that changes nothing in F(S), so
     // a W2 stamped inside the window (the row-7b stamp after a stall-root notice,
     // or another task's permanent preparation-failure notice) matched F(S) forever
-    // and the fall-through never named the task nothing would retry.
-    const f = await fixture(t)
+    // and the fall-through never named the task nothing would retry. The clock
+    // and the ticks are driven by hand.
+    const f = await fixture(t, { clock: new FakeClock() })
     const tickMs = f.runtime.config.tickMs
     const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
     const research = { kind: 'research', checks: undefined }
@@ -516,7 +509,7 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
     await f.runtime.claim(f.actor, f.mission.id, sibling.id)
     const other = f.propose('Unrelated dead end', research)
     const backoff = f.propose('Backing off', { ...research, assigneeId: second.id })
-    const retryAt = Date.now() + 400
+    const retryAt = f.clock.now() + 400
     f.runtime.commit(f.mission.id, () => {
       const row = f.runtime.store.get('tasks', backoff.id)
       row.epoch++
@@ -541,17 +534,17 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
     const epoch = f.runtime.store.get('tasks', backoff.id).epoch
     const named = () => f.fallthroughs().filter(delivery => delivery.subjects?.includes(`${backoff.id}@${epoch}`))
     // The co-stamp happened inside the window and the board did not change after it.
-    const stamped = await eventually(() => {
+    const stamped = await ticksUntil(f, () => {
       const witness = f.runtime.store.get('missions', f.mission.id).witness
       return witness?.kind === 'W2' && witness.at <= retryAt + tickMs && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
     }, 'a W2 witness is stamped during the back-off window')
     assert.ok(stamped.at <= retryAt, `stamped inside the window (${retryAt - stamped.at} ms before retryAt)`)
     assert.equal(named().length, 0, 'the live back-off is not named')
-    const notice = await eventually(() => named()[0], 'the expired back-off is named despite the earlier W2 for the same F(S)', 3000)
+    const notice = await ticksUntil(f, () => named()[0], 'the expired back-off is named despite the earlier W2 for the same F(S)', 120)
     assert.ok(notice.createdAt > retryAt + tickMs, `named only after retryAt plus one tick (${notice.createdAt - retryAt} ms after retryAt)`)
     assert.deepEqual(notice.subjects, [`${backoff.id}@${epoch}`], 'only the expired back-off is named')
     assert.equal(f.runtime.store.get('tasks', backoff.id).status, 'pending', 'no retry happened')
-    await sleep(150)
+    await ticks(f, 6)
     assert.equal(named().length, 1, 'named exactly once: the fall-through re-stamps the witness past the bound')
     const witness = f.runtime.store.get('missions', f.mission.id).witness
     assert.equal(witness.fingerprint, f.runtime.fingerprint(f.mission.id), 'the witness is still keyed by F(S) alone')
@@ -563,7 +556,9 @@ test('an expired back-off that still waits (queued behind a live lease) is judge
   // 12b12a6: once a back-off expired after the witness was stamped, the F(S)
   // dedup stayed bypassed for as long as the task legitimately waited, so the
   // whole classifier ran on every pass and transition (~40 per second here).
-  const f = await fixture(t)
+  // The clock and the ticks are driven by hand; the instants below are the
+  // runtime's clock.
+  const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const research = { kind: 'research', checks: undefined }
   const running = f.propose('Running work', research)
@@ -571,7 +566,7 @@ test('an expired back-off that still waits (queued behind a live lease) is judge
   const other = f.propose('Unrelated dead end', research)
   // Queued behind its own assignee's live lease once the back-off expires.
   const backoff = f.propose('Backing off', research)
-  const retryAt = Date.now() + 300
+  const retryAt = f.clock.now() + 300
   f.runtime.commit(f.mission.id, () => {
     const row = f.runtime.store.get('tasks', backoff.id)
     row.epoch++
@@ -582,17 +577,17 @@ test('an expired back-off that still waits (queued behind a live lease) is judge
     f.runtime.store.put('tasks', dead)
   })
   // The unrelated stall root stamps the W2 witness inside the back-off window.
-  const stamped = await eventually(() => {
+  const stamped = await ticksUntil(f, () => {
     const witness = f.runtime.store.get('missions', f.mission.id).witness
     return witness?.kind === 'W2' && witness.at <= retryAt && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
   }, 'a W2 witness is stamped during the back-off window')
   const notices = f.runtime.notices
   const judged = [], passes = []
   const waits = notices.waitsLegitimately.bind(notices)
-  notices.waitsLegitimately = (task, tasks) => { if (task.id === backoff.id) judged.push(Date.now()); return waits(task, tasks) }
+  notices.waitsLegitimately = (task, tasks) => { if (task.id === backoff.id) judged.push(f.clock.now()); return waits(task, tasks) }
   const ensure = notices.ensureWitness.bind(notices)
-  notices.ensureWitness = (missionId, options) => { passes.push(Date.now()); return ensure(missionId, options) }
-  await sleep(Math.max(0, retryAt + tickMs - Date.now()) + 800)
+  notices.ensureWitness = (missionId, options) => { passes.push(f.clock.now()); return ensure(missionId, options) }
+  await ticks(f, Math.ceil((Math.max(0, retryAt + tickMs - f.clock.now()) + 800) / tickMs))
   const bound = retryAt + tickMs
   const after = judged.filter(at => at > bound)
   t.diagnostic(`witness passes after the bound: ${passes.filter(at => at > bound).length}; back-off judgements after the bound: ${after.length}`)
@@ -611,8 +606,10 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   // was judged still waiting early in that pass; its bound passed before the
   // pass ended, and the re-stamp then post-dated it, so every later pass read
   // the same F(S) as already judged and B's fall-through was never owed. The
-  // re-stamp now carries the instant the judgement began.
-  const f = await fixture(t)
+  // re-stamp now carries the instant the judgement began. The clock and the
+  // ticks are driven by hand: the slow judgement moves the clock past B's bound
+  // itself instead of spinning on real time.
+  const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
   const research = { kind: 'research', checks: undefined }
@@ -623,7 +620,7 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   // the re-stamp); B's assignee is stopped, so once expired a fall-through is owed.
   const a = f.propose('Backoff A', research)
   const b = f.propose('Backoff B', { ...research, assigneeId: second.id })
-  const retryA = Date.now() + 400
+  const retryA = f.clock.now() + 400
   const retryB = retryA + 80
   f.runtime.commit(f.mission.id, () => {
     for (const [task, retryAt] of [[a, retryA], [b, retryB]]) {
@@ -641,7 +638,7 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   })
   const boundA = retryA + tickMs, boundB = retryB + tickMs
   const bSubject = `${b.id}@${f.runtime.store.get('tasks', b.id).epoch}`
-  await eventually(() => {
+  await ticksUntil(f, () => {
     const witness = f.runtime.store.get('missions', f.mission.id).witness
     return witness?.kind === 'W2' && witness.at <= retryA && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
   }, 'a W2 witness is stamped inside both back-off windows')
@@ -649,16 +646,16 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   let spun
   const judgedB = []
   const waits = notices.waitsLegitimately.bind(notices)
-  notices.waitsLegitimately = (task, tasks) => { const result = waits(task, tasks); if (task.id === b.id) judgedB.push({ at: Date.now(), waits: result }); return result }
+  notices.waitsLegitimately = (task, tasks) => { const result = waits(task, tasks); if (task.id === b.id) judgedB.push({ at: f.clock.now(), waits: result }); return result }
   const judge = notices.judgeBoard.bind(notices)
   notices.judgeBoard = (...args) => {
-    const start = Date.now()
+    const start = f.clock.now()
     const result = judge(...args)
     // The first judgement after A's bound runs past B's bound: a slow tail.
-    if (spun === undefined && start > boundA && start < boundB) { spun = { start }; while (Date.now() <= boundB + 1) { /* a slow judgement */ } }
+    if (spun === undefined && start > boundA && start < boundB) { spun = { start }; f.clock.advance(boundB + 2 - f.clock.now()) /* a slow judgement */ }
     return result
   }
-  const named = await eventually(() => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject)), 'B\'s expired back-off is named by the fall-through', Math.max(0, boundB - Date.now()) + 1000).catch(error => error)
+  const named = await ticksUntil(f, () => f.fallthroughs().find(delivery => delivery.subjects?.includes(bSubject)), 'B\'s expired back-off is named by the fall-through', Math.ceil((Math.max(0, boundB - f.clock.now()) + 1000) / tickMs)).catch(error => error)
   assert.ok(spun !== undefined, 'a judgement began between the two bounds and ran past B\'s')
   assert.ok(judgedB.some(item => item.at >= spun.start && item.at < boundB && item.waits), 'that judgement found B still waiting')
   assert.ok(!(named instanceof Error), 'a later pass judged B expired and named it')

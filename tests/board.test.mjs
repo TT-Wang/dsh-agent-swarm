@@ -24,30 +24,21 @@ import { DatabaseSync } from 'node:sqlite'
 import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS, errorTypeFor, spanContractViolation } from '../lib/trace.js'
+import { FakeWorkers, budget as sharedBudget } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
 
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+const newWorkers = () => new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] })
 
 async function fixture(t, options = {}) {
+  // fixture gap: a caller-chosen state directory and file name; the store-backed test lists state/ and filters db.sqlite.
   const root = await mkdtemp(join(tmpdir(), 'swarm-board-'))
   const stateDirectory = join(root, 'state')
   const workspace = join(root, 'workspace')
   await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
+  const workers = newWorkers()
   const config = { statePath: join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10,
     maxMessageChars: options.maxMessageChars ?? 16000, maxEvents: 200, maxTasksPerMember: 4 }
   const runtime = new SwarmRuntime(config, workers)
@@ -376,7 +367,7 @@ test('posts survive a runtime restart and remain immutable', async t => {
   const post = f.runtime.post(f.aliceActor, f.mission.id, { kind: 'HANDOFF', to: f.bob.id, body: 'Dossier: what I tried and what failed', ttlMs: 3600000 })
   await f.runtime.dispose()
 
-  const reopened = new SwarmRuntime(f.config, new Workers())
+  const reopened = new SwarmRuntime(f.config, newWorkers())
   t.after(() => reopened.dispose())
   const view = reopened.board(f.bobActor, f.mission.id, { postId: post.id })
   assert.deepEqual(view.post, {
@@ -394,7 +385,7 @@ test('a version-2 state file upgrades in place and gains the append-only board',
   legacy.exec('DROP TABLE posts; PRAGMA user_version=2;')
   legacy.close()
 
-  const upgraded = new SwarmRuntime(f.config, new Workers())
+  const upgraded = new SwarmRuntime(f.config, newWorkers())
   t.after(() => upgraded.dispose())
   const schema = new DatabaseSync(f.config.statePath)
   assert.equal(schema.prepare('PRAGMA user_version').get().user_version, 3, 'the store records the new schema version')

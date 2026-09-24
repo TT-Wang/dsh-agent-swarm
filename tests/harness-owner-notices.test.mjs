@@ -21,6 +21,7 @@ import * as Swarm from '../lib/index.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { tempDirectory } from './temp-root.mjs'
+import { budget } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
@@ -62,7 +63,7 @@ async function fixture(t, respond = () => text('Done'), configure, profile = {})
   const rt = ctx.swarm
   rt.kick = () => {}; rt.pumpOutbox = () => {}
   const owner = { sessionId: 'owner-session' }
-  const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })
+  const mission = rt.create(owner, { title: 'Native owner notices', objective: 'Preserve correct owner work', workspace: source, scope: ['**'], acceptance: ['correct'], budget: { ...budget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   const emit = (content, options = {}) => {
     rt.commit(mission.id, () => rt.notify(mission.id, content, [`mission:${mission.id}`], { dedupKey: content, ...options }))
     return rt.store.list('deliveries', mission.id).find(row => row.notice?.dedupKey === content)

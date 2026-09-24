@@ -12,12 +12,10 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { blockCauses, stopOutcome } from '../lib/attempts.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { guardBoard } from './guard-model.mjs'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 const DEFAULT_LIMIT = 3
 const evidence = { refuted: 'refuted', verified: 'verified', challenged: 'challenged' }
@@ -122,27 +120,15 @@ test('the recovery limit decides only the stops it is not exempted from', () => 
   assert.deepEqual(stopOutcome(new Set(['task-ceiling']), 'handoff'), { blocked: true, recoveryLimit: false })
 })
 
-class IdleWorkers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return artifact }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
-
 test('the guard-chain board reads a preparation block from the recorded failure, not from the prose of task.output', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-causes-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: DEFAULT_LIMIT }, new IdleWorkers())
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact, checks: [], async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: DEFAULT_LIMIT, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'causes-owner' }
   const mission = runtime.create(owner, { title: 'Causes', objective: 'Classify blocks', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,

@@ -39,16 +39,14 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
 import { selectAcceptedDelivery, taskGraphIndex } from '../lib/task-graph.js'
-import { SWARM_SCRATCH_DIRNAME, Workspaces, runProcess } from '../lib/workspaces.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { SWARM_SCRATCH_DIRNAME } from '../lib/workspaces.js'
+import { FakeWorkers, SwarmRuntime, budget, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const BUDGET = { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60, maxExperiments: 0 }
+const BUDGET = { ...budget, maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 }
 
 function task(id, kind, status, extra = {}) {
   return { id, missionId: 'm', workstreamId: 'w', title: id, objective: id, kind, status, dependencies: [], scope: ['docs/'],
@@ -56,32 +54,32 @@ function task(id, kind, status, extra = {}) {
 }
 const artifact = commit => ({ commit, baseCommit: '0'.repeat(40), workspace: '/w', changedPaths: ['docs/x.md'] })
 
-class StubWorkers {
-  constructor() { this.idle = new Set(); this.runs = []; this.stopped = [] }
-  bind(callbacks) { this.callbacks = callbacks }
+/**
+ * Always idle; `idle` holds what `start` added and `stop` removes it. `start`
+ * and `stop` are prototype methods, so R18-4e can hold the stop of the adapter a
+ * restart creates.
+ */
+class StubWorkers extends FakeWorkers {
+  autoIdle = true
+  checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
   async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) }
   async start(member) { this.idle.add(member.id) }
-  async deliver() {}
   async stop(memberId) { this.stopped.push(memberId); this.idle.delete(memberId) }
-  async dispose() {}
-  isIdle() { return true }
-  async prepareTask() {}
-  async captureArtifact(member, task) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } }
-  async verifyArtifact() { return [{ command: 'npm test', exitCode: 0, output: 'ok' }] }
+  async captureArtifact(member) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } }
 }
+/** The runtime without its own tick and outbox pumps: each test drives both. */
+const quiet = runtime => { runtime.kick = () => {}; runtime.pumpOutbox = () => {}; return runtime }
+const r18Config = { tickMs: 60000, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined }
 async function fixture(t, config = {}) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-r18-'))
-  const settings = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, ...config }
+  // Registered before makeRuntime's cleanup, so a reopened runtime is disposed before the temp dir goes.
+  const f = {}
+  t.after(async () => { await f.runtime?.dispose() })
+  const { dir: directory, config: settings, runtime, workers } = await makeRuntime(t, { workers: new StubWorkers(), config: { ...r18Config, ...config } })
   const open = () => {
     const workers = new StubWorkers()
-    const runtime = new SwarmRuntime(settings, workers)
-    runtime.kick = () => {}
-    runtime.pumpOutbox = () => {}
-    return { runtime, workers }
+    return { runtime: quiet(new SwarmRuntime(settings, workers)), workers }
   }
-  const f = open()
-  t.after(async () => { await f.runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  Object.assign(f, { runtime: quiet(runtime), workers })
   const owner = { sessionId: `r18-owner-${Math.random()}` }
   const mission = f.runtime.create(owner, { title: 'R18', objective: 'Deliver verified work', workspace: directory, scope: ['src/', 'docs/'], acceptance: ['done'], budget: { ...BUDGET } })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
@@ -98,11 +96,7 @@ const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.i
   kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
 const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
 const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status
-async function barrierSettled(f, task) {
-  const deadline = Date.now() + 2000
-  while (Date.now() < deadline && current(f, task).resumeAfterStop !== undefined) await new Promise(resolve => setTimeout(resolve, 10))
-  assert.equal(current(f, task).resumeAfterStop, undefined, 'the stop barrier settled')
-}
+const barrierSettled = (f, task) => eventually(() => current(f, task).resumeAfterStop === undefined, 'the stop barrier settled', 2000)
 /**
  * Hold the adapter's stop so the window between a fence and its confirmed stop
  * is observable. The returned release is also armed on a bounded timer and on
@@ -122,9 +116,8 @@ function holdStop(f, t) {
 }
 /** Wait until the barrier has asked the adapter to stop that handle `count` times. */
 async function stopRequested(f, memberId, count) {
-  const deadline = Date.now() + 2000
   const stops = () => f.workers.stopped.filter(id => id === memberId).length
-  while (Date.now() < deadline && stops() < count) await new Promise(resolve => setTimeout(resolve, 10))
+  await eventually(() => stops() >= count, 'the barrier asked the adapter to stop the fenced handle', 2000)
   assert.equal(stops(), count, 'the barrier asked the adapter to stop the fenced handle')
 }
 
@@ -177,7 +170,6 @@ test('R18-1b: a mission behind a repaired middle task cannot complete with the p
 })
 
 test('R18-2: a staged-plan member edit drops the stale composition so the member can start again', async t => {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-plan-')))
   const compositions = new Map()
   const started = []
   let live = 1
@@ -197,12 +189,8 @@ test('R18-2: a staged-plan member edit drops the stale composition so the member
       this.idle.add(member.id)
     }
   }
-  const workers = new PlanWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, workerStartTimeoutMs: 5000 }, workers)
-  runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers } = await makeRuntime(t, { workers: new PlanWorkers(), config: { ...r18Config, workerStartTimeoutMs: 5000 } })
+  quiet(runtime)
   const owner = { sessionId: 'r18-plan-owner' }
   const plan = {
     title: 'Staged plan', objective: 'Deliver', workspace: directory, scope: ['src/'], acceptance: ['done'], budget: { ...BUDGET },
@@ -444,15 +432,10 @@ test('R18-4e: a ceiling barrier interrupted by a host restart is re-run on reope
 })
 
 test('R18-5: both launch paths refuse a check with invalid shell syntax, before any work exists', async t => {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-syntax-')))
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
-  const boot = new StubWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100 }, boot)
-  runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
-  t.after(async () => { await runtime.dispose(); await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime } = await makeRuntime(t, { workers: new StubWorkers(), config: r18Config })
+  quiet(runtime)
+  const workspaces = makeWorkspaces(directory, { maxCheckOutputBytes: 100000 })
+  t.after(() => workspaces.dispose())
   // The adapter-level preflight is what the launch boundary calls; assert it directly
   // (it runs the plan's checks through /bin/sh -n only). Its result is located, not
   // input-aligned: one entry per unparsable command carrying its position in
@@ -466,20 +449,16 @@ test('R18-5: both launch paths refuse a check with invalid shell syntax, before 
 })
 
 test('R18-5b: the syntax refusal names the broken check and pairs each location with its own diagnostic', async t => {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-syntax-attribution-')))
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  let workspaces
   // The launch boundary consults the adapter's parse-only probe; this stub hands
   // it to the real host seam so the refusal carries /bin/sh's own diagnostics.
   class SyntaxWorkers extends StubWorkers {
     checkSyntaxPreflight(checks, cwd, signal) { return workspaces.checkSyntaxPreflight(checks, cwd, signal) }
   }
-  const workers = new SyntaxWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100 }, workers)
-  runtime.kick = () => {}
-  runtime.pumpOutbox = () => {}
-  t.after(async () => { await runtime.dispose(); await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers } = await makeRuntime(t, { workers: new SyntaxWorkers(), config: r18Config })
+  quiet(runtime)
+  workspaces = makeWorkspaces(directory, { maxCheckOutputBytes: 100000 })
+  t.after(() => workspaces.dispose())
   const owner = { sessionId: 'r18-syntax-owner' }
   // Satisfies the automatic-plan policy too, so one plan drives both launch paths.
   const plan = checks => ({
@@ -561,21 +540,8 @@ test('R18-6: mission-scope amend is reachable and names its own required shape',
 })
 
 test('R18-7: the scratch root lives inside the member worktree and stays out of work and artifacts', async t => {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-scratch-')))
-  const source = path.join(directory, 'source')
-  await mkdir(source)
-  const git = async (cwd, ...args) => {
-    const result = await runProcess(['git', '-c', 'user.name=R18', '-c', 'user.email=r18@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 60000, maxBytes: 200000 })
-    assert.equal(result.exitCode, 0, result.output)
-    return result.output.trim()
-  }
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, '.gitignore'), 'node_modules/\n')
-  await writeFile(path.join(source, 'README.md'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 60000, maxCheckOutputBytes: 200000, confineCheck: argv => argv })
+  const { root: directory, source } = await makeRepo('swarm-r18-scratch', { '.gitignore': 'node_modules/\n', 'README.md': 'base\n' })
+  const workspaces = makeWorkspaces(directory, { checkTimeoutMs: 60000, maxCheckOutputBytes: 200000 })
   t.after(async () => { await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
   const mission = { id: 'mission-scratch', workspace: source }
   const workspace = await workspaces.prepareWorkspace(mission, 'member-scratch')
@@ -617,19 +583,7 @@ test('R18-9: composition fidelity reports a dependency path whose content the me
   // host compares every path the dependency commit changed against the composed
   // working tree, so a one-sided resolution (or a repository merge driver that
   // keeps this side) can no longer pass as a successful composition.
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-fidelity-')))
-  const source = path.join(directory, 'source')
-  await mkdir(source)
-  const git = async (cwd, ...args) => {
-    const result = await runProcess(['git', '-c', 'user.name=R18', '-c', 'user.email=r18@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 60000, maxBytes: 500000 })
-    assert.equal(result.exitCode, 0, `git ${args.join(' ')}: ${result.output}`)
-    return result.output.trim()
-  }
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'conf.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const base = await git(source, 'rev-parse', 'HEAD')
+  const { root: directory, source, head: base } = await makeRepo('swarm-r18-fidelity', { 'conf.txt': 'base\n' })
   await writeFile(path.join(source, 'conf.txt'), 'dependency\n')
   await git(source, 'commit', '-qam', 'dependency')
   const dependency = await git(source, 'rev-parse', 'HEAD')
@@ -638,8 +592,7 @@ test('R18-9: composition fidelity reports a dependency path whose content the me
   await git(source, 'worktree', 'add', '--detach', worktree, base)
   await writeFile(path.join(worktree, 'conf.txt'), 'ours\n')
   await git(worktree, 'commit', '-qam', 'ours-side')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'ws'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(directory, { workspacesRoot: path.join(directory, 'ws'), maxCheckOutputBytes: 100000 })
   t.after(async () => { await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
   const signal = new AbortController().signal
   assert.deepEqual(await workspaces.droppedDependencyPaths(worktree, dependency, signal), ['conf.txt'],

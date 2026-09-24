@@ -233,8 +233,8 @@ export class Attempts {
         if (this.rt.shuttingDown) return
         const stoppedTask = this.rt.task(missionId, task.id)
         if (stoppedTask.epoch !== state.epoch || stoppedTask.resumeAfterStop?.epoch !== state.epoch || stoppedTask.resumeAfterStop.memberId !== state.memberId) return
-        if (candidates.length === 0 && this.rt.workers.checkpointTask !== undefined) throw new Error('The recorded stop owner is missing; its workspace checkpoint cannot be confirmed')
-        for (const candidate of candidates) await this.rt.workers.checkpointTask?.(candidate, stoppedTask, state.memberId === undefined ? { ifOwned: true } : undefined)
+        if (candidates.length === 0) throw new Error('The recorded stop owner is missing; its workspace checkpoint cannot be confirmed')
+        for (const candidate of candidates) await this.rt.workers.checkpointTask(candidate, stoppedTask, state.memberId === undefined ? { ifOwned: true } : undefined)
         await this.rt.exclusive(missionId, async () => {
           const mission = this.rt.mission(missionId)
           const fresh = this.rt.task(missionId, task.id)
@@ -380,16 +380,16 @@ export class Attempts {
   /**
    * The live operation an attempt currently holds, or undefined when none is
    * live. This is the liveness rule renewal has always used: the durable member
-   * activity is the record, and an adapter that reports current activity must
-   * confirm that exact operation is still the live one.
+   * activity is the record, and the adapter's current activity must confirm
+   * that exact operation is still the live one.
    */
   private liveOperation(task: Task): WorkerActivity | undefined {
     const ownerId = task.attempt?.ownerId
     if (ownerId === undefined) return undefined
     const activity = this.rt.store.get('members', ownerId)?.activity
     if (activity === undefined) return undefined
-    const observed = this.rt.workers.currentActivity?.(ownerId)
-    return this.rt.workers.currentActivity === undefined || (observed !== undefined && observed.id === activity.id) ? activity : undefined
+    const observed = this.rt.workers.currentActivity(ownerId)
+    return observed !== undefined && observed.id === activity.id ? activity : undefined
   }
   /**
    * F1: the bound that applies to one operation, i.e. the operations that

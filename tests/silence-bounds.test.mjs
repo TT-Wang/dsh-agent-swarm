@@ -44,40 +44,32 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { tempDirectory } from './temp-root.mjs'
 import { silenceReport } from './instruments.mjs'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-const eventually = async (read, message, timeoutMs = 5000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await sleep(5) }
-  assert.fail(message)
-}
 
-/** The only external boundary the runtime talks to; every host operation is controlled by the test. */
-class Workers {
-  constructor(options = {}) { this.options = options; this.started = []; this.deliveries = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
+/**
+ * The only external boundary the runtime talks to; every host operation is
+ * controlled by the test: `options.hangStart`/`hangStop` wedge a start or stop,
+ * `options.idle` answers idleness (always idle by default).
+ */
+class Workers extends FakeWorkers {
+  artifact = { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }
+  checks = []
+  constructor(options = {}) { super(); this.options = options }
   async start(spec) { this.started.push(spec.member.id); if (this.options.hangStart === true) return new Promise(() => {}) }
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, content: delivery.content, kind: delivery.kind }) }
   async stop() { if (this.options.hangStop === true) return new Promise(() => {}) }
   isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
 }
 
 async function scenario(t, { workers = new Workers(), config = {} } = {}) {
-  const directory = await tempDirectory('swarm-silence-bounds-')
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, workers)
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers,
+    config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
+  })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'silence-bounds' }
   const mission = runtime.create(owner, { title: 'Silence bounds', objective: 'Bound the release and the report', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
@@ -99,13 +91,13 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
 async function wedgeNextPass(f, workers) {
   // Arm only once the board is quiet: the pass opened by the last `kick` must
   // have settled, so the NEXT pass is the one that hangs.
-  await eventually(() => f.pass() === undefined ? true : undefined, 'the current pass must finish before the wedge is armed')
+  await eventually(() => f.pass() === undefined ? true : undefined, 'the current pass must finish before the wedge is armed', 5000)
   workers.options.hangStart = true
   f.runtime.kick(f.mission.id)
   const wedged = await eventually(() => {
     const pass = f.pass()
     return pass !== undefined && f.runtime.scheduling.passWedged(f.mission.id) ? pass : undefined
-  }, 'a pass must wedge past its declared bound')
+  }, 'a pass must wedge past its declared bound', 5000)
   return wedged
 }
 
@@ -199,7 +191,7 @@ test('R16-D3 pair: a control-path kick neither supersedes nor duplicates a wedge
   const held = f.runtime.store.get('tasks', sibling.id)
   // The wedged body's record, in exactly the shape the watchdog sees: held on
   // the mission queue, past the live-work bound.
-  await eventually(() => f.pass() === undefined ? true : undefined, 'the passes the claim kicked must settle')
+  await eventually(() => f.pass() === undefined ? true : undefined, 'the passes the claim kicked must settle', 5000)
   const wedged = {
     id: f.passKey, operationId: 'operation_wedged_probe', missionId: f.mission.id,
     startedAt: Date.now() - 5000, revisionBefore: f.runtime.store.revision(),
@@ -307,6 +299,9 @@ test('R16-D6 pair: F1\'s operation silence owns the clock while an operation is 
   const member = f.runtime.store.get('members', builder.id)
   member.activity = { id: 'activity_stuck', kind: 'tool', tool: 'bash', startedAt: Date.now() - 500, attemptId: claimed.attempt.id }
   f.runtime.store.put('members', member)
+  // The adapter reports that same operation as its live one. The row is written
+  // directly (not through reportActivity) so no member/activity event records progress.
+  f.workers.activity = member.activity
   assert.equal(f.runtime.sweepSilentAttempts(f.mission.id), 0, 'the attempt bound yields to the in-flight operation')
   const operation = await eventually(() => f.escalations('operation-silent:')[0], 'F1 names the stuck operation', 3000)
   assert.equal(operation.notice.dedupKey, `operation-silent:${claimed.attempt.id}:activity_stuck:${member.activity.startedAt}`)

@@ -14,21 +14,15 @@ import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
 import { tempDirectory } from '../temp-root.mjs'
+import { FakeWorkers } from '../faults/harness.mjs'
 
 export const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 
-export class TraceWorkers {
-  constructor() { this.commands = []; this.stopped = []; this.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; this.artifacts = 0 }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
+/** The shared FakeWorkers (never idle, `/isolated/` workspaces) with one new commit per capture. */
+export class TraceWorkers extends FakeWorkers {
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  artifacts = 0
   async captureArtifact() { this.artifacts++; return { commit: `commit-${this.artifacts}`, baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return this.checks }
-  async prepareTask() {}
-  async dispose() {}
 }
 
 /**

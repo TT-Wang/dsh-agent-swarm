@@ -28,14 +28,11 @@ import { dirname, join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
-import { MISSION_ACCEPTANCE, WorkspaceWorkers, Workspaces, eventually, events, makeRepo, setup, taskOf } from './faults/harness.mjs'
+import { MISSION_ACCEPTANCE, WorkspaceWorkers, eventually, events, makeRepo, setup, taskOf, makeWorkspaces } from './faults/harness.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
 
 const PREPARATION = '(verification preparation)'
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-const workspaceOptions = (root, extra = {}) => ({
-  subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv, ...extra,
-})
 
 /** `git worktree add` for a disposable verification checkout (never a member worktree). */
 const verificationWorktreeAdd = argv => argv.includes('worktree') && argv.includes('add') && argv.some(part => part.includes(`${sep}verification${sep}`))
@@ -63,7 +60,7 @@ async function verificationCheckouts(root) {
 async function reviewFixture(t, { check = () => 'test -f src/answer.txt', options = {}, prepare = async () => {} } = {}) {
   const repo = await makeRepo('verification-preparation', { 'src/answer.txt': 'base\n', '.gitignore': 'node_modules/\n' })
   await prepare(repo)
-  const workspaces = new Workspaces(workspaceOptions(repo.root, typeof options === 'function' ? options(repo) : options))
+  const workspaces = makeWorkspaces(repo.root, typeof options === 'function' ? options(repo) : options)
   const workers = new WorkspaceWorkers(workspaces)
   const f = await setup({ workers, workspace: repo.source, config: { tickMs: 60_000 } })
   t.after(async () => { await f.cleanup(); await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
@@ -219,8 +216,8 @@ test('Workspaces.cancel during preparation still rejects instead of becoming a r
   const started = []
   const holding = deferred()
   // The verification worktree add is held open, so the cancel lands in it.
-  const workspaces = new Workspaces(workspaceOptions(repo.root, { checkConcurrency: 1,
-    subprocess: substitutingSeam(argv => verificationWorktreeAdd(argv) && started.push(argv) === 1, ['/bin/sh', '-c', 'sleep 30'], () => holding.resolve()) }))
+  const workspaces = makeWorkspaces(repo.root, { checkConcurrency: 1,
+    subprocess: substitutingSeam(argv => verificationWorktreeAdd(argv) && started.push(argv) === 1, ['/bin/sh', '-c', 'sleep 30'], () => holding.resolve()) })
   t.after(async () => { await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   const mission = { id: 'mission-cancel', workspace: repo.source }
   const member = { id: 'member-cancel', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-cancel') }

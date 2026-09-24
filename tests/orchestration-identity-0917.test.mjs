@@ -2,42 +2,29 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { canBorrowTask } from '../lib/assignment.js'
 import { taskGraphIndex } from '../lib/task-graph.js'
+import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
 
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
+class Workers extends FakeWorkers {
+  checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
   async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
-  async start() {}
-  async stop() {}
-  async dispose() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery: structuredClone(delivery) }) }
-  isIdle() { return false }
-  async prepareTask() {}
   async captureArtifact(member, task) { return { commit: createHash('sha1').update(task.id).digest('hex'), baseCommit: 'b'.repeat(40), workspace: member.workspace, changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [{ command: 'npm test', exitCode: 0, output: 'ok' }] }
-}
-async function eventually(read, message, timeout = 6000) {
-  const until = Date.now() + timeout
-  while (Date.now() < until) { const result = read(); if (result) return result; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
 }
 async function fixture(t, extra = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-identity-'))
-  const config = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, ...extra }
-  const workers = new Workers(), runtime = new SwarmRuntime(config, workers)
+  const runtimes = []
+  // Every restarted runtime is disposed first; makeRuntime's own cleanup then removes the state directory.
+  t.after(async () => { for (const rt of runtimes) await rt.dispose() })
+  const { dir: root, config, runtime, workers, budget } = await makeRuntime(t, { workers: new Workers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...extra },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   const nativeKick = runtime.kick.bind(runtime)
   runtime.kick = () => {}
   runtime.pumpOutbox = () => {}
-  const runtimes = [runtime]
-  t.after(async () => { for (const rt of runtimes) await rt.dispose(); await rm(root, { recursive: true, force: true }) })
+  runtimes.push(runtime)
   const owner = { sessionId: 'identity-owner' }
-  const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })
+  const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Complete the work' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -121,7 +108,7 @@ for (const omitAdmissionEvent of [false, true]) test(`C08: withdrawn automatic r
   const source = f.propose('Automatic review source')
   await f.submit(source)
   const reviews = rt => rt.store.list('tasks', f.mission.id).filter(task => task.reviewOf === source.id)
-  const automatic = await eventually(() => reviews(f.runtime)[0], 'the scheduler must admit a review')
+  const automatic = await eventually(() => reviews(f.runtime)[0], 'the scheduler must admit a review', 6000)
   f.runtime.cancel(f.owner, f.mission.id, { taskId: automatic.id, reason: 'Owner withdraws this review' })
   for (let n = 0; n < 35; n++) f.runtime.setAdmissionLimit(f.owner, f.mission.id, { level: 'taskClass', key: 'implementation', limit: 100 + n }, 'Unrelated admission update')
   assert.equal(f.runtime.store.events(f.mission.id, 20).some(row => row.type === 'task/review-admitted'), false)

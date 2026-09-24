@@ -1,31 +1,18 @@
 /** M10/L5: the runtime projects one delivery target and the last successful apply. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 10000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
-class Workers {
+class Workers extends FakeWorkers {
   applied = 0
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [{ command: 'test', exitCode: 0, output: 'ok' }] }
-  async prepareTask() {}
   async applyDelivery() { this.applied++; return { status: 'applied', changedPaths: [], conflicts: [] } }
-  async dispose() {}
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-delivery-target-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new Workers(),
+    config: { maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
+  })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Deliver', objective: 'Chain integrations', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const put = task => { runtime.store.put('tasks', task); return task }

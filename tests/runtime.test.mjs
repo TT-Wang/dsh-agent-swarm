@@ -1,38 +1,25 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
 import { withinScope, scopeSubset } from '../lib/scope.js'
+import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, budget as defaultBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-async function eventually(read, message) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
+const budget = { ...defaultBudget, maxTokens: 1000, maxSteps: 10, maxTasks: 12, maxExperiments: 2 }
 /** Only the external execution adapter is replaced; store/admission/state/outbox are real. */
-class ControlledWorkers {
-  callbacks; deliveries = []; stopped = []; checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }; stopGate; prepared = []
-  bind(c) { this.callbacks = c }
-  async prepareWorkspace(m, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver(m, d) { this.deliveries.push(d) }
+class ControlledWorkers extends FakeWorkers {
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
+  stopGate
   async stop(id) { if (this.stopGate) await this.stopGate; this.stopped.push(id) }
-  isIdle() { return false }
   async captureArtifact(_member, task) { return task.kind === 'research' ? { ...this.artifact, changedPaths: [] } : this.artifact }
-  async verifyArtifact() { return this.checks }
+  /** Records the epoch each preparation was for. */
   async prepareTask(member,task) { this.prepared.push(task.epoch) }
-  async dispose() {}
 }
 async function setup(t, overrides = {}, options = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-runtime-'))
-  const workers = new ControlledWorkers()
-  const config = { statePath: join(dir,'db.sqlite'), leaseMs:60000, tickMs:1000, maxMessageChars:16000, maxEvents:100, maxTasksPerMember:3, ...options.config }
-  const runtime = new SwarmRuntime(config, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir,{recursive:true,force:true}) })
+  const { runtime, workers, config } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { tickMs:1000, maxEvents:100, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId:'owner-session' }
   const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}})
   const stream = runtime.workstream(owner,mission.id,{title:'Core',objective:'Fix module'})
@@ -125,10 +112,10 @@ test('pause preserves mission accounting and revokes old task attempts',async t=
   assert.equal(s.mission.usedTokens,51)
   assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,{taskId:task.id,attemptId:task.attempt.id,claim:'late',outcome:'supported',toolRunIds:[]}),/Stale/)
   releaseStop()
-  await eventually(()=>f.runtime.task(f.mission.id,task.id).resumeAfterStop===undefined,'pause stop must settle before reassignment')
+  await eventually(()=>f.runtime.task(f.mission.id,task.id).resumeAfterStop===undefined,'pause stop must settle before reassignment', 2500)
 })
 test('store rejects concurrent runtime ownership and rolls back outbox with state',async t=>{
-  const dir=await mkdtemp(join(tmpdir(),'swarm-store-'));const path=join(dir,'state.sqlite')
+  const dir=await tempDirectory('swarm-store-');const path=join(dir,'state.sqlite')
   const store=new SwarmStore(path);t.after(async()=>{store.close();await rm(dir,{recursive:true,force:true})})
   assert.throws(()=>new SwarmStore(path),/already owned/)
   assert.throws(()=>store.transaction(()=>{store.put('deliveries',{id:'m',missionId:'x',from:'a',to:'b',kind:'finding',content:'hello',createdAt:1});store.event('x','test','a',{});throw new Error('rollback')}),/rollback/)
@@ -417,7 +404,7 @@ test('lease expiry restores the plan-intended assignee without losing recovery a
   const stored = f.runtime.store.get('tasks', task.id)
   stored.attempt.leaseUntil = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
-  const pending = await eventually(() => { const current = f.runtime.store.get('tasks', task.id); return current.status === 'pending' ? current : undefined }, 'the expired attempt must be re-pended')
+  const pending = await eventually(() => { const current = f.runtime.store.get('tasks', task.id); return current.status === 'pending' ? current : undefined }, 'the expired attempt must be re-pended', 2500)
   assert.equal(pending.assigneeId, f.a.id, 'the planned assignee survives the expiry')
   assert.equal(pending.plannedAssigneeId, f.a.id)
   assert.equal(pending.recoveryCount, 1)

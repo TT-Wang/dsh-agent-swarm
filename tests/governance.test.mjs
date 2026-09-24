@@ -7,30 +7,17 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-
-async function eventually(read, message) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
+const budget = { ...sharedBudget, maxTokens: 1000, maxSteps: 10, maxWorkers: 4, maxTasks: 12, maxExperiments: 2 }
 
 /** A provider whose supported efforts are declared by `unsupported` and `rejectAll`. */
-class GovernanceWorkers {
-  callbacks; deliveries = []; stopped = []; prepared = []
+class GovernanceWorkers extends FakeWorkers {
   unsupported = new Set()
   rejectAll = false
   captureStarted = false
-  captureGate
   artifact = { commit: 'abc123', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/isolated/${memberId}` }
   async start(spec) {
     const effort = spec.member.reasoningEffort
     if (effort !== undefined && this.unsupported.has(effort)) {
@@ -40,21 +27,12 @@ class GovernanceWorkers {
     }
     if (this.rejectAll) throw new Error(`provider "${spec.member.provider ?? 'inherited'}" model "${spec.member.model ?? 'inherited'}" is unavailable`)
   }
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
   async captureArtifact() { this.captureStarted = true; if (this.captureGate) await this.captureGate; return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async prepareTask(member, task) { this.prepared.push(task.epoch) }
-  async dispose() {}
 }
 
 async function setup(t, options = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-governance-'))
-  const workers = new GovernanceWorkers()
-  const config = { statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 1000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, ...options.config }
-  const runtime = new SwarmRuntime(config, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, workers } = await makeRuntime(t, { workers: new GovernanceWorkers(),
+    config: { tickMs: 1000, maxEvents: 200, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Govern', objective: 'Fix governance', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget, ...options.budget } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix governance' })
@@ -139,7 +117,7 @@ test('F6: cancelling during artifact capture tells the worker the task is termin
   let release
   f.workers.captureGate = new Promise(resolve => { release = resolve })
   const submitting = f.runtime.submit({ sessionId: builder.sessionId }, f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'done' })
-  await eventually(() => f.workers.captureStarted, 'artifact capture did not start')
+  await eventually(() => f.workers.captureStarted, 'artifact capture did not start', 2500)
   f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'captured by mistake' })
   release()
   await assert.rejects(submitting, /cancelled this task while the artifact was captured\. It is terminal: stop working on it and do not resubmit/)

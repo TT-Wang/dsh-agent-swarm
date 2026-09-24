@@ -1,16 +1,29 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, chmod } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, writeFile, readFile, chmod } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { requireHostChecks } from '../lib/admission.js'
 import { artifactNeedsChecks } from '../lib/artifact-policy.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-artifact-policy-')))
+  let workspaces
+  const { dir: root, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      prepareBaseline: (...args) => workspaces.prepareBaseline(...args),
+      prepareWorkspace: (...args) => workspaces.prepareWorkspace(...args),
+      prepareTask: (...args) => workspaces.prepareTask(...args),
+      captureArtifact: (...args) => workspaces.captureArtifact(...args),
+      inspectArtifact: (...args) => workspaces.inspectArtifact(...args),
+      verifyArtifact: (...args) => workspaces.verifyArtifact(...args),
+      dispose: () => workspaces.dispose(),
+    }),
+    config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxTasks: 12 },
+  })
+  workspaces = makeWorkspaces(root)
   const source = path.join(root, 'source')
   await mkdir(source)
   const command = async (cwd, argv) => {
@@ -23,22 +36,8 @@ async function fixture(t) {
   await writeFile(path.join(source, '.gitignore'), 'reviews/\n')
   await command(source, ['git', 'add', '.'])
   await command(source, ['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'baseline'])
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    prepareBaseline: (...args) => workspaces.prepareBaseline(...args),
-    prepareWorkspace: (...args) => workspaces.prepareWorkspace(...args),
-    prepareTask: (...args) => workspaces.prepareTask(...args),
-    captureArtifact: (...args) => workspaces.captureArtifact(...args),
-    inspectArtifact: (...args) => workspaces.inspectArtifact(...args),
-    verifyArtifact: (...args) => workspaces.verifyArtifact(...args),
-    start: async () => {}, stop: async () => {}, deliver: async () => {}, isIdle: () => false,
-    dispose: () => workspaces.dispose(),
-  }
-  const runtime = new SwarmRuntime({ statePath: path.join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Review', objective: 'Inspect project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 } })
+  const mission = runtime.create(owner, { title: 'Review', objective: 'Inspect project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Review', objective: 'Inspect project' })
   const author = await runtime.addMember(owner, mission.id, { role: 'author' })
   const reviewer = await runtime.addMember(owner, mission.id, { role: 'reviewer' })

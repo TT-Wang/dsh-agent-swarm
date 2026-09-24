@@ -1,33 +1,20 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
 const buckets = (input, requests = 1) => ({ uncachedInputTokens: input, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests })
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async stop() {}
-  async deliver() {}
-  async dispose() {}
-}
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-usage-recovery-'))
-  const config = { statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 1000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }
-  let workers = new Workers(), runtime = new SwarmRuntime(config, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  // The reopened runtime is disposed first; makeRuntime's own cleanup then removes the state directory.
+  t.after(async () => { await runtime.dispose() })
+  let { config, runtime, workers, budget } = await makeRuntime(t, { config: { tickMs: 1000, maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 1, maxTasks: 4, maxExperiments: 1 } })
   const owner = { sessionId: 'usage-owner' }
-  const mission = runtime.create(owner, { title: 'Accounting', objective: 'Retain recovered usage', workspace: '/source', scope: ['**'], acceptance: ['done'], budget: {
-    maxTokens: 10000, maxSteps: 100, maxWorkers: 1, maxDurationMs: 600000, maxTasks: 4, maxExperiments: 1,
-  } })
+  const mission = runtime.create(owner, { title: 'Accounting', objective: 'Retain recovered usage', workspace: '/source', scope: ['**'], acceptance: ['done'], budget })
   const member = await runtime.addMember(owner, mission.id, { name: 'Ada', role: 'Research' })
   return {
     record(total, usage, source) { return workers.callbacks.usageSnapshot(member.id, total, usage, source) },
     read() { return { mission: runtime.store.get('missions', mission.id), member: runtime.store.get('members', member.id) } },
-    async reopen() { await runtime.dispose(); workers = new Workers(); runtime = new SwarmRuntime(config, workers) },
+    async reopen() { await runtime.dispose(); workers = new FakeWorkers(); runtime = new SwarmRuntime(config, workers) },
   }
 }
 

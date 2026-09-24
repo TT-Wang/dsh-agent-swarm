@@ -1,35 +1,18 @@
 /** M9 residual regression: runtime.addMember validates subscriptions at its own boundary. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class SubscriptionWorkers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'f'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-subscriptions-'))
-  const workers = new SubscriptionWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'f'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] }, checks: [],
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'subscription-owner' }
   const mission = runtime.create(owner, { title: 'Subscriptions', objective: 'Validate the runtime boundary', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   return { runtime, workers, owner, mission }
 }
 

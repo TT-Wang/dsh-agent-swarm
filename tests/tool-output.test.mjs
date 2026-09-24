@@ -2,14 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { checkSyntaxDetail, declaredPlanChecks } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
-import { Workspaces } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { setup } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
+import { budget as defaultBudget, setup, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
-const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
-function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget); return definitions }
+const budget = { ...defaultBudget, maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4 }
+function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, makeRuntimeStub(), budget); return definitions }
 test('model-visible renders stay compact: observe passes the focused view through and never repeats the board; launch and stage return identities', () => {
   const definitions = tools()
   const observe = definitions.get('swarm_observe')
@@ -145,12 +145,12 @@ test('tool schemas match the enforced runtime contract for observe cursors and m
 test('registered launch accepts omitted member names and forwards canonical identities', async () => {
   const definitions = new Map(), launched = []
   const snapshot = { mission: { id: 'named-mission' } }
-  const runtime = {
+  const runtime = makeRuntimeStub({
     config: {},
     starts: () => [{ id: 'named-request', workspace: '/workspace' }],
     async startPlan(_actor, requestId, plan) { launched.push({ requestId, plan }); return snapshot },
     snapshot: () => snapshot,
-  }
+  })
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   for (const name of ['swarm_stage', 'swarm_launch']) {
     const member = definitions.get(name).parameters.properties.members.items
@@ -176,10 +176,9 @@ test('registered launch accepts omitted member names and forwards canonical iden
 })
 
 test('launch rejects indexed shell syntax errors before admission and syntax checks never execute commands', async t => {
-  const { mkdtemp, access, rm } = await import('node:fs/promises')
-  const { tmpdir } = await import('node:os')
+  const { access, rm } = await import('node:fs/promises')
   const { join } = await import('node:path')
-  const workspace = await mkdtemp(join(tmpdir(), 'swarm-check-syntax-'))
+  const workspace = await tempDirectory('swarm-check-syntax-')
   t.after(() => rm(workspace, { recursive: true, force: true }))
   let launches = 0
   const snapshot = { mission: { id: 'mission-one' } }
@@ -189,15 +188,14 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   // running the real parse-only probe before it counts a launch, and pairs its
   // result with the production helpers launchDraft uses (R18-5b proves that
   // boundary end to end). `checks` are parsed with /bin/sh -n and never executed.
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(workspace, { maxCheckOutputBytes: 100000 })
   t.after(() => workspaces.dispose())
-  const runtime = { config: {}, starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
+  const runtime = makeRuntimeStub({ config: {}, starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
     const declared = declaredPlanChecks(plan.tasks)
     const issues = await workspaces.checkSyntaxPreflight(declared.map(check => check.command), workspace)
     if (issues.length) throw new Error(`[check_syntax_invalid] ${checkSyntaxDetail(declared, issues)}`)
     launches++; assert.equal(plan.budget.maxTokens, 12345); return snapshot
-  }, snapshot: () => snapshot }
+  }, snapshot: () => snapshot })
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) }, get: name => name === 'subprocess' ? subprocessSeam() : undefined }, runtime, budget)
   const input = { requestId: 'request-one', title: 'Goal', objective: 'Deliver the goal', scope: ['result.txt'], acceptance: ['works'], budget: { ...budget, maxTokens: 12345 },
@@ -217,7 +215,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
 
 test('request control routes through the existing tool without accepting ambiguous identities', async () => {
   const calls = [], definitions = new Map()
-  const runtime = { controlStart(...args) { calls.push(args); return { id: 'request-1', status: 'planning', planningEpoch: 2 } } }
+  const runtime = makeRuntimeStub({ controlStart(...args) { calls.push(args); return { id: 'request-1', status: 'planning', planningEpoch: 2 } } })
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const control = definitions.get('swarm_control')
   const execution = { agent: { id: 'owner' }, signal: new AbortController().signal }
@@ -232,7 +230,7 @@ test('request control routes through the existing tool without accepting ambiguo
 test('observe lists bounded saved requests and permits one owner-scoped focused recovery read', async () => {
   const definitions = new Map()
   const requests = Array.from({ length: 20 }, (_, i) => ({ id: `request-${i}`, status: 'failed', updatedAt: i, goal: 'x'.repeat(1000), error: 'e'.repeat(1000), planningEpoch: 2 }))
-  const runtime = { list: () => [], starts: actor => actor.sessionId === 'owner' ? requests : [] }
+  const runtime = makeRuntimeStub({ list: () => [], starts: actor => actor.sessionId === 'owner' ? requests : [] })
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const observe = definitions.get('swarm_observe')
   const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
@@ -430,7 +428,7 @@ test('a null optional property is an omission at every nesting level, and a decl
 test('a null optional plan field is an omission inside launch and stage tasks and members', async () => {
   const launched = [], staged = []
   const definitions = new Map()
-  const runtime = { config: {}, starts: () => [{ id: 'request_1', workspace: '/workspace' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, createDraft(_actor, plan) { staged.push(plan); return { id: 'draft_1', revision: 1, status: 'draft' } }, snapshot: () => undefined }
+  const runtime = makeRuntimeStub({ config: {}, starts: () => [{ id: 'request_1', workspace: '/workspace' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, createDraft(_actor, plan) { staged.push(plan); return { id: 'draft_1', revision: 1, status: 'draft' } }, snapshot: () => undefined })
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const workspace = await realpath(tmpdir())
   const task = { key: 'task_1', workstreamKey: 'main', title: 'T', objective: 'O', kind: 'research', scope: ['**'], acceptance: ['works'], outputs: [], maxRecoveryAttempts: 1, maxSteps: null, maxFindings: null, priority: null, experiment: null, reviewOf: null, dependencies: null, checks: null }
@@ -496,7 +494,7 @@ test('an undeclared key is refused by name with the keys that object accepts, at
  */
 test('a recorded launch shape carrying workspace is accepted and runs in the frozen request workspace, while compact stays refused on swarm_observe', async () => {
   const launched = [], definitions = new Map()
-  const runtime = { config: {}, starts: () => [{ id: 'request_1', workspace: '/frozen/request' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, snapshot: () => undefined }
+  const runtime = makeRuntimeStub({ config: {}, starts: () => [{ id: 'request_1', workspace: '/frozen/request' }], async startPlan(_actor, _id, plan) { launched.push(plan); return { mission: { id: 'mission_1' } } }, snapshot: () => undefined })
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const exec = { agent: { id: 'owner' }, signal: new AbortController().signal }
   // The keys, key order and budget of call_00_IDLtqD00MZDkoD3xm0HV5189

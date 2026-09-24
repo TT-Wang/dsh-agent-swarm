@@ -1,35 +1,30 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { hasNotice } from '../lib/arena.js'
 import { factKey } from '../lib/notices.js'
-import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
+
+class InterceptWorkers extends FakeWorkers {
+  sent = []
+  intercept = async () => {}
+  async deliver(_member, delivery) {
+    this.sent.push(structuredClone(delivery))
+    await this.intercept(delivery)
+  }
+}
 
 async function fixture(t) {
-  const directory = await tempDirectory('swarm-wake-identity-')
-  const config = { statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 10 }
-  const workers = {
-    sent: [], intercept: async () => {}, bind() {}, async dispose() {},
-    async deliver(_member, delivery) {
-      this.sent.push(structuredClone(delivery))
-      await this.intercept(delivery)
-    },
-  }
-  let runtime
-  const open = () => {
-    runtime = new SwarmRuntime(config, workers)
-    // Exercise the real durable outbox at deterministic transport boundaries.
-    runtime.pumpOutbox = () => {}
-  }
-  open()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  // The reopened runtime is disposed first; makeRuntime's own cleanup then removes the state directory.
+  t.after(async () => { await runtime.dispose() })
+  let { dir: directory, config, runtime, workers, budget } = await makeRuntime(t, { workers: new InterceptWorkers(),
+    config: { tickMs: 60000, maxEvents: 500, maxTasksPerMember: 10, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 20 } })
+  // Exercise the real durable outbox at deterministic transport boundaries.
+  const quiet = () => { runtime.pumpOutbox = () => {} }
+  quiet()
   const owner = { sessionId: 'wake-identity-owner' }
   const mission = runtime.create(owner, { title: 'Wake identity', objective: 'Report each fact once',
-    workspace: directory, scope: ['**'], acceptance: ['facts reach the owner'],
-    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 } })
+    workspace: directory, scope: ['**'], acceptance: ['facts reach the owner'], budget })
   const rows = () => runtime.store.list('deliveries', mission.id).filter(row => row.to === 'owner')
   const emit = (content, { subject = 'task_delivery@0', reason = content, ...options } = {}) => {
     runtime.commit(mission.id, () => runtime.notify(mission.id, content, [subject], {
@@ -42,7 +37,7 @@ async function fixture(t) {
     for (let index = 0; index < runtime.notices.wakeBudget; index++) emit(`seed ${index}`)
   }
   return { get runtime() { return runtime }, workers, mission, rows, emit, fillBudget,
-    async restart() { await runtime.dispose(); open(); await runtime.start() },
+    async restart() { await runtime.dispose(); runtime = new SwarmRuntime(config, workers); quiet(); await runtime.start() },
   }
 }
 

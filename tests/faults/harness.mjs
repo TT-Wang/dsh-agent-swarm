@@ -1,5 +1,20 @@
 /**
- * Shared fixtures for the fault-injection suite (F1-F14).
+ * The one shared runtime test fixture: the fault-injection suite (F1-F21) and
+ * the node:test files under tests/ both import it from here, so a new runtime
+ * or adapter dependency is added to a fixture once. It stays under faults/
+ * because the scenario modules and two dozen test files already import this
+ * path; a re-export module would only add a second spelling of every symbol.
+ *
+ *  - `FakeWorkers`: the recording `WorkerAdapter` (behaviour-neutral answers
+ *    for every required method, never `prepareBaseline`/`checkEnvelope`).
+ *  - `makeRuntime(t, ...)`: a runtime on a temp dir with the shared config and
+ *    budget, cleaned up by `t.after`; it creates no mission, member or event.
+ *  - `setup(...)`: the same runtime config, started, with a mission and two
+ *    members, for the fault scenarios (which have no node:test context).
+ *  - `makeWorkspaces(dir, overrides)` / `workspaceOptions(dir, overrides)`: the
+ *    real Workspaces engine behind the subprocess seam.
+ *  - `makeRuntimeStub(overrides)`: a partial runtime for one component.
+ *  - `eventually(read, message, timeoutMs)`, `FakeClock`.
  *
  * The suite asserts from durable state, never from logs. Two seams are used:
  *  - Tier A drives the real `SwarmRuntime` with a controllable `WorkerAdapter`
@@ -26,6 +41,7 @@ const execute = promisify(execFile)
 export const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
 export const { SwarmRuntime } = await import(pathToFileURL(join(PROJECT, 'lib/runtime.js')).href)
 export const { Workspaces, runProcess } = await import(pathToFileURL(join(PROJECT, 'lib/workspaces.js')).href)
+const { PolicyError } = await import(pathToFileURL(join(PROJECT, 'lib/policy-error.js')).href)
 
 export const budget = { maxTokens: 500_000, maxSteps: 500, maxWorkers: 3, maxDurationMs: 600_000, maxTasks: 30, maxExperiments: 0 }
 export const MISSION_ACCEPTANCE = ['fault recovery is proven from durable state']
@@ -98,6 +114,33 @@ export function runNode(args, options = {}) {
 /**
  * The external execution boundary only: every call is recorded so a scenario
  * can prove its injection fired. `autoIdle` lets the runtime reassign work.
+ *
+ * `overrides` replaces any field or method on the instance, e.g.
+ * `new FakeWorkers({ checks: [], autoIdle: true })` or `new FakeWorkers({ async
+ * prepareWorkspace(mission, id) { return join(mission.workspace, id) } })`. A
+ * subclass's own field initializers run after this constructor and win.
+ *
+ * Every required adapter method has a behaviour-neutral answer, the one the
+ * runtime gave before these methods were required: `inspectArtifact` keeps the
+ * stored artifact, `checkpointTask`, `compactAtBoundary` and
+ * `invalidateComposition` do nothing, `checkSyntaxPreflight` finds no issue and
+ * the delivery pair refuses with `delivery_unsupported`. They answer
+ * synchronously, so each awaited call takes a single microtask. (A stop whose
+ * recorded owner has no member row is refused as unconfirmable, as it is for the
+ * Harness adapter; the store never deletes a member.)
+ *
+ * Three methods are deliberately different:
+ *  - `prepareBaseline` and `checkEnvelope` (still optional in `WorkerAdapter`)
+ *    are NOT implemented. Their presence adds `workspace/snapshot` and
+ *    `task/check-envelope` events that the seq/count assertions and the replay
+ *    digest do not expect; a test that needs them passes them as overrides (or
+ *    uses `WorkspaceWorkers`).
+ *  - `currentActivity` reads `activity`, so an operation is live only while the
+ *    adapter reports it: the durable member activity alone is never live.
+ *    `reportActivity(id, activity)` moves the adapter's view and the durable
+ *    member activity together; a test that writes the member row directly sets
+ *    `activity` to the same operation. `activity` is one value for every member;
+ *    a test with several live members keeps a per-member subclass.
  */
 export class FakeWorkers {
   callbacks
@@ -115,6 +158,7 @@ export class FakeWorkers {
   captureGate
   startError
 
+  constructor(overrides = {}) { Object.assign(this, overrides) }
   bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
   async start(spec) { this.started.push(spec.member.id); if (this.startError) throw this.startError }
@@ -132,6 +176,15 @@ export class FakeWorkers {
   }
   async prepareTask(member, task) { this.prepared.push({ memberId: member.id, taskId: task.id, epoch: task.epoch }) }
   currentActivity() { return this.activity }
+  /** Report a live operation (or its end, with `undefined`) the way the Harness adapter does. */
+  reportActivity(id, activity) { this.activity = activity; this.callbacks?.activity?.(id, activity) }
+  inspectArtifact(_member, artifact) { return artifact }
+  checkpointTask() {}
+  compactAtBoundary() {}
+  invalidateComposition() {}
+  checkSyntaxPreflight() { return [] }
+  inspectDelivery() { throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support delivery inspection') }
+  applyDelivery() { throw new PolicyError('delivery_unsupported', 'tool_error', 'This worker adapter does not support applying results') }
   async dispose() {}
 }
 
@@ -158,6 +211,60 @@ export class WorkspaceWorkers extends FakeWorkers {
 }
 
 /**
+ * The RuntimeConfig every fixture runtime starts from; `overrides` wins. With a
+ * `clock` the runtime reads it and runs no tick timer (see `setup`).
+ */
+function runtimeConfig(dir, overrides, clock) {
+  return {
+    statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
+    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+    ...(clock === undefined ? {} : { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }), ...overrides,
+  }
+}
+
+/**
+ * A runtime on a fresh temp dir with the shared config and budget, disposed and
+ * removed by `t.after` (a node:test context). It is not started and holds no
+ * mission, member or event until the test creates one, so every event count and
+ * seq a test asserts is its own. `budget` is the default merged with the
+ * overrides, ready for `runtime.create`; `config` is the exact RuntimeConfig, for
+ * reopening the same state file. A `clock` (FakeClock) works as in `setup`.
+ * `storeOptions` is the runtime's third argument (the SQLite writer's busy
+ * timeout and retries), for a test that holds the writer lock itself.
+ */
+export async function makeRuntime(t, { workers = new FakeWorkers(), config = {}, budget: overrides = {}, clock, storeOptions } = {}) {
+  const dir = await realpath(await tempDirectory('swarm-runtime-'))
+  const runtimeSettings = runtimeConfig(dir, config, clock)
+  const runtime = new SwarmRuntime(runtimeSettings, workers, storeOptions)
+  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  return { dir, config: runtimeSettings, runtime, workers, budget: { ...budget, ...overrides }, clock }
+}
+
+/**
+ * The options every fixture `Workspaces` engine shares: the host subprocess seam,
+ * worktrees under `<dir>/worktrees`, and an identity `confineCheck`, so checks
+ * run unconfined (a suite that tests confinement passes its own). `overrides`
+ * wins, e.g. `{ checkConcurrency: 1 }`, a recording `confineCheck` or another
+ * subprocess seam.
+ */
+export const workspaceOptions = (dir, overrides = {}) => ({
+  subprocess: subprocessSeam, workspacesRoot: join(dir, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000,
+  confineCheck: argv => argv, ...overrides,
+})
+
+/** The real Workspaces engine with `workspaceOptions(dir, overrides)`; the caller disposes it. */
+export const makeWorkspaces = (dir, overrides) => new Workspaces(workspaceOptions(dir, overrides))
+
+/**
+ * A partial runtime for a unit test that builds one component (Scheduling,
+ * Attempts, RefusalRegistry, Notices, WorkspaceAdmission, OwnerReplyGuard, the
+ * tool layer) without a store. It always carries `now()`, so a runtime
+ * dependency every component reads is added here once; `overrides` supplies
+ * the rest and wins.
+ */
+export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), ...overrides })
+
+/**
  * Runtime + mission + two members + a propose helper. The runtime, store,
  * admission, scheduler and outbox are real; only the adapter is controlled.
  * With a `clock` (a FakeClock) the runtime reads it and runs no tick timer
@@ -168,11 +275,7 @@ export class WorkspaceWorkers extends FakeWorkers {
  */
 export async function setup({ workers = new FakeWorkers(), config = {}, budget: overrides = {}, acceptance = MISSION_ACCEPTANCE, checks = ['test -d .'], workspace, clock } = {}) {
   const dir = await realpath(await tempDirectory('swarm-faults-'))
-  const runtime = new SwarmRuntime({
-    statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
-    ...(clock === undefined ? {} : { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }), ...config,
-  }, workers)
+  const runtime = new SwarmRuntime(runtimeConfig(dir, config, clock), workers)
   await runtime.start()
   const owner = { sessionId: 'fault-owner' }
   const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } })

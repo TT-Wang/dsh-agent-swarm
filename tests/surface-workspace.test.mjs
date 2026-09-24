@@ -5,12 +5,13 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, realpath, rm, symlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { registerTools } from '../lib/tools.js'
+import { tempDirectory } from './temp-root.mjs'
+import { budget as defaultBudget, makeRuntimeStub } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
+const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 const plan = workspace => ({
   title: 'Session-bound plan', objective: 'Prove the workspace is the session workspace', workspace, scope: ['src/'], acceptance: ['works'], budget,
   members: [{ key: 'analyst', name: 'Analyst', role: 'analysis' }],
@@ -26,16 +27,16 @@ function definitions(runtime) {
 }
 function fakeRuntime() {
   const calls = { created: [], staged: [] }
-  return { calls,
+  return makeRuntimeStub({ calls,
     create: (_actor, input) => { calls.created.push(input); return { id: 'mission-1', ...input } },
     createDraft: (_actor, input) => { calls.staged.push(input); return { id: 'draft-1', revision: 1, status: 'draft', input } },
     snapshot: () => undefined,
-  }
+  })
 }
 const execution = (cwd, id = 'owner') => ({ agent: { id, ...(cwd === undefined ? {} : { session: { header: { cwd } } }) }, signal: new AbortController().signal })
 
 test('swarm_stage/swarm_create reject a workspace whose realpath differs from exec.agent.session.header.cwd', async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-surface-workspace-')))
+  const directory = await realpath(await tempDirectory('swarm-surface-workspace-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const workspace = join(directory, 'workspace'), other = join(directory, 'other')
   await mkdir(workspace); await mkdir(other)
@@ -48,7 +49,7 @@ test('swarm_stage/swarm_create reject a workspace whose realpath differs from ex
 })
 
 test('swarm_create/swarm_stage accept a symlinked alias of the session workspace and record its canonical path', async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-surface-alias-')))
+  const directory = await realpath(await tempDirectory('swarm-surface-alias-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const workspace = join(directory, 'workspace'), alias = join(directory, 'workspace-alias')
   await mkdir(workspace); await symlink(workspace, alias)
@@ -66,7 +67,7 @@ test('swarm_create/swarm_stage accept a symlinked alias of the session workspace
 })
 
 test('planning tools fail closed when the calling session exposes no workspace', async t => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), 'swarm-surface-nocwd-')))
+  const directory = await realpath(await tempDirectory('swarm-surface-nocwd-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const runtime = fakeRuntime()
   const tools = definitions(runtime)

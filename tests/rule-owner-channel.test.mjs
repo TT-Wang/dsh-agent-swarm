@@ -1,32 +1,25 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { rm } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
 import { RoleScoper } from '../lib/roles.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 import { hasNotice } from '../lib/arena.js'
-import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, SwarmRuntime, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(_member, delivery) { this.deliveries.push(structuredClone(delivery)) }
-  async stop() {}
-  isIdle() { return false }
-  async dispose() {}
-}
 async function fixture(t) {
-  const root = await tempDirectory('swarm-rule-owner-')
-  const workers = new Workers()
-  const config = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 20, maxTasksPerMember: 100 }
-  let runtime = new SwarmRuntime(config, workers)
+  let runtime
+  // Registered first, so the current (possibly reloaded) runtime is disposed before makeRuntime removes the state dir.
+  t.after(async () => { await runtime?.dispose() })
+  const made = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 20, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
+  const { dir: root, config, workers, budget } = made
+  runtime = made.runtime
   runtime.kick = () => {}
   runtime.notices.wakeBudget = 0
   const owner = { sessionId: 'owner' }
@@ -38,7 +31,6 @@ async function fixture(t) {
     await runtime.flushOutbox(mission.id)
     return rows().filter(row => row.replyExpected).at(-1)
   }
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   return { root, owner, mission, member, workers, rows, question, get runtime() { return runtime }, async reload() {
     await runtime.dispose(); runtime = new SwarmRuntime(config, workers); runtime.kick = () => {}; runtime.notices.wakeBudget = 0
   } }
@@ -376,8 +368,8 @@ function plannerFixture(t) {
   const agent = { id: 'owner', session: { snapshotEvents: () => events }, send(message) { sent.push(message); events.push({ type: 'user/message', data: message }) } }
   const ctx = { agents: { get: () => agent }, sessions: { async flush() { if (failFlush) throw new Error('persistence offline') } },
     on: () => () => {}, effect: factory => disposers.push(factory()), inject() {}, commands: { register: () => () => {} } }
-  const runtime = { config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, now: () => Date.now(), store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
-    subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() }
+  const runtime = makeRuntimeStub({ config: { tickMs: 60000 }, stallPassTimeoutMs: 1000, store: { list: () => [...requests.values()], get: (_table, id) => structuredClone(requests.get(id)), put: (_table, row) => requests.set(row.id, structuredClone(row)) },
+    subscribe(fn) { handlers.add(fn); return () => handlers.delete(fn) }, commit: (_id, fn) => fn() })
   registerAutomaticStart(ctx, runtime)
   t.after(() => disposers.forEach(dispose => dispose()))
   return { requests, sent, retry: () => { failFlush = false; for (const handler of handlers) handler() } }
@@ -400,6 +392,8 @@ test('R06: in-flight usage triggers durable mission review with a larger recomme
   const f = await fixture(t)
   const member = f.runtime.store.get('members', f.member.id)
   member.accountedTokens = 10000; member.usage = { requests: 1 }; member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+  // The adapter reports that model request as live; the row itself is written directly, with no activity event.
+  f.workers.activity = member.activity
   const mission = f.runtime.mission(f.mission.id); mission.usedTokens = 65000
   f.runtime.commit(mission.id, () => { f.runtime.store.put('members', member); f.runtime.store.put('missions', mission) })
   f.runtime.gates.warnBudget(f.runtime.mission(mission.id))

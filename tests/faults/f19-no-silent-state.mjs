@@ -15,10 +15,7 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
-import { realpath, rm } from 'node:fs/promises'
-import { join } from 'node:path'
-import { FakeWorkers, SwarmRuntime, acceptThroughReview, blockThroughReview, clone, eventually, events, runScenario, setup, taskOf } from './harness.mjs'
-import { tempDirectory } from '../temp-root.mjs'
+import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, runScenario, setup, taskOf } from './harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.kind === 'control')
@@ -533,22 +530,22 @@ await runScenario({
     // Row 17 — zero-task, zero-member active mission: documented exemption; the
     // test asserts no notice and a fingerprint stable across ticks.
     {
-      const directory = await realpath(await tempDirectory('swarm-f19-empty-'))
-      const workers = new FakeWorkers()
-      const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10,
-        maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+      // fixture gap: makeRuntime takes a node:test context and a scenario has none, so its cleanup is collected here and run in finally.
+      let cleanup
+      const { dir: directory, runtime, budget } = await makeRuntime({ after: fn => { cleanup = fn } }, { config: { maxEvents: 500, checkTimeoutMs: undefined },
+        budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20 } })
       try {
         await runtime.start()
         const owner = { sessionId: 'f19-empty-owner' }
         const mission = runtime.create(owner, { title: 'Empty', objective: 'Owner still planning', workspace: directory, scope: ['**'],
-          acceptance: ['x'], budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 } })
+          acceptance: ['x'], budget })
         const first = runtime.fingerprint(mission.id)
         await sleep(120)
         assert.equal(runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').length, 0, 'row 17: the documented exemption is not spammed')
         assert.equal(runtime.store.get('missions', mission.id).witness, undefined, 'row 17: no witness is fabricated for the exemption')
         assert.equal(runtime.fingerprint(mission.id), first, 'row 17: wall-clock ticks never change F(S)')
         rows.row17 = { witness: 'exempt' }
-      } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) }
+      } finally { await cleanup() }
     }
 
     // The board is stable under task/member order and sensitive to real change.

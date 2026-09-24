@@ -9,30 +9,23 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
+const newWorkers = () => new FakeWorkers({
+  artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }, checks: [],
+  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+})
 
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
+/** The first host; every later host reopens its state file with the same `config`. */
+const firstRuntime = t => makeRuntime(t, {
+  workers: newWorkers(),
+  config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+  budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+})
 
-const config = statePath => ({ statePath, leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 })
-
-async function firstHost(t, statePath) {
-  const runtime = new SwarmRuntime(config(statePath), new Workers())
+async function firstHost(t) {
+  const { runtime, config, budget } = await firstRuntime(t)
   await runtime.start()
   const owner = { sessionId: 'restart-owner' }
   const mission = runtime.create(owner, { title: 'Restart', objective: 'Survive a host restart', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
@@ -42,15 +35,12 @@ async function firstHost(t, statePath) {
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, maxRecoveryAttempts: 1 })
   const claimed = await runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
   await runtime.dispose()
-  return { owner, mission, member, task, claimed }
+  return { config, owner, mission, member, task, claimed }
 }
 
 test('R11-07: a restart re-pends a running task with a per-task event and spends no recovery credit', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-restart-'))
-  const statePath = join(directory, 'state.sqlite')
-  t.after(async () => rm(directory, { recursive: true, force: true }))
-  const f = await firstHost(t, statePath)
-  const running = new SwarmRuntime(config(statePath), new Workers())
+  const f = await firstHost(t)
+  const running = new SwarmRuntime(f.config, newWorkers())
   t.after(async () => { await running.dispose().catch(() => undefined) })
   await running.start()
   const restarted = running.store.get('tasks', f.task.id)
@@ -73,18 +63,15 @@ test('R11-07: a restart re-pends a running task with a per-task event and spends
 })
 
 test('R11-07: a task already at its recovery limit still re-pends once after a restart', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-restart-limit-'))
-  const statePath = join(directory, 'state.sqlite')
-  t.after(async () => rm(directory, { recursive: true, force: true }))
-  const f = await firstHost(t, statePath)
+  const f = await firstHost(t)
   // Simulate a task that spent its single credit on an earlier worker failure.
-  const runtime = new SwarmRuntime(config(statePath), new Workers())
+  const runtime = new SwarmRuntime(f.config, newWorkers())
   await runtime.start()
   const stored = runtime.store.get('tasks', f.task.id)
   stored.recoveryCount = 1
   runtime.store.transaction(() => runtime.store.put('tasks', stored))
   await runtime.dispose()
-  const again = new SwarmRuntime(config(statePath), new Workers())
+  const again = new SwarmRuntime(f.config, newWorkers())
   t.after(async () => { await again.dispose().catch(() => undefined) })
   await again.start()
   const restarted = again.store.get('tasks', f.task.id)
@@ -97,10 +84,7 @@ test('restart recovery admits nothing again: a stored row whose text names prior
   // accepted `dependencies: []`). The guard refuses where a dependency set is
   // written; the open is not a second admission, so it blocks nothing and
   // wakes no owner, and a failure in the owner path cannot abort `start()`.
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-restart-no-readmit-'))
-  const statePath = join(directory, 'state.sqlite')
-  t.after(async () => rm(directory, { recursive: true, force: true }))
-  const first = new SwarmRuntime(config(statePath), new Workers())
+  const { runtime: first, config, budget } = await firstRuntime(t)
   await first.start()
   const owner = { sessionId: 'restart-owner' }
   const mission = first.create(owner, { title: 'Reopen', objective: 'Reopen a stored row', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
@@ -113,7 +97,7 @@ test('restart recovery admits nothing again: a stored row whose text names prior
   const lastSeq = Math.max(0, ...first.store.events(mission.id, 500).map(event => event.seq))
   const earlier = new Set(first.store.list('deliveries', mission.id).map(delivery => delivery.id))
   await first.dispose()
-  const reopened = new SwarmRuntime(config(statePath), new Workers())
+  const reopened = new SwarmRuntime(config, newWorkers())
   t.after(async () => { await reopened.dispose().catch(() => undefined) })
   await reopened.start()
   const row = reopened.store.get('tasks', resumed.id)

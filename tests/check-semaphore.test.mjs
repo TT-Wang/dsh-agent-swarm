@@ -8,31 +8,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { Config } from '../lib/index.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
-
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+import { tempDirectory } from './temp-root.mjs'
+import { eventually, makeRepo, makeWorkspaces } from './faults/harness.mjs'
 
 async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sleep 0.15') {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-semaphore-')))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'src'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'fixture baseline')
+  const { root: temp, source } = await makeRepo('swarm-semaphore')
   const checkStarts = []
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    confineCheck: (argv) => { checkStarts.push(Date.now()); return argv }, ...options })
+  const workspaces = makeWorkspaces(temp, { confineCheck: (argv) => { checkStarts.push(Date.now()); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const prepared = []
   for (let index = 0; index < members; index++) {
@@ -50,14 +36,9 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
 
 /**
  * Deadline on hanging, not on speed: the predicates below wait for real check work
- * (git checkout, process spawn, the FIFO slot). The former 4 s default assumed an
- * unloaded host; the assertions are unchanged.
+ * (git checkout, process spawn, the FIFO slot), so each passes a 30 s bound. The
+ * former 4 s default assumed an unloaded host; the assertions are unchanged.
  */
-const eventually = async (read, message, timeoutMs = 30000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
 
 test('R11-19: checkConcurrency 1 serializes declared checks and records the measured envelope', async t => {
   const f = await semaphoreFixture(t, { checkConcurrency: 1 })
@@ -120,10 +101,10 @@ test('R11-19: an aborted queued verification leaves the queue instead of running
   const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 2, 'sleep 5')
   const [first, second] = f.prepared
   const running = f.workspaces.verifyArtifact(first.member, first.task, first.artifact)
-  await eventually(() => f.checkStarts.length === 1, 'the first check never started')
+  await eventually(() => f.checkStarts.length === 1, 'the first check never started', 30000)
   const controller = new AbortController()
   const queued = f.workspaces.verifyArtifact(second.member, second.task, second.artifact, controller.signal)
-  await eventually(() => f.workspaces.checkEnvelope().queued === 1, 'the second check was not queued')
+  await eventually(() => f.workspaces.checkEnvelope().queued === 1, 'the second check was not queued', 30000)
   controller.abort(new Error('reviewer cancelled'))
   await assert.rejects(queued, /reviewer cancelled/)
   await running
@@ -133,7 +114,7 @@ test('R11-19: an aborted queued verification leaves the queue instead of running
 })
 
 test('R11-19: the plugin config declares the limit and the composition passes it to the owned Workspaces', async t => {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-semaphore-config-')))
+  const temp = await realpath(await tempDirectory('swarm-semaphore-config-'))
   t.after(async () => rm(temp, { recursive: true, force: true }))
   const base = { statePath: path.join(temp, 'state.sqlite'), workspacesRoot: path.join(temp, 'worktrees') }
   assert.equal(Config(base).checkConcurrency, 2, 'the production default bounds the host')

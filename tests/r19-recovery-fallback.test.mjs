@@ -26,25 +26,13 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readdir, readFile, realpath, rm, writeFile, stat } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readdir, readFile, rm, writeFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, SwarmRuntime, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 /** A bound on a wedged runtime, not on a busy machine (real git work runs between ticks). */
-async function eventually(read, message, timeoutMs = 90000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-async function git(cwd, ...args) {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+const WEDGED_MS = 90000
 const exists = file => stat(file).then(() => true, () => false)
 
 /**
@@ -60,46 +48,36 @@ const refusingVerificationRemoval = () => {
 }
 
 /** Production-shaped: every Workers method HarnessWorkers forwards to Workspaces, including checkpointTask and both Workspaces report callbacks. */
-class ProdShapeWorkers {
-  idle = new Set()
+class ProdShapeWorkers extends FakeWorkers {
   failStart = new Map()
   constructor(root, subprocess = subprocessSeam) {
+    super()
     // Same option shape as src/harness-workers.ts: the fallback and cleanup
     // reports reach the bound runtime callbacks, nothing else is wired. The
     // callbacks are the whole channel (`Workspaces` keeps no in-memory mirror),
     // so the test also records every report it was handed, in order.
     this.reports = { fallbacks: [], cleanups: [] }
-    this.workspaces = new Workspaces({ subprocess, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+    this.workspaces = makeWorkspaces(root, { subprocess,
       onRecoveryFallback: info => { this.reports.fallbacks.push(info); this.callbacks?.recoveryFallback?.(info) },
       onCleanupFailure: info => { this.reports.cleanups.push(info); this.callbacks?.verificationCleanupFailure?.(info) } })
   }
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
   async prepareWorkspace(mission, memberId) { return await this.workspaces.prepareWorkspace(mission, memberId) }
   async start(spec) { const error = this.failStart.get(spec.member.id); if (error) throw error }
-  async deliver() {}
-  async stop() {}
-  isIdle(memberId) { return this.idle.has(memberId) }
   async prepareTask(member, task, dependencies, reviewSource) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
   checkpointTask(member, task, options) { return this.workspaces.checkpointTask(member, task, options) }
   async captureArtifact(member, task, deliverables) { return await this.workspaces.captureArtifact(member, task, deliverables) }
   async verifyArtifact(member, task, artifact, signal) { return await this.workspaces.verifyArtifact(member, task, artifact, signal) }
   async dispose() { await this.workspaces.dispose() }
 }
-const makeRuntime = (root, workers) => new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
 
 async function fixture(t, options = {}) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-r19-h3-')))
-  const source = join(root, 'source')
-  await mkdir(join(source, 'src'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const workers = new ProdShapeWorkers(root, options.subprocess)
-  const runtime = makeRuntime(root, workers)
+  const { root, source } = await makeRepo('swarm-r19-h3')
+  const { config, runtime, workers, budget } = await makeRuntime(t, { workers: new ProdShapeWorkers(root, options.subprocess),
+    config: { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'r19-h3-owner' }
-  const mission = runtime.create(owner, { title: 'H3', objective: 'recovery fallback is preserved and surfaced', workspace: source, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const mission = runtime.create(owner, { title: 'H3', objective: 'recovery fallback is preserved and surfaced', workspace: source, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -124,10 +102,10 @@ async function fixture(t, options = {}) {
     await runtime.dispose(); await workers.dispose()
     f.workers2 = new ProdShapeWorkers(root)
     f.workers2.idle.add(author.id); f.workers2.idle.add(reviewer.id)
-    f.runtime2 = makeRuntime(root, f.workers2)
+    f.runtime2 = new SwarmRuntime(config, f.workers2)
     return f
   }
-  f.reviewerTookOver = rt => taskId => eventually(() => { const c = f.current(rt)(taskId); return c.status === 'running' && c.attempt?.ownerId === reviewer.id ? c : undefined }, 'reviewer took over')
+  f.reviewerTookOver = rt => taskId => eventually(() => { const c = f.current(rt)(taskId); return c.status === 'running' && c.attempt?.ownerId === reviewer.id ? c : undefined }, 'reviewer took over', WEDGED_MS)
   t.after(async () => {
     for (const rt of [f.runtime2, runtime]) { try { await rt?.dispose() } catch { /* already disposed */ } }
     for (const w of [f.workers2, workers]) { try { await w?.dispose() } catch { /* already disposed */ } }
@@ -174,7 +152,7 @@ test('A. lease expiry (production stop barrier): no fallback, the replacement in
   planned.attempt.leaseUntil = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', planned))
   f.workers.idle.add(f.author.id); f.workers.idle.add(f.reviewer.id)
-  await eventually(() => f.events(f.runtime).find(e => e.type === 'task/checkpoint-failed'), 'lease-expiry checkpoint failure audited')
+  await eventually(() => f.events(f.runtime).find(e => e.type === 'task/checkpoint-failed'), 'lease-expiry checkpoint failure audited', WEDGED_MS)
   await f.reviewerTookOver(f.runtime)(task.id)
   const reviewerWs = f.runtime.store.get('members', f.reviewer.id).workspace
   assert.equal(f.workers.reports.fallbacks.length, 0, 'the stop barrier preserved WIP first; the fallback is never reached')
@@ -192,8 +170,8 @@ test('B. host restart + provider outage re-route: the replacement inherits the p
   await f.restart()
   f.workers2.failStart.set(f.author.id, Object.assign(new Error('provider rate limit exceeded'), { status: 429 }))
   await f.runtime2.start()
-  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/restart-repended'), 'restart re-pend')
-  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/reassigned'), 'automatic re-route to another member')
+  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/restart-repended'), 'restart re-pend', WEDGED_MS)
+  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/reassigned'), 'automatic re-route to another member', WEDGED_MS)
   await f.reviewerTookOver(f.runtime2)(task.id)
   const reviewerWs = f.runtime2.store.get('members', f.reviewer.id).workspace
   const snapshot = await git(reviewerWs, 'rev-parse', 'HEAD')
@@ -226,8 +204,8 @@ test('C. host restart + owner amend assigneeId: same inheritance, same surfacing
   // The old owner never comes back (retired session): block its start so the task stays pending on it.
   f.workers2.failStart.set(f.author.id, new Error('worker bootstrap failed'))
   await f.runtime2.start()
-  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/restart-repended'), 'restart re-pend')
-  await eventually(() => f.current(f.runtime2)(task.id).status === 'pending', 'pending after restart')
+  await eventually(() => f.events(f.runtime2).find(e => e.type === 'task/restart-repended'), 'restart re-pend', WEDGED_MS)
+  await eventually(() => f.current(f.runtime2)(task.id).status === 'pending', 'pending after restart', WEDGED_MS)
   f.runtime2.controlTask(f.owner, f.mission.id, task.id, 'amend', { assigneeId: f.reviewer.id }, 'route to reviewer')
   await f.reviewerTookOver(f.runtime2)(task.id)
   const reviewerWs = f.runtime2.store.get('members', f.reviewer.id).workspace
@@ -250,7 +228,7 @@ test('D. preservation impossible: the replacement starts from the task base and 
   await writeFile(preservation, 'not a directory\n')
   f.workers2.failStart.set(f.author.id, new Error('worker bootstrap failed'))
   await f.runtime2.start()
-  await eventually(() => f.current(f.runtime2)(task.id).status === 'pending', 'pending after restart')
+  await eventually(() => f.current(f.runtime2)(task.id).status === 'pending', 'pending after restart', WEDGED_MS)
   f.runtime2.controlTask(f.owner, f.mission.id, task.id, 'amend', { assigneeId: f.reviewer.id }, 'route to reviewer')
   await f.reviewerTookOver(f.runtime2)(task.id)
   const reviewerWs = f.runtime2.store.get('members', f.reviewer.id).workspace

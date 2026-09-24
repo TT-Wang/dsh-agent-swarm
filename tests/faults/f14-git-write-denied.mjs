@@ -12,14 +12,13 @@
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
-import { makeRepo, Workspaces, WorkspaceWorkers, setup, events, git, runScenario, taskOf } from './harness.mjs'
-import { subprocessSeam } from '../subprocess-seam.mjs'
+import { makeRepo, WorkspaceWorkers, setup, events, git, runScenario, taskOf, makeWorkspaces } from './harness.mjs'
 
 await runScenario({
   id: 'F14', title: 'A denied worker git write delivers a typed error and never blocks artifact publication or workspace tools', invariants: ['I14'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f14')
-    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = makeWorkspaces(root)
     const workers = new WorkspaceWorkers(workspaces)
     // The adapter's inbox write is asynchronous (it awaits the resident and the session flush).
     const deliver = workers.deliver.bind(workers)
