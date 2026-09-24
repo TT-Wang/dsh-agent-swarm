@@ -200,7 +200,7 @@ const CENSUS = [
   ["src/runtime.ts",26,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",27,"Set","const ids = new Set(task.priorOwnerIds ?? [])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",28,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",29,"Set","if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",29,"Set","for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",30,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",31,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",32,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],

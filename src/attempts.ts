@@ -505,7 +505,7 @@ export class Attempts {
     if (!task.attempt || task.attempt.leaseUntil >= this.rt.now() + this.rt.config.leaseMs / 2) return
     // A live operation is liveness for its full duration: match by member and
     // activity id, never by the attempt the operation happens to be stored under.
-    // Adapters that report current activity must confirm the operation is live.
+    // The adapter must confirm the operation is live; a durable activity alone never renews.
     const activity = this.liveOperation(task)
     if (activity === undefined) {
       if (task.leaseWarned !== task.attempt.leaseUntil) {
