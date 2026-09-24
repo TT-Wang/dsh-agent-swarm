@@ -2056,7 +2056,7 @@ export class Workspaces {
 
   /**
    * Reclaim this verification's checkout and every checkout of its mission no verification in this
-   * process owns (a crash left it): each tree under `verification/`, then each registration still
+   * process owns (a crash left it): each entry under `verification/`, then each registration still
    * naming a path there, locked ones included; nothing else in the source repository is touched or
    * pruned. The owner-permission repair removes a tree a check left unreadable. Best effort by
    * contract: only this verification's own failure is reported, and nothing is thrown.
@@ -2072,29 +2072,24 @@ export class Workspaces {
         try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
       })
     }
-    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) if (entry.isDirectory()) await reclaim(path.join(directory, entry.name))
+    for (const name of await readdir(directory).catch(() => [])) await reclaim(path.join(directory, name))
     const registered = await this.worktreeGit(source, ['worktree', 'list', '--porcelain']).catch(() => '')
     for (const [, candidate] of registered.matchAll(/^worktree (.+)$/gm)) if (path.dirname(candidate!) === directory) await reclaim(candidate!)
   }
 
-  /** Restore owner permissions on an unreadable tree so removal can finish. */
-  private async forceRemove(directory: string): Promise<void> {
+  /** Remove `target` after restoring owner access to each directory in it (unlink needs no more); a link is never followed. */
+  private async forceRemove(target: string): Promise<void> {
     const gone = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT'
     // A failed recursive removal can still be deleting entries, so every step
     // tolerates a path that disappeared underneath it.
     const ignoringMissing = async <T>(operation: Promise<T>): Promise<T | undefined> => await operation.catch(error => { if (gone(error)) return undefined; throw error })
     const repair = async (current: string): Promise<void> => {
-      for (const entry of await ignoringMissing(readdir(current, { withFileTypes: true })) ?? []) {
-        const child = path.join(current, entry.name)
-        const info = await ignoringMissing(lstat(child))
-        if (info === undefined || info.isSymbolicLink()) continue
-        if (info.isDirectory()) { await ignoringMissing(chmod(child, 0o700)); await repair(child) }
-        else await ignoringMissing(chmod(child, 0o600))
-      }
+      if (!(await ignoringMissing(lstat(current)))?.isDirectory()) return
+      await ignoringMissing(chmod(current, 0o700))
+      for (const name of await ignoringMissing(readdir(current)) ?? []) await repair(path.join(current, name))
     }
-    await repair(directory)
-    await ignoringMissing(chmod(directory, 0o700))
-    await rm(directory, { recursive: true, force: true })
+    await repair(target)
+    await rm(target, { recursive: true, force: true })
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */

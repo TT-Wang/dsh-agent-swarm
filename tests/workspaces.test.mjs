@@ -533,6 +533,30 @@ test('the next verification of a mission reclaims every checkout a crash left, t
   assert.deepEqual(failures, [], 'a leftover is not a cleanup failure of the verification that reclaimed it')
 })
 
+test('the reclaim removes a link under verification/ without following it, and a checkout whose root a check made unreadable', async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  // A link something left in verification/ reaches the user's files elsewhere.
+  const outside = path.join(temp, 'outside')
+  await mkdir(path.join(outside, 'kept'), { recursive: true })
+  await writeFile(path.join(outside, 'kept', 'notes.txt'), 'mine\n')
+  await chmod(path.join(outside, 'kept'), 0o755)
+  await chmod(path.join(outside, 'kept', 'notes.txt'), 0o644)
+  await mkdir(verification, { recursive: true })
+  await symlink(outside, path.join(verification, 'link'))
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['chmod 000 .'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.deepEqual(await readdir(verification), [], 'the link and the unreadable checkout are both removed')
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/)
+  assert.equal((await lstat(path.join(outside, 'kept'))).mode & 0o777, 0o755, 'the link was never followed')
+  assert.equal((await lstat(path.join(outside, 'kept', 'notes.txt'))).mode & 0o777, 0o644)
+  assert.equal(await readFile(path.join(outside, 'kept', 'notes.txt'), 'utf8'), 'mine\n')
+  assert.equal(failures.length, 1, "only the verification's own checkout, which git could not remove, is reported")
+})
+
 test("a verification never prunes the source repository's own worktrees, even when its cleanup needs the permission repair", async t => {
   const failures = []
   const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
