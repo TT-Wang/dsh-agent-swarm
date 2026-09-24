@@ -66,6 +66,16 @@ export function pendingStopOwner(tasks: readonly Task[], memberId: string): bool
 export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferred' | 'needs-replacement' | 'refuted' | 'recovery-exhausted'
 
 /**
+ * The claims of the task's current attempt generation. A rework archives the
+ * claims its rejection refuted in `rejections`: they stay refuted, but they no
+ * longer block the task and no later submission or verdict touches them.
+ */
+export function currentEvidenceIds(task: Pick<Task, 'evidenceIds' | 'rejections'>): string[] {
+  const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
+  return (task.evidenceIds ?? []).filter(evidenceId => !archived.has(evidenceId))
+}
+
+/**
  * The block causes holding for `task` now. `evidenceStatusOf` reads an evidence
  * row's current status; `defaultMaxRecoveryAttempts` is the limit of a task
  * without its own `maxRecoveryAttempts` (the runtime's `maxTasksPerMember`). A
@@ -73,7 +83,7 @@ export type BlockCause = 'task-ceiling' | 'preparation-failed' | 'review-deferre
  * is pending and the host retries it.
  */
 export function blockCauses(
-  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts'>,
+  task: Pick<Task, 'status' | 'ceiling' | 'preparationFailure' | 'verificationRecovery' | 'artifact' | 'evidenceIds' | 'recoveryCount' | 'maxRecoveryAttempts' | 'rejections'>,
   evidenceStatusOf: (evidenceId: string) => EvidenceStatus | undefined,
   defaultMaxRecoveryAttempts: number,
 ): Set<BlockCause> {
@@ -82,9 +92,10 @@ export function blockCauses(
   if (task.preparationFailure !== undefined && task.preparationFailure.retryAt === undefined) causes.add('preparation-failed')
   if (task.verificationRecovery !== undefined) causes.add('review-deferred')
   // A rejected source, or submitted work invalidated after submission: its
-  // artifact is immutable, so only a replacement can repair it.
+  // artifact is immutable. Only an owner rework (a rejected non-experiment,
+  // whose artifact then moves into history) or a replacement repairs it.
   if (task.status === 'blocked' && task.artifact !== undefined) causes.add('needs-replacement')
-  if ((task.evidenceIds ?? []).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
+  if (currentEvidenceIds(task).some(evidenceId => evidenceStatusOf(evidenceId) === 'refuted')) causes.add('refuted')
   if ((task.recoveryCount ?? 0) >= (task.maxRecoveryAttempts ?? defaultMaxRecoveryAttempts)) causes.add('recovery-exhausted')
   return causes
 }
