@@ -22,10 +22,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { realpath, rm } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { setup, eventually, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, budget, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { tempDirectory } from './temp-root.mjs'
+import { setup, makeRuntime, eventually, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const wedgeEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
@@ -183,7 +181,7 @@ test('S1: the renaming of bodies that wedge on an unchanged board stops at the f
   } finally { await f.cleanup() }
 })
 
-test('S1: a naming whose commit fails once is retried by a later tick, and the wedge is named exactly once', async () => {
+test('S1: a naming whose commit fails once is retried by a later tick, and the wedge is named exactly once', async t => {
   // Before, the watchdog marked the body named before its durable write, so a
   // naming that failed on its one tick (here a real SQLite writer lock held by a
   // second connection for exactly that tick) left the wedge unnamed for the rest
@@ -204,11 +202,9 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
       try { await hold.release.promise } finally { hold.settledAt = clock.now() }
     }
   }
-  const workers = new HeldStartWorkers()
-  const dir = await realpath(await tempDirectory('swarm-pass-busy-'))
-  const statePath = join(dir, 'swarm.sqlite')
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, manualTick: true, now: clock.now, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
-    stallPassTimeoutMs: bound, stallPasses: 1_000 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
+  // The writer gives up at once, so the one locked tick fails its commit instead of waiting it out.
+  const { dir, runtime, workers, budget, config: { statePath } } = await makeRuntime(t, { workers: new HeldStartWorkers(), clock,
+    config: { stallPassTimeoutMs: bound, stallPasses: 1_000 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -258,8 +254,6 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   } finally {
     process.stderr.write = write
     hold.release.reject(new Error('test ended'))
-    await runtime.dispose()
-    await rm(dir, { recursive: true, force: true })
   }
 })
 
