@@ -251,14 +251,16 @@ export const DEFAULT_ABSENCE_BOUND_MS = 600_000
 /**
  * R17-G2: the reviewed notice template table. Every reviewed family's body is
  * built by one pure function from the durable rows it cites, and the generator
- * calls that function — so the machine replay check can rebuild each emitted
- * body from the store and fail a body that states a cause no row supports.
+ * calls that function through `renderNotice` — so the machine replay check can
+ * rebuild each emitted body from the store and fail a body that states a cause
+ * no row supports. `counts` names the counts a body states, read from its input.
  * `trigger` is the durable event the family is keyed on; a family absent from
  * this table is listed with its reason in the test's reviewed-site table.
  */
 export const NOTICE_TEMPLATES = {
   'stall-root': {
     trigger: 'task/blocked',
+    counts: (input: { dependents: readonly string[] }) => ({ dependents: input.dependents.length }),
     build: (input: { rootId: string; title: string; epoch: number; cause: string; dependents: readonly string[]; recordedReason?: string }) =>
       `Task ${input.rootId} (${input.title}, epoch ${input.epoch}) is a stall root: it is blocked and ${input.cause}${input.dependents.length ? `; ${input.dependents.length} task(s) depend on it (${input.dependents.join(', ')})` : ''}${input.recordedReason === undefined ? '' : `. Recorded reason: ${input.recordedReason}`}. Inspect the recorded cause: extend this task's allocation with swarm_budget, amend its unsubmitted policy or resume it after environment repair with swarm_control(taskId: "${input.rootId}"). Rejected implementations require swarm_propose with replaces: ["${input.rootId}"]; the repair inherits its acceptance. Use swarm_cancel to withdraw mistaken work.`,
   },
@@ -269,8 +271,9 @@ export const NOTICE_TEMPLATES = {
   },
   stall: {
     trigger: 'mission/stalled',
-    build: (input: { reason: string; detail: string; subjects: readonly string[] }) =>
-      `Mission stalled: no task can be scheduled and workers are idle. ${input.reason}. Unschedulable: ${input.detail || 'none'}. Subjects: ${input.subjects.join(', ')}. Decide: amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose, or adjust the budget. If work is no longer required, withdraw it explicitly with swarm_cancel; completing a mission never cancels unfinished tasks. Use swarm_control stop to stop the mission.`,
+    counts: (input: { unschedulable: readonly unknown[] }) => ({ unschedulable: input.unschedulable.length }),
+    build: (input: { reason: string; unschedulable: ReadonlyArray<Pick<Task, 'id' | 'kind' | 'status' | 'reviewOf' | 'dependencies'>>; subjects: readonly string[] }) =>
+      `Mission stalled: no task can be scheduled and workers are idle. ${input.reason}. Unschedulable: ${input.unschedulable.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ') || 'none'}. Subjects: ${input.subjects.join(', ')}. Decide: amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose, or adjust the budget. If work is no longer required, withdraw it explicitly with swarm_cancel; completing a mission never cancels unfinished tasks. Use swarm_control stop to stop the mission.`,
   },
   parked: {
     trigger: 'member/waiting',
@@ -284,6 +287,7 @@ export const NOTICE_TEMPLATES = {
   },
   'integration-gap': {
     trigger: 'task/proposed',
+    counts: (input: { implementations: readonly string[] }) => ({ implementations: input.implementations.length }),
     build: (input: { diagnostic: string; implementations: readonly string[] }) =>
       `${input.diagnostic}. The mission now has ${input.implementations.length} implementation branches (${input.implementations.join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`,
   },
@@ -293,6 +297,17 @@ export const NOTICE_TEMPLATES = {
       `Mission ${input.missionTitle} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`,
   },
 } as const
+/**
+ * R17-G2: one reviewed body and the statement of what it states, from the one
+ * input the body is rendered from: the family is the template that rendered it
+ * and each count is read from that same input, so the recorded statement cannot
+ * disagree with the body.
+ */
+export function renderNotice<F extends keyof typeof NOTICE_TEMPLATES>(family: F, input: Parameters<(typeof NOTICE_TEMPLATES)[F]['build']>[0]): { content: string; statement: NoticeStatement } {
+  // TypeScript cannot correlate NOTICE_TEMPLATES[family] with its own input type across the union.
+  const template = NOTICE_TEMPLATES[family] as unknown as { build: (input: unknown) => string; counts?: (input: unknown) => Record<string, number> }
+  return { content: template.build(input), statement: { family, counts: template.counts?.(input) ?? {} } }
+}
 /** R17-G2: the template key of one emitted notice, or undefined when the family is not reviewed. */
 export function noticeTemplateKey(delivery: Pick<Delivery, 'notice'>): keyof typeof NOTICE_TEMPLATES | undefined {
   const key = delivery.notice?.dedupKey ?? ''
@@ -1411,9 +1426,9 @@ export class Notices {
     // R17-G3: the fact is the named subjects and the recorded reason (the
     // classifier's verdict), never the board digest.
     const reason = `no live path advances ${subjects.slice().sort().join(', ')}`
+    const { content, statement } = renderNotice('fallthrough', { missionTitle: mission.title, subjects: unrecognised })
     this.rt.commit(missionId, () => {
-      this.notify(missionId, NOTICE_TEMPLATES.fallthrough.build({ missionTitle: mission.title, subjects: unrecognised }), view.subjectsOf(unrecognised),
-        { dedupe: true, family: 'fallthrough', trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason, statement: { family: 'fallthrough', counts: {} } })
+      this.notify(missionId, content, view.subjectsOf(unrecognised), { dedupe: true, family: 'fallthrough', trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason, statement })
     })
     return true
   }
@@ -1442,7 +1457,7 @@ export class Notices {
           ? `its stop carries no recorded start, so the declared bound (${this.rt.stallPassTimeoutMs}ms) cannot be shown to hold`
           : `its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past the declared bound (${this.rt.stallPassTimeoutMs}ms)`)
         : 'no live replacement exists anywhere in its lineage'
-      const body = NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause,
+      const { content: body, statement } = renderNotice('stall-root', { rootId: root.id, title: root.title, epoch: root.epoch, cause,
         dependents: dependents.map(task => task.id), ...(root.output === undefined ? {} : { recordedReason: root.output }) })
       // A root the verify site already put in front of the owner (its rejection
       // decision at this subject@epoch, as its own row) is recorded against that decision when
@@ -1455,7 +1470,7 @@ export class Notices {
         ? this.rejectionDecisionFor(mission.id, subject) : undefined
       this.rt.commit(mission.id, () => {
         this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupe: true, dedupKey: key, stampWitness: false, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
-          statement: { family: 'stall-root', counts: { dependents: dependents.length } }, ...(cover === undefined ? {} : { coveredBy: cover.id }) })
+          statement, ...(cover === undefined ? {} : { coveredBy: cover.id }) })
         // The event exists only with the delivery row that carries the fact (its
         // own row or the wake-budget summary), in the same transaction: a notice
         // that was not written must not leave an event per tick behind it.
@@ -1557,7 +1572,6 @@ export class Notices {
     const fingerprint = this.rt.fingerprint(mission.id)
     if (mission.stallNotice === fingerprint) return
     mission.stallNotice = fingerprint; mission.updatedAt = this.rt.now()
-    const detail = leftover.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
     this.rt.commit(mission.id, () => {
       this.rt.store.put('missions', mission)
       this.rt.store.event(mission.id, 'mission/stalled', 'runtime', { reason, fingerprint, unschedulable: leftover.map(task => task.id) })
@@ -1568,8 +1582,8 @@ export class Notices {
       // stop the board-level notice, and this notice no longer depends on prose
       // to say which subject is stuck.
       const stuck = leftover.length ? leftover : view.nonTerminal
-      this.notify(mission.id, NOTICE_TEMPLATES.stall.build({ reason, detail, subjects: view.subjectsOf(stuck) }), view.subjectsOf(stuck),
-        { trigger: NOTICE_TEMPLATES.stall.trigger, reason, statement: { family: 'stall', counts: { unschedulable: leftover.length } } })
+      const { content, statement } = renderNotice('stall', { reason, unschedulable: leftover, subjects: view.subjectsOf(stuck) })
+      this.notify(mission.id, content, view.subjectsOf(stuck), { trigger: NOTICE_TEMPLATES.stall.trigger, reason, statement })
       // W3: the stall notice is the no-silent-state witness for this state.
       mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
       this.rt.store.put('missions', mission)
@@ -1591,8 +1605,9 @@ export class Notices {
       this.rt.store.put('missions', mission)
       // R15-A1: the deliverable's lineage is the subject (every accepted task),
       // never an anonymous mission-scoped sentence.
-      this.notify(mission.id, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
-        { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered', statement: { family: 'coverage-complete', counts: {} } })
+      const { content, statement } = renderNotice('coverage-complete', { missionTitle: view.mission.title })
+      this.notify(mission.id, content, view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
+        { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered', statement })
     })
   }
 
@@ -1608,8 +1623,9 @@ export class Notices {
     // S5: the durable notice ledger is the gate (its row is written in this call).
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     this.rt.commit(mission.id, () => {
-      this.notify(mission.id, NOTICE_TEMPLATES.parked.build({ taskId: row.id, title: row.title }), view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked', statement: { family: 'parked', counts: {} } })
+      const { content, statement } = renderNotice('parked', { taskId: row.id, title: row.title })
+      this.notify(mission.id, content, view.subjectsOf([row]),
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked', statement })
     })
   }
 
@@ -1628,8 +1644,9 @@ export class Notices {
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
     this.rt.commit(mission.id, () => {
-      this.notify(mission.id, NOTICE_TEMPLATES['integration-gap'].build({ diagnostic, implementations: view.implementations.map(task => task.id) }), view.subjectsOf(view.implementations),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement: { family: 'integration-gap', counts: { implementations: implementations.length } } })
+      const { content, statement } = renderNotice('integration-gap', { diagnostic, implementations: view.implementations.map(task => task.id) })
+      this.notify(mission.id, content, view.subjectsOf(view.implementations),
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement })
     })
   }
 
@@ -1644,8 +1661,9 @@ export class Notices {
     const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      this.notify(mission.id, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic, sourceId: row.id }), view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement: { family: 'review-blocked', counts: {} } })
+      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: row.id })
+      this.notify(mission.id, content, view.subjectsOf([row]),
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
     })
   }
 

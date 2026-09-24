@@ -8,10 +8,12 @@
  *    every `notify(` site in the source tree with its trigger and its reason for
  *    not passing an explicit fact marker, so a new site fails this file.
  * 2. FACT-ONLY TEMPLATES: every body of a reviewed family is built by the one
- *    function in `NOTICE_TEMPLATES` and records what it states (its statement:
- *    template family and counts, beside its subjects and recorded reason); the
- *    structure check asserts those facts against the rows the notice cites plus
- *    a few stable anchors in the body, so the wording is free to change.
+ *    function in `NOTICE_TEMPLATES` through `renderNotice`, which records what
+ *    it states from the same input (its statement: the rendering family and its
+ *    counts, beside its subjects and recorded reason); the structure check
+ *    asserts those facts against the rows the notice cites, rebuilds the body
+ *    from those rows with the template, and checks the stated counts and each
+ *    family's decision anchors, so the wording between anchors is free to change.
  * 3. FACT-KEYED REPETITION: identity is subject@epoch + triggering event +
  *    recorded reason. The same fact records one row, an unrelated board change
  *    does not re-arm it, and a changed fact is a new row.
@@ -228,54 +230,104 @@ test('R17-G8: the admitted owner message records consumption after inbox claim',
  * R17-G2 (structure, not prose): each reviewed body is checked through the
  * facts the notice records with it — its statement (template family and the
  * counts the body states), its subjects at their epochs and its recorded
- * reason — asserted against the durable rows the notice cites, never against
- * NOTICE_TEMPLATES and never against a second copy of the sentence. A few
- * stable anchors tie the body to those facts (a subject id, a code token, the
- * recorded cause where the builder interpolates it); the wording around them
- * can change without a test edit.
+ * reason — asserted against the durable rows the notice cites. The body itself
+ * is checked twice: it must equal its template rebuilt here from those rows (a
+ * body rendered by the wrong template or from the wrong rows fails), and it must
+ * state the recorded counts and keep the family's decision anchors below (a
+ * template that states a wrong count, names the wrong tool or drops an exit
+ * fails). Anchors, not sentences: the wording around them can change without a
+ * test edit.
  */
 function ownerNotice(f, prefix) {
   return f.ownerNotices().find(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith(prefix))
 }
 const subjectOf = task => `${task.id}@${task.epoch}`
+/** Every tool each reviewed body names, bound to the action it is named for, and the exit the body leaves open. */
+const DECISIONS = {
+  'stall-root': ['allocation with swarm_budget', 'swarm_propose with replaces', 'swarm_cancel to withdraw'],
+  stall: ['assignee with swarm_control', 'review with swarm_propose', 'explicitly with swarm_cancel', 'swarm_control stop'],
+  fallthrough: ['review with swarm_propose', 'decide with swarm_control'],
+  parked: ['held by a parked member', 'without spending a recovery attempt'],
+  'integration-gap': ['integration task depending on every branch'],
+  'coverage-complete': ['stays active until you decide', 'swarm_control complete', 'more work with swarm_propose'],
+  'review-blocked': ['verification task with swarm_propose', 'cannot complete while it is unreviewable'],
+}
+function assertDecision(notice, family) {
+  for (const anchor of DECISIONS[family]) assert.ok(notice.content.includes(anchor), `the ${family} body keeps "${anchor}"`)
+}
+/** Blocks a task the way a failed attempt leaves it: blocked at a new epoch with its reason recorded. */
+function blockTask(f, task) {
+  const row = f.runtime.store.get('tasks', task.id)
+  row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
+  f.runtime.store.put('tasks', row)
+  return row
+}
+/** Makes a proposed task wait on another, as the store would hold it. */
+function dependOn(f, task, dependency) {
+  const row = f.runtime.store.get('tasks', task.id)
+  row.dependencies = [dependency.id]
+  f.runtime.store.put('tasks', row)
+  return row
+}
 
 test('R17-G2a: the stall-root body replays from the blocked row alone', async t => {
   const f = await fixture(t)
   const member = await f.addMember('Ada')
-  const task = f.propose('Blocked work', { assigneeId: member.id })
-  const row = f.runtime.store.get('tasks', task.id)
-  row.status = 'blocked'; row.epoch += 1; row.output = 'blocked for repair'
-  f.runtime.store.put('tasks', row)
+  // One root strands a dependent and one strands none, so the stated dependent
+  // count is checked both when the body states it and when it must not.
+  const stranding = blockTask(f, f.propose('Blocked work', { assigneeId: member.id }))
+  const lone = blockTask(f, f.propose('Blocked alone', { assigneeId: member.id }))
+  dependOn(f, f.propose('Waits on the blocked work'), stranding)
   f.runtime.notices.notifyStallRoots(f.runtime.interpretation(f.mission.id))
-  const notice = ownerNotice(f, 'stall-root:')
-  assert.ok(notice, 'the stall root was reported')
-  const root = f.runtime.store.get('tasks', task.id)
-  const dependents = f.runtime.store.list('tasks', f.mission.id).filter(candidate => candidate.dependencies.includes(root.id))
-  assert.deepEqual(notice.notice.statement, { family: 'stall-root', counts: { dependents: dependents.length } }, 'the body is the stall-root template and states the dependent count the rows hold')
-  assert.deepEqual(notice.notice.subjects, [root, ...dependents].map(subjectOf), 'the subjects are the blocked row and its dependents at their epochs')
-  assert.equal(notice.notice.reason, 'no live replacement exists anywhere in its lineage', 'the recorded reason is row-derived (the row is blocked with no replacement)')
-  assert.ok(notice.content.includes(notice.notice.reason), 'the body states the recorded cause')
-  assert.ok(notice.content.includes(root.output), 'the body quotes the reason recorded on the blocked row')
-  assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
+  for (const task of [stranding, lone]) {
+    const root = f.runtime.store.get('tasks', task.id)
+    const notice = ownerNotice(f, `stall-root:${f.mission.id}:${subjectOf(root)}`)
+    assert.ok(notice, 'the stall root was reported')
+    const dependents = f.runtime.store.list('tasks', f.mission.id).filter(candidate => candidate.dependencies.includes(root.id))
+    assert.deepEqual(notice.notice.statement, { family: 'stall-root', counts: { dependents: dependents.length } }, 'the body is the stall-root template and states the dependent count the rows hold')
+    assert.deepEqual(notice.notice.subjects, [root, ...dependents].map(subjectOf), 'the subjects are the blocked row and its dependents at their epochs')
+    assert.equal(notice.notice.reason, 'no live replacement exists anywhere in its lineage', 'the recorded reason is row-derived (the row is blocked with no replacement)')
+    assert.equal(notice.content, NOTICE_TEMPLATES['stall-root'].build({ rootId: root.id, title: root.title, epoch: root.epoch, cause: notice.notice.reason,
+      dependents: dependents.map(dependent => dependent.id), recordedReason: root.output }), 'the body is the template rebuilt from the blocked row and its dependents')
+    assert.ok(notice.content.includes(notice.notice.reason), 'the body states the recorded cause')
+    assert.ok(notice.content.includes(root.output), 'the body quotes the reason recorded on the blocked row')
+    assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
+    assert.equal(notice.content.includes('depend on it'), dependents.length > 0, 'the body states a dependent count only when the rows hold one')
+    if (dependents.length) assert.ok(notice.content.includes(`${dependents.length} task(s) depend on it (${dependents.map(dependent => dependent.id).join(', ')})`), 'the body states the dependent count and names each dependent')
+    assertDecision(notice, 'stall-root')
+  }
 })
 
 test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', async t => {
   const f = await fixture(t)
-  await f.addMember('Ada')
+  const member = await f.addMember('Ada')
   f.propose('Waiting work')
-  const view = f.runtime.interpretation(f.mission.id)
-  const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
-  f.runtime.notices.notifyStall(view, reason)
-  const notice = ownerNotice(f, 'mission/stalled')
-  assert.ok(notice, 'the W3 stall was reported')
-  const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
-  const subjects = stuck.map(subjectOf)
-  assert.deepEqual(notice.notice.statement, { family: 'stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the stall template and states the unschedulable count of the rows')
-  assert.deepEqual(notice.notice.subjects, subjects, 'the subjects are the unschedulable rows, or every non-terminal row when none is')
-  assert.equal(notice.notice.reason, reason, 'the recorded reason is the completion diagnostic')
-  assert.ok(notice.content.includes(reason), 'the body states the recorded completion diagnostic')
-  for (const subject of subjects) assert.ok(notice.content.includes(subject), `the body names ${subject}`)
-  assert.ok(notice.content.includes('swarm_control'), 'the body names the decision tool')
+  const stall = () => {
+    const view = f.runtime.interpretation(f.mission.id)
+    const reason = f.runtime.completionError(view.mission) ?? 'no task can make progress'
+    f.runtime.notices.notifyStall(view, reason)
+    return { view, reason, notice: f.ownerNotices().filter(delivery => delivery.notice.dedupKey.startsWith('mission/stalled')).at(-1) }
+  }
+  // First nothing is unschedulable (the body names every non-terminal row);
+  // then a blocked row and its dependent are, so the body counts and names them.
+  const stalls = [stall()]
+  const dead = blockTask(f, f.propose('Dead end', { assigneeId: member.id }))
+  dependOn(f, f.propose('Waits on the dead end'), dead)
+  stalls.push(stall())
+  assert.equal(stalls[1].view.unschedulable.length, 2, 'the second board holds two unschedulable rows')
+  for (const { view, reason, notice } of stalls) {
+    assert.ok(notice, 'the W3 stall was reported')
+    const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
+    const subjects = stuck.map(subjectOf)
+    assert.deepEqual(notice.notice.statement, { family: 'stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the stall template and states the unschedulable count of the rows')
+    assert.deepEqual(notice.notice.subjects, subjects, 'the subjects are the unschedulable rows, or every non-terminal row when none is')
+    assert.equal(notice.notice.reason, reason, 'the recorded reason is the completion diagnostic')
+    assert.equal(notice.content, NOTICE_TEMPLATES.stall.build({ reason, unschedulable: view.unschedulable, subjects }), 'the body is the template rebuilt from the unschedulable rows')
+    assert.ok(notice.content.includes(reason), 'the body states the recorded completion diagnostic')
+    for (const subject of subjects) assert.ok(notice.content.includes(subject), `the body names ${subject}`)
+    for (const row of view.unschedulable) assert.ok(notice.content.includes(`${row.id} (${row.kind}, ${row.status}`), `the body counts ${row.id} as unschedulable`)
+    assertDecision(notice, 'stall')
+  }
 })
 
 test('R17-G2c: the fall-through body replays from the unrecognised rows alone', async t => {
@@ -290,9 +342,7 @@ test('R17-G2c: the fall-through body replays from the unrecognised rows alone', 
   await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, dead.id)
   await f.runtime.cancel(f.owner, f.mission.id, { taskId: dead.id, reason: 'withdrawn' })
   const waiting = f.propose('Waiting on the withdrawn task')
-  const waitingRow = f.runtime.store.get('tasks', waiting.id)
-  waitingRow.dependencies = [dead.id]
-  f.runtime.store.put('tasks', waitingRow)
+  dependOn(f, waiting, dead)
   f.runtime.notices.ensureWitness(f.mission.id, { offPass: true, wedged: true })
   const notice = ownerNotice(f, 'fallthrough:')
   assert.ok(notice, 'the fall-through was reported')
@@ -300,8 +350,10 @@ test('R17-G2c: the fall-through body replays from the unrecognised rows alone', 
   assert.deepEqual(notice.notice.statement, { family: 'fallthrough', counts: {} }, 'the body is the fall-through template and states no count')
   assert.deepEqual(notice.notice.subjects, [subjectOf(row)], 'the body names exactly the row the classifier did not recognise')
   assert.equal(notice.notice.reason, `no live path advances ${row.id}@${row.epoch}`, 'the recorded reason is the classifier verdict over that row')
+  assert.equal(notice.content, NOTICE_TEMPLATES.fallthrough.build({ missionTitle: f.mission.title, subjects: [row] }), 'the body is the template rebuilt from the unrecognised row')
   assert.ok(notice.content.includes(row.id), 'the body names the unrecognised row')
   assert.ok(notice.content.includes('swarm_propose'), 'the body names the repair tool')
+  assertDecision(notice, 'fallthrough')
 })
 
 test('R17-G2d: the integration-gap and coverage-complete bodies replay from the task rows alone', async t => {
@@ -315,7 +367,10 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   assert.deepEqual(gap.notice.statement, { family: 'integration-gap', counts: { implementations: implementations.length } }, 'the gap states the implementation branch count of the rows')
   assert.deepEqual(gap.notice.subjects, implementations.map(subjectOf), 'the gap names every implementation branch')
   assert.ok(gap.notice.reason.length > 0 && gap.content.includes(gap.notice.reason), 'the body states the recorded completion rule')
+  assert.equal(gap.content, NOTICE_TEMPLATES['integration-gap'].build({ diagnostic: gap.notice.reason, implementations: implementations.map(task => task.id) }), 'the gap body is the template rebuilt from the implementation rows')
+  assert.ok(gap.content.includes(`${implementations.length} implementation branches`), 'the gap body states the branch count of the rows')
   for (const task of implementations) assert.ok(gap.content.includes(task.id), `the gap body names ${task.id}`)
+  assertDecision(gap, 'integration-gap')
 
   // Coverage-complete: accept the only task and report with the mission still active.
   const accepted = f.runtime.store.get('tasks', implementations[0].id)
@@ -326,8 +381,9 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   assert.ok(coverage, 'the coverage-complete notice was reported')
   assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
   assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted)], 'the subject is the accepted deliverable')
+  assert.equal(coverage.content, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: f.mission.title }), 'the body is the template rebuilt from the mission row')
   assert.ok(coverage.content.includes(f.mission.title), 'the body names the mission')
-  assert.ok(coverage.content.includes('swarm_control complete'), 'the body names the completion decision')
+  assertDecision(coverage, 'coverage-complete')
 })
 
 test('R17-G2e: the parked-holder body replays from the running task row alone', async t => {
@@ -345,7 +401,9 @@ test('R17-G2e: the parked-holder body replays from the running task row alone', 
   assert.deepEqual(notice.notice.statement, { family: 'parked', counts: {} }, 'the body is the parked template and states no count')
   assert.deepEqual(notice.notice.subjects, [subjectOf(row)], 'the subject is the running row the parked member holds')
   assert.equal(notice.notice.reason, 'the owning member is parked')
+  assert.equal(notice.content, NOTICE_TEMPLATES.parked.build({ taskId: row.id, title: row.title }), 'the body is the template rebuilt from the held row')
   assert.ok(notice.content.includes(row.id), 'the body names the held task')
+  assertDecision(notice, 'parked')
 })
 
 test('R17-G2f: the review-blocked body replays from the submitted source row and the recorded reason alone', async t => {
@@ -368,7 +426,8 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   // The body leads with the admission diagnostic built from the durable reason.
   assert.ok(notice.content.includes(recorded.data.reason), 'the body states the recorded reason')
   assert.ok(notice.content.includes('[review_path_missing]'), 'the body carries the typed diagnostic code')
-  assert.ok(notice.content.includes(source.id), 'the body names the source task')
+  assert.ok(notice.content.includes(`reviewOf ${source.id}`), 'the verification advice names the source task')
+  assertDecision(notice, 'review-blocked')
 })
 
 test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
