@@ -3,7 +3,7 @@ import { isAbsolute } from 'node:path'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
 import { canOwnReview } from './assignment.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
-import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
+import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanReviewOverride, type PlanTask } from './types.ts'
 
 // Plan refusals echo the caller's own plan, so they are typed admission
 // refusals the browser sees by type. Each category is authored at its own
@@ -223,6 +223,7 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (task.assigneeKey && !canOwnReview({ assigneeId: source.assigneeKey as string | undefined }, String(task.assigneeKey))) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
+    if (task.review !== undefined) inspectAdmission(() => reviewOverride(task, `${at}.review`, members, tasks, Number((value.budget as Record<string, unknown>).maxSteps)))
   }
   if (undeclared.length) admissionIssues.push(outputsRequired(undeclared))
   if (experiments > Number(value.budget.maxExperiments)) inspectAdmission(() => { throw new AdmissionError('plan_experiments_exceed_budget', 'budget_error', 'Plan exceeds experiment budget', 'tasks') })
@@ -246,11 +247,100 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
       ...(raw.budget.deadlineAt === undefined ? {} : { deadlineAt: raw.budget.deadlineAt }) },
     members: raw.members.map(({ key, name, role, provider, model, reasoningEffort, maxOutputTokens }) => ({ key, name, role, provider, model, reasoningEffort, maxOutputTokens })),
     workstreams: raw.workstreams.map(({ key, title, objective }) => ({ key, title, objective })),
-    tasks: raw.tasks.map(({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf }) =>
-      ({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf })),
+    tasks: raw.tasks.map(canonicalTask),
   }
   orderedTasks(plan.tasks)
   return plan
+}
+
+/** Exactly the admitted task fields in one fixed order: a retry compares saved and new plans as JSON. */
+function canonicalTask({ key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf, review }: PlanTask): PlanTask {
+  return { key, workstreamKey, title, objective, kind, scope, acceptance, outputs, checks, maxRecoveryAttempts, maxSteps, maxFindings, ceilingProvenance, checkTimeoutMs, priority, experiment, assigneeKey, assignmentMode, dependencies, reviewOf,
+    ...(review === undefined ? {} : { review: JSON.parse(JSON.stringify({ assigneeKey: review.assigneeKey, objective: review.objective, acceptance: review.acceptance, maxSteps: review.maxSteps, maxRecoveryAttempts: review.maxRecoveryAttempts })) as PlanReviewOverride }) }
+}
+
+/** One malformed override field's refusal: coded, located, and naming the exit. */
+function overrideRefusal(location: string, detail: string): AdmissionError {
+  return new AdmissionError('plan_review_override_invalid', 'validation_error', `[plan_review_override_invalid] ${location}${detail} Relaunch the complete plan.`, location)
+}
+
+/** `review` on a deliverable: the fields of the one review the host adds for it (see `pairReviews`). */
+function reviewOverride(task: Record<string, unknown>, location: string, members: ReadonlyMap<string, unknown>, tasks: ReadonlyMap<string, Record<string, unknown>>, missionMaxSteps: number): void {
+  if (task.kind === 'verification') throw overrideRefusal(location, ' belongs on the deliverable a verification reviews. Remove `review` from this verification task, or edit its own fields instead.')
+  const review = task.review
+  if (review === null || typeof review !== 'object' || Array.isArray(review)) throw overrideRefusal(location, ' must be an object. Set `review` to the review fields to override, or omit it.')
+  const fields = review as Record<string, unknown>
+  if (fields.objective !== undefined) text(fields.objective, `${location}.objective`)
+  if (fields.acceptance !== undefined) strings(fields.acceptance, `${location}.acceptance`)
+  for (const name of ['maxSteps', 'maxRecoveryAttempts'] as const) {
+    const limit = fields[name]
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || Number(limit) < 1 || (name === 'maxSteps' && Number(limit) > missionMaxSteps))) {
+      throw overrideRefusal(`${location}.${name}`, ` must be a positive safe integer${name === 'maxSteps' ? ' no greater than the mission `maxSteps` budget' : ''}. Set \`${name}\` in \`review\` to one, or omit it to inherit.`)
+    }
+  }
+  if (fields.assigneeKey !== undefined) {
+    if (typeof fields.assigneeKey !== 'string' || !members.has(fields.assigneeKey)) throw overrideRefusal(`${location}.assigneeKey`, ' must name an existing member key. Set `assigneeKey` in `review` to a member key, or omit it to leave the review unassigned.')
+    // A planned source's only author is its assignee.
+    if (!canOwnReview({ assigneeId: task.assigneeKey as string | undefined }, fields.assigneeKey)) {
+      throw new AdmissionError('plan_review_independence_required', 'tool_error', `[plan_review_independence_required] ${location}.assigneeKey names this task's own assignee ${JSON.stringify(fields.assigneeKey)}; a review must be independent. Set \`assigneeKey\` in \`review\` to another member key, or omit it to leave the review unassigned. Relaunch the complete plan.`, `${location}.assigneeKey`)
+    }
+  }
+  const named = [...tasks.values()].find(other => other.kind === 'verification' && other.reviewOf === task.key)
+  if (named !== undefined) throw overrideRefusal(location, ` overrides the review the host adds, but ${JSON.stringify(named.key)} already names this task in \`reviewOf\`. Remove \`review\` from this task, or remove that verification task.`)
+}
+
+/** The key of the review the host adds for `sourceKey`: `<key>-review`, numbered when taken, within the 100-character key limit. */
+function reviewKey(sourceKey: string, taken: Set<string>): string {
+  for (let index = 1; ; index++) {
+    const suffix = index === 1 ? '-review' : `-review${index}`
+    const key = `${sourceKey.slice(0, 100 - suffix.length)}${suffix}`
+    if (!taken.has(key)) { taken.add(key); return key }
+  }
+}
+
+/**
+ * The host owns review pairing: every deliverable (a non-verification task)
+ * that no verification task names in `reviewOf` gets exactly one independent
+ * review, inserted after it: unassigned, with the source's workstream, scope,
+ * acceptance, priority, check timeout and recovery limit, and `outputs: []`.
+ * Like an authored review it names no checks: verification runs the source's.
+ * The source's `review` override supplies assigneeKey, objective, acceptance,
+ * maxSteps and maxRecoveryAttempts, and is consumed. An authored review
+ * suppresses the synthesis, so a plan that pairs every deliverable is returned
+ * unchanged. The added rows count against `maxTasks`. Takes and returns a
+ * validated plan: the added rows are canonical admitted rows, so validating
+ * the result again changes nothing.
+ */
+export function pairReviews(plan: PlanInput): PlanInput {
+  const reviewed = new Set(plan.tasks.flatMap(task => task.kind === 'verification' && task.reviewOf !== undefined ? [task.reviewOf] : []))
+  const taken = new Set(plan.tasks.map(task => task.key))
+  const tasks: PlanTask[] = []
+  let added = 0
+  for (const { review, ...source } of plan.tasks) {
+    tasks.push(source)
+    if (source.kind === 'verification' || reviewed.has(source.key)) continue
+    const maxRecoveryAttempts = review?.maxRecoveryAttempts ?? source.maxRecoveryAttempts
+    const row: PlanTask = {
+      key: reviewKey(source.key, taken), workstreamKey: source.workstreamKey, title: `Independent review of ${source.title}`,
+      objective: review?.objective ?? `Independently verify the submitted artifact of ${source.key} (${source.title}) against its acceptance criteria.`,
+      kind: 'verification', scope: [...source.scope], acceptance: [...(review?.acceptance ?? source.acceptance)], outputs: [], reviewOf: source.key,
+      ...(review?.assigneeKey === undefined ? {} : { assigneeKey: review.assigneeKey }),
+      ...(review?.maxSteps === undefined ? {} : { maxSteps: review.maxSteps }),
+      ...(maxRecoveryAttempts === undefined ? {} : { maxRecoveryAttempts }),
+      ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
+      ...(source.priority === undefined ? {} : { priority: source.priority }),
+    }
+    // Every field above is the source's or an override `validatePlan` already
+    // admitted; only the step/finding ceilings are derived here, as for an authored row.
+    tasks.push(canonicalTask({ ...row, ...normalizeTaskCeilings(row, plan.budget.maxSteps, `tasks[${tasks.length}]`) }))
+    added++
+  }
+  if (added === 0) return plan
+  if (tasks.length > plan.budget.maxTasks) {
+    throw new AdmissionError('plan_tasks_exceed_budget', 'budget_error', `[plan_tasks_exceed_budget] The plan needs ${tasks.length} tasks, including ${added} independent review(s) the host adds for deliverables no verification task names in \`reviewOf\`, but \`maxTasks\` is ${plan.budget.maxTasks}. Raise \`maxTasks\` in \`budget\` to at least ${tasks.length}, or plan fewer deliverables, and relaunch the complete plan.`, 'budget.maxTasks')
+  }
+  orderedTasks(tasks)
+  return { ...plan, tasks }
 }
 
 /** Include review edges so sources exist before their verification tasks are admitted. */

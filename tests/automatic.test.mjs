@@ -138,9 +138,10 @@ test('concurrent plan delivery launches once with the saved workspace and primar
 test('automatic admission rejects incomplete topology before creating workers or a draft', async t => {
   for (const mutate of [
     input => { input.members.pop(); input.tasks.pop() },
-    input => { input.tasks.pop() },
+    // A deliverable without a review, or with an unassigned one, is no longer
+    // incomplete: the host adds or keeps its independent review
+    // (tests/review-pairing.test.mjs). Its own assignee is still required.
     input => { input.tasks[0].assigneeKey = undefined },
-    input => { input.tasks[1].assigneeKey = undefined },
     // One reviewed implementation is deliverable alone; several implementation branches still need a final integration.
     input => { input.tasks[0].kind = 'implementation'; input.tasks.push({ ...input.tasks[0], key: 'second', title: 'Second' }, { ...input.tasks[1], key: 'second-review', title: 'Second review', reviewOf: 'second' }) },
     input => { input.acceptance = ['uncovered obligation'] },

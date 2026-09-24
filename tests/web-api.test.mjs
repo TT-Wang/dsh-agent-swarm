@@ -345,7 +345,8 @@ test('launch revalidates current model routing before side effects and activates
   assert.equal(snapshot.mission.status, 'active')
   assert.equal(snapshot.members.length, 1)
   assert.equal(snapshot.workstreams.length, 1)
-  assert.equal(snapshot.tasks.length, 1)
+  // The deliverable and the independent review the host added for it when the draft was saved.
+  assert.deepEqual(snapshot.tasks.map(task => task.kind).sort(), ['implementation', 'verification'])
   const retried = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
   assert.equal(retried.result.ok, true, retried.text)
   assert.equal(retried.result.value.snapshot.mission.id, snapshot.mission.id)

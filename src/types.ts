@@ -870,6 +870,20 @@ export interface PlanTask {
   assignmentMode?: 'preferred' | 'pinned'
   dependencies?: string[]
   reviewOf?: string
+  /**
+   * On a deliverable no verification task names in `reviewOf`: fields of the
+   * one independent review the host adds for it. Consumed when that review is
+   * added, so a saved or launched plan carries the review row instead.
+   */
+  review?: PlanReviewOverride
+}
+/** The planner's choices for a host-added review; every other field derives from its source. */
+export interface PlanReviewOverride {
+  assigneeKey?: string
+  objective?: string
+  acceptance?: string[]
+  maxSteps?: number
+  maxRecoveryAttempts?: number
 }
 export interface PlanInput extends CreateMissionInput {
   members: PlanMember[]

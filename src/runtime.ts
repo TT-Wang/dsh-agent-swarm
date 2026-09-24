@@ -24,7 +24,7 @@ import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependency
 import { canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
-import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
+import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -2724,11 +2724,14 @@ export class SwarmRuntime {
     })
     return request
   }
-  /** Automatic requests must contain a complete independently verifiable topology. */
+  /**
+   * Automatic requests must contain a complete topology. The one independent
+   * review each deliverable needs is the host's: `pairReviews` adds it unless
+   * the plan names one, so the planner never has to author the pairing.
+   */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
-    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
-    // New automatic plans use preferences; old/manual task rows keep their binding.
-    for (const task of plan.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
+    const options = { launch: true, dependencyDirs: this.config.verificationDependencyDirs }
+    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, options)
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
     const issues: string[] = []
     if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
@@ -2739,11 +2742,7 @@ export class SwarmRuntime {
       if (task.maxRecoveryAttempts === undefined) issues.push(`tasks[${task.key}].maxRecoveryAttempts is required: choose the allowed automatic recovery attempts`)
       if (task.kind !== 'verification' && task.checks?.length && task.checkTimeoutMs === undefined) issues.push(`tasks[${task.key}].checkTimeoutMs is required because it has checks`)
     }
-    for (const source of sources) {
-      if (!source.assigneeKey || !plan.tasks.some(review => review.kind === 'verification' && review.reviewOf === source.key && review.assigneeKey && review.assigneeKey !== source.assigneeKey)) {
-        issues.push(`tasks[${source.key}] requires an assigned independent verification task (kind verification, reviewOf ${source.key}, assigneeKey different from ${source.assigneeKey ?? 'its assignee'})`)
-      }
-    }
+    for (const source of sources) if (source.assigneeKey === undefined) issues.push(`tasks[${source.key}].assigneeKey is required: choose the member who delivers this task`)
     const missingCriteria = plan.acceptance.filter(criterion => !sources.some(task => task.acceptance.includes(criterion)))
     if (missingCriteria.length) issues.push(`Deliverables must cover every mission acceptance criterion. Missing exact acceptance strings: ${JSON.stringify(missingCriteria)}. Copy each missing string into the acceptance array of the deliverable task that satisfies it; a paraphrase does not match.`)
     const implementations = sources.filter(task => task.kind === 'implementation')
@@ -2766,7 +2765,10 @@ export class SwarmRuntime {
       issues.push(`The integration task must depend on implementation ${implementations[0]!.key}, or be omitted so the reviewed implementation is delivered directly`)
     }
     if (issues.length) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
-    return plan
+    const paired = pairReviews(plan)
+    // New automatic plans use preferences; old/manual task rows keep their binding.
+    for (const task of paired.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
+    return paired
   }
   /**
    * Launch one validated generated plan under the saved human request's workspace
@@ -2898,7 +2900,9 @@ export class SwarmRuntime {
     return draft
   }
   private prepareDraftInput(input: PlanInput) {
-    const admitted = validatePlan(input, { dependencyDirs: this.config.verificationDependencyDirs })
+    // The saved draft already shows the review the host adds for each deliverable.
+    const options = { dependencyDirs: this.config.verificationDependencyDirs }
+    const admitted = pairReviews(validatePlan(input, options))
     const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     // Store the authorization anchor on the draft, outside its canonical plan.
     const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
@@ -3061,7 +3065,8 @@ export class SwarmRuntime {
           || (current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1))) throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
       }
       assertCurrent()
-      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
+      const launching = { launch: true, dependencyDirs: this.config.verificationDependencyDirs }
+      const input = automatic ? this.automaticPlan(draft.input, automatic) : pairReviews(validatePlan(draft.input, launching))
       draft.input = input
       draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
       // P4: the parse-only check preflight runs on EVERY launch path, at the one

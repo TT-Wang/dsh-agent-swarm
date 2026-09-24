@@ -3,8 +3,8 @@
  * review path is recorded, repaired by an automatic independent review when the
  * board can afford one, and escalated to the owner with the exact task id when
  * it cannot. The normal two-step owner flow (admit the source, then its review)
- * keeps working, and the launch-time plan validation still rejects a code
- * deliverable without an assigned independent review.
+ * keeps working, and a launched plan never lacks a review: the host adds one
+ * for a code deliverable the plan does not pair.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -196,7 +196,7 @@ test('an unreviewable submission survives a host restart and is repaired on reco
   assert.equal(review.status, 'pending')
 })
 
-test('automatic plan admission still rejects a code deliverable without an assigned independent review', async t => {
+test('automatic plan admission adds the independent review a code deliverable lacks, and keeps an authored one', async t => {
   const { dir: directory, runtime, budget } = await makeRuntime(t, {
     workers: new ReviewWorkers(),
     config: { ...reviewConfig, tickMs: 60000, maxTasksPerMember: 10 },
@@ -210,9 +210,19 @@ test('automatic plan admission still rejects a code deliverable without an assig
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'],
       assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 }] }
-  await assert.rejects(runtime.startPlan(owner, request.id, plan), /requires an assigned independent verification task/)
+  const synthesized = await runtime.startPlan(owner, request.id, plan)
+  assert.equal(synthesized.mission.status, 'active')
+  const source = synthesized.tasks.find(task => task.kind === 'integration')
+  const reviews = synthesized.tasks.filter(task => task.kind === 'verification' && task.reviewOf === source.id)
+  assert.equal(reviews.length, 1, 'exactly one review is added')
+  assert.equal(reviews[0].assigneeId, undefined)
+  assert.equal(reviews[0].maxRecoveryAttempts, 5, 'the added review takes the source\'s recovery limit')
+
+  const authoredOwner = { sessionId: 'plan-owner-authored' }
+  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory })
   plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'],
     acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 })
-  const snapshot = await runtime.startPlan(owner, request.id, plan)
+  const snapshot = await runtime.startPlan(authoredOwner, authoredRequest.id, plan)
   assert.equal(snapshot.mission.status, 'active')
+  assert.deepEqual(snapshot.tasks.filter(task => task.kind === 'verification').map(task => task.objective), ['Verify immutable artifact'], 'the authored review is the only one')
 })
