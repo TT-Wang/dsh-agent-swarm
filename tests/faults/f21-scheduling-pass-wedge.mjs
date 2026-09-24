@@ -94,6 +94,7 @@ async function namingCommitFailsOnce() {
   const workers = new WedgeStartWorkers()
   const dir = await realpath(await tempDirectory('swarm-faults-f21-busy-'))
   const statePath = join(dir, 'swarm.sqlite')
+  // fixture gap: setup/makeRuntime cannot pass SwarmRuntime's store options (busyTimeoutMs, writerAttempts, writerDelayMs) nor export the default RuntimeConfig.
   const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
     stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 1_500 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
   const tickFailures = []

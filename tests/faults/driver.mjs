@@ -32,7 +32,6 @@ assert(phase && stateDir && workspacesRoot, 'driver requires a phase, --state an
 const workspaces = makeWorkspaces(dirname(workspacesRoot), { workspacesRoot })
 
 class DriverWorkers extends WorkspaceWorkers {
-  async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
   async applyDelivery(mission, resultCommit, signal) {
     // The real delivery engine materializes the delta; the crash then lands
     // after the effect but before the runtime commits its receipt.
@@ -44,6 +43,7 @@ class DriverWorkers extends WorkspaceWorkers {
 }
 
 await mkdir(stateDir, { recursive: true })
+// fixture gap: the harness exports no default RuntimeConfig for a runtime that reopens a state file outside makeRuntime/setup (no node:test context here).
 const config = {
   statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000, tickMs: 20, maxMessageChars: 16_000,
   maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
