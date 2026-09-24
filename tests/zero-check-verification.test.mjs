@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { access, mkdir, rm, writeFile } from 'node:fs/promises'
 import { makeRepo, makeWorkspaces } from './faults/harness.mjs'
-import { loadWorkspaceGrants, WORKSPACE_AUTHORIZATION_CODE } from '../lib/authorization.js'
+import { loadWorkspaceGrants } from '../lib/authorization.js'
 
 async function fixture(t) {
   const repo = await makeRepo('zero-check-verification', { '.gitignore': 'node_modules/\n', 'research.md': 'baseline\n' })
@@ -82,25 +82,19 @@ test('zero-check verification still rejects malformed and nonexistent artifact c
   await f.assertNoExecution()
 })
 
-test('zero-check verification still rejects a revoked workspace grant', async t => {
-  const f = await fixture(t)
-  f.grants.grants.length = 0
-  await assert.rejects(f.verify(), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await f.assertNoExecution()
-})
-
-test('zero-check verification preserves caller cancellation before and during authorization', async t => {
+test('zero-check verification preserves caller cancellation before and during preparation', async t => {
   const f = await fixture(t)
   const before = new AbortController()
   const beforeReason = new Error('cancelled before verification')
   before.abort(beforeReason)
   await assert.rejects(f.verify(before.signal), error => error === beforeReason)
   const during = new AbortController()
-  const duringReason = new Error('cancelled during authorization')
-  const authorize = f.workspaces.assertWorkspaceAuthorized.bind(f.workspaces)
-  t.mock.method(f.workspaces, 'assertWorkspaceAuthorized', async (...args) => {
-    await authorize(...args)
+  const duringReason = new Error('cancelled during preparation')
+  const missionRecord = f.workspaces.missionRecord.bind(f.workspaces)
+  t.mock.method(f.workspaces, 'missionRecord', async (...args) => {
+    const record = await missionRecord(...args)
     during.abort(duringReason)
+    return record
   })
   await assert.rejects(f.verify(during.signal), error => error === duringReason)
   await f.assertNoExecution()

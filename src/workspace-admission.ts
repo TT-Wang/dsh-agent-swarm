@@ -8,9 +8,10 @@
  * so no call site changed; the pure helpers are imported by name.
  */
 import { tmpdir } from 'node:os'
+import { hasNotice } from './arena.ts'
 import { stopPending } from './attempts.ts'
-import { grantFor, isContained, reauthorizeWorkspace, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
-import { emitGuardTerminal } from './refusals.ts'
+import { grantFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
+import { emitGuardTerminal, guardTerminal, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -359,17 +360,6 @@ export function gitWriteSubcommand(command: string): string | undefined {
  */
 const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
 
-/**
- * A mission's recorded workspace is no longer inside a human-authorized root.
- * Distinct from an ordinary preparation failure because it is terminal for this
- * host process: the mission is fenced immediately instead of spending recovery
- * credit, and the owner is woken with the durable reason.
- */
-export class WorkspaceRevokedError extends Error {
-  readonly code = 'workspace_revoked'
-  constructor(readonly diagnostic: string) { super(diagnostic); this.name = 'WorkspaceRevokedError' }
-}
-
 export class WorkspaceAdmission {
   /** R11-15: bounded per-path mention history and reported-pair bookkeeping. */
   private readonly tempMentions = new Map<string, TempMention[]>()
@@ -434,8 +424,11 @@ export class WorkspaceAdmission {
   fenceWorkspace(missionId: string, reason: string): void {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission)) return
-    if (this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')) return
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
+    // Idempotent from mission state: nothing left to block, and the owner
+    // already holds the workspace terminal for this board, means it is fenced.
+    const notice = guardTerminalKey('workspace', guardTerminal('workspace').code, this.rt.fingerprint(missionId))
+    if (blocked.length === 0 && hasNotice(this.rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: notice, from: 'runtime' })) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
@@ -453,11 +446,8 @@ export class WorkspaceAdmission {
     // The marker is an obligation, not a record: without this poke the fenced
     // handle keeps running against a workspace the human withdrew.
     for (const task of blocked) if (stopPending(task)) this.rt.attempts.resumeStoppedAttempt(missionId, task)
-    // S4b: every caller of `fenceWorkspace` (the dispatch catch, the authorization
-    // re-checks in src/runtime.ts) now reaches the shared coded workspace
-    // terminal, not only the dispatch path. The emission is deduplicated per
-    // (chain, code, board fingerprint), so a caller that emits after this one is
-    // absorbed.
+    // S4b: the fence reaches the shared coded workspace terminal, deduplicated
+    // per (chain, code, board fingerprint): the owner is woken once per board.
     emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason })
   }
 

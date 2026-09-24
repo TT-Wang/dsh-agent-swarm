@@ -80,13 +80,7 @@ export interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
-  /**
-   * The human-authorized roots loaded once at plugin start. When supplied, the
-   * owned `Workspaces` re-validates every workspace preparation and verification
-   * checkout against them, so a revoked root fences the mission instead of
-   * silently continuing. Absent in unit fixtures that drive `Workspaces`
-   * directly, where the recorded admission result stands.
-   */
+  /** The human-authorized roots loaded once at plugin start, for the owned `Workspaces` (see its `grants`). */
   grants?: WorkspaceGrantSnapshot
   /** Ignored dependency directories linked from the source into verification checkouts. */
   verificationDependencyDirs?: string[]

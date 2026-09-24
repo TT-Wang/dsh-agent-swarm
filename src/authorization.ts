@@ -42,6 +42,17 @@ export interface WorkspaceRefused {
 export type WorkspaceAuthorization = WorkspaceAuthorized | WorkspaceRefused
 
 /**
+ * A recorded workspace is no longer inside a human-authorized root. Distinct
+ * from an ordinary preparation failure because it is terminal for this host
+ * process: the runtime fences the mission instead of spending recovery or start
+ * credit, and the owner is woken with the durable reason.
+ */
+export class WorkspaceRevokedError extends Error {
+  readonly code = 'workspace_revoked'
+  constructor(readonly diagnostic: string) { super(diagnostic); this.name = 'WorkspaceRevokedError' }
+}
+
+/**
  * The refusal diagnostic is a stable, machine-checkable field-level message:
  * it names the authorization requirement and how a human grants it, and it is
  * never a bare cwd-equality error. The leading sentence is retained verbatim
