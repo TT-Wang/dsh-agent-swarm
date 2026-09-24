@@ -1050,16 +1050,16 @@ export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
   /** Freeze once before planning; optional only for adapters without Git execution. */
   prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
-  inspectDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
-  applyDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
+  inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
+  applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
   start(spec: WorkerSpec, signal?: AbortSignal): Promise<void>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */
-  currentActivity?(memberId: string): WorkerActivity | undefined
+  currentActivity(memberId: string): WorkerActivity | undefined
   /** A unit of work closed for this member; the adapter may compact its history when idle and over its pressure threshold. */
-  compactAtBoundary?(memberId: string): void
+  compactAtBoundary(memberId: string): void
   /**
    * The durable worker identity changed (a staged-plan repair rotated the
    * member's sessionId), so the adapter's persisted composition for that member
@@ -1067,7 +1067,7 @@ export interface WorkerAdapter {
    * start composes a fresh session for the new identity instead of refusing a
    * composition that belongs to the replaced one.
    */
-  invalidateComposition?(missionId: string, memberId: string): Promise<void>
+  invalidateComposition(missionId: string, memberId: string): Promise<void>
   /**
    * Parse every declared check without executing it, so a plan whose check is a
    * shell syntax error is refused before any worker, worktree or model step
@@ -1075,7 +1075,7 @@ export interface WorkerAdapter {
    * command, in plan order, whose `index` is that command's position in
    * `checks`; a command that parses has no entry, so callers pair by `index`.
    */
-  checkSyntaxPreflight?(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
+  checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
   isIdle(memberId: string): boolean
   /**
    * Capture the member worktree plus `deliverables` and the task's declared
@@ -1084,9 +1084,9 @@ export interface WorkerAdapter {
    */
   captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact>
   /** Preserve any owned WIP after stop without treating it as an accepted artifact. */
-  checkpointTask?(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
+  checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
   /** Read authoritative immutable Git facts, including fields absent from older stored records. */
-  inspectArtifact?(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact>
+  inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
   verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */

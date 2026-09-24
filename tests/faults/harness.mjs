@@ -5,8 +5,8 @@
  * because the scenario modules and two dozen test files already import this
  * path; a re-export module would only add a second spelling of every symbol.
  *
- *  - `FakeWorkers`: the recording `WorkerAdapter` (behaviour-neutral no-ops for
- *    the optional methods, never `prepareBaseline`/`checkEnvelope`).
+ *  - `FakeWorkers`: the recording `WorkerAdapter` (behaviour-neutral answers
+ *    for every required method, never `prepareBaseline`/`checkEnvelope`).
  *  - `makeRuntime(t, ...)`: a runtime on a temp dir with the shared config and
  *    budget, cleaned up by `t.after`; it creates no mission, member or event.
  *  - `setup(...)`: the same runtime config, started, with a mission and two
@@ -120,26 +120,27 @@ export function runNode(args, options = {}) {
  * prepareWorkspace(mission, id) { return join(mission.workspace, id) } })`. A
  * subclass's own field initializers run after this constructor and win.
  *
- * The optional adapter methods do what the runtime does when a method is
- * absent: `inspectArtifact` keeps the stored artifact, `checkpointTask`,
- * `compactAtBoundary` and `invalidateComposition` do nothing,
- * `checkSyntaxPreflight` finds no issue and the delivery pair refuses with the
- * runtime's own `delivery_unsupported` error. They answer synchronously, so an
- * `await workers.method?.()` call site takes the same microtask it takes for an
- * absent method. (`checkpointTask`'s presence also makes a stop whose recorded
- * owner has no member row fail instead of re-pending; the store never deletes a
- * member.)
+ * Every required adapter method has a behaviour-neutral answer, the one the
+ * runtime gave before these methods were required: `inspectArtifact` keeps the
+ * stored artifact, `checkpointTask`, `compactAtBoundary` and
+ * `invalidateComposition` do nothing, `checkSyntaxPreflight` finds no issue and
+ * the delivery pair refuses with `delivery_unsupported`. They answer
+ * synchronously, so each awaited call takes a single microtask. (A stop whose
+ * recorded owner has no member row is refused as unconfirmable, as it is for the
+ * Harness adapter; the store never deletes a member.)
  *
  * Three methods are deliberately different:
- *  - `prepareBaseline` and `checkEnvelope` are NOT implemented. Their presence
- *    adds `workspace/snapshot` and `task/check-envelope` events that the
- *    seq/count assertions and the replay digest do not expect; a test that
- *    needs them passes them as overrides (or uses `WorkspaceWorkers`).
- *  - `currentActivity` IS implemented and reads `activity`, so an operation is
- *    live only while the adapter reports it. `reportActivity(id, activity)`
- *    moves the adapter's view and the durable member activity together. A test
- *    whose stub had no `currentActivity` and that records activity, where the
- *    durable row alone counted as live, keeps its own stub.
+ *  - `prepareBaseline` and `checkEnvelope` (still optional in `WorkerAdapter`)
+ *    are NOT implemented. Their presence adds `workspace/snapshot` and
+ *    `task/check-envelope` events that the seq/count assertions and the replay
+ *    digest do not expect; a test that needs them passes them as overrides (or
+ *    uses `WorkspaceWorkers`).
+ *  - `currentActivity` reads `activity`, so an operation is live only while the
+ *    adapter reports it: the durable member activity alone is never live.
+ *    `reportActivity(id, activity)` moves the adapter's view and the durable
+ *    member activity together; a test that writes the member row directly sets
+ *    `activity` to the same operation. `activity` is one value for every member;
+ *    a test with several live members keeps a per-member subclass.
  */
 export class FakeWorkers {
   callbacks

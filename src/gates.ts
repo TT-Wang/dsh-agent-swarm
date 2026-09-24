@@ -340,7 +340,7 @@ export class RuntimeGates {
     if (!thresholds.length) return
     const members = this.rt.store.list('members', mission.id)
     const inFlight = members.filter(member => memberPhaseOf(member) !== 'stopped'
-      && (this.rt.workers.currentActivity?.(member.id) ?? member.activity)?.kind === 'model')
+      && (this.rt.workers.currentActivity(member.id) ?? member.activity)?.kind === 'model')
     const tasks = this.rt.store.list('tasks', mission.id)
     const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
     const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !['accepted', 'cancelled'].includes(task.status) && !pairedSources.has(task.id)).length
