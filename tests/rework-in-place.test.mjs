@@ -281,6 +281,26 @@ test('the rework bound refuses with its exit, and raising maxRework through swar
   assert.equal(raised.rejections.length, 3)
 })
 
+test('a budget-only amendment of a rejected task stores the ceiling and leaves it blocked; only a resume reworks it', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement', { maxRecoveryAttempts: 2 })
+  await f.submit(source)
+  const review = await f.reject(source)
+  const rejected = f.current(source)
+  // The call swarm_budget(taskId, taskBudget) makes.
+  const amended = f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { maxRecoveryAttempts: 4 }, 'Give the task more recovery headroom')
+  assert.equal(amended.status, 'blocked', 'the rejected task is not re-opened')
+  assert.equal(amended.maxRecoveryAttempts, 4, 'the ceiling is stored')
+  assert.deepEqual(amended.artifact, rejected.artifact, 'its artifact stays')
+  assert.equal(amended.epoch, rejected.epoch)
+  assert.equal(amended.reworkCount, undefined, 'no rework was spent')
+  assert.equal(f.current(review).status, 'blocked', 'its rejecting review keeps its verdict')
+  assert.equal(f.events('task/amended').at(-1).data.rework, undefined)
+  const reopened = f.resume(source)
+  assert.equal(reopened.status, 'pending', 'the explicit resume reworks it')
+  assert.equal(reopened.reworkCount, 1)
+})
+
 test('the rejection decision names the rework first and a replacement second, to the owner and to the author', async t => {
   const f = await fixture(t)
   const deliveries = () => f.runtime.store.list('deliveries', f.mission.id)

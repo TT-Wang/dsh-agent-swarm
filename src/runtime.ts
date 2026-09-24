@@ -3670,8 +3670,12 @@ export class SwarmRuntime {
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }
-    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next, this.now()) === undefined)
-      || (rejection !== undefined && changes.maxRework !== undefined && (task.reworkCount ?? 0) < changes.maxRework)
+    // A raised allocation implies the resume of other blocked work. A rejected
+    // task is re-opened only by an explicit resume or a `maxRework` raise past
+    // the reworks spent; a budget-only amendment of it (`swarm_budget`) stores
+    // the ceiling and leaves it blocked.
+    const implied = (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next, this.now()) === undefined)
+    const resumes = action === 'resume' || (rejection === undefined ? implied : changes.maxRework !== undefined && (task.reworkCount ?? 0) < changes.maxRework)
     const rework = resumes ? rejection : undefined
     const maxRework = next.maxRework ?? DEFAULT_MAX_REWORK
     if (rework !== undefined && (task.reworkCount ?? 0) >= maxRework) throw new PolicyError('task_rework_exhausted', 'budget_error', `[task_rework_exhausted] Task ${task.id} was already reworked ${task.reworkCount}/${maxRework} time(s) after independent rejection, so it stays blocked. Raise \`maxRework\` in \`changes\` with \`swarm_control\` to resume it again, or withdraw it with \`swarm_cancel\` and its \`taskId\` and propose a replacement with \`swarm_propose\` naming \`replaces\`: ["${task.id}"].`)
