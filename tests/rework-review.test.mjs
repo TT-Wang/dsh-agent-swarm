@@ -206,3 +206,51 @@ test('a real unchanged resubmission is re-reviewed by the automatic review that 
   await verdict(reviews()[0], 'accept', 'On a second look the draft meets the criterion')
   assert.equal(f.runtime.store.get('tasks', source.id).status, 'accepted')
 })
+
+test('a reworked task stays pinned to its author through a failed start, so the only other member can still review it', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  await f.submit(author, source)
+  const review = f.proposeReview(source)
+  await f.verify(reviewer, review, 'reject')
+  const reopened = f.resume(source)
+  assert.equal(reopened.assignmentMode, 'pinned')
+  assert.equal(reopened.assigneeId, author.id)
+  // The owner can still move the rework, but never to the member its paired review is assigned to.
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: reviewer.id }, 'Let the reviewer rework it'), error => {
+    assert.equal(error.code, 'review_independence_required')
+    assert.ok(error.message.startsWith('[review_independence_required] '), error.message)
+    assert.ok(error.message.includes(`review ${review.id}`), error.message)
+    return true
+  })
+  // The author's provider is rate-limited before it starts the rework, then it
+  // fails outright: a reroute would hand the rework to the reviewer.
+  const outage = f.workers.start
+  let failure = Object.assign(new Error('429 Too Many Requests: rate limit'), { status: 429 })
+  f.workers.start = async spec => { f.workers.started.push(spec.member.id); if (spec.member.id === author.id && failure) throw failure }
+  for (let i = 0; i < 4; i++) { f.clock.advance(50); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  failure = new Error('worker could not start')
+  for (let i = 0; i < 4; i++) { f.clock.advance(50); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  assert.ok(f.events('task/start-failed').some(event => event.data.taskId === source.id), 'the author route failed to start the rework')
+  assert.equal(f.current(source).assigneeId, author.id, 'the rework stays with its author')
+  assert.deepEqual(f.events('task/reassigned').filter(event => event.data.taskId === source.id), [])
+  f.workers.start = outage
+})
+
+test('a missing review path names every author of a reworked artifact', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  await f.submit(author, source)
+  const review = f.proposeReview(source)
+  await f.verify(reviewer, review, 'reject')
+  f.resume(source)
+  // The owner withdraws the paired review and moves the rework to the reviewer.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'Hand the rework over' })
+  f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: reviewer.id }, 'The author is unavailable')
+  await f.submit(reviewer, source)
+  const blocker = f.runtime.reviewPathBlocker(f.runtime.mission(f.mission.id), f.current(source), f.runtime.store.list('members', f.mission.id))
+  assert.match(blocker, /^no live member other than the author \(/)
+  assert.ok(blocker.includes(author.id) && blocker.includes(reviewer.id), `both authors are named: ${blocker}`)
+})

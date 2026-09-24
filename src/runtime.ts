@@ -21,7 +21,7 @@ import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from '.
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { canBorrowTask, canOwnReview } from './assignment.ts'
+import { authorIdsOf, canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
@@ -2363,9 +2363,10 @@ export class SwarmRuntime {
    * rejection moves into `rejections` with the claims it refuted, which stay
    * refuted; the artifact is released, so scope, checks and assignee can be
    * amended again; the rejected attempt's owner joins `priorOwnerIds` and stays
-   * the assignee. The author therefore resumes from the rejected commit (the
-   * same-task workspace recovery), and no member who could review the rejected
-   * attempt loses the right to review the reworked one.
+   * the assignee, pinned: a reroute or a borrow never moves the rework (only an
+   * owner amendment does), so no member who could review the rejected attempt
+   * becomes an author of the reworked one. The author resumes from the rejected
+   * commit (the same-task workspace recovery).
    */
   private reopenForRework(task: Task, review: Task): void {
     const archived = new Set(task.rejections?.flatMap(rejection => rejection.evidenceIds))
@@ -2373,7 +2374,8 @@ export class SwarmRuntime {
     const reason = review.output ?? ''
     task.rejections = [...task.rejections ?? [], { commit, epoch: task.epoch, reviewTaskId: review.id, reason, evidenceIds: task.evidenceIds.filter(evidenceId => !archived.has(evidenceId)) }]
     task.reworkCount = (task.reworkCount ?? 0) + 1
-    task.assigneeId = task.attempt?.ownerId ?? task.assigneeId
+    const author = task.attempt?.ownerId ?? task.assigneeId
+    if (author !== undefined) { task.assigneeId = author; task.plannedAssigneeId = author; task.assignmentMode = 'pinned' }
     delete task.artifact
     this.dropAttempt(task); task.epoch++
     task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}: ${reason}\nRework it from that commit, then resubmit.`.trim()
@@ -2535,8 +2537,8 @@ export class SwarmRuntime {
     if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
-    const author = source.attempt?.ownerId ?? source.assigneeId
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
+    const authors = [...authorIdsOf(source)]
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable. */
@@ -3660,6 +3662,11 @@ export class SwarmRuntime {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
         if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        // The new executor becomes an author: a live review of this task assigned
+        // to that member could then never be owned.
+        const paired = this.store.list('tasks', missionId).find(review => review.reviewOf === task.id && !TERMINAL_STATES.has(review.status)
+          && review.assigneeId !== undefined && !canOwnReview({ assigneeId: member.id }, review.assigneeId))
+        if (paired !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${member.id} is the assignee of review ${paired.id} of task ${task.id}, and an author can never review its own work. Choose another member as \`assigneeId\` in \`changes\` with \`swarm_control\`, or move that review to another member first.`)
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }
