@@ -139,40 +139,42 @@ test('S1: every body that wedges is named once, also when an earlier named body 
   } finally { await f.cleanup() }
 })
 
-test('S1: under a recorded provider outage, the renaming of bodies that wedge on an unchanged board stops at the first naming the notice dedup suppressed', async () => {
+test('S1: the renaming of bodies that wedge on an unchanged board stops at the first naming the notice dedup suppressed', async () => {
   // Before, a named body that settled always cleared the wedge key. A start
-  // under a recorded outage is never counted, so start-failure retirement never
+  // under a recorded outage was never counted, so start-failure retirement never
   // capped the renaming: every body that wedged in H's hung start was named
   // again, about three per second, and each mission/stalled event claimed
   // ownerNotified: true although the notice dedup had suppressed the row. The
   // key is now cleared only when the naming reached the owner, and the event
-  // states what notify did.
+  // states what notify did. A start under a recorded outage is now also paced to
+  // one probe per outage window (tests/start-failure-recovery.test.mjs), so the
+  // recurring wedge here is a start that outlives the pass bound and then
+  // succeeds: never a failure, so never counted and never retired.
   class HangEveryStartWorkers extends FakeWorkers {
     names = new Map()
     hangH = false
     hangs = 0
-    async start(spec, signal) {
+    async start(spec) {
       this.started.push(spec.member.id)
       if (this.names.get(spec.member.id) !== 'H' || !this.hangH) return
       this.hangs += 1
-      await new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }))
+      await new Promise(resolve => setTimeout(resolve, 250))
     }
   }
   const workers = new HangEveryStartWorkers()
   workers.autoIdle = true
-  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: 300 } })
+  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPasses: 1_000, workerStartTimeoutMs: 2_000 } })
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     workers.names.set(h.id, 'H')
     const task = f.propose({ title: 'Work for H', assigneeId: h.id })
     await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? true : undefined, 'the task dispatches to H', 4_000)
     const armedAt = Date.now()
-    f.runtime.onProviderOutage(h.id, { class: 'unavailable', message: 'provider unavailable' })
     workers.hangH = true
-    await eventually(() => workers.hangs >= 7 ? true : undefined, 'H\'s starts keep hanging under the outage', 6_000)
+    await eventually(() => workers.hangs >= 7 ? true : undefined, 'H\'s starts keep outliving the pass bound', 6_000)
     const namings = wedgeEvents(f).filter(item => item.createdAt >= armedAt)
-    assert.ok(workers.hangs >= namings.length + 3, `bodies kept wedging (${workers.hangs} hung starts) after the last naming`)
-    assert.equal(f.runtime.store.get('members', h.id).phase, 'active', 'the outage keeps H live: start-failure retirement never caps the renaming')
+    assert.ok(workers.hangs >= namings.length + 3, `bodies kept wedging (${workers.hangs} slow starts) after the last naming`)
+    assert.equal(f.runtime.store.get('members', h.id).phase, 'active', 'a slow start never fails, so start-failure retirement never caps the renaming')
     assert.ok(namings.length >= 2, `the bodies are named until the notice dedup suppresses one (${namings.length})`)
     assert.deepEqual(namings.map(item => item.data.ownerNotified), [...namings.slice(0, -1).map(() => true), false],
       'every naming reached the owner except the last, a repeat the notice dedup suppressed; nothing is named after it')

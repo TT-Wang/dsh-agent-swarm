@@ -20,7 +20,8 @@ class GitWorkers {
   bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
   async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
+  // Asynchronous like the adapter's inbox write, so ordering is observable.
+  async deliver(member, delivery) { await new Promise(resolve => setImmediate(resolve)); this.deliveries.push({ memberId: member.id, delivery }) }
   async stop(memberId) { this.stopped.push(memberId) }
   isIdle() { return false }
   async prepareTask(member, task) { this.prepared.push(structuredClone({ member: member.id, task })) }
@@ -68,9 +69,12 @@ test('a denied worker git write returns a typed error naming swarm_submit and le
   const guard = f.workers.callbacks.guard(f.author.id, 'bash')
   assert.equal(guard, undefined, 'workspace tools remain available after the sandbox refused a Git write')
   assert.equal(f.workers.callbacks.guard(f.author.id, 'swarm_submit'), undefined, 'submission stays available')
-  const notice = await eventually(() => f.workers.deliveries.find(item => item.memberId === f.author.id
-    && /swarm_submit/.test(item.delivery.content)), 'the worker receives the actionable notice')
-  assert.match(notice.delivery.content, /cannot write git metadata/)
+  // The adapter awaits toolRun before the model sees the failed result, so the
+  // notice must already be in the worker's inbox: its next model step sees it.
+  // (The assignment's instructions also name swarm_submit; match the typed control row.)
+  const notice = f.workers.deliveries.find(item => item.memberId === f.author.id && item.delivery.kind === 'control' && /swarm_submit/.test(item.delivery.content))
+  assert.ok(notice, 'the worker receives the actionable notice before the failed run returns')
+  assert.match(notice.delivery.content, /git commit -m "integrate branches" could not write git metadata/)
   const submitted = await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'workspace captured host-side' })
   assert.equal(submitted.status, 'submitted', 'artifact publication never depends on a worker-side commit')
   assert.equal(submitted.artifact.commit, f.workers.artifact.commit)

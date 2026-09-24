@@ -38,7 +38,9 @@ class OutageWorkers {
 
 async function fixture(t, workers = new OutageWorkers()) {
   const directory = await mkdtemp(join(tmpdir(), 'swarm-outage-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  // The runtime clock can be moved past a provider outage window (5 min).
+  const clock = { skew: 0 }
+  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3, now: () => Date.now() + clock.skew }, workers)
   await runtime.start()
   t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'outage-owner' }
@@ -48,7 +50,7 @@ async function fixture(t, workers = new OutageWorkers()) {
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: first.id, maxRecoveryAttempts: 1, ...extra })
-  return { directory, runtime, workers, owner, mission, first, second, propose }
+  return { directory, runtime, workers, owner, mission, first, second, propose, clock }
 }
 
 const eventually = async (read, message, timeoutMs = 4000) => {
@@ -110,8 +112,10 @@ test('R11-01: a start failure classified as an outage re-routes without spending
   assert.equal(startFailed[0].data.quiescent, true, 'the start-failure row is marked as an outage, not a member fault')
   assert.ok(events.some(event => event.type === 'task/reassigned' && event.data.to === f.second.id))
   assert.notEqual(f.runtime.store.get('members', f.first.id).status, 'stopped', 'a quiescent route stays live for a later retry')
-  // Recovery clears the marker durably once the route answers again.
+  // Recovery clears the marker durably once the route answers again. A route
+  // inside its outage window is probed once per window, so move past it.
   workers.failFor = undefined
+  f.clock.skew += 5 * 60_000 + 1
   const recovered = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'provider/recovered'), 'the recovered route was not recorded')
   assert.equal(recovered.data.memberId, f.first.id)
   assert.equal(f.runtime.store.get('members', f.first.id).providerOutage, undefined)
