@@ -115,6 +115,8 @@ const START_FAILURE_REROUTE_LIMIT = 3
  * consume an unbounded share of the mission budget.
  */
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
+/** Only `automaticReviewId` mints a task id with this prefix. */
+const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
 /**
  * Owner re-opens of one rejected task (`maxRework` when the task sets none).
  * Past it the task stays blocked until the owner raises `maxRework` or
@@ -312,8 +314,8 @@ export class SwarmRuntime {
    *  derivable (the gate re-reads the store; the memory value is only a cache):
    *   - the unreviewed-submission grace: age of the durable `task/submitted`
    *     event (`unreviewedStall`; the old `unreviewedSince` timer is removed);
-   *   - a withdrawn automatic review: durable `task/review-admitted` events
-   *     and deterministic task identity (`withdrawnAutomaticReview`);
+   *   - a withdrawn automatic review: the durable `task/cancelled` event of a
+   *     host-minted review identity (`withdrawnAutomaticReview`);
    *   - a recorded missing review: durable `task/review-missing` event per
    *     submission (`missingReviewRecorded`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
@@ -2531,24 +2533,28 @@ export class SwarmRuntime {
     const data = event.data as { submissionSeq?: number }
     return data.submissionSeq === undefined ? event.seq > submissionSeq : data.submissionSeq === submissionSeq
   }
-  /** The automatic review admitted for this submission, once the owner has withdrawn it. */
+  /**
+   * The automatic review the owner withdrew from this submission: one the
+   * owner cancelled after the submission while it was the submission's review,
+   * whether the host admitted it for this submission or a rework re-opened it
+   * for it. Control facts never use the presentation event window: the
+   * cancellation is its own durable `task/cancelled` row, written in the
+   * cancel's transaction, and an automatic review is known by its host-minted
+   * identity, which survives a failed post-admission event write and a
+   * restart. A review retired by a verdict's sibling retirement or by a rework
+   * was never cancelled by the owner, and one cancelled before this submission
+   * was not withdrawn from it.
+   */
   private withdrawnAutomaticReview(missionId: string, sourceId: string): string | undefined {
-    // Control facts never use the presentation event window. The deterministic
-    // row also survives a failed post-admission event write and process restart.
-    // Both name only a review admitted for this submission: a review of an
-    // earlier one (retired by its verdict's sibling retirement or by a rework)
-    // was not withdrawn from this artifact.
-    const source = this.task(missionId, sourceId)
     const submitted = this.latestSubmission(missionId, sourceId)?.seq ?? 0
-    const event = this.store.latestTaskEvent(missionId, sourceId, 'task/review-admitted', 'reviewOf')
-    const admitted = event !== undefined && event.seq > submitted ? (event.data as { taskId?: string } | undefined)?.taskId : undefined
-    const admittedId = this.store.get('tasks', this.automaticReviewId(source))?.id ?? admitted
-    if (admittedId === undefined || this.store.get('tasks', admittedId)?.status !== 'cancelled') return undefined
-    return `the automatically admitted review ${admittedId} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
+    const withdrawn = this.store.list('tasks', missionId).find(review => review.reviewOf === sourceId && review.status === 'cancelled'
+      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(missionId, review.id, 'task/cancelled')?.seq ?? 0) > submitted)
+    if (withdrawn === undefined) return undefined
+    return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
   }
   /** Keyed on the submission: the epoch fences every resubmission, including one of an unchanged commit. */
   private automaticReviewId(source: Task): string {
-    return `task_auto_review_${createHash('sha256').update(`${source.missionId}:${source.id}:${source.epoch}:${source.artifact?.commit ?? ''}`).digest('hex').slice(0, 32)}`
+    return `${AUTOMATIC_REVIEW_PREFIX}${createHash('sha256').update(`${source.missionId}:${source.id}:${source.epoch}:${source.artifact?.commit ?? ''}`).digest('hex').slice(0, 32)}`
   }
   /** The concrete reason the runtime cannot admit an independent review right now. */
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {

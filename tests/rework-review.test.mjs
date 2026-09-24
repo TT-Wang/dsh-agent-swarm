@@ -192,6 +192,37 @@ test('a re-opened automatic review regains its recovery credit, so one lease exp
   assert.equal(f.current(source).status, 'accepted')
 })
 
+test('the owner\'s withdrawal of the automatic review of a resubmission is honoured as for a first submission', async t => {
+  for (const which of ['first submission', 'reworked resubmission']) {
+    await t.test(which, async t => {
+      const f = await fixture(t, { members: ['Author', 'Reviewer', 'Third'] })
+      const [author, reviewer] = f.m
+      const source = f.propose('Implement')
+      await f.submit(author, source)
+      await f.pastReviewGrace()
+      const [review] = f.live(source)
+      assert.match(review.id, /^task_auto_review_/)
+      if (which === 'reworked resubmission') {
+        await f.verify(reviewer, review, 'reject')
+        f.resume(source)
+        await f.submit(author, source)
+        await f.pastReviewGrace()
+        assert.deepEqual(f.live(source).map(task => task.id), [review.id], 'the re-opened automatic review is the review of the resubmission')
+      }
+      f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'I will not have this reviewed now' })
+      await f.pastReviewGrace(4)
+      assert.deepEqual(f.live(source), [], 'no review is admitted over the owner\'s withdrawal')
+      assert.deepEqual(f.reviewsOf(source).map(task => [task.id, task.status]), [[review.id, 'cancelled']], 'no task slot is spent')
+      assert.equal(f.events('task/review-admitted').length, 1)
+      assert.deepEqual(f.events('task/review-blocked').map(event => event.data.reason),
+        [`the automatically admitted review ${review.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${source.id}) or cancel the source task`])
+      const notices = f.ownerNotices(/was withdrawn/)
+      assert.equal(notices.length, 1, 'the owner is told once')
+      assert.match(notices[0].content, /review_path_missing/)
+    })
+  }
+})
+
 test('an automatic review of the rejected submission is never read as withdrawn from an unchanged resubmission', async t => {
   const f = await fixture(t, { members: ['Author', 'Reviewer', 'Third'] })
   const [author, reviewer] = f.m
