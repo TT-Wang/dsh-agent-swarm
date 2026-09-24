@@ -56,6 +56,11 @@ async function fixture(t) {
   return { temp, session, granted, foreign, project, outside }
 }
 const runtimeConfig = { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined }
+/** A runtime wired as src/index.ts wires the plugin: the loaded snapshot is the one representation it reads. */
+const wired = grants => ({ ...runtimeConfig, grants })
+const revokedEvents = (runtime, missionId) => runtime.store.events(missionId, 500).filter(event => event.type === 'mission/workspace-revoked')
+/** The typed revocation every path throws: the error the runtime fences on, never a bare preparation failure. */
+const revokedError = error => error.code === 'workspace_revoked' && error.name === 'WorkspaceRevokedError' && new RegExp(WORKSPACE_AUTHORIZATION_CODE).test(error.message)
 
 /** Criterion 1: an unauthorized foreign path is refused with the grant diagnostic. */
 test('AC1: a path outside the session cwd and every configured root is refused with the grant-requirement diagnostic', async t => {
@@ -84,7 +89,7 @@ test('AC1: a path outside the session cwd and every configured root is refused w
 test('AC2: a granted repository is accepted and the mission records the matched root plus the resolved path', async t => {
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
-  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
   await runtime.start(grants)
   const loaded = runtime.store.events('swarm/install', 50).filter(event => event.type === 'workspace/grant-loaded')
   assert.equal(loaded.length, 1, 'one grant-loaded audit event per configured root')
@@ -105,7 +110,7 @@ test('AC2: a granted repository is accepted and the mission records the matched 
 test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen an authorization root', async t => {
   const { session, granted, project, outside } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
   const tools = definitions(runtime, grants)
   // No workspace-bound tool exposes a grant field in its model-visible schema.
   for (const name of ['swarm_create', 'swarm_stage', 'swarm_propose']) {
@@ -166,8 +171,8 @@ test('AC4: prefix confusion, traversal and symlink escapes are refused; a symlin
   assert.equal(accepted.ok, true)
   assert.equal(accepted.grantRoot, await realpath(granted))
   // Re-validation after the root is removed from configuration refuses.
-  assert.equal((await reauthorizeWorkspace(project, await realpath(granted), await loadWorkspaceGrants([]))).ok, false, 'a removed root no longer authorizes its workspace')
-  assert.equal((await reauthorizeWorkspace(foreign, await realpath(granted), grants)).ok, false, 'a workspace outside its recorded root is refused')
+  assert.equal((await reauthorizeWorkspace({ workspace: project, workspaceGrantRoot: await realpath(granted) }, await loadWorkspaceGrants([]))).ok, false, 'a removed root no longer authorizes its workspace')
+  assert.equal((await reauthorizeWorkspace({ workspace: foreign, workspaceGrantRoot: await realpath(granted) }, grants)).ok, false, 'a workspace outside its recorded root is refused')
   // The adapter re-validates at workspace preparation and verification checkout.
   const source = join(granted, 'repo')
   await mkdir(source)
@@ -196,7 +201,7 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
   const grants = await loadWorkspaceGrants([{ path: granted }])
   const workspaces = makeWorkspaces(temp, { workspacesRoot: join(temp, 'snapshots'), maxCheckOutputBytes: 100000, grants })
   const adapter = new FakeWorkers({ prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() })
-  const { runtime } = await makeRuntime(t, { workers: adapter, config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
+  const { runtime } = await makeRuntime(t, { workers: adapter, config: wired(grants) })
 
   // The native command path records a session authorization for the session cwd.
   const owner = { sessionId: 'owner-t3e', agent: { id: 'owner-t3e', session: { header: { cwd: session } } } }
@@ -223,7 +228,7 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
 test('AC5: a worker session cannot create a mission or use a grant, and another session cannot re-point a mission', async t => {
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
   const owner = { sessionId: 'owner-a' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = runtime.create(owner, { title: 'Owned', objective: 'Own the workspace', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -253,7 +258,7 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
 test('AC6: a removed root refuses new missions and fences a running mission with a blocked reason and an owner notice', async t => {
   const { session, granted, project } = await fixture(t)
   const before = await loadWorkspaceGrants([{ path: granted }])
-  const { config, runtime, workers } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, before), grants: before } })
+  const { config, runtime, workers } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(before) })
   const owner = { sessionId: 'owner' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = runtime.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -265,7 +270,7 @@ test('AC6: a removed root refuses new missions and fences a running mission with
   await runtime.dispose()
   // Human removes the root and restarts: the same durable state, no grant.
   const after = await loadWorkspaceGrants([])
-  const restarted = new SwarmRuntime({ ...config, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after), grants: after }, workspaceWorkers())
+  const restarted = new SwarmRuntime({ ...config, grants: after }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   assert.throws(() => restarted.create(owner, { title: 'New', objective: 'New mission in a revoked root', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   await restarted.start(after)
@@ -296,40 +301,35 @@ test('AC7: README.md and docs/known-limitations.md document the authorization mo
   assert.match(readme, /human/i)
 })
 
-/** D1 (review task_fb92df98): the runtime must decide fencing from the configured predicate. */
+/** D1 (review task_fb92df98): the runtime must decide fencing from the loaded roots. */
 test('D1: a runtime wired like the plugin keeps a configured-root mission staffable and unfenced', async t => {
   const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
-  // Two production wirings of the same loaded snapshot. `closure only` is the
-  // shape src/index.ts had when the review found the defect; `closure + grants`
-  // is the repaired shape. Fencing must depend on the configured predicate, so
-  // both must keep a configured-root mission alive while the root is configured.
-  for (const [label, extra] of [['closure only', {}], ['closure + grants', { grants }]]) {
-    const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), ...extra } })
-    const owner = { sessionId: `owner-${label}` }
-    const mission = runtime.create(owner, { title: 'Wired', objective: 'Stay staffable', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
-    const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-    assert.ok(member.id, `${label}: the mission inside a configured root is staffable`)
-    assert.equal(runtime.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, `${label}: no false revocation while the root stays configured`)
-    await runtime.dispose()
-  }
+  const { runtime: live } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
+  const liveOwner = { sessionId: 'owner-wired' }
+  const liveMission = live.create(liveOwner, { title: 'Wired', objective: 'Stay staffable', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const member = await live.addMember(liveOwner, liveMission.id, { name: 'Builder', role: 'implementation' })
+  assert.ok(member.id, 'the mission inside a configured root is staffable')
+  assert.equal(live.store.events(liveMission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'no false revocation while the root stays configured')
+  await live.dispose()
   // Nested configured roots resolve to the most specific root at admission and
   // at fencing, so a mission strictly inside both is not falsely revoked.
   const nestedRepo = join(project, 'nested')
   await mkdir(nestedRepo)
   const nested = await loadWorkspaceGrants([{ path: granted }, { path: project }])
-  const { runtime: nestedRuntime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: nested, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, nested) } })
+  const { runtime: nestedRuntime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(nested) })
   const nestedOwner = { sessionId: 'owner-nested' }
   const nestedMission = nestedRuntime.create(nestedOwner, { title: 'Nested', objective: 'Most specific root', workspace: await realpath(nestedRepo), workspaceGrantRoot: await realpath(granted), scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   assert.equal(nestedMission.workspaceGrantRoot, await realpath(project), 'the most specific configured root is recorded')
   await nestedRuntime.addMember(nestedOwner, nestedMission.id, { name: 'Builder', role: 'implementation' })
   await nestedRuntime.dispose()
   // Revocation under the same wiring still fences.
-  const revoked = await loadWorkspaceGrants([])
-  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, revoked) } })
+  const revocable = await loadWorkspaceGrants([{ path: granted }])
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(revocable) })
   const owner = { sessionId: 'owner-revoked' }
   const mission = runtime.create(owner, { title: 'Revoked', objective: 'Fence', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  revocable.grants.length = 0
   await assert.rejects(runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
 })
 
@@ -371,7 +371,7 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   const { session, granted } = await fixture(t)
   const grantedPath = await realpath(granted), sessionPath = await realpath(session)
   const live = await loadWorkspaceGrants([{ path: granted }])
-  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) } })
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(live) })
   const owner = { sessionId: 'owner-exact' }
   // The workspace IS the configured root: admission authorizes it as a grant,
   // and the mission must record that source so revocation can be detected.
@@ -390,7 +390,7 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   // a durable reason, exactly one revocation event and an owner notice, while
   // the session-cwd mission keeps working.
   const after = await loadWorkspaceGrants([])
-  const restarted = new SwarmRuntime({ ...config, grants: after, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after) }, workspaceWorkers())
+  const restarted = new SwarmRuntime({ ...config, grants: after }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   await assert.rejects(restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
@@ -421,20 +421,20 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
   const removed = await loadWorkspaceGrants([])
 
   // Direct module, workspace === root, source omitted.
-  const liveControl = await reauthorizeWorkspace(grantedPath, grantedPath, live, undefined)
+  const liveControl = await reauthorizeWorkspace({ workspace: grantedPath, workspaceGrantRoot: grantedPath }, live)
   assert.equal(liveControl.ok, true, 'a still-configured root authorizes an exact-root record with no source')
   assert.equal(liveControl.source, 'grant', 'the configured set decides before any session shortcut')
-  const revokedControl = await reauthorizeWorkspace(grantedPath, grantedPath, removed, undefined)
+  const revokedControl = await reauthorizeWorkspace({ workspace: grantedPath, workspaceGrantRoot: grantedPath }, removed)
   assert.equal(revokedControl.ok, false, 'a missing source must not pick the permissive session branch')
   assert.match(revokedControl.diagnostic, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  const explicitSession = await reauthorizeWorkspace(grantedPath, grantedPath, removed, 'session')
+  const explicitSession = await reauthorizeWorkspace({ workspace: grantedPath, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'session' }, removed)
   assert.equal(explicitSession.ok, true, 'an explicit session record stays authorized when its root is not configured')
   assert.equal(explicitSession.source, 'session')
-  assert.equal((await reauthorizeWorkspace(grantedPath, grantedPath, removed, 'grant')).ok, false, 'an explicit grant record is refused once the root is revoked')
+  assert.equal((await reauthorizeWorkspace({ workspace: grantedPath, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant' }, removed)).ok, false, 'an explicit grant record is refused once the root is revoked')
 
   // Runtime path: a durable record that carries the anchor but no source must
   // fence on revocation, and must stay staffable while the root is configured.
-  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) } })
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(live) })
   const owner = { sessionId: 'owner-x3' }
   const mission = before.create(owner, { title: 'Missing source', objective: 'Fail closed on revocation', workspace: grantedPath, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
@@ -446,7 +446,7 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
   assert.equal(before.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'the live root keeps the source-less record authorized')
   await before.dispose()
 
-  const restarted = new SwarmRuntime({ ...config, grants: removed, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, removed) }, workspaceWorkers())
+  const restarted = new SwarmRuntime({ ...config, grants: removed }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   await assert.rejects(restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
@@ -460,7 +460,7 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
 
 test('G1: grant expiry is judged at the runtime clock\'s instant by admission and by the dispatch fence alike', async t => {
   // Admission read the runtime clock, but the dispatch and verification fence
-  // called config.authorizeWorkspace, which judged expiry on the wall clock. With
+  // once called a config closure that judged expiry on the wall clock. With
   // the runtime clock past expiresAt, admission refused a new mission under the
   // grant while the fence kept the admitted one live.
   const { granted, project } = await fixture(t)
@@ -469,8 +469,7 @@ test('G1: grant expiry is judged at the runtime clock\'s instant by admission an
   const grants = await loadWorkspaceGrants([{ path: granted, expiresAt: Date.now() + 5_000 }])
   const clock = new FakeClock()
   // Wired as src/index.ts wires the plugin runtime.
-  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, manualTick: true, now: clock.now, grants,
-    authorizeWorkspace: (workspace, cwd, now) => authorizeWorkspace(workspace, cwd, grants, now) } })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...wired(grants), manualTick: true, now: clock.now } })
   const owner = { sessionId: 'owner-expiry' }
   const grantedPath = await realpath(granted), projectPath = await realpath(project), secondPath = await realpath(second)
   const input = workspace => ({ title: 'Expiring grant', objective: 'Fence at expiry', workspace, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -480,4 +479,118 @@ test('G1: grant expiry is judged at the runtime clock\'s instant by admission an
   assert.throws(() => runtime.create(owner, input(secondPath)), /not inside a currently authorizedWorkspaces root/, 'admission refuses the expired grant')
   await assert.rejects(runtime.assertWorkspaceAuthorized(runtime.mission(mission.id)), /was removed from authorizedWorkspaces or has expired/, 'the dispatch fence refuses it at the same instant')
   assert.equal(runtime.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 1, 'the admitted mission is fenced once')
+})
+
+/**
+ * H-1 (review 2026-09-24): re-validation selected the longest configured root
+ * and demanded it equal the recorded one, so configuring a narrower root later
+ * fenced a healthy mission with "Authorized root … was removed". Admission and
+ * re-validation now share one selector: a workspace any active configured root
+ * contains stays authorized, whichever root was recorded.
+ */
+test('H-1: a narrower root configured after admission keeps the mission authorized, and so does removing it again', async t => {
+  const { granted, project } = await fixture(t)
+  const grantedPath = await realpath(granted), projectPath = await realpath(project)
+  const input = (title, workspaceGrantRoot) => ({ title, objective: 'Stay authorized', workspace: projectPath, workspaceGrantRoot, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const outer = await loadWorkspaceGrants([{ path: granted }])
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(outer) })
+  const owner = { sessionId: 'owner-h1' }
+  const mission = before.create(owner, input('Outer root', grantedPath))
+  assert.equal(mission.workspaceGrantRoot, grantedPath)
+  await before.dispose()
+  // The human adds /granted/project and keeps /granted.
+  const both = await loadWorkspaceGrants([{ path: granted }, { path: project }])
+  const widened = new SwarmRuntime({ ...config, grants: both }, workspaceWorkers())
+  t.after(async () => { await widened.dispose() })
+  await widened.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  assert.equal(revokedEvents(widened, mission.id).length, 0, 'a healthy mission is not fenced when a nested root is added')
+  // Mirror: admitted under the narrower root, which the human removes while the outer root still contains the workspace.
+  const nested = widened.create(owner, input('Inner root', grantedPath))
+  assert.equal(nested.workspaceGrantRoot, projectPath, 'admission records the most specific root')
+  await widened.dispose()
+  const narrowed = new SwarmRuntime({ ...config, grants: await loadWorkspaceGrants([{ path: granted }]) }, workspaceWorkers())
+  t.after(async () => { await narrowed.dispose() })
+  await narrowed.addMember(owner, nested.id, { name: 'Builder', role: 'implementation' })
+  assert.equal(revokedEvents(narrowed, nested.id).length, 0, 'a workspace the outer root still contains is not fenced')
+})
+
+/** The one rule, shape by shape: every difference the three former implementations had, decided once. */
+test('One rule: reauthorizeWorkspace judges every recorded shape with the admission selector', async t => {
+  const { temp, session, granted, foreign, project } = await fixture(t)
+  const alias = join(temp, 'granted-alias')
+  await symlink(granted, alias)
+  const at = Date.now()
+  const load = roots => loadWorkspaceGrants(roots.map(root => typeof root === 'string' ? { path: root } : root), at)
+  const outer = await load([granted]), inner = await load([project]), both = await load([granted, project]), none = await load([])
+  const expiring = await load([{ path: granted, expiresAt: at + 1_000 }]), aliased = await load([alias])
+  const grant = (workspace, workspaceGrantRoot) => ({ workspace, workspaceGrantRoot, workspaceAuthorizationSource: 'grant' })
+  const cases = [
+    ['a session workspace with no root configured', { workspace: session, workspaceGrantRoot: session, workspaceAuthorizationSource: 'session' }, none, at, 'session'],
+    ['a grant whose root is configured', grant(project, granted), outer, at, 'grant'],
+    ['a grant whose root was removed', grant(project, granted), none, at, /was removed from authorizedWorkspaces/],
+    ['a missing source whose root is configured', { workspace: granted, workspaceGrantRoot: granted }, outer, at, 'grant'],
+    ['a missing source whose root was removed (X3 fails closed)', { workspace: granted, workspaceGrantRoot: granted }, none, at, /was removed from authorizedWorkspaces/],
+    ['a missing anchor inside a configured root', { workspace: project }, outer, at, 'grant'],
+    ['a missing anchor outside every configured root', { workspace: session }, outer, at, /was removed from authorizedWorkspaces/],
+    ['a grant before its expiresAt', grant(project, granted), expiring, at, 'grant'],
+    ['a grant at its expiresAt', grant(project, granted), expiring, at + 1_000, /has expired/],
+    ['a nested root configured after admission (H-1)', grant(project, granted), both, at, 'grant'],
+    ['a recorded nested root removed while the outer root stays', grant(project, project), outer, at, 'grant'],
+    ['a recorded outer root removed while a nested root contains the workspace', grant(project, granted), inner, at, 'grant'],
+    ['a root configured through a symlink', grant(project, granted), aliased, at, 'grant'],
+    ['a workspace that no longer resolves', grant(join(granted, 'gone'), granted), outer, at, /no longer exists or cannot be resolved/],
+    ['a workspace outside its recorded root', grant(foreign, granted), outer, at, /escaped its recorded authorized root/],
+  ]
+  for (const [shape, record, roots, now, expected] of cases) {
+    const result = await reauthorizeWorkspace(record, roots, now)
+    if (typeof expected === 'string') {
+      assert.equal(result.ok, true, `${shape} is authorized`)
+      assert.equal(result.source, expected, `${shape} is authorized as ${expected}`)
+    } else {
+      assert.equal(result.ok, false, `${shape} is refused`)
+      assert.match(result.diagnostic, expected, shape)
+      assert.match(result.diagnostic, new RegExp(WORKSPACE_AUTHORIZATION_CODE), shape)
+    }
+  }
+})
+
+test('A record from before the anchor existed is judged by the configured roots alone', async t => {
+  const { session, granted, project } = await fixture(t)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
+  const legacy = (owner, workspace, source) => {
+    const mission = runtime.create(owner, { title: 'Legacy', objective: 'Predates the anchor', workspace, ...(source === undefined ? {} : { workspaceAuthorizationSource: source }), scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    const stored = runtime.store.get('missions', mission.id)
+    delete stored.workspaceGrantRoot; delete stored.workspaceAuthorizationSource
+    runtime.store.transaction(() => runtime.store.put('missions', stored))
+    return mission
+  }
+  const insideOwner = { sessionId: 'owner-legacy-inside' }, outsideOwner = { sessionId: 'owner-legacy-outside' }
+  const inside = legacy(insideOwner, await realpath(project))
+  await runtime.addMember(insideOwner, inside.id, { name: 'Builder', role: 'implementation' })
+  assert.equal(revokedEvents(runtime, inside.id).length, 0, 'a configured root still contains it')
+  const outside = legacy(outsideOwner, await realpath(session), 'session')
+  await assert.rejects(runtime.addMember(outsideOwner, outside.id, { name: 'Builder', role: 'implementation' }), revokedError)
+  assert.equal(revokedEvents(runtime, outside.id).length, 1, 'no configured root contains it, and it records no session source')
+})
+
+test('A restart with the same configuration, and a root configured through a symlink, keep the mission authorized', async t => {
+  const { temp, granted, project } = await fixture(t)
+  const alias = join(temp, 'granted-alias')
+  await symlink(granted, alias)
+  const configured = [{ path: alias, note: 'configured through a symlink' }]
+  const first = await loadWorkspaceGrants(configured)
+  const admitted = await authorizeWorkspace(join(alias, 'project'), undefined, first)
+  assert.equal(admitted.grantRoot, await realpath(granted), 'the recorded root is canonical')
+  assert.equal(admitted.workspace, await realpath(project), 'the recorded workspace is canonical')
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(first) })
+  const owner = { sessionId: 'owner-restart' }
+  const mission = before.create(owner, { title: 'Restarted', objective: 'Survive a restart', workspace: admitted.workspace, workspaceGrantRoot: admitted.grantRoot, workspaceAuthorizationSource: admitted.source, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
+  await before.dispose()
+  const restarted = new SwarmRuntime({ ...config, grants: await loadWorkspaceGrants(configured) }, workspaceWorkers())
+  t.after(async () => { await restarted.dispose() })
+  await restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
+  await restarted.assertWorkspaceAuthorized(restarted.mission(mission.id))
+  assert.equal(revokedEvents(restarted, mission.id).length, 0)
 })

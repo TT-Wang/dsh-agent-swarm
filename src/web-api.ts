@@ -154,9 +154,7 @@ async function canonicalWorkspace(input: string, header: SessionHeader, grants: 
 
 /** Re-validate a mission already recorded against its own durable grant root. */
 async function missionWorkspace(mission: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, grants: WorkspaceGrantSnapshot): Promise<string> {
-  // A mission recorded before this feature has no anchor; its workspace is its
-  // own anchor, matching the pre-feature session-cwd authorization.
-  const authorization = await reauthorizeWorkspace(mission.workspace, mission.workspaceGrantRoot ?? mission.workspace, grants, mission.workspaceAuthorizationSource)
+  const authorization = await reauthorizeWorkspace(mission, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
   return authorization.workspace
 }

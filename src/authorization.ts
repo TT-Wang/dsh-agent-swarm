@@ -14,7 +14,7 @@
  */
 import { realpath } from 'node:fs/promises'
 import { isAbsolute, relative, sep } from 'node:path'
-import type { WorkspaceGrant, WorkspaceGrantSnapshot } from './types.ts'
+import type { Mission, WorkspaceGrant, WorkspaceGrantSnapshot } from './types.ts'
 
 /** Why a workspace was accepted; `session` means the calling session's own cwd. */
 export type WorkspaceAuthorizationSource = 'session' | 'grant'
@@ -86,11 +86,6 @@ export async function loadWorkspaceGrants(configured: readonly WorkspaceGrant[] 
   return { grants, loadedAt: now, unresolved }
 }
 
-/** Roots in effect for one admission: loaded grants minus any that expired since start. */
-function activeGrants(loaded: WorkspaceGrantSnapshot, now: number): WorkspaceGrant[] {
-  return loaded.grants.filter(grant => grant.expiresAt === undefined || grant.expiresAt > now)
-}
-
 /**
  * The one matching rule: the most specific (longest) configured root that is
  * still active at `now` and contains `path`. Admission, the synchronous create
@@ -120,39 +115,31 @@ export async function authorizeWorkspace(requested: string, sessionCwd: string |
 }
 
 /**
- * Re-validate a workspace already recorded on a mission, using the mission's
- * own durable `workspaceGrantRoot` as the recorded anchor:
+ * Re-validate a workspace already recorded on a mission or planning request.
+ * The resolved workspace must still sit inside its recorded
+ * `workspaceGrantRoot`; it then stays authorized as the session workspace it
+ * was recorded as, or while `grantFor` still finds an active configured root
+ * containing it: the admission rule, so a root added or removed around it
+ * never fences a workspace admission would accept, and removing the last root
+ * that contains it fences the mission at its next preparation.
  *
- * - a session workspace keeps its recorded root equal to itself, so it stays
- *   authorized exactly while the directory still resolves to that path;
- * - a mission bound to a grant root stays authorized only while the workspace
- *   resolves inside that root *and* the root is still one the human configured
- *   and has not expired — so removing the root fences the mission at its next
- *   prepare or verification checkout instead of continuing silently.
+ * X3: only an explicit `session` record takes the session branch; a missing
+ * source is judged by the configured roots and fails closed. A record without
+ * an anchor predates the feature: its workspace is its own anchor and, having
+ * no source either, it is judged by the configured roots alone.
  *
  * Residual TOCTOU: the check and the subsequent git operation are separate
  * syscalls, so a root replaced in that window is not caught here. This is
  * documented in docs/known-limitations.md rather than claimed closed.
  */
-export async function reauthorizeWorkspace(workspace: string, recordedRoot: string | undefined, loaded: WorkspaceGrantSnapshot, source?: 'session' | 'grant', now = Date.now()): Promise<WorkspaceAuthorization> {
-  const resolved = await realpath(workspace).catch(() => undefined)
-  if (resolved === undefined) return { ok: false, diagnostic: `Authorized workspace ${workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  const root = recordedRoot === undefined ? undefined : await realpath(recordedRoot).catch(() => undefined)
-  if (root === undefined) return { ok: false, diagnostic: `Workspace ${workspace} has no recorded authorized root [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  // X3: the configured set decides first. A recorded root that currently
-  // matches a configured grant is a grant even when the record omitted its
-  // source, so it stays authorized while the human keeps the root. A session
-  // workspace is admitted only when the record explicitly says 'session': a
-  // missing source on a root that is not configured could be a revoked grant
-  // whose root happens to equal the workspace, and that must fail closed.
-  if (resolved === root) {
-    const configured = activeGrants(loaded, now).find(candidate => candidate.path === root)
-    if (configured !== undefined) return { ok: true, workspace: resolved, source: 'grant', grantRoot: root, grant: configured }
-    if (source === 'session') return { ok: true, workspace: resolved, source: 'session', grantRoot: root }
-    return { ok: false, diagnostic: `Authorized root ${recordedRoot} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  }
-  if (!isContained(root, resolved)) return { ok: false, diagnostic: `Workspace ${workspace} escaped its recorded authorized root ${recordedRoot} [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  const grant = activeGrants(loaded, now).find(candidate => candidate.path === root)
-  if (grant === undefined) return { ok: false, diagnostic: `Authorized root ${recordedRoot} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  return { ok: true, workspace: resolved, source: 'grant', grantRoot: root, grant }
+export async function reauthorizeWorkspace(record: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, loaded: WorkspaceGrantSnapshot, now = Date.now()): Promise<WorkspaceAuthorization> {
+  const recorded = record.workspaceGrantRoot ?? record.workspace
+  const workspace = await realpath(record.workspace).catch(() => undefined)
+  if (workspace === undefined) return { ok: false, diagnostic: `Authorized workspace ${record.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]` }
+  const anchor = await realpath(recorded).catch(() => undefined)
+  if (anchor === undefined || !isContained(anchor, workspace)) return { ok: false, diagnostic: `Workspace ${record.workspace} escaped its recorded authorized root ${recorded} [${WORKSPACE_AUTHORIZATION_CODE}]` }
+  if (record.workspaceAuthorizationSource === 'session' && workspace === anchor) return { ok: true, workspace, source: 'session', grantRoot: anchor }
+  const grant = grantFor(workspace, loaded, now)
+  if (grant !== undefined) return { ok: true, workspace, source: 'grant', grantRoot: grant.path, grant }
+  return { ok: false, diagnostic: `Authorized root ${recorded} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }
 }

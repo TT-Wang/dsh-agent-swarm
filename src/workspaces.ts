@@ -839,15 +839,14 @@ export class Workspaces {
    * Re-validate the human authorization behind a mission before its first
    * filesystem effect (baseline snapshot, member worktree, verification
    * checkout). The recorded `workspaceGrantRoot` — falling back to the mission
-   * record, then to the workspace itself for records written before this
-   * feature — anchors the check, and the loaded grant snapshot decides whether
-   * that root is still configured and unexpired. A root the human removed
-   * therefore fences the mission here instead of silently continuing.
+   * record — anchors the check, and `reauthorizeWorkspace` applies the one rule
+   * to the loaded grant snapshot. A root the human removed therefore fences the
+   * mission here instead of silently continuing.
    */
   private async assertWorkspaceAuthorized(workspace: string, recordedRoot: string | undefined, source?: 'session' | 'grant'): Promise<void> {
     const grants = this.options.grants
     if (grants === undefined) return
-    const authorization = await reauthorizeWorkspace(workspace, recordedRoot ?? workspace, grants, source)
+    const authorization = await reauthorizeWorkspace({ workspace, workspaceGrantRoot: recordedRoot, workspaceAuthorizationSource: source }, grants)
     if (!authorization.ok) throw new Error(authorization.diagnostic)
   }
   /**

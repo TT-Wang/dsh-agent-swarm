@@ -856,7 +856,7 @@ export interface CreateMissionInput {
    * from the session cwd or a configured `authorizedWorkspaces` root. Model
    * tools never supply it directly: `boundPlanWorkspace` overwrites the
    * workspace and passes the host-derived root, and the runtime re-derives it
-   * through `RuntimeConfig.authorizeWorkspace` when that check is configured.
+   * from `RuntimeConfig.grants` when roots are configured.
    */
   workspaceGrantRoot?: string
   /** Host-derived authorization origin, computed with `workspaceGrantRoot` at admission. */
@@ -1196,18 +1196,13 @@ export interface RuntimeConfig {
    */
   stallPassTimeoutMs?: number
   /**
-   * Human-authorized workspace predicate, loaded once from plugin configuration
-   * at start. When present the runtime re-derives every mission's grant root
-   * from it and fences a mission whose root was revoked; when absent (unit
-   * runtimes and adapters without Git) the recorded admission result stands.
-   * It judges grant expiry at `now`, the runtime clock's instant, as admission
-   * does. It is a value on the runtime's own config, never a model-callable surface.
-   */
-  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined, now: number) => Promise<WorkspaceAuthorization>
-  /**
-   * The roots `authorizeWorkspace` closes over, carried so revocation fencing
-   * can name the recorded root without re-reading configuration. Never
-   * re-loaded at runtime.
+   * The human-authorized roots, loaded once from plugin configuration at
+   * start: the one representation every admission and re-validation reads,
+   * judged at `now`, the runtime clock's instant. When present the runtime
+   * re-validates every mission before its workspace preparations and fences a
+   * mission whose workspace no configured root authorizes any more; when absent
+   * (unit runtimes and adapters without Git) the recorded admission result
+   * stands. Never re-loaded at runtime and never a model-callable surface.
    */
   grants?: WorkspaceGrantSnapshot
   /**
@@ -1228,12 +1223,3 @@ export interface RuntimeConfig {
  */
 export interface WorkspaceGrant { path: string; note?: string; expiresAt?: number }
 export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; loadedAt: number; unresolved: readonly string[] }
-/** Structural mirror of the `authorizeWorkspace` result, for `RuntimeConfig.authorizeWorkspace`. */
-export interface WorkspaceAuthorization {
-  ok: boolean
-  workspace?: string
-  source?: 'session' | 'grant'
-  grantRoot?: string
-  grant?: WorkspaceGrant
-  diagnostic?: string
-}
