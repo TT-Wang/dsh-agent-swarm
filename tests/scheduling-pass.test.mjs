@@ -28,8 +28,21 @@ import { setup, makeRuntime, eventually, events, taskOf, FakeWorkers, FakeClock,
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 /** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
 async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
-/** An adapter await of `ms` clock time: whatever is already runnable runs first, then the clock moves and the await returns. */
-const clockWait = (clock, ms) => new Promise(resolve => setImmediate(() => { clock.advance(ms); resolve() }))
+/**
+ * An adapter await of `ms` clock time, as the tick timer sees it: the clock moves one tick unit
+ * at a time, each step after whatever is already runnable, and the timer's tick (its guards: the
+ * outbox pump, the watchdog, sweepDecisions, the mission kicks) runs at each step while the caller
+ * stays suspended in the await. The tick is not awaited, as the timer's is not, so a body held
+ * past its bound inside the await is named, or held live, exactly as in production.
+ */
+async function clockWait(f, ms) {
+  const step = f.runtime.config.tickMs
+  for (let left = ms; left > 0; left -= step) {
+    await new Promise(resolve => setImmediate(resolve))
+    f.clock.advance(Math.min(step, left))
+    void f.runtime.tick()
+  }
+}
 const wedgeEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
 
 /**
@@ -430,14 +443,16 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
   // B's busy handle as the holder of T.
   //
   // Each owner delivery waits 60ms of the runtime's clock, which the adapter
-  // moves while the body is suspended in the delivery, and the ticks are driven
-  // by hand: the flush of three facts holds the body for exactly 180ms against
-  // its 100ms bound.
+  // moves one tick unit at a time while the body is suspended in the delivery,
+  // running the timer's tick at each step, and the other ticks are driven by
+  // hand: the flush of three facts holds the body for exactly 180ms against its
+  // 100ms bound, and the watchdog sees it past that bound, held live by the
+  // running live work.
   const clock = new FakeClock()
   class SlowOwnerWorkers extends FakeWorkers {
     slowOwnerMs = 0
     async deliver(member, delivery) {
-      if (member.id === 'owner' && this.slowOwnerMs > 0) await clockWait(clock, this.slowOwnerMs)
+      if (member.id === 'owner' && this.slowOwnerMs > 0) await clockWait(f, this.slowOwnerMs)
       return super.deliver(member, delivery)
     }
   }
@@ -685,17 +700,19 @@ test('S1: a chain of early-stopped bodies covers one rotation, and the body that
   // ran back to back without the tick. A chained body now ends its sweep
   // before the member its chain started from.
   //
-  // Each start waits 40ms of the runtime's clock, which the adapter moves while
-  // the body is suspended in the start, and the ticks are driven by hand. A
-  // tick waits for the chain it kicks, so a chain that never ends (the defect)
-  // is cut once there are more bodies than the driven ticks' rotations hold,
-  // and the assertions below then fail on it.
+  // Each start waits 40ms of the runtime's clock, which the adapter moves one
+  // tick unit at a time while the body is suspended in the start, running the
+  // timer's tick at each step, so the watchdog names a body held past its bound
+  // as in production; the other ticks are driven by hand. A tick waits for the
+  // chain it kicks, so a chain that never ends (the defect) is cut once there
+  // are more bodies than the driven ticks' rotations hold, and the assertions
+  // below then fail on it.
   const clock = new FakeClock()
   class SlowStartWorkers extends FakeWorkers {
     slow = false
     async start(spec) {
       this.started.push(spec.member.id)
-      if (this.slow) await clockWait(clock, 40)
+      if (this.slow) await clockWait(f, 40)
     }
   }
   const workers = new SlowStartWorkers()
