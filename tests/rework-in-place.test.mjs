@@ -172,7 +172,7 @@ test('a claim a rework archived cannot be challenged: the refusal names the live
     assert.equal(error.code, 'evidence_archived')
     assert.equal(error.category, 'conflict_error')
     assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
-    assert.ok(error.message.includes(`refuted with the rejected commit ${rejectedCommit} of task ${source.id} (review ${rejecting.id})`), error.message)
+    assert.ok(error.message.includes(`belongs to the round of task ${source.id} that review ${rejecting.id} closed by rejecting commit ${rejectedCommit}`), error.message)
     assert.match(error.message, live)
     assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
     message.push(error.message)

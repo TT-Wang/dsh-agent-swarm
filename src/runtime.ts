@@ -2249,14 +2249,16 @@ export class SwarmRuntime {
     const { key } = this.active(actor, missionId)
     const evidence = this.store.get('evidence', input.evidenceId)
     if (!evidence || evidence.missionId !== missionId) throw new Error('Unknown evidence')
-    // A claim a rework archived is history of a rejected commit: that rejection
-    // already refuted it and no later verdict judges it, so a dispute of it could
-    // never be resolved, and it would re-open the reworked task.
+    // A claim a rework archived is history of a rejected commit, whether the
+    // author published it (the rejection refuted it) or the rejecting reviewer
+    // did (on the review row the rework re-opened): no later verdict judges it,
+    // so a dispute of it could never be resolved, and it would re-open the
+    // reworked task or the review that accepted the rework.
     const owning = this.task(missionId, evidence.taskId)
     const archivedBy = owning.rejections?.find(rejection => rejection.evidenceIds.includes(evidence.id))
     if (archivedBy !== undefined) {
       const live = currentEvidenceIds(owning)
-      throw new PolicyError('evidence_archived', 'conflict_error', `[evidence_archived] Evidence ${evidence.id} was already refuted with the rejected commit ${archivedBy.commit} of task ${owning.id} (review ${archivedBy.reviewTaskId}); the rework archived it, so no verdict can judge it again. ${live.length
+      throw new PolicyError('evidence_archived', 'conflict_error', `[evidence_archived] Evidence ${evidence.id} belongs to the round of task ${owning.id} that review ${archivedBy.reviewTaskId} closed by rejecting commit ${archivedBy.commit}; the rework archived it with that rejection, so no verdict can judge it again. ${live.length
         ? `Use \`swarm_challenge\` with the \`evidenceId\` of a live claim of that task instead: ${live.join(', ')}.`
         : 'That task has no live claim yet; wait for its next claim, then use `swarm_challenge` with that `evidenceId`.'}`)
     }
@@ -2396,9 +2398,12 @@ export class SwarmRuntime {
   }
   /**
    * A rework re-opens its source's review in place too: the rejecting review is
-   * re-pended for the next submission. Its verdict, `reviewedCommit` and review
-   * artifact move into the row's own `rejections`, as the source archives its
-   * rejection; the epoch fences the finished attempt; and the rejecting reviewer
+   * re-pended for the next submission. Its verdict, `reviewedCommit`, review
+   * artifact and the claims its reviewer published against the rejected commit
+   * move into the row's own `rejections`, as the source archives its
+   * rejection, so a verdict on the resubmission never carries them (a dispute
+   * of one is refused with [evidence_archived] and none blocks completion);
+   * the epoch fences the finished attempt; and the rejecting reviewer
    * stays its assignee, which keeps it independent (a reviewer never authors its
    * source). The resubmission is therefore reviewed at once by its paired
    * review: no automatic review and no task slot per rework. Every other open
@@ -2411,7 +2416,7 @@ export class SwarmRuntime {
    */
   private reopenReviewForRework(source: Task, review: Task, reason: string): void {
     const spent = { usedSteps: review.usedSteps ?? 0, recoveryCount: review.recoveryCount ?? 0, ...(review.ceiling === undefined ? {} : { ceiling: review.ceiling }) }
-    const archived: TaskRejection = { commit: review.reviewedCommit!, epoch: review.epoch, reviewTaskId: review.id, reason: review.output ?? '', evidenceIds: [], spent,
+    const archived: TaskRejection = { commit: review.reviewedCommit!, epoch: review.epoch, reviewTaskId: review.id, reason: review.output ?? '', evidenceIds: currentEvidenceIds(review), spent,
       ...(review.reviewArtifact === undefined ? {} : { reviewArtifact: review.reviewArtifact }) }
     const reopened: Task = { ...review, status: 'pending', rejections: [...review.rejections ?? [], archived] }
     const reviewer = review.attempt?.ownerId ?? review.assigneeId

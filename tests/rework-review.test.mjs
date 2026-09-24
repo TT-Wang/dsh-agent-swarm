@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeClock, FakeWorkers, WorkspaceWorkers, makeRepo, makeRuntime, makeWorkspaces, setup } from './faults/harness.mjs'
 
 /** Every attempt captures its own commit unless `fixedCommit` pins one (an unchanged resubmission). */
@@ -320,6 +321,35 @@ test('a reworked task stays pinned to its author through a failed start, so the 
   assert.equal(f.current(source).assigneeId, author.id, 'the rework stays with its author')
   assert.deepEqual(f.events('task/reassigned').filter(event => event.data.taskId === source.id), [])
   f.workers.start = outage
+})
+
+test('the rejecting reviewer\'s claims are archived with its verdict: disputing one after the rework is accepted is refused and blocks nothing', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const index = await toolSchemaIndex()
+  const source = f.propose('Implement')
+  await f.submit(author, source)
+  const review = f.proposeReview(source)
+  const first = await f.runtime.claim(f.actor(reviewer), f.mission.id, review.id)
+  const run = await f.workers.callbacks.toolRun(reviewer.id, { tool: 'bash', arguments: { command: 'node --test' }, result: { exitCode: 1, output: 'fail' }, isError: false })
+  const finding = f.runtime.publish(f.actor(reviewer), f.mission.id, { taskId: review.id, attemptId: first.attempt.id, claim: 'The artifact fails test X', outcome: 'supported', toolRunIds: [run] })
+  await f.runtime.verify(f.actor(reviewer), f.mission.id, { taskId: review.id, attemptId: first.attempt.id, verdict: 'reject', reason: 'Fails test X' })
+  const rejected = f.current(source).artifact.commit
+  f.resume(source)
+  assert.deepEqual(f.current(review).rejections.at(-1).evidenceIds, [finding.id], 'the round\'s claims are archived with its verdict')
+  await f.submit(author, source)
+  await f.verify(reviewer, review, 'accept', 'The rework meets the criterion')
+  assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the same review row accepts the rework')
+  assert.throws(() => f.runtime.challenge(f.owner, f.mission.id, { evidenceId: finding.id, reason: 'Dispute the round-1 finding', toolRunIds: [] }), error => {
+    assert.equal(error.code, 'evidence_archived')
+    assert.ok(error.message.startsWith('[evidence_archived] '), error.message)
+    assert.ok(error.message.includes(`belongs to the round of task ${review.id} that review ${review.id} closed by rejecting commit ${rejected}`), error.message)
+    assert.deepEqual(assessText(error.message, index), [], 'the exit resolves in the published tool schema')
+    return true
+  })
+  assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the accepting review is not reverted')
+  assert.equal(f.runtime.store.get('evidence', finding.id).challenges.length, 0, 'no dispute was recorded')
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
 })
 
 test('a released rework is never taken by the reviewer its re-opened review is bound to', async t => {

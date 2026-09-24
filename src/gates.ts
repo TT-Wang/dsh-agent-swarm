@@ -8,6 +8,7 @@
  */
 import { randomUUID, createHash } from 'node:crypto'
 import { arenaView as projectArenaView } from './arena.ts'
+import { currentEvidenceIds } from './attempts.ts'
 import { excerpt } from './declared-checks.ts'
 import { executionElapsed } from './resource-time.ts'
 import { memberPhaseOf } from './projection.ts'
@@ -354,7 +355,8 @@ export class RuntimeGates {
       if (['accepted', 'cancelled'].includes(task.status)) continue
       if (task.maxSteps !== undefined) dimensions.push({ dimension: 'maxSteps', used: task.usedSteps ?? 0, limit: task.maxSteps,
         inFlight: inFlight.some(member => member.id === task.attempt?.ownerId) ? 1 : 0, task })
-      if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: task.evidenceIds.length, limit: task.maxFindings, inFlight: 0, task })
+      // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.
+      if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: currentEvidenceIds(task).length, limit: task.maxFindings, inFlight: 0, task })
     }
     const warnings: Array<{ gate: string; threshold: number; key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
     let missionProgress: string | undefined

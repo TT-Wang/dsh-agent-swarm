@@ -394,8 +394,8 @@ export interface TaskAmendment {
  * that review's reason, and the claims the rejection refuted (history, not a
  * block cause, once the task is reworked). On the review row a rework re-opens,
  * the same record archives its own verdict: the commit it rejected, its epoch,
- * itself, its reason, no claims, the review artifact it captured, and what
- * that round consumed (`spent`).
+ * itself, its reason, the claims its reviewer published in that round, the
+ * review artifact it captured, and what that round consumed (`spent`).
  */
 export interface TaskRejection {
   commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[]; reviewArtifact?: Artifact
