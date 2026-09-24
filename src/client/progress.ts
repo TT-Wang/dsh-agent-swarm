@@ -1,5 +1,6 @@
 import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
+import { completionExempt } from '../task-graph.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
@@ -50,7 +51,7 @@ export function currentProgress(snapshot: Snapshot, connection: ConnectionState 
   const firstRunning = running.values().next().value as Task | undefined
   if (firstRunning) return { label: 'Task in progress', task: firstRunning, note: 'Waiting for the next observed activity.', stale }
   if (snapshot.tasks.some(task => task.status === 'submitted')) return { label: 'Waiting for acceptance', note: 'Submitted work is waiting for independent review.', stale }
-  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || (task.experiment && task.status === 'blocked'))) return { label: 'Preparing the final result', stale }
+  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
   return { label: 'Waiting for worker activity', note: mission.reason ?? 'No current worker activity has been observed.', stale }
 }
 

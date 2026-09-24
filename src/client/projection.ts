@@ -1,5 +1,5 @@
 import type { Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
-import { taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
+import { completionExempt, taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
 import { assignmentAllows, canOwnReview } from '../assignment.ts'
 
 export type BoardLane = 'ready' | 'queued' | 'active' | 'review' | 'blocked' | 'cancelled' | 'done'
@@ -274,7 +274,7 @@ export function completionBlocker(snapshot: Snapshot): string | undefined {
   const completion = readCompletion(snapshot)
   if (completion) return completion.eligible ? undefined : completion.reason || 'Mission is not eligible to complete'
   if (!snapshot.tasks.length) return 'Mission still has unfinished or blocked required work'
-  const unfinished = snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))
+  const unfinished = snapshot.tasks.some(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, snapshot.tasks))
   return unfinished ? 'Mission still has unfinished or blocked required work' : undefined
 }
 

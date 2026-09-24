@@ -15,6 +15,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { pairReviews, validatePlan } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
 import { DraftEditor } from '../lib/types/client/DraftEditor.js'
+import { completionBlocker } from '../lib/types/client/projection.js'
 import { FakeClock, FakeWorkers, makeRuntime, makeRuntimeStub, taskOf } from './faults/harness.mjs'
 
 class PairingWorkers extends FakeWorkers {
@@ -158,6 +159,43 @@ test('an automatic plan refusal lists the maxTasks shortfall of the added review
     assert.match(error.message, /\[plan_tasks_exceed_budget\] The plan needs 2 tasks, including 1 independent review\(s\)/, 'the cap shortfall arrives in the same round')
     return true
   })
+})
+
+test('the added review of an optional experiment inherits its exemption: a rejected experiment does not hold completion open', async t => {
+  class ExperimentWorkers extends PairingWorkers {
+    async captureArtifact(member, task) { return { ...this.artifact, commit: `${task.id}@${task.epoch}`.padEnd(40, '0').slice(0, 40), workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/a.ts'] } }
+  }
+  const clock = new FakeClock()
+  const { dir, runtime, workers } = await makeRuntime(t, { clock, workers: new ExperimentWorkers(), config: { checkTimeoutMs: undefined } })
+  await runtime.start()
+  const owner = { sessionId: 'experiment-owner' }
+  const input = plan(dir, { tasks: [
+    deliverable({ key: 'impl' }),
+    { key: 'exp', workstreamKey: 'main', title: 'Exp', objective: 'Measure an alternative idea', kind: 'research', experiment: true, outputs: [], scope: ['src/'], acceptance: ['alternative measured'], assigneeKey: 'builder', maxRecoveryAttempts: 2 },
+  ] })
+  input.budget.maxExperiments = 1
+  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'experiment', goal: 'Deliver', workspace: dir }).id, input)
+  const missionId = snapshot.mission.id
+  const task = key => runtime.store.list('tasks', missionId).find(row => row.id.endsWith(`_${key}`))
+  const actor = key => ({ sessionId: snapshot.members.find(row => row.id.endsWith(`_${key}`)).sessionId })
+  const deliver = async (key, verdict) => {
+    const claimed = await runtime.claim(actor('builder'), missionId, task(key).id)
+    if (key === 'exp') {
+      const runId = await workers.callbacks.toolRun(snapshot.members.find(row => row.id.endsWith('_builder')).id, { tool: 'bash', arguments: { command: 'node --test' }, result: { exitCode: 0, output: 'ok' }, isError: false })
+      runtime.publish(actor('builder'), missionId, { taskId: task(key).id, attemptId: claimed.attempt.id, claim: 'the alternative is faster', outcome: 'supported', toolRunIds: [runId] })
+    }
+    await runtime.submit(actor('builder'), missionId, { taskId: task(key).id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = task(`${key}-review`)
+    const reviewing = await runtime.claim(actor('reviewer'), missionId, review.id)
+    await runtime.verify(actor('reviewer'), missionId, { taskId: review.id, attemptId: reviewing.attempt.id, verdict, reason: `${verdict} after independent checks` })
+  }
+  await deliver('exp', 'reject')
+  assert.equal(task('exp').status, 'blocked')
+  assert.equal(task('exp-review').status, 'blocked', 'the rejecting review is the experiment\'s verdict record')
+  assert.equal(task('exp-review').experiment, false, 'the host-added review is not itself an experiment')
+  await deliver('impl', 'accept')
+  assert.equal(runtime.completionError(runtime.mission(missionId)), undefined, 'neither the rejected experiment nor its review holds completion open')
+  assert.equal(completionBlocker({ ...runtime.snapshot(owner, missionId), completion: undefined }), undefined, 'the client\'s legacy completion rule agrees')
 })
 
 test('a staged draft shows the synthesized review in the editor before launch, and launches it', async t => {

@@ -23,7 +23,7 @@ import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
@@ -3468,7 +3468,7 @@ export class SwarmRuntime {
   completionError(mission: Mission): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
-    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))
+    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, tasks))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
     const accepted = tasks.filter(task => task.status === 'accepted')
     // Verification acceptance text is free-form review criteria; only deliverable
@@ -3476,7 +3476,7 @@ export class SwarmRuntime {
     const deliverables = accepted.filter(task => task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
     const uncovered = mission.acceptance.filter(criterion => !deliverables.some(task => Array.isArray(task.acceptance) && task.acceptance.includes(criterion)))
     if (uncovered.length) {
-      const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
+      const blocked = tasks.filter(task => task.status === 'blocked' && !completionExempt(task, tasks)).map(task => task.id)
       return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
     }
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
