@@ -243,6 +243,28 @@ test('removing a deliverable in the draft editor removes the review that pairs i
   assert.deepEqual(saved.input.tasks.map(task => task.key), ['second', 'second-review'])
 })
 
+test('a draft saved before reviews were paired shows its review, or its maxTasks refusal, when it is read', async t => {
+  const f = await fixture(t)
+  const { members: _members, ...rest } = plan(f.dir)
+  const staged = { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) }
+  /** The row an older build stored: the plan as validated, with no host-added review. */
+  const legacy = maxTasks => {
+    const draft = f.runtime.createDraft(f.owner, staged)
+    const row = f.runtime.store.get('drafts', draft.id)
+    row.input = { ...row.input, budget: { ...row.input.budget, maxTasks }, tasks: row.input.tasks.filter(task => task.kind !== 'verification') }
+    f.runtime.store.transaction(() => f.runtime.store.put('drafts', row))
+    return draft.id
+  }
+  const listed = id => f.runtime.drafts(f.owner).find(draft => draft.id === id)
+  const paired = legacy(12)
+  assert.deepEqual(listed(paired).input.tasks.map(task => [task.key, task.reviewOf ?? null]), [['deliver', null], ['deliver-review', 'deliver']], 'the editor is shown the review the launch adds')
+  assert.equal(listed(paired).error, undefined)
+  const capped = legacy(1)
+  assert.equal(listed(capped).status, 'draft')
+  assert.match(listed(capped).error ?? '', /^\[plan_tasks_exceed_budget\] The plan needs 2 tasks/, 'the launch refusal shows before launch')
+  await assert.rejects(f.runtime.launchDraft(f.owner, capped, listed(capped).revision), /\[plan_tasks_exceed_budget\]/, 'and the launch refuses exactly that')
+})
+
 test('swarm_stage and swarm_launch declare the review override, and the registered launch forwards it', async () => {
   const definitions = new Map(), launched = []
   const runtime = makeRuntimeStub({

@@ -2980,7 +2980,21 @@ export class SwarmRuntime {
       note: 'Read-only registry over durable records: artifact commit, task, mission, acceptance state and review verdict. Per-mission artifact refs are private; this is the sanctioned cross-mission read path. Reading it changes no state.',
     }
   }
-  drafts(actor: Actor): DraftPlan[] { return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded') }
+  /**
+   * The owner's drafts, each as it will launch. An editable draft saved before
+   * the host paired reviews is paired on read, so the editor shows the review
+   * it will launch (its next save stores it); when that pairing puts the draft
+   * over `maxTasks`, the launch refusal is its `error` before launch.
+   */
+  drafts(actor: Actor): DraftPlan[] {
+    return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded').map(draft => {
+      if (draft.status !== 'draft' && draft.status !== 'failed') return draft
+      try {
+        const input = pairReviews(draft.input)
+        return input === draft.input ? draft : { ...draft, input }
+      } catch (error) { return { ...draft, error: error instanceof Error ? error.message : String(error) } }
+    })
+  }
   private ownedDraft(actor: Actor, draftId: string): DraftPlan {
     actor.signal?.throwIfAborted()
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
