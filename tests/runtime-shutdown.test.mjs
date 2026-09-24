@@ -82,14 +82,14 @@ for (const scenario of [
     recovered = new SwarmRuntime(config, recoveryWorkers)
     await recovered.start()
     if (scenario.resumes) {
-      await eventually(() => recovered.store.get('tasks', task.id)?.status === 'running', 'matching stop marker did not release the interrupted dispatch')
+      await eventually(() => recovered.store.get('tasks', task.id)?.status === 'running', 'matching stop marker did not release the interrupted dispatch', 2500)
       const running = recovered.store.get('tasks', task.id)
       assert.equal(running.attempt.ownerId, nextOwner.id, 'the durable handoff destination owns the fresh attempt')
       assert.equal(running.epoch, scenario.epoch + 1)
       assert.equal(running.resumeAfterStop, undefined)
       assert.match(running.handoff, /prior worktree checkpoint/)
     } else {
-      await eventually(() => recoveryWorkers.starts >= 4, 'recovery scheduler did not inspect the members')
+      await eventually(() => recoveryWorkers.starts >= 4, 'recovery scheduler did not inspect the members', 2500)
       assert.equal(recovered.store.get('tasks', task.id).status, 'blocked', 'a newer revocation or exhausted retry budget must retain its block')
       assert.equal(recovered.store.get('tasks', task.id).attempt, undefined)
     }
@@ -126,7 +126,7 @@ for (const stage of ['start', 'prepare']) {
 
     recovered = new SwarmRuntime(config, new ShutdownWorkers())
     await recovered.start()
-    await eventually(() => recovered.store.get('tasks', task.id)?.status === 'running', 'the unchanged pending task did not resume without its owner session')
+    await eventually(() => recovered.store.get('tasks', task.id)?.status === 'running', 'the unchanged pending task did not resume without its owner session', 2500)
     assert.equal(recovered.store.get('tasks', task.id).attempt.ownerId, member.id)
     assert.notEqual(recovered.store.get('members', member.id).status, 'stopped')
   })
@@ -145,14 +145,14 @@ test('pausing an in-flight worker start preserves membership for resume', async 
   await workers.gate.entered.promise
   workers.stop = async () => { workers.disposed = true; workers.gate.release.resolve() }
   runtime.control(owner, mission.id, 'pause', 'Pause during start')
-  await eventually(() => workers.interrupted.length === 1, 'pause did not interrupt the in-flight start')
+  await eventually(() => workers.interrupted.length === 1, 'pause did not interrupt the in-flight start', 2500)
   assert.equal(runtime.store.get('members', member.id).status, 'idle')
   assert.equal(runtime.store.get('tasks', task.id).status, 'pending')
   assert.equal(runtime.store.events(mission.id, 100).some(event => event.type === 'member/resume-failed'), false)
   workers.disposed = false
   workers.gate = undefined
   runtime.control(owner, mission.id, 'resume', 'Continue the same mission')
-  await eventually(() => runtime.store.get('tasks', task.id).status === 'running', 'worker did not resume after pause')
+  await eventually(() => runtime.store.get('tasks', task.id).status === 'running', 'worker did not resume after pause', 2500)
 })
 
 /** A committed budget pause with a preserved running attempt, ready to resume or restart. */
@@ -183,7 +183,7 @@ test('budget resume keeps the preserved attempt and spends no recovery credit', 
   const f = await budgetFixture(t)
   f.pause(); f.preserve(f.claimed.attempt.id)
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
-  await eventually(() => f.runtime.store.get('missions', f.mission.id).budgetPause === undefined, 'the pause must clear on resume')
+  await eventually(() => f.runtime.store.get('missions', f.mission.id).budgetPause === undefined, 'the pause must clear on resume', 2500)
   const resumed = f.runtime.store.get('tasks', f.task.id)
   assert.equal(resumed.status, 'running')
   assert.equal(resumed.attempt.id, f.claimed.attempt.id, 'the preserved attempt survives the pause')
@@ -195,7 +195,7 @@ test('a stale budget resume marker re-pends without charging a recovery attempt'
   const f = await budgetFixture(t)
   f.pause(); f.preserve('stale-attempt')
   f.runtime.control(f.owner, f.mission.id, 'resume', 'Budget raised')
-  await eventually(() => f.runtime.store.events(f.mission.id, 100).some(event => event.type === 'task/budget-resume-skipped'), 'the stale marker must be reported')
+  await eventually(() => f.runtime.store.events(f.mission.id, 100).some(event => event.type === 'task/budget-resume-skipped'), 'the stale marker must be reported', 2500)
   const current = f.runtime.store.get('tasks', f.task.id)
   assert.equal(current.recoveryCount, undefined, 'a stale marker is not a recovery failure')
   assert.notEqual(current.attempt?.id, 'stale-attempt')

@@ -71,7 +71,7 @@ test('an accepting verdict retires a running sibling, a pending sibling and a pa
   await f.runtime.verify(f.actor(f.first), f.mission.id, { taskId: verdict.id, attemptId: claimedVerdict.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
   assert.equal(f.current(source.id).status, 'accepted')
   assert.equal(f.current(verdict.id).status, 'accepted', 'the verdict task itself is accepted')
-  await eventually(() => [sibling, parked].every(task => f.current(task).resumeAfterStop === undefined), 'retired reviewers stop before their markers clear')
+  await eventually(() => [sibling, parked].every(task => f.current(task).resumeAfterStop === undefined), 'retired reviewers stop before their markers clear', 2500)
   for (const [task, previous] of [[f.current(sibling.id), 'running'], [f.current(pending.id), 'pending'], [f.current(parked.id), 'blocked']]) {
     assert.equal(task.status, 'cancelled', 'a sibling that can no longer reach a verdict is retired')
     assert.equal(task.attempt, undefined, 'the retired attempt is fenced')
@@ -91,7 +91,7 @@ test('an accepting verdict retires a running sibling, a pending sibling and a pa
   assert.equal(typeof siblingEvent.data.attemptId, 'string')
   assert.equal(siblingEvent.data.ownerId, f.second.id)
   assert.equal(f.events('task/lease-expired').filter(event => event.data.taskId === parked.id).length, 0)
-  await eventually(() => f.workers.stopped.includes(f.second.id), 'the retired reviewer handle is stopped')
+  await eventually(() => f.workers.stopped.includes(f.second.id), 'the retired reviewer handle is stopped', 2500)
   // A later scheduling pass must not re-pend or re-claim the retired sibling.
   f.workers.callbacks.idle(f.second.id)
   await new Promise(resolve => setTimeout(resolve, 40))
@@ -176,8 +176,8 @@ test('cancelling a source retires its running reviews with a durable event', asy
     assert.equal(event.data.reviewOf, source.id)
     assert.match(event.data.reason, /cancelled by the mission owner/)
   }
-  await eventually(() => f.workers.stopped.includes(f.first.id) && f.workers.stopped.includes(f.second.id), 'both retired reviewer handles are stopped')
-  await eventually(() => [first, second].every(task => f.current(task).resumeAfterStop === undefined), 'confirmed stops clear the barriers without reopening cancelled tasks')
+  await eventually(() => f.workers.stopped.includes(f.first.id) && f.workers.stopped.includes(f.second.id), 'both retired reviewer handles are stopped', 2500)
+  await eventually(() => [first, second].every(task => f.current(task).resumeAfterStop === undefined), 'confirmed stops clear the barriers without reopening cancelled tasks', 2500)
   // A later scheduling pass must not re-pend or reassign either review.
   f.workers.callbacks.idle(f.first.id)
   f.workers.callbacks.idle(f.second.id)

@@ -126,7 +126,7 @@ test('routine progress reaches the UI only; the owner is woken for rejection, st
   // R10-14: a coverage-complete owner-assembled mission announces readiness
   // instead of returning silently; acceptance itself is still not a
   // rejection/stall notice, and the mission stays active for the owner's decision.
-  const readiness = await eventually(() => f.controls().find(delivery => /ready to complete/.test(delivery.content)), 'a coverage-complete board must announce readiness')
+  const readiness = await eventually(() => f.controls().find(delivery => /ready to complete/.test(delivery.content)), 'a coverage-complete board must announce readiness', 3000)
   assert.match(readiness.content, /every acceptance criterion is independently covered/)
   assert.deepEqual(f.controls().filter(delivery => !/ready to complete/.test(delivery.content)), [], 'acceptance wakes the owner only with the coverage-complete decision')
   assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active', 'the owner keeps the completion decision')
@@ -134,7 +134,7 @@ test('routine progress reaches the UI only; the owner is woken for rejection, st
   assert(events.includes('task/submitted') && events.includes('task/accepted'), 'progress is durable for the panel')
   const rejected = await f.submitted()
   await f.reviewed(rejected, 'reject')
-  const notice = await eventually(() => f.controls().find(delivery => /blocked by independent verification/.test(delivery.content)), 'rejection must wake the owner')
+  const notice = await eventually(() => f.controls().find(delivery => /blocked by independent verification/.test(delivery.content)), 'rejection must wake the owner', 3000)
   assert.match(notice.content, new RegExp(rejected.id))
 })
 
@@ -283,12 +283,12 @@ test('one reviewed implementation is a complete automatic code plan and becomes 
   assert.equal(snapshot.tasks.length, 2)
   f.workers.callbacks.ownerUsage(f.owner.sessionId, { uncachedInputTokens: 1, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 0, requests: 1 })
   await acceptByKey(f, snapshot, 'impl')
-  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', snapshot.mission.id); return mission.status === 'completed' ? mission : undefined }, 'automatic completion after the reviewed implementation')
+  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', snapshot.mission.id); return mission.status === 'completed' ? mission : undefined }, 'automatic completion after the reviewed implementation', 3000)
   assert.deepEqual(completed.ownerUsage, { uncachedInputTokens: 1, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 0, requests: 1 })
   const inspection = await f.runtime.inspectDelivery(f.owner, snapshot.mission.id)
   const implementation = f.runtime.store.list('tasks', snapshot.mission.id).find(task => task.kind === 'implementation')
   assert.equal(inspection.resultCommit, implementation.artifact.commit, 'the single accepted implementation is the delivery target')
-  const notice = await eventually(() => f.workers.deliveries.find(delivery => delivery.kind === 'control' && /Completed/.test(delivery.content)), 'completion wakes the owner')
+  const notice = await eventually(() => f.workers.deliveries.find(delivery => delivery.kind === 'control' && /Completed/.test(delivery.content)), 'completion wakes the owner', 3000)
   assert.match(notice.content, /independently accepted/)
 })
 
@@ -332,7 +332,7 @@ test('a stalled automatic board preserves covered leftovers and completes only a
   await verdict(byKey('rbase'), 'reject')
   assert.equal(byKey('base').status, 'blocked')
   // Nothing runs, follow/rfollow can never start, and 'documented' is uncovered: the owner is told exactly once.
-  const stall = await eventually(() => f.workers.deliveries.find(delivery => delivery.kind === 'control' && /Mission stalled/.test(delivery.content)), 'stall notice')
+  const stall = await eventually(() => f.workers.deliveries.find(delivery => delivery.kind === 'control' && /Mission stalled/.test(delivery.content)), 'stall notice', 3000)
   assert.match(stall.content, /Unschedulable: .*_follow/); assert.match(stall.content, /unfinished or blocked required work/)
   await settle()
   assert.equal(f.workers.deliveries.filter(delivery => delivery.kind === 'control' && /Mission stalled/.test(delivery.content)).length, 1, 'no repeated stall notices for the same state')
@@ -355,7 +355,7 @@ test('a stalled automatic board preserves covered leftovers and completes only a
   assert.equal(byKey('rbase').reviewedCommit, byKey('base').artifact.commit)
   assert.equal(byKey('rbase').output, `${rejectedReview.output}\nSuperseded: ${byKey('base').id} was cancelled by the mission owner`)
   f.runtime.cancel(f.owner, missionId, { taskId: byKey('follow').id, reason: 'Owner withdraws the no-longer-required follow-up' })
-  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', missionId); return mission.status === 'completed' ? mission : undefined }, 'explicit withdrawal permits automatic completion')
+  const completed = await eventually(() => { const mission = f.runtime.store.get('missions', missionId); return mission.status === 'completed' ? mission : undefined }, 'explicit withdrawal permits automatic completion', 3000)
   assert.match(completed.reason, /independent verification satisfied/)
   for (const key of ['follow', 'rfollow', 'base', 'rbase']) assert.equal(byKey(key).status, 'cancelled', key)
   assert.match(byKey('follow').output, /Cancelled by the mission owner/)

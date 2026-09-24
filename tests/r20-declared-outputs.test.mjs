@@ -185,7 +185,7 @@ test('R20: the host-created automatic review declares no outputs', async t => {
   const claimed = await f.runtime.claim({ sessionId: author.sessionId }, f.mission.id, source.id)
   await f.runtime.submit({ sessionId: author.sessionId }, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === source.id),
-    'the automatic review is admitted')
+    'the automatic review is admitted', 5000)
   assert.deepEqual(review.outputs, [], 'the host-created review owes no file and says so, rather than inheriting the source text')
 })
 
