@@ -11,30 +11,16 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class SlowCheckWorkers {
-  activity
+class SlowCheckWorkers extends FakeWorkers {
   checks = []
-  envelope
-  idleMembers = new Set()
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle(memberId) { return this.idleMembers.has(memberId) }
-  async prepareTask() {}
   async captureArtifact(member, task) { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: `/isolated/${member.id}`, changedPaths: ['src/a.ts'] } }
   async verifyArtifact(member, source, artifact, signal) {
     this.checks.push({ memberId: member.id, sourceId: source.id, startedAt: Date.now() })
-    this.activity = { id: `verification-${member.id}`, kind: 'verification', startedAt: Date.now(), updatedAt: Date.now() }
-    this.callbacks.activity(member.id, this.activity)
+    this.reportActivity(member.id, { id: `verification-${member.id}`, kind: 'verification', startedAt: Date.now(), updatedAt: Date.now() })
     try {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(resolve, this.delayMs)
@@ -42,28 +28,18 @@ class SlowCheckWorkers {
       })
       return [{ command: source.checks[0] ?? 'check', exitCode: 0, output: 'ok' }]
     } finally {
-      this.activity = undefined
-      this.callbacks.activity(member.id)
+      this.reportActivity(member.id, undefined)
     }
   }
-  currentActivity() { return this.activity }
-  checkEnvelope() { return this.envelope }
-  async dispose() {}
-}
-
-const eventually = async (read, message, timeoutMs = 4000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
 }
 
 test('R11-05: a long queued check keeps its attempt lease alive and does not delay dispatch', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-lease-queue-'))
   const workers = new SlowCheckWorkers()
   workers.delayMs = 1500
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 300, tickMs: 15, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers,
+    config: { leaseMs: 300, tickMs: 15, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'lease-owner' }
   const mission = runtime.create(owner, { title: 'Long check', objective: 'Keep the lease', workspace: directory, scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
@@ -79,7 +55,7 @@ test('R11-05: a long queued check keeps its attempt lease alive and does not del
   const reviewClaim = await runtime.claim({ sessionId: reviewer.sessionId }, mission.id, review.id)
   const initialLease = runtime.store.get('tasks', review.id).attempt.leaseUntil
   const verification = runtime.verify({ sessionId: reviewer.sessionId }, mission.id, { taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: 'accept', reason: 'Independent review' })
-  await eventually(() => workers.checks.length === 1, 'the declared check never started')
+  await eventually(() => workers.checks.length === 1, 'the declared check never started', 4000)
   const startedAt = workers.checks[0].startedAt
   // R11-05: the queued attempt's lease is renewed from live verification
   // activity while the check runs, so it never expires mid-check.
@@ -88,11 +64,11 @@ test('R11-05: a long queued check keeps its attempt lease alive and does not del
     if (task.status !== 'running') return undefined
     const leaseUntil = task.attempt?.leaseUntil ?? 0
     return leaseUntil > initialLease ? leaseUntil : undefined
-  }, 'the lease was not renewed while the check was running')
+  }, 'the lease was not renewed while the check was running', 4000)
   assert.ok(renewed > Date.now(), 'the renewed lease covers the present')
   // R11-05: dispatch is not delayed behind the check: a second ready task is
   // claimed while the first check is still in flight.
-  workers.idleMembers.add(other.id)
+  workers.idle.add(other.id)
   const parallel = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Parallel', objective: 'Dispatch during the check', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test -d .'], assigneeId: other.id })
   const dispatched = await eventually(() => {

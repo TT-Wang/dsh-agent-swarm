@@ -1,21 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { arenaView, pendingReadiness } from '../lib/arena.js'
 import { formatDiagnostic } from '../lib/admission.js'
+import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 600000, maxTasks: 30, maxExperiments: 0 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-simplification-'))
-  const workers = { bind() {}, async dispose() {}, async stop() {} }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
+  const { dir: directory, runtime } = await makeRuntime(t, { config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined } })
   runtime.kick = () => {}
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, runtime, owner: { sessionId: 'owner' } }
 }
 
