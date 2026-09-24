@@ -1,7 +1,7 @@
 import type { Member, Snapshot, SwarmEvent, Task, WorkerActivity } from '../types.ts'
 import { recentProgress, type ConnectionState } from './progress.ts'
 
-export type LiveWorkState = 'observed' | 'quiet' | 'waiting' | 'idle' | 'stale' | 'paused' | 'stopped' | 'complete'
+type LiveWorkState = 'observed' | 'quiet' | 'waiting' | 'idle' | 'stale' | 'paused' | 'stopped' | 'complete'
 export interface LiveWorkRow {
   member: Member
   task?: Task
@@ -15,7 +15,7 @@ export interface LiveWorkRow {
   /** Animation means a recently observed native operation, never estimated progress. */
   animate: boolean
 }
-export interface LiveWorkEvent {
+interface LiveWorkEvent {
   /** Durable identity remains the same after reconnect and reload. */
   id: string
   seq: number
@@ -44,7 +44,7 @@ export interface LiveWorkProjection {
   lastActivityAt?: number
   recentEvents: LiveWorkEvent[]
 }
-export interface LiveWorkOptions {
+interface LiveWorkOptions {
   connection: ConnectionState
   now: number
   /** Pass monitor.updatedAt. Without it, offline intervals end at each activity's last observation. */

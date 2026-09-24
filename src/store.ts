@@ -32,7 +32,7 @@ interface Tables {
   admissions: AdmissionRecord
   limits: LimitRule
 }
-export type Table = keyof Tables
+type Table = keyof Tables
 /**
  * A store written before the scheduling pass guard moved into memory also holds
  * a `passes` table; nothing reads it, and it is left in place untouched.
@@ -141,7 +141,7 @@ export class StaleTaskRevisionError extends Error {
   }
 }
 /** One refused stale task write, recorded durably when the refused write rolled back. */
-export interface StaleTaskRefusal {
+interface StaleTaskRefusal {
   missionId: string
   taskId: string
   expected: number
@@ -289,7 +289,7 @@ function finishRestore(statePath: string): void {
   rmSync(intentPath)
   syncDirectory(statePath)
 }
-export interface StoreChange { revision: number; scopes: string[] }
+interface StoreChange { revision: number; scopes: string[] }
 /** SQLite-backed source of truth. Only one live runtime may own a state file. */
 export class SwarmStore {
   private readonly db: DatabaseSync
@@ -498,9 +498,8 @@ export class SwarmStore {
     // accepted write.
     if (table === 'tasks') { this.putTask(value as Task); return }
     // R17-G7: the member funnel drops the derived live status and normalizes the
-    // durable phase. A caller that assigns `member.status` (there are legacy
-    // sites outside this round's write scope) changes nothing durable: the next
-    // read re-derives the status from the phase and the live attempts.
+    // durable phase. Status is never stored: every read re-derives it from the
+    // phase and the live attempts.
     if (table === 'members') {
       const member = value as Member
       const { status: _derivedStatus, ...durable } = member

@@ -6,7 +6,6 @@ import { orchestratorCommands, ReplayGraphError, ReplayTruncationError } from '.
 import { validatePlan, planAdvisories } from '../lib/plans.js'
 import { classifyCheck, taskCeilingExhaustion } from '../lib/admission.js'
 import { taskGraphIndex, selectAcceptedDelivery } from '../lib/task-graph.js'
-import { liveCarrier, proposalAllowance } from '../lib/arena.js'
 import { boardIndex, deliverableTask } from '../lib/types/client/projection.js'
 import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
@@ -142,13 +141,13 @@ test('R25 all projections reject ambiguity and cross-kind replacements, with exa
   const review = task('review', 'verification', 'pending', { reviewOf: source.id })
   for (const rows of [[source, repair, second, review], [source, { ...repair, kind: 'research' }, review]]) {
     assert.equal(taskGraphIndex(rows).dependencyMet(source.id), false)
-    assert.notEqual(liveCarrier(rows, source.id)?.status, 'accepted')
+    assert.notEqual(taskGraphIndex(rows).effective(source.id)?.status, 'accepted')
     assert.equal(boardIndex(rows).dependencyMet(source.id), false)
   }
   repair.status = 'submitted'
   const rows = [source, repair, review]
   assert.equal(taskGraphIndex(rows).reviewSource(review).id, source.id)
-  assert.equal(boardIndex(rows).lane(review), 'blocked')
+  assert.equal(boardIndex(rows).lane(review, [{ id: 'reviewer', status: 'idle' }]), 'blocked')
 })
 
 test('R23/R24 completion and delivery share unique artifact coverage before terminal state', async t => {
@@ -166,13 +165,6 @@ test('R23/R24 completion and delivery share unique artifact coverage before term
   assert.equal(deliverableTask({ tasks: remaining }).id, 'code')
   const missingCoverage = [accepted('a'), accepted('b'), accepted('integration', 'integration', ['a'])]
   assert.throws(() => selectAcceptedDelivery(missingCoverage), /all implementation results/)
-})
-
-test('R11 worker expansion leaves aggregate proposal safety unchanged', () => {
-  const rows = Array.from({ length: 6 }, (_, i) => task(`t${i}`, 'research', 'pending'))
-  const before = proposalAllowance({ budget: { ...budget, maxTasks: 40, maxWorkers: 4 } }, [], rows, 'worker')
-  const after = proposalAllowance({ budget: { ...budget, maxTasks: 40, maxWorkers: 8 } }, [], rows, 'worker')
-  assert.equal(before.limit, 40); assert.equal(after.limit, 40); assert.equal(after.admitted, 6)
 })
 
 

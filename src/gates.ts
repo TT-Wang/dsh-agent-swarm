@@ -16,7 +16,7 @@ import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
-export const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
+const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
 export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
 
@@ -27,13 +27,13 @@ export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): U
 }
 
 /** Cumulative logs never shrink; a smaller bucket means a replayed snapshot and contributes nothing. */
-export function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
+function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
   const result = emptyUsage()
   for (const key of USAGE_KEYS) result[key] = Math.max(0, next[key] - (previous?.[key] ?? 0))
   return result
 }
 
-export function validUsage(value: unknown): value is UsageBuckets {
+function validUsage(value: unknown): value is UsageBuckets {
   return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
 }
 
@@ -54,7 +54,7 @@ export interface MissionFingerprintBoard {
  * `unreviewed` are derived by the runtime from durable state (`ready()` and the
  * live review path); they are never supplied by a caller's claim.
  */
-export interface MissionFingerprintTask {
+interface MissionFingerprintTask {
   id: string
   status: Task['status']
   /** The attempt owner only; a planned assignee is not an observed owner. */
@@ -93,7 +93,7 @@ export function missionFingerprint(board: MissionFingerprintBoard): string {
 export const BOARD_DELTA_POSTS = 3
 
 /** Extra lease headroom per allowed output token while a model stream is observably live. */
-export const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
+const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
 
 /**
  * Bounded board projection. `full` is used only by the single-post read; every
@@ -118,14 +118,13 @@ export function postView(post: Post, now: number, full = false): Record<string, 
 }
 
 /** A board page shows a bounded body excerpt; the full body is read by postId. */
-export const BOARD_BODY_EXCERPT = 600
+const BOARD_BODY_EXCERPT = 600
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 export class RuntimeGates {
   /** F(S) cache keyed by the store revision: the digest is pure over durable state. */
   readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()
-  readonly budgetStops = new Set<string>()
 
   constructor(private readonly rt: SwarmRuntime) {}
 
@@ -439,14 +438,11 @@ export class RuntimeGates {
   /**
    * Stop outside the mission queue, which a cancelled in-flight tool may own.
    *
-   * S5r: the gate is the DURABLE pause row, never the in-memory `budgetStops`
-   * Set. The claim (`budgetPause.stopping`) is written before any await, so two
-   * concurrent callers — or the same caller after the Set was lost — cannot run
-   * the stop twice and write a duplicate `mission/budget-quiesced` event. The
-   * claim is bounded exactly like the pass guard: a foreign instance's claim, or
-   * one older than `stallPassTimeoutMs`, is a crashed stop and does not gate.
-   * `budgetStops` stays only as the public mirror `SwarmRuntime.budgetStops`
-   * names for the gate census; it is never read to decide anything.
+   * S5r: the gate is the DURABLE pause row. The claim (`budgetPause.stopping`)
+   * is written before any await, so two concurrent callers cannot run the stop
+   * twice and write a duplicate `mission/budget-quiesced` event. The claim is
+   * bounded exactly like the pass guard: a foreign instance's claim, or one
+   * older than `stallPassTimeoutMs`, is a crashed stop and does not gate.
    */
   beginBudgetStop(missionId: string, pauseId: string): void {
     if (this.rt.shuttingDown) return
@@ -457,27 +453,24 @@ export class RuntimeGates {
     const claim = pause.stopping
     if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.stallPassTimeoutMs) return
     // The durable claim lands BEFORE the first await, so it is the gate for any
-    // later caller, whether or not this process still holds the mirror entry.
+    // later caller.
     pause.stopping = { instanceId: this.rt.instanceId, at: this.rt.now() }
     this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
-    this.budgetStops.add(pauseId)
     this.rt.defer(async () => {
-      try {
-        await Promise.all(this.rt.store.list('members', missionId).map(member => this.rt.workers.stop(member.id)))
-        if (this.rt.closed) return
-        const current = this.rt.mission(missionId)
-        // Re-read after the await: the pause may have been resumed or already
-        // quiesced by a concurrent stop; either way this claim writes nothing.
-        if (current.budgetPause?.id !== pauseId || current.budgetPause.quiesced) return
-        current.budgetPause.quiesced = true
-        delete current.budgetPause.stopping
-        this.rt.commit(missionId, () => {
-          this.rt.store.put('missions', current)
-          this.rt.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
-        })
-        this.rt.kick(missionId)
-        await this.rt.flushOutbox(missionId)
-      } finally { this.budgetStops.delete(pauseId) }
+      await Promise.all(this.rt.store.list('members', missionId).map(member => this.rt.workers.stop(member.id)))
+      if (this.rt.closed) return
+      const current = this.rt.mission(missionId)
+      // Re-read after the await: the pause may have been resumed or already
+      // quiesced by a concurrent stop; either way this claim writes nothing.
+      if (current.budgetPause?.id !== pauseId || current.budgetPause.quiesced) return
+      current.budgetPause.quiesced = true
+      delete current.budgetPause.stopping
+      this.rt.commit(missionId, () => {
+        this.rt.store.put('missions', current)
+        this.rt.store.event(missionId, 'mission/budget-quiesced', 'runtime', { pauseId })
+      })
+      this.rt.kick(missionId)
+      await this.rt.flushOutbox(missionId)
     })
   }
 

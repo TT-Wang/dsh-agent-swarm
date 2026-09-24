@@ -219,13 +219,11 @@ export interface Mission {
   coordinatorId?: string
   reason?: string
   baseline?: WorkspaceBaseline
-  /** Durable gate while budget exhaustion stops the previous worker activity. */
   /**
    * S5r: the durable stop claim. `stopping` is written before the deferred stop
-   * touches the adapter, so clearing the in-memory `budgetStops` mirror cannot
-   * re-run a stop that is already in flight. A claim from another runtime
-   * instance, or one older than the declared pass bound, is a crashed stop and
-   * does not gate a fresh attempt.
+   * touches the adapter, so a second request cannot re-run a stop that is
+   * already in flight. A claim from another runtime instance, or one older than
+   * the declared pass bound, is a crashed stop and does not gate a fresh attempt.
    */
   budgetPause?: { id: string; quiesced: boolean; stopping?: { instanceId: string; at: number } }
   /** Bucketed worker usage behind `usedTokens`; absent on missions recorded before bucket accounting. */
@@ -737,30 +735,6 @@ export interface Delivery {
   escalation?: Escalation
 }
 /**
- * Every durable event that fences a running attempt, and therefore closes the
- * attempt interval both readers reconstruct from the log:
- *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
- *    and refuses the whole log with `ReplayTruncationError` when one never
- *    closes;
- *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
- *    with the same set.
- *
- * The two readers used to carry hand-mirrored copies. They drifted: neither had
- * `task/restart-repended` (emitted when a host restart re-pends a running task,
- * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
- * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
- * refuse its own mission as truncated. One list, both readers.
- */
-/**
- * The owner-only tool surface: management and runtime modification that a
- * worker session must never reach. Declared ONCE, because two enforcement points
- * read it and they had drifted: the role projection hides exactly this set from
- * a worker's schemas (`src/tools.ts`), and the runtime's synchronous final guard
- * refuses exactly this set on every dispatch surface (`src/runtime.ts`). The
- * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
- * tool the guard would have allowed.
- */
-/**
  * The host's shared browser-transport channel and this plugin's endpoint prefix
  * inside it.
  *
@@ -787,11 +761,35 @@ export const SWARM_WEB_ENDPOINTS: readonly string[] = [
   'create-draft', 'update-draft', 'discard-draft', 'launch-draft', 'add-member', 'propose',
 ]
 
+/**
+ * The owner-only tool surface: management and runtime modification that a
+ * worker session must never reach. Declared ONCE, because two enforcement points
+ * read it and they had drifted: the role projection hides exactly this set from
+ * a worker's schemas (`src/tools.ts`), and the runtime's synchronous final guard
+ * refuses exactly this set on every dispatch surface (`src/runtime.ts`). The
+ * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
+ * tool the guard would have allowed.
+ */
 export const OWNER_ONLY_TOOLS: readonly string[] = [
   'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member',
   'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
 ]
 
+/**
+ * Every durable event that fences a running attempt, and therefore closes the
+ * attempt interval both readers reconstruct from the log:
+ *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
+ *    and refuses the whole log with `ReplayTruncationError` when one never
+ *    closes;
+ *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
+ *    with the same set.
+ *
+ * The two readers used to carry hand-mirrored copies. They drifted: neither had
+ * `task/restart-repended` (emitted when a host restart re-pends a running task,
+ * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
+ * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
+ * refuse its own mission as truncated. One list, both readers.
+ */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every control path now writes through
   // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
@@ -1171,12 +1169,6 @@ export interface RuntimeConfig {
   checkTimeoutMs?: number
   /** Idle close-out nudges before an open attempt is checkpointed and abandoned; defaults to 2. */
   maxIdleCloseouts?: number
-  /**
-   * L2 owner-reply guard. `nudge` (default) records the missing reply and sends a
-   * bounded instruction to the owner; `block` additionally refuses the owner's
-   * next step, which ends the turn that answered in prose only.
-   */
-  ownerReplyGuard?: 'nudge' | 'block'
   /** Owner-reply nudges before the guard terminal; defaults to 2. */
   maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */

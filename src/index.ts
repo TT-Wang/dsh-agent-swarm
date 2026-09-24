@@ -66,12 +66,6 @@ export interface Config {
    */
   authorizedWorkspaces: WorkspaceGrant[]
   defaultBudget: Budget
-  /**
-   * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
-   * left unanswered and instructs with the exact call. Legacy `block` is an
-   * alias: the owner's control channel always remains available to answer.
-   */
-  ownerReplyGuard: 'nudge' | 'block'
   /** Nudges spent on one unanswered owner question before the guard terminal; default 2. */
   maxOwnerReplyNudges: number
 }
@@ -94,7 +88,6 @@ export const Config: z<Config> = z.object({
   // campaign) and that value wins.
   checkTimeoutMs: z.natural().min(100).default(600000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
-  ownerReplyGuard: z.union(['nudge', 'block']).default('nudge'),
   maxOwnerReplyNudges: z.natural().min(0).default(2),
   verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),
@@ -186,7 +179,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // L2: the owner side of the reply protocol. The guard observes owner turns and
   // reports questions the turn did not settle; it never answers on the owner's
   // behalf and never edits a message.
-  const ownerReplies = new OwnerReplyGuard(ctx, runtime, { guard: config.ownerReplyGuard, maxNudges: config.maxOwnerReplyNudges })
+  const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
   ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))

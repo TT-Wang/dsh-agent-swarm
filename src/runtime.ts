@@ -17,7 +17,7 @@ import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type M
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, type TempMention } from './workspace-admission.ts'
-import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from './arena.ts'
+import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
@@ -321,13 +321,14 @@ export class SwarmRuntime {
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `idleSignals` (durable `Task.idleSignal`),
-   *     `startFailures`, `budgetStops`, `operations`, `startControllers`,
+   *     `startFailures`, `operations`, `startControllers`, `listeners`,
    *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
    *  The scheduling pass guard (`Scheduling.passes`) is the same kind of state:
    *  the one scheduling body queued or running on a mission's queue, removed
    *  when that body settles.
+   *  lifecycle: `workerStarts`, one cancellable native start per member, fenced by durable checks.
    *
    * There is deliberately no in-memory `scheduled` Set: the Row-13 incident was
    * that Set swallowing the tick timer's only liveness action while the pass it
@@ -507,15 +508,6 @@ export class SwarmRuntime {
   private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
   private resumeBudgetTasks(mission: Mission): void { return this.gates.resumeBudgetTasks(mission) }
 
-  /**
-   * M1a: the moved in-memory caches stay reachable on the runtime under the same
-   * names. Each is a live getter onto the module that now owns the collection, so
-   * the cache-only tests clear and inspect exactly the object the scheduling path
-   * reads (loss of each changes no durable outcome; S5's inventory names them).
-   */
-  get idleSignals() { return this.attempts.idleSignals }
-  get budgetStops() { return this.gates.budgetStops }
-  get fingerprintCache() { return this.gates.fingerprintCache }
   get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {

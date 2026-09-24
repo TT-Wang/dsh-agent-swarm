@@ -83,7 +83,7 @@ test('F3b: a rejected tool verdict with passing checks emits one refuted normali
 })
 
 test('infrastructure-deferred tool verification emits no evidence verdict and leaves sibling review live', async t => {
-  const f = await traceFixture(t, { checks: [{ command: 'test', exitCode: 127, output: 'test: command not found' }] })
+  const f = await traceFixture(t, { checks: [{ command: 'test', exitCode: 127, failureKind: 'infrastructure', output: 'test: command not found' }] })
   const source = f.task(f.source.id)
   const evidence = f.runtime.store.get('evidence', source.evidenceIds[0])
   assert.equal(source.status, 'submitted')

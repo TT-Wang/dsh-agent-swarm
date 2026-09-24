@@ -5,7 +5,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { useSyncExternalStore } from 'react'
 import { currentSessionId } from './navigation.ts'
 
-export const SWARM_COMMAND = 'agent-swarm'
+const SWARM_COMMAND = 'agent-swarm'
 
 interface CommandUiOptions {
   openSidebar(): void

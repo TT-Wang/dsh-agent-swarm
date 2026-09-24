@@ -47,7 +47,7 @@ export function normalizeReviewDependencies(kind: string, reviewOf: string | und
 }
 
 /** The minimal task shape a review path needs: one verification task and its source. */
-export interface ReviewPathCandidate extends AssignmentCandidate {
+interface ReviewPathCandidate extends AssignmentCandidate {
   id: string
   kind: string
   resumeAfterStop?: { epoch?: number }
@@ -90,7 +90,7 @@ export interface TaskGraphNode {
   reviewOf?: string
 }
 
-export type TaskGraphDefectCode = 'task_graph_duplicate' | 'task_graph_self_edge' | 'task_graph_unknown_edge' | 'task_graph_cycle'
+type TaskGraphDefectCode = 'task_graph_duplicate' | 'task_graph_self_edge' | 'task_graph_unknown_edge' | 'task_graph_cycle'
 
 export interface TaskGraphDefect {
   code: TaskGraphDefectCode
@@ -154,7 +154,7 @@ export function taskGraphDefects(nodes: readonly TaskGraphNode[], known?: Readon
 }
 
 /** Render one defect as an admission diagnostic; the code is the same token. */
-export function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): AdmissionDiagnostic {
+function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): AdmissionDiagnostic {
   return { code: defect.code, location, path: defect.target, message: defect.message }
 }
 
@@ -257,7 +257,7 @@ export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: n
   return { maxSteps, maxFindings, ceilingProvenance: { maxSteps: provenance('maxSteps', maxSteps), maxFindings: provenance('maxFindings', maxFindings) } }
 }
 
-export interface TaskCeilingState extends TaskCeilingInput {
+interface TaskCeilingState extends TaskCeilingInput {
   usedSteps?: number
   evidenceIds?: readonly string[]
 }
@@ -297,7 +297,7 @@ function declaredOutputFault(output: unknown, scope: readonly string[], dependen
   if (output.endsWith('/')) return 'ends in "/", so it names a directory rather than one file'
   if (/[*?[\]]/.test(output)) return 'contains a glob character, and only literal paths can be captured'
   if (isAbsolute(output) || output.startsWith('/') || output.includes('\\')) return 'is not a repository-relative path'
-  if (/[ -]/.test(output)) return 'contains a control character'
+  if (/[\u0000-\u001f]/.test(output)) return 'contains a control character'
   const parts = output.split('/')
   if (parts.some(part => part === '' || part === '.')) return 'has an empty or "." path segment'
   if (parts.includes('..')) return 'has a ".." segment, which could escape the repository'
@@ -311,7 +311,7 @@ function declaredOutputFault(output: unknown, scope: readonly string[], dependen
 }
 
 /** The context of one `assertDeclaredOutputs` call, which decides the refusal's exit. */
-export interface DeclaredOutputsOptions {
+interface DeclaredOutputsOptions {
   /**
    * The outputs are the task's stored declaration, re-checked because the
    * owner amended only its scope. The caller never passed `outputs`, so the
@@ -391,17 +391,14 @@ export function reconcileTaskAdmission(task: DependencyAssumptionInput, location
  * both exits.
  * ------------------------------------------------------------------------- */
 
-/** The stable code of the R12-F9 admission refusal. */
-export const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
-
-export interface DependencyAssumptionInput {
+interface DependencyAssumptionInput {
   objective: string
   acceptance?: readonly string[]
   dependencies?: readonly string[]
   replaces?: readonly string[]
 }
 
-export interface DependencyAssumptionContext {
+interface DependencyAssumptionContext {
   /** The declared dependency set. Absent means unknown, never "empty". */
   dependencies?: readonly string[]
   replaces?: readonly string[]
@@ -426,7 +423,7 @@ const CLAUSE_SPLIT = /(?:[.;!?]\s+|\n+)/
 const CONTENT_WORD = /\b(?:artifact|assembly|checkpoint|commit|evidence|snapshot|previous\s+attempt|prior\s+work|replaced\s+task)\b/i
 
 /** Named artifact/evidence/task identities and commit-like tokens appearing in a clause. */
-export function namedContentTokens(text: string): string[] {
+function namedContentTokens(text: string): string[] {
   const found: string[] = []
   for (const match of text.matchAll(/\b(?:artifact|evidence|task|attempt|mission|stream|checkpoint)_[A-Za-z0-9-]{4,}\b/g)) found.push(match[0])
   // A bare short hex token is only a commit reference when it carries a digit:
@@ -506,7 +503,7 @@ export function dependencyAssumptions(task: DependencyAssumptionInput, location:
   return found
 }
 
-export interface CheckClassification {
+interface CheckClassification {
   command: string
   runnable: 'worker' | 'host-only'
   code?: 'check_requires_host'
@@ -576,7 +573,7 @@ export function classifyCheck(command: string, scripts?: Record<string, string>)
  * directory, the source checkout, a project toolchain) that the disposable
  * checkout does not contain.
  */
-export const SYSTEM_CHECK_PATH_ALLOWLIST: readonly string[] = [
+const SYSTEM_CHECK_PATH_ALLOWLIST: readonly string[] = [
   '/bin', '/usr/bin', '/sbin', '/usr/sbin',
   '/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr',
 ]
@@ -588,7 +585,7 @@ export function isSystemCheckPath(candidate: string): boolean {
 }
 
 /** One shell word after quote removal and backslash unescaping. */
-export interface ShellToken { text: string; offset: number }
+interface ShellToken { text: string; offset: number }
 const SHELL_WORD_OPERATORS = new Set([';', '&', '|', '(', ')', '<', '>', '\n'])
 /**
  * R11-04: a bounded POSIX-ish word splitter. It resolves single/double quotes

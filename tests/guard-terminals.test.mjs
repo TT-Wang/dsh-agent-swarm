@@ -49,9 +49,12 @@ import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
-import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
+import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
+
+/** The model-visible code of the R12-F9 admission refusal. */
+const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 

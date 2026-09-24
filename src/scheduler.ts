@@ -20,7 +20,7 @@
  */
 import { errorChain, isQuotaExceededError } from '@deepseek-ai/dsh-llm'
 import type { ProviderOutage } from './types.ts'
-export const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
+const ADMISSION_REASONS = ['admitted', 'queue_full', 'budget_exceeded', 'lease_conflict', 'writer_busy'] as const
 export type AdmissionReason = (typeof ADMISSION_REASONS)[number]
 
 /**
@@ -118,7 +118,7 @@ export interface AdmissionUsage {
  * Host facts that outrank configured limits. Each is a short reason, so the
  * durable row explains the refusal without re-reading runtime state.
  */
-export interface AdmissionSignals {
+interface AdmissionSignals {
   budgetExceeded?: string
   leaseConflict?: string
   writerBusy?: string
@@ -154,7 +154,7 @@ export function scopeKeysOverlap(a: string, b: string): boolean {
 }
 
 /** The key a candidate is counted and matched under at each level. */
-export function candidateKeys(candidate: AdmissionCandidate): Record<LimitLevel, string> {
+function candidateKeys(candidate: AdmissionCandidate): Record<LimitLevel, string> {
   return { scope: candidate.scope, taskClass: candidate.taskClass, agent: candidate.memberId }
 }
 

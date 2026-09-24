@@ -30,7 +30,7 @@ import type { Actor, Artifact, EvidenceStatus, Member, Mission, Task, WorkerActi
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Why a fenced task still owes a stop, as the durable marker records it. */
-export type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
+type StopReason = NonNullable<Task['resumeAfterStop']>['reason']
 
 /**
  * A fence this task still owes: a stop marker recorded at the task's OWN epoch.
@@ -115,9 +115,9 @@ export function stopOutcome(causes: ReadonlySet<BlockCause>, reason: StopReason)
 }
 
 /** W6: bounded idle close-outs before the workspace is checkpointed and re-pended. */
-export const DEFAULT_IDLE_CLOSEOUTS = 2
+const DEFAULT_IDLE_CLOSEOUTS = 2
 /** Renewal allowance per model output token, so a long model call keeps its lease. */
-export const LEASE_MS_PER_OUTPUT_TOKEN = 20
+const LEASE_MS_PER_OUTPUT_TOKEN = 20
 /**
  * F1: the declared bound on how long one in-flight operation may hold an
  * attempt without recording anything. Inside the bound an operation is
@@ -132,9 +132,9 @@ export const LEASE_MS_PER_OUTPUT_TOKEN = 20
  * point where "bounded" is still plausible, while an operation that declares a
  * longer bound of its own is judged by that bound instead.
  */
-export const DEFAULT_OPERATION_BOUND_MS = 10 * 60_000
+const DEFAULT_OPERATION_BOUND_MS = 10 * 60_000
 /** Read the declared bound; invalid configuration keeps the default rather than reverting to 0. */
-export function declaredOperationBoundMs(config: { operationBoundMs?: unknown }): number {
+function declaredOperationBoundMs(config: { operationBoundMs?: unknown }): number {
   // The bound arrives on the runtime config. `RuntimeConfig` (src/types.ts) and
   // the plugin `Config` schema (src/index.ts) live outside this task's write
   // scope, so the read is structural and the two schema lines are recorded in
@@ -152,7 +152,7 @@ function formatElapsed(ms: number): string {
   return minutes < 60 ? `${minutes}m ${seconds % 60}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
 }
 /** F1: one in-flight operation that has produced nothing beyond the declared bound. */
-export interface SilentOperation {
+interface SilentOperation {
   attemptId: string
   ownerId: string
   activityId: string

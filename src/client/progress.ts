@@ -4,13 +4,13 @@ import { completionExempt } from '../task-graph.ts'
 import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
-export interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
-export const activityLabels = { model: 'Agent is thinking', tool: 'Running a tool', verification: 'Running verification', retry: 'Waiting to retry' } as const
+interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
+const activityLabels = { model: 'Agent is thinking', tool: 'Running a tool', verification: 'Running verification', retry: 'Waiting to retry' } as const
 const statusLabels: Record<string, string> = { staged: 'Preparing collaboration', paused: 'Mission paused', blocked: 'Mission needs attention', stopped: 'Mission stopped', completed: 'Collaboration completed' }
 const activityPriority = { verification: 4, tool: 3, retry: 2, model: 1 } as const
 
 /** Running task per owner id, built in one pass so per-member activity lookup is O(1) (F-34). */
-export function runningByOwner(tasks: readonly Task[]): Map<string, Task> {
+function runningByOwner(tasks: readonly Task[]): Map<string, Task> {
   const running = new Map<string, Task>()
   for (const task of tasks) {
     if (task.status !== 'running') continue
@@ -61,7 +61,7 @@ export function activityDuration(startedAt: number, now: number): { minutes: num
   return { minutes: Math.floor(elapsed / 60), seconds: elapsed % 60 }
 }
 
-export interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
+interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
 /**
  * Compatibility label: no writer in this repository's history emits
  * `attempt/started` (the live kind is `task/claimed`), but a historical card may
@@ -221,10 +221,10 @@ export function taskReasons(snapshot: Snapshot): Map<string, string> {
  * missing timestamp is reported as an unknown age instead of being invented.
  * ------------------------------------------------------------------------- */
 
-export type OwnerPhase = 'working' | 'recovering' | 'waiting-for-owner' | 'paused' | 'disconnected' | 'finished'
+type OwnerPhase = 'working' | 'recovering' | 'waiting-for-owner' | 'paused' | 'disconnected' | 'finished'
 
 /** One unresolved decision, with delivery state kept separate from consumption. */
-export interface OwnerDecisionView {
+interface OwnerDecisionView {
   /** The decision's subject: `taskId@epoch` or `mission:<id>`. */
   subject: string
   content: string
@@ -238,7 +238,7 @@ export interface OwnerDecisionView {
 }
 
 /** The recovery the runtime is currently performing for one subject. */
-export interface OwnerRecoveryView {
+interface OwnerRecoveryView {
   action: string
   subject: string
   /** Durable start of the current recovery step, when one is recorded. */
@@ -247,7 +247,7 @@ export interface OwnerRecoveryView {
   ageMs?: number
 }
 
-export interface SidebarStateView {
+interface SidebarStateView {
   phase: OwnerPhase
   /**
    * OWNER PASS 2026-09-11: `label`, `note`, `count`, `decision.content` and

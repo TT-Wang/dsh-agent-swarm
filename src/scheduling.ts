@@ -29,9 +29,9 @@ import { type Actor, type Attempt, type Member, type Mission, type Task } from '
  * planned; a submission that stays unreviewable past this bounded grace is a
  * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
  */
-export const STALL_GRACE_PASSES = 30
+const STALL_GRACE_PASSES = 30
 
-export const STALL_GRACE_MAX_MS = 1000
+const STALL_GRACE_MAX_MS = 1000
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
@@ -43,7 +43,7 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
  * that belongs to the task and epoch, so an unrelated notice can never consume
  * this decision.
  */
-export interface DispatchQuestion {
+interface DispatchQuestion {
   task: Task
   holder?: Member
   message: string
@@ -139,10 +139,10 @@ interface WedgeRecord {
 }
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
-export const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
+const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
 
 /** R16-D: one live attempt whose durable progress is past its declared bound. */
-export interface SilentAttempt {
+interface SilentAttempt {
   taskId: string
   epoch: number
   /** The notice subject (`taskId@epoch`). */
