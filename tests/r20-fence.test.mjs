@@ -21,47 +21,37 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { orchestratorCommands } from '../lib/trace.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const BUDGET = { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60, maxExperiments: 0 }
 const artifact = commit => ({ commit, baseCommit: '0'.repeat(40), workspace: '/w', changedPaths: ['src/x.ts'] })
 
-class StubWorkers {
-  constructor() { this.idle = new Set(); this.stopped = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) }
-  async start(member) { this.idle.add(member.id) }
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId); this.idle.delete(memberId) }
-  async dispose() {}
-  isIdle() { return true }
-  async prepareTask() {}
-  async captureArtifact(member) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } }
-  async verifyArtifact() { return [{ command: 'npm test', exitCode: 0, output: 'ok' }] }
-}
-
 async function fixture(t) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-r20-'))
-  const workers = new StubWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100 }, workers)
+  // A held stop is released before dispose whatever the test did, so a failed
+  // assertion reports itself instead of wedging the runner on a pending barrier:
+  // registered before makeRuntime's cleanup, which disposes the runtime.
+  const held = {}
+  t.after(() => { held.release?.() })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      autoIdle: true,
+      checks: [{ command: 'npm test', exitCode: 0, output: 'ok' }],
+      async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) },
+      async captureArtifact(member) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 },
+  })
   runtime.kick = () => {}
   runtime.pumpOutbox = () => {}
-  // A held stop is released before dispose whatever the test did, so a failed
-  // assertion reports itself instead of wedging the runner on a pending barrier.
-  const held = {}
-  t.after(async () => { held.release?.(); await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const holdStop = () => {
     workers.stop = async memberId => { workers.stopped.push(memberId); await new Promise(resolve => { held.release = resolve }) }
     return () => held.release?.()
   }
   const owner = { sessionId: `r20-owner-${Math.random()}` }
   const mission = runtime.create(owner, { title: 'R20', objective: 'Deliver verified work', workspace: directory,
-    scope: ['src/', 'docs/'], acceptance: ['done'], budget: { ...BUDGET } })
+    scope: ['src/', 'docs/'], acceptance: ['done'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -72,12 +62,7 @@ const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.i
 const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
 const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status
 const replay = f => orchestratorCommands(f.runtime.store.events(f.mission.id, 2000))
-async function until(predicate, what) {
-  const deadline = Date.now() + 2000
-  while (Date.now() < deadline && !predicate()) await new Promise(resolve => setTimeout(resolve, 10))
-  assert.ok(predicate(), what)
-}
-const barrierSettled = (f, task) => until(() => current(f, task).resumeAfterStop === undefined, 'the stop barrier settled')
+const barrierSettled = (f, task) => eventually(() => current(f, task).resumeAfterStop === undefined, 'the stop barrier settled', 2000)
 
 // ---------------------------------------------------------------------------
 
@@ -97,7 +82,7 @@ test('R20-1: fencing a revoked workspace drops the attempt, records the owner an
   assert.equal(row.resumeAfterStop?.epoch, row.epoch, 'the stop obligation is recorded at the current epoch')
   assert.equal(row.resumeAfterStop?.memberId, f.author.id)
   assert.equal(row.resumeAfterStop?.reason, 'invalidated', 'revocation is terminal for this host process; the barrier must not re-pend it')
-  await until(() => f.workers.stopped.includes(f.author.id), 'the fenced handle was actually stopped')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the fenced handle was actually stopped', 2000)
   await barrierSettled(f, task)
   assert.equal(current(f, task).status, 'blocked', 'the settled barrier leaves the revoked task blocked')
   // The fenced attempt can never resume against the revoked root.
@@ -157,7 +142,7 @@ test('R20-5: a fence in flight refuses every further step of the outgoing handle
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the claimed attempt steps normally')
 
   f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Withdraw the work' })
-  await until(() => f.workers.stopped.includes(f.author.id), 'the cancel barrier asked the adapter to stop the handle')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the cancel barrier asked the adapter to stop the handle', 2000)
   const charged = f.runtime.mission(f.mission.id).usedSteps
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the outgoing handle takes no further step while its stop is in flight')
   assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and the refused step is never charged to the mission')
@@ -172,7 +157,7 @@ test('R20-6: fresh input does not buy a step from a handle whose ceiling barrier
   await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the first step is admitted')
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the second step blocks at the task ceiling')
-  await until(() => f.workers.stopped.includes(f.author.id), 'the ceiling barrier asked the adapter to stop the exhausted handle')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the ceiling barrier asked the adapter to stop the exhausted handle', 2000)
 
   const charged = f.runtime.mission(f.mission.id).usedSteps
   // The adapter's recovery inbox preserves rejected input across the stop, so a

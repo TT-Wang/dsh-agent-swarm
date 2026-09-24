@@ -1,20 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { makeRuntime } from './faults/harness.mjs'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-r12-runtime-'))
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks }, async prepareWorkspace(m, id) { return `/isolated/${id}` },
-    async start() {}, async stop() {}, async dispose() {}, async deliver() {}, isIdle() { return false }, async prepareTask() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 10, workerStartTimeoutMs: 40, maxEvents: 2, maxMessageChars: 16000, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { dir: root, runtime, workers, budget } = await makeRuntime(t, {
+    config: { workerStartTimeoutMs: 40, maxEvents: 2, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxTasks: 20 },
+  })
   // These tests drive dispatch explicitly so incidental scheduling cannot mask a race.
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
@@ -23,12 +16,12 @@ async function fixture(t) {
   const a = await runtime.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'B', role: 'implementation' })
   const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Task', objective: 'Task', kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra })
-  return { runtime, workers, owner, mission, a, b, propose }
+  return { runtime, workers, budget, owner, mission, a, b, propose }
 }
 
 test('a failed tick guard and one failed mission do not suppress other guards or missions', async t => {
   const f = await fixture(t), calls = []
-  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget })
+  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget })
   f.runtime.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')
@@ -120,7 +113,7 @@ test('retired members and late start failures cannot resurrect membership', asyn
   f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', f.a.id); member.phase = 'stopped'; f.runtime.store.put('members', member) })
   f.runtime.onStartFailure(f.mission, f.a, new Error('late bootstrap failure'))
   assert.equal(f.runtime.store.get('members', f.a.id).phase, 'stopped')
-  assert.equal(f.runtime.updateBudget(f.owner, f.mission.id, { ...budget, maxWorkers: 1 }).maxWorkers, 1)
+  assert.equal(f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxWorkers: 1 }).maxWorkers, 1)
 })
 
 test('submission and missing-review identity survive event-window truncation and cache loss', async t => {

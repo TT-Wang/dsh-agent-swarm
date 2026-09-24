@@ -1,28 +1,24 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { orchestratorCommands, ReplayGraphError, ReplayTruncationError } from '../lib/trace.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan, planAdvisories } from '../lib/plans.js'
 import { classifyCheck, taskCeilingExhaustion } from '../lib/admission.js'
 import { taskGraphIndex, selectAcceptedDelivery } from '../lib/task-graph.js'
 import { liveCarrier, proposalAllowance } from '../lib/arena.js'
 import { boardIndex, deliverableTask } from '../lib/types/client/projection.js'
+import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-class Workers {
-  prepared = []; starts = []; stopped = []; delivered = []
-  bind(callbacks) { this.callbacks = callbacks }
+/** `prepared` counts prepared workspaces (not tasks); `stop` can be held by `stopGate`. */
+class Workers extends FakeWorkers {
+  delivered = []
   async prepareWorkspace(mission, id) { this.prepared.push(id); return join(mission.workspace, id) }
-  async start(spec) { this.starts.push(spec) }
   async stop(id) { this.stopping?.resolve(); if (this.stopGate) await this.stopGate; this.stopped.push(id) }
   async prepareTask() {}
   async deliver(member, delivery) { this.delivered.push({ member, delivery }) }
-  isIdle() { return false }
-  async dispose() {}
 }
 function plan(workspace) {
   return { title: 'Saved request', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget: { ...budget },
@@ -32,10 +28,11 @@ function plan(workspace) {
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code', maxRecoveryAttempts: 2 }] }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-rule-plan-'))
-  const workers = new Workers(), runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
+  // The gate is dropped before makeRuntime's cleanup disposes the runtime.
+  const workers = new Workers()
+  t.after(() => { workers.stopGate = undefined })
+  const { dir: directory, runtime } = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }, input = plan(directory)
-  t.after(async () => { workers.stopGate = undefined; await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, workers, runtime, owner, input }
 }
 function failAfterAdmission(f) {
