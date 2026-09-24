@@ -593,7 +593,13 @@ test('Revocation on the dispatch path fences exactly once, and work resumed afte
   // The owner resumes it before the human restores the root: the fence blocks it again instead of leaving it pending.
   runtime.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'retry the work')
   for (let pass = 0; pass < 3; pass++) { await runtime.tick(); await runtime.settle(f.mission.id) }
-  assert.equal(runtime.store.get('tasks', task.id).status, 'blocked', 'work that became schedulable again is fenced again')
+  const fenced = runtime.store.get('tasks', task.id)
+  assert.equal(fenced.status, 'blocked', 'work that became schedulable again is fenced again')
+  assert.match(fenced.output, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  assert.doesNotMatch(fenced.output, /preparation failed/, 'fenced, not failed as a preparation')
+  assert.equal(runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/preparation-failed').length, 0, 'no preparation failure is recorded')
+  assert.deepEqual(revokedEvents(runtime, f.mission.id).map(event => event.data.blockedTasks), [[task.id], [task.id]], 'the second fence records the work it blocked')
+  assert.equal(workspaceNotices(runtime, f.mission.id).length, 1, 'the owner already holds the revocation decision')
 })
 
 test('Revocation on the claim path refuses with the typed error and fences once', async t => {
@@ -648,6 +654,37 @@ test('Revocation found by the adapter at a worker start fences once with the typ
   const row = restarted.store.get('members', member.id)
   assert.equal(row.startFailures, undefined, 'a revoked root spends no start credit')
   assert.notEqual(row.phase, 'stopped', 'the member is not retired')
+})
+
+/**
+ * The fence is idempotent from mission state: once nothing schedulable is left
+ * and the owner holds the revocation decision, a later detection records
+ * nothing, however the board moved in between (an owner exit, an admission).
+ * Every pass detects it again, since a worker start is re-validated first.
+ */
+test('A fenced mission records one revocation event and wakes the owner once, across owner exits and later detections', async t => {
+  const { granted, project } = await fixture(t)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants), clock: new FakeClock() })
+  await runtime.start()
+  const f = await grantedMission(runtime, project, granted, 'owner-idempotent')
+  await runtime.settle(f.mission.id)
+  grants.grants.length = 0
+  const first = f.propose({ title: 'First', assigneeId: f.author.id }), second = f.propose({ title: 'Second', assigneeId: f.reviewer.id })
+  const passes = async () => { for (let pass = 0; pass < 3; pass++) { await runtime.tick(); await runtime.settle(f.mission.id) } }
+  const once = when => {
+    assert.equal(revokedEvents(runtime, f.mission.id).length, 1, `one revocation event ${when}`)
+    assert.equal(workspaceNotices(runtime, f.mission.id).length, 1, `one owner notice ${when}`)
+  }
+  await passes()
+  assert.deepEqual([first, second].map(task => runtime.store.get('tasks', task.id).status), ['blocked', 'blocked'])
+  once('after the fence')
+  // An exit the decision names changes the board; later detections still record nothing.
+  runtime.cancel(f.owner, f.mission.id, { taskId: second.id, reason: 'withdrawn while the root is revoked' })
+  await passes()
+  once('after an owner exit')
+  await assert.rejects(runtime.addMember(f.owner, f.mission.id, { name: 'Third', role: 'implementation' }), revokedError)
+  once('after a refused admission')
 })
 
 test('A record from before the anchor existed is judged by the configured roots alone', async t => {

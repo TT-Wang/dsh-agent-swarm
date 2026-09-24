@@ -371,6 +371,11 @@ export function guardTerminalKey(chain: GuardChainId, code: string, fingerprint:
   return `guard-terminal:${chain}:${code}:${fingerprint}`
 }
 
+/** The dedup `emitGuardTerminal` applies: the owner holds `chain`'s decision for this board, `question:<id>` or `localKey`. */
+export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, chain: GuardChainId, fingerprint: string): boolean {
+  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: guardTerminalKey(chain, GUARD_TERMINAL_CODES[chain], fingerprint), from: 'runtime' })
+}
+
 /**
  * Emit one guard-chain terminal: the durable decision request and the owner
  * notice that make it unconditional.
@@ -403,8 +408,8 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
   const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
+  if (guardTerminalHeld(rt, missionId, chain, fingerprint)) return terminal
   const key = guardTerminalKey(chain, terminal.code, fingerprint)
-  if (hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return terminal
   try {
     rt.commit(missionId, () => {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so
