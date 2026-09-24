@@ -167,7 +167,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 实时增量数据异常时，侧栏保留最后有效视图，并退避重试完整快照；持续异常会明确显示连接故障，不会虚构进度。主 agent 可以在暂停、停止或完成后结算已有问题，无需重新启动 worker。Trace 指标明确标注所覆盖的 span 窗口及截断状态，完整持久记录另行保留。
 
-Worker 隔离依赖配置的 Harness 沙箱；共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程、准入阶段同步执行的 ignore 探测也保留了进程管理例外，详见[已知限制](known-limitations.md)。
+Worker 隔离依赖配置的 Harness 沙箱；共享临时目录仍可能成为成员之间的通信路径。交付阶段的 Git 子进程也保留了进程管理例外，详见[已知限制](known-limitations.md)。
 
 <a id="companion-context-policy"></a>
 

@@ -165,7 +165,7 @@ Snapshot selection follows the current Git index: a file removed from the index 
 
 An invalid live update retains the last valid view and retries a full snapshot with backoff. Continued invalid data stays visibly disconnected rather than displaying invented progress. Owners can settle existing questions after pause, stop or completion without resuming workers. Trace metrics describe a bounded span window and expose its truncation explicitly; full durable records remain available separately.
 
-Worker confinement follows the configured Harness sandbox. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses and synchronous admission ignore probes also retain the process-management exceptions described in [known limitations](known-limitations.md).
+Worker confinement follows the configured Harness sandbox. Shared temporary directories remain a possible cross-member channel. Delivery Git subprocesses also retain the process-management exceptions described in [known limitations](known-limitations.md).
 
 ## Companion context policy
 
