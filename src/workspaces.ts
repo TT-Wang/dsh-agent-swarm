@@ -5,11 +5,10 @@ import { StringDecoder } from 'node:string_decoder'
 import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import { reauthorizeWorkspace, WorkspaceRevokedError } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline, WorkspaceGrantSnapshot } from './types.js'
+import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
 
 /** Full-repository path inventories are metadata, not user-visible check output. */
@@ -91,16 +90,6 @@ export interface WorkspaceOptions {
    * Required for the same reason as `onCleanupFailure`.
    */
   onRecoveryFallback(info: RecoveryFallback): void
-  /**
-   * Human-authorized roots loaded once at plugin start. When supplied, baseline
-   * preparation, the entry of every planning snapshot and member worktree,
-   * re-validates the mission's recorded authorization with the runtime's rule
-   * (`reauthorizeWorkspace`), because a worker start and a planning snapshot
-   * reach it without a preceding runtime check; a refusal throws the typed
-   * `WorkspaceRevokedError` the runtime fences on. Absent in unit fixtures that
-   * drive `Workspaces` directly; the recorded admission result then stands.
-   */
-  grants?: WorkspaceGrantSnapshot
   /**
    * R11-19: maximum declared-check executions per host process. Verifications
    * beyond the limit wait in a FIFO queue; every wait and run is measured and
@@ -932,10 +921,8 @@ export class Workspaces {
   }
 
   /** Freeze one source baseline before planning; all members and restarts reuse it. */
-  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
+  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
     signal?.throwIfAborted()
-    const authorization = this.options.grants === undefined ? undefined : await reauthorizeWorkspace(mission, this.options.grants)
-    if (authorization?.ok === false) throw new WorkspaceRevokedError(authorization.diagnostic)
     const existing = this.baselines.get(mission.id)
     if (existing !== undefined) {
       const baseline = await existing

@@ -4,12 +4,10 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { access, mkdir, rm, writeFile } from 'node:fs/promises'
 import { makeRepo, makeWorkspaces } from './faults/harness.mjs'
-import { loadWorkspaceGrants } from '../lib/authorization.js'
 
 async function fixture(t) {
   const repo = await makeRepo('zero-check-verification', { '.gitignore': 'node_modules/\n', 'research.md': 'baseline\n' })
-  const grants = await loadWorkspaceGrants([{ path: repo.source }])
-  const workspaces = makeWorkspaces(repo.root, { checkConcurrency: 1, grants })
+  const workspaces = makeWorkspaces(repo.root, { checkConcurrency: 1 })
   t.after(async () => { await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   await mkdir(join(repo.source, 'node_modules'))
   await writeFile(join(repo.source, 'node_modules', 'fixture-dependency'), 'installed\n')
@@ -22,7 +20,7 @@ async function fixture(t) {
   const checkout = t.mock.method(workspaces, 'worktreeAdd')
   const dependencies = t.mock.method(workspaces, 'linkDependencyDirs')
   const envelope = workspaces.checkEnvelope()
-  return { ...repo, grants, workspaces, mission, member, task, artifact,
+  return { ...repo, workspaces, mission, member, task, artifact,
     verify: (signal, selectedArtifact = artifact, selectedMember = member) => workspaces.verifyArtifact(selectedMember, task, selectedArtifact, signal),
     async assertNoExecution() {
       assert.equal(checkout.mock.callCount(), 0, 'empty checks must not create a disposable worktree')

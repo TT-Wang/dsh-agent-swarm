@@ -1093,7 +1093,7 @@ export interface CheckSyntaxIssue { index: number; message: string }
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
   /** Freeze once before planning; optional only for adapters without Git execution. */
-  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
+  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
@@ -1199,8 +1199,9 @@ export interface RuntimeConfig {
    * The human-authorized roots, loaded once from plugin configuration at
    * start: the one representation every admission and re-validation reads,
    * judged at `now`, the runtime clock's instant. When present the runtime
-   * re-validates every mission before its workspace preparations and fences a
-   * mission whose workspace no configured root authorizes any more; when absent
+   * re-validates a mission before every adapter call that can reach its
+   * workspace (worker start, baseline, worktree, task preparation, verification
+   * checkout) and fences one no configured root authorizes any more; when absent
    * (unit runtimes and adapters without Git) the recorded admission result
    * stands. Never re-loaded at runtime and never a model-callable surface.
    */

@@ -156,7 +156,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // instead of starting empty. Applying here (not in a model tool) keeps the
   // swap outside any live runtime's ownership.
   const restored = applyPendingRestore(config.statePath)
-  const workers = new HarnessWorkers(ctx, { ...config, grants })
+  const workers = new HarnessWorkers(ctx, config)
   // The profile passes unknown keys through; the runtime clock and the manual
   // tick are never among them.
   const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants }, workers)
