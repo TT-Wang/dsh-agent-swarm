@@ -20,10 +20,10 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { authorIdsOf, canBorrowTask, canOwnReview } from './assignment.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
-import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
@@ -472,7 +472,7 @@ export class SwarmRuntime {
   private readonly scheduling = new Scheduling(this)
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
-  reviewable(task: Task, tasks: Task[]): boolean { return this.scheduling.reviewable(task, tasks) }
+  reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
   stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
   private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
   private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
@@ -480,7 +480,7 @@ export class SwarmRuntime {
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
-  private reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
+  reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
   /** R11-01: a route inside its provider outage window waits for its next probe, so it is re-routed work's last resort. */
   private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
     const target = this.scheduling.rerouteTarget(missionId, task, failedId)
@@ -2307,6 +2307,9 @@ export class SwarmRuntime {
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
     if (input.to !== undefined && task.reviewOf !== undefined && !canOwnReview(this.task(missionId, task.reviewOf), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    // The source side of the same rule: the new owner must stay independent of this task's own reviews.
+    const stranded = input.to === undefined ? undefined : strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: input.to })
+    if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${input.to} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Hand off to another member with \`to\`, or omit \`to\` to release the task.`)
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
@@ -2458,16 +2461,6 @@ export class SwarmRuntime {
     return { retired, released }
   }
   /**
-   * F2: the live independent review of a submitted source, if one can still
-   * reach a verdict. Uses the shared admission predicate so admission,
-   * scheduling and the owner notice agree on what "has a review" means.
-   */
-  private liveReview(missionId: string, source: Task): Task | undefined {
-    const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
-    return liveReviewFor(this.store.list('tasks', missionId), source, live,
-      review => review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
-  }
-  /**
    * F2/R11-16: why a freshly submitted artifact has no review path, or
    * undefined when it has one or produced no reviewable artifact. Reviewability
    * is derived from the captured artifact, never from the declared kind: a
@@ -2476,7 +2469,7 @@ export class SwarmRuntime {
    */
   private missingReviewPath(task: Task): string | undefined {
     if (task.artifact === undefined) return undefined
-    if (this.liveReview(task.missionId, task) !== undefined) return undefined
+    if (this.reviewable(task, this.store.list('tasks', task.missionId))) return undefined
     return `no live independent verification task reviews this submitted ${task.kind} artifact; a review (kind verification, reviewOf ${task.id}) must be pending or running and assigned to a member who did not author it`
   }
   /**
@@ -2495,7 +2488,7 @@ export class SwarmRuntime {
     const unreviewable: Task[] = []
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
-      if (this.liveReview(mission.id, source) !== undefined) continue
+      if (this.reviewable(source, tasks, members)) continue
       const submission = this.latestSubmission(mission.id, source.id)
       if (submission !== undefined && submission.age < grace) continue
       this.reportMissingReview(mission, source, submission?.seq ?? 0)
@@ -2901,8 +2894,14 @@ export class SwarmRuntime {
     } else if (implementations.length === 1 && integrations.length && !integrations.some(task => dependsOn(task.key, implementations[0]!.key))) {
       issues.push(`The integration task must depend on implementation ${implementations[0]!.key}, or be omitted so the reviewed implementation is delivered directly`)
     }
-    if (issues.length) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
-    const paired = pairReviews(plan)
+    // The host-added reviews and their maxTasks refusal belong to the same
+    // repair round; alone, that refusal keeps its own code.
+    let paired: PlanInput | undefined
+    try { paired = pairReviews(plan) } catch (error) {
+      if (!issues.length || !(error instanceof AdmissionError)) throw error
+      issues.push(error.message)
+    }
+    if (issues.length || paired === undefined) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
     // New automatic plans use preferences; old/manual task rows keep their binding.
     for (const task of paired.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
     return paired
@@ -3036,7 +3035,21 @@ export class SwarmRuntime {
       note: 'Read-only registry over durable records: artifact commit, task, mission, acceptance state and review verdict. Per-mission artifact refs are private; this is the sanctioned cross-mission read path. Reading it changes no state.',
     }
   }
-  drafts(actor: Actor): DraftPlan[] { return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded') }
+  /**
+   * The owner's drafts, each as it will launch. An editable draft saved before
+   * the host paired reviews is paired on read, so the editor shows the review
+   * it will launch (its next save stores it); when that pairing puts the draft
+   * over `maxTasks`, the launch refusal is its `error` before launch.
+   */
+  drafts(actor: Actor): DraftPlan[] {
+    return this.store.list('drafts').filter(d => d.ownerSessionId === actor.sessionId && d.status !== 'discarded').map(draft => {
+      if (draft.status !== 'draft' && draft.status !== 'failed') return draft
+      try {
+        const input = pairReviews(draft.input)
+        return input === draft.input ? draft : { ...draft, input }
+      } catch (error) { return { ...draft, error: error instanceof Error ? error.message : String(error) } }
+    })
+  }
   private ownedDraft(actor: Actor, draftId: string): DraftPlan {
     actor.signal?.throwIfAborted()
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
@@ -3527,7 +3540,7 @@ export class SwarmRuntime {
   completionError(mission: Mission): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     if (!tasks.length) return 'Mission still has unfinished or blocked required work'
-    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !(task.experiment && task.status === 'blocked'))
+    const unfinished = tasks.filter(task => !['accepted', 'cancelled'].includes(task.status) && !completionExempt(task, tasks))
     if (unfinished.length) return `Mission still has unfinished or blocked required work: ${unfinished.map(task => `${task.id} (${task.status})`).join(', ')}`
     const accepted = tasks.filter(task => task.status === 'accepted')
     // Verification acceptance text is free-form review criteria; only deliverable
@@ -3535,7 +3548,7 @@ export class SwarmRuntime {
     const deliverables = accepted.filter(task => task.kind !== 'verification' && (task.kind === 'research' || task.artifact !== undefined))
     const uncovered = mission.acceptance.filter(criterion => !deliverables.some(task => Array.isArray(task.acceptance) && task.acceptance.includes(criterion)))
     if (uncovered.length) {
-      const blocked = tasks.filter(task => task.status === 'blocked' && !task.experiment).map(task => task.id)
+      const blocked = tasks.filter(task => task.status === 'blocked' && !completionExempt(task, tasks)).map(task => task.id)
       return `Accepted tasks do not cover every mission acceptance criterion: ${JSON.stringify(uncovered)}${blocked.length ? `. Blocked work still needs repair: ${blocked.join(', ')}` : ''}`
     }
     if (tasks.some(task => ['implementation', 'integration'].includes(task.kind) && task.status !== 'cancelled')) {
@@ -3695,11 +3708,8 @@ export class SwarmRuntime {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
         if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
-        // The new executor becomes an author: a live review of this task assigned
-        // to that member could then never be owned.
-        const paired = this.store.list('tasks', missionId).find(review => review.reviewOf === task.id && !TERMINAL_STATES.has(review.status)
-          && review.assigneeId !== undefined && !canOwnReview({ assigneeId: member.id }, review.assigneeId))
-        if (paired !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${member.id} is the assignee of review ${paired.id} of task ${task.id}, and an author can never review its own work. Choose another member as \`assigneeId\` in \`changes\` with \`swarm_control\`, or move that review to another member first.`)
+        const stranded = strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: member.id })
+        if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${member.id} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Pass another member as \`assigneeId\` in \`changes\`, or first amend review ${stranded.id}'s \`assigneeId\` with \`swarm_control\`.`)
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }

@@ -11,6 +11,15 @@ const localDeadline = (value?: number) => value === undefined ? '' : new Date(va
 export function cleanPlan(input: PlanInput): PlanInput {
   return { ...input, scope: cleanLines(input.scope), acceptance: cleanLines(input.acceptance), tasks: input.tasks.map(task => ({ ...task, scope: cleanLines(task.scope), acceptance: cleanLines(task.acceptance), outputs: task.outputs ? cleanLines(task.outputs) : undefined, checks: task.checks ? cleanLines(task.checks) : undefined })) }
 }
+/**
+ * Remove one task and every verification row that reviews it (the review the
+ * host added, or an authored one): a review whose source is gone could never
+ * be saved. Dependencies on any removed row are dropped with it.
+ */
+export function removeTask(input: PlanInput, key: string): PlanInput {
+  const removed = new Set([key, ...input.tasks.filter(task => task.reviewOf === key).map(task => task.key)])
+  return { ...input, tasks: input.tasks.filter(task => !removed.has(task.key)).map(task => ({ ...task, dependencies: task.dependencies?.filter(dependency => !removed.has(dependency)) })) }
+}
 const freshKey = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 /** Read-only subset of the native model directory's advertised route metadata. */
 interface CatalogGroup { id: string; name: string; models: Array<{ id: string; name: string; reasoning?: { efforts: Array<{ id: string; name: string }>; defaultEffort?: string } }> }
@@ -133,7 +142,7 @@ export function DraftEditor({ sessionId, workspace, budget, draft, directory, re
       </section>
       <section className="sw-section"><div className="sw-row"><h3>{t('Tasks')}</h3><button type="button" onClick={() => update({ tasks: [...input.tasks, { key: freshKey('task'), workstreamKey: input.workstreams[0]?.key ?? '', title: '', objective: '', kind: 'research', scope: [...input.scope], acceptance: [...input.acceptance], dependencies: [] }] })}>{t('Add task')}</button></div>
         {input.tasks.map(task => <details className="sw-edit-item" key={task.key} open><summary>{task.title || task.key} · {task.kind}</summary>
-          <div className="sw-row"><code>{task.key}</code><button type="button" onClick={() => update({ tasks: input.tasks.filter(item => item.key !== task.key).map(item => ({ ...item, dependencies: item.dependencies?.filter(key => key !== task.key), ...(item.reviewOf === task.key ? { reviewOf: undefined } : {}) })) })}>{t('Remove')}</button></div>
+          <div className="sw-row"><code>{task.key}</code><button type="button" onClick={() => update({ tasks: removeTask(input, task.key).tasks })}>{t('Remove')}</button></div>
           <label>{t('Title')}<input value={task.title} required onChange={event => updateTask(task.key, { title: event.currentTarget.value })} /></label>
           <label>{t('Objective')}<textarea value={task.objective} required onChange={event => updateTask(task.key, { objective: event.currentTarget.value })} /></label>
           <div className="sw-fields"><label>{t('Kind')}<select value={task.kind} onChange={event => updateTask(task.key, { kind: event.currentTarget.value as PlanTask['kind'], reviewOf: undefined })}>{['research', 'implementation', 'integration', 'verification'].map(kind => <option key={kind}>{kind}</option>)}</select></label>

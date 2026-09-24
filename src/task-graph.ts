@@ -176,3 +176,16 @@ export function selectAcceptedDelivery(tasks: readonly Task[]): Task {
   if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required; repair or combine the current delivery obligations before completing')
   return finals[0]!
 }
+
+/**
+ * Completion's one exemption: a blocked optional experiment, and a blocked
+ * review of one, which inherits it. A review is not itself an experiment (the
+ * host-added one never is), yet when it rejects the experiment it only records
+ * that the optional work failed, so it cannot hold the mission open either.
+ */
+export function completionExempt(task: Pick<Task, 'status' | 'experiment' | 'reviewOf'>, tasks: readonly Task[]): boolean {
+  if (task.status !== 'blocked') return false
+  if (task.experiment) return true
+  const source = task.reviewOf === undefined ? undefined : tasks.find(candidate => candidate.id === task.reviewOf)
+  return source !== undefined && completionExempt(source, tasks)
+}

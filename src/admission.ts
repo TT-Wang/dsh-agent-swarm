@@ -50,12 +50,21 @@ export function normalizeReviewDependencies(kind: string, reviewOf: string | und
 export interface ReviewPathCandidate extends AssignmentCandidate {
   id: string
   kind: string
+  resumeAfterStop?: { epoch?: number }
 }
 
-/** A live review needs at least one live member allowed to own it independently. */
-export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], source: AuthoredTask & { id: string }, liveMemberIds: ReadonlySet<string>,
-  isLiveStatus: (review: T) => boolean = review => review.status === 'pending' || review.status === 'running'): T | undefined {
-  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id && isLiveStatus(review)
+/**
+ * The one live-review rule: the review of `source` that can still reach a
+ * verdict. Its status is pending, running or parked (blocked behind a stop at
+ * its own epoch, the `stopPending` marker, so it re-pends once the stop
+ * settles), and at least one live member may own it: independently
+ * (`canOwnReview`) and by assignment (`assignmentAllows`). A review nobody live
+ * may own is no path. The dispatcher's stall, the owner notices, the arena
+ * digest and the runtime's own review admission all answer from this.
+ */
+export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], source: AuthoredTask & { id: string }, liveMemberIds: ReadonlySet<string>): T | undefined {
+  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id
+    && (review.status === 'pending' || review.status === 'running' || (review.status === 'blocked' && review.resumeAfterStop !== undefined && review.resumeAfterStop.epoch === review.epoch))
     && [...liveMemberIds].some(memberId => canOwnReview(source, memberId) && assignmentAllows(review, memberId, reviews)))
 }
 

@@ -17,6 +17,8 @@
 import { createHash } from 'node:crypto'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { assignmentAllows, canOwnReview } from './assignment.ts'
+import { liveReviewFor } from './admission.ts'
+import { memberPhaseOf } from './projection.ts'
 import type { Delivery, Escalation, Evidence, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /** Owner-observable board, as durable records; no wall-clock value participates. */
@@ -45,9 +47,9 @@ export function dependencyAccepted(tasks: readonly Task[], dependencyId: string)
   return liveCarrier(tasks, dependencyId)?.status === 'accepted'
 }
 
-/** A submitted task's live review path: a non-terminal verification task reviewing it. */
-function hasReviewPath(tasks: readonly Task[], taskId: string): boolean {
-  return tasks.some(candidate => candidate.reviewOf === taskId && ['pending', 'running', 'submitted'].includes(candidate.status))
+/** A submitted task's live review path: the scheduler's one live-review rule (`liveReviewFor`). */
+function hasReviewPath(tasks: readonly Task[], members: readonly Member[], source: Task): boolean {
+  return liveReviewFor(tasks, source, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
 }
 
 /**
@@ -110,7 +112,7 @@ function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pe
     tasks: [...tasks].sort(byId).map(task => [task.id, task.status, task.attempt?.ownerId ?? null]),
     ready: readiness.ready,
     notReady: readiness.notReady,
-    submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, task.id)).map(task => task.id).sort(),
+    submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, members, task)).map(task => task.id).sort(),
     members: [...members].sort(byId).map(member => [member.id, member.status]),
     pendingDeliveries: deliveries.filter(delivery => awaitsDelivery(delivery) && !(excludeNotices && delivery.notice !== undefined)).length,
     challenged: evidence.filter(item => item.status === 'challenged').map(item => item.id).sort(),
