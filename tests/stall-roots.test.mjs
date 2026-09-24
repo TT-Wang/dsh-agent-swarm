@@ -5,39 +5,22 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { waitsLegitimately } from '../lib/notices.js'
 import { wakePrecision } from './instruments.mjs'
-import { tempDirectory } from './temp-root.mjs'
-import { FakeClock } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-async function eventually(read, message, timeoutMs = 5000) {
-  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline; await sleep(5)) { const value = read(); if (value) return value }
-  assert.fail(`timed out: ${message}`)
-}
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
 
-async function fixture(t, config = {}) {
-  const directory = await tempDirectory('swarm-stall-roots-')
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, new Workers())
+/**
+ * A started runtime with one member, on the shared fixture. With a `clock`
+ * (FakeClock) the runtime reads it and runs no tick timer: the test moves the
+ * clock and drives `runtime.tick()` itself.
+ */
+async function fixture(t, { clock, ...config } = {}) {
+  const workers = new FakeWorkers({ autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers, clock, config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 } })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'stall-owner' }
   const mission = runtime.create(owner, { title: 'Stall roots', objective: 'Name the root', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
@@ -49,7 +32,7 @@ async function fixture(t, config = {}) {
   const notices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const stallRoots = () => notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('stall-root:'))
   const fallthroughs = () => notices().filter(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith('fallthrough:'))
-  return { directory, runtime, owner, mission, member, actor, propose, block, cancel, notices, stallRoots, fallthroughs }
+  return { directory, runtime, clock, owner, mission, member, actor, propose, block, cancel, notices, stallRoots, fallthroughs }
 }
 
 test('R14-F2(b): a blocked root is named once per root@epoch while a healthy sibling runs', async t => {
@@ -383,7 +366,7 @@ for (const repaired of [true, false]) {
     // while the root's repair was already running. The clock and the ticks are
     // driven by hand: each reminder interval is one clock step and one tick.
     const clock = new FakeClock()
-    const f = await fixture(t, { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 })
+    const f = await fixture(t, { clock })
     const followupMs = f.runtime.notices.obligationFollowupMs = 300
     const reminderIntervals = async count => { for (let step = 0; step < count; step += 1) { clock.advance(followupMs); await f.runtime.tick() } }
     const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
