@@ -1374,9 +1374,20 @@ export class Notices {
         const submission = this.rt.latestSubmission(missionId, task.id)
         return submission === undefined || submission.age >= grace
       })
-      if (!ripe.length) return false
+      // On a board with no other progress (`reviewPathStalled`) the runtime's
+      // own review admission owns every submitted artifact: its pass admits the
+      // review or names the exact blocker, so a second, generic fact here would
+      // only race it. This branch names the rest: submissions behind a board
+      // that keeps running, as its body says, everything when a wedged pass
+      // never reaches that admission, and a legacy submission without an
+      // artifact, which that admission skips.
+      const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
+      const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
+      if (!named.length) return false
+      const diagnostic = `Submitted artifact ${named.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running`
+      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: named[0]!.id })
       this.rt.commit(missionId, () => {
-        this.notify(missionId, `Submitted artifact ${ripe.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${ripe[0]!.id}) or cancel the source task.`, view.subjectsOf(ripe), { family: 'review-blocked', trigger: 'task/review-blocked' })
+        this.notify(missionId, content, view.subjectsOf(named), { family: 'review-blocked', trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason: diagnostic, statement })
       })
       return true
     }

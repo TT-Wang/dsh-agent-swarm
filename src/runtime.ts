@@ -480,7 +480,7 @@ export class SwarmRuntime {
   private openPass(missionId: string): SchedulingPass | undefined { return this.scheduling.openPass(missionId) }
   private closePass(missionId: string, pass: SchedulingPass): void { return this.scheduling.closePass(missionId, pass) }
   private checkSchedulingPasses(): void { return this.scheduling.checkSchedulingPasses() }
-  private reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
+  reviewPathStalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.reviewPathStalled(tasks, members) }
   /** R11-01: a route inside its provider outage window waits for its next probe, so it is re-routed work's last resort. */
   private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
     const target = this.scheduling.rerouteTarget(missionId, task, failedId)

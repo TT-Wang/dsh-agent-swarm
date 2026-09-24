@@ -39,7 +39,7 @@ import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
-import { FakeWorkers } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers } from './faults/harness.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -406,8 +406,16 @@ test('R17-G2e: the parked-holder body replays from the running task row alone', 
   assertDecision(notice, 'parked')
 })
 
+/** A hand-driven clock and tick: which generator speaks first can no longer depend on host load. */
+async function clockedFixture(t) {
+  const clock = new FakeClock()
+  const f = await fixture(t, { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 })
+  const pass = async () => { clock.advance(1_500); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  return { ...f, clock, pass }
+}
+
 test('R17-G2f: the review-blocked body replays from the submitted source row and the recorded reason alone', async t => {
-  const f = await fixture(t)
+  const f = await clockedFixture(t)
   const member = await f.addMember('Ada')
   // A second, independent member makes the automatic review admissible; with
   // only the author present the path is blocked instead of admitted.
@@ -415,9 +423,19 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   const source = f.propose('Reviewable work', { assigneeId: member.id })
   const claimed = await f.runtime.claim({ sessionId: member.sessionId }, f.mission.id, source.id)
   await f.runtime.submit({ sessionId: member.sessionId }, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === source.id), 'the automatic review is admitted')
+  await f.pass()
+  const review = f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === source.id)
+  assert.ok(review, 'the automatic review is admitted')
   f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'withdrawn for the replay check' })
-  const notice = await eventually(() => ownerNotice(f, 'review-blocked:'), 'the blocked review path was reported')
+  // The off-pass witness (a tick or a transition between passes) may judge the
+  // board before the next pass does; under load it did. Nothing else can
+  // progress, so the runtime's own review admission owns this board and the
+  // witness adds no second, generic review-blocked fact whichever runs first.
+  f.runtime.notices.ensureWitness(f.mission.id, { offPass: true })
+  await f.pass()
+  const blocked = f.ownerNotices().filter(delivery => delivery.notice?.dedupKey?.startsWith('review-blocked:'))
+  assert.equal(blocked.length, 1, `one review-blocked fact for one blocked path: ${JSON.stringify(blocked.map(delivery => delivery.content.slice(0, 80)))}`)
+  const [notice] = blocked
   const recorded = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/review-blocked').at(-1)
   assert.ok(recorded, 'the reason is durable in the task/review-blocked event')
   assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'the body is the review-blocked template and states no count')
@@ -447,6 +465,28 @@ test('R17-G8: the admitted owner message records consumption after inbox claim',
   const recorded = row.notice.consumedAt
   f.ctx.emit('session/event', { header: { id: f.owner.sessionId } }, { type: 'user/message', data: message })
   assert.equal(f.runtime.store.get('deliveries', notice.id).notice.consumedAt, recorded)
+})
+
+test('R17-G2g: the review-blocked notice beside running work is the template too, with its statement and recorded reason', async t => {
+  const f = await clockedFixture(t)
+  const author = await f.addMember('Ada')
+  const other = await f.addMember('Grace')
+  const source = f.propose('Reviewable work', { assigneeId: author.id })
+  const claimed = await f.runtime.claim({ sessionId: author.sessionId }, f.mission.id, source.id)
+  await f.runtime.submit({ sessionId: author.sessionId }, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  // Unrelated work keeps running, so the runtime admits no automatic review and
+  // the witness path is the one that names the unreviewable submission.
+  const running = f.propose('Unrelated work', { assigneeId: other.id, kind: 'research', checks: [] })
+  await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, running.id)
+  await f.pass()
+  const notice = ownerNotice(f, 'review-blocked:')
+  assert.ok(notice, 'the unreviewable submission is named while the board keeps running')
+  const row = f.runtime.store.get('tasks', source.id)
+  assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'every review-blocked body states its template')
+  assert.deepEqual(notice.notice.subjects, [subjectOf(row)])
+  assert.match(notice.notice.reason, /has no live independent review path/)
+  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: notice.notice.reason, sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
+  assertDecision(notice, 'review-blocked')
 })
 
 test('R17-G2: every reviewed notice body replays from the rows it cites', async t => {
