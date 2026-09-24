@@ -406,7 +406,7 @@ async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T
   try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
 }
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
-/** Verification checkouts this process is using or removing; any other under a mission's `verification/` was left by one that died. */
+/** Verification checkouts in flight in this process; any other under a mission's `verification/` was left by one that died. */
 const verificationCheckouts = new Set<string>()
 
 /**
@@ -2034,7 +2034,7 @@ export class Workspaces {
       } finally {
         release?.()
         verificationCheckouts.delete(checkout)
-        await this.cleanupVerification(member, task, mission.source, path.dirname(checkout))
+        await this.cleanupVerification(member, task, mission.source, checkout)
       }
     }, signal)
   }
@@ -2055,26 +2055,26 @@ export class Workspaces {
   }
 
   /**
-   * Remove every checkout in the mission's verification `directory` that no verification of
-   * this process owns (the caller's own, and any a crash left, even one an interrupted
-   * `git worktree add` left locked), then prune stale registrations from the source repository.
-   * An unreadable tree a check left defeats `git worktree remove`; an owner-permission repair
-   * removes it. Best effort by contract: failures are recorded for the host, never thrown.
+   * Reclaim this verification's checkout and every checkout of its mission no verification in this
+   * process owns (a crash left it): each tree under `verification/`, then each registration still
+   * naming a path there, locked ones included; nothing else in the source repository is touched or
+   * pruned. The owner-permission repair removes a tree a check left unreadable. Best effort by
+   * contract: only this verification's own failure is reported, and nothing is thrown.
    */
-  private async cleanupVerification(member: Member, task: Task, source: string, directory: string): Promise<void> {
-    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
-      const checkout = path.join(directory, entry.name)
-      if (!entry.isDirectory() || verificationCheckouts.has(checkout)) continue
-      verificationCheckouts.add(checkout)
-      await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', checkout]).catch(async (removal: unknown) => {
-        if (!(await lstat(checkout).then(() => true, () => false))) return
-        const failure = await this.forceRemove(checkout).then(() => removal, (error: unknown) => error)
-        const reason = failure instanceof Error ? failure.message : String(failure)
-        try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
+  private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
+    const directory = path.dirname(checkout)
+    const reclaim = async (candidate: string): Promise<void> => {
+      if (verificationCheckouts.has(candidate)) return
+      await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', candidate]).catch(async (removal: unknown) => {
+        if (!(await lstat(candidate).then(() => true, () => false))) return
+        const failure = await this.forceRemove(candidate).then(() => removal, (error: unknown) => error)
+        if (candidate !== checkout) return
+        try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
       })
-      verificationCheckouts.delete(checkout)
     }
-    try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
+    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) if (entry.isDirectory()) await reclaim(path.join(directory, entry.name))
+    const registered = await this.worktreeGit(source, ['worktree', 'list', '--porcelain']).catch(() => '')
+    for (const [, candidate] of registered.matchAll(/^worktree (.+)$/gm)) if (path.dirname(candidate!) === directory) await reclaim(candidate!)
   }
 
   /** Restore owner permissions on an unreadable tree so removal can finish. */

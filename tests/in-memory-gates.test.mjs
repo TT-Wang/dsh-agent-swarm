@@ -302,7 +302,7 @@ const RECOVERY_COLLECTIONS = {
     reason: 'One promise chain per git common dir and per task record: every writer of either runs in this process, so the chain is the whole serialization; an entry is released when its last callback settles and holds nothing durable.' },
   'src/workspaces.ts:verificationCheckouts': { kind: 'Set', label: 'in-flight', proof: 'tests/workspaces.test.mjs',
     behavior: 'never reclaims the checkout of a concurrent in-flight verification',
-    reason: 'The verification checkouts this process is using or removing. Loss on restart is the point: every checkout left under a mission is then garbage, and the next verification of that mission reclaims it.' },
+    reason: 'The verification checkouts in flight in this process. Loss on restart is the point: every checkout left under a mission is then garbage, and the next verification of that mission reclaims its tree and its registration.' },
   'src/workspaces.ts:preparations': { kind: 'Map', label: 'in-flight', proof: 'tests/rule-workspace-recovery.test.mjs',
     behavior: 'overlapping preparation of one member and epoch reuses its workspace after the first preparation settles',
     reason: 'Per-member preparation promises serialize concurrent workspace I/O and release in finally; stop/dispose abort queued work. Durable workspace manifests, not this process-local queue, own restart recovery.' },
