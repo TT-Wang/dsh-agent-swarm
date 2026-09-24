@@ -7,7 +7,7 @@
  * thin forwarding methods, so no call site changed.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
+import { covered, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { requireText } from './refusals.ts'
@@ -965,7 +965,7 @@ export class Notices {
       const fact = noticeRow(delivery)
       // A covered fact is never sent, so it has no reminders of its own: the
       // covering delivery's reminders carry its root.
-      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined || fact.coveredBy !== undefined
+      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined || covered(delivery)
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
@@ -1029,7 +1029,7 @@ export class Notices {
     if (ownerDeliveryMoot(mission, delivery)) return false
     // A covered fact is never a wake of its own: the covering delivery carried
     // the obligation, and that delivery's reminders carry it too.
-    if (noticeRow(delivery)?.coveredBy !== undefined) return false
+    if (covered(delivery)) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
     const stopFailures = this.stopFailureSubjects(mission.id, delivery)
     if (stopFailures !== undefined) return mission.status !== 'completed' && stopFailures.length > 0

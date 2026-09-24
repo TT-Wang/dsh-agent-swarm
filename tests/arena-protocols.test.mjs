@@ -30,7 +30,7 @@ import { join } from 'node:path'
 import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MEMBER_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
-import { arenaLedgerDigest, hasNotice, noticeFingerprint, noticeLedger, pendingReadiness, proposalAllowance } from '../lib/arena.js'
+import { arenaLedgerDigest, hasNotice, noticeFingerprint, noticeLedger, pendingReadiness } from '../lib/arena.js'
 import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
 const DEFAULT_BUDGET = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxTasks: 6, maxExperiments: 1 }
@@ -98,9 +98,10 @@ test('proposal capacity is the aggregate mission budget and never shrinks when t
   await assert.rejects(propose.execute(proposal(f, { title: 'Still over aggregate' }), alice), /task budget exhausted/)
   assert.equal(notices(f).length, count)
   assert.throws(() => f.runtime.updateBudget(f.aliceActor, f.mission.id, { ...f.budget, maxTasks: 30 }, 'self increase'), /Only the primary user session/)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxWorkers: 6 }, 'more workers only')
+  await assert.rejects(propose.execute(proposal(f, { title: 'More workers, same aggregate' }), alice), /task budget exhausted/,
+    'a larger roster neither widens nor shrinks the aggregate proposal room')
   f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxTasks: 12, maxWorkers: 6 }, 'more repair capacity')
-  const allowance = proposalAllowance(f.runtime.mission(f.mission.id), f.runtime.store.list('members', f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.alice.id)
-  assert.equal(allowance.limit, 12)
   const admitted = await propose.execute(proposal(f, { title: 'Same member continues' }), alice)
   assert.equal(admitted.result.proposedBy, f.alice.id)
 })

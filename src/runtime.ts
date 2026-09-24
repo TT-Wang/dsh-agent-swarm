@@ -17,7 +17,7 @@ import { RuntimeGates, emptyUsage, addUsage, BOARD_DELTA_POSTS, postView, type M
 import { DeclaredChecks, MAX_REPORTED_CHECK_FAILURES, excerpt } from './declared-checks.ts'
 import { verdictRows } from './trace.ts'
 export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, WorkspaceRevokedError, type TempMention } from './workspace-admission.ts'
-import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from './arena.ts'
+import { awaitsDelivery } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'

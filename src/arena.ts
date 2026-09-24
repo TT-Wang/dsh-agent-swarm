@@ -32,16 +32,6 @@ interface FingerprintInput {
 
 const byId = <T extends { id: string }>(left: T, right: T): number => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
 
-/**
- * The live carrier of one dependency reference, following repair lineage the
- * same way the runtime does: a blocked or cancelled task resolves to its
- * replacement, deterministically (oldest live replacement, id tie-break).
- */
-export function liveCarrier(tasks: readonly Task[], dependencyId: string, seen: Set<string> = new Set()): Task | undefined {
-  if (seen.has(dependencyId)) return undefined
-  return taskGraphIndex(tasks).effective(dependencyId)
-}
-
 /** A submitted task's live review path: the scheduler's one live-review rule (`liveReviewFor`). */
 function hasReviewPath(tasks: readonly Task[], members: readonly Member[], source: Task): boolean {
   return liveReviewFor(tasks, source, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
@@ -93,7 +83,7 @@ export function noticeFingerprint(input: FingerprintInput): string {
 }
 
 /** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
-const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
+export const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
 
 /** Whether a delivery is still owed to its recipient; a covered fact never is. */
 export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
@@ -115,24 +105,6 @@ function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pe
       .map(task => [task.id, task.ceiling!.dimension, task.ceiling!.limit, task.ceiling!.used]).sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
   }
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
-}
-
-/** Compatibility projection of the aggregate mission task safety limit. */
-interface ProposalAllowance {
-  limit: number
-  ceiling: number
-  /** Informational capacity; increasing workers never reduces proposal room. */
-  plannedMembers: number
-  /** All admitted rows, matching the aggregate runtime safety limit. */
-  admitted: number
-}
-
-export function proposalAllowance(mission: Pick<Mission, 'budget'>, _members: readonly Member[], tasks: readonly Task[], _proposer: string): ProposalAllowance {
-  const ceiling = Math.max(1, mission.budget.maxTasks)
-  const plannedMembers = Math.max(1, mission.budget.maxWorkers)
-  const limit = ceiling
-  const admitted = tasks.length
-  return { limit, ceiling, plannedMembers, admitted }
 }
 
 /** One owner notice as the ledger exposes it: immutable, read-only projection. */
