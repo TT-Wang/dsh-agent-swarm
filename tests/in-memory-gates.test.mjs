@@ -65,7 +65,7 @@ import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
-import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
+import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 import { persistentCollections } from './source-semantics.mjs'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
@@ -89,7 +89,7 @@ class GatedWorkers extends FakeWorkers {
 
 /** A valid automatic plan (the shape `startPlan` accepts), copied from tests/automatic.test.mjs. */
 function automaticPlan(workspace) {
-  const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+  const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
   return {
     title: 'Automatic delivery', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
@@ -485,6 +485,7 @@ const GATE_TESTS = {
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
       const statePath = join(g.dir, 'swarm.sqlite')
       await g.runtime.dispose()
+      // fixture gap: setup() returns no RuntimeConfig to reopen its state file with.
       restarted = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10, messageChars: 16000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, new FakeWorkers())
       assert.equal(restarted.store.get('members', g.author.id).startFailures, 2, 'the count survives a restart')
       restarted.onStartFailure(restarted.mission(g.mission.id), restarted.store.get('members', g.author.id), new Error('injected start failure'))
@@ -786,7 +787,7 @@ test('S5 gate src/runtime.ts:7 pair: the mission queue never forks two waiters o
   // both waited on one predecessor each registered themselves as the tail and
   // ran their bodies concurrently. Mission-scoped work (dispatch, claim,
   // prepareTask) must be serialized, so this pins the ordering, not the timing.
-  const f = await setup(t, { workers: new FakeWorkers() })
+  const f = await makeRuntime(t)
   const events = []
   const body = name => async () => {
     events.push(`start:${name}`)
