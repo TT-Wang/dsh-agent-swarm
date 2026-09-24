@@ -30,10 +30,10 @@
  *                     refused with harness-target's message
  *   --allow-unsupported-harness
  *                     update a preview pinned to an unsupported Harness anyway,
- *                     with a warning on stderr and in restart.log. The 5202
- *                     preview still boots 0.1.6-alpha.2 and its snapshot links
- *                     that release's SDK packages, so refusing it outright
- *                     would strand it; the flag makes that choice explicit
+ *                     with a warning on stderr and in restart.log. A preview
+ *                     whose snapshot links an unsupported release's SDK
+ *                     packages would otherwise be stranded; the flag makes
+ *                     that choice explicit
  *   --patch <file>    patch overlay (default: <preview>/preview.patch.yml)
  *   --home <dir>      DSH_HOME (default: <preview>/home)
  *   --workspace <dir> host working directory (default: <preview>/workspace)
