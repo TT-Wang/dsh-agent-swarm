@@ -506,6 +506,43 @@ test('verification cleanup failure never masks the check result and is reported 
   assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
 })
 
+test('the next verification of a mission reclaims the checkouts a crash left behind, with their registrations', async t => {
+  const { source, head, workspaces, member, task, temp } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  // A crash between `git worktree add` and cleanup: one completed checkout, and one an
+  // interrupted add left locked, both still registered in the source repository.
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  await mkdir(verification, { recursive: true })
+  for (const name of ['after-add', 'during-add']) await git(source, 'worktree', 'add', '--detach', path.join(verification, name), head)
+  await git(source, 'worktree', 'lock', '--reason', 'initializing', path.join(verification, 'during-add'))
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['true'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.deepEqual(await readdir(verification), [], 'every leftover checkout is removed')
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/, 'and so is its registration in the source repository')
+})
+
+test('a verification never reclaims the checkout of a concurrent in-flight verification of the same mission', async t => {
+  const held = Promise.withResolvers(), release = Promise.withResolvers()
+  const checkouts = []
+  const { workspaces, member, task, temp } = await fixture(t, { confineCheck: async (argv, cwd) => {
+    checkouts.push(cwd)
+    if (checkouts.length === 1) { held.resolve(); await release.promise }
+    return argv
+  } })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const verifying = { ...task, checks: ['test -f src/answer.txt'] }
+  const first = workspaces.verifyArtifact(member, verifying, artifact)
+  await held.promise
+  assert.equal((await workspaces.verifyArtifact(member, verifying, artifact))[0].exitCode, 0)
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  assert.deepEqual(await readdir(verification), [path.basename(checkouts[0])], "the other verification's reclaim leaves the in-flight checkout alone")
+  release.resolve()
+  assert.equal((await first)[0].exitCode, 0, 'and its check still runs in it')
+  assert.deepEqual(await readdir(verification), [])
+})
+
 test('copied dependency directories isolate check writes from the source toolchain', async t => {
   const { source, workspaces, member, task } = await fixture(t, { verificationDependencyMode: 'copy' })
   await writeFile(path.join(source, '.gitignore'), 'node_modules/\n')

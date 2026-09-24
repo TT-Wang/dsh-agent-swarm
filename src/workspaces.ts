@@ -406,6 +406,8 @@ async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T
   try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
 }
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
+/** Verification checkouts this process is using or removing; any other under a mission's `verification/` was left by one that died. */
+const verificationCheckouts = new Set<string>()
 
 /**
  * ENV: one bounded output window over a command's two streams. The retained
@@ -1944,6 +1946,7 @@ export class Workspaces {
       // Keep the validation above, but reserve execution capacity only for checks.
       if (task.checks.length === 0) return []
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
+      verificationCheckouts.add(checkout)
       let release: (() => void) | undefined
       try {
         let linked: string[]
@@ -2030,7 +2033,8 @@ export class Workspaces {
         return results
       } finally {
         release?.()
-        await this.cleanupVerification(member, task, mission.source, checkout)
+        verificationCheckouts.delete(checkout)
+        await this.cleanupVerification(member, task, mission.source, path.dirname(checkout))
       }
     }, signal)
   }
@@ -2051,26 +2055,26 @@ export class Workspaces {
   }
 
   /**
-   * Remove a disposable verification checkout without ever masking the check
-   * results. `git worktree remove` fails when a check left an unreadable
-   * directory; fall back to `fs.rm`, then to an owner-permission repair before
-   * `git worktree prune` drops a stale registration. Failures are recorded for
-   * the host and are never thrown.
+   * Remove every checkout in the mission's verification `directory` that no verification of
+   * this process owns (the caller's own, and any a crash left, even one an interrupted
+   * `git worktree add` left locked), then prune stale registrations from the source repository.
+   * An unreadable tree a check left defeats `git worktree remove`; an owner-permission repair
+   * removes it. Best effort by contract: failures are recorded for the host, never thrown.
    */
-  private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
-    let failure: unknown
-    try {
-      await this.worktreeGit(source, ['worktree', 'remove', '--force', checkout])
-      return
-    } catch (error) { failure = error }
-    if (!(await lstat(checkout).then(() => true, () => false))) {
-      try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-      return
+  private async cleanupVerification(member: Member, task: Task, source: string, directory: string): Promise<void> {
+    for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+      const checkout = path.join(directory, entry.name)
+      if (!entry.isDirectory() || verificationCheckouts.has(checkout)) continue
+      verificationCheckouts.add(checkout)
+      await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', checkout]).catch(async (removal: unknown) => {
+        if (!(await lstat(checkout).then(() => true, () => false))) return
+        const failure = await this.forceRemove(checkout).then(() => removal, (error: unknown) => error)
+        const reason = failure instanceof Error ? failure.message : String(failure)
+        try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
+      })
+      verificationCheckouts.delete(checkout)
     }
-    try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
-    catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
     try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-    this.recordCleanupIssue(member, task, checkout, failure)
   }
 
   /** Restore owner permissions on an unreadable tree so removal can finish. */
@@ -2091,11 +2095,6 @@ export class Workspaces {
     await repair(directory)
     await ignoringMissing(chmod(directory, 0o700))
     await rm(directory, { recursive: true, force: true })
-  }
-
-  private recordCleanupIssue(member: Member, task: Task, checkout: string, failure: unknown): void {
-    const reason = failure instanceof Error ? failure.message : String(failure)
-    try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */
