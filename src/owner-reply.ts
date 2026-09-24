@@ -24,16 +24,6 @@ import { emitGuardTerminal } from './refusals.ts'
  * makes the missing receipt visible and executable, which is the invariant the
  * board already keeps for task state.
  */
-export interface OwnerReplyOptions {
-  /**
-   * `nudge` records the miss and instructs. Legacy `block` is accepted as an
-   * alias: the owner control channel must remain available to answer it.
-   */
-  guard: 'nudge' | 'block'
-  /** Nudges spent on one question before the guard terminal; default 2. */
-  maxNudges: number
-}
-
 /** One question booked at turn start, with everything the nudge must name. */
 interface Booking {
   missionId: string
@@ -62,7 +52,7 @@ export class OwnerReplyGuard {
   private readonly removals: Array<() => void> = []
   private closed = false
 
-  constructor(private readonly ctx: Context, private readonly rt: SwarmRuntime, private readonly options: OwnerReplyOptions) {
+  constructor(private readonly ctx: Context, private readonly rt: SwarmRuntime, private readonly options: { /** Nudges spent on one question before the guard terminal. */ maxNudges: number }) {
     this.removals.push(ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }

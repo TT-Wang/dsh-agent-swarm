@@ -70,3 +70,13 @@ test('a non-function now in a runtime config built from the profile falls back t
     } finally { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
   }
 })
+
+test('the owner-reply guard mode is no longer offered, and a profile that still sets it loads', () => {
+  // No code read `ownerReplyGuard`: 'block' behaved exactly like 'nudge'. The
+  // schema no longer advertises it, and the object schema keeps an unknown key,
+  // so an existing profile naming it still parses.
+  assert.equal(Object.hasOwn(Config.dict, 'ownerReplyGuard'), false, 'the settings surface does not offer a mode nothing reads')
+  for (const ownerReplyGuard of ['block', 'nudge']) {
+    assert.equal(Config({ ...base, ownerReplyGuard }).maxOwnerReplyNudges, 2, `a profile naming ownerReplyGuard: ${ownerReplyGuard} still loads`)
+  }
+})

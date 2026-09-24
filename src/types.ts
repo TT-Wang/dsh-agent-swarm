@@ -1171,12 +1171,6 @@ export interface RuntimeConfig {
   checkTimeoutMs?: number
   /** Idle close-out nudges before an open attempt is checkpointed and abandoned; defaults to 2. */
   maxIdleCloseouts?: number
-  /**
-   * L2 owner-reply guard. `nudge` (default) records the missing reply and sends a
-   * bounded instruction to the owner; `block` additionally refuses the owner's
-   * next step, which ends the turn that answered in prose only.
-   */
-  ownerReplyGuard?: 'nudge' | 'block'
   /** Owner-reply nudges before the guard terminal; defaults to 2. */
   maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */

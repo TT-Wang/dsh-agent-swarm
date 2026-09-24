@@ -124,7 +124,7 @@ test('L1: a board post may settle a receipt, and a post reply still means a post
 test('L2/L3: an owner turn that leaves a question open is recorded, nudged with the call, then escalated', async t => {
   const f = await fixture(t)
   const ask = await f.ask('Which API version should I target?')
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
 
   // Turn 1: the owner reads the question and ends the turn without the call.
@@ -192,7 +192,7 @@ test('L2: the turn boundary and the consumption stamp are on the runtime clock, 
   const clock = new FakeClock(Date.now() + 600_000)
   const f = await fixture(t, { now: clock.now })
   const ask = await f.ask()
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
   clock.advance(1_000)
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
@@ -208,7 +208,7 @@ test('L2: the turn boundary and the consumption stamp are on the runtime clock, 
 test('L2: an answered turn is never nudged, and a repeated turn end is a no-op', async t => {
   const f = await fixture(t)
   const ask = await f.ask()
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'answered in-turn', replyTo: ask.id })
@@ -222,12 +222,12 @@ test('L2: an answered turn is never nudged, and a repeated turn end is a no-op',
 test('L2: replacing the guard resumes the durable nudge ordinal and reaches escalation', async t => {
   const f = await fixture(t)
   const ask = await f.ask()
-  const first = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const first = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   first.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
   first.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   await f.runtime.flushOutbox(f.mission.id)
   first.dispose()
-  const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => replacement.dispose())
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
   replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
@@ -245,7 +245,7 @@ test('L2: replacing the guard resumes the durable nudge ordinal and reaches esca
 test('L2: an outbox write failure does not spend a nudge without retaining its wake', async t => {
   const f = await fixture(t)
   const ask = await f.ask()
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
   const original = f.runtime.store.put.bind(f.runtime.store)
   let injected = false
@@ -290,7 +290,7 @@ test('owner receipt books actual consumption before transport acknowledgement an
   f.runtime.pumpOutbox = () => {}
   f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
   const question = f.deliveries().find(row => row.replyExpected)
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
   t.after(() => guard.dispose())
   assert.equal(question.deliveredAt, undefined)
   guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'swarm', deliveryId: question.id } })
@@ -311,7 +311,7 @@ for (const summarized of [false, true]) test(`answered receipts invalidate queue
     f.runtime.notices.wakeBudget = 1
     f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`]))
   }
-  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { maxNudges: 1 })
   t.after(() => guard.dispose())
   for (let i = 0; i < 2; i++) {
     guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })

@@ -22,7 +22,7 @@ function guardFixture() {
   const ctx = { on: () => () => {}, agents: { get: () => ({ ctx: { on: (_name, hook) => {
     hooks.add(hook); return () => hooks.delete(hook)
   } } }) } }
-  return { mission, question, hooks, rt, guard: new OwnerReplyGuard(ctx, rt, { guard: 'block', maxNudges: 2 }) }
+  return { mission, question, hooks, rt, guard: new OwnerReplyGuard(ctx, rt, { maxNudges: 2 }) }
 }
 
 test('R12: aborted, failed and blocked turns leave the owner reply opportunity intact', () => {
@@ -35,13 +35,13 @@ test('R12: aborted, failed and blocked turns leave the owner reply opportunity i
   f.guard.observe('owner', 'user/message', { createdAt: 2 })
   f.guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.question.replyNudges, 1)
-  assert.equal(f.hooks.size, 0, 'legacy block never installs an owner pre-step rejection')
+  assert.equal(f.hooks.size, 0, 'the reply guard never installs an owner pre-step rejection')
   f.guard.dispose()
   f.guard.dispose()
   assert.equal(f.hooks.size, 0, 'all lazy pre-step hooks are disposed')
 })
 
-test('R12: legacy block keeps active and terminal owner work executable', async () => {
+test('R12: the reply guard keeps active and terminal owner work executable', async () => {
   const f = guardFixture()
   f.guard.observe('owner', 'user/message', { createdAt: 2 })
   f.guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
