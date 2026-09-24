@@ -28,7 +28,7 @@ export interface EventSpec {
    * tests/reader-census.test.mjs.
    */
   historical?: true
-  /** Writing the kind advances its mission's progress clock (`Mission.meaningfulProgressAt`) in the same write. */
+  /** The kind is mission progress: the absence net measures silence from the newest such row (`SwarmStore.progressAt`). */
   progress?: true
 }
 
@@ -58,7 +58,7 @@ export const EVENTS = {
   'task/rejected': { description: 'Independent verification rejected the source artifact', panel: { en: 'Review requested changes', zh: '审查要求修改' }, progress: true },
   'task/blocked': { description: 'Task blocked with the reason that must be repaired', panel: { en: 'Task needs attention', zh: '子任务需要处理' } },
   'task/cancelled': { description: 'Owner withdrew admitted work; dependents named as stranded', panel: { en: 'Task cancelled', zh: '子任务已取消' }, progress: true },
-  'task/cancelled-at-completion': { description: 'Unschedulable leftover cancelled at mission completion', panel: { en: 'Task cancelled at completion', zh: '子任务在完成时被取消' }, historical: true },
+  'task/cancelled-at-completion': { description: 'Unschedulable leftover cancelled at mission completion', panel: { en: 'Task cancelled at completion', zh: '子任务在完成时被取消' }, historical: true, progress: true },
   'task/lease-expired': { description: 'Attempt lease expired and the owner was released', panel: { en: 'Task execution expired', zh: '任务执行已到期' } },
   'attempt/fenced': { description: 'A control decision fenced a running attempt: epoch bumped, outgoing owner recorded, stop obligation installed', panel: { en: 'Task work was stopped', zh: '子任务的工作已被停止' } },
   'task/ceiling-exhausted': { description: 'Task exhausted its step allocation and preserved work for owner-directed continuation', panel: { en: 'Task ceiling reached', zh: '子任务超出执行上限' } },
@@ -169,8 +169,8 @@ const SPECS: Record<string, EventSpec> = EVENTS
 /** Description by kind: the read path's vocabulary, unchanged in shape and meaning. */
 export const EVENT_VOCABULARY: Record<string, string> = Object.fromEntries(Object.entries(SPECS).map(([kind, spec]) => [kind, spec.description]))
 
-/** Whether writing a kind is mission progress; telemetry, scheduling and transport are not. */
-export const isProgress = (kind: string): boolean => SPECS[kind]?.progress === true
+/** The mission-progress kinds; telemetry, scheduling and transport are not among them. */
+export const PROGRESS_KINDS: string[] = Object.entries(SPECS).filter(([, spec]) => spec.progress).map(([kind]) => kind)
 
 /** Compact-panel labels by kind; a kind whose `panel` names an omit reason is absent. */
 export const EVENT_PANEL_LABELS: Record<string, { en: string; zh: string }> = Object.fromEntries(

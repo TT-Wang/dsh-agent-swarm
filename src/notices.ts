@@ -895,7 +895,7 @@ export class Notices {
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
       implementations: tasks.filter(task => task.kind === 'implementation'),
-      lastTransitionAt: mission.meaningfulProgressAt ?? mission.createdAt,
+      lastTransitionAt: this.rt.store.progressAt(mission),
       subjectsOf: list => subjectsOfTasks(list, mission),
     }
   }

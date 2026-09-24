@@ -216,8 +216,6 @@ export interface Mission {
   deadline: number
   /** Active execution time; paused, idle and resource-waiting time is excluded. */
   executionTime?: { usedMs: number; since?: number }
-  /** When the latest progress kind (`EventSpec.progress`) was written; absent means `createdAt`. */
-  meaningfulProgressAt?: number
   coordinatorId?: string
   reason?: string
   baseline?: WorkspaceBaseline
