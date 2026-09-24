@@ -1037,22 +1037,6 @@ export class SwarmRuntime {
   dropAttempt(task: Task, ownerId?: string): void { return this.attempts.dropAttempt(task, ownerId) }
   private onIdle(memberId: string): void { return this.attempts.onIdle(memberId) }
   async closeOutIdleAttempt(mission: Mission, member: Member, task: Task, pass?: SchedulingPass): Promise<void> { return this.attempts.closeOutIdleAttempt(mission, member, task, pass) }
-  /** The task plus every task it replaces transitively; a repair may only supersede its own lineage. */
-  private replacementLineage(missionId: string, task: Task): Set<string> {
-    const tasks = this.store.list('tasks', missionId)
-    const seen = new Set<string>([task.id])
-    for (let frontier = [task]; frontier.length;) {
-      const next: Task[] = []
-      for (const item of frontier) for (const replacedId of item.replaces ?? []) {
-        if (seen.has(replacedId)) continue
-        seen.add(replacedId)
-        const replaced = tasks.find(candidate => candidate.id === replacedId)
-        if (replaced) next.push(replaced)
-      }
-      frontier = next
-    }
-    return seen
-  }
   
   
   
@@ -1668,7 +1652,8 @@ export class SwarmRuntime {
     this.bounded(input.claim)
     if (!EVIDENCE_OUTCOMES.includes(input.outcome)) throw new PolicyError('invalid_evidence_outcome', 'validation_error', '[invalid_evidence_outcome] Evidence `outcome` must be supported, disproved or inconclusive; it describes the hypothesis, not task success. Correct `outcome` and retry `swarm_publish`.')
     this.validateRuns(missionId, member.id, task, input.toolRunIds)
-    const lineage = this.replacementLineage(missionId, task)
+    // A repair may only supersede evidence of its own replaced lineage.
+    const lineage = new Set(taskGraphIndex(this.store.list('tasks', missionId)).replacedLineage(task.id).map(row => row.id))
     for (const previous of input.supersedes ?? []) {
       const evidence = this.store.get('evidence', previous)
       if (!evidence || evidence.missionId !== missionId) throw new Error('[supersede_foreign_evidence] Superseded evidence must belong to this mission. Correct `supersedes` with `swarm_publish`, then retry.')
