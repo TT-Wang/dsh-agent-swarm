@@ -414,6 +414,23 @@ test('R06: in-flight usage triggers durable mission review with a larger recomme
   assert.equal(warnings().length, 2, 'a changed limit has its own review identity')
 })
 
+test('R06: a durable model activity the adapter does not report still counts one step in flight', async t => {
+  const f = await fixture(t)
+  await stalledDecision(f)
+  // Only the member's durable row says a model request is open; the adapter reports nothing for it.
+  const member = f.runtime.store.get('members', f.member.id)
+  member.activity = { id: 'model', kind: 'model', startedAt: Date.now(), updatedAt: Date.now() }
+  const mission = f.runtime.mission(f.mission.id); mission.usedSteps = 699
+  const task = f.runtime.task(f.mission.id, 'blocked-task'); task.status = 'running'; task.maxSteps = 10; task.usedSteps = 6; task.attempt = { id: 'attempt', ownerId: f.member.id, epoch: task.epoch, leaseUntil: Date.now() + 60000 }
+  f.runtime.commit(mission.id, () => { f.runtime.store.put('members', member); f.runtime.store.put('missions', mission); f.runtime.store.put('tasks', task) })
+  assert.equal(f.workers.currentActivity(f.member.id), undefined)
+  f.runtime.gates.warnBudget(f.runtime.mission(mission.id))
+  const steps = f.runtime.store.events(mission.id, 100).filter(event => event.type === 'mission/budget-warning' && event.data.dimension === 'maxSteps')
+  const projection = warning => warning && [warning.data.used, warning.data.inFlightEstimate, warning.data.projected]
+  assert.deepEqual(projection(steps.find(event => event.data.taskId === undefined)), [699, 1, 700], 'the mission step projection counts the open request')
+  assert.deepEqual(projection(steps.find(event => event.data.taskId === task.id)), [6, 1, 7], "the owner's task step projection counts it too")
+})
+
 test('R06/R10: task step and finding warnings preserve task identity and submission path', async t => {
   const f = await fixture(t)
   await stalledDecision(f)
