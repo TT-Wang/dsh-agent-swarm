@@ -20,7 +20,7 @@ export { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision, Wor
 import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from './arena.ts'
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
-import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
+import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
 import { canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
@@ -472,7 +472,7 @@ export class SwarmRuntime {
   private readonly scheduling = new Scheduling(this)
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
-  reviewable(task: Task, tasks: Task[]): boolean { return this.scheduling.reviewable(task, tasks) }
+  reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
   stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
   private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
   private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
@@ -2411,16 +2411,6 @@ export class SwarmRuntime {
     return { retired, released }
   }
   /**
-   * F2: the live independent review of a submitted source, if one can still
-   * reach a verdict. Uses the shared admission predicate so admission,
-   * scheduling and the owner notice agree on what "has a review" means.
-   */
-  private liveReview(missionId: string, source: Task): Task | undefined {
-    const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
-    return liveReviewFor(this.store.list('tasks', missionId), source, live,
-      review => review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
-  }
-  /**
    * F2/R11-16: why a freshly submitted artifact has no review path, or
    * undefined when it has one or produced no reviewable artifact. Reviewability
    * is derived from the captured artifact, never from the declared kind: a
@@ -2429,7 +2419,7 @@ export class SwarmRuntime {
    */
   private missingReviewPath(task: Task): string | undefined {
     if (task.artifact === undefined) return undefined
-    if (this.liveReview(task.missionId, task) !== undefined) return undefined
+    if (this.reviewable(task, this.store.list('tasks', task.missionId))) return undefined
     return `no live independent verification task reviews this submitted ${task.kind} artifact; a review (kind verification, reviewOf ${task.id}) must be pending or running and assigned to a member who did not author it`
   }
   /**
@@ -2448,7 +2438,7 @@ export class SwarmRuntime {
     const unreviewable: Task[] = []
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
-      if (this.liveReview(mission.id, source) !== undefined) continue
+      if (this.reviewable(source, tasks, members)) continue
       const submission = this.latestSubmission(mission.id, source.id)
       if (submission !== undefined && submission.age < grace) continue
       this.reportMissingReview(mission, source, submission?.seq ?? 0)

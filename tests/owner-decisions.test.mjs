@@ -304,13 +304,16 @@ test('R15-A1/B: the owner ledger carries subjects, reports consumption unknown, 
 test('R15-F1: a pending verification waits on its live source and is named only when the source closes', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
+  // The review waits only while a live member may own it independently (the
+  // one live-review rule): its assignee never authored the source.
+  const reviewer = await f.addMember('Reviewer')
   const source = f.propose('Reviewed source', { assigneeId: builder.id })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, source.id)
   // Verification tasks carry `reviewOf`, not `dependencies`: the protocol puts the
   // prerequisite in the review link.
   // `research` keeps the fixture free of the integration-gap notice, whose
   // subjects legitimately name every implementation branch.
-  const review = f.propose('Pending review', { assigneeId: builder.id, kind: 'research' })
+  const review = f.propose('Pending review', { assigneeId: reviewer.id, kind: 'research' })
   const row = f.runtime.store.get('tasks', review.id)
   row.kind = 'verification'; row.reviewOf = source.id; row.dependencies = []
   f.runtime.store.put('tasks', row)
@@ -562,7 +565,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   }
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
-    return source !== undefined && !TERMINAL_STATES.has(source.status)
+    return source !== undefined && !TERMINAL_STATES.has(source.status) && runtime.reviewable(source, tasks)
   }
   if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
     && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && runtime.effectiveDependency(missionId, id, tasks).status === 'accepted')) {

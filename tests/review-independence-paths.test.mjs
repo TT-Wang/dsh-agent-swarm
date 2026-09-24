@@ -9,7 +9,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { authorIdsOf, canOwnReview } from '../lib/assignment.js'
-import { arenaView, pendingReadiness } from '../lib/arena.js'
+import { arenaLedgerDigest, arenaView, pendingReadiness } from '../lib/arena.js'
 import { validatePlan } from '../lib/plans.js'
 import { boardIndex } from '../lib/types/client/projection.js'
 import { FakeClock, MISSION_ACCEPTANCE, setup, taskOf } from './faults/harness.mjs'
@@ -96,12 +96,22 @@ test('verify: a prior owner holding a review attempt cannot record a verdict', a
   assert.equal(taskOf(f.runtime, f.source.id).status, 'submitted', 'the source keeps waiting for an independent verdict')
 })
 
-test('liveReview: a pending review only a prior owner could take is not a live review path', async t => {
+test('reviewable: a pending review only a prior owner could take is not a live review path', async t => {
+  const f = await coauthored(t)
+  f.review()
+  const reviewable = () => f.runtime.reviewable(taskOf(f.runtime, f.source.id), f.runtime.store.list('tasks', f.mission.id))
+  assert.equal(reviewable(), true, 'an independent live member makes it live')
+  f.stopReviewer()
+  assert.equal(reviewable(), false)
+})
+
+test('waitsLegitimately: a pending review only a prior owner could take waits on nothing', async t => {
   const f = await coauthored(t)
   const open = f.review()
-  assert.equal(f.runtime.liveReview(f.mission.id, taskOf(f.runtime, f.source.id))?.id, open.id, 'an independent live member makes it live')
+  const waits = () => f.runtime.notices.waitsLegitimately(taskOf(f.runtime, open.id), f.runtime.store.list('tasks', f.mission.id))
+  assert.equal(waits(), true, 'an independent live member makes the review a live wait')
   f.stopReviewer()
-  assert.equal(f.runtime.liveReview(f.mission.id, taskOf(f.runtime, f.source.id)), undefined)
+  assert.equal(waits(), false, 'with only the source\'s authors live, no path advances the review')
 })
 
 test('reviewPathBlocker: a prior owner does not count as the independent member an automatic review needs', async t => {
@@ -137,6 +147,13 @@ test('arena: readiness and the member projection never offer a review to a prior
   const view = arenaView({ missionId: 'mission', now: 2, leaseMs: 1_000, mission: { status: 'active' }, tasks, members: [member('prior'), member('independent')], evidence: [], deliveries: [] })
   assert.equal(view.members.find(entry => entry.id === 'prior').pendingTaskId, undefined)
   assert.equal(view.members.find(entry => entry.id === 'independent').pendingTaskId, 'review')
+})
+
+test('arena digest: a submitted source whose only review no live member may own is unreviewed', () => {
+  const { tasks, member } = board()
+  // Same member statuses (so the same readiness), only the independent member's phase differs.
+  const digest = phase => arenaLedgerDigest({ mission: { status: 'active' }, tasks, members: [member('prior'), { ...member('independent'), phase }], evidence: [], deliveries: [] })
+  assert.notEqual(digest('stopped'), digest('active'), 'the digest records the lost review path')
 })
 
 test('client projection: a review only a prior owner could take is shown blocked, not ready', () => {

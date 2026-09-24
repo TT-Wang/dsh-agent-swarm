@@ -514,10 +514,12 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
   }
   if (task.status === 'pending') {
     // Reviews wait on their exact source; no worker stop can repair a missing
-    // or terminal source. Ordinary prerequisites keep the shared lineage rule.
+    // or terminal source, and a review path no live member may own (the one
+    // live-review rule, `reviewable`) waits on nothing. Ordinary prerequisites
+    // keep the shared lineage rule.
     if (task.reviewOf !== undefined) {
       const source = tasks.find(candidate => candidate.id === task.reviewOf)
-      return source !== undefined && !TERMINAL_STATES.has(source.status)
+      return source !== undefined && !TERMINAL_STATES.has(source.status) && rt.reviewable(source, tasks)
     }
     if (rt.unfinishedDependencies(task.missionId, task, tasks).length > 0) return true
     const graph = taskGraphIndex(tasks)

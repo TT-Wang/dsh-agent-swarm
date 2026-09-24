@@ -188,3 +188,35 @@ test('swarm_stage and swarm_launch declare the review override, and the register
   const unknown = plan('/workspace', { tasks: [deliverable({ review: { reviewer: 'reviewer' } })] })
   await assert.rejects(definitions.get('swarm_launch').execute({ ...unknown, requestId: 'request' }, execution), /\[tool_arguments_invalid\]/)
 })
+
+test('a host-added review no live member may own is no review path: the owner is asked for an independent member', async t => {
+  for (const variant of ['one member', 'the only independent member stopped']) {
+    await t.test(variant, async t => {
+      const clock = new FakeClock()
+      const { dir, runtime, workers } = await makeRuntime(t, { clock, workers: new PairingWorkers(), config: { checkTimeoutMs: undefined } })
+      await runtime.start()
+      const owner = { sessionId: 'strand-owner' }
+      const base = plan(dir)
+      const members = (variant === 'one member' ? base.members.slice(0, 1) : base.members).map(({ maxOutputTokens: _tokens, ...member }) => member)
+      const draft = runtime.createDraft(owner, { ...base, members })
+      const snapshot = await runtime.launchDraft(owner, draft.id, draft.revision)
+      const missionId = snapshot.mission.id
+      if (variant !== 'one member') {
+        const reviewer = runtime.store.get('members', snapshot.members.find(row => row.id.endsWith('_reviewer')).id)
+        reviewer.phase = 'stopped'
+        runtime.store.transaction(() => runtime.store.put('members', reviewer))
+      }
+      const source = snapshot.tasks.find(task => task.kind === 'implementation')
+      const builder = snapshot.members.find(row => row.id.endsWith('_builder'))
+      const claimed = await runtime.claim({ sessionId: builder.sessionId }, missionId, source.id)
+      await runtime.submit({ sessionId: builder.sessionId }, missionId, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+      for (let tick = 0; tick < 6; tick++) { clock.advance(1_500); await runtime.tick(); await runtime.settle(missionId) }
+      const tasks = runtime.store.list('tasks', missionId)
+      assert.equal(reviewsOf(tasks, source).filter(review => review.status === 'pending').length, 1, 'the host-added review is still pending')
+      assert.equal(runtime.reviewable(taskOf(runtime, source.id), tasks), false, 'a review nobody live may own is not a review path')
+      const delivered = workers.deliveries.filter(delivery => delivery.memberId === 'owner').map(delivery => delivery.content)
+      assert.ok(delivered.some(content => content.startsWith('[review_path_missing]') && content.includes(source.id) && content.includes('add an independent member')),
+        `the owner receives the actionable review-path decision: ${JSON.stringify(delivered)}`)
+    })
+  }
+})

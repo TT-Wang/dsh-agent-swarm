@@ -10,6 +10,7 @@
 import { randomUUID } from 'node:crypto'
 import { selectAcceptedDelivery } from './task-graph.ts'
 import { assignmentAllows, canBorrowTask, canOwnReview } from './assignment.ts'
+import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
@@ -547,16 +548,16 @@ export class Scheduling {
   }
 
   /**
-   * A submitted task is progress only while a live review can still accept it.
-   * A review that was never admitted or was retired leaves the submission
-   * unreviewable forever; counting it as progress hid a stalled board from the
-   * owner (Round-8 F1). Pending and running reviews are live, and a parked
-   * review (blocked with a matching stop marker) re-pends after the stop
-   * acknowledgement, so it still counts.
+   * A submitted task is progress only while a live review can still accept it,
+   * under the one live-review rule (`liveReviewFor`). A review that was never
+   * admitted or was retired leaves the submission unreviewable forever;
+   * counting it as progress hid a stalled board from the owner (Round-8 F1).
+   * So does a review no live member may own: counting it silenced the owner's
+   * review-blocked decision. A parked review (blocked with a matching stop
+   * marker) re-pends after the stop acknowledgement, so it still counts.
    */
-  reviewable(task: Task, tasks: Task[]): boolean {
-    return tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
-      && (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)))
+  reviewable(task: Task, tasks: Task[], members: Member[] = this.rt.store.list('members', task.missionId)): boolean {
+    return liveReviewFor(tasks, task, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
   }
 
   /**
@@ -581,7 +582,7 @@ export class Scheduling {
     // An empty board is a mission the owner has not planned yet, not a stall.
     if (!tasks.length) return false
     if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks))
+    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members))
     if (unreviewed.length) {
       if (!this.unreviewedStall(mission.id, unreviewed)) return false
     }
