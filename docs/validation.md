@@ -7,6 +7,59 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Batch-8 fix: boundary compaction reaches the member's preset realm (2026-09-24)
+
+Boundary compaction (`boundaryCompactionTokens`, default 250000) was on by default but never ran. The batch-8 measurement found 288 recorded (member, verdict) boundaries whose last prompt was at or above 250K, and no boundary compaction. The only two member compactions were the preset engine's own pressure path at about 800K (0.8 of the 1M window).
+
+**Root cause.** The adapter resolved the engine with `ctx.get('compaction')` from the plugin's context.
+- That call needs no `inject` entry. Cordis `ReflectService.get` returns any active implementation stored under the caller's isolation key. With `compaction-basic` on the host plane it did find the engine: a probe at `73cf4fb` compacted on both hosts.
+- The web profile disables the host-plane rows (`compaction-basic`, `command-compact` and `tool-result-pruner` are `disabled: true` in `packages/bundle/web-app/cordis.patch.yml`). Each agent preset mounts them in a `cordis:group` with `isolate: { compaction: true, toolResultPruner: true }`.
+- The realm therefore has its own key. The plugin's lookup returned nothing, and `compactIfRequested` cleared the request without a log line.
+- The layout is the same on every host the recorded roots ran on (`0.1.3-alpha.2` for v41, `0.1.5-rc.1` for 5198/5199, `0.1.6-alpha.2` for 5202) and on both supported releases:
+  - 0.1.5-rc.3: web-app patch line 427, and `agent-presets/presets/standard/agent.cordis.yml` lines 138-146.
+  - 0.1.7-rc.1: web-app patch line 488, and `web-app/presets/standard.patch.yml` lines 63-71.
+- Read-only session logs agree:
+  - In v41 member `0629119e` (mission `85262933`), a `swarm_verify` at a 313,277-token prompt was followed by `swarm_wait`, a `blocked` turn end and 7.7 minutes idle, with no compaction. The session's only compaction came at 792,439 tokens, from the preset's pressure path.
+  - In the 5198/5199/5202 roots, 8 reviewer verdicts were at or above 250K. All reached an idle turn end, and none compacted.
+
+The other candidates:
+- `lastPromptTokens` was not the cause. It is updated from every `assistant/message` usage, and the DeepSeek adapter reports `inputTokens` net of cache hits, so input plus cache read is the whole prompt.
+- The request did survive a busy member and was retried at the next idle. However, the idle handler first re-woke input queued behind a rejected step, so that unit ran on the full history.
+- The summary request's usage (`compaction/summary`) was never charged to the member, although known-limitations said it was.
+
+**Fix.**
+- The adapter reaches the member's own engine through the `/compact` command that the member's composition resolves (`commands.find(agent, 'compact')`). It falls back to a host-plane `compaction` service, and warns once when there is neither.
+- The idle handler now compacts before it re-wakes a rejected step's queued input. That input then waits behind the engine's `runMaintenance`.
+- `compaction/summary` usage is charged like a model response, both live and when a session is restored.
+
+**Regression.**
+- `tests/harness-boundary-compaction.mjs` is now part of `test:harness`, and `test:pack` also runs it against the packed artifact.
+  - It is a real Loader composition: `commands` and `tokenMeter` on the host plane, plus the preset's realm (the same group and `isolate` map). It sets `boundaryCompactionTokens: 1000` and scripts prompts of 1,500 tokens.
+  - The builder is idle at its verdict and compacts at once. The reviewer is inside `swarm_verify` and compacts at the idle after that turn.
+  - For each member it checks: exactly one `compaction/start`/`summary`/`end` after the verdict and before the next assignment reaches the model; no open turn; no command id.
+  - It also checks that the next request has fewer messages and characters and carries the `<compacted-summary>` checkpoint, and that the stored usage equals every scripted request, the summary included.
+- A unit test in `tests/roles.test.mjs` covers the retry at the next idle. A member parks itself inside a held tool while next-turn input is queued, and must compact while idle before that input's unit runs.
+- At `73cf4fb`'s adapter:
+  - The Loader test times out waiting for any compaction on both hosts.
+  - The unit test records `next-unit-request` before the compaction.
+  - With only the accounting change reverted, the Loader test fails at the usage check.
+
+**Checks.** Each supported host was checked with its `nm-015rc3` or `nm-017rc1` link farm and `DSH_HARNESS_ROOT` at the matching clone:
+- `typecheck` and `build` clean.
+- Ten adapter test files (roles, harness-workers, activity, r12-native-start-fixes, r19-recovery-fallback, rule-owner-channel, harness-owner-notices, owner-decisions, scheduling-pass, operation-bound): 155/155.
+- `test:harness` passed, smoke snapshot unchanged.
+- `test:pack` passed: 239 archive entries, both compositions on the packed artifact.
+- `test:profile` passed. `test:bundle` 7/7.
+- Fault suite 24/24.
+- `test:replay` ran once, on 0.1.5-rc.3: digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`, unchanged.
+
+**Expected effect, not yet measured live.**
+- The worktree measurement attributes 414.1M accounted tokens (4,085M raw, almost all cache reads) of 800.7M member tokens to context carried into later tasks. The median carried context at a later task's start is 306,666 tokens (p10 130K, p90 600K).
+- The report's cap model (carried context at most 250K) removes about 137M accounted. That moves one-member-per-task's remaining saving from −40.7..−50.4% to −23.6..−33.2% of member tokens at the budget rule, and to +4.5..−13.8% at list price.
+- This is a lower bound for boundaries above 250K, because a compacted member starts its next unit from the summary plus the last retained node, not from 250K. Carried context under 250K is untouched.
+- Each compaction costs one summary request that replays the old prompt, mostly as cache hits: about 30-65K accounted at 250-600K prompts. If all 288 boundaries had compacted, that would be at most about 9-19M.
+- Measuring the effect needs a new mission on a host with this build.
+
 ## Round-28 host versions: 0.1.5-rc.3 and 0.1.7-rc.1 only (2026-09-24)
 
 The plugin now supports exactly two Harness releases, `0.1.5-rc.3` (npm `latest`, the default host) and

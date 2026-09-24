@@ -112,7 +112,7 @@ flowchart TD
 Agent Swarm 当前以源码插件形式提供。你需要：
 
 - **Node.js `^22.19.0 || >=24.0.0`、Git，以及 macOS 或 Linux。** 任务在本地 Git 仓库中执行。
-- **已构建的受支持 DeepSeek Harness。** 只支持两个版本：`0.1.5-rc.3`（npm `latest`，默认宿主）和 `0.1.7-rc.1`（npm `next`），准确提交见[兼容矩阵](compatibility.json)。用 `DSH_HARNESS_ROOT`（或 `DSH_SOURCE`）指定检出；未指定时，脚本依次查看 `~/.dsh/source/current` 和同级目录 `deepseek-harness-015rc3`、`deepseek-harness-017rc1`，取第一个受支持版本的检出，其他版本的检出会被跳过。
+- **已构建的受支持 DeepSeek Harness。** 只支持两个版本：`0.1.5-rc.3`（npm `latest`，默认宿主）和 `0.1.7-rc.1`（npm `next`），准确提交见[兼容矩阵](compatibility.json)。用 `DSH_HARNESS_ROOT`（或 `DSH_SOURCE`）指定检出；未指定时，脚本依次查看 `~/.dsh/source/current` 和同级目录 `deepseek-harness-015rc3`、`deepseek-harness-017rc1`，取第一个已构建（存在 `apps/cli/lib/bin.js`）的受支持版本检出，其他版本或未构建的检出会被跳过。
 - **可用的 Harness 模型配置。** 凭据由宿主管理；除非计划指定其他模型路由，成员默认沿用主会话模型。
 
 ```sh

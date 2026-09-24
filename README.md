@@ -106,7 +106,7 @@ For the implementation contracts and their origins, see [design notes](docs/desi
 Agent Swarm currently ships as a source plugin. You need:
 
 - **Node.js `^22.19.0 || >=24.0.0`, Git, and macOS or Linux.** Work happens in local Git repositories.
-- **A built, supported DeepSeek Harness checkout.** Exactly two releases are supported: `0.1.5-rc.3` (npm `latest`, the default host) and `0.1.7-rc.1` (npm `next`), each at the commit in the [exact compatibility matrix](compatibility.json). Point `DSH_HARNESS_ROOT` (or `DSH_SOURCE`) at the checkout you mean. Without it the scripts take the first supported checkout among `~/.dsh/source/current` and the sibling `deepseek-harness-015rc3` and `deepseek-harness-017rc1` directories; a checkout of any other release is skipped.
+- **A built, supported DeepSeek Harness checkout.** Exactly two releases are supported: `0.1.5-rc.3` (npm `latest`, the default host) and `0.1.7-rc.1` (npm `next`), each at the commit in the [exact compatibility matrix](compatibility.json). Point `DSH_HARNESS_ROOT` (or `DSH_SOURCE`) at the checkout you mean. Without it the scripts take the first built, supported checkout among `~/.dsh/source/current` and the sibling `deepseek-harness-015rc3` and `deepseek-harness-017rc1` directories; a checkout of any other release is skipped.
 - **A working model configuration in Harness.** Credentials stay with the host. Workers inherit the primary conversation's model unless the plan selects another route.
 
 ```sh
