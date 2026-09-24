@@ -1,7 +1,7 @@
 /** Optional native browser RPC consumers of the durable swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import { RpcId } from '@deepseek-ai/dsh-client-connection'
-import type { ConnectionRpcHandler, ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
 import { isAppendSurfaceEvent, SessionId, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
@@ -207,7 +207,8 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
     } }
   }
-  const handler: ConnectionRpcHandler = async (endpoint, payload, signal) => {
+  // The routes below call this directly; 0.1.7's ConnectionRpcHandler adds a peer argument no route needs.
+  const handler = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
     try {
       signal.throwIfAborted()
       if (Buffer.byteLength(JSON.stringify(payload) ?? '', 'utf8') > options.maxPayloadBytes) throw new RequestError('Swarm request exceeds the payload limit')
@@ -396,12 +397,11 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // Three host generations, one route shape. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5 onward, 0.1.6
-  // included: `rpc.handle` registers the route under the CONNECTION plugin's own
-  // fiber, and from 0.1.5 that fiber injects `credentials` alone (0.1.3 injected
-  // `webServer` too), so Cordis refuses its `webServer` access and the route is
-  // never registered — silently, because the failure lands in a child fiber.
+  // One route shape on both supported hosts. A plugin-owned channel
+  // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
+  // registers the route under the CONNECTION plugin's own fiber, which injects
+  // `credentials` alone, so Cordis refuses its `webServer` access and the route
+  // is never registered — silently, because the failure lands in a child fiber.
   // The shared `/api` interceptor is not an option either — that channel admits
   // exactly one interceptor and another plugin holds it. What is left is what the
   // host itself documents for plugin endpoints: one exact route per endpoint on

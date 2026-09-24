@@ -1,13 +1,80 @@
 # Validation
 
-Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile.
+Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are recorded separately below. Supported Harness releases remain prereleases; matching a version string alone does not establish compatibility with an arbitrary checkout or profile. From round 28 exactly two releases are supported; entries before it record checks against the releases supported at the time (`0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1`, `0.1.6-alpha.2`), which are no longer supported.
 
 | Harness release | Exact source commit |
 | --- | --- |
-| `0.1.5-rc.1` | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
-| `0.1.6-alpha.2` | `ddefc45fbc7f8e46dd73185e68295696d1297887` |
-| `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
-| `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+| `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
+
+## Round-28 host versions: 0.1.5-rc.3 and 0.1.7-rc.1 only (2026-09-24)
+
+The plugin now supports exactly two Harness releases, `0.1.5-rc.3` (npm `latest`, the default host) and
+`0.1.7-rc.1` (npm `next`); `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` are dropped.
+
+**Hosts.** Two fresh clones of `github.com/deepseek-ai/deepseek-harness`, checked out at `dsh-v0.1.5-rc.3`
+(`a4c74a91e0`) and `dsh-v0.1.7-rc.1` (`46a7f68b09`), built the way the earlier checkouts were: pnpm 11.7.0,
+Node 22.22.3, `pnpm install --frozen-lockfile` then `pnpm run build` (native system addon, `build:lib` host and
+client, `build:web`, client build record). 0.1.5-rc.3: install 128 s, build 406 s (234 client artifacts).
+0.1.7-rc.1: install 23 s (warm store), build 330 s (263 client artifacts), partly concurrent with the 0.1.5-rc.3
+gates. Each gate ran with `DSH_HARNESS_ROOT` at one clone and the plugin's own SDK links (`npm run link:dsh`)
+pointing at the same clone, so the plugin's imports and the Loader's host packages come from one release.
+
+**What each host needed.**
+
+- 0.1.5-rc.3 needed no product change: typecheck, build and every gate except `test:web` passed at `fa6a507`
+  with only the compatibility metadata of `a4798c1` applied.
+- `test:web` failed on both hosts at `[data-swarm-launcher]`. With `DSH_HARNESS_ROOT` unset the web smokes had
+  resolved `~/.dsh/source/current`, a 0.1.2-rc.1 checkout on the development host, and were written against the
+  plugin's standalone dock, which renders only where the host has no right sidebar. Both supported hosts carry
+  the panel as a native right-sidebar tab. `test:web` and `test:command-web` now open it through the native footer
+  launcher, check that it sits beside the conversation without covering the composer, collapse it through the
+  host's own control and reopen it (unsaved plan edits survive), keep it inside a 390px viewport, and open a
+  worker conversation's own tab from the launcher (the right sidebar is per conversation).
+- 0.1.7-rc.1 failed typecheck with six errors at four sites, and the Loader composition could not read tool results. The
+  `agentPresets` service moved from `dsh-agent-presets` (not published at 0.1.7) to `dsh-agent-preset-registry`
+  with the same `composedPreset`/`mount` methods: the adapter declares it structurally and the peer is dropped.
+  The regenerated runtime context is a `runtime-context` message source (the shared `plugin` kind is gone): the
+  owner delivery filter accepts both shapes. `ConnectionRpcHandler` gained a `peer` argument: the web routes
+  type their own handler. Tool results are `role: 'tool'` messages carrying `isError`: the swarm card and the
+  worker transcript read that flag too, and the test fixtures read either shape through `toolResultBlocks`.
+  The bundle test accepts 0.1.7's `patchPaths` list and mount-relative plugin URL, and the command test bench
+  offers 0.1.7's `sessions.binding`/`sessions.using`.
+
+**Deleted as serving only the dropped releases.** The standalone dock (`SidebarDock.tsx`, its `shell.overlay`
+seat, the open-monitor event, the panel's Collapse button, its CSS and strings), the setup hook's
+`agentCtx.agent` fallback, the empty `deployment:persona` section, the persistence `list` fallback, and the
+test-side `options.system` carrier and pre-handle storage helpers. Net: client −125 lines, runtime −18, tests −38;
+the earlier estimate of about 400 lines of client compatibility code did not hold. The 0.1.6 behaviour that
+0.1.7 keeps (the retained `mainView` session, `uiWorkspace.openSession`, the asynchronous sandbox `confine`, the
+right-sidebar guide entry id) stays beside the 0.1.5 path. The default Harness selection skips an unsupported
+`~/.dsh/source/current` and tries `deepseek-harness-015rc3` and `deepseek-harness-017rc1` beside the checkout.
+
+**Host defect, not patched here.** The `ui-conversation` claim-token loop is unchanged in both releases (and was
+in 0.1.6-alpha.2): `claim-decor.ts` splits the styled `/command ` token with `splitText`, the overflow keeps the
+token style, Lexical merges the identically styled siblings, and the transform never settles. With Lexical 0.49.0
+headless, registering the decoration for `/agent-swarm `, creating that text node and appending `全` to it throws
+`One or more transforms are endlessly triggering additional transforms` on 0.1.5-rc.3, 0.1.6-alpha.2 and
+0.1.7-rc.1; clearing the overflow style after the split (the shipped `patches/harness-command-input.patch`,
+retargeted from 0.1.5-rc.1) stops it on all three, and `scripts/check-harness-command-input.mjs` passes 5/5 on
+both supported clones. Both browser command smokes pass without it.
+
+| Check | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run typecheck` / `npm run build` | passed / passed | passed / passed |
+| `node --test tests/*.test.mjs` | 1491/1491 (183 s) | 1491/1491 (292 s); the first run failed the three command-bench tests fixed in `962ab92` |
+| `npm run test:harness` | passed | passed |
+| `npm run test:pack` | passed (239 published files) | passed (239 published files) |
+| `npm run test:profile` | passed | passed |
+| `npm run test:bundle` | 7/7 | 7/7 |
+| `node scripts/faults/run.mjs` (F3a-c boot the real Loader) | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks (host on 127.0.0.1:64131) | passed, 13 checks (127.0.0.1:52831) |
+| `npm run test:command-web` | passed, 10 checks (127.0.0.1:64333) | passed, 10 checks (127.0.0.1:53197) |
+
+Both web smokes start their own temporary host on a port the OS assigns (`--port 0`); none used 5192-5202. A
+smoke process can stay alive after `passed` while Chrome shuts down; the result is `passed` in its `report.json`.
+Not exercised: a real-provider mission (`test:deepseek`, `test:command-deepseek`), `test:load`, `test:replay` and
+the attended preview.
 
 ## Round-27 simplification batch 7: rework in place, whole-lineage retirement, host-added reviews (2026-09-24)
 
@@ -1123,7 +1190,7 @@ The behavioral tests import the built `lib/` output. `npm test` builds first; a 
 
 `npm run test:harness`, `npm run test:pack` and `npm run test:profile` compose a real Harness profile whose sandbox requests `workspace-write`, so they require a host that permits nested `sandbox_apply`. Inside an outer workspace-write sandbox, macOS denies it (`sandbox-exec: sandbox_apply: Operation not permitted`) and the composition fails with `SandboxUnavailableError`. `test:pack` and `test:profile` detect an unusable nested sandbox before the composition and abort with that prerequisite; set `DSH_SWARM_SKIP_SANDBOX_PREFLIGHT=1` to attempt the composition anyway. `npm run test:harness` runs the composition directly and reports the same `SandboxUnavailableError`.
 
-`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or `~/.dsh/source/current` (or a sibling `deepseek-harness-rc1`/`deepseek-harness-latest`) with built `lib/` entries matching [compatibility.json](../compatibility.json). Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only the built entry points, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`, so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
+`npm run test:faults` needs no sandbox, but its provider-fault tier B (F3a/F3b/F3c) boots the real Harness Loader, so it needs a built supported Harness checkout: `DSH_HARNESS_ROOT` or `DSH_SOURCE`, or else the first of `~/.dsh/source/current` and the siblings `deepseek-harness-015rc3`/`deepseek-harness-017rc1` whose version is in [compatibility.json](../compatibility.json), with built `lib/` entries. Without one it fails with `The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT`. The host-only `npm run test:isolation` drives the real sandbox provider and needs the same built checkout plus a host that permits the platform sandbox; it is not part of the worker check set. The published tarball ships only the built entry points, the manifest, `cordis.patch.yml`, four documents and `scripts/packed-smoke.mjs`, so the full suite requires the repository checkout (see [known-limitations.md](known-limitations.md)).
 
 `npm run test:web` and `npm run test:command-web` launch the real Web application and are load-sensitive. Run them sequentially on an idle host, without other large suites or browsers in parallel, and re-run a timeout before treating it as a product defect.
 

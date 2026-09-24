@@ -6,7 +6,6 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type {} from '@deepseek-ai/dsh-agent-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
@@ -31,6 +30,21 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 /**
+ * The `agentPresets` service, declared structurally: 0.1.5 provides it from
+ * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
+ * with the same two methods this adapter uses.
+ */
+interface AgentPresets {
+  composedPreset(agentCtx: Context): string | undefined
+  mount(agentCtx: Context, id?: string): Promise<unknown>
+}
+
+/** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
+export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
+  return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+}
+
+/**
  * Keep lifecycle policy in the runtime, but apply it at the native consumer
  * boundary too: transport acknowledgement can precede consumption by a turn.
  * Returning an empty admitted batch lets Harness finish a completed turn while
@@ -50,7 +64,7 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
     const admitted = decision.messages.filter(message => !stale(agent, message)
       // A changed generated context is not an independent user request. Let it
       // be regenerated for the next genuine turn instead of reviving this one.
-      && !(onlyStale && message.source.kind === 'plugin' && message.source.plugin === '@deepseek-ai/dsh-system-prompt'))
+      && !(onlyStale && isRuntimeContext(message.source)))
     return { ...decision, messages: admitted.map(message => {
       if (message.source.kind !== 'swarm') return message
       const content = project(String(agent.id), message.source.deliveryId)
@@ -109,7 +123,7 @@ export interface HarnessWorkerOptions {
 }
 /** The confinement surface a declared verification check must pass through. */
 export interface VerificationSandbox {
-  /** 0.1.5 returned the confinement synchronously; 0.1.6 resolves it (the backend probe became async). Both are accepted. */
+  /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
   confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
 }
 export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
@@ -691,7 +705,7 @@ export class HarnessWorkers implements WorkerAdapter {
     }
     const owner = this.ctx.agents.get(SessionId(spec.ownerSessionId))
     if (owner === undefined) throw new Error('First worker creation requires its owner session to seed a durable composition')
-    const preset = this.ctx.get('agentPresets')?.composedPreset(owner.ctx)
+    const preset = (this.ctx.get('agentPresets') as AgentPresets | undefined)?.composedPreset(owner.ctx)
     const inherited = await ownerModelSelection(this.ctx, owner, signal)
     const selection = inherited === undefined && spec.member.provider === undefined && spec.member.model === undefined && spec.member.reasoningEffort === undefined
       ? undefined : workerModelSelection(inherited, spec.member)
@@ -736,22 +750,14 @@ export class HarnessWorkers implements WorkerAdapter {
       abort.signal.throwIfAborted()
     }
     const usageSource = { generation: composition.usageGeneration, restored: persisted }
-    // The setup hook's shape moved in the 0.1.5 line: through 0.1.3-alpha.2 the
-    // agent was reached through `agentCtx.agent` (removed at 0.1.5), and from
-    // 0.1.5 the callback receives it as its second parameter. An OPTIONAL second
-    // parameter satisfies both `AgentSetup` signatures, and the value is taken
-    // from whichever host supplies it, so one callback serves every supported
-    // release instead of forking the adapter by host version.
-    const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
+    const setup = async (agentCtx: Context, agent: Agent): Promise<void> => {
       abort.signal.throwIfAborted()
-      const presets = this.ctx.get('agentPresets')
+      const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
       if (composition.preset !== undefined) {
         if (presets === undefined) throw new Error('Saved worker composition requires agent-presets')
         await presets.mount(agentCtx, composition.preset)
       } else if (presets !== undefined) throw new Error('A rosterless worker cannot silently resume under a new default preset')
       abort.signal.throwIfAborted()
-      const agent = setupAgent ?? (agentCtx as Context & { agent?: Agent }).agent
-      if (agent === undefined) throw new Error('Worker setup received no agent from the Harness')
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
       abort.signal.throwIfAborted()
@@ -769,10 +775,8 @@ export class HarnessWorkers implements WorkerAdapter {
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
-      // rc.1 uses one persona; alpha.2 split it into prefix/suffix. Shadow the
-      // deployment persona on both public section contracts so workers retain
-      // only their own role, including after resuming an older composition.
-      agentCtx.systemPrompt.section({ name: 'deployment:persona', order: 0, text: '' })
+      // Shadow the deployment persona's prefix and suffix so workers retain only
+      // their own role, including after resuming an older composition.
       agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
       agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
       // Source metadata is preserved in the host log, but provider serializers

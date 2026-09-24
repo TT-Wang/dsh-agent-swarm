@@ -1,6 +1,6 @@
 # Design traceability
 
-Automatic project snapshots and explicit result application accompany native one-command planning, primary-agent-selected budgets, the docked sidebar and durable collaboration runtime. Plan editing and mission controls call the same runtime that authenticates model tools by session identity; the browser transport uses modern Harness native browser credentials, cookies and trusted-host checks.
+Automatic project snapshots and explicit result application accompany native one-command planning, primary-agent-selected budgets, the native right-sidebar tab and durable collaboration runtime. Plan editing and mission controls call the same runtime that authenticates model tools by session identity; the browser transport uses modern Harness native browser credentials, cookies and trusted-host checks.
 
 | Agreed design property | Implementation | Evidence |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ Automatic project snapshots and explicit result application accompany native one
 | Editable planning before execution | `swarm_stage`, `PlanInput`, revisioned `DraftPlan`, `plans.ts`, `DraftEditor.tsx` | Plan validation, ownership, revision-conflict and draft HTTP tests; CLI Web/browser workflow in `test:web` |
 | Complete topology before dispatch | Staged mission assembly, stable topology IDs, `launchDraft`; saved-plan workspace and exact-model admission | Launch retry, interrupted assembly recovery and model-validation-before-effects tests |
 | Live inspectable mission state | `ActivityPanel.tsx`, selected-session `SwarmMonitor`, native state/watch RPC, summary and disclosed technical views | Watch cancellation, cursor replay, owner isolation, HTTP and actual Web-profile browser tests |
-| Sidebar remains usable beside chat | Optional Better Sidebar tab, independent dock fallback, retained draft state on collapse | Real service contract tests and browser geometry/draft interactions |
+| Sidebar remains usable beside chat | Native right-sidebar tab, optional Better Sidebar tab, retained draft state on collapse | Real service contract tests and browser geometry/draft interactions |
 | Owner-only mission management | Verified native session IDs, `visibleSnapshots`, durable worker identity checks and runtime control methods | Owner/member isolation, historical-worker readonly, pause/stop and cold-owner HTTP cases |
 | Independent worker conversations and persisted transcripts | Listed workers use `sessions.open(workerSessionId)`; missing/disposed workers use owner-authorized `worker-history` RPC backed by native `sessionController.inspect`, through `WorkerHistory` and `WorkerTranscript` | Native navigation and history pagination/projection tests; browser workflow checks live navigation and cold history without model activation |
 | Conversation history stays reconstructable | Durable `tool/result.meta.swarmSnapshot` conversation projections, separate from live watches | Real client registry mount/dispose and conversation render tests |
@@ -44,7 +44,7 @@ Deterministic composition tests script provider responses while Harness loading,
 
 The client registers one `agent-swarm` tab through the optional public Better Sidebar service. Each tab receives its supplied session scope and visibility, owns a separate state monitor and history viewer, and never substitutes the globally selected session for a pinned tab. Hidden tabs suspend monitor requests. Registration and service replacement follow Cordis disposal.
 
-Without Better Sidebar, the additive shell contribution renders a right-edge dock and explicitly reserves its width from the DSH root. A narrow viewport uses a bottom row. Width changes, collapse and reopen affect layout, not runtime authority. The floating rectangle, title-bar dragging, corner resize and free-position preferences were removed. The native conversation and tool-details slot owners remain installed.
+The panel is a tab of the host's right sidebar, which owns its geometry and places it beside the conversation. Collapse and reopen affect layout, not runtime authority. The standalone dock that served hosts without a right sidebar (0.1.2, 0.1.3) was removed with those hosts, as were the floating rectangle, title-bar dragging, corner resize and free-position preferences. The native conversation and tool-details slot owners remain installed.
 
 
 ## Native command and primary-agent decisions (v0.3.0)

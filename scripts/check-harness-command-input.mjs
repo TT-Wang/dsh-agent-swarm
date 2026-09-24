@@ -8,14 +8,15 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 if (process.argv.length !== 3 || process.argv[2].startsWith('-')) {
-  console.error('Usage: node scripts/check-harness-command-input.mjs /path/to/deepseek-harness-015')
+  console.error('Usage: node scripts/check-harness-command-input.mjs /path/to/deepseek-harness')
   process.exit(1)
 }
 
 const harness = resolve(process.argv[2])
 const packageRoot = join(harness, 'packages/client/ui-conversation')
 const packageJson = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
-assert.equal(packageJson.version, '0.1.5-rc.1', 'this patch targets Harness 0.1.5-rc.1 only')
+const supported = JSON.parse(await readFile(new URL('../compatibility.json', import.meta.url), 'utf8')).supportedHosts.map(host => host.version)
+assert(supported.includes(packageJson.version), `this patch targets the supported Harness releases (${supported.join(', ')}), not ${packageJson.version}`)
 const require = createRequire(join(packageRoot, 'package.json'))
 // Use the same ESM Lexical instance for the source module and test editor.
 const lexicalUrl = pathToFileURL(require.resolve('lexical').replace(/\.js$/, '.mjs')).href
@@ -24,7 +25,7 @@ const { $createParagraphNode, $createTextNode, $getRoot, $getSelection } = await
 const { createHeadlessEditor } = await import(headlessUrl)
 const sourcePath = 'src/client/input/editor/claim-decor.ts'
 const original = await readFile(join(packageRoot, sourcePath), 'utf8')
-const patch = fileURLToPath(new URL('../patches/harness-0.1.5-rc.1-command-input.patch', import.meta.url))
+const patch = fileURLToPath(new URL('../patches/harness-command-input.patch', import.meta.url))
 const temporary = await mkdtemp(join(tmpdir(), 'dsh-command-input-regression-'))
 
 try {
@@ -44,7 +45,8 @@ try {
   const before = await load(original)
   const after = await load(patched)
   const TOKEN = '/agent-swarm '
-  const STYLE = 'color: var(--dsw-alias-state-warn-label)'
+  // 0.1.5 styles the token with the warn label, 0.1.7 with the business accent.
+  const STYLE = original.match(/const TOKEN_STYLE = '([^']+)'/)[1]
 
   function bench(module, initial = TOKEN) {
     const editor = createHeadlessEditor({ namespace: 'claim-overflow-regression', onError(error) { throw error } })

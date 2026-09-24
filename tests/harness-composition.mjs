@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
-import { bootHarness, importHarness } from './fixtures/built-harness.mjs'
+import { bootHarness, importHarness, toolResultBlocks } from './fixtures/built-harness.mjs'
 import { requests, setResponder } from './fixtures/scripted-llm.mjs'
 
 const execute = promisify(execFile)
@@ -48,7 +48,7 @@ let workerMode = 'complete'
 const tool = (name, args) => ({ kind: 'tool', name, args })
 const answer = text => ({ kind: 'text', text })
 const texts = message => message.content.filter(block => block.type === 'text').map(block => block.text)
-const toolBlocks = messages => messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
+const toolBlocks = toolResultBlocks
 function jsonResult(block) {
   const rendered = texts(block).join('\n')
   assert(!block.isError, `Harness tool failed: ${rendered}`)

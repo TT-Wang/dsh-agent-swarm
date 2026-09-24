@@ -17,7 +17,6 @@ import { mergeStartResponse, requestStartControl, type StartAction } from './sta
 import { RequestDeadlineError } from './request-deadline.ts'
 import { currentSessionId } from './navigation.ts'
 
-export const OPEN_MONITOR = 'agent-swarm:open-monitor'
 interface PendingOperation { context: string; generation: number; action: string }
 const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting', paused: 'Updates paused' }
 /**
@@ -37,10 +36,10 @@ export function CompletionControls({ snapshot, disabled, onComplete }: { snapsho
     {reason !== undefined && <span className="sw-small" data-swarm-completion="blocked" title={`${t('Cannot complete')}: ${reason}`}>{t('Cannot complete')}: {reason}</span>}
   </div>
 }
-export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
+export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true }: {
   sessions: Context['sessions']; modelDirectories: Context['modelDirectories']; monitor: SwarmMonitor;
   history: WorkerHistory; onOpenWorker: (member: Member) => void;
-  sessionId?: string; active?: boolean; onClose?: () => void;
+  sessionId?: string; active?: boolean;
 }) {
   const t = useCopy()
   const sessionState = useSyncExternalStore(sessions.list.subscribe, sessions.list.getSnapshot, sessions.list.getSnapshot)
@@ -115,7 +114,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   const start = selectedStart && (['planning', 'launching', 'failed'].includes(selectedStart.status) || (selectedStart.status === 'stopped' && !snapshot)) ? selectedStart : undefined
   useEffect(() => { setStartUnconfirmed(false) }, [state.updatedAt, context])
   const directory = useMemo(() => {
-    // A selected subagent address (0.1.5 `currentAddress`) has no model directory of its own; 0.1.6 panes always name their session.
+    // A selected subagent address (0.1.5 `currentAddress`) has no model directory of its own; 0.1.7 panes always name their session.
     const currentAddress = (sessionState as { currentAddress?: unknown }).currentAddress
     if (!owner || (!sessionId && currentAddress)) return undefined
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
@@ -178,7 +177,6 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   return <aside data-swarm="" data-swarm-panel="" data-swarm-session={owner} aria-label={t('Mission control')}>
     <header className="sw-panel-title">
       <div><strong>{t('Agent Swarm')}</strong><small data-swarm-connection={connection}><span className="sw-live-dot" data-connection={connection} />{t(connectionLabels[connection])}</small></div>
-      {onClose && <div className="sw-panel-buttons"><button title={t('Collapse sidebar')} aria-label={t('Collapse sidebar')} onClick={onClose}>›</button></div>}
     </header>
     <div className="sw-panel-toolbar">{showMissionPicker && <select aria-label={t('Missions')} value={selected} onChange={event => choose(event.currentTarget.value)}>
       {!drafts.length && !snapshots.length && <option value="">{t('No missions yet')}</option>}

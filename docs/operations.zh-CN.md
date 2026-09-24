@@ -10,12 +10,10 @@
 
 | Harness 版本 | 发布提交 |
 | --- | --- |
-| [0.1.5-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.1) | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
-| [0.1.6-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.6-alpha.2) | `ddefc45fbc7f8e46dd73185e68295696d1297887` |
-| [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
-| [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3)（npm `latest`，默认宿主） | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1)（npm `next`） | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
-三个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。插件不承诺兼容 `0.1.0-rc.5`、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
+两个版本都是预发行版。开发链接器检查记录的发布提交，不只检查包版本号。第 28 轮已停止支持 `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-rc.1` 和 `0.1.6-alpha.2`，并删除了只为它们保留的代码。插件不承诺兼容其他版本、未发布提交或任意自定义 profile。Better Sidebar 集成在 0.18.0 上经过验证。
 
 运行需要：
 
@@ -88,11 +86,10 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 插件按顺序选择第一个可用界面：
 
-1. **Harness 原生右侧边栏**：在受支持的 0.1.5 版本中，打开 Files 旁的 **New tab → Start → Agent Swarm**。命令和会话卡片会打开同一个标签页。
-2. **Better Sidebar**：较早的受支持宿主已安装该插件时，从 **+** 标签菜单选择 **Agent Swarm**。
-3. **独立 dock**：位于会话旁并记忆宽度；窄屏时移到会话下方。
+1. **Harness 原生右侧边栏**：两个受支持版本都适用。点击左侧导航底部的 **Agent Swarm** 按钮打开；命令和会话卡片会打开同一个标签页。右侧栏属于单个会话，成员会话需要用同一个按钮打开它自己的只读视图。
+2. **Better Sidebar**：profile 安装了该插件时，从 **+** 标签菜单选择 **Agent Swarm**。
 
-同一时间只挂载一个界面。隐藏侧栏只停止显示更新，不停止 worker。成员活动显示宿主观察到的操作和信号新鲜度，不会逐 token 流式展示模型输出，也不保证每个活跃操作都产生有效进展。断线后，保留的活动会标记为最后观测状态，计时冻结；缺少新信号时会停止忙碌动画，但不会直接认定 worker 失败。
+隐藏侧栏只停止显示更新，不停止 worker。成员活动显示宿主观察到的操作和信号新鲜度，不会逐 token 流式展示模型输出，也不保证每个活跃操作都产生有效进展。断线后，保留的活动会标记为最后观测状态，计时冻结；缺少新信号时会停止忙碌动画，但不会直接认定 worker 失败。
 
 ### 控制与交付
 

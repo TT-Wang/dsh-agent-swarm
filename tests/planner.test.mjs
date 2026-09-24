@@ -10,8 +10,8 @@ import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import { registerAutomaticStart } from '../lib/planner.js'
 
 /**
- * The slice of an Agent inbox the planner's owner fixtures exercise. 0.1.3 exported a runtime Inbox from
- * dsh-agent; 0.1.6 keeps it inside the loop (ReactLoopInbox), so the fixture models the contract itself:
+ * The slice of an Agent inbox the planner's owner fixtures exercise. dsh-agent exports no runtime Inbox (the
+ * loop keeps it as ReactLoopInbox), so the fixture models the contract itself:
  * every insertion is the durable `agent/inbox/spliced` record the planner reads back to decide whether a
  * recovery notice was already delivered (src/planner.ts), and the queues mirror what the record says.
  */
