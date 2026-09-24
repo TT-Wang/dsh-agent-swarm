@@ -679,15 +679,14 @@ export class HarnessWorkers implements WorkerAdapter {
     const existing = this.residents.get(spec.member.id)
     if (existing !== undefined) {
       if (existing.spec.member.sessionId !== spec.member.sessionId) throw new Error('Worker identity changed')
-      if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec, signal) }
-      existing.abort.signal.throwIfAborted()
+      if (existing.abort.signal.aborted) { await this.stop(spec.member.id); return await this.start(spec, signal) }
       return await this.awaitOpening(existing, signal)
     }
     const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
     try { await this.awaitOpening(resident, signal) }
-    catch (error) { if (this.residents.get(spec.member.id) === resident) this.residents.delete(spec.member.id); throw error }
+    catch (error) { if (this.residents.get(spec.member.id) === resident && resident.handle === undefined) this.residents.delete(spec.member.id); throw error }
   }
 
   private async awaitOpening(resident: Resident, signal?: AbortSignal): Promise<void> {
@@ -1128,11 +1127,12 @@ export class HarnessWorkers implements WorkerAdapter {
           const sessions = this.ctx.get('sessions')
           if (sessions?.get(handle.agent.id) === handle.agent.session) await sessions.flush(handle.agent.session)
         }
-        finally { await handle.dispose() }
+        finally { await handle.dispose(); resident.handle = undefined }
       }
     })()
+    // The table holds a resident until its handle is released; a failed release is not cached, so the next stop() retries it.
     try { await resident.stopping }
-    finally { if (this.residents.get(memberId) === resident) this.residents.delete(memberId) }
+    finally { if (resident.handle !== undefined) resident.stopping = undefined; else if (this.residents.get(memberId) === resident) this.residents.delete(memberId) }
   }
 
   /**

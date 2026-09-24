@@ -119,3 +119,57 @@ test('native cancel rejection cannot escape the startup abort listener or skip h
   gate.resolve(); await rejected
   assert.equal(f.calls.disposed, 1, 'cleanup still releases the handle after cancel() throws')
 })
+
+/**
+ * M-15: a worker handle leaves the adapter's table only when it is released.
+ * `failures` native disposals reject before the next one succeeds; `live`
+ * counts handles created and not yet released.
+ */
+function failingDispose(f, failures) {
+  const state = { attempts: 0, live: 1 }
+  f.handle.dispose = async () => { state.attempts++; if (state.attempts <= failures) throw new Error('native dispose failed'); state.live-- }
+  const create = f.adapter.ctx.agents.create
+  f.adapter.ctx.agents.create = async options => {
+    assert.equal(state.live, 0, 'no second handle is created for the session while the old one is unreleased')
+    state.live++
+    return await create(options)
+  }
+  return state
+}
+
+test('M-15: a successful stop releases the handle and removes its entry', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  await f.adapter.stop(f.member.id)
+  assert.equal(f.calls.disposed, 1)
+  assert.equal(f.adapter.residents.has(f.member.id), false)
+})
+
+test('M-15: a handle whose native dispose rejected stays in the table and the unload pass releases it', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  const state = failingDispose(f, 1)
+  await assert.rejects(f.adapter.stop(f.member.id), /native dispose failed/)
+  assert.equal(f.adapter.residents.has(f.member.id), true, 'the unreleased handle keeps its entry')
+  assert.equal(f.adapter.isIdle(f.member.id), false, 'and stays fenced')
+  await f.adapter.dispose()
+  assert.equal(state.attempts, 2, "unload's pass attempts the release again")
+  assert.equal(state.live, 0)
+  assert.equal(f.adapter.residents.size, 0, 'the released handle leaves the table')
+})
+
+test('M-15: start after a failed stop releases the old handle through stop() before it opens a new one', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  const state = failingDispose(f, 2)
+  await assert.rejects(f.adapter.stop(f.member.id), /native dispose failed/)
+  // The release fails again: start reports it and opens nothing.
+  await assert.rejects(f.adapter.start(f.spec), /native dispose failed/)
+  assert.equal(f.calls.create, 1)
+  // The release succeeds: the member starts on a fresh resident and handle.
+  await f.adapter.start(f.spec)
+  assert.equal(state.attempts, 3)
+  assert.equal(f.calls.create, 2)
+  assert.equal(state.live, 1)
+  assert.equal(f.adapter.residents.get(f.member.id).abort.signal.aborted, false)
+})
