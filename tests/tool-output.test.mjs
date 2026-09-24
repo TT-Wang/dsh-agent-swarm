@@ -5,9 +5,10 @@ import { registerTools } from '../lib/tools.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { setup, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
+import { budget as defaultBudget, setup, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
-const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
+const budget = { ...defaultBudget, maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4 }
 function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, makeRuntimeStub(), budget); return definitions }
 test('model-visible renders stay compact: observe passes the focused view through and never repeats the board; launch and stage return identities', () => {
   const definitions = tools()
@@ -175,10 +176,9 @@ test('registered launch accepts omitted member names and forwards canonical iden
 })
 
 test('launch rejects indexed shell syntax errors before admission and syntax checks never execute commands', async t => {
-  const { mkdtemp, access, rm } = await import('node:fs/promises')
-  const { tmpdir } = await import('node:os')
+  const { access, rm } = await import('node:fs/promises')
   const { join } = await import('node:path')
-  const workspace = await mkdtemp(join(tmpdir(), 'swarm-check-syntax-'))
+  const workspace = await tempDirectory('swarm-check-syntax-')
   t.after(() => rm(workspace, { recursive: true, force: true }))
   let launches = 0
   const snapshot = { mission: { id: 'mission-one' } }

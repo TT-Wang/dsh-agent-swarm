@@ -30,43 +30,28 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore, StaleTaskRevisionError, STALE_TASK_REFUSAL_EVENT, WriterBusyError, isSqliteBusy } from '../lib/store.js'
 import { missionFingerprint } from '../lib/gates.js'
 import { EVENT_VOCABULARY, eventVocabularyReport } from '../lib/trace.js'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
-/** The external execution boundary only: nothing in these tests dispatches work. */
-class QuietWorkers {
-  bind() {}
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  /**
-   * Deliberately false: `propose` kicks a deferred scheduling pass, and this
-   * suite must own every task write. A dispatchable member would let that pass
-   * claim the task underneath the writers being tested.
-   */
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
-
-const budget = { maxTokens: 1_000_000, maxSteps: 1_000, maxWorkers: 2, maxDurationMs: 3_600_000, maxTasks: 20, maxExperiments: 0 }
+/**
+ * The external execution boundary only: nothing in these tests dispatches work.
+ * FakeWorkers is never idle by default, deliberately: `propose` kicks a deferred
+ * scheduling pass, and this suite must own every task write. A dispatchable
+ * member would let that pass claim the task underneath the writers being tested.
+ */
+const quietWorkers = () => new FakeWorkers({ artifact: { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: [] }, checks: [],
+  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-s5-revision-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60_000, tickMs: 10_000,
-    maxMessageChars: 20_000, maxEvents: 500, maxTasksPerMember: 10 }, new QuietWorkers())
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, config, runtime, budget } = await makeRuntime(t, { workers: quietWorkers(),
+    config: { tickMs: 10_000, maxMessageChars: 20_000, maxEvents: 500, maxTasksPerMember: 10, checkTimeoutMs: undefined },
+    budget: { maxTokens: 1_000_000, maxSteps: 1_000, maxWorkers: 2, maxDurationMs: 3_600_000, maxTasks: 20 } })
   const owner = { sessionId: 's5-owner' }
   const mission = runtime.create(owner, { title: 'Revisions', objective: 'Prove per-task compare-and-swap', workspace: directory,
-    scope: ['**'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   // The tick timer is deliberately not started: these tests drive writes directly
@@ -77,7 +62,7 @@ async function fixture(t) {
   const refusals = () => store.events(mission.id, 500).filter(event => event.type === STALE_TASK_REFUSAL_EVENT)
   const twoReaders = () => { const record = store.get('tasks', task.id); return [structuredClone(record), structuredClone(record)] }
   const write = record => store.transaction(() => { record.assigneeId = author.id; store.put('tasks', record) })
-  return { directory, runtime, store, owner, mission, stream, author, task, refusals, twoReaders, write }
+  return { directory, config, runtime, store, owner, mission, stream, author, task, refusals, twoReaders, write }
 }
 
 test('S5: an accepted task write stamps the next revision onto the caller object', async t => {
@@ -165,8 +150,7 @@ test('S5: the refusal record is durable across a process restart', async t => {
   f.write(winner)
   assert.throws(() => f.write(loser), StaleTaskRevisionError)
   await f.runtime.dispose()
-  const reopened = new SwarmRuntime({ statePath: join(f.directory, 'state.sqlite'), leaseMs: 60_000, tickMs: 10_000,
-    maxMessageChars: 20_000, maxEvents: 500, maxTasksPerMember: 10 }, new QuietWorkers())
+  const reopened = new SwarmRuntime(f.config, quietWorkers())
   t.after(async () => { await reopened.dispose() })
   const recorded = reopened.store.events(f.mission.id, 500).filter(event => event.type === STALE_TASK_REFUSAL_EVENT)
   assert.equal(recorded.length, 1, 'the refused lost update is visible in the durable record after a restart')
@@ -232,9 +216,7 @@ test('S5: a new task record is accepted without a revision and a legacy row is m
   assert.equal(created.revision, 1, 'a brand-new row is stamped with revision 1')
   // A row written before per-task revisions existed carries no `revision`: its
   // first accepted write stamps one instead of refusing the bootstrap write.
-  const legacyDirectory = await mkdtemp(join(tmpdir(), 'swarm-s5-legacy-'))
-  t.after(async () => { await rm(legacyDirectory, { recursive: true, force: true }) })
-  const store = new SwarmStore(join(legacyDirectory, 'state.sqlite'), { snapshotIntervalMs: 0 })
+  const store = new SwarmStore(join(f.directory, 'legacy.sqlite'), { snapshotIntervalMs: 0 })
   t.after(() => store.close())
   const legacy = { ...created, id: 'task_legacy', revision: undefined }
   store.transaction(() => store.put('tasks', legacy))

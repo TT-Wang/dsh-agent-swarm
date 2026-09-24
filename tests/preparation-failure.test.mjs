@@ -1,48 +1,35 @@
 /** Preparation failures preserve task identity and use bounded retries only for typed transient causes. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-async function eventually(read, message, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
+/** The bound on a wedged preparation retry, as before. */
+const PREPARED_MS = 10000
 
 /** Only the external execution adapter is replaced; preparation fails on demand. */
-class PrepWorkers {
+class PrepWorkers extends FakeWorkers {
   calls = 0
   failures = 0
   transient = true
   gate
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async stop() {}
-  isIdle() { return true }
+  autoIdle = true
+  artifact = { commit: 'prep', baseCommit: 'base', workspace: '/isolated', changedPaths: [] }
+  checks = []
   async prepareTask() {
     this.calls++
     if (this.calls <= this.failures) throw Object.assign(new Error(`workspace condition ${this.calls}`), this.transient ? { code: 'EBUSY' } : {})
     if (this.gate) await this.gate
   }
-  async captureArtifact() { return { commit: 'prep', baseCommit: 'base', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
 }
 
+const prepRuntime = (t, tickMs) => makeRuntime(t, {
+  workers: new PrepWorkers(),
+  config: { tickMs, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+  budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+})
+
 async function setup(t, overrides = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-prep-'))
-  const workers = new PrepWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'state.sqlite'), leaseMs: 60000, tickMs: 20,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, workers, budget } = await prepRuntime(t, 20)
   const owner = { sessionId: 'prep-owner' }
   const mission = runtime.create(owner, { title: 'Preparation', objective: 'Recover a preparation failure', workspace: '/source',
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -62,7 +49,7 @@ test('R17: a transient preparation failure backs off and re-pends without spendi
   let release
   f.workers.gate = new Promise(resolve => { release = resolve })
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
-  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded')
+  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded', PREPARED_MS)
   const repended = f.task(proposed.id)
   assert.equal(repended.status, 'pending', 'a recoverable preparation failure re-pends the task')
   assert.equal(repended.recoveryCount ?? 0, 0)
@@ -78,7 +65,7 @@ test('R17: a transient preparation failure backs off and re-pends without spendi
   assert.match(failed[0].data.reason, /workspace condition 1/)
   assert.equal(f.events('task/blocked').length, 0, 'the first failure does not block the task')
   release()
-  await eventually(() => f.task(proposed.id).status === 'running', 'the task was not re-dispatched once preparation succeeded')
+  await eventually(() => f.task(proposed.id).status === 'running', 'the task was not re-dispatched once preparation succeeded', PREPARED_MS)
   assert.equal(f.task(proposed.id).recoveryCount ?? 0, 0, 'preparation never spends task execution credit')
   assert.equal(f.workers.calls, 2)
 })
@@ -87,7 +74,7 @@ test('R17: transient preparation retries are bounded and end in owner-resumable 
   const f = await setup(t)
   f.workers.failures = Number.POSITIVE_INFINITY
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
-  await eventually(() => f.task(proposed.id).status === 'blocked', 'the task never blocked after exhausting its recovery limit')
+  await eventually(() => f.task(proposed.id).status === 'blocked', 'the task never blocked after exhausting its recovery limit', PREPARED_MS)
   const blocked = f.task(proposed.id)
   assert.equal(blocked.recoveryCount ?? 0, 0)
   assert.equal(blocked.preparationFailure.attempts, 2)
@@ -111,7 +98,7 @@ test('R17: deterministic preparation failures wait immediately for cause-changin
   f.workers.transient = false
   f.workers.failures = Number.POSITIVE_INFINITY
   const proposed = f.propose({ maxRecoveryAttempts: 4 })
-  await eventually(() => f.task(proposed.id).status === 'blocked', 'deterministic failure should become resumable wait')
+  await eventually(() => f.task(proposed.id).status === 'blocked', 'deterministic failure should become resumable wait', PREPARED_MS)
   assert.equal(f.workers.calls, 1)
   assert.equal(f.task(proposed.id).recoveryCount ?? 0, 0)
   assert.match(f.task(proposed.id).output, /swarm_control/)
@@ -123,9 +110,9 @@ test('a handoff after a successful preparation retry re-pends the task and never
   const f = await setup(t)
   f.workers.failures = 1
   const proposed = f.propose({ maxRecoveryAttempts: 2 })
-  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded')
+  await eventually(() => f.task(proposed.id).preparationFailure?.attempts === 1, 'the first preparation failure was not recorded', PREPARED_MS)
   const running = await eventually(() => { const row = f.task(proposed.id); return row.status === 'running' ? row : undefined },
-    'the task was not re-dispatched once the preparation retry succeeded')
+    'the task was not re-dispatched once the preparation retry succeeded', PREPARED_MS)
   assert.equal(f.workers.calls, 2)
   assert.equal(running.preparationFailure?.attempts, 1, 'the recovered failure keeps its retry count until an owner resume')
   const assignment = f.runtime.store.list('deliveries', f.mission.id).filter(row => row.kind === 'assignment' && row.attemptId === running.attempt.id)
@@ -134,7 +121,7 @@ test('a handoff after a successful preparation retry re-pends the task and never
   // Keep the handed-off task observable as pending: no member is dispatchable.
   f.workers.isIdle = () => false
   f.runtime.handoff({ sessionId: f.member.sessionId }, f.mission.id, { taskId: proposed.id, attemptId: running.attempt.id, summary: 'Continue elsewhere' })
-  await eventually(() => f.events('task/handoff-ready').some(event => event.data.taskId === proposed.id), 'the handoff stop barrier did not confirm')
+  await eventually(() => f.events('task/handoff-ready').some(event => event.data.taskId === proposed.id), 'the handoff stop barrier did not confirm', PREPARED_MS)
   const handedOff = f.task(proposed.id)
   assert.equal(handedOff.status, 'pending', 'a handoff after a recovered preparation re-pends the task instead of blocking it')
   assert.equal(handedOff.preparationFailure?.attempts, 1, 'the retry count survives the handoff')
@@ -177,10 +164,7 @@ test('a flapping preparation keeps its retry count across start-failure re-pends
 })
 
 test('the assignment of a task that never failed preparation embeds its stored row unchanged', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-prep-shape-'))
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, new PrepWorkers())
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, budget } = await prepRuntime(t, 60000)
   const owner = { sessionId: 'shape-owner' }
   const mission = runtime.create(owner, { title: 'Shape', objective: 'Assignment shape', workspace: '/source',
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })

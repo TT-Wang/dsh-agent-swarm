@@ -228,11 +228,13 @@ function runtimeConfig(dir, overrides, clock) {
  * seq a test asserts is its own. `budget` is the default merged with the
  * overrides, ready for `runtime.create`; `config` is the exact RuntimeConfig, for
  * reopening the same state file. A `clock` (FakeClock) works as in `setup`.
+ * `storeOptions` is the runtime's third argument (the SQLite writer's busy
+ * timeout and retries), for a test that holds the writer lock itself.
  */
-export async function makeRuntime(t, { workers = new FakeWorkers(), config = {}, budget: overrides = {}, clock } = {}) {
+export async function makeRuntime(t, { workers = new FakeWorkers(), config = {}, budget: overrides = {}, clock, storeOptions } = {}) {
   const dir = await realpath(await tempDirectory('swarm-runtime-'))
   const runtimeSettings = runtimeConfig(dir, config, clock)
-  const runtime = new SwarmRuntime(runtimeSettings, workers)
+  const runtime = new SwarmRuntime(runtimeSettings, workers, storeOptions)
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   return { dir, config: runtimeSettings, runtime, workers, budget: { ...budget, ...overrides }, clock }
 }

@@ -1,8 +1,7 @@
 /** Real Harness tool registry and prompt assembly: sessions see only their role's swarm tools and protocol. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -17,11 +16,12 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HarnessWorkers } from '../lib/harness-workers.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { RoleScoper } from '../lib/roles.js'
 import { registerTools, ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
+import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
 
 /**
  * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
@@ -35,11 +35,12 @@ const systemTextOf = request => request.system ?? (request.messages ?? [])
   .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
   .join('\n')
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const swarmNames = tools => (tools ?? []).map(tool => tool.name).filter(name => name.startsWith('swarm_')).sort()
 
 async function fixture(t, responder, workerOptions = {}) {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-roles-')))
+  // fixture gap: a temp tree that exists before the runtime; the Harness session store and HarnessWorkers are rooted in it.
+  const root = await realpath(await tempDirectory('swarm-roles-'))
   const source = path.join(root, 'source')
   await mkdir(source)
   for (const args of [['init', '-b', 'main'], ['-c', 'user.name=Swarm', '-c', 'user.email=swarm@localhost', 'commit', '--allow-empty', '-m', 'base']]) {
@@ -75,12 +76,15 @@ async function fixture(t, responder, workerOptions = {}) {
   ctx.llm.registerAdapter(['swarm-test'], new Scripted())
   const options = { workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, ...workerOptions }
   const workers = new HarnessWorkers(ctx, options)
-  const runtime = new SwarmRuntime({ statePath: path.join(root, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
+  // Cleanup runs in registration order: the scoper, then makeRuntime's runtime and state, then the Harness context and this tree.
+  let scoper
+  t.after(() => { scoper?.dispose() })
+  const { runtime } = await makeRuntime(t, { workers, config: { tickMs: 20, maxEvents: 100, checkTimeoutMs: undefined } })
+  t.after(async () => { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
   registerTools(ctx, runtime, budget)
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
-  const scoper = new RoleScoper(ctx, runtime)
+  scoper = new RoleScoper(ctx, runtime)
   await runtime.start()
-  t.after(async () => { scoper.dispose(); await runtime.dispose(); await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
   return { ctx, runtime, workers, requests, source, scoper }
 }
 const prompt = text => ({ kind: 'text', text })
@@ -309,6 +313,7 @@ test('workers see only member tools and the member protocol, and each tool resul
     events: f.runtime.store.events(missionId, 12).map(e => [e.type, JSON.stringify(e.data).slice(0, 160)]),
     deliveries: f.runtime.store.list('deliveries', missionId).map(d => [d.kind, d.to, Boolean(d.deliveredAt)]),
     workerEvents: worker.session.snapshotEvents().map(e => e.type).slice(-12), inbox: worker.inbox.hasPending })
+  // fixture gap: the shared eventually takes a fixed message; this one reports the board as it stands at the deadline.
   const eventually = async (read, what) => {
     const deadline = Date.now() + 20000
     while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 20)) }

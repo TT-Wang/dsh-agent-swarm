@@ -19,10 +19,10 @@ import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import AgentDefaultModel from '@deepseek-ai/dsh-agent-default-model'
 import { HarnessWorkers } from '../lib/harness-workers.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
+import { eventually, makeRuntime } from './faults/harness.mjs'
 
 /**
  * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
@@ -73,6 +73,7 @@ test('session metadata supports both public persistence contracts without activa
 })
 
 async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), config = {}) {
+  // fixture gap: makeRepo commits a file, and this Harness tree needs an empty base commit beside its sessions and worktrees.
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-workers-')))
   const source = path.join(root, 'source')
   await mkdir(source)
@@ -152,11 +153,6 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
 
 const message = (member, id = 'delivery-one') => ({ id, missionId: member.missionId, from: 'coordinator-test', to: member.id, kind: 'assignment', content: 'Complete the assigned task.', createdAt: 1 })
 
-async function eventually(read, what, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(`Timed out waiting for ${what}`)
-}
 /** The scripted provider reports this per request; cache reads are charged at the adapter weight, buckets stay raw. */
 const rawScriptedBuckets = { uncachedInputTokens: 10, cacheReadTokens: 3, cacheWriteTokens: 4, outputTokens: 2, reasoningTokens: 1, requests: 1 }
 
@@ -380,10 +376,10 @@ for (const wakeDuringRejection of [false, true]) {
       ? { kind: 'tool', name: 'swarm_wait', arguments: { missionId } }
       : { kind: 'text', text: 'Resumed with fresh peer context.' })
     const adapter = new HarnessWorkers(f.ctx, { ...f.options, workspacesRoot: path.join(f.options.workspacesRoot, 'waiting-runtime') })
-    const runtime = new SwarmRuntime({ statePath: path.join(f.options.workspacesRoot, 'waiting.sqlite'), leaseMs: 60000,
-      tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, adapter)
+    const { runtime, budget } = await makeRuntime(t, { workers: adapter,
+      config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+      budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
     try {
-      const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 }
       registerTools(f.ctx, runtime, budget)
       const owner = { sessionId: String(f.owner.agent.id) }
       const mission = runtime.create(owner, { title: 'Wait for evidence', objective: 'Park until useful peer input arrives',
@@ -487,7 +483,7 @@ test('recreating a missing native log advances its durable usage generation befo
   const snapshots = []
   f.callbacks.usageSnapshot = async (_memberId, total, usage, source) => { snapshots.push({ total, usage, source }) }
   await f.adapter.deliver(f.member, message(f.member))
-  await eventually(() => snapshots.length === 1, 'first accounted request')
+  await eventually(() => snapshots.length === 1, 'first accounted request', 10000)
   const oldGeneration = snapshots[0].source.generation
   await f.adapter.dispose()
   // Only this fixture's retired log is lost; SQLite's member usage survives.
@@ -506,7 +502,7 @@ test('recreating a missing native log advances its durable usage generation befo
     const metadata = JSON.parse(await readFile(path.join(f.options.workspacesRoot, f.mission.id, `${f.member.id}.worker.json`), 'utf8'))
     assert.equal(metadata.usageGeneration, opened.source.generation, 'the generation survives adapter and host restarts')
     await recreated.deliver(f.member, message(f.member, 'after-recreation'))
-    await eventually(() => snapshots.at(-1).total === 17, 'replacement session first request')
+    await eventually(() => snapshots.at(-1).total === 17, 'replacement session first request', 10000)
     assert.equal(snapshots.at(-1).source.generation, opened.source.generation)
     assert.deepEqual(f.observations.failures, [])
   } finally { await recreated.dispose() }
@@ -517,11 +513,11 @@ test('cache reads are charged at the configured weight while raw buckets stay ex
   const f = await fixture(t, undefined, { workerOptions: { cacheReadWeight: 0.5 } })
   f.callbacks.usageSnapshot = async (_memberId, total, usage) => { charged.push({ total, usage }) }
   await f.adapter.deliver(f.member, message(f.member))
-  await eventually(() => charged.length >= 1, 'the first weighted usage snapshot')
+  await eventually(() => charged.length >= 1, 'the first weighted usage snapshot', 10000)
   assert.deepEqual(charged, [{ total: 18, usage: rawScriptedBuckets }],
     '10 uncached + 2 output + 4 cache-write + 3 cache-read × 0.5 = 17.5, charged as 18, while every raw bucket stays exact')
   await f.adapter.deliver(f.member, message(f.member, 'weighted-usage-second'))
-  await eventually(() => charged.length >= 2, 'the cumulative weighted usage snapshot')
+  await eventually(() => charged.length >= 2, 'the cumulative weighted usage snapshot', 10000)
   assert.equal(charged[1].total, 36, 'the cumulative charge is the sum of per-request charges, not a re-weighted total')
   assert.deepEqual(charged[1].usage, { uncachedInputTokens: 20, cacheReadTokens: 6, cacheWriteTokens: 8, outputTokens: 4, reasoningTokens: 2, requests: 2 },
     'the UI contract stays raw and cumulative')
@@ -537,7 +533,7 @@ test('a single long model generation republishes liveness without inventing prog
   })
   try {
     await f.adapter.deliver(f.member, message(f.member))
-    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'model'), 'the model activity')
+    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'model'), 'the model activity', 10000)
     // The gate holds the provider silent: no chunk arrives, so only the liveness
     // heartbeat can republish the still-running operation.
     await new Promise(resolve => setTimeout(resolve, 140))
@@ -551,7 +547,7 @@ test('a single long model generation republishes liveness without inventing prog
     assert.equal(sameOperation.every(item => item.activity.attemptId === undefined), true, 'the adapter reports liveness only; the runtime owns the attempt binding')
   } finally { release() }
   await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
-  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the model activity to end')
+  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the model activity to end', 10000)
   assert.equal(f.adapter.currentActivity(f.member.id), undefined)
   const settled = f.observations.activities.length
   await new Promise(resolve => setTimeout(resolve, 100))
@@ -566,7 +562,7 @@ test('an active tool execution republishes liveness while its body is blocked', 
   f.ctx.tools.register(defineContentToolFixture({ name: 'slow_probe', description: 'Slow probe', parameters: {}, execute: async () => { await gate; return [{ type: 'text', text: 'probe done' }] } }))
   try {
     await f.adapter.deliver(f.member, message(f.member))
-    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'tool'), 'the tool activity')
+    const first = await eventually(() => f.observations.activities.find(item => item.activity?.kind === 'tool'), 'the tool activity', 10000)
     assert.equal(first.activity.tool, 'slow_probe')
     await new Promise(resolve => setTimeout(resolve, 140))
     const sameOperation = f.observations.activities.filter(item => item.activity?.id === first.activity.id)
@@ -574,7 +570,7 @@ test('an active tool execution republishes liveness while its body is blocked', 
     assert.equal(f.adapter.currentActivity(f.member.id).tool, 'slow_probe')
   } finally { release() }
   await f.ctx.agents.get(SessionId(f.member.sessionId)).whenIdle()
-  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the tool activity to end')
+  await eventually(() => f.observations.activities.at(-1)?.activity === undefined, 'the tool activity to end', 10000)
 })
 
 test('a silent generation keeps its attempt lease renewed through the runtime with no tool call', async t => {
@@ -598,10 +594,10 @@ test('a silent generation keeps its attempt lease renewed through the runtime wi
   // could publish its first activity). The decision the property is about is
   // pinned below by driving the durable lease to its expiry boundary, not by
   // waiting for wall-clock time to pass.
-  const runtime = new SwarmRuntime({ statePath: path.join(f.options.workspacesRoot, 'lease.sqlite'), leaseMs: 60_000, tickMs: 10,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, adapter)
+  const { runtime, budget } = await makeRuntime(t, { workers: adapter,
+    config: { maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
   try {
-    const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 }
     const owner = { sessionId: String(f.owner.agent.id) }
     const mission = runtime.create(owner, { title: 'Lease liveness', objective: 'Survive one silent generation', workspace: f.mission.workspace, scope: ['**'], acceptance: ['survives'], budget })
     const member = await runtime.addMember(owner, mission.id, { name: 'silent-worker', role: 'implementation' })

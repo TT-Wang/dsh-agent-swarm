@@ -18,31 +18,21 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 /** Must match START_FAILURE_REROUTE_LIMIT in src/runtime.ts. */
 const K = 3
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-async function eventually(read, message, timeoutMs = 8000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
 
 /** Only the external execution adapter is replaced; start fails on demand for one member. */
-class StartFailureWorkers {
+class StartFailureWorkers extends FakeWorkers {
   failMember
   /** Every member in this set fails its start, with `failWith` when set. */
   failMembers = new Set()
   failWith
   starts = []
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/isolated/${memberId}` }
+  autoIdle = true
+  artifact = { commit: 'start-failure', baseCommit: 'base', workspace: '/isolated', changedPaths: [] }
+  checks = []
   async start(spec) {
     this.starts.push(spec.member.id)
     // Deliberately not provider-outage wording: R11-01 classifies "provider
@@ -52,23 +42,16 @@ class StartFailureWorkers {
     if (spec.member.id === this.failMember) throw new Error(`worker bootstrap failed for ${spec.member.name}`)
     if (this.failMembers.has(spec.member.id)) throw this.failWith ?? new Error(`worker bootstrap failed for ${spec.member.name}`)
   }
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async stop() {}
-  isIdle() { return true }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'start-failure', baseCommit: 'base', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
 }
 
 async function setup(t, { gamma = false, tickMs = 20 } = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-start-failure-'))
-  const workers = new StartFailureWorkers()
   // The runtime clock can be moved past a provider outage window.
   const clock = { skew: 0 }
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'state.sqlite'), leaseMs: 60000, tickMs,
-    maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, now: () => Date.now() + clock.skew }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, workers, budget } = await makeRuntime(t, {
+    workers: new StartFailureWorkers(),
+    config: { tickMs, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined, now: () => Date.now() + clock.skew },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'start-owner' }
   const mission = runtime.create(owner, { title: 'Start failure', objective: 'Recover a worker start failure', workspace: '/source',
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })

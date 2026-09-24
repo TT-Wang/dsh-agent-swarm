@@ -1,32 +1,22 @@
 /** Shutdown is a recoverable lifecycle transition, even inside an awaited dispatch. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
+import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
 
 function deferred() {
   let resolve
   const promise = new Promise(done => { resolve = done })
   return { promise, resolve }
 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) {
-    if (read()) return
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  assert.fail(message)
-}
 
-class ShutdownWorkers {
+/** Start and preparation can be held at a gate, and fail once the adapter is disposed. */
+class ShutdownWorkers extends FakeWorkers {
   gate
   disposed = false
   interrupted = []
   starts = 0
-  bind(callbacks) { this.callbacks = callbacks }
+  autoIdle = true
   async prepareWorkspace(mission, memberId) { return `${mission.workspace}/${memberId}` }
   async start() { this.starts++; await this.wait('start') }
   async prepareTask() { await this.wait('prepare') }
@@ -40,14 +30,17 @@ class ShutdownWorkers {
       throw new Error('Worker adapter is disposed')
     }
   }
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
   async dispose() {
     this.disposed = true
     this.gate?.release.resolve()
   }
 }
+
+/** Every runtime here shares one config and budget; `config` and `budget` override them. */
+const shutdownRuntime = (t, config = {}, budget = {}) => makeRuntime(t, {
+  workers: new ShutdownWorkers(), config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined, ...config },
+  budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10, ...budget },
+})
 
 for (const scenario of [
   { name: 'interrupted handoff', reason: 'handoff', epoch: 4, markerEpoch: 4, recoveryCount: 0, resumes: true },
@@ -56,20 +49,13 @@ for (const scenario of [
   { name: 'exhausted lease recovery', reason: 'lease-expired', epoch: 4, markerEpoch: 4, recoveryCount: 3, resumes: false },
 ]) {
   test(`restart handles ${scenario.name} using its durable stop marker`, { timeout: 10000 }, async t => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'swarm-stop-recovery-'))
-    const config = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-      maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
-    const runtime = new SwarmRuntime(config, new ShutdownWorkers())
     let recovered
-    t.after(async () => {
-      await runtime.dispose()
-      await recovered?.dispose()
-      await rm(directory, { recursive: true, force: true })
-    })
+    // Registered first, so the recovered runtime is disposed before makeRuntime removes the state dir.
+    t.after(async () => { await recovered?.dispose() })
+    const { dir: directory, config, runtime, budget } = await shutdownRuntime(t)
     const owner = { sessionId: 'crash-owner' }
     const mission = runtime.create(owner, { title: 'Interrupted stop', objective: 'Recover task ownership',
-      workspace: directory, scope: ['src/'], acceptance: ['done'],
-      budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
+      workspace: directory, scope: ['src/'], acceptance: ['done'], budget })
     const previousOwner = await runtime.addMember(owner, mission.id, { name: 'previous', role: 'implementation' })
     const nextOwner = await runtime.addMember(owner, mission.id, { name: 'next', role: 'implementation' })
     const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Continue checkpoint' })
@@ -112,21 +98,13 @@ for (const scenario of [
 
 for (const stage of ['start', 'prepare']) {
   test(`shutdown during scheduler ${stage} preserves durable membership and dispatch for recovery`, { timeout: 10000 }, async t => {
-    const directory = await mkdtemp(path.join(tmpdir(), 'swarm-shutdown-'))
-    const config = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-      maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }
-    const workers = new ShutdownWorkers()
-    const runtime = new SwarmRuntime(config, workers)
     let recovered
-    t.after(async () => {
-      await runtime.dispose()
-      await recovered?.dispose()
-      await rm(directory, { recursive: true, force: true })
-    })
+    // Registered first, so the recovered runtime is disposed before makeRuntime removes the state dir.
+    t.after(async () => { await recovered?.dispose() })
+    const { dir: directory, config, runtime, workers, budget } = await shutdownRuntime(t, { maxTasksPerMember: 100 })
     const owner = { sessionId: 'shutdown-owner' }
     const mission = runtime.create(owner, { title: 'Resume after shutdown', objective: 'Preserve unfinished work',
-      workspace: directory, scope: ['src/'], acceptance: ['done'],
-      budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
+      workspace: directory, scope: ['src/'], acceptance: ['done'], budget })
     const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
     const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Recover this dispatch' })
     workers.gate = { stage, entered: deferred(), release: deferred() }
@@ -155,15 +133,10 @@ for (const stage of ['start', 'prepare']) {
 }
 
 test('pausing an in-flight worker start preserves membership for resume', async t => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-pause-dispatch-'))
-  const workers = new ShutdownWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await shutdownRuntime(t, {}, { maxTasks: 10, maxExperiments: 1 })
   const owner = { sessionId: 'pause-owner' }
   const mission = runtime.create(owner, { title: 'Pause dispatch', objective: 'Resume the same worker', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2,
-      maxDurationMs: 3600000, maxTasks: 10, maxExperiments: 1 } })
+    scope: ['src/'], acceptance: ['done'], budget })
   const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Resume dispatch' })
   workers.gate = { stage: 'start', entered: deferred(), release: deferred() }
@@ -184,12 +157,10 @@ test('pausing an in-flight worker start preserves membership for resume', async 
 
 /** A committed budget pause with a preserved running attempt, ready to resume or restart. */
 async function budgetFixture(t) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-budget-'))
-  const config = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
-  const runtime = new SwarmRuntime(config, new ShutdownWorkers())
+  const { dir: directory, config, runtime, budget } = await shutdownRuntime(t, { tickMs: 10 }, { maxTasks: 10, maxExperiments: 1 })
   const owner = { sessionId: 'budget-owner' }
   const mission = runtime.create(owner, { title: 'Pause', objective: 'Resume the same attempt', workspace: directory, scope: ['src/'], acceptance: ['done'],
-    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 10, maxExperiments: 1 } })
+    budget })
   const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Resume' })
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Paused task', objective: 'Resume', kind: 'implementation',
@@ -205,7 +176,6 @@ async function budgetFixture(t) {
     taskRecord.budgetResume = { pauseId: 'pause-1', attemptId, epoch: taskRecord.epoch }
     runtime.store.put('tasks', taskRecord)
   }
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, config, runtime, owner, mission, member, task, claimed, pause, preserve }
 }
 

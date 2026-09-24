@@ -1,28 +1,14 @@
 /** M11/M2: the projected completion state is exactly what control('complete') enforces. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 10000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [{ command: 'test', exitCode: 0, output: 'ok' }] }
-  async prepareTask() {}
-  async dispose() {}
-}
 async function fixture(t, acceptance) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-completion-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, new Workers())
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [{ command: 'test', exitCode: 0, output: 'ok' }] }),
+    config: { maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
+  })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Finish', objective: 'Cover every criterion', workspace: directory, scope: ['src/'], acceptance, budget })
   const put = task => { runtime.store.put('tasks', task); return task }

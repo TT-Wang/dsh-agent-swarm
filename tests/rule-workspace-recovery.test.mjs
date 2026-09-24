@@ -1,29 +1,11 @@
 /** Rule audit: exact-artifact recovery, conflict delivery, and abandoned WIP preservation. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path, { join } from 'node:path'
-import { runProcess } from '../lib/workspaces.js'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+import { FakeWorkers, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 async function workspaceFixture(t, options = {}) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-workspaces-')))
-  const source = path.join(temp, 'source')
-  await mkdir(source)
-  await git(source, 'init', '-b', 'main')
-  await mkdir(path.join(source, 'src'))
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await writeFile(path.join(source, 'outside.txt'), 'original\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const head = await git(source, 'rev-parse', 'HEAD')
+  const { root: temp, source, head } = await makeRepo('swarm-workspaces', { 'src/answer.txt': 'base\n', 'outside.txt': 'original\n' })
   const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
@@ -32,27 +14,13 @@ async function workspaceFixture(t, options = {}) {
   return { temp, source, head, workspaces, mission, member, task }
 }
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class GitWorkers {
-  prepared = []; stopped = []; deliveries = []; verifyCount = 0
+/** Counts every host verification it answers. */
+class GitWorkers extends FakeWorkers {
+  verifyCount = 0
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   artifact = { commit: 'e'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(structuredClone({ member: member.id, task })) }
-  async captureArtifact() { return this.artifact }
   async verifyArtifact() { this.verifyCount++; return this.checks }
-  async dispose() {}
 }
 
 const deniedCommit = {
@@ -63,14 +31,14 @@ const deniedCommit = {
 }
 
 async function runtimeFixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-gitwrite-'))
-  const workers = new GitWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new GitWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'git-owner' }
   const mission = runtime.create(owner, { title: 'Git write', objective: 'Surface the sandbox boundary', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -109,7 +77,7 @@ test('R13: repeated timeouts preserve the submitted source and both real runs fo
   f.workers.checks = [{ command: 'test', exitCode: 0, output: 'passed after environment repair' }]
   // The real owner recovery API keeps the original review and immutable source.
   await f.runtime.controlTask(f.owner, f.mission.id, result.id, 'resume', {}, 'check environment repaired')
-  await eventually(() => f.runtime.store.get('tasks', result.id).status === 'pending', 'owner recovery makes the same review pending')
+  await eventually(() => f.runtime.store.get('tasks', result.id).status === 'pending', 'owner recovery makes the same review pending', 2500)
   const retry = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, result.id)
   const accepted = await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: retry.id, attemptId: retry.attempt.id, verdict: 'accept', reason: 'repaired host check passed' })
   assert.equal(accepted.status, 'accepted')

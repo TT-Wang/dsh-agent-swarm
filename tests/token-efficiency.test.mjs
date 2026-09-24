@@ -1,38 +1,22 @@
 /** Model-visible context stays bounded and role-appropriate; owner notices are reserved for decisions. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime, emptyUsage } from '../lib/runtime.js'
+import { emptyUsage } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 3000
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
+const budget = { ...sharedBudget, maxTokens: 1000, maxSteps: 10, maxTasks: 12, maxExperiments: 2 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 60))
 /** Only the external execution adapter is replaced; store, admission, scheduling and outbox are real. */
-class ControlledWorkers {
-  callbacks; deliveries = []; stopped = []; checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; prepared = []; idle = new Set()
-  bind(c) { this.callbacks = c }
-  async prepareWorkspace(m, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver(m, d) { this.deliveries.push(d) }
-  async stop(id) { this.stopped.push(id) }
-  isIdle(id) { return this.idle.has(id) }
+class ControlledWorkers extends FakeWorkers {
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  // No currentActivity: the in-flight test reports a model request through the callback alone,
+  // so the durable member row is the only live view (FakeWorkers' activity is not per member).
+  currentActivity = undefined
   async captureArtifact(member, task) { return { commit: `c-${task.id.slice(-8)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/a.ts'] } }
-  async verifyArtifact() { return this.checks }
-  async prepareTask(member, task, dependencies) { this.prepared.push({ task: task.id, dependencies: dependencies.map(d => d.id) }) }
-  async dispose() {}
 }
 async function manual(t, overrides = {}, acceptance = ['works']) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-efficiency-'))
-  const workers = new ControlledWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, workers } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Build', objective: 'Fix module', workspace: '/source', scope: ['src/'], acceptance, budget: { ...budget, ...overrides } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix module' })
@@ -267,10 +251,7 @@ class AutoWorkers extends ControlledWorkers {
   async captureArtifact(member, task) { return { commit: `verified-${task.id.slice(-6)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/value.cjs'] } }
 }
 async function automatic(t, tasks, acceptance = ['works']) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-efficiency-auto-'))
-  const workers = new AutoWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers } = await makeRuntime(t, { workers: new AutoWorkers(), config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'automatic-owner' }
   const plan = { title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance, budget: { ...budget, maxTokens: 100000, maxSteps: 100 },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],

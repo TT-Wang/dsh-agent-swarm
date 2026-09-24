@@ -1,14 +1,12 @@
 /** Admission uses native commands, real Git status, durable runtime and the owner inbox boundary. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, realpath, readFile, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerAutomaticStart } from '../lib/planner.js'
 
 /**
@@ -37,26 +35,30 @@ function fakeInbox(session) {
   }
 }
 import { SubprocessLocal } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
-const budget = { maxTokens: 10000, maxSteps: 50, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 10, maxExperiments: 1 }
-async function eventually(read) {
-  const until = Date.now() + 3000
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail('Expected native planner recovery transition did not occur')
-}
+import { FakeWorkers, eventually as poll, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+const eventually = read => poll(read, 'Expected native planner recovery transition did not occur', 3000)
 async function fixture(t, options = {}) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-planner-')))
-  const snapshotRoot = await realpath(await mkdtemp(join(tmpdir(), 'swarm-planner-snapshots-')))
+  // Registered before makeRuntime's own cleanup, so the plugin, the idle gates,
+  // the runtime and then the context are released in that order.
+  const ctx = new Context(), idleGates = []
+  let fiber, runtime, workspaces
+  t.after(async () => { await fiber?.dispose(); for (const gate of idleGates) gate.resolve(); await runtime?.dispose(); await ctx.fiber.dispose() })
+  const made = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: async () => { await workspaces?.dispose() } }),
+    config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined, ...options.config },
+  })
+  runtime = made.runtime
+  // The repository sits beside the state file and the snapshot worktrees, so neither is in its status.
+  const root = join(made.dir, 'source')
+  await mkdir(root)
   const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
   git(['init', '-q']); git(['-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'initial'])
-  const ctx = new Context()
   await ctx.plugin(SessionStore); await ctx.plugin(CommandRuntime); await ctx.plugin(SubprocessLocal)
-  const workspaces = makeWorkspaces(snapshotRoot, { workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000 })
-  const runtime = new SwarmRuntime({ statePath: join(root, '.git', 'swarm.sqlite'), tickMs: 60000, leaseMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3, ...options.config }, { bind() {}, async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: () => workspaces.dispose() })
+  workspaces = makeWorkspaces(made.dir, { checkTimeoutMs: 10000, maxCheckOutputBytes: 100000 })
   await runtime.start()
   const session = await ctx.sessions.create(SessionId('planner-owner'), { meta: { cwd: root } })
   const pending = Promise.withResolvers()
-  const idleGates = [pending]
+  idleGates.push(pending)
   const messages = []
   const inbox = fakeInbox(session)
   const agent = { id: session.id, session, inbox, options: { provider: 'current', model: 'current-model' },
@@ -68,9 +70,8 @@ async function fixture(t, options = {}) {
   ctx.provide('llm', { async resolveCallConfig(selection) { assert.equal(selection.provider, 'current'); assert.equal(selection.model, 'current-model'); if (options.resolve) await options.resolve(); return selection } })
   if (options.flush) ctx.on('session/flush', options.flush)
   const plugin = { name: 'planner-test', inject: ['commands', 'agents', 'llm', 'sessions'], apply(scope) { registerAutomaticStart(scope, runtime) } }
-  let fiber = ctx.plugin(plugin)
+  fiber = ctx.plugin(plugin)
   await fiber
-  t.after(async () => { await fiber.dispose(); for (const gate of idleGates) gate.resolve(); await runtime.dispose(); await ctx.fiber.dispose(); await rm(snapshotRoot, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }) })
   return { root, ctx, runtime, agent, agents, messages, pending, get fiber() { return fiber },
     nextIdle() { const gate = Promise.withResolvers(); idleGates.push(gate); return gate },
     async reload() { await fiber.dispose(); fiber = ctx.plugin(plugin); await fiber },

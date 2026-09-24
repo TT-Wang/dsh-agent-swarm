@@ -8,12 +8,9 @@ import { existsSync } from 'node:fs'
 import { rm, writeFile } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { setup, makeRepo, runScenario, PROJECT } from './harness.mjs'
+import { setup, makeRepo, runScenario, PROJECT, SwarmRuntime } from './harness.mjs'
 
 const { SwarmStore, StoreRecoveryError } = await import(pathToFileURL(join(PROJECT, 'lib/store.js')).href)
-const { SwarmRuntime } = await import(pathToFileURL(join(PROJECT, 'lib/runtime.js')).href)
-
-const config = statePath => ({ statePath, leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000 })
 
 await runScenario({
   id: 'F20', title: 'A truncated or deleted store fails closed and the owner restore recovers the mission', invariants: ['I2', 'I5'],
@@ -23,7 +20,7 @@ await runScenario({
     let reopened
     try {
       const task = f.propose()
-      const statePath = join(f.dir, 'swarm.sqlite')
+      const { config } = f.runtime, { statePath } = config
       // Owner action: one consistent snapshot of the live board.
       const snapshot = f.runtime.store.snapshot()
       assert.ok(existsSync(snapshot.path), 'the snapshot file exists')
@@ -46,7 +43,7 @@ await runScenario({
         return true
       })
       SwarmStore.restore(statePath, snapshot.path)
-      reopened = new SwarmRuntime(config(statePath), f.workers)
+      reopened = new SwarmRuntime(config, f.workers)
       await reopened.start()
       assert.equal(reopened.store.get('missions', f.mission.id).title, 'Fault injection', 'the mission is recovered from the snapshot')
       assert.equal(reopened.store.get('tasks', task.id).status, 'pending', 'the recovered board still holds the task')
@@ -63,7 +60,7 @@ await runScenario({
         return true
       })
       SwarmStore.restore(statePath, SwarmStore.latestSnapshot(statePath))
-      reopened = new SwarmRuntime(config(statePath), f.workers)
+      reopened = new SwarmRuntime(config, f.workers)
       await reopened.start()
       assert.equal(reopened.store.get('missions', f.mission.id).title, 'Fault injection', 'the deleted store is restored, not recreated empty')
       return { snapshot: snapshot.path, mission: f.mission.id, task: task.id, restoredRevision: reopened.store.revision() }

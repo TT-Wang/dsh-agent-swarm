@@ -1,18 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
-import { TraceWorkers } from './fixtures/trace-runtime.mjs'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 200, maxExperiments: 0 }
 async function fixture(t, size = 1) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-owner-delta-'))
-  const config = { statePath: join(root, 'db.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }
-  const runtime = new SwarmRuntime(config, new TraceWorkers())
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { dir: root, config, runtime, budget } = await makeRuntime(t, {
+    config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 200 },
+  })
   const owner = { sessionId: 'owner-session' }
   const input = { title: 'Owner delta', objective: 'Read updates', workspace: root, scope: ['src/'], acceptance: ['works'], budget }
   const mission = runtime.create(owner, input)
@@ -85,7 +80,7 @@ test('owner cursors are replayable, scoped, bounded and disposable; exact reads 
   assert.equal((await f.read({ cursor: first.nextCursor })).cursorReset, true, 'eviction is a complete compact reset')
   const last = await f.read()
   await f.runtime.dispose()
-  const restarted = new SwarmRuntime(f.config, new TraceWorkers())
+  const restarted = new SwarmRuntime(f.config, new FakeWorkers())
   try {
     const reset = restarted.observe(f.owner, f.mission.id, { cursor: last.nextCursor })
     assert.equal(reset.cursorReset, true)

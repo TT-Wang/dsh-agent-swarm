@@ -7,34 +7,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { OWNER_PROMPT, registerTools } from '../lib/tools.js'
 import { guardTerminal } from '../lib/refusals.js'
+import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-
-class ControlledWorkers {
-  callbacks; deliveries = []; stopped = []; checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async stop(id) { this.stopped.push(id) }
-  isIdle() { return false }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async prepareTask() {}
-  async dispose() {}
-}
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 
 async function setup(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-ceiling-surface-'))
-  const workers = new ControlledWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { runtime, workers } = await makeRuntime(t, {
+    workers: new FakeWorkers({ checks: [{ command: 'test', exitCode: 0, output: 'ok' }], artifact: { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] } }),
+    config: { tickMs: 60000, maxEvents: 200, checkTimeoutMs: undefined },
+  })
   const owner = { sessionId: 'ceiling-owner' }
   const mission = runtime.create(owner, { title: 'Ceiling surface', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Bound per-task work' })

@@ -2,28 +2,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-class RepairWorkers {
-  prepared = []
-  stopped = []
-  idle = new Set()
+class RepairWorkers extends FakeWorkers {
   prepare = async () => {}
-  bind(callbacks) { this.callbacks = callbacks }
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle(memberId) { return this.idle.has(memberId) }
   async prepareTask(member, task, dependencies, reviewSource) {
     this.prepared.push(structuredClone({ member, task, dependencies, reviewSource }))
     await this.prepare(member, task, dependencies, reviewSource)
@@ -31,17 +17,14 @@ class RepairWorkers {
   async captureArtifact(member, task) {
     return { commit: createHash('sha1').update(task.id).digest('hex'), baseCommit: 'b'.repeat(40), workspace: member.workspace, changedPaths: ['src/a.ts'] }
   }
-  async verifyArtifact() { return [{ command: 'test', exitCode: 0, output: 'ok' }] }
-  async dispose() {}
 }
 async function fixture(t) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-replacement-dependencies-'))
-  const workers = new RepairWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100 }, workers)
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new RepairWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
   const owner = { sessionId: 'replacement-owner' }
   const mission = runtime.create(owner, { title: 'Repair existing plan', objective: 'Preserve accepted replacement obligations', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
+    scope: ['src/'], acceptance: ['done'], budget })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const integrator = await runtime.addMember(owner, mission.id, { name: 'Integrator', role: 'integration' })
@@ -69,7 +52,6 @@ async function fixture(t) {
   const reject = async task => { await submit(task); await review(task, 'reject'); return current(task) }
   const challenge = task => runtime.challenge(owner, mission.id, { evidenceId: current(task).evidenceIds[0], reason: 'A counterexample invalidates the accepted prerequisite', toolRunIds: [] })
   const preparedFor = task => workers.prepared.filter(call => call.task.id === task.id)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { runtime, workers, owner, mission, author, reviewer, integrator, actor, propose, current, integration, submit, review, accept, reject, challenge, preparedFor }
 }
 
@@ -85,7 +67,7 @@ test('four accepted replacements unblock an existing integration and prepare the
   assert.equal(f.current(integration).status, 'pending', 'submission alone never substitutes for independent acceptance')
   assert.equal(f.preparedFor(integration).length, 0, 'workspace preparation waits for every accepted obligation')
   await f.review(replacements.at(-1))
-  const running = await eventually(() => { const task = f.current(integration); return task.status === 'running' ? task : undefined }, 'existing integration remained pending after all four repairs were accepted')
+  const running = await eventually(() => { const task = f.current(integration); return task.status === 'running' ? task : undefined }, 'existing integration remained pending after all four repairs were accepted', 2500)
   const prepared = f.preparedFor(integration).at(-1)
   assert.deepEqual(prepared.dependencies.map(task => task.id), replacements.map(task => task.id))
   assert.deepEqual(prepared.dependencies.map(task => task.artifact.commit), replacements.map(task => f.current(task).artifact.commit))
@@ -190,7 +172,7 @@ test('challenging a replacement fences a running descendant whose stored depende
   assert.notEqual(f.current(integration).status, 'running', 'replacement challenges must invalidate semantic descendants')
   assert.notEqual(f.workers.callbacks.guard(f.integrator.id, 'write_file'), undefined)
   await assert.rejects(f.runtime.submit(f.actor(f.integrator), f.mission.id, { taskId: integration.id, attemptId: running.attempt.id, output: 'Stale integrated artifact' }), /Stale|prerequisite|invalidated/i)
-  await eventually(() => f.workers.stopped.includes(f.integrator.id), 'invalidated descendant worker was not stopped')
+  await eventually(() => f.workers.stopped.includes(f.integrator.id), 'invalidated descendant worker was not stopped', 2500)
 })
 
 test('a replacement challenge during preparation cannot dispatch an integration with obsolete trust', async t => {

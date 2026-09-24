@@ -2,8 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { request as httpRequest } from 'node:http'
-import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, symlink } from 'node:fs/promises'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import WebServer from '@deepseek-ai/dsh-host-webserver'
@@ -19,31 +18,31 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
-import { ObserveDetailRefusedError, SwarmRuntime } from '../lib/runtime.js'
+import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
+import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
-class Workers {
+const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
+/** Records the members it started and the workspaces it prepared. */
+class Workers extends FakeWorkers {
   starts = []
   workspaces = []
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { this.workspaces.push(id); return path.join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec.member.id) }
-  async stop() {}
-  async deliver() {}
-  isIdle() { return false }
-  async dispose() {}
 }
 async function fixture(t) {
-  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-web-api-')))
-  const workspace = path.join(directory, 'workspace')
-  await mkdir(workspace)
+  // Registered before makeRuntime's cleanup, so the runtime and then the host
+  // composition are disposed before the temp dir goes.
   const ctx = new Context()
   let runtime
-  t.after(async () => { await runtime?.dispose(); await ctx.fiber.dispose(); await rm(directory, { recursive: true, force: true }) })
+  t.after(async () => { await runtime?.dispose(); await ctx.fiber.dispose() })
+  const made = await makeRuntime(t, { workers: new Workers(), config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
+  const { dir: directory, workers } = made
+  const workspace = path.join(directory, 'workspace')
+  await mkdir(workspace)
   await ctx.plugin(WebServer, { host: '127.0.0.1', port: 0 })
   // In-memory credential storage; authentication/token/cookie enforcement is
   // the actual modern Connection implementation, never a bypass.
@@ -89,9 +88,7 @@ async function fixture(t) {
   }
   const catalog = new Catalog()
   ctx.llm.registerAdapter(['public-provider'], catalog)
-  const workers = new Workers()
-  runtime = new SwarmRuntime({ statePath: path.join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
+  runtime = made.runtime
   const ownerId = 'web-owner'
   const ownerFiber = ctx.plugin({ name: 'test-web-owner', inject: ['agents'], async apply(scope) {
     const handle = await scope.agents.create({ sessionId: SessionId(ownerId), meta: { cwd: workspace }, agentOptions: { provider: 'public-provider', model: 'model-one' } })

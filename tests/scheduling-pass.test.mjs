@@ -22,12 +22,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { realpath, rm } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { setup, eventually, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, budget, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { tempDirectory } from './temp-root.mjs'
+import { setup, makeRuntime, eventually, events, taskOf, FakeWorkers, FakeClock, SwarmRuntime, MISSION_ACCEPTANCE } from './faults/harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+/** `count` ticks of the timer a fake-clock runtime does not run, one tick unit of clock time apart. */
+async function ticks(f, count) { for (let n = 0; n < count; n += 1) { f.clock.advance(f.runtime.config.tickMs); await f.runtime.tick() } }
+/** An adapter await of `ms` clock time: whatever is already runnable runs first, then the clock moves and the await returns. */
+const clockWait = (clock, ms) => new Promise(resolve => setImmediate(() => { clock.advance(ms); resolve() }))
 const wedgeEvents = f => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
 
 /**
@@ -183,7 +185,7 @@ test('S1: the renaming of bodies that wedge on an unchanged board stops at the f
   } finally { await f.cleanup() }
 })
 
-test('S1: a naming whose commit fails once is retried by a later tick, and the wedge is named exactly once', async () => {
+test('S1: a naming whose commit fails once is retried by a later tick, and the wedge is named exactly once', async t => {
   // Before, the watchdog marked the body named before its durable write, so a
   // naming that failed on its one tick (here a real SQLite writer lock held by a
   // second connection for exactly that tick) left the wedge unnamed for the rest
@@ -204,11 +206,9 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
       try { await hold.release.promise } finally { hold.settledAt = clock.now() }
     }
   }
-  const workers = new HeldStartWorkers()
-  const dir = await realpath(await tempDirectory('swarm-pass-busy-'))
-  const statePath = join(dir, 'swarm.sqlite')
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, manualTick: true, now: clock.now, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
-    stallPassTimeoutMs: bound, stallPasses: 1_000 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
+  // The writer gives up at once, so the one locked tick fails its commit instead of waiting it out.
+  const { dir, runtime, workers, budget, config: { statePath } } = await makeRuntime(t, { workers: new HeldStartWorkers(), clock,
+    config: { stallPassTimeoutMs: bound, stallPasses: 1_000 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -258,8 +258,6 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   } finally {
     process.stderr.write = write
     hold.release.reject(new Error('test ended'))
-    await runtime.dispose()
-    await rm(dir, { recursive: true, force: true })
   }
 })
 
@@ -430,15 +428,21 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
   // deliveredAt commits against the stamp of the last member boundary: the
   // wedged branch skipped the rule that an all-busy board is working and named
   // B's busy handle as the holder of T.
+  //
+  // Each owner delivery waits 60ms of the runtime's clock, which the adapter
+  // moves while the body is suspended in the delivery, and the ticks are driven
+  // by hand: the flush of three facts holds the body for exactly 180ms against
+  // its 100ms bound.
+  const clock = new FakeClock()
   class SlowOwnerWorkers extends FakeWorkers {
     slowOwnerMs = 0
     async deliver(member, delivery) {
-      if (member.id === 'owner' && this.slowOwnerMs > 0) await sleep(this.slowOwnerMs)
+      if (member.id === 'owner' && this.slowOwnerMs > 0) await clockWait(clock, this.slowOwnerMs)
       return super.deliver(member, delivery)
     }
   }
   const workers = new SlowOwnerWorkers()
-  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
   try {
     // Only the body delivers: the queue-external pump is off.
     f.runtime.notices.pumpOutbox = () => {}
@@ -446,16 +450,19 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
     const t = f.propose({ title: 'T for busy B', assigneeId: b.id })
-    await eventually(() => taskOf(f.runtime, live.id).status === 'running' ? true : undefined, 'the live work dispatches', 4_000)
+    await f.runtime.settle(f.mission.id)
+    assert.equal(taskOf(f.runtime, live.id).status, 'running', 'the live work dispatches')
     workers.idle.delete(f.author.id)
-    await sleep(300)
+    await ticks(f, 30)
     workers.slowOwnerMs = 60
-    const startedAt = Date.now()
+    const startedAt = clock.now()
     for (const n of [1, 2, 3]) f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, `Owner fact ${n}`, [`mission:${f.mission.id}`], { from: 'runtime', dedupKey: `flush-fact-${n}` }))
     f.runtime.kick(f.mission.id)
-    const last = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(item => item.content === 'Owner fact 3' && item.deliveredAt !== undefined), 'the body delivers the three facts', 4_000)
+    await f.runtime.settle(f.mission.id)
+    const last = f.runtime.store.list('deliveries', f.mission.id).find(item => item.content === 'Owner fact 3' && item.deliveredAt !== undefined)
+    assert.ok(last !== undefined, 'the body delivers the three facts')
     assert.ok(last.deliveredAt - startedAt >= 100, `the flush carried the body past its bound (${last.deliveredAt - startedAt}ms)`)
-    await sleep(50)
+    await ticks(f, 5)
     assert.equal(taskOf(f.runtime, t.id).status, 'pending', 'T waits for B\'s busy handle')
     const questions = f.runtime.store.list('deliveries', f.mission.id).filter(item => item.to === 'owner' && item.notice?.dedupKey?.startsWith(`dispatch-question:${f.mission.id}:${t.id}@`))
     assert.deepEqual(questions.map(item => item.content), [], 'no question: every eligible handle is busy, so the board is working')
@@ -639,25 +646,28 @@ test('S1: a body whose members each take less than a bound is not stopped early,
   // member it just swept held it for a whole bound: here the adapter start of
   // each of sixteen more members computes for 4ms against a 60ms bound, so every
   // sweep runs past the bound while no member comes near holding it for one.
-  // One stop is tolerated for a pause of the whole process under suite load;
-  // the round-4 rule stops most bodies here.
+  // The computation is 4ms of the runtime's clock, which the start moves itself,
+  // and the ticks are driven by hand, so no process pause lengthens a member and
+  // the one stop the assertion tolerates is never used. The round-4 rule stops
+  // the first body of every tick here, half of all bodies.
+  const clock = new FakeClock()
   class ComputingStartWorkers extends FakeWorkers {
     async start(spec) {
       this.started.push(spec.member.id)
-      const end = Date.now() + 4
-      while (Date.now() < end) { /* the adapter's synchronous work */ }
+      clock.advance(4) // the adapter's synchronous work
     }
     isIdle() { return false }
   }
   const workers = new ComputingStartWorkers()
-  const f = await setup({ workers, budget: { maxWorkers: 24 }, config: { tickMs: 10, stallPassTimeoutMs: 60, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60, stallPasses: 1_000 } })
   try {
     for (let n = 0; n < 16; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
     const members = f.runtime.store.list('members', f.mission.id).map(member => member.id)
-    await sleep(200)
+    await ticks(f, 20)
     const watched = watchBodies(f)
     const firstStart = workers.started.length
-    await sleep(1_500)
+    // Each tick runs one body, whose sweep of eighteen members takes 72ms of clock.
+    await ticks(f, 8)
     const bodies = [...watched.bodies]
     assert.ok(bodies.length >= 5, `bodies ran: ${bodies.length}`)
     const stopped = bodies.filter(body => body.stopped)
@@ -674,23 +684,35 @@ test('S1: a chain of early-stopped bodies covers one rotation, and the body that
   // chain never ended: no body ran ensureWitness or flushOutbox, and bodies
   // ran back to back without the tick. A chained body now ends its sweep
   // before the member its chain started from.
+  //
+  // Each start waits 40ms of the runtime's clock, which the adapter moves while
+  // the body is suspended in the start, and the ticks are driven by hand. A
+  // tick waits for the chain it kicks, so a chain that never ends (the defect)
+  // is cut once there are more bodies than the driven ticks' rotations hold,
+  // and the assertions below then fail on it.
+  const clock = new FakeClock()
   class SlowStartWorkers extends FakeWorkers {
     slow = false
     async start(spec) {
       this.started.push(spec.member.id)
-      if (this.slow) await sleep(40)
+      if (this.slow) await clockWait(clock, 40)
     }
   }
   const workers = new SlowStartWorkers()
-  const f = await setup({ workers, budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 30, stallPasses: 1_000 } })
+  const f = await setup({ workers, clock, budget: { maxWorkers: 8 }, config: { stallPassTimeoutMs: 30, stallPasses: 1_000 } })
   try {
     for (const name of ['C', 'D']) await f.runtime.addMember(f.owner, f.mission.id, { name, role: 'implementation', maxOutputTokens: 5_000 })
     const members = f.runtime.store.list('members', f.mission.id).length
-    await sleep(100)
+    await ticks(f, 10)
     workers.slow = true
-    await eventually(() => f.runtime.scheduling.passes.get(f.mission.id) === undefined ? true : undefined, 'the body that saw the fast starts settles')
+    await f.runtime.settle(f.mission.id)
+    assert.equal(f.runtime.scheduling.passes.get(f.mission.id), undefined, 'the body that saw the fast starts settles')
     const watched = watchBodies(f)
-    await sleep(1_000)
+    const driven = 3
+    const cut = Promise.withResolvers()
+    const closePass = f.runtime.scheduling.closePass
+    f.runtime.scheduling.closePass = (missionId, pass) => { const closed = closePass(missionId, pass); if (watched.bodies.length > driven * members) cut.resolve(); return closed }
+    for (let n = 0; n < driven; n += 1) await Promise.race([ticks(f, 1), cut.promise])
     const bodies = [...watched.bodies]
     const completed = bodies.filter(body => !body.stopped).length
     assert.ok(completed >= 2, `chains end: ${completed} of ${bodies.length} bodies completed the rotation`)

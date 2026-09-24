@@ -1,47 +1,41 @@
 /** Lean allocation exercises the durable runtime; only worker execution is controlled. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { assignmentAllows, canBorrowTask } from '../lib/assignment.js'
 import { pendingReadiness } from '../lib/arena.js'
+import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
-class Workers {
-  prepared = []
-  stopped = []
+class Workers extends FakeWorkers {
   busy = new Set()
   onPrepare = async () => {}
-  bind(callbacks) { this.callbacks = callbacks }
+  checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
   async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
-  async start() {}
-  async stop(id) { this.stopped.push(id) }
-  async dispose() {}
   isIdle(id) { return !this.busy.has(id) }
   async prepareTask(member, task) { this.prepared.push({ memberId: member.id, taskId: task.id }); await this.onPrepare(member, task) }
-  async deliver() {}
   async captureArtifact(member) { return { commit: 'verified', baseCommit: 'base', workspace: member.workspace, changedPaths: ['src/value.js'] } }
-  async verifyArtifact() { return [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }] }
 }
 
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-lean-assignment-'))
-  const config = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 20000, maxEvents: 100, maxTasksPerMember: 3 }
-  const workers = new Workers(), runtime = new SwarmRuntime(config, workers)
+  // Registered before makeRuntime's cleanup, so a restarted runtime is disposed before the temp dir goes.
+  const runtimes = []
+  t.after(async () => { for (const rt of runtimes) await rt.dispose() })
+  const { dir: root, config, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new Workers(),
+    config: { tickMs: 60000, maxMessageChars: 20000, maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxExperiments: 3 },
+  })
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Parallel work', objective: 'Deliver independent work', workspace: root, scope: ['src/'], acceptance: ['works'], budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 30, maxExperiments: 3 } })
+  const mission = runtime.create(owner, { title: 'Parallel work', objective: 'Deliver independent work', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Delivery', objective: 'Complete the work' })
   // Spare comes first in the real dispatch order: preference must not depend on member order.
   const spare = await runtime.addMember(owner, mission.id, { name: 'Spare', role: 'general' })
   const preferred = await runtime.addMember(owner, mission.id, { name: 'Preferred', role: 'general' })
   const actor = member => ({ sessionId: member.sessionId })
   const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Change', objective: 'Implement an independent change', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], assigneeId: preferred.id, assignmentMode: 'preferred', ...extra })
-  const runtimes = [runtime]
-  t.after(async () => { for (const rt of runtimes) await rt.dispose(); await rm(root, { recursive: true, force: true }) })
   const restart = async () => {
-    await runtimes.at(-1).dispose()
+    await (runtimes.at(-1) ?? runtime).dispose()
     const rt = new SwarmRuntime(config, workers); rt.kick = () => {}; runtimes.push(rt)
     await rt.start()
     return rt

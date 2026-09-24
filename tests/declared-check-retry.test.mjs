@@ -23,7 +23,6 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
 import { setup, taskOf, events, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers } from './faults/harness.mjs'
 
 const CHECK = 'node --test tests/first.test.mjs'
@@ -175,7 +174,7 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
 
     // Phase 2: a fresh runtime on the same store, as after a host restart. The
     // retry pass completes the pair without rewriting the durable first pass.
-    revived = new SwarmRuntime({ statePath: join(f.dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000 }, new FakeWorkers())
+    revived = new SwarmRuntime(f.runtime.config, new FakeWorkers())
     const recorded = revived.declaredChecks.recordRuns(f.mission.id, { memberId: f.reviewer.id, taskId: review.id, attemptId, commit }, [passing()])
     assert.equal(recorded.length, 1, 'the deciding pass is the returned run')
     const after = revived.store.list('tool_runs', f.mission.id).filter(run => run.taskId === review.id)

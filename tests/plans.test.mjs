@@ -1,36 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
 import { AdmissionError } from '../lib/admission.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { WORKER_NAME_POOL } from '../lib/types.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-async function eventually(read) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const result = read(); if (result) return result; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail('Expected runtime transition did not occur')
-}
-class Workers {
-  prepared = []
+/** Records member workspaces (not task preparations) as `prepared`, full start specs and raw deliveries. */
+class Workers extends FakeWorkers {
+  autoIdle = true
   starts = []
   delivered = []
   onStart = async () => {}
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { this.prepared.push(id); return join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec); await this.onStart(spec) }
   async prepareTask() {}
   async deliver(member, message) { this.delivered.push({ member, message }) }
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
 }
 function plan(workspace) {
   return { title: 'Editable plan', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
@@ -44,11 +35,9 @@ function plan(workspace) {
       scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'] }] }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-plans-'))
-  const config = { statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
-  const workers = new Workers(), runtime = new SwarmRuntime(config, workers)
+  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'plan-owner' }
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, config, workers, runtime, owner, input: plan(directory) }
 }
 
@@ -141,7 +130,7 @@ test('launch holds execution until roster and dependency/review topology are com
   const review = snapshot.tasks.find(task => task.kind === 'verification')
   assert.equal(review.reviewOf, snapshot.tasks.find(task => task.kind === 'integration').id)
   assert.deepEqual(review.dependencies, [])
-  await eventually(() => f.workers.delivered.some(({ message }) => message.kind === 'assignment'))
+  await eventually(() => f.workers.delivered.some(({ message }) => message.kind === 'assignment'), 'Expected runtime transition did not occur', 2500)
   const duplicate = await f.runtime.launchDraft(f.owner, draft.id, draft.revision)
   assert.equal(duplicate.mission.id, snapshot.mission.id)
   assert.equal(f.workers.prepared.length, 2)

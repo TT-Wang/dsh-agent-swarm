@@ -1,27 +1,25 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { executionElapsed } from '../lib/resource-time.js'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
 const flush = () => new Promise(resolve => setImmediate(resolve))
+/** Records every stop and checkpoint, each behind a gate a test can hold. */
+class GatedWorkers extends FakeWorkers {
+  stops = []; checkpoints = []
+  async stop(id) { this.stops.push(id); await this.stopGate }
+  async checkpointTask(member, task) { this.checkpoints.push({ memberId: member.id, taskId: task.id }); await this.checkpointGate }
+}
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-resource-review-'))
-  let releaseStop, releaseCheckpoint
-  const workers = {
-    stops: [], bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(_mission, id) { return `/isolated/${id}` }, async start() {},
-    async stop(id) { this.stops.push(id); await this.stopGate },
-    checkpoints: [], async checkpointTask(member, task) { this.checkpoints.push({ memberId: member.id, taskId: task.id }); await this.checkpointGate },
-    async prepareTask() {}, async deliver() {}, isIdle() { return false }, async dispose() {},
-  }
-  const config = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }
-  let rt = new SwarmRuntime(config, workers)
+  let releaseStop, releaseCheckpoint, rt
+  const workers = new GatedWorkers()
+  // Registered first, so the gates open and the current (possibly restarted) runtime is disposed before makeRuntime removes the state dir.
+  t.after(async () => { releaseStop?.(); releaseCheckpoint?.(); workers.stopGate = undefined; workers.checkpointGate = undefined; await rt?.dispose() })
+  const made = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
+  const { dir: root, config } = made
+  rt = made.runtime
   rt.kick = () => {}
-  t.after(async () => { releaseStop?.(); releaseCheckpoint?.(); workers.stopGate = undefined; workers.checkpointGate = undefined; await rt.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner' }
   const mission = rt.create(owner, { title: 'Review recovery', objective: 'Keep same work safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
   const stream = rt.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
@@ -63,25 +61,21 @@ test('review: pause preserves the pending resource stop barrier across reassignm
   f.rt.control(f.owner, f.mission.id, 'resume', 'Continue once safe')
   await assert.rejects(f.rt.claim({ sessionId: f.other.sessionId }, f.mission.id, f.task.id), /stop|ready|pending|quiescen/i, 'another worker cannot prepare the work before prior stop acknowledgement')
   release()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.equal((await f.rt.claim({ sessionId: f.other.sessionId }, f.mission.id, f.task.id)).attempt.ownerId, f.other.id)
 })
 
-async function until(predicate) {
-  for (let i = 0; i < 50; i++) { if (predicate()) return; await flush() }
-  assert.ok(predicate(), 'expected deferred stop/checkpoint to settle')
-}
 
 test('review: paused stop can checkpoint without resuming or notifying the user', async t => {
   const f = await fixture(t)
   await f.rt.claim(f.actor, f.mission.id, f.task.id)
   const release = f.holdCheckpoint()
   f.rt.control(f.owner, f.mission.id, 'pause', 'User pauses work')
-  await until(() => f.workers.checkpoints.length === 1)
+  await eventually(() => f.workers.checkpoints.length === 1, 'expected deferred stop/checkpoint to settle')
   assert.ok(f.rt.task(f.mission.id, f.task.id).resumeAfterStop)
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'blocked')
   release()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.equal(f.rt.mission(f.mission.id).status, 'paused')
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'pending')
   await assert.rejects(f.rt.claim(f.actor, f.mission.id, f.task.id), /active|paused/i)
@@ -94,11 +88,11 @@ test('review: cancellation blocks member reuse until the old workspace checkpoin
   const next = f.nextTask()
   const release = f.holdCheckpoint()
   f.rt.cancel(f.owner, f.mission.id, { taskId: f.task.id, reason: 'Withdraw this work' })
-  await until(() => f.workers.checkpoints.length === 1)
+  await eventually(() => f.workers.checkpoints.length === 1, 'expected deferred stop/checkpoint to settle')
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'cancelled')
   await assert.rejects(f.rt.claim(f.actor, f.mission.id, next.id), /stop|quiescen/i)
   release()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'cancelled')
   await f.rt.claim(f.actor, f.mission.id, next.id)
   assert.deepEqual(f.workers.stops, [f.member.id])
@@ -110,13 +104,13 @@ test('review: cancelling an in-flight resource stop neither duplicates stop nor 
   const release = f.holdStop()
   await f.workers.callbacks.beforeStep(f.member.id)
   await f.workers.callbacks.beforeStep(f.member.id)
-  await until(() => f.workers.stops.length === 1)
+  await eventually(() => f.workers.stops.length === 1, 'expected deferred stop/checkpoint to settle')
   const before = f.rt.task(f.mission.id, f.task.id)
   f.rt.cancel(f.owner, f.mission.id, { taskId: f.task.id, reason: 'Cancel fenced work' })
   assert.equal(f.rt.task(f.mission.id, f.task.id).epoch, before.epoch)
   assert.deepEqual(f.rt.task(f.mission.id, f.task.id).resumeAfterStop, before.resumeAfterStop)
   release()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'cancelled')
   assert.deepEqual(f.workers.stops, [f.member.id])
 })
@@ -130,11 +124,11 @@ test('review: cold recovery preserves a cancelled stop marker until checkpoint c
   const next = f.nextTask()
   const release = f.holdCheckpoint()
   await f.restart()
-  await until(() => f.workers.checkpoints.length === 1)
+  await eventually(() => f.workers.checkpoints.length === 1, 'expected deferred stop/checkpoint to settle')
   assert.ok(f.rt.task(f.mission.id, f.task.id).resumeAfterStop)
   await assert.rejects(f.rt.claim(f.actor, f.mission.id, next.id), /stop|quiescen/i)
   release()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'cancelled')
   await f.rt.claim(f.actor, f.mission.id, next.id)
 })
@@ -167,7 +161,7 @@ test('review: legacy handoff recovery uses the recorded old owner instead of its
     f.rt.store.event(f.mission.id, 'task/handoff-started', f.member.id, { taskId: old.id, to: f.other.id })
   })
   await f.restart()
-  await until(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, f.task.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   assert.deepEqual(f.workers.stops, [f.member.id])
   assert.equal(f.rt.task(f.mission.id, f.task.id).status, 'pending')
   assert.equal(f.rt.task(f.mission.id, f.task.id).assigneeId, f.other.id)
@@ -208,7 +202,7 @@ test('review: finding-ceiling migration retains a separate repair block after it
   old.resumeAfterStop = { epoch: old.epoch, memberId: f.member.id, reason: 'resource', at: Date.now() }
   f.rt.commit(f.mission.id, () => f.rt.store.put('tasks', old))
   await f.restart()
-  await until(() => f.rt.task(f.mission.id, old.id).resumeAfterStop === undefined)
+  await eventually(() => f.rt.task(f.mission.id, old.id).resumeAfterStop === undefined, 'expected deferred stop/checkpoint to settle')
   const restored = f.rt.task(f.mission.id, old.id)
   assert.equal(restored.status, 'blocked')
   assert.equal(restored.ceiling, undefined)
@@ -226,16 +220,16 @@ test('review: ambiguous legacy owner recovery stops every candidate and preserve
   f.rt.commit(f.mission.id, () => f.rt.store.put('tasks', legacy))
   const releaseStop = f.holdStop(), releaseCheckpoint = f.holdCheckpoint()
   f.rt.attempts.resumeStoppedAttempt(f.mission.id, legacy)
-  await until(() => f.workers.stops.length === 2)
+  await eventually(() => f.workers.stops.length === 2, 'expected deferred stop/checkpoint to settle')
   assert.deepEqual(new Set(f.workers.stops), new Set([f.member.id, f.other.id]))
   assert.equal(f.rt.task(f.mission.id, peer.id).status, 'blocked', 'the scan fences other running work before stopping its handle')
   const next = f.nextTask(f.other.id)
   await assert.rejects(f.rt.claim({ sessionId: f.other.sessionId }, f.mission.id, next.id), /stop|quiescen/i)
   releaseStop()
-  await until(() => f.workers.checkpoints.length > 0)
+  await eventually(() => f.workers.checkpoints.length > 0, 'expected deferred stop/checkpoint to settle')
   assert.ok(f.rt.task(f.mission.id, legacy.id).resumeAfterStop, 'stop acknowledgements alone do not clear the legacy obligation')
   releaseCheckpoint()
-  await until(() => [legacy, peer].every(task => f.rt.task(f.mission.id, task.id).resumeAfterStop === undefined))
+  await eventually(() => [legacy, peer].every(task => f.rt.task(f.mission.id, task.id).resumeAfterStop === undefined), 'expected deferred stop/checkpoint to settle')
   for (const task of [legacy, peer]) assert.equal(f.rt.task(f.mission.id, task.id).status, 'pending')
   assert.equal(f.rt.mission(f.mission.id).status, 'active')
   await f.rt.claim({ sessionId: f.other.sessionId }, f.mission.id, next.id)

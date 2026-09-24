@@ -15,28 +15,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { runProcess } from '../lib/workspaces.js'
 import { captureGitSnapshot } from '../lib/git-snapshot.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
+import { FakeWorkers, eventually, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
 const schemaIndex = await toolSchemaIndex()
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 }
 const SECRET = 'DATABASE_URL=postgres://user:SECRET@db/prod\n'
-async function eventually(read, message, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const result = read()
-    if (result) return result
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  assert.fail(message)
-}
 
 /** True when the temp filesystem folds case (macOS default); the spelling test needs that. */
 async function caseInsensitiveTemp() {
@@ -60,49 +49,42 @@ function outputMissing(error, paths, tool = 'swarm_submit') {
   return true
 }
 
-async function repository(root, { ignore = [] } = {}) {
-  const source = path.join(root, 'source')
-  for (const dir of ['docs', 'notes', 'src']) await mkdir(path.join(source, dir), { recursive: true })
+/** A scratch repository in the shape this repository ships, plus the real Workspaces engine rooted beside it. */
+async function repository(prefix, { ignore = [] } = {}) {
+  // The shape this repository ships plus the two toolchain roots: docs/ ignores
+  // everything but named files, the root ignores the local environment file,
+  // the dependency directory and the member scratch root.
+  const { root, source } = await makeRepo(prefix, { 'README.md': 'Fixture\n', '.gitignore': ['.env', 'node_modules/', '.swarm-scratch/', ...ignore].join('\n') + '\n',
+    'docs/.gitignore': '*\n!.gitignore\n', 'notes/.gitkeep': '', 'src/index.js': 'export const answer = 42\n' })
   const run = (cwd, argv) => runProcess(argv, { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 200000 })
   const git = async (cwd, ...args) => {
     const result = await run(cwd, ['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', ...args])
     assert.equal(result.exitCode, 0, result.output)
     return result.output.trim()
   }
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'README.md'), 'Fixture\n')
-  // The shape this repository ships plus the two toolchain roots: docs/ ignores
-  // everything but named files, the root ignores the local environment file,
-  // the dependency directory and the member scratch root.
-  await writeFile(path.join(source, '.gitignore'), ['.env', 'node_modules/', '.swarm-scratch/', ...ignore].join('\n') + '\n')
-  await writeFile(path.join(source, 'docs', '.gitignore'), '*\n!.gitignore\n')
-  await writeFile(path.join(source, 'notes', '.gitkeep'), '')
-  await writeFile(path.join(source, 'src', 'index.js'), 'export const answer = 42\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'baseline')
   const workspaces = makeWorkspaces(root)
-  return { source, run, git, workspaces }
+  return { root, source, run, git, workspaces }
 }
 
 async function fixture(t, options = {}) {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-outputs-')))
-  const { source, run, git, workspaces } = await repository(root, options)
+  const { root, source, run, git, workspaces } = await repository('swarm-r24-outputs', options)
   // Production-shaped: the stop barrier reaches Workspaces.checkpointTask exactly as HarnessWorkers forwards it.
-  const idle = new Set()
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    prepareBaseline: (...args) => workspaces.prepareBaseline(...args),
-    prepareWorkspace: (...args) => workspaces.prepareWorkspace(...args),
-    prepareTask: (...args) => workspaces.prepareTask(...args),
-    checkpointTask: (...args) => workspaces.checkpointTask(...args),
-    captureArtifact: (...args) => workspaces.captureArtifact(...args),
-    inspectArtifact: (...args) => workspaces.inspectArtifact(...args),
-    verifyArtifact: (...args) => workspaces.verifyArtifact(...args),
-    start: async () => {}, stop: async () => {}, deliver: async () => {}, isIdle: memberId => idle.has(memberId),
-    dispose: () => workspaces.dispose(),
-  }
-  const runtime = new SwarmRuntime({ statePath: path.join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, ...options.runtimeConfig }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      prepareBaseline: (...args) => workspaces.prepareBaseline(...args),
+      prepareWorkspace: (...args) => workspaces.prepareWorkspace(...args),
+      prepareTask: (...args) => workspaces.prepareTask(...args),
+      checkpointTask: (...args) => workspaces.checkpointTask(...args),
+      captureArtifact: (...args) => workspaces.captureArtifact(...args),
+      inspectArtifact: (...args) => workspaces.inspectArtifact(...args),
+      verifyArtifact: (...args) => workspaces.verifyArtifact(...args),
+      dispose: () => workspaces.dispose(),
+    }),
+    config: { tickMs: 60000, maxEvents: 200, checkTimeoutMs: undefined, ...options.runtimeConfig },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxTasks: 12 } })
+  // Registered after makeRuntime, so the runtime (and its Workspaces) is disposed before the repository goes.
+  t.after(async () => { await rm(root, { recursive: true, force: true }) })
+  const idle = workers.idle
   const owner = { sessionId: 'owner' }
   const mission = runtime.create(owner, { title: 'Report', objective: 'Report on the project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Report', objective: 'Report on the project' })
@@ -142,8 +124,7 @@ async function fixture(t, options = {}) {
 }
 
 test('a checkpoint capture carries a written declared output past ignore rules and skips one still owed; requireOutputs refuses the owed one', async t => {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-capture-')))
-  const { source, git, workspaces } = await repository(root)
+  const { root, source, git, workspaces } = await repository('swarm-r24-capture')
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'capture', workspace: source }
   const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }
@@ -276,7 +257,7 @@ test('a declared draft survives a handoff and is captured by the replacement, wh
   await f.readEvidence(f.author, task, 'notes/config.md')
   // The production stop barrier: handoff -> stop -> Workspaces.checkpointTask (preservation snapshot) -> pending.
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing the config work over' })
-  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task', 15000)
   assert.ok((await f.refsCarrying('docs/report.md', 'refs/preservation/')).length >= 1, 'the private preservation snapshot carries the ignored declared draft')
   assert.deepEqual(await f.refsCarrying('.env', 'refs/'), [], 'no ref carries the undeclared .env')
   const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
@@ -309,7 +290,7 @@ test('a stored task without outputs declares none: an ignored draft and a .env i
   await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Undeclared draft\n')
   await f.readEvidence(f.author, task, 'notes/config.md')
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
-  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task', 15000)
   for (const name of ['.env', 'docs/report.md']) assert.deepEqual(await f.refsCarrying(name, 'refs/'), [], `no ref carries the undeclared ignored ${name}`)
   const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
   assert.equal(await readFile(path.join(f.peer.workspace, 'notes', 'config.md'), 'utf8'), 'uses .env\n')
@@ -413,8 +394,7 @@ test('a declared output written under a directory of a different case outside sc
 })
 
 test('a capture that fails after committing puts the member HEAD and index back, and the retry captures from them', async t => {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-rollback-')))
-  const { source, git, workspaces } = await repository(root)
+  const { root, source, git, workspaces } = await repository('swarm-r24-rollback')
   const objects = path.join(root, 'worktrees', 'rollback', 'artifacts.git', 'objects')
   t.after(async () => { await chmod(objects, 0o700).catch(() => undefined); await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'rollback', workspace: source }
@@ -450,7 +430,7 @@ test('a legacy preservation snapshot that tracks an undeclared ignored .env is r
   await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Draft by the first owner\n')
   await f.readEvidence(f.author, task, 'notes/config.md')
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
-  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task', 15000)
   // Replace the checkpoint with the shape a pre-R24 host wrote: its snapshot
   // force-included every ignored file the prose hinted at, `.env` among them.
   const git = async (args, env = {}) => {
@@ -511,8 +491,7 @@ test('a declared output the task deleted or renamed is refused as a wrong declar
 })
 
 test('each non-file shape of a declared output gets its own cause and exit in one output_missing refusal', async t => {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-shapes-')))
-  const { source, workspaces } = await repository(root)
+  const { root, source, workspaces } = await repository('swarm-r24-shapes')
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'shapes', workspace: source }
   const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }
@@ -569,8 +548,7 @@ test('a declared output outside the scope the owner narrowed is refused as an ow
 
 test('a declared output under a host-configured dependency directory is refused as an owner amendment', async t => {
   // stuck.mjs B / s7-depdirs.mjs: admission knows only the default list.
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-depdir-')))
-  const { source } = await repository(root)
+  const { root, source } = await repository('swarm-r24-depdir')
   const workspaces = makeWorkspaces(root, { verificationDependencyDirs: ['node_modules', 'gen'] })
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'depdir', workspace: source }
@@ -640,7 +618,7 @@ test('a declared ignored draft written under a different case survives a handoff
   await writeFile(path.join(f.author.workspace, 'docs', 'report.md'), '# Draft by the first owner\n')
   await f.readEvidence(f.author, task, 'docs/report.md')
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.peer.id, summary: 'Handing over' })
-  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task')
+  await eventually(() => f.taskRow(task.id).status === 'pending', 'the stop barrier checkpointed the first owner and released the task', 15000)
   assert.ok((await f.refsCarrying('docs/report.md', 'refs/preservation/')).length >= 1, 'the preservation snapshot carries the draft under its stored spelling')
   const recovered = await f.runtime.claim(f.actor(f.peer), f.mission.id, task.id)
   assert.equal(await readFile(path.join(f.peer.workspace, 'docs', 'report.md'), 'utf8'), '# Draft by the first owner\n', 'the draft reaches the replacement')
@@ -651,8 +629,7 @@ test('a declared ignored draft written under a different case survives a handoff
 })
 
 test('a snapshot hint that is present but not recorded fails the snapshot instead of dropping the file', { skip: (await caseInsensitiveTemp()) ? false : 'the temp filesystem is case-sensitive' }, async t => {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-hint-')))
-  const { source, git } = await repository(root)
+  const { root, source, git } = await repository('swarm-r24-hint')
   t.after(async () => { await rm(root, { recursive: true, force: true }) })
   await writeFile(path.join(source, 'docs', 'report.md'), '# Draft\n')
   const snapshotGit = async (args, env = {}) => {
@@ -676,14 +653,14 @@ test('an idle close-out checkpoints a task that still owes a declared output, an
   // The worker ends its turn with the attempt open and the appendix still owed.
   f.idle.add(f.author.id)
   f.workers.callbacks.idle(f.author.id)
-  const abandoned = await eventually(() => f.events('task/closeout-abandoned')[0], 'the idle close-out checkpointed the attempt')
+  const abandoned = await eventually(() => f.events('task/closeout-abandoned')[0], 'the idle close-out checkpointed the attempt', 15000)
   assert.deepEqual(f.events('task/closeout-failed'), [], 'an owed output never fails the checkpoint')
   assert.equal(await f.inCommit(abandoned.data.commit, 'docs/report.md'), true, 'the written declared output is carried past ignore rules')
   assert.equal(await f.inCommit(abandoned.data.commit, 'docs/appendix.md'), false, 'the owed output is skipped')
   const resumed = await eventually(() => {
     const row = f.taskRow(task.id)
     return row.status === 'running' && row.attempt?.id !== task.attempt.id ? row : undefined
-  }, 'the checkpointed task resumes on the same member')
+  }, 'the checkpointed task resumes on the same member', 15000)
   assert.equal(resumed.attempt.ownerId, f.author.id)
   f.idle.delete(f.author.id)
   await f.readEvidence(f.author, resumed, 'notes/wip.md')
@@ -714,14 +691,14 @@ test('a lease-expiry checkpoint of a task that still owes a declared output succ
     row.attempt.leaseUntil = Date.now() - 1
     f.runtime.store.put('tasks', row)
   })
-  const checkpointed = await eventually(() => f.events('task/checkpointed').find(event => event.data.reason === 'lease-expired'), 'the lease-expiry checkpoint was recorded')
+  const checkpointed = await eventually(() => f.events('task/checkpointed').find(event => event.data.reason === 'lease-expired'), 'the lease-expiry checkpoint was recorded', 15000)
   assert.deepEqual(f.events('task/checkpoint-failed'), [], 'an owed output never fails the checkpoint')
   assert.equal(await f.inCommit(checkpointed.data.commit, 'docs/report.md'), true)
   assert.equal(await f.inCommit(checkpointed.data.commit, 'docs/appendix.md'), false)
   const replacement = await eventually(() => {
     const row = f.taskRow(task.id)
     return row.status === 'running' && row.attempt?.ownerId === f.peer.id ? row : undefined
-  }, 'the planned replacement takes the task')
+  }, 'the planned replacement takes the task', 15000)
   f.idle.delete(f.author.id)
   f.idle.delete(f.peer.id)
   assert.equal(await readFile(path.join(f.peer.workspace, 'docs', 'report.md'), 'utf8'), '# Report by the first owner\n', 'the checkpointed output reaches the replacement')

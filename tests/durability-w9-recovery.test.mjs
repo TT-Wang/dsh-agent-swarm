@@ -12,16 +12,11 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { runProcess } from '../lib/workspaces.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
+import { WorkspaceWorkers, eventually, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 /**
  * Deadline on hanging, not on speed. The predicates below wrap real git work
  * (`git init`, `worktree add`, commits) that the runtime performs between
@@ -30,53 +25,22 @@ const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs
  * bound on a wedged runtime, not on a busy machine: on an idle host this test
  * finishes in a few seconds.
  */
-async function eventually(read, message, timeoutMs = 90000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-async function git(cwd, ...args) {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+const HANG_MS = 90000
 
 /** Real worktrees and real commits; only the worker lifecycle is inert. */
-class RealWorkers {
-  idle = new Set()
-  stopped = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
-  async prepareWorkspace(mission, memberId) { return await this.workspaces.prepareWorkspace(mission, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle(memberId) { return this.idle.has(memberId) }
-  async prepareTask(member, task, dependencies, reviewSource) { await this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
-  async captureArtifact(member, task) { return await this.workspaces.captureArtifact(member, task) }
-  async verifyArtifact(member, task, artifact, signal) { return await this.workspaces.verifyArtifact(member, task, artifact, signal) }
-  async dispose() {}
-}
-
 async function fixture(t) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-w9-')))
-  const source = join(root, 'source')
-  await mkdir(source)
-  await git(source, 'init', '-b', 'main')
-  await mkdir(join(source, 'src'))
-  await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const workers = new RealWorkers()
+  const { root, source } = await makeRepo('swarm-w9')
   // Every fallback report the host was handed, in order. `Workspaces` keeps no
   // in-memory mirror of its own: the callback is the whole channel.
   const reports = []
   // Production shape (src/harness-workers.ts): the fallback report reaches the bound runtime callbacks.
   const workspaces = makeWorkspaces(root, { onRecoveryFallback: info => { reports.push(info); workers.callbacks?.recoveryFallback?.(info) } })
-  workers.workspaces = workspaces
-  const runtime = new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
+  const { runtime, workers, budget } = await makeRuntime(t, {
+    workers: new WorkspaceWorkers(workspaces),
+    config: { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
+  t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: 'w9-owner' }
   const mission = runtime.create(owner, { title: 'W9', objective: 'Never dead-end on a dirty workspace', workspace: source,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -109,7 +73,7 @@ test('W9: a cross-member recovery from a dirty workspace carries its preserved s
   f.workers.idle.add(f.author.id)
   f.workers.idle.add(f.reviewer.id)
   // The lease-expiry checkpoint really fired and failed.
-  const failed = await eventually(() => f.events('task/checkpoint-failed')[0], 'the lease-expiry checkpoint failure is audited')
+  const failed = await eventually(() => f.events('task/checkpoint-failed')[0], 'the lease-expiry checkpoint failure is audited', HANG_MS)
   assert.match(failed.data.reason, /outside task scope/)
   // Recovery succeeds on the reviewer instead of blocking the task forever.
   // The fallback that handed the task over is sampled in the same synchronous
@@ -122,7 +86,7 @@ test('W9: a cross-member recovery from a dirty workspace carries its preserved s
     if (!(current.status === 'running' && current.attempt?.ownerId === f.reviewer.id)) return undefined
     fallbacksAtRecovery = f.reports.slice()
     return current
-  }, 'the task is recovered by the other member')
+  }, 'the task is recovered by the other member', HANG_MS)
   assert.equal(f.current(task.id).status, 'running')
   // One distinct recovery fact, sampled at the observation above. The runtime may
   // re-derive the same fallback on each preparation retry (and the epoch differs
@@ -182,7 +146,7 @@ test('W9: a cross-member recovery from a dirty workspace carries its preserved s
         if (prepared.memberId !== f.reviewer.id || prepared.task?.taskId !== task.id || prepared.task.epoch !== current.attempt.epoch) return undefined
       } catch { return undefined }
       return current
-    }, 'the reviewer to hold the prepared attempt that will submit')
+    }, 'the reviewer to hold the prepared attempt that will submit', HANG_MS)
     await writeFile(join(reviewerWorkspace, 'src', 'answer.txt'), `recovered work ${round}\n`)
     try {
       submitted = await f.runtime.submit(f.actor(f.reviewer), f.mission.id, { taskId: task.id, attemptId: live.attempt.id, output: 'recovered' })

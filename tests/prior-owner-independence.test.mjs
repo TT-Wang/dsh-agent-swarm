@@ -11,44 +11,24 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1e7, maxSteps: 9999, maxWorkers: 20, maxDurationMs: 3_600_000, maxTasks: 60, maxExperiments: 0 }
-
-async function eventually(read, message, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class IndependenceWorkers {
-  callbacks
+/** `startError` fails only `failingMemberId`'s start when one is named. */
+class IndependenceWorkers extends FakeWorkers {
   checks = [{ command: 't', exitCode: 0, output: 'ok' }]
-  idle = new Set()
-  startError
   failingMemberId
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
   async start(spec) { if (this.startError && (this.failingMemberId === undefined || spec.member.id === this.failingMemberId)) throw this.startError }
-  async deliver() {}
-  async stop() {}
-  isIdle(id) { return this.idle.has(id) }
-  async prepareTask() {}
   async captureArtifact(member) { return { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: member.workspace, changedPaths: ['src/runtime.ts'] } }
-  async verifyArtifact() { return this.checks }
-  currentActivity() { return undefined }
-  async dispose() {}
 }
 
 async function fixture(t, config = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-independence-'))
-  const workers = new IndependenceWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 600_000, tickMs: 10,
-    maxMessageChars: 16_000, maxEvents: 500, maxTasksPerMember: 5, ...config }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new IndependenceWorkers(),
+    config: { leaseMs: 600_000, maxEvents: 500, maxTasksPerMember: 5, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 1e7, maxSteps: 9999, maxWorkers: 20, maxDurationMs: 3_600_000, maxTasks: 60 },
+  })
   await runtime.start()
   const owner = { sessionId: 'independence-owner' }
   const mission = runtime.create(owner, { title: 'independence', objective: 'No prior owner may review', workspace: directory, scope: ['**'], acceptance: ['ok'], budget })
@@ -104,7 +84,7 @@ test('X1: a handoff does not make the first author eligible to review or accept'
   const source = f.propose({ assigneeId: f.first.id })
   const firstClaim = await f.runtime.claim(f.actor(f.first), f.mission.id, source.id)
   f.runtime.handoff(f.actor(f.first), f.mission.id, { taskId: source.id, attemptId: firstClaim.attempt.id, to: f.second.id, summary: 'first half done' })
-  await eventually(() => f.taskOf(source.id).status === 'pending', 'the handoff re-pends the task')
+  await eventually(() => f.taskOf(source.id).status === 'pending', 'the handoff re-pends the task', 5000)
   const secondClaim = await f.runtime.claim(f.actor(f.second), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.second), f.mission.id, { taskId: source.id, attemptId: secondClaim.attempt.id, output: 'joint work by first and second' })
   assert.deepEqual(f.taskOf(source.id).priorOwnerIds, [f.first.id], 'the handoff records the first owner durably')
@@ -119,7 +99,7 @@ test('X1: a lease expiry does not make the previous owner eligible again', async
   const expiring = f.taskOf(source.id)
   expiring.attempt.leaseUntil = Date.now() + 5
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', expiring))
-  await eventually(() => f.taskOf(source.id).status === 'pending', 'the expired lease re-pends the task')
+  await eventually(() => f.taskOf(source.id).status === 'pending', 'the expired lease re-pends the task', 5000)
   assert.deepEqual(f.taskOf(source.id).priorOwnerIds, [f.first.id])
   const released = f.taskOf(source.id)
   delete released.assigneeId; delete released.plannedAssigneeId
@@ -135,7 +115,7 @@ test('X1: an idle close-out does not make the previous owner eligible again', as
   await f.runtime.claim(f.actor(f.first), f.mission.id, source.id)
   f.workers.idle.add(f.first.id)
   f.workers.callbacks.idle(f.first.id)
-  await eventually(() => (f.taskOf(source.id).priorOwnerIds ?? []).includes(f.first.id), 'the idle close-out checkpoints and records the owner')
+  await eventually(() => (f.taskOf(source.id).priorOwnerIds ?? []).includes(f.first.id), 'the idle close-out checkpoints and records the owner', 5000)
   // The checkpoint dropped the attempt. Force the released state and stop the
   // member from being re-dispatched so the next owner can claim.
   const released = f.taskOf(source.id)

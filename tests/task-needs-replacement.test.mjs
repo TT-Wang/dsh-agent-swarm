@@ -9,46 +9,26 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 30))
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class ReplacementWorkers {
-  stopped = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-replacement-'))
-  const workers = new ReplacementWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'replacement-owner' }
   const mission = runtime.create(owner, { title: 'Replacement', objective: 'Repair rejected work', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -159,7 +139,7 @@ test('a resume while the stop is still pending stays the cleanup retry and keeps
   rejected.resumeAfterStop = { epoch: rejected.epoch, memberId: f.author.id, reason: 'handoff', at: Date.now(), failure: { message: 'preservation conflict', deterministic: true } }
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', rejected))
   f.runtime.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'Workspace preservation repaired')
-  await eventually(() => f.current(task).resumeAfterStop === undefined, 'the cleanup retry must clear the stop obligation')
+  await eventually(() => f.current(task).resumeAfterStop === undefined, 'the cleanup retry must clear the stop obligation', 2500)
   assert.equal(f.current(task).status, 'blocked', 'the barrier keeps the rejected source blocked')
   assert.ok(f.workers.stopped.includes(f.author.id), 'the cleanup retry stops the recorded handle')
 })

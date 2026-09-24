@@ -1,33 +1,15 @@
 /** W7 regressions: a denied worker git write is typed, actionable and never blocks submission. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class GitWorkers {
-  prepared = []; stopped = []; deliveries = []
+class GitWorkers extends FakeWorkers {
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   artifact = { commit: 'e'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
   // Asynchronous like the adapter's inbox write, so ordering is observable.
   async deliver(member, delivery) { await new Promise(resolve => setImmediate(resolve)); this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(structuredClone({ member: member.id, task })) }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
 }
 
 const deniedCommit = {
@@ -38,11 +20,11 @@ const deniedCommit = {
 }
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-gitwrite-'))
-  const workers = new GitWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new GitWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'git-owner' }
   const mission = runtime.create(owner, { title: 'Git write', objective: 'Surface the sandbox boundary', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })

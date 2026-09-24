@@ -1,30 +1,29 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
+
+/** Records a clone of every delivery the outbox sends and lets a test intercept the transport. */
+class OutboxWorkers extends FakeWorkers {
+  sent = []; intercept = async () => {}
+  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
+  async deliver(member, delivery) {
+    this.sent.push(structuredClone(delivery))
+    await this.intercept(member, delivery)
+  }
+}
 
 async function fixture(t, config = {}) {
-  const directory = await tempDirectory('swarm-outbox-ack-')
-  const workers = {
-    sent: [], intercept: async () => {}, bind() {},
-    async prepareWorkspace(_mission, memberId) { return join(directory, memberId) },
-    async start() {}, async stop() {}, async dispose() {}, isIdle() { return false },
-    async deliver(member, delivery) {
-      this.sent.push(structuredClone(delivery))
-      await this.intercept(member, delivery)
-    },
-  }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000,
-    tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, ...config }, workers)
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new OutboxWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   // Drive the real outbox at a controlled adapter boundary, without a competing pump.
   runtime.pumpOutbox = () => {}
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'ack-owner' }
   const mission = runtime.create(owner, { title: 'Outbox acknowledgement', objective: 'Preserve concurrent decisions',
-    workspace: directory, scope: ['**'], acceptance: ['preserved'],
-    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 } })
+    workspace: directory, scope: ['**'], acceptance: ['preserved'], budget })
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'implementation' })
   const rows = () => runtime.store.list('deliveries', mission.id)
   const emit = key => {
