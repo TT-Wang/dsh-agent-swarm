@@ -23,23 +23,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, ScopedEnvironment, assertCompositionScratch } from '../lib/harness-workers.js'
-import { runProcess } from '../lib/workspaces.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
-import { makeWorkspaces } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, eventually, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-const eventually = async (read, message, timeoutMs = 3000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await sleep(5) }
-  assert.fail(message)
-}
 
 /**
  * F1rv: a declared check that CANNOT finish until the test creates its sentinel
@@ -52,29 +43,19 @@ const eventually = async (read, message, timeoutMs = 3000) => {
  */
 const sentinelHold = sentinel => `until [ -f '${sentinel}' ]; do sleep 0.05; done`
 
-/** The only external boundary the runtime talks to; every host operation is controlled by the test. */
-class Workers {
-  activities = new Map()
-  stopped = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop(id) { this.stopped.push(id) }
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  currentActivity(memberId) { return this.activities.get(memberId) }
-  async dispose() {}
-}
-
+/**
+ * The adapter is the only external boundary the runtime talks to; every host
+ * operation is controlled by the test. Each fixture has one member, so the
+ * adapter's single reported activity (`reportActivity`) is that member's live
+ * operation.
+ */
 async function fixture(t, config, taskInput = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-operation-bound-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 400, tickMs: 10, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, ...config }, workers)
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] }),
+    config: { leaseMs: 400, maxEvents: 200, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
+  })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Bound', objective: 'Escalate a silent operation', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Bound the operation' })
@@ -98,18 +79,7 @@ const silentEscalations = (runtime, missionId) => runtime.store.list('deliveries
  * exercise the engine itself rather than a stub.
  */
 async function realCheckFixture(t, members = 2, checkCommand = 'sleep 0.6') {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-operation-bound-checks-')))
-  const source = join(root, 'source')
-  await mkdir(join(source, 'src'), { recursive: true })
-  const git = async (...args) => {
-    const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 100000 })
-    assert.equal(result.exitCode, 0, result.output)
-    return result.output.trim()
-  }
-  await git('init', '-b', 'main')
-  await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
-  await git('add', '.')
-  await git('commit', '-m', 'fixture baseline')
+  const { root, source } = await makeRepo('swarm-operation-bound-checks')
   const workspaces = makeWorkspaces(root, { checkConcurrency: 1 })
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'mission-operation-bound-checks', workspace: source }
@@ -130,10 +100,9 @@ test('F1: a silent in-flight operation escalates with a durable witness naming m
   const { runtime, workers, member, task, mission } = f
   const startedAt = Date.now() - 5000
   const activity = { id: 'op-stuck', kind: 'tool', tool: 'job_output', startedAt, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
+  workers.reportActivity(member.id, activity)
 
-  const escalation = await eventually(() => silentEscalations(runtime, mission.id)[0], 'a silent operation past the bound must escalate')
+  const escalation = await eventually(() => silentEscalations(runtime, mission.id)[0], 'a silent operation past the bound must escalate', 3000)
   assert.equal(escalation.from, 'runtime')
   assert.equal(escalation.to, 'owner')
   assert.equal(escalation.notice.class, 'stall')
@@ -161,9 +130,8 @@ test('F1: the same silence never repeats, and the attempt stops being renewed un
   const f = await fixture(t, { operationBoundMs: 50 })
   const { runtime, workers, member, task, mission } = f
   const activity = { id: 'op-stuck', kind: 'tool', tool: 'job_output', startedAt: Date.now() - 5000, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
-  await eventually(() => silentEscalations(runtime, mission.id)[0], 'the silent operation must escalate')
+  workers.reportActivity(member.id, activity)
+  await eventually(() => silentEscalations(runtime, mission.id)[0], 'the silent operation must escalate', 3000)
 
   // Many passes with the same silence: one witness, one notice (no repeat).
   await sleep(150)
@@ -172,18 +140,17 @@ test('F1: the same silence never repeats, and the attempt stops being renewed un
 
   // Pair with lease expiry: the operation no longer renews the lease, so the
   // existing recovery path fires and the stuck worker is stopped.
-  const expired = await eventually(() => runtime.store.events(mission.id, 500).find(event => event.type === 'task/lease-expired'), 'the lease must expire once the operation stops counting as liveness')
+  const expired = await eventually(() => runtime.store.events(mission.id, 500).find(event => event.type === 'task/lease-expired'), 'the lease must expire once the operation stops counting as liveness', 3000)
   assert.equal(expired.data.oldOwner, member.id)
   assert.notEqual(runtime.store.get('tasks', task.id).status, 'running')
-  await eventually(() => workers.stopped.includes(member.id), 'the stuck worker is actually stopped after fencing')
+  await eventually(() => workers.stopped.includes(member.id), 'the stuck worker is actually stopped after fencing', 3000)
 })
 
 test('F1: a bounded operation that is still progressing neither escalates nor loses its lease renewal', async t => {
   const f = await fixture(t, { operationBoundMs: 60000 })
   const { runtime, workers, member, task, mission } = f
   const activity = { id: 'op-live', kind: 'tool', tool: 'bash', startedAt: Date.now(), updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
+  workers.reportActivity(member.id, activity)
 
   // Shorten the stored lease so a renewal is observable, exactly as the lease
   // liveness test does: the renewal rule for a bounded operation is unchanged.
@@ -194,7 +161,7 @@ test('F1: a bounded operation that is still progressing neither escalates nor lo
   const renewed = await eventually(() => {
     const value = runtime.store.get('tasks', task.id).attempt?.leaseUntil ?? 0
     return value > before + 400 ? value : undefined
-  }, 'a bounded live operation must keep renewing its lease')
+  }, 'a bounded live operation must keep renewing its lease', 3000)
 
   await sleep(200)
   assert.ok(renewed > before + 400)
@@ -207,16 +174,15 @@ test('F1: a recording re-arms the silence clock, and the renewed silence escalat
   const f = await fixture(t, { operationBoundMs: 50, leaseMs: 5000 })
   const { runtime, workers, member, task, mission } = f
   const activity = { id: 'op-stuck', kind: 'tool', tool: 'job_output', startedAt: Date.now() - 5000, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
-  const first = await eventually(() => silentEscalations(runtime, mission.id)[0], 'the first silence must escalate')
+  workers.reportActivity(member.id, activity)
+  const first = await eventually(() => silentEscalations(runtime, mission.id)[0], 'the first silence must escalate', 3000)
   const attemptId = runtime.store.get('tasks', task.id).attempt.id
 
   // A durable recording on this attempt proves the operation is producing
   // again; the clock restarts from it rather than staying at the first breach.
   const recordedAt = Date.now()
   runtime.store.put('tool_runs', { id: 'run_progress', seq: 1, missionId: mission.id, memberId: member.id, taskId: task.id, attemptId, tool: 'job_output', arguments: {}, result: {}, isError: false, createdAt: recordedAt })
-  const second = await eventually(() => silentEscalations(runtime, mission.id)[1], 'a renewed silence after a recording is a new actionable state')
+  const second = await eventually(() => silentEscalations(runtime, mission.id)[1], 'a renewed silence after a recording is a new actionable state', 3000)
   assert.notEqual(second.notice.dedupKey, first.notice.dedupKey, 'the dedup key is derived from the operation and the instant its silence began')
   assert.ok(second.content.includes(`lastRecordedAt ${recordedAt}`), `the renewed silence measures from the recording: ${second.content}`)
   await sleep(120)
@@ -243,15 +209,14 @@ test('F1 pair: a declared check running inside its own declared task timeout doe
   // attempt alive.
   const startedAt = Date.now() - 20000
   const activity = { id: 'op-check-running', kind: 'verification', startedAt, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
+  workers.reportActivity(member.id, activity)
   // F1rv: the check is held by a sentinel the test writes LAST, so "the check is
   // still running" is structural rather than a race against a fixed sleep.
   const sentinel = join(f.directory, 'hold-running-check')
   const checks = await realCheckFixture(t, 1, sentinelHold(sentinel))
 
   const running = checks.workspaces.verifyArtifact(checks.prepared[0].member, checks.prepared[0].task, checks.prepared[0].artifact)
-  await eventually(() => checks.workspaces.checkEnvelope().active === 1 ? true : undefined, 'the declared check must be running')
+  await eventually(() => checks.workspaces.checkEnvelope().active === 1 ? true : undefined, 'the declared check must be running', 3000)
   assert.equal(existsSync(sentinel), false, 'the hold is in place: the check cannot finish before the sentinel exists')
 
   // Shorten the stored lease so the renewal rule is observable while the check runs.
@@ -263,7 +228,7 @@ test('F1 pair: a declared check running inside its own declared task timeout doe
   const renewed = await eventually(() => {
     const value = runtime.store.get('tasks', task.id).attempt?.leaseUntil ?? 0
     return value > before + 400 ? value : undefined
-  }, 'a bounded live declared check must keep renewing its lease')
+  }, 'a bounded live declared check must keep renewing its lease', 3000)
 
   try {
     await sleep(200)
@@ -296,8 +261,7 @@ test('F1 pair: a queued verification inside its own queue wait does not escalate
   // published before the real repository fixture is built, exactly as the
   // composed adapter publishes it.
   const activity = { id: 'op-check-queued', kind: 'verification', startedAt: Date.now() - 20000, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
+  workers.reportActivity(member.id, activity)
   // F1rv: the first check is held by a sentinel the test writes LAST, so it
   // cannot finish while the second check is being queued or while the lease and
   // escalation assertions run. The old fixture's fixed `sleep 0.6` raced the
@@ -307,7 +271,7 @@ test('F1 pair: a queued verification inside its own queue wait does not escalate
   const checks = await realCheckFixture(t, 2, sentinelHold(sentinel))
 
   const first = checks.workspaces.verifyArtifact(checks.prepared[0].member, checks.prepared[0].task, checks.prepared[0].artifact)
-  await eventually(() => checks.workspaces.checkEnvelope().active === 1 ? true : undefined, 'the first declared check must be running')
+  await eventually(() => checks.workspaces.checkEnvelope().active === 1 ? true : undefined, 'the first declared check must be running', 3000)
   const second = checks.workspaces.verifyArtifact(checks.prepared[1].member, checks.prepared[1].task, checks.prepared[1].artifact)
   // The hold makes this observation structural; only the second call's own
   // checkout setup can be slow under load, which a longer deadline tolerates
@@ -324,7 +288,7 @@ test('F1 pair: a queued verification inside its own queue wait does not escalate
   const renewed = await eventually(() => {
     const value = runtime.store.get('tasks', task.id).attempt?.leaseUntil ?? 0
     return value > before + 400 ? value : undefined
-  }, 'a queued verification must keep renewing its lease while it waits')
+  }, 'a queued verification must keep renewing its lease while it waits', 3000)
 
   try {
     await sleep(200)
@@ -348,7 +312,7 @@ test('F1 pair: a queued verification inside its own queue wait does not escalate
 })
 
 test('F3: the adapter composes one scratch root per member as TMPDIR, private and inside the mission directory', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-scratch-'))
+  const root = await tempDirectory('swarm-scratch-')
   const workers = new HarnessWorkers(new Context(), { workspacesRoot: root, checkTimeoutMs: 1000, maxCheckOutputBytes: 1024 })
   t.after(async () => { await workers.dispose(); await rm(root, { recursive: true, force: true }) })
   const first = await workers.sessionEnvironment('mission_alpha', 'member_one')
@@ -402,9 +366,8 @@ test('F1: the guard co-fires with the task ceiling path and never re-reports the
   // One model step is charged, then the operation goes silent past the bound.
   await workers.callbacks.beforeStep(member.id, true)
   const activity = { id: 'op-stuck', kind: 'tool', tool: 'job_output', startedAt: Date.now() - 5000, updatedAt: Date.now() }
-  workers.activities.set(member.id, activity)
-  workers.callbacks.activity(member.id, activity)
-  await eventually(() => silentEscalations(runtime, mission.id)[0], 'the silent operation must escalate')
+  workers.reportActivity(member.id, activity)
+  await eventually(() => silentEscalations(runtime, mission.id)[0], 'the silent operation must escalate', 3000)
 
   // The next step hits the task's own ceiling. The attempt is dropped, so a
   // later pass has no running attempt to watch: the ceiling path owns the exit
