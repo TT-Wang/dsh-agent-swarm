@@ -325,11 +325,16 @@ try {
   }
   const assignments = new Map()
   const peerMessages = new Map()
+  // Each delivery records the role of the session it reached, so a delivery
+  // routed to the wrong participant changes the snapshot.
+  const roles = new Map([[ownerId, 'owner'], [builder.sessionId, 'builder'], [reviewer.sessionId, 'reviewer']])
+  const recipientOf = request => roles.get(request.sessionId) ?? request.sessionId
   for (const request of requests) {
     for (const message of request.messages.filter(message => message.source?.kind === 'swarm' && message.source.deliveryKind === 'question')) {
       const rendered = texts(message).join('\n')
       peerMessages.set(message.id, {
         source: { kind: message.source.kind, form: message.source.form, deliveryKind: message.source.deliveryKind },
+        recipient: recipientOf(request),
         content: rendered.slice(rendered.indexOf('\n') + 1),
       })
     }
@@ -339,6 +344,7 @@ try {
       const body = JSON.parse(rendered.slice(rendered.indexOf('\n') + 1))
       assignments.set(message.id, {
         source: { kind: message.source.kind, form: message.source.form, deliveryKind: message.source.deliveryKind },
+        recipient: recipientOf(request),
         task: {
           title: body.task.title, objective: body.task.objective, kind: body.task.kind,
           scope: body.task.scope, acceptance: body.task.acceptance, checks: body.task.checks,
@@ -373,6 +379,7 @@ try {
   assert(ASSIGNMENT_INSTRUCTIONS.trim().length > 0, 'the assignment instructions must not be empty')
   for (const sentence of ASSIGNMENT_INVARIANTS) assert(ASSIGNMENT_INSTRUCTIONS.includes(sentence), `the assignment instructions must keep: ${sentence}`)
   assert(boundarySnapshot.assignments.length > 0 && boundarySnapshot.assignments.every(item => item.instructions === ASSIGNMENT_INSTRUCTIONS), 'every model-visible assignment must carry the assignment instructions')
+  assert(!ownerRequests.some(request => request.messages.some(message => texts(message).join('\n').includes(ASSIGNMENT_INSTRUCTIONS))), 'the worker assignment instructions must never reach the owner')
   const withInstructions = (snapshot, from, to) => ({ ...snapshot, assignments: snapshot.assignments.map(item => item.instructions === from ? { ...item, instructions: to } : item) })
   const snapshotPath = fileURLToPath(new URL('./fixtures/model-visible.expected.json', import.meta.url))
   if (process.env.UPDATE_SMOKE_SNAPSHOT === '1') await writeFile(snapshotPath, JSON.stringify(withInstructions(boundarySnapshot, ASSIGNMENT_INSTRUCTIONS, INSTRUCTIONS_PLACEHOLDER), null, 2) + '\n')
