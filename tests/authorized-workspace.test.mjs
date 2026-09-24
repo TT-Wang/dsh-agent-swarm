@@ -397,6 +397,8 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   assert.equal(revoked.length, 1, 'exactly one durable revocation event')
   const notice = restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.kind === 'control')
   assert.ok(notice, 'the owner is notified of the revocation')
+  await restarted.settle(mission.id)
+  assert.ok(restarted.store.get('deliveries', notice.id).deliveredAt, 'the adapter delivered the revocation notice to the owner')
   // S4b: `fenceWorkspace` now emits the shared coded workspace terminal, so the
   // owner notice carries that stable code plus the substantive revocation
   // reason; the underlying authorization code stays in the durable event detail.
@@ -450,7 +452,10 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
   assert.equal(revoked.length, 1, 'the source-less record is fenced exactly once on revocation')
   assert.match(revoked[0].data.reason, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  assert.ok(restarted.store.list('deliveries', mission.id).some(delivery => delivery.to === 'owner' && delivery.kind === 'control'), 'the owner is notified of the revocation')
+  const notice = restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.kind === 'control')
+  assert.ok(notice, 'the owner is notified of the revocation')
+  await restarted.settle(mission.id)
+  assert.ok(restarted.store.get('deliveries', notice.id).deliveredAt, 'the adapter delivered the revocation notice to the owner')
 })
 
 test('G1: grant expiry is judged at the runtime clock\'s instant by admission and by the dispatch fence alike', async t => {
