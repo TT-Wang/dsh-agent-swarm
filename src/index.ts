@@ -16,6 +16,7 @@ import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
 import type { Budget } from './types.ts'
+import { reportHarnessSupport } from './host-version.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
 
@@ -144,6 +145,8 @@ export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
 
 /** Register the host service and all consumers under one disposable plugin fiber. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  // An unsupported host is logged, not refused: 0.1.5-rc.3 enforces no peer range.
+  reportHarnessSupport(ctx.logger)
   if (!isAbsolute(config.statePath) || !isAbsolute(config.workspacesRoot)) throw new Error('Swarm statePath and workspacesRoot must be absolute')
   // Human authorization is read exactly once here, from plugin configuration.
   // Nothing below re-reads the profile and no model tool can reach this value.
