@@ -12,15 +12,13 @@ class GatedWorkers extends FakeWorkers {
   async checkpointTask(member, task) { this.checkpoints.push({ memberId: member.id, taskId: task.id }); await this.checkpointGate }
 }
 async function fixture(t) {
-  let releaseStop, releaseCheckpoint, rt, workers
+  let releaseStop, releaseCheckpoint, rt
+  const workers = new GatedWorkers()
   // Registered first, so the gates open and the current (possibly restarted) runtime is disposed before makeRuntime removes the state dir.
-  t.after(async () => { releaseStop?.(); releaseCheckpoint?.(); workers.stopGate = undefined; workers.checkpointGate = undefined; await rt.dispose() })
-  const made = await makeRuntime(t, {
-    workers: new GatedWorkers(),
-    config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined },
-  })
+  t.after(async () => { releaseStop?.(); releaseCheckpoint?.(); workers.stopGate = undefined; workers.checkpointGate = undefined; await rt?.dispose() })
+  const made = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
   const { dir: root, config } = made
-  ;({ runtime: rt, workers } = made)
+  rt = made.runtime
   rt.kick = () => {}
   const owner = { sessionId: 'owner' }
   const mission = rt.create(owner, { title: 'Review recovery', objective: 'Keep same work safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
