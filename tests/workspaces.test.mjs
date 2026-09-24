@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { HOST_GIT_TIMEOUT_MS, runProcess } from '../lib/workspaces.js'
@@ -504,6 +504,152 @@ test('verification cleanup failure never masks the check result and is reported 
   assert.match(failures[0].checkout, /verification/, 'the report names the checkout that could not be removed')
   assert.ok(failures[0].reason.length > 0, 'the removal failure reaches the host')
   assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
+})
+
+/** Register `count` more worktrees of `source` under `temp`, so its worktree listing outgrows a small output bound. */
+const crowd = async (source, temp, count) => {
+  const crowded = Array.from({ length: count }, (_, index) => path.join(temp, `crowd-${index}`))
+  for (const worktree of crowded) await git(source, 'worktree', 'add', '--detach', worktree)
+  return crowded
+}
+
+test('the next verification of a mission reclaims every checkout a crash left, tree and registration, without reporting it', async t => {
+  const failures = []
+  // The source repository's worktree listing is larger than the check output bound.
+  const { source, head, workspaces, member, task, temp } = await fixture(t, { maxCheckOutputBytes: 1024, onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const crowded = await crowd(source, temp, 8)
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  const leftover = name => path.join(verification, name)
+  await mkdir(verification, { recursive: true })
+  for (const name of ['after-checks', 'during-add', 'tree-gone']) await git(source, 'worktree', 'add', '--detach', leftover(name), head)
+  // Killed after its checks ran, in a tree a check left unreadable.
+  await mkdir(path.join(leftover('after-checks'), 'locked'))
+  await writeFile(path.join(leftover('after-checks'), 'locked', 'keep'), '')
+  await chmod(path.join(leftover('after-checks'), 'locked'), 0o500)
+  // Killed inside `git worktree add`: still locked "initializing", its `.git` link not valid yet.
+  await git(source, 'worktree', 'lock', '--reason', 'initializing', leftover('during-add'))
+  await writeFile(path.join(leftover('during-add'), '.git'), 'gitdir: partial\n')
+  // A locked registration whose tree is already gone, and a tree whose registration is.
+  await git(source, 'worktree', 'lock', '--reason', 'initializing', leftover('tree-gone'))
+  await rm(leftover('tree-gone'), { recursive: true, force: true })
+  await mkdir(path.join(leftover('unregistered'), 'src'), { recursive: true })
+  assert.ok((await git(source, 'worktree', 'list', '--porcelain')).length > 1024, 'the listing outgrows the bound')
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['true'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.deepEqual(await readdir(verification), [], 'every leftover tree is removed')
+  const listed = await git(source, 'worktree', 'list', '--porcelain')
+  assert.doesNotMatch(listed, /verification/, 'and, in the same pass, every registration, locked ones included')
+  for (const worktree of crowded) assert.ok(listed.split('\n').includes(`worktree ${worktree}`), 'no other worktree is touched')
+  assert.deepEqual(failures, [], 'a leftover is not a cleanup failure of the verification that reclaimed it')
+})
+
+test("a verification drops its own registration when git refused its checkout, whatever the size of the source's worktree listing", async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { maxCheckOutputBytes: 1024, onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  await crowd(source, temp, 8)
+  // Without its `.git` link, git refuses to remove the checkout.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['rm .git'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.equal(failures.length, 1, 'the refusal is reported')
+  assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [])
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/, 'and its registration is gone with its tree')
+})
+
+test('the reclaim removes a link under verification/ without following it, and a checkout whose root a check made unreadable', async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  // Links something left in verification/ reach the user's files and two registered worktrees with uncommitted work.
+  const outside = path.join(temp, 'outside')
+  await mkdir(path.join(outside, 'kept'), { recursive: true })
+  await writeFile(path.join(outside, 'kept', 'notes.txt'), 'mine\n')
+  await chmod(path.join(outside, 'kept'), 0o755)
+  await chmod(path.join(outside, 'kept', 'notes.txt'), 0o644)
+  const feature = path.join(temp, 'user-feature')
+  await git(source, 'worktree', 'add', '-b', 'feature', feature)
+  for (const worktree of [member.workspace, feature]) await writeFile(path.join(worktree, 'src', 'wip.txt'), 'work in progress\n')
+  await mkdir(verification, { recursive: true })
+  await symlink(outside, path.join(verification, 'link'))
+  await symlink(member.workspace, path.join(verification, 'member-link'))
+  await symlink(feature, path.join(verification, 'feature-link'))
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['chmod 000 .'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  const listed = await git(source, 'worktree', 'list', '--porcelain')
+  for (const worktree of [member.workspace, feature]) {
+    assert.ok(listed.split('\n').includes(`worktree ${worktree}`), `a worktree a link names is never removed: ${worktree}`)
+    assert.equal(await readFile(path.join(worktree, 'src', 'wip.txt'), 'utf8'), 'work in progress\n', 'with its uncommitted work')
+  }
+  assert.equal((await lstat(path.join(outside, 'kept'))).mode & 0o777, 0o755, 'the link was never followed')
+  assert.equal((await lstat(path.join(outside, 'kept', 'notes.txt'))).mode & 0o777, 0o644)
+  assert.equal(await readFile(path.join(outside, 'kept', 'notes.txt'), 'utf8'), 'mine\n')
+  assert.deepEqual(await readdir(verification), [], 'the links and the unreadable checkout are all removed')
+  assert.doesNotMatch(listed, /verification/)
+  assert.equal(failures.length, 1, "only the verification's own checkout, which git could not remove, is reported")
+})
+
+test('a verification/ that is itself a link reclaims only the checkout the verification made behind it', async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const elsewhere = path.join(temp, 'elsewhere')
+  await mkdir(path.join(elsewhere, 'project'), { recursive: true })
+  await writeFile(path.join(elsewhere, 'project', 'notes.txt'), 'mine\n')
+  await writeFile(path.join(elsewhere, 'todo.txt'), 'mine\n')
+  await symlink(elsewhere, path.join(temp, 'worktrees', 'mission-one', 'verification'))
+  // Git refuses the checkout without its `.git` link, so the fallback runs through the link too.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['rm .git'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.equal(failures.length, 1)
+  assert.deepEqual((await readdir(elsewhere)).sort(), ['project', 'todo.txt'], 'only its own checkout is removed behind the link')
+  assert.equal(await readFile(path.join(elsewhere, 'project', 'notes.txt'), 'utf8'), 'mine\n')
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /elsewhere|verification/, 'and its registration')
+})
+
+test("a verification never prunes the source repository's own worktrees, even when its cleanup needs the permission repair", async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  // The user's own linked worktree holds staged work while its directory is away (an unmounted volume, a moved folder).
+  const feature = path.join(temp, 'user-feature'), away = path.join(temp, 'user-feature-away')
+  await git(source, 'worktree', 'add', '-b', 'feature', feature)
+  await writeFile(path.join(feature, 'wip.txt'), 'work in progress\n')
+  await git(feature, 'add', 'wip.txt')
+  await rename(feature, away)
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['mkdir locked && touch locked/keep && chmod 500 locked'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.equal(failures.length, 1, "the verification's own checkout needed the fallback")
+  await rename(away, feature)
+  assert.ok((await git(source, 'worktree', 'list', '--porcelain')).split('\n').includes(`worktree ${feature}`), 'the user worktree is still registered')
+  assert.equal(await git(feature, 'status', '--porcelain'), 'A  wip.txt', 'with its staged work')
+})
+
+test('a verification never reclaims the checkout of a concurrent in-flight verification of the same mission', async t => {
+  const held = Promise.withResolvers(), release = Promise.withResolvers()
+  const checkouts = []
+  const { workspaces, member, task, temp } = await fixture(t, { confineCheck: async (argv, cwd) => {
+    checkouts.push(cwd)
+    if (checkouts.length === 1) { held.resolve(); await release.promise }
+    return argv
+  } })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const verifying = { ...task, checks: ['test -f src/answer.txt'] }
+  const first = workspaces.verifyArtifact(member, verifying, artifact)
+  await held.promise
+  assert.equal((await workspaces.verifyArtifact(member, verifying, artifact))[0].exitCode, 0)
+  const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
+  assert.deepEqual(await readdir(verification), [path.basename(checkouts[0])], "the other verification's reclaim leaves the in-flight checkout alone")
+  release.resolve()
+  assert.equal((await first)[0].exitCode, 0, 'and its check still runs in it')
+  assert.deepEqual(await readdir(verification), [])
 })
 
 test('copied dependency directories isolate check writes from the source toolchain', async t => {

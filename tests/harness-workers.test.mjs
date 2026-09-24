@@ -176,6 +176,35 @@ test('cancelled native startup cannot publish a late worker and can be retried a
   assert.ok(f.ctx.agents.get(SessionId(f.member.sessionId)), 'clean retry can publish a native handle')
 })
 
+test('a native dispose that rejected has still released the worker, so the member starts again and unload completes', async t => {
+  // Both supported hosts memoize a handle's dispose and run registry, scope and
+  // ownership cleanup to quiescence before it rejects: a settled dispose is a
+  // released handle, never one to retry (review M-15).
+  const f = await fixture(t, undefined, { start: false })
+  // The worker's session write handle (a fresh create, or a resume's open) closes, then reports EIO.
+  const persistence = f.ctx.sessionPersistence
+  const { create, open } = persistence
+  let closeFailures = 0
+  const failingClose = (id, handle) => {
+    if (id !== SessionId(f.member.sessionId)) return handle
+    const close = handle.close
+    handle.close = async function () { await close.call(this); if (closeFailures > 0) { closeFailures--; throw new Error('session close failed (EIO)') } }
+    return handle
+  }
+  persistence.create = async function (header, ...rest) { return failingClose(header.id, await create.call(this, header, ...rest)) }
+  persistence.open = async function (id, mode, ...rest) { return mode === 'write' ? failingClose(id, await open.call(this, id, mode, ...rest)) : await open.call(this, id, mode, ...rest) }
+  t.after(() => { persistence.create = create; persistence.open = open })
+  await f.adapter.start(f.spec)
+  closeFailures = 1
+  await assert.rejects(f.adapter.stop(f.member.id), /session close failed/)
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'the host released the worker before it reported the failure')
+  await f.adapter.stop(f.member.id)
+  await f.adapter.start(f.spec)
+  assert.ok(f.ctx.agents.get(SessionId(f.member.sessionId)), 'the member starts again on one fresh handle')
+  await f.adapter.dispose()
+  assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'and unload releases it')
+})
+
 const reasoningModel = model => model === 'plain-model' ? {} : {
   reasoning: { efforts: [{ id: ReasoningEffortId('off'), name: 'Off' }, { id: ReasoningEffortId('high'), name: 'High' }], defaultEffort: ReasoningEffortId('off') },
 }

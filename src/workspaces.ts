@@ -377,15 +377,25 @@ interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
 type ProcessSeamSource = () => ProcessSeam | undefined
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean; subprocess?: ProcessSeamSource }
 /**
- * Worktree metadata mutation queues keyed by canonical git common dir. Git
- * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
- * `git worktree add` calls in one repository can observe a half-written file
- * and fail with `git worktree failed (128): failed to read .../commondir`,
- * which blocks the task. Module scope makes every Workspaces instance in one
- * process share the queue for a repository.
+ * One promise chain per path, shared by every Workspaces instance in this
+ * process. It serializes worktree metadata mutation per canonical git common
+ * dir (git publishes `.git/worktrees/<name>/commondir` non-atomically, so
+ * concurrent `git worktree add` calls can read a half-written file and fail
+ * with `failed to read .../commondir`) and each task record's read-check-write
+ * (advisory A1). A task record has no writer outside this process: it lives
+ * under `workspacesRoot/<missionId>`, and a mission id is minted from a random
+ * UUID by the one runtime that holds its store's lock.
  */
-const worktreeQueues = new Map<string, Promise<void>>()
+const pathQueues = new Map<string, Promise<void>>()
+async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T> {
+  const result = (pathQueues.get(key) ?? Promise.resolve()).then(callback)
+  const tail = result.then(() => undefined, () => undefined)
+  pathQueues.set(key, tail)
+  try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
+}
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
+/** Verification checkouts in flight in this process, until their cleanup ends; any other under a mission's `verification/` was left by one that died. */
+const verificationCheckouts = new Set<string>()
 
 /**
  * ENV: one bounded output window over a command's two streams. The retained
@@ -878,12 +888,7 @@ export class Workspaces {
 
   /** Serialize worktree metadata mutation for one repository, never per member or mission. */
   private async queueWorktree<T>(cwd: string, callback: () => Promise<T>): Promise<T> {
-    const key = await this.commonDir(cwd)
-    const previous = worktreeQueues.get(key) ?? Promise.resolve()
-    const result = previous.then(callback)
-    const tail = result.then(() => undefined, () => undefined)
-    worktreeQueues.set(key, tail)
-    try { return await result } finally { if (worktreeQueues.get(key) === tail) worktreeQueues.delete(key) }
+    return await serialized(await this.commonDir(cwd), callback)
   }
 
   /** Serialized `git worktree add` with one retry for a cross-process metadata race. */
@@ -901,9 +906,9 @@ export class Workspaces {
     })
   }
 
-  /** Serialized worktree metadata mutation (remove/prune) for one repository. */
+  /** Serialized worktree metadata access (remove, list) for one repository; a listing is an inventory. */
   private async worktreeGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
-    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal))
+    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal, undefined, INVENTORY_BYTES))
   }
 
   private async missionRecord(missionId: string): Promise<MissionWorkspace> {
@@ -1285,40 +1290,12 @@ export class Workspaces {
     return missing
   }
 
-  /**
-   * Serialize one task record's read-check-write across members and processes.
-   * The member record is per member, but the task record is shared by the
-   * previous owner, the recovering owner and capture; without mutual exclusion
-   * a repair could read a stale record and clobber a newer owner's write (W1
-   * advisory A1). The lock is a leaf lock: it is never held while another lock
-   * or a git operation runs.
-   */
-  private async withTaskRecordLock<T>(taskPath: string, callback: () => Promise<T>): Promise<T> {
-    const lockPath = `${taskPath}.lock`
-    const staleAfterMs = 30_000
-    const started = Date.now()
-    await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 })
-    for (;;) {
-      try { await writeFile(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); break }
-      catch (error) {
-        const code = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
-        if (code !== 'EEXIST') throw error
-        const info = await lstat(lockPath).catch(() => undefined)
-        if (info === undefined) continue
-        if (Date.now() - info.mtimeMs > staleAfterMs) { await rm(lockPath, { force: true }).catch(() => undefined); continue }
-        if (Date.now() - started > staleAfterMs) throw new Error(`Timed out waiting for the task workspace record lock: ${taskPath}`)
-        await new Promise(resolve => setTimeout(resolve, 5))
-      }
-    }
-    try { return await callback() } finally { await rm(lockPath, { force: true }).catch(() => undefined) }
-  }
-
   private async saveTaskWorkspace(record: MemberWorkspace): Promise<void> {
     await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
     const task = record.task
     if (task === undefined) return
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
+    await serialized(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
   }
 
   /** Preserve quiescent WIP without applying artifact scope or changing the checkout. */
@@ -1478,7 +1455,7 @@ export class Workspaces {
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const current = await readJson(taskPath)
       const ownsTask = isRecord(current) && current.memberId === record.memberId && isRecord(current.task) && current.task.epoch === task.epoch
       // Preparation may revisit a member's previous checkout after this task
@@ -1511,9 +1488,9 @@ export class Workspaces {
     const previous = record.task
     if (previous === undefined || previous.taskId === nextTaskId) return
     const taskPath = this.taskPath(record.missionId, previous.taskId)
-    // Read, compare and write under one lock: a newer owner's record written
+    // Read, compare and write as one serialized step: a newer owner's record written
     // while this checkpoint was deciding can never be clobbered (advisory A1).
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const saved = await readJson(taskPath)
       if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
       await writePrivateJson(taskPath, {
@@ -1931,6 +1908,7 @@ export class Workspaces {
       // Keep the validation above, but reserve execution capacity only for checks.
       if (task.checks.length === 0) return []
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
+      verificationCheckouts.add(checkout)
       let release: (() => void) | undefined
       try {
         let linked: string[]
@@ -2018,6 +1996,7 @@ export class Workspaces {
       } finally {
         release?.()
         await this.cleanupVerification(member, task, mission.source, checkout)
+        verificationCheckouts.delete(checkout)
       }
     }, signal)
   }
@@ -2038,51 +2017,41 @@ export class Workspaces {
   }
 
   /**
-   * Remove a disposable verification checkout without ever masking the check
-   * results. `git worktree remove` fails when a check left an unreadable
-   * directory; fall back to `fs.rm`, then to an owner-permission repair before
-   * `git worktree prune` drops a stale registration. Failures are recorded for
-   * the host and are never thrown.
+   * Remove this verification's checkout, then every checkout of its mission no verification in this
+   * process owns (a crash left it): the entries of its canonical `verification/` and the registrations
+   * naming a path there. Git removes the own checkout; a refusal is reported and the checkout reclaimed.
+   * Reclaiming removes the tree as what it is (a link is never followed), then the registration of the
+   * now missing path, which git cannot resolve to another worktree. Nothing else is touched or pruned.
+   * Best effort by contract: what resists stays for the mission's next verification; nothing is thrown.
    */
   private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
-    let failure: unknown
-    try {
-      await this.worktreeGit(source, ['worktree', 'remove', '--force', checkout])
-      return
-    } catch (error) { failure = error }
-    if (!(await lstat(checkout).then(() => true, () => false))) {
-      try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-      return
-    }
-    try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
-    catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
-    try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-    this.recordCleanupIssue(member, task, checkout, failure)
+    const remove = async (candidate: string): Promise<string> => await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', candidate])
+    const reclaim = async (candidate: string): Promise<void> => { await this.forceRemove(candidate); await remove(candidate).catch(() => undefined) }
+    await remove(checkout).catch(async (removal: unknown) => {
+      if (!(await lstat(checkout).then(() => true, () => false))) return
+      const failure = await reclaim(checkout).then(() => removal, (error: unknown) => error)
+      try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
+    })
+    const directory = path.dirname(checkout)
+    if (await realpath(directory).catch(() => undefined) !== directory) return
+    const registered = (await this.worktreeGit(source, ['worktree', 'list', '--porcelain', '-z']).catch(() => '')).split('\0').flatMap(line => line.startsWith('worktree ') ? [line.slice('worktree '.length)] : [])
+    const leftovers = new Set([...(await readdir(directory).catch(() => [])).map(name => path.join(directory, name)), ...registered.filter(candidate => path.dirname(candidate) === directory)])
+    for (const candidate of leftovers) if (!verificationCheckouts.has(candidate)) await reclaim(candidate).catch(() => undefined)
   }
 
-  /** Restore owner permissions on an unreadable tree so removal can finish. */
-  private async forceRemove(directory: string): Promise<void> {
+  /** Remove `target` after restoring owner access to each directory in it (unlink needs no more); a link is never followed. */
+  private async forceRemove(target: string): Promise<void> {
     const gone = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT'
     // A failed recursive removal can still be deleting entries, so every step
     // tolerates a path that disappeared underneath it.
     const ignoringMissing = async <T>(operation: Promise<T>): Promise<T | undefined> => await operation.catch(error => { if (gone(error)) return undefined; throw error })
     const repair = async (current: string): Promise<void> => {
-      for (const entry of await ignoringMissing(readdir(current, { withFileTypes: true })) ?? []) {
-        const child = path.join(current, entry.name)
-        const info = await ignoringMissing(lstat(child))
-        if (info === undefined || info.isSymbolicLink()) continue
-        if (info.isDirectory()) { await ignoringMissing(chmod(child, 0o700)); await repair(child) }
-        else await ignoringMissing(chmod(child, 0o600))
-      }
+      if (!(await ignoringMissing(lstat(current)))?.isDirectory()) return
+      await ignoringMissing(chmod(current, 0o700))
+      for (const name of await ignoringMissing(readdir(current)) ?? []) await repair(path.join(current, name))
     }
-    await repair(directory)
-    await ignoringMissing(chmod(directory, 0o700))
-    await rm(directory, { recursive: true, force: true })
-  }
-
-  private recordCleanupIssue(member: Member, task: Task, checkout: string, failure: unknown): void {
-    const reason = failure instanceof Error ? failure.message : String(failure)
-    try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
+    await repair(target)
+    await rm(target, { recursive: true, force: true })
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */
