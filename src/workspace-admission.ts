@@ -438,7 +438,7 @@ export class WorkspaceAdmission {
       // workspace that is its own root; anything else — including a missing
       // source on a root that is no longer configured — fails closed, because
       // it could be a revoked grant whose root happens to equal the workspace.
-      const live = await authorize(mission.workspace, undefined)
+      const live = await authorize(mission.workspace, undefined, this.rt.now())
       const liveGrant = live.ok && live.grantRoot === root
       const sessionWorkspace = resolved === root && mission.workspaceAuthorizationSource === 'session'
       if (!liveGrant && !sessionWorkspace) diagnostic = `Authorized root ${anchor} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]`

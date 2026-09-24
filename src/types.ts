@@ -1098,12 +1098,22 @@ export interface WorkerAdapter {
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
-  /** Tick timer period; 0 runs no timer, so a test drives `SwarmRuntime.tick()` by hand. */
+  /**
+   * Tick timer period, and the unit of every tick-derived window (the
+   * unreviewed-submission grace, the no-progress window, the back-off bound,
+   * the start retry).
+   */
   tickMs: number
+  /**
+   * Run no tick timer, so a test drives `SwarmRuntime.tick()` by hand; `tickMs`
+   * stays the tick unit. The plugin never sets it from the profile.
+   */
+  manualTick?: boolean
   /**
    * The runtime clock. Every wall-clock read that decides runtime behaviour
    * (leases, bounds, back-offs, silence, stall and wedge ages, wake budgets,
    * follow-up timing, event `createdAt`) reads it; defaults to `Date.now`.
+   * Only a function is taken, and the plugin never sets it from the profile.
    */
   now?: () => number
   /** Prelaunch watchdog fallback; the owner can extend it with a reason. */
@@ -1146,9 +1156,10 @@ export interface RuntimeConfig {
    * at start. When present the runtime re-derives every mission's grant root
    * from it and fences a mission whose root was revoked; when absent (unit
    * runtimes and adapters without Git) the recorded admission result stands.
-   * It is a value on the runtime's own config, never a model-callable surface.
+   * It judges grant expiry at `now`, the runtime clock's instant, as admission
+   * does. It is a value on the runtime's own config, never a model-callable surface.
    */
-  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined) => Promise<WorkspaceAuthorization>
+  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined, now: number) => Promise<WorkspaceAuthorization>
   /**
    * The roots `authorizeWorkspace` closes over, carried so revocation fencing
    * can name the recorded root without re-reading configuration. Never

@@ -25,7 +25,7 @@ import { tempDirectory } from './temp-root.mjs'
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 const text = value => ({ kind: 'text', text: value })
 const input = (id, content) => freezeMessage({ id: MessageId(id), role: 'user', content: [{ type: 'text', text: content }], source: { kind: 'user' } })
-async function fixture(t, respond = () => text('Done'), configure) {
+async function fixture(t, respond = () => text('Done'), configure, profile = {}) {
   const root = await realpath(await tempDirectory('swarm-owner-native-'))
   const source = path.join(root, 'source'); await mkdir(source)
   for (const args of [['init', '-b', 'main'], ['-c', 'user.name=Swarm', '-c', 'user.email=swarm@localhost', 'commit', '--allow-empty', '-m', 'base']]) {
@@ -58,7 +58,7 @@ async function fixture(t, respond = () => text('Done'), configure) {
   ctx.llm.registerAdapter(['swarm-test'], new Scripted())
   await configure?.(ctx)
   const handle = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
-  await ctx.plugin(Swarm, { statePath: path.join(root, 'state.sqlite'), workspacesRoot: path.join(root, 'worktrees'), tickMs: 60000, leaseMs: 60000, maxEvents: 500, maxAttempts: 100, maxMessageChars: 10000 })
+  await ctx.plugin(Swarm, { statePath: path.join(root, 'state.sqlite'), workspacesRoot: path.join(root, 'worktrees'), tickMs: 60000, leaseMs: 60000, maxEvents: 500, maxAttempts: 100, maxMessageChars: 10000, ...profile })
   const rt = ctx.swarm
   rt.kick = () => {}; rt.pumpOutbox = () => {}
   const owner = { sessionId: 'owner-session' }
@@ -69,6 +69,22 @@ async function fixture(t, respond = () => text('Done'), configure) {
   }
   return { ctx, rt, owner, agent: handle.agent, mission, requests, emit }
 }
+
+// The plugin Config passes unknown profile keys through. A key named `now` used
+// to become the runtime clock, and the first clock read threw
+// 'this.now is not a function'; the runtime clock is never a profile setting.
+for (const now of [5, 'x']) test(`a profile key now: ${JSON.stringify(now)} never replaces the runtime clock`, async t => {
+  const before = Date.now()
+  const f = await fixture(t, undefined, undefined, { now })
+  assert.equal(f.mission.status, 'active')
+  assert.ok(f.mission.createdAt >= before && f.mission.createdAt <= Date.now(), 'the mission is stamped by the default clock')
+  assert.equal(f.rt.config.now, undefined, 'the plugin builds the runtime config without the profile key')
+})
+
+test('a profile key manualTick never turns off the tick timer', async t => {
+  const f = await fixture(t, undefined, undefined, { manualTick: true })
+  assert.notEqual(f.rt.timer, undefined, 'the plugin runtime keeps its tick timer')
+})
 
 test('full plugin books first consumed question before the transport flush acknowledges it', async t => {
   const f = await fixture(t, () => text('Ordinary prose is not a receipt answer'))

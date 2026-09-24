@@ -205,7 +205,7 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   const workers = new HeldStartWorkers()
   const dir = await realpath(await tempDirectory('swarm-pass-busy-'))
   const statePath = join(dir, 'swarm.sqlite')
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 0, now: clock.now, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, manualTick: true, now: clock.now, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
     stallPassTimeoutMs: bound, stallPasses: 1_000 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
@@ -247,6 +247,8 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
     workers.autoIdle = true
     hold.release.reject(new Error('Worker startup timed out'))
     await runtime.settle(mission.id)
+    // The failed start may retry one tick unit later, when the next tick comes.
+    clock.advance(runtime.config.tickMs)
     await runtime.tick()
     assert.equal(taskOf(runtime, task.id).status, 'running', 'the task dispatches once the wedged start settles')
     await runtime.tick()
@@ -597,6 +599,8 @@ test('S1: a body past its bound stops at the next member boundary, so lease reco
     assert.equal(workers.started[hangB.index + 1], c.id, 'and the body after B\'s sweeps from C')
     workers.end(c.id, hangMs)
     await f.runtime.settle(f.mission.id)
+    // C's failed start may retry one tick unit later, when the next tick comes.
+    clock.advance(f.runtime.config.tickMs)
     await f.runtime.tick()
     assert.deepEqual(hanging.filter(member => workers.started.lastIndexOf(member.id) <= workers.hangs.get(member.id).index).map(member => member.name), [],
       'every member is started again after its hung start settles')
@@ -855,14 +859,18 @@ test('S5: the durable notice ledger alone dedups a decision notice, within one p
   } finally { if (restarted !== undefined) await restarted.dispose(); await f.cleanup() }
 })
 
-test('tickMs 0 runs no timer: settle() returns once the kicked body has settled, and tick() runs the guards once and waits for the body it kicked', async () => {
-  // Before, every runtime installed a tick timer (tickMs 0 clamps to 1ms) and
-  // had no awaitable pass, so a test could only poll real time for the effects
-  // of a kick or a tick.
-  const f = await setup({ config: { tickMs: 0, stallPassTimeoutMs: 60_000, stallPasses: 1_000 } })
+test('manualTick runs no timer while tickMs stays the tick unit: settle() returns once the kicked body has settled, tick() runs the guards once and waits for the body it kicked, and a tick-derived window elapses on the clock', async () => {
+  // Before, every runtime installed a tick timer and had no awaitable pass, so
+  // a test could only poll real time for the effects of a kick or a tick. Then
+  // tickMs 0 meant both "no timer" and "a tick unit of 0", so every fake-clock
+  // runtime ran each tick-derived window at zero and no test could reach one.
+  const clock = new FakeClock()
+  const f = await setup({ clock, config: { stallPasses: 1_000 } })
   const scheduling = f.runtime.scheduling
   try {
     assert.equal(f.runtime.timer, undefined, 'no tick timer is installed')
+    const { tickMs } = f.runtime.config
+    assert.equal(tickMs, 10, 'the tick unit is unchanged')
     await f.runtime.settle(f.mission.id)
     assert.equal(scheduling.passes.has(f.mission.id), false, 'the setup kicks have settled')
     f.workers.autoIdle = true
@@ -877,5 +885,47 @@ test('tickMs 0 runs no timer: settle() returns once the kicked body has settled,
     await f.runtime.tick()
     assert.equal(checks, 1, 'one tick runs the watchdog once')
     assert.equal(scheduling.passes.has(f.mission.id), false, 'and returns once the body it kicked has settled')
+    // The unreviewed-submission grace is 30 tick units (at most 1 s) of clock
+    // time from the durable submission, so a submission is not a stall inside it.
+    const claimed = taskOf(f.runtime, task.id)
+    await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const unreviewed = () => f.runtime.scheduling.unreviewedStall(f.mission.id, [taskOf(f.runtime, task.id)])
+    assert.equal(unreviewed(), false, 'a submission is not a stall at its own instant')
+    clock.advance(30 * tickMs - 1)
+    assert.equal(unreviewed(), false, 'nor one clock millisecond inside the grace')
+    clock.advance(1)
+    assert.equal(unreviewed(), true, 'it is one once the grace has elapsed on the clock')
+  } finally { await f.cleanup() }
+})
+
+test('settle() is not quiescence: a kick coalesced into an open body is run by the next tick, as the timer would run it', async () => {
+  // The body sweeps the author, then the reviewer, whose start the test holds.
+  // T2 for the author is proposed while that body is open and past the author,
+  // so its kick is coalesced into the body and dropped.
+  class HeldReviewerWorkers extends FakeWorkers {
+    hold
+    async start(spec) {
+      this.started.push(spec.member.id)
+      const hold = this.hold
+      if (hold === undefined || spec.member.id !== hold.memberId || hold.entered.done) return
+      hold.entered.done = true
+      hold.entered.resolve()
+      await hold.release.promise
+    }
+  }
+  const workers = new HeldReviewerWorkers()
+  const f = await setup({ workers, clock: new FakeClock() })
+  try {
+    await f.runtime.settle(f.mission.id)
+    workers.autoIdle = true
+    workers.hold = { memberId: f.reviewer.id, entered: Promise.withResolvers(), release: Promise.withResolvers() }
+    const t1 = f.propose({ title: 'T1 for the reviewer', assigneeId: f.reviewer.id })
+    await workers.hold.entered.promise
+    const t2 = f.propose({ title: 'T2 for the author' })
+    workers.hold.release.resolve()
+    await f.runtime.settle(f.mission.id)
+    assert.deepEqual([t1, t2].map(task => taskOf(f.runtime, task.id).status), ['running', 'pending'], 'settle() returns with the coalesced kick undone')
+    await f.runtime.tick()
+    assert.equal(taskOf(f.runtime, t2.id).status, 'running', 'the next tick runs it')
   } finally { await f.cleanup() }
 })

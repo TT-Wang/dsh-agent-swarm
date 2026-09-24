@@ -305,10 +305,11 @@ export class SwarmRuntime {
    */
   readonly store: SwarmStore
   /**
-   * The runtime clock (`RuntimeConfig.now`, default `Date.now`, read late so a
-   * test's `Date.now` mock still applies). Every wall-clock read that decides
-   * runtime behaviour goes through it; the modules read it from the runtime
-   * they are handed, and the store stamps event `createdAt` with it.
+   * The runtime clock (`RuntimeConfig.now` when it is a function, else
+   * `Date.now`, read late so a test's `Date.now` mock still applies). Every
+   * wall-clock read that decides runtime behaviour goes through it; the
+   * modules read it from the runtime they are handed, and the store stamps
+   * event `createdAt` with it.
    */
   readonly now: () => number
   private readonly listeners = new Set<(missionId: string) => void>()
@@ -492,7 +493,7 @@ export class SwarmRuntime {
   get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {
-    this.now = config.now ?? (() => Date.now())
+    this.now = typeof config.now === 'function' ? config.now : () => Date.now()
     this.store = new SwarmStore(config.statePath, { ...storeOptions, now: this.now })
     workers.bind({
       activity: (memberId, activity) => this.onActivity(memberId, activity),
@@ -648,12 +649,12 @@ export class SwarmRuntime {
    * racing the watchdog for the same state.
    */
   private startTicker(): void {
-    if (this.timer !== undefined || this.config.tickMs <= 0) return
+    if (this.timer !== undefined || this.config.manualTick === true) return
     this.timer = setInterval(() => this.runTick(), this.config.tickMs)
     this.timer.unref()
   }
   /**
-   * One tick by hand, for a runtime built with `tickMs: 0` (no timer): the
+   * One tick by hand, for a runtime built with `manualTick` (no timer): the
    * timer's guards, then it resolves once every operation they deferred (a
    * scheduling body, the outbox pump, a stop barrier), and every operation
    * started while it waits, has settled. An operation already in flight when
@@ -667,10 +668,17 @@ export class SwarmRuntime {
     for (let pending = started(); pending.length > 0; pending = started()) await Promise.allSettled(pending)
   }
   /**
-   * Resolves once the mission's scheduling body, and any body already kicked
-   * after it, has settled and no deferred operation (a worker start, a stop
-   * barrier, an outbox pump) is in flight. Deferred operations carry no
-   * mission, so it waits for every one. It never kicks a body itself.
+   * Resolves once the mission's queue is empty and no deferred operation (a
+   * scheduling body, a worker start, a stop barrier, an outbox pump) is in
+   * flight. Deferred operations carry no mission, so it waits for every one.
+   * It never kicks a body, so it is not quiescence: a kick made while a body
+   * is open is coalesced into that body and dropped, and the next tick runs
+   * that work (the timer's, or `tick()`). Call `tick()` after it to reach the
+   * state the timer would. Never await it from inside a scheduling body or an
+   * adapter call a body awaits: it waits for that body, which waits for it,
+   * until the body's own bound (the worker start timeout) aborts it. That call
+   * is not refused, because telling the body's own async chain from any other
+   * caller would need async context, which the runtime deliberately does not keep.
    */
   async settle(missionId: string): Promise<void> {
     for (;;) {
@@ -1643,7 +1651,7 @@ export class SwarmRuntime {
     const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
     // D1: a task that exhausted its own finding (or step) ceiling blocks instead
     // of publishing more evidence and consuming the mission budget.
-    const ceiling = taskCeilingBlock(task)
+    const ceiling = taskCeilingBlock(task, this.now())
     if (ceiling !== undefined) { this.blockTaskCeiling(this.mission(missionId), task, ceiling); throw new Error(ceiling.reason) }
     this.bounded(input.claim)
     if (!EVIDENCE_OUTCOMES.includes(input.outcome)) throw new PolicyError('invalid_evidence_outcome', 'validation_error', '[invalid_evidence_outcome] Evidence `outcome` must be supported, disproved or inconclusive; it describes the hypothesis, not task success. Correct `outcome` and retry `swarm_publish`.')
@@ -3551,7 +3559,7 @@ export class SwarmRuntime {
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }
-    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next) === undefined)
+    const resumes = action === 'resume' || (task.status === 'blocked' && structural) || (task.status === 'blocked' && changes.maxRecoveryAttempts !== undefined && (next.recoveryCount ?? 0) < changes.maxRecoveryAttempts) || (task.ceiling !== undefined && taskCeilingBlock(next, this.now()) === undefined)
     // A blocked task that carries an artifact was rejected, or invalidated after
     // it submitted: the artifact is immutable, so a resume would only fence the
     // historical author and re-pend work that can never change. A resume while a
@@ -3559,7 +3567,7 @@ export class SwarmRuntime {
     // blocked outcome, so it stays allowed.
     if (resumes && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
-    if (resumes && taskCeilingBlock(next) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
+    if (resumes && taskCeilingBlock(next, this.now()) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
       const source = this.task(missionId, task.verificationRecovery.sourceTaskId)
       if (source.status !== 'submitted' || source.artifact?.commit !== task.verificationRecovery.commit) throw new PolicyError('review_artifact_changed', 'conflict_error', 'Review recovery requires its exact submitted artifact')
@@ -3570,7 +3578,7 @@ export class SwarmRuntime {
     if (resumes && next.status === 'blocked' && next.artifact === undefined && next.resumeAfterStop?.reason === 'invalidated') {
       next.resumeAfterStop = { ...next.resumeAfterStop, reason: 'handoff' }
     }
-    if (taskCeilingBlock(next) === undefined) delete next.ceiling
+    if (taskCeilingBlock(next, this.now()) === undefined) delete next.ceiling
     if (resumes) { delete next.preparationFailure; delete next.verificationRecovery; delete next.closeout; delete next.idleSignal }
     const activeOwner = task.attempt?.ownerId
     if (activeOwner !== undefined && (structural || (resumes && task.status === 'blocked'))) {
@@ -3749,7 +3757,7 @@ export class SwarmRuntime {
     // the next step is charged, so the mission budget is never drained by it.
     const activeTask = this.store.list('tasks', mission.id).find(task => task.status === 'running' && task.attempt?.ownerId === memberId)
     if (activeTask !== undefined) {
-      const ceiling = taskCeilingBlock(activeTask)
+      const ceiling = taskCeilingBlock(activeTask, this.now())
       if (ceiling !== undefined) { this.blockTaskCeiling(mission, activeTask, ceiling); return false }
     }
     // Requests still streaming for other workers will settle against the same pool.

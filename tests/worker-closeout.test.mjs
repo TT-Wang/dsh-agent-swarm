@@ -187,9 +187,11 @@ test('an owner cancel during the lease-expiry checkpoint is never overwritten by
   assert.equal(cancelled.status, 'cancelled')
   release.resolve()
   // The released checkpoint's transition and the cancel's stop barrier have
-  // both run once the mission has settled, so the negative assertions below
-  // mean something without a pause.
+  // both run once the mission has settled, and the next tick has run the
+  // cancel's kick the open recovery body coalesced, so the negative assertions
+  // below mean something without a pause.
   await f.runtime.settle(f.mission.id)
+  await f.runtime.tick()
   const final = f.current(task.id)
   assert.equal(final.status, 'cancelled', 'the in-flight checkpoint must not overwrite the owner cancel')
   assert.equal(final.epoch, cancelled.epoch, 'the cancelled epoch is preserved')
