@@ -1,44 +1,24 @@
 /** Acceptance text cannot erase an admitted report or its independent review. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 const acceptance = ['Audit the code', 'Deliver the independently reviewed report']
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 1 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 3000
-  while (Date.now() < deadline) {
-    const result = read()
-    if (result) return result
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  assert.fail(message)
-}
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
+class Workers extends FakeWorkers {
+  checks = []
   async prepareBaseline() { return { sourceHead: 'b'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: '/planning', changedPaths: [], createdAt: Date.now() } }
   async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
-  async start() {}
-  async stop() {}
-  async dispose() {}
-  isIdle() { return false }
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async prepareTask() {}
   async captureArtifact(member, task) {
     return { commit: `captured-${task.id}`, baseCommit: 'b'.repeat(40), workspace: member.workspace, changedPaths: ['docs/reviews/audit.md'] }
   }
-  async verifyArtifact() { return [] }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-required-report-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), tickMs: 10, leaseMs: 60000,
-    maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 20 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new Workers(),
+    config: { maxEvents: 500, maxTasksPerMember: 20, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 1 },
+  })
   const owner = { sessionId: 'report-owner' }
   const common = { workstreamKey: 'audit', scope: ['docs/reviews/'], acceptance, outputs: [], maxRecoveryAttempts: 3 }
   const research = (key, dependencies = []) => ({ ...common, key, title: key, objective: key,
@@ -88,7 +68,7 @@ test('covered audit text cannot auto-complete or manually complete a stranded re
   const captured = await f.strandReport()
   const report = f.task('s_report'), review = f.task('v_report')
   const notice = await eventually(() => f.workers.deliveries.find(item => item.to === 'owner' && /Mission stalled/.test(item.content)
-    && item.content.includes(report.id)), 'the owner must be notified of the unfinished report')
+    && item.content.includes(report.id)), 'the owner must be notified of the unfinished report', 3000)
   assert.match(notice.content, new RegExp(review.id))
   const snapshot = f.runtime.snapshot(f.owner, f.missionId)
   assert.deepEqual(f.task('r_main').acceptance, acceptance, 'an accepted audit already repeats every mission criterion')
@@ -112,7 +92,7 @@ test('covered audit text cannot auto-complete or manually complete a stranded re
   await f.submit(amended)
   assert.equal(f.runtime.snapshot(f.owner, f.missionId).completion.eligible, false, 'the submitted final report still requires independent acceptance')
   await f.accept(amended)
-  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'the original chain completes after its actual deliverable is accepted')
+  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'the original chain completes after its actual deliverable is accepted', 3000)
   assert.equal(f.current(report.id).status, 'accepted')
   assert.equal(f.current(review.id).status, 'accepted')
   assert.equal(f.runtime.snapshot(f.owner, f.missionId).completion.eligible, true)
@@ -126,7 +106,7 @@ test('an owner may explicitly withdraw a redundant report chain and complete the
   const report = f.task('s_report'), review = f.task('v_report')
   assert.equal(f.runtime.snapshot(f.owner, f.missionId).completion.eligible, false)
   f.runtime.cancel(f.owner, f.missionId, { taskId: report.id, reason: 'Owner explicitly changes the deliverable to the accepted audit artifact' })
-  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'explicit withdrawal permits completion')
+  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'explicit withdrawal permits completion', 3000)
   assert.match(f.current(report.id).output, /Cancelled by the mission owner/)
   assert.equal(f.current(review.id).status, 'cancelled', 'review retirement follows its explicit source withdrawal')
   assert.equal(f.events('task/cancelled-at-completion').length, 0)
@@ -145,7 +125,7 @@ test('an accepted replacement satisfies the original prerequisite without replac
   assert.deepEqual(f.current(report.id).dependencies, report.dependencies, 'original dependency ids resolve through the accepted replacement')
   assert.equal(f.runtime.snapshot(f.owner, f.missionId).completion.eligible, false, 'replacement coverage cannot skip the final report')
   await f.submit(report); await f.accept(report)
-  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'accepted replacement and the original report chain complete normally')
+  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'accepted replacement and the original report chain complete normally', 3000)
   assert.equal(f.current(replacement.id).status, 'accepted')
   assert.equal(f.current(report.id).status, 'accepted')
   assert.equal(f.task('v_report').status, 'accepted')
@@ -163,12 +143,12 @@ test('a blocked optional experiment keeps its evidence and status when the requi
     claim: 'Preserve the partial experiment', outcome: 'supported', toolRunIds: [runId] })
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
-  await eventually(() => !f.current(experiment.id).resumeAfterStop, 'the experimental worker stops before other work resumes')
+  await eventually(() => !f.current(experiment.id).resumeAfterStop, 'the experimental worker stops before other work resumes', 3000)
   const blocked = f.current(experiment.id)
   assert.equal(blocked.status, 'blocked')
   await f.strandReport()
   f.runtime.cancel(f.owner, f.missionId, { taskId: report.id, reason: 'Owner explicitly accepts the audit artifact as the deliverable' })
-  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'a blocked optional experiment does not hold required completion open')
+  await eventually(() => f.runtime.store.get('missions', f.missionId).status === 'completed', 'a blocked optional experiment does not hold required completion open', 3000)
   assert.equal(f.current(experiment.id).status, 'blocked', 'completion does not silently cancel even optional work')
   assert.deepEqual(f.current(experiment.id).evidenceIds, blocked.evidenceIds)
   assert.equal(f.current(experiment.id).usedSteps, blocked.usedSteps)

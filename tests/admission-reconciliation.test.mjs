@@ -6,17 +6,14 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { planAdvisories, validatePlan } from '../lib/plans.js'
-import { setup } from './faults/harness.mjs'
+import { FakeWorkers, budget as defaultBudget, makeRuntime, setup } from './faults/harness.mjs'
 import {
   DEFAULT_TASK_MAX_FINDINGS, DEFAULT_TASK_MAX_STEPS, classifyCheck, taskCeilingBlock, taskCeilingExhaustion,
 } from '../lib/admission.js'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
 
 function plan(workspace, overrides = {}) {
   return {
@@ -149,15 +146,10 @@ test('existing cycle, missing-review, uncovered-acceptance and integration-topol
   delete missingReview.tasks[0].reviewOf
   assert.throws(() => validatePlan(missingReview), /reviewOf must name the existing source task/)
 
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-admission-runtime-'))
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(mission, id) { return join(mission.workspace, id) },
-    async start() {}, async prepareTask() {}, async deliver() {}, async stop() {},
-    isIdle() { return false }, async dispose() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, id) { return join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined },
+  })
   const owner = { sessionId: 'admission-owner' }
   const automatic = () => ({
     title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'], budget,

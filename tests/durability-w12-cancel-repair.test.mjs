@@ -8,43 +8,22 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class RepairWorkers {
-  prepared = []; deliveries = []; stopped = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ to: member.id, ...delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-w12-'))
-  const workers = new RepairWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'w12-owner' }
   const mission = runtime.create(owner, { title: 'W12', objective: 'Repair withdrawn obligations', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -75,7 +54,7 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
   assert.equal(f.current(original.id).status, 'cancelled')
   const [cancelled] = f.events('task/cancelled')
   assert.deepEqual(cancelled.data.strandedDependents, [admitted.id], 'the durable event names the stranded dependent')
-  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal')
+  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal', 2500)
   // A new dependent is still refused while no live repair exists.
   assert.throws(() => f.research({ title: 'New dependent', dependencies: [original.id] }), /no live replacement/)
   const before = structuredClone(f.current(original.id))
@@ -100,7 +79,7 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
     assert.equal(claimed.status, 'running', 'the dependent becomes ready through the repair lineage')
     // Release the author for the next dependent; the claim itself is the assertion.
     f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: dependent.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'Continue elsewhere' })
-    await eventually(() => f.current(dependent.id).resumeAfterStop === undefined, 'the old worker must stop before it claims different work')
+    await eventually(() => f.current(dependent.id).resumeAfterStop === undefined, 'the old worker must stop before it claims different work', 2500)
   }
 })
 
