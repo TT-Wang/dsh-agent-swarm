@@ -7,7 +7,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { boardIndex, taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
+import { boardIndex, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
 import { leaseExpired } from '../lib/types/client/clock.js'
 import { swarmCardDefinition } from '../lib/types/client/card-definition.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
@@ -48,20 +48,21 @@ test('board separates queued, blocked and cancelled work and clamps budget', () 
   // OWNER PASS 2026-09-11: waiting on live work is "queued"; only a dead
   // prerequisite, a stopped assignee or a vanished review source is "blocked";
   // withdrawals get their own lane instead of sharing it with blocked work.
-  const { tasks } = uiSnapshot()
-  assert.equal(taskLane(tasks[2], tasks), 'queued', 'a review whose source is still running is queued, not blocked')
-  assert.equal(taskLane(tasks[4], tasks), 'ready')
-  assert.equal(taskLane(tasks[0], tasks), 'done')
+  const { tasks, members } = uiSnapshot()
+  const lane = (task, rows) => boardIndex(rows).lane(task, members)
+  assert.equal(lane(tasks[2], tasks), 'queued', 'a review whose source is still running is queued, not blocked')
+  assert.equal(lane(tasks[4], tasks), 'ready')
+  assert.equal(lane(tasks[0], tasks), 'done')
   const review = { ...tasks[2], dependencies: [], reviewOf: tasks[1].id }
-  assert.equal(taskLane(review, tasks), 'queued', 'review waits for source submission')
-  assert.equal(taskLane({ ...review, reviewOf: 'missing-source' }, tasks), 'blocked', 'missing review source is never ready')
-  assert.equal(taskLane(review, tasks.map(task => task.id === review.reviewOf ? { ...task, status: 'submitted' } : task)), 'ready')
+  assert.equal(lane(review, tasks), 'queued', 'review waits for source submission')
+  assert.equal(lane({ ...review, reviewOf: 'missing-source' }, tasks), 'blocked', 'missing review source is never ready')
+  assert.equal(lane(review, tasks.map(task => task.id === review.reviewOf ? { ...task, status: 'submitted' } : task)), 'ready')
   const cancelled = { ...tasks[4], status: 'cancelled' }
-  assert.equal(taskLane(cancelled, tasks), 'cancelled', 'a withdrawal has its own lane')
+  assert.equal(lane(cancelled, tasks), 'cancelled', 'a withdrawal has its own lane')
   const blockedByDead = { ...tasks[4], dependencies: [cancelled.id] }
-  assert.equal(taskLane(blockedByDead, [...tasks, cancelled]), 'blocked', 'a dead prerequisite blocks instead of queueing')
+  assert.equal(lane(blockedByDead, [...tasks, cancelled]), 'blocked', 'a dead prerequisite blocks instead of queueing')
   const queuedBehindLive = { ...tasks[4], dependencies: [tasks[1].id] }
-  assert.equal(taskLane(queuedBehindLive, tasks), 'queued', 'a live prerequisite queues instead of blocking')
+  assert.equal(lane(queuedBehindLive, tasks), 'queued', 'a live prerequisite queues instead of blocking')
   assert.equal(remainingPercent(140, 100), 0)
   assert.equal(remainingPercent(0, 0), 0)
 })

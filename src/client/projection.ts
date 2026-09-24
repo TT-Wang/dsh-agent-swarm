@@ -65,16 +65,6 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
   return { byId, effective, dependencyMet, blockedDependencies, lane }
 }
 
-/** Compatibility wrapper for a single lineage query; render paths reuse one `boardIndex`. */
-export function dependencyMet(id: string, tasks: readonly Task[]): boolean {
-  return boardIndex(tasks).dependencyMet(id)
-}
-
-/** Dependent pending work is visibly blocked instead of advertised as dispatchable. */
-export function taskLane(task: Task, tasks: readonly Task[]): BoardLane {
-  return boardIndex(tasks).lane(task)
-}
-
 export function remainingPercent(used: number, limit: number): number {
   return limit <= 0 ? 0 : Math.max(0, Math.min(100, 100 - used / limit * 100))
 }
@@ -379,11 +369,6 @@ export function retiredReviewsBySource(snapshot: Snapshot): Map<string, RetiredR
     else list.push(review)
   }
   return retired
-}
-
-/** Verification tasks of one source that the owner or runtime withdrew (F-12 sibling surface). */
-export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): RetiredReview[] {
-  return retiredReviewsBySource(snapshot).get(sourceTaskId) ?? []
 }
 
 /**

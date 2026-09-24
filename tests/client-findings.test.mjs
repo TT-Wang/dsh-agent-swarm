@@ -10,7 +10,7 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import  {  boardIndex, dependencyMet, durableVerdict, eventSummary, readSnapshot, retiredReviews, snapshotFromResult, taskLane , cancellationNotes }  from '../lib/types/client/projection.js'
+import  {  boardIndex, durableVerdict, eventSummary, readSnapshot, retiredReviewsBySource, snapshotFromResult, cancellationNotes }  from '../lib/types/client/projection.js'
 import { recentProgress, taskReasons } from '../lib/types/client/progress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
@@ -242,27 +242,27 @@ test('F-16: client lineage fails closed on ambiguity and matches the runtime old
   const older = base('rep-old', 'accepted', { replaces: ['orig'], createdAt: 2 })
   const newer = base('rep-new', 'accepted', { replaces: ['orig'], createdAt: 3 })
   const dependent = base('dep', 'pending', { dependencies: ['orig'], kind: 'research' })
+  const live = [{ id: 'worker', status: 'idle' }]
   // Two accepted repairs for one obligation is ambiguous history: the runtime refuses the claim.
-  assert.equal(dependencyMet('orig', [original, newer, older, dependent]), false)
-  assert.equal(taskLane(dependent, [original, newer, older, dependent]), 'blocked')
+  assert.equal(boardIndex([original, newer, older, dependent]).dependencyMet('orig'), false)
+  assert.equal(boardIndex([original, newer, older, dependent]).lane(dependent, live), 'blocked')
   // One accepted repair resolves the reference.
-  assert.equal(dependencyMet('orig', [original, older, dependent]), true)
-  assert.equal(taskLane(dependent, [original, older, dependent]), 'ready')
+  assert.equal(boardIndex([original, older, dependent]).dependencyMet('orig'), true)
+  assert.equal(boardIndex([original, older, dependent]).lane(dependent, live), 'ready')
   // Oldest live repair wins while nothing is accepted.
   const pendingOld = base('rep-old', 'running', { replaces: ['orig'], createdAt: 1 })
   const pendingNew = base('rep-new', 'pending', { replaces: ['orig'], createdAt: 2 })
-  assert.equal(dependencyMet('orig', [original, pendingNew, pendingOld, dependent]), false, 'a live but unaccepted repair does not satisfy')
-  assert.equal(dependencyMet('orig', [original, pendingOld, { ...pendingNew, status: 'accepted' }, dependent]), true)
+  assert.equal(boardIndex([original, pendingNew, pendingOld, dependent]).dependencyMet('orig'), false, 'a live but unaccepted repair does not satisfy')
+  assert.equal(boardIndex([original, pendingOld, { ...pendingNew, status: 'accepted' }, dependent]).dependencyMet('orig'), true)
   // A different kind is not a repair of this obligation.
-  assert.equal(dependencyMet('orig', [original, { ...older, kind: 'research' }, dependent]), false)
+  assert.equal(boardIndex([original, { ...older, kind: 'research' }, dependent]).dependencyMet('orig'), false)
   // Lane mirrors runtime unschedulable: stopped assignee and unsubmitted review source.
   const stopped = base('assigned', 'pending', { assigneeId: 'gone' })
-  assert.equal(taskLane(stopped, [stopped]), 'ready', 'compatibility call without members keeps the historical lane')
   assert.equal(boardIndex([stopped]).lane(stopped, [{ id: 'gone', status: 'stopped' }]), 'blocked')
   assert.equal(boardIndex([stopped]).lane(stopped, [{ id: 'gone', status: 'idle' }]), 'ready')
   const review = base('review', 'pending', { kind: 'verification', reviewOf: 'orig' })
-  assert.equal(taskLane(review, [original, older, review]), 'blocked', 'review waits for the source submission')
-  assert.equal(taskLane(review, [{ ...original, status: 'submitted' }, older, review]), 'ready')
+  assert.equal(boardIndex([original, older, review]).lane(review, live), 'blocked', 'review waits for the source submission')
+  assert.equal(boardIndex([{ ...original, status: 'submitted' }, older, review]).lane(review, live), 'ready')
 })
 
 test('F-17: malformed snapshot fields are rejected instead of throwing during render', () => {
@@ -433,7 +433,7 @@ test('F-12/F-13 client surface: durable verdict naming, retired siblings, retain
   assert.match(withEvent, /Durable verdict event: evidence\/verified/)
   // A retired sibling review is visible on the claim it reviewed.
   snapshot.tasks.push({ ...snapshot.tasks[2], id: 't3-retired', title: 'Retired sibling review', status: 'cancelled', reviewOf: 't1' })
-  assert.deepEqual(retiredReviews(snapshot, 't1').map(review => review.id), ['t3-retired'])
+  assert.deepEqual(retiredReviewsBySource(snapshot).get('t1').map(review => review.id), ['t3-retired'])
   assert.match(render(SwarmBoard, { snapshot, initialView: 'evidence' }), /Retired reviews: Retired sibling review/)
   // The activity view shows the whole retained window, not an unexplained newest-40 slice.
   const many = uiSnapshot()
@@ -491,5 +491,5 @@ test('OWNER PASS 2026-09-11: the cancelled lane names why each task was withdraw
   assert.deepEqual(withRepair.get(cancelled.id), { kind: 'superseded', detail: repair.title })
   assert.equal(cancellationNotes(completed).get(orphan.id).kind, 'at-completion')
   // The board places them in the cancelled lane, never in blocked.
-  assert.equal(taskLane(cancelled, active.tasks), 'cancelled')
+  assert.equal(boardIndex(active.tasks).lane(cancelled, active.members), 'cancelled')
 })
