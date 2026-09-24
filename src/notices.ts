@@ -291,6 +291,12 @@ export const NOTICE_TEMPLATES = {
     build: (input: { diagnostic: string; implementations: readonly string[] }) =>
       `${input.diagnostic}. The mission now has ${input.implementations.length} implementation branches (${input.implementations.join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`,
   },
+  'duplicate-carrier': {
+    trigger: 'task/duplicate-carrier',
+    counts: (input: { duplicates: readonly unknown[] }) => ({ duplicates: input.duplicates.length }),
+    build: (input: { acceptedId: string; duplicates: ReadonlyArray<Pick<Task, 'id' | 'title' | 'status'>> }) =>
+      `Task ${input.acceptedId} was independently accepted and carries the obligation of every task it replaces, but ${input.duplicates.map(task => `${task.id} (${task.title}, ${task.status})`).join(', ')} in that lineage ${input.duplicates.length === 1 ? 'is' : 'are'} still live, so one obligation now has a duplicate carrier. Withdraw each duplicate with swarm_cancel(taskId, reason) unless its result is still needed; to keep both results, admit an integration task with swarm_propose that depends on both.`,
+  },
   'coverage-complete': {
     trigger: 'task/accepted',
     build: (input: { missionTitle: string }) =>
