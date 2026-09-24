@@ -103,6 +103,25 @@ export interface NotifyOptions {
    * not count it as a notice.
    */
   coveredBy?: string
+  /** R17-G2: what a reviewed-template body states, written on the durable row with it. */
+  statement?: NoticeStatement
+}
+
+/**
+ * R17-G2: the facts a reviewed-template body states, as data on the durable
+ * notice row, so a reader checks them against the rows instead of parsing the
+ * sentence, and the wording can change without changing a recorded fact. The
+ * body's subjects and cause already travel on the same row as the fact identity
+ * (`subjects`, `reason`); the statement adds what the row did not carry: the
+ * template family that rendered the body (the dedup key prefix names a
+ * different family for the stall and coverage-complete bodies) and the counts
+ * the body states. A fact carried by a wake-budget summary is recorded in its
+ * `aggregatedFacts` constituent, which has no statement.
+ */
+export interface NoticeStatement {
+  family: keyof typeof NOTICE_TEMPLATES
+  /** Named counts the body states (dependents, implementations, unschedulable); empty when it states none. */
+  counts: Record<string, number>
 }
 
 /**
@@ -138,6 +157,8 @@ export interface NoticeFactRecord {
   /** R17-G4: the facts a degraded wake-budget summary carries. */
   facts?: string[]
   aggregatedIdentities?: NonNullable<Delivery['notice']>['aggregatedIdentities']
+  /** R17-G2: what a reviewed-template body states (`NoticeStatement`). */
+  statement?: NoticeStatement
 }
 export type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
 /** The fact view of one delivery row, or undefined when it is not a notice. */
@@ -597,7 +618,7 @@ export class Notices {
     const family = options.family ?? (options.dedupKey === undefined ? undefined : options.dedupKey.split(':')[0])
     const fact: NoticeFactRecord = { subjects: attributed, trigger: options.trigger ?? options.dedupKey?.split(':')[0] ?? noticeClass, reason: options.reason ?? '', questionId: options.questionId, deliveryFailureId: options.deliveryFailureId, ...(family === undefined ? {} : { family }),
       ...(options.facts === undefined ? {} : { facts: options.facts }), ...(options.aggregatedIdentities === undefined ? {} : { aggregatedIdentities: options.aggregatedIdentities }),
-      ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }) }
+      ...(options.coveredBy === undefined ? {} : { coveredBy: options.coveredBy }), ...(options.statement === undefined ? {} : { statement: options.statement }) }
     const dedupe = options.dedupe ?? true
     // No-silent-state witness W2: every owner-decision notice is durable under
     // the fingerprint of the board it was emitted for, so the owner can verify
@@ -651,7 +672,7 @@ export class Notices {
       id: id('msg'), missionId, from, to: 'owner', kind: noticeClass === 'escalation' ? 'escalation' : 'control',
       content, createdAt: at,
       notice: { dedupKey, class: noticeClass, sentAt: at, queuedAt: at, ...(fact === undefined ? {} : { subjects: fact.subjects, trigger: fact.trigger, reason: fact.reason, facts: fact.facts, aggregatedIdentities: fact.aggregatedIdentities, questionId: fact.questionId, deliveryFailureId: fact.deliveryFailureId,
-        ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }) }) } as NonNullable<Delivery['notice']>,
+        ...(fact.coveredBy === undefined ? {} : { coveredBy: fact.coveredBy }), ...(fact.statement === undefined ? {} : { statement: fact.statement }) }) } as NonNullable<Delivery['notice']>,
       ...deliveryExtra,
     }
     const limit = Math.min(MAX_OWNER_NOTICE_CHARS, this.rt.config.maxMessageChars)
@@ -1392,7 +1413,7 @@ export class Notices {
     const reason = `no live path advances ${subjects.slice().sort().join(', ')}`
     this.rt.commit(missionId, () => {
       this.notify(missionId, NOTICE_TEMPLATES.fallthrough.build({ missionTitle: mission.title, subjects: unrecognised }), view.subjectsOf(unrecognised),
-        { dedupe: true, family: 'fallthrough', trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason })
+        { dedupe: true, family: 'fallthrough', trigger: NOTICE_TEMPLATES.fallthrough.trigger, reason, statement: { family: 'fallthrough', counts: {} } })
     })
     return true
   }
@@ -1434,7 +1455,7 @@ export class Notices {
         ? this.rejectionDecisionFor(mission.id, subject) : undefined
       this.rt.commit(mission.id, () => {
         this.notify(mission.id, body, view.subjectsOf([root, ...dependents]), { dedupe: true, dedupKey: key, stampWitness: false, trigger: NOTICE_TEMPLATES['stall-root'].trigger, reason: cause,
-          ...(cover === undefined ? {} : { coveredBy: cover.id }) })
+          statement: { family: 'stall-root', counts: { dependents: dependents.length } }, ...(cover === undefined ? {} : { coveredBy: cover.id }) })
         // The event exists only with the delivery row that carries the fact (its
         // own row or the wake-budget summary), in the same transaction: a notice
         // that was not written must not leave an event per tick behind it.
@@ -1548,7 +1569,7 @@ export class Notices {
       // to say which subject is stuck.
       const stuck = leftover.length ? leftover : view.nonTerminal
       this.notify(mission.id, NOTICE_TEMPLATES.stall.build({ reason, detail, subjects: view.subjectsOf(stuck) }), view.subjectsOf(stuck),
-        { trigger: NOTICE_TEMPLATES.stall.trigger, reason })
+        { trigger: NOTICE_TEMPLATES.stall.trigger, reason, statement: { family: 'stall', counts: { unschedulable: leftover.length } } })
       // W3: the stall notice is the no-silent-state witness for this state.
       mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
       this.rt.store.put('missions', mission)
@@ -1571,7 +1592,7 @@ export class Notices {
       // R15-A1: the deliverable's lineage is the subject (every accepted task),
       // never an anonymous mission-scoped sentence.
       this.notify(mission.id, NOTICE_TEMPLATES['coverage-complete'].build({ missionTitle: view.mission.title }), view.subjectsOf(view.tasks.filter(task => TERMINAL_STATES.has(task.status))),
-        { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered' })
+        { trigger: NOTICE_TEMPLATES['coverage-complete'].trigger, reason: 'every acceptance criterion is independently covered', statement: { family: 'coverage-complete', counts: {} } })
     })
   }
 
@@ -1588,7 +1609,7 @@ export class Notices {
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
     this.rt.commit(mission.id, () => {
       this.notify(mission.id, NOTICE_TEMPLATES.parked.build({ taskId: row.id, title: row.title }), view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked' })
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES.parked.trigger, reason: 'the owning member is parked', statement: { family: 'parked', counts: {} } })
     })
   }
 
@@ -1608,7 +1629,7 @@ export class Notices {
     const diagnostic = 'Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task'
     this.rt.commit(mission.id, () => {
       this.notify(mission.id, NOTICE_TEMPLATES['integration-gap'].build({ diagnostic, implementations: view.implementations.map(task => task.id) }), view.subjectsOf(view.implementations),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic })
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['integration-gap'].trigger, reason: diagnostic, statement: { family: 'integration-gap', counts: { implementations: implementations.length } } })
     })
   }
 
@@ -1624,7 +1645,7 @@ export class Notices {
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
       this.notify(mission.id, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic, sourceId: row.id }), view.subjectsOf([row]),
-        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason })
+        { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement: { family: 'review-blocked', counts: {} } })
     })
   }
 
