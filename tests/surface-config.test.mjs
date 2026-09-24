@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Config } from '../lib/index.js'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { FakeWorkers } from './faults/harness.mjs'
+import { FakeWorkers, budget } from './faults/harness.mjs'
 
 const base = { statePath: '/tmp/swarm-config/swarm.sqlite', workspacesRoot: '/tmp/swarm-config/workspaces' }
 
@@ -58,13 +58,13 @@ test('a non-function now in a runtime config built from the profile falls back t
   // Config keeps unknown keys, so a runtime built from `{ ...Config(profile) }`
   // took any `now` value as its clock and threw at the first read.
   for (const now of [5, 'x']) {
+    // fixture gap: makeRuntime cannot build a runtime whose whole config is Config(profile); this one is the subject.
     const dir = await mkdtemp(join(tmpdir(), 'swarm-config-now-'))
     const runtime = new SwarmRuntime({ ...Config({ statePath: join(dir, 'swarm.sqlite'), workspacesRoot: join(dir, 'workspaces'), now }), maxTasksPerMember: 3 }, new FakeWorkers())
     try {
       await runtime.start()
       const before = Date.now()
-      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'],
-        budget: { maxTokens: 1000, maxSteps: 10, maxWorkers: 1, maxDurationMs: 60000, maxTasks: 5, maxExperiments: 0 } })
+      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
       assert.equal(mission.status, 'active', `now: ${JSON.stringify(now)}`)
       assert.ok(mission.createdAt >= before && mission.createdAt <= Date.now(), 'the mission is stamped by the default clock')
     } finally { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
