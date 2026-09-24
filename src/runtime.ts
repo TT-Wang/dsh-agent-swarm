@@ -2402,17 +2402,22 @@ export class SwarmRuntime {
    * source). The resubmission is therefore reviewed at once by its paired
    * review: no automatic review and no task slot per rework. Every other open
    * review of the source (a sibling, a deferred review of the rejected commit)
-   * is retired in the same transaction, so exactly one review remains. Call
+   * is retired in the same transaction, so exactly one review remains. The
+   * resubmission gets the allowance a fresh review would have: what the
+   * rejecting round consumed (steps, recovery credit, an exhausted ceiling)
+   * moves into the archived entry's `spent` and the row starts from zero. Call
    * inside a mission transaction.
    */
   private reopenReviewForRework(source: Task, review: Task, reason: string): void {
-    const archived: TaskRejection = { commit: review.reviewedCommit!, epoch: review.epoch, reviewTaskId: review.id, reason: review.output ?? '', evidenceIds: [],
+    const spent = { usedSteps: review.usedSteps ?? 0, recoveryCount: review.recoveryCount ?? 0, ...(review.ceiling === undefined ? {} : { ceiling: review.ceiling }) }
+    const archived: TaskRejection = { commit: review.reviewedCommit!, epoch: review.epoch, reviewTaskId: review.id, reason: review.output ?? '', evidenceIds: [], spent,
       ...(review.reviewArtifact === undefined ? {} : { reviewArtifact: review.reviewArtifact }) }
     const reopened: Task = { ...review, status: 'pending', rejections: [...review.rejections ?? [], archived] }
     const reviewer = review.attempt?.ownerId ?? review.assigneeId
     if (reviewer !== undefined) reopened.assigneeId = reviewer
     this.dropAttempt(reopened); reopened.epoch++
     delete reopened.reviewedCommit; delete reopened.reviewArtifact; delete reopened.output
+    delete reopened.usedSteps; delete reopened.recoveryCount; delete reopened.ceiling
     this.store.put('tasks', reopened)
     this.store.event(source.missionId, 'task/amended', 'owner', { taskId: review.id, action: 'resume', reason, changes: {}, epoch: reopened.epoch, status: reopened.status, previous: {}, rework: archived })
     this.retireReviewSiblings(source.missionId, source.id, { exclude: review.id, reason, blocked: true })

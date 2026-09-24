@@ -394,9 +394,18 @@ export interface TaskAmendment {
  * that review's reason, and the claims the rejection refuted (history, not a
  * block cause, once the task is reworked). On the review row a rework re-opens,
  * the same record archives its own verdict: the commit it rejected, its epoch,
- * itself, its reason, no claims, and the review artifact it captured.
+ * itself, its reason, no claims, the review artifact it captured, and what
+ * that round consumed (`spent`).
  */
-export interface TaskRejection { commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[]; reviewArtifact?: Artifact }
+export interface TaskRejection {
+  commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[]; reviewArtifact?: Artifact
+  /**
+   * On a review's own entry: what the rejecting round consumed. The re-opened
+   * review starts the next round with a fresh review's allowance, so this is
+   * history only; no ceiling or recovery limit reads it.
+   */
+  spent?: { usedSteps: number; recoveryCount: number; ceiling?: TaskCeiling }
+}
 export interface Task {
   id: string
   missionId: string

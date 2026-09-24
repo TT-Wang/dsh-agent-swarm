@@ -139,6 +139,59 @@ test('a deferred review of the rejected commit is retired with the rework, so th
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
 })
 
+test('a re-opened review re-reviews with a fresh review\'s step allowance; the rejecting round\'s steps are history', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const step = async () => (await f.workers.callbacks.beforeStep(reviewer.id)) === false ? 'refused' : 'charged'
+  const source = f.propose('Implement')
+  await f.submit(author, source)
+  const review = f.proposeReview(source, { maxSteps: 3, assigneeId: reviewer.id })
+  const first = await f.runtime.claim(f.actor(reviewer), f.mission.id, review.id)
+  assert.deepEqual([await step(), await step(), await step()], ['charged', 'charged', 'charged'], 'the rejecting round spends the whole allowance')
+  await f.runtime.verify(f.actor(reviewer), f.mission.id, { taskId: review.id, attemptId: first.attempt.id, verdict: 'reject', reason: 'Misses the criterion' })
+  assert.equal(f.current(review).usedSteps, 3)
+  f.resume(source)
+  const reopened = f.current(review)
+  assert.equal(reopened.usedSteps, undefined, 'the re-opened review starts from zero, as a freshly admitted one would')
+  assert.equal(reopened.ceiling, undefined)
+  assert.deepEqual(reopened.rejections.at(-1).spent, { usedSteps: 3, recoveryCount: 0 }, 'what the round spent is kept with its verdict')
+  await f.submit(author, source)
+  const second = await f.runtime.claim(f.actor(reviewer), f.mission.id, review.id)
+  assert.equal(await step(), 'charged', 'the first step of the re-review is not refused by the previous round\'s spend')
+  assert.deepEqual([f.current(review).status, f.current(review).usedSteps, f.current(review).ceiling], ['running', 1, undefined])
+  assert.deepEqual(f.ownerNotices(/task_ceiling_terminal/), [])
+  await f.runtime.verify(f.actor(reviewer), f.mission.id, { taskId: review.id, attemptId: second.attempt.id, verdict: 'accept', reason: 'The rework meets the criterion' })
+  assert.equal(f.current(source).status, 'accepted')
+})
+
+test('a re-opened automatic review regains its recovery credit, so one lease expiry per round never blocks it', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  await f.submit(author, source)
+  await f.pastReviewGrace()
+  const [review] = f.live(source)
+  assert.match(review.id, /^task_auto_review_/)
+  const max = review.maxRecoveryAttempts
+  assert.equal(max, 2)
+  async function expireOnce() {
+    await f.runtime.claim(f.actor(reviewer), f.mission.id, review.id)
+    f.clock.advance(f.runtime.config.leaseMs + 10); await f.runtime.tick(); await f.runtime.settle(f.mission.id)
+    for (let i = 0; i < 5 && f.current(review).status !== 'pending'; i++) { f.clock.advance(20); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+    return [f.current(review).status, f.current(review).recoveryCount]
+  }
+  assert.deepEqual(await expireOnce(), ['pending', 1], 'the rejecting round spends one recovery credit')
+  await f.verify(reviewer, f.current(review), 'reject')
+  f.resume(source)
+  assert.equal(f.current(review).recoveryCount, undefined)
+  assert.equal(f.current(review).rejections.at(-1).spent.recoveryCount, 1)
+  await f.submit(author, source)
+  assert.deepEqual(await expireOnce(), ['pending', 1], 'the re-review spends its own credit, not the rejecting round\'s')
+  assert.deepEqual(f.ownerNotices(new RegExp(`${review.id} \\(blocked\\)`)), [], 'no owner notice names the review blocked')
+  await f.verify(reviewer, f.current(review), 'accept', 'The rework meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+})
+
 test('an automatic review of the rejected submission is never read as withdrawn from an unchanged resubmission', async t => {
   const f = await fixture(t, { members: ['Author', 'Reviewer', 'Third'] })
   const [author, reviewer] = f.m
