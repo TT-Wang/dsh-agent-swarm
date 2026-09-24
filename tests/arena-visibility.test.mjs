@@ -32,6 +32,7 @@ import { TRACE_STEPS } from '../lib/trace.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { FakeWorkers, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
+// fixture gap: the shared git asserts success; these probes need the failure itself.
 const gitFails = async (cwd, ...args) => {
   const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 10000 })
   return result.exitCode !== 0
