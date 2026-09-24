@@ -10,12 +10,10 @@ The repository records these exact supported Harness releases in [compatibility.
 
 | Harness release | Release commit |
 | --- | --- |
-| [0.1.5-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.1) | `183f08e9c6dde7e36cd2318eaee70b0da08fb35e` |
-| [0.1.6-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.6-alpha.2) | `ddefc45fbc7f8e46dd73185e68295696d1297887` |
-| [0.1.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.3-alpha.2) | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
-| [0.1.2-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.2-rc.1) | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
+| [0.1.5-rc.3](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.5-rc.3) (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
+| [0.1.7-rc.1](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.1) (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
-All three are prereleases. The development linker checks the recorded release revision, not only the package version. Compatibility with `0.1.0-rc.5`, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
+Both are prereleases. The development linker checks the recorded release revision, not only the package version. `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` were dropped in round 28, and the code that served only them was deleted. Compatibility with other releases, unreleased commits or arbitrary custom profiles is not claimed. Better Sidebar integration was exercised against 0.18.0.
 
 You need:
 
@@ -88,11 +86,10 @@ New automatic plans treat task assignees as preferences. If a preferred member i
 
 The plugin uses the first available surface:
 
-1. **Native Harness right sidebar**, on the supported 0.1.5 release: open **New tab → Start → Agent Swarm** beside Files. The command and conversation card reveal the same tab.
-2. **Better Sidebar**, on older supported hosts when installed: choose **Agent Swarm** in the **+** tab menu.
-3. **Standalone dock** beside the conversation, with remembered width; narrow screens place it below the conversation.
+1. **Native Harness right sidebar**, on both supported releases: the **Agent Swarm** button at the bottom of the left navigation opens it; the command and conversation card reveal the same tab. The right sidebar belongs to one conversation, so a worker's conversation opens its own read-only view from the same button.
+2. **Better Sidebar**, when a profile installs it: choose **Agent Swarm** in the **+** tab menu.
 
-Only one surface mounts at a time. Hiding it stops display updates, not workers. Worker activity shows host-observed operations and signal freshness; it does not stream model tokens or guarantee useful progress. On disconnection, retained activity is marked as last-observed and its timer freezes. Missing fresh activity stops busy animations without declaring a worker failed.
+Hiding a surface stops its display updates, not workers. Worker activity shows host-observed operations and signal freshness; it does not stream model tokens or guarantee useful progress. On disconnection, retained activity is marked as last-observed and its timer freezes. Missing fresh activity stops busy animations without declaring a worker failed.
 
 ### Controls and delivery
 
