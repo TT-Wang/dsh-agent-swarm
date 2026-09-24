@@ -108,7 +108,7 @@ test('no session event: the plugin appends nothing to the owner log, and the der
   const { readdir } = await import('node:fs/promises')
   const sources = await Promise.all((await readdir(join(ROOT, 'src'))).filter(name => name.endsWith('.ts'))
     .map(async name => [name, await readFile(join(ROOT, 'src', name), 'utf8')]))
-  const appenders = sources.filter(([, source]) => /session\.append\(|\.append\(\s*['"]swarm\//.test(source)).map(([name]) => name)
+  const appenders = sources.filter(([, source]) => /\bsession\.append\(|\.append\(\s*['"]swarm\//.test(source)).map(([name]) => name)
   assert.deepEqual(appenders, [], 'no src module appends a session event: the host format cannot carry a plugin-owned type')
 })
 
