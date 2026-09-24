@@ -2964,9 +2964,12 @@ export class SwarmRuntime {
    * Read-only cross-mission artifact registry (R11-14 / R10-10): for every
    * mission this session may see, each captured artifact commit with its task
    * and mission identity, the task's acceptance state and the independent
-   * review verdict. Per-mission artifact refs are private (A2-04), so this
-   * durable projection is the sanctioned read path for cross-mission
-   * artifacts. It reads records only and never mutates mission state.
+   * review verdict. A rework keeps its history here: every rejected commit it
+   * archived is listed (`archived: true`) with its refuting verdict, and a
+   * re-opened review's archived review record with the commit it judged.
+   * Per-mission artifact refs are private (A2-04), so this durable projection
+   * is the sanctioned read path for cross-mission artifacts. It reads records
+   * only and never mutates mission state.
    */
   artifacts(actor: Actor, query: { missionId?: string } = {}): unknown {
     actor.signal?.throwIfAborted()
@@ -2978,6 +2981,14 @@ export class SwarmRuntime {
     for (const mission of missions) {
       const tasks = this.store.list('tasks', mission.id)
       for (const task of tasks) {
+        const identity = { missionId: mission.id, missionTitle: mission.title, missionStatus: mission.status, missionAcceptance: mission.acceptance,
+          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status, acceptance: task.acceptance }
+        for (const rejection of task.rejections ?? []) {
+          if (task.kind !== 'verification') rows.push({ ...identity, artifact: { commit: rejection.commit }, archived: true,
+            review: { taskId: rejection.reviewTaskId, verdict: 'refuted', reason: excerpt(rejection.reason, 400) } })
+          else if (rejection.reviewArtifact !== undefined) rows.push({ ...identity, archived: true, artifactRole: 'review-record', reviewedCommit: rejection.commit,
+            artifact: { commit: rejection.reviewArtifact.commit, baseCommit: rejection.reviewArtifact.baseCommit, changedPaths: rejection.reviewArtifact.changedPaths } })
+        }
         const captured = task.kind === 'verification' ? task.reviewArtifact : task.artifact
         if (captured === undefined) continue
         const review = tasks.filter(candidate => candidate.reviewOf === task.id && candidate.status !== 'cancelled')
@@ -2990,10 +3001,7 @@ export class SwarmRuntime {
         // artifact no reviewer had judged.
         const refuted = review?.status === 'blocked' && review.reviewedCommit !== undefined && review.verificationRecovery === undefined
         rows.push({
-          missionId: mission.id, missionTitle: mission.title, missionStatus: mission.status,
-          missionAcceptance: mission.acceptance,
-          taskId: task.id, taskTitle: task.title, taskKind: task.kind, taskStatus: task.status,
-          acceptance: task.acceptance,
+          ...identity,
           artifact: { commit: captured.commit, baseCommit: captured.baseCommit, changedPaths: captured.changedPaths },
           ...(task.kind === 'verification' ? { artifactRole: 'review-record', reviewedCommit: task.reviewedCommit } : {}),
           ...(review === undefined ? {} : { review: { taskId: review.id, status: review.status,

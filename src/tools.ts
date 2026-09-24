@@ -566,7 +566,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   register('swarm_cancel', 'Owner only: withdraw one admitted-but-mistaken task. Pending, blocked, submitted and running tasks become terminally cancelled; a running attempt is fenced and its worker released. Refuses accepted work, which is immutable and needs a replacement. Records a durable task/cancelled event with the reason; replay is idempotent.',
     { ...mission, taskId: string, reason: string }, ['missionId', 'taskId', 'reason'],
     (a, actor) => runtime.cancel(actor, text(a, 'missionId'), { taskId: text(a, 'taskId'), reason: text(a, 'reason') }))
-  register('swarm_registry', 'Owner only, read-only: the cross-mission artifact registry. For every mission this session may see, lists each captured artifact commit with its task, mission, acceptance state and independent review verdict. Per-mission artifact refs are private, so this durable projection is the sanctioned cross-mission read path; reading it changes no state.',
+  register('swarm_registry', 'Owner only, read-only: the cross-mission artifact registry. For every mission this session may see, lists each captured artifact commit with its task, mission, acceptance state and independent review verdict, and each rejected commit a rework archived (archived: true) with its refuting verdict. Per-mission artifact refs are private, so this durable projection is the sanctioned cross-mission read path; reading it changes no state.',
     { ...mission }, [], (a, actor) => runtime.artifacts(actor, {
       ...(a.missionId === undefined ? {} : { missionId: text(a, 'missionId') }),
     }))

@@ -296,6 +296,29 @@ test('the reworking author reads each rejection reason once', async t => {
   assert.deepEqual(JSON.parse(assignment.content).task.rejections.map(rejection => rejection.reason), reasons)
 })
 
+test('the artifact registry keeps a rework\'s rejected commit with its refuting verdict, and the archived review record', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  await f.submit(source)
+  const review = f.proposeReview(source)
+  const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'reject', reason: 'Misses the criterion', deliverables: ['src/review.md'] })
+  const rejected = f.current(source).artifact.commit
+  const record = f.current(review).reviewArtifact.commit
+  f.resume(source)
+  await f.submit(source)
+  const resubmitted = f.current(source).artifact.commit
+  await f.verify(f.pendingReviewOf(source) ?? f.proposeReview(source), 'accept', 'The rework meets the criterion')
+  const rows = f.runtime.artifacts(f.owner, { missionId: f.mission.id }).artifacts
+  const sourceRows = rows.filter(row => row.taskId === source.id)
+  assert.deepEqual(sourceRows.map(row => [row.artifact.commit, row.archived === true, row.review.taskId, row.review.verdict]),
+    [[rejected, true, review.id, 'refuted'], [resubmitted, false, review.id, 'verified']], 'the rejected commit stays listed with its refuting verdict')
+  assert.equal(sourceRows[0].review.reason, 'Misses the criterion')
+  assert.equal(sourceRows[0].taskStatus, 'accepted')
+  const reviewRows = rows.filter(row => row.taskId === review.id)
+  assert.deepEqual(reviewRows.map(row => [row.artifact.commit, row.artifactRole, row.reviewedCommit]), [[record, 'review-record', rejected]], 'the review record of the rejected commit stays listed')
+})
+
 test('a budget-only amendment of a rejected task stores the ceiling and leaves it blocked; only a resume reworks it', async t => {
   const f = await fixture(t)
   const source = f.propose('Implement', { maxRecoveryAttempts: 2 })
