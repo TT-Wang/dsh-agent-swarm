@@ -7,26 +7,11 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime, TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision } from '../lib/runtime.js'
+import { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision } from '../lib/runtime.js'
 import { EVENT_VOCABULARY } from '../lib/trace.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 test('R11-15: sharedTempPaths extracts only shared-temp absolute paths from host-recorded input', () => {
   assert.deepEqual(sharedTempPaths({ tool: 'bash', arguments: { command: 'cat /tmp/swarm-probe-one' } }), ['/tmp/swarm-probe-one'])
@@ -48,11 +33,15 @@ test('R11-15: the rendezvous decision needs a different member inside the window
 })
 
 test('R11-15: two members naming the same temp path emit one durable event and one observe row', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-temp-rendezvous-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }, checks: [],
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'temp-owner' }
   const mission = runtime.create(owner, { title: 'Temp channel', objective: 'Detect a rendezvous', workspace: directory, scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })

@@ -12,26 +12,11 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
+import { readFile } from 'node:fs/promises'
+import { ObserveDetailRefusedError } from '../lib/runtime.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const shape = JSON.parse(await readFile(new URL('./fixtures/observe-session-shape.json', import.meta.url), 'utf8'))
-
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
 
 /** Content blocks the owner's method charges: records the model could already have in context. */
 function contentFragments(result) {
@@ -45,10 +30,11 @@ function contentFragments(result) {
 }
 
 test('replayed member session returns only new content, refuses worker detail=full, and keeps the owner path', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-observe-delta-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] }),
+    config: { maxEvents: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
+  })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Observe replay', objective: 'Replay the recorded observe shape', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Replay' })
