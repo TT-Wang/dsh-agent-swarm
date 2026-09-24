@@ -44,7 +44,7 @@ async function fixture(t, options = {}) {
   let fiber, runtime, workspaces
   t.after(async () => { await fiber?.dispose(); for (const gate of idleGates) gate.resolve(); await runtime?.dispose(); await ctx.fiber.dispose() })
   const made = await makeRuntime(t, {
-    workers: new FakeWorkers({ async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: () => workspaces.dispose() }),
+    workers: new FakeWorkers({ async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: async () => { await workspaces?.dispose() } }),
     config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined, ...options.config },
   })
   runtime = made.runtime
