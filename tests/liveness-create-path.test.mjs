@@ -18,42 +18,24 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-class Workers {
-  prepared = []; started = []; stopped = []; deliveries = []; idle = new Set()
+class Workers extends FakeWorkers {
   checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
   artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/value.cjs'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, id) { this.prepared.push(id); return join(mission.workspace, id) }
-  async start(spec) { this.started.push(spec.member.id) }
+  async prepareWorkspace(mission, id) { return join(mission.workspace, id) }
   async deliver(member, delivery) { this.deliveries.push({ member, delivery }) }
-  async stop(id) { this.stopped.push(id) }
-  isIdle(id) { return this.idle.has(id) }
-  async prepareTask(member, task) { this.prepared.push(`${member.id}:${task.id}`) }
   async captureArtifact(member) { return { ...this.artifact, workspace: member.workspace } }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-liveness-'))
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new Workers(),
+    config: { maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'liveness-owner' }
   // The create path: no `starts` journal row, exactly like swarm_create.
   const mission = runtime.create(owner, { title: 'Liveness', objective: 'Reach automatic completion and stall notices',
-    workspace: directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -84,14 +66,14 @@ test('a covered swarm_create mission retains blocked work until the owner explic
   await f.workers.callbacks.beforeStep(f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the task blocks at its own ceiling')
   assert.equal(f.current(blocked.id).status, 'blocked')
-  await eventually(() => !f.current(blocked.id).resumeAfterStop, 'old worker must stop before other work')
+  await eventually(() => !f.current(blocked.id).resumeAfterStop, 'old worker must stop before other work', 2500)
   const cover = f.propose({ title: 'Cover the criterion' })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, cover.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: cover.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.propose({ kind: 'verification', reviewOf: cover.id, checks: [], title: 'Review' })
   const reviewing = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
-  const notice = await eventually(() => f.control(/Mission stalled/).find(item => item.delivery.content.includes(blocked.id)), 'blocked required work wakes the owner')
+  const notice = await eventually(() => f.control(/Mission stalled/).find(item => item.delivery.content.includes(blocked.id)), 'blocked required work wakes the owner', 2500)
   assert.equal(notice.delivery.to, 'owner')
   assert.equal(f.current(cover.id).status, 'accepted')
   assert.equal(f.current(blocked.id).status, 'blocked')
@@ -100,7 +82,7 @@ test('a covered swarm_create mission retains blocked work until the owner explic
   assert.equal(f.events('automatic/completed').length, 0)
   assert.equal(f.events('task/cancelled-at-completion').length, 0)
   f.runtime.cancel(f.owner, f.mission.id, { taskId: blocked.id, reason: 'Owner withdraws the redundant attempt after reviewing the accepted alternative' })
-  await eventually(() => f.control(/ready to complete/)[0], 'explicit withdrawal makes the owner-assembled board ready')
+  await eventually(() => f.control(/ready to complete/)[0], 'explicit withdrawal makes the owner-assembled board ready', 2500)
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).completion.eligible, true)
   assert.equal(f.runtime.store.get('missions', f.mission.id).status, 'active', 'create-path completion remains an explicit owner decision')
   assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'All remaining required work was accepted').status, 'completed')
@@ -114,7 +96,7 @@ test('a submitted task with no live review is reported stalled with its exact ta
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   // No review is ever admitted: the submission is unreviewable forever.
   f.markAutomatic()
-  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'an unreviewable submission must be reported stalled')
+  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'an unreviewable submission must be reported stalled', 2500)
   assert.match(stall.delivery.content, new RegExp(source.id))
   const event = f.events('mission/stalled').at(-1)
   assert.ok(event, 'the stall is durable')
@@ -134,16 +116,16 @@ test('a create-path stall notice names the parked work, and admitting the follow
   // what refuses its steps, and the member itself reads idle between attempts.
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'idle')
   // Nothing is dispatchable: the create-path mission must wake the owner.
-  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'a parked create-path mission is reported stalled')
+  const stall = await eventually(() => f.control(/Mission stalled/)[0], 'a parked create-path mission is reported stalled', 2500)
   assert.match(stall.delivery.content, new RegExp(parked.id))
   // Without a new assignment the park persists: no assignment was delivered.
   assert.deepEqual(f.workers.deliveries.filter(item => item.delivery.kind === 'assignment'), [])
   // The owner admits the repair the notice asked for; the scheduler wakes the parked member.
   f.workers.idle.add(f.author.id)
-  await eventually(() => !f.current(parked.id).resumeAfterStop, 'resource stop must be confirmed')
+  await eventually(() => !f.current(parked.id).resumeAfterStop, 'resource stop must be confirmed', 2500)
   const repair = f.runtime.controlTask(f.owner, f.mission.id, parked.id, 'amend', { maxSteps: 5 }, 'Review estimate and continue the same work')
   const running = await eventually(() => f.current(repair.id).status === 'running' ? f.current(repair.id) : undefined,
-    'the follow-up task must be assigned to the parked member')
+    'the follow-up task must be assigned to the parked member', 2500)
   assert.equal(running.attempt.ownerId, f.author.id)
   // R17-G7: the live status is derived from the phase and the attempt, never
   // written, so the new attempt alone makes its owner `working`.
