@@ -321,7 +321,7 @@ export class SwarmRuntime {
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `idleSignals` (durable `Task.idleSignal`),
-   *     `startFailures`, `budgetStops`, `operations`, `startControllers`,
+   *     `startFailures`, `operations`, `startControllers`,
    *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
@@ -507,15 +507,6 @@ export class SwarmRuntime {
   private beginBudgetStop(missionId: string, pauseId: string): void { return this.gates.beginBudgetStop(missionId, pauseId) }
   private resumeBudgetTasks(mission: Mission): void { return this.gates.resumeBudgetTasks(mission) }
 
-  /**
-   * M1a: the moved in-memory caches stay reachable on the runtime under the same
-   * names. Each is a live getter onto the module that now owns the collection, so
-   * the cache-only tests clear and inspect exactly the object the scheduling path
-   * reads (loss of each changes no durable outcome; S5's inventory names them).
-   */
-  get idleSignals() { return this.attempts.idleSignals }
-  get budgetStops() { return this.gates.budgetStops }
-  get fingerprintCache() { return this.gates.fingerprintCache }
   get instanceId(): string { return this.scheduling.instanceId }
 
   constructor(readonly config: RuntimeConfig, readonly workers: WorkerAdapter, storeOptions: StoreOptions = {}) {

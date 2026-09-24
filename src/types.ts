@@ -222,8 +222,8 @@ export interface Mission {
   /** Durable gate while budget exhaustion stops the previous worker activity. */
   /**
    * S5r: the durable stop claim. `stopping` is written before the deferred stop
-   * touches the adapter, so clearing the in-memory `budgetStops` mirror cannot
-   * re-run a stop that is already in flight. A claim from another runtime
+   * touches the adapter, so a second request cannot re-run a stop that is
+   * already in flight. A claim from another runtime
    * instance, or one older than the declared pass bound, is a crashed stop and
    * does not gate a fresh attempt.
    */

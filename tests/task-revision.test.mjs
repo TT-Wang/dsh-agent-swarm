@@ -194,7 +194,7 @@ test('S5 pair: the revision-keyed fingerprint cache can never serve the stale bo
   const after = f.runtime.fingerprint(f.mission.id)
   assert.equal(after, missionFingerprint(f.runtime.fingerprintBoard(f.mission.id)),
     'the refusal record advanced the store revision, so the cache recomputed instead of gating on the stale digest')
-  f.runtime.fingerprintCache.clear()
+  f.runtime.gates.fingerprintCache.clear()
   assert.equal(f.runtime.fingerprint(f.mission.id), after, 'losing the cache changes no digest (cache-only)')
 })
 
