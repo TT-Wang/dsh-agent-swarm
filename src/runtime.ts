@@ -876,6 +876,10 @@ export class SwarmRuntime {
       ])
     } finally { if (timer !== undefined) clearTimeout(timer) }
   }
+  /**
+   * One transaction. After it only non-throwing work runs (contained listeners, queueing the
+   * R17-G5 publication of this transition), so a throw from commit() means nothing was committed.
+   */
   commit<T>(missionId: string, fn: () => T): T {
     if (this.closed) throw new PolicyError('runtime_closed', 'conflict_error', 'Swarm runtime is closed')
     this.commitDepth += 1
@@ -894,10 +898,6 @@ export class SwarmRuntime {
       return value
     }) } finally { this.commitDepth -= 1 }
     for (const listener of this.listeners) { try { listener(missionId) } catch { /* A UI subscriber cannot roll back committed work. */ } }
-    // R17-G5: and it publishes its decision facts in the same transition — the
-    // classifier runs here (never from the tick sample), against the state this
-    // commit produced. The pass state selects the one pass-end branch; a wedged
-    // pass keeps its own subject. Reentrant commits are ignored by the guard.
     this.notices.transition(missionId)
     return result
   }

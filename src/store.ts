@@ -15,7 +15,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
-import type { EventKind } from './events.ts'
+import { isProgress, type EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -577,11 +577,15 @@ export class SwarmStore {
    * Append an immutable coordination event inside the same state transaction.
    * `type` is the registered kind set, so an unregistered kind fails to compile
    * at the emit site instead of reaching the durable log as an undescribed row.
+   * A progress kind advances its mission's progress clock in this same write.
    */
   event(missionId: string, type: EventKind, actor: string, data: unknown): void {
     const statement = this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)')
-    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), this.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    const createdAt = this.now()
+    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), createdAt), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
+    const mission = isProgress(type) ? this.get('missions', missionId) : undefined
+    if (mission !== undefined) this.put('missions', { ...mission, meaningfulProgressAt: createdAt })
   }
   /**
    * Upsert one admission decision. A repeated refusal for the same candidate and

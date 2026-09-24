@@ -895,7 +895,7 @@ export class Notices {
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
       implementations: tasks.filter(task => task.kind === 'implementation'),
-      lastTransitionAt: this.lastTransitionAt(missionId),
+      lastTransitionAt: mission.meaningfulProgressAt ?? mission.createdAt,
       subjectsOf: list => subjectsOfTasks(list, mission),
     }
   }
@@ -929,24 +929,6 @@ export class Notices {
         dedupe: true, dedupKey: key, trigger: 'absence-net', reason: `no durable progress for ${elapsed}ms`,
       })
     })
-  }
-
-  /** A progress clock excludes scheduling, usage, transport and repeated tool logs. */
-  private lastTransitionAt(missionId: string): number {
-    const mission = this.rt.store.get('missions', missionId) as (Mission & { meaningfulProgressAt?: number }) | undefined
-    if (mission === undefined) return 0
-    let latest = mission.meaningfulProgressAt ?? mission.createdAt
-    const progressTypes = new Set([
-      'mission/created', 'mission/resume', 'mission/budget-updated', 'mission/revised', 'mission/scope-amended',
-      'task/proposed', 'task/claimed', 'task/submitted', 'task/accepted', 'task/rejected',
-      'task/cancelled', 'task/cancelled-at-completion', 'task/handoff', 'task/revised', 'task/amended',
-      'evidence/published', 'evidence/verified', 'evidence/refuted', 'message/answered', 'message/dismissed',
-    ])
-    for (const event of this.rt.store.events(missionId, this.rt.config.maxEvents)) {
-      if (progressTypes.has(event.type)) latest = Math.max(latest, event.createdAt)
-    }
-    for (const evidence of this.rt.store.list('evidence', missionId)) if (Number.isFinite(evidence.createdAt)) latest = Math.max(latest, evidence.createdAt)
-    return latest
   }
 
   /**
@@ -1189,14 +1171,6 @@ export class Notices {
    * `attemptSilenceBoundMs`).
    */
   transition(missionId: string): void {
-    // Save progress when its transition commits, before telemetry can evict it
-    // from the bounded event window. Interpretation remains read-only.
-    const mission = this.rt.store.get('missions', missionId) as (Mission & { meaningfulProgressAt?: number }) | undefined
-    const progressAt = this.lastTransitionAt(missionId)
-    if (mission !== undefined && mission.meaningfulProgressAt !== progressAt) {
-      mission.meaningfulProgressAt = progressAt
-      this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
-    }
     if (this.publishingTransition) return
     this.pendingTransitions.add(missionId)
     if (this.transitionScheduled) return
