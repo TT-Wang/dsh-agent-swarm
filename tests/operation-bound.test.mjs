@@ -29,8 +29,9 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { HarnessWorkers, ScopedEnvironment, assertCompositionScratch } from '../lib/harness-workers.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -109,8 +110,7 @@ async function realCheckFixture(t, members = 2, checkCommand = 'sleep 0.6') {
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git('add', '.')
   await git('commit', '-m', 'fixture baseline')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    checkConcurrency: 1, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(root, { checkConcurrency: 1 })
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'mission-operation-bound-checks', workspace: source }
   const prepared = []

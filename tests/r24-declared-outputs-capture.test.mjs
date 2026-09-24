@@ -19,10 +19,11 @@ import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, 
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { captureGitSnapshot } from '../lib/git-snapshot.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessRefusal, assessText, diagnosticProducers, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const schemaIndex = await toolSchemaIndex()
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxTasks: 12, maxExperiments: 0, maxDurationMs: 600000 }
@@ -79,7 +80,7 @@ async function repository(root, { ignore = [] } = {}) {
   await writeFile(path.join(source, 'src', 'index.js'), 'export const answer = 42\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'baseline')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(root)
   return { source, run, git, workspaces }
 }
 
@@ -570,7 +571,7 @@ test('a declared output under a host-configured dependency directory is refused 
   // stuck.mjs B / s7-depdirs.mjs: admission knows only the default list.
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r24-depdir-')))
   const { source } = await repository(root)
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, verificationDependencyDirs: ['node_modules', 'gen'] })
+  const workspaces = makeWorkspaces(root, { verificationDependencyDirs: ['node_modules', 'gen'] })
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const mission = { id: 'depdir', workspace: source }
   const member = { id: 'writer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'writer') }

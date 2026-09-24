@@ -32,9 +32,10 @@ import assert from 'node:assert/strict'
 import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { SwarmRuntime, compareCheckEnvironments } from '../lib/runtime.js'
-import { Workspaces, checkTempEnvironment, runProcess } from '../lib/workspaces.js'
+import { checkTempEnvironment, runProcess } from '../lib/workspaces.js'
 import { tempDirectory } from './temp-root.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const FIXTURE_TEST = 'tests/fixture-failing.test.mjs'
@@ -124,11 +125,8 @@ async function workspaceFixture(t, options = {}) {
   await writeFile(path.join(source, TMP_PROBE), TMP_PROBE_SOURCE)
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'fixture baseline')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam,
-    workspacesRoot: path.join(temp, 'worktrees'),
-    checkTimeoutMs: 30000,
+  const workspaces = makeWorkspaces(temp, {
     maxCheckOutputBytes: options.maxCheckOutputBytes ?? 4096,
-    confineCheck: argv => argv,
     checkEnv: options.checkEnv ?? checkEnvFor(process.env.HOME),
     ...(options.checkConcurrency === undefined ? {} : { checkConcurrency: options.checkConcurrency }),
   })

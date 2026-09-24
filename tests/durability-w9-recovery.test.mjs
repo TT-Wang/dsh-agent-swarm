@@ -17,8 +17,9 @@ import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 /**
@@ -71,8 +72,7 @@ async function fixture(t) {
   // in-memory mirror of its own: the callback is the whole channel.
   const reports = []
   // Production shape (src/harness-workers.ts): the fallback report reaches the bound runtime callbacks.
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
-    onRecoveryFallback: info => { reports.push(info); workers.callbacks?.recoveryFallback?.(info) } })
+  const workspaces = makeWorkspaces(root, { onRecoveryFallback: info => { reports.push(info); workers.callbacks?.recoveryFallback?.(info) } })
   workers.workspaces = workspaces
   const runtime = new SwarmRuntime({ statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: 20,
     maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)

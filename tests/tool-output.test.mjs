@@ -2,11 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { checkSyntaxDetail, declaredPlanChecks } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
-import { Workspaces } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { setup } from './faults/harness.mjs'
+import { setup, makeWorkspaces } from './faults/harness.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 const budget = { maxTokens: 100, maxSteps: 10, maxWorkers: 2, maxDurationMs: 10000, maxTasks: 4, maxExperiments: 0 }
 function tools() { const definitions = new Map(); registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, {}, budget); return definitions }
@@ -189,8 +188,7 @@ test('launch rejects indexed shell syntax errors before admission and syntax che
   // running the real parse-only probe before it counts a launch, and pairs its
   // result with the production helpers launchDraft uses (R18-5b proves that
   // boundary end to end). `checks` are parsed with /bin/sh -n and never executed.
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(workspace, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(workspace, { maxCheckOutputBytes: 100000 })
   t.after(() => workspaces.dispose())
   const runtime = { config: {}, starts: () => [{ id: 'request-one', workspace }], async startPlan(_actor, _id, plan) {
     const declared = declaredPlanChecks(plan.tasks)

@@ -27,8 +27,7 @@ import { SwarmRuntime } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { AdmissionError } from '../lib/admission.js'
-import { Workspaces } from '../lib/workspaces.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 class Workers {
@@ -383,8 +382,7 @@ test('a scope or check echoing the caller\'s own absolute path is a fixed repair
 
 test('a staged launch refused by the shell syntax preflight is an internal error in the browser', async t => {
   const f = await fixture(t)
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(f.workspace, '..', 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(path.join(f.workspace, '..'), { maxCheckOutputBytes: 100000 })
   t.after(() => workspaces.dispose())
   // The real parse-only probe, as the Harness adapter runs it.
   f.workers.checkSyntaxPreflight = (checks, cwd, signal) => workspaces.checkSyntaxPreflight(checks, cwd, signal)

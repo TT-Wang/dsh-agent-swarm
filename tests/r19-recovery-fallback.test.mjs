@@ -30,8 +30,9 @@ import { mkdtemp, mkdir, readdir, readFile, realpath, rm, writeFile, stat } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 /** A bound on a wedged runtime, not on a busy machine (real git work runs between ticks). */
@@ -69,7 +70,7 @@ class ProdShapeWorkers {
     // callbacks are the whole channel (`Workspaces` keeps no in-memory mirror),
     // so the test also records every report it was handed, in order.
     this.reports = { fallbacks: [], cleanups: [] }
-    this.workspaces = new Workspaces({ subprocess, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+    this.workspaces = makeWorkspaces(root, { subprocess,
       onRecoveryFallback: info => { this.reports.fallbacks.push(info); this.callbacks?.recoveryFallback?.(info) },
       onCleanupFailure: info => { this.reports.cleanups.push(info); this.callbacks?.verificationCleanupFailure?.(info) } })
   }

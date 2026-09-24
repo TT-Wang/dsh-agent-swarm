@@ -13,12 +13,12 @@ import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { authorizeWorkspace, loadWorkspaceGrants, reauthorizeWorkspace, WORKSPACE_AUTHORIZATION_CODE, WORKSPACE_AUTHORIZATION_REQUIREMENT } from '../lib/authorization.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { registerTools } from '../lib/tools.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { Config } from '../lib/index.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
-import { FakeClock } from './faults/harness.mjs'
+import { FakeClock, makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
 const plan = (workspace, extra = {}) => ({
@@ -194,7 +194,7 @@ test('AC4: prefix confusion, traversal and symlink escapes are refused; a symlin
   await mkdir(source)
   const git = async (...args) => { const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 100000 }); assert.equal(result.exitCode, 0, result.output); return result.output.trim() }
   await git('init', '-b', 'main'); await writeFile(join(source, 'file.txt'), 'x\n'); await git('add', '.'); await git('commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(foreign, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, grants: await loadWorkspaceGrants([]) })
+  const workspaces = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([]) })
   t.after(async () => { await workspaces.dispose() })
   const mission = { id: 'mission-revoked', workspace: await realpath(source), workspaceGrantRoot: await realpath(granted) }
   await assert.rejects(workspaces.prepareBaseline(mission), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
@@ -215,7 +215,7 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
   }
   await initRepo(session); await initRepo(project)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(temp, 'snapshots'), checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv, grants })
+  const workspaces = makeWorkspaces(temp, { workspacesRoot: join(temp, 'snapshots'), maxCheckOutputBytes: 100000, grants })
   const adapter = { bind() {}, prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() }
   const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, adapter)
   t.after(async () => { await runtime.dispose() })
@@ -373,9 +373,7 @@ test('D2: a verification checkout re-validates the persisted anchor and refuses 
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git('add', '.')
   await git('commit', '-m', 'initial')
-  const workspacesRoot = join(foreign, 'worktrees')
-  const options = { workspacesRoot, checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv }
-  const live = new Workspaces({ subprocess: subprocessSeam, ...options, grants: await loadWorkspaceGrants([{ path: granted }]) })
+  const live = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([{ path: granted }]) })
   t.after(async () => { await live.dispose() })
   const mission = { id: 'mission-d2', workspace: await realpath(source), workspaceGrantRoot: await realpath(granted) }
   const member = { id: 'member-d2', missionId: mission.id, workspace: await live.prepareWorkspace(mission, 'member-d2') }
@@ -388,7 +386,7 @@ test('D2: a verification checkout re-validates the persisted anchor and refuses 
   assert.equal(control.length, 1)
   assert.equal(control[0].exitCode, 0, 'the live snapshot still creates the verification checkout')
   // Revoked: the persisted anchor must be read back, so the checkout is refused.
-  const revoked = new Workspaces({ subprocess: subprocessSeam, ...options, grants: await loadWorkspaceGrants([]) })
+  const revoked = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([]) })
   t.after(async () => { await revoked.dispose() })
   await assert.rejects(revoked.verifyArtifact(member, task, artifact), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
 })

@@ -12,8 +12,9 @@ import assert from 'node:assert/strict'
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -33,8 +34,7 @@ async function fixture(t, options = {}) {
   await git(source, 'commit', '-m', 'fixture baseline')
   await mkdir(path.join(source, 'node_modules', 'pkg'), { recursive: true })
   await writeFile(path.join(source, 'node_modules', 'pkg', 'file.txt'), 'toolchain\n')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    confineCheck: argv => argv, ...options })
+  const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-dep', workspace: source }
   const member = { id: 'member-dep', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-dep') }
   const task = { id: 'task-dep', missionId: mission.id, epoch: 1, title: 'Dependency link', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }

@@ -2,8 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, readFile, writeFile } from 'node:fs/promises'
-import { FakeWorkers, WorkspaceWorkers, Workspaces, setup, makeRepo, taskOf, events, eventually } from './faults/harness.mjs'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, WorkspaceWorkers, setup, makeRepo, taskOf, events, eventually, makeWorkspaces } from './faults/harness.mjs'
 
 const deferred = () => { let resolve; return { promise: new Promise(r => { resolve = r }), resolve: value => resolve(value) } }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -50,7 +49,7 @@ test('queue wait timeout refuses all successors until the actual operation retur
 
 test('a rejected second claim leaves real Git workspace ownership and working content untouched', async () => {
   const repo = await makeRepo('swarm-claim-ownership')
-  const ws = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(repo.root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 100_000, confineCheck: argv => argv })
+  const ws = makeWorkspaces(repo.root, { maxCheckOutputBytes: 100_000 })
   const workers = new WorkspaceWorkers(ws)
   const f = await fixture({ workers, workspace: repo.source })
   const gate = deferred(), entered = deferred()

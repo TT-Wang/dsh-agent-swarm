@@ -15,9 +15,10 @@ import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { validatePlan } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const schemaIndex = await toolSchemaIndex()
 /** The refusal is `[output_outside_scope]`, and its rendered text satisfies the refusal contract. */
@@ -230,8 +231,7 @@ async function workspaceFixture(t) {
   await writeFile(path.join(source, 'tracked.txt'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(temp)
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   const mission = { id: 'mission-r20', workspace: source }
   const member = { id: 'first', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'first') }

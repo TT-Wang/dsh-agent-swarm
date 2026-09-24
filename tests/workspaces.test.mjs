@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { HOST_GIT_TIMEOUT_MS, Workspaces, runProcess } from '../lib/workspaces.js'
+import { HOST_GIT_TIMEOUT_MS, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -22,7 +23,7 @@ async function fixture(t, options = {}) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const head = await git(source, 'rev-parse', 'HEAD')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Implement answer', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -113,7 +114,7 @@ test('concurrent members and restarted workspace managers reuse the exact origin
   assert.equal(await git(first, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   assert.equal(await git(second, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   await writeFile(path.join(source, 'src', 'answer.txt'), 'later source edits\n')
-  const resumed = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const resumed = makeWorkspaces(temp)
   try {
     assert.deepEqual(await resumed.prepareBaseline(mission), baseline)
     const third = await resumed.prepareWorkspace(mission, 'third')

@@ -4,10 +4,11 @@ import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, chmod } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { requireHostChecks } from '../lib/admission.js'
 import { artifactNeedsChecks } from '../lib/artifact-policy.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 async function fixture(t) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-artifact-policy-')))
@@ -23,7 +24,7 @@ async function fixture(t) {
   await writeFile(path.join(source, '.gitignore'), 'reviews/\n')
   await command(source, ['git', 'add', '.'])
   await command(source, ['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'baseline'])
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(root)
   const workers = {
     bind(callbacks) { this.callbacks = callbacks },
     prepareBaseline: (...args) => workspaces.prepareBaseline(...args),

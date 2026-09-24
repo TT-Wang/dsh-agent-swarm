@@ -27,11 +27,12 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MANAGEMENT_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -50,7 +51,7 @@ async function gitFixture(t) {
   await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(temp)
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   return { temp, source, workspaces, artifactsOf: missionId => path.join(temp, 'worktrees', missionId, 'artifacts.git') }
 }

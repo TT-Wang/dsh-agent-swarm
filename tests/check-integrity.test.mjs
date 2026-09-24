@@ -22,9 +22,10 @@ import { chmod, lstat, mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/p
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { validatePlan } from '../lib/plans.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -59,8 +60,7 @@ async function pythonFixture(t, options = {}) {
   await writeFile(path.join(source, '.tox', 'py', 'bin', 'python'), '#!/bin/sh\necho "tox-python"\n')
   await chmod(path.join(source, '.tox', 'py', 'bin', 'python'), 0o755)
   const seen = []
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    confineCheck: (argv, cwd) => { seen.push(cwd); return argv }, ...options })
+  const workspaces = makeWorkspaces(temp, { confineCheck: (argv, cwd) => { seen.push(cwd); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Fix the answer', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }

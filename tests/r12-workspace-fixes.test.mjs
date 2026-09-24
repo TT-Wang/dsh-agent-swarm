@@ -6,6 +6,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, re
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { workspaceOptions } from './faults/harness.mjs'
 
 // Source mode permits parallel development without rebuilding shared lib/.
 const sourceMode = process.env.SWARM_TEST_SOURCE === '1'
@@ -28,7 +29,8 @@ async function fixture(t) {
   await writeFile(path.join(source, '.gitignore'), 'node_modules\nignored.txt\n')
   git(source, ['add', '.']); git(source, ['commit', '-m', 'baseline'])
   const baseline = git(source, ['rev-parse', 'HEAD'])
-  const options = { subprocess: subprocessSeam, workspacesRoot: path.join(root, 'workspaces'), checkTimeoutMs: 10000, maxCheckOutputBytes: 32000, confineCheck: argv => argv }
+  // The shared option bag; the engine stays this file's own `Workspaces` so SWARM_TEST_SOURCE=1 still builds it from src/.
+  const options = workspaceOptions(root, { workspacesRoot: path.join(root, 'workspaces'), checkTimeoutMs: 10000 })
   const workspaces = new Workspaces(options)
   const mission = { id: 'mission', workspace: source }
   const member = { id: 'member', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member') }

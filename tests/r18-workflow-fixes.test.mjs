@@ -45,8 +45,9 @@ import path from 'node:path'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
 import { selectAcceptedDelivery, taskGraphIndex } from '../lib/task-graph.js'
-import { SWARM_SCRATCH_DIRNAME, Workspaces, runProcess } from '../lib/workspaces.js'
+import { SWARM_SCRATCH_DIRNAME, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const BUDGET = { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60, maxExperiments: 0 }
 
@@ -445,8 +446,7 @@ test('R18-4e: a ceiling barrier interrupted by a host restart is re-run on reope
 
 test('R18-5: both launch paths refuse a check with invalid shell syntax, before any work exists', async t => {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-syntax-')))
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(directory, { maxCheckOutputBytes: 100000 })
   const boot = new StubWorkers()
   const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
     maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100 }, boot)
@@ -467,8 +467,7 @@ test('R18-5: both launch paths refuse a check with invalid shell syntax, before 
 
 test('R18-5b: the syntax refusal names the broken check and pairs each location with its own diagnostic', async t => {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-r18-syntax-attribution-')))
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(directory, { maxCheckOutputBytes: 100000 })
   // The launch boundary consults the adapter's parse-only probe; this stub hands
   // it to the real host seam so the refusal carries /bin/sh's own diagnostics.
   class SyntaxWorkers extends StubWorkers {
@@ -574,8 +573,7 @@ test('R18-7: the scratch root lives inside the member worktree and stays out of 
   await writeFile(path.join(source, 'README.md'), 'base\n')
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'worktrees'),
-    checkTimeoutMs: 60000, maxCheckOutputBytes: 200000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(directory, { checkTimeoutMs: 60000, maxCheckOutputBytes: 200000 })
   t.after(async () => { await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
   const mission = { id: 'mission-scratch', workspace: source }
   const workspace = await workspaces.prepareWorkspace(mission, 'member-scratch')
@@ -638,8 +636,7 @@ test('R18-9: composition fidelity reports a dependency path whose content the me
   await git(source, 'worktree', 'add', '--detach', worktree, base)
   await writeFile(path.join(worktree, 'conf.txt'), 'ours\n')
   await git(worktree, 'commit', '-qam', 'ours-side')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(directory, 'ws'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(directory, { workspacesRoot: path.join(directory, 'ws'), maxCheckOutputBytes: 100000 })
   t.after(async () => { await workspaces.dispose(); await rm(directory, { recursive: true, force: true }) })
   const signal = new AbortController().signal
   assert.deepEqual(await workspaces.droppedDependencyPaths(worktree, dependency, signal), ['conf.txt'],

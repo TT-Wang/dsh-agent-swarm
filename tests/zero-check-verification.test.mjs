@@ -3,15 +3,13 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { access, mkdir, rm, writeFile } from 'node:fs/promises'
-import { makeRepo, Workspaces } from './faults/harness.mjs'
+import { makeRepo, makeWorkspaces } from './faults/harness.mjs'
 import { loadWorkspaceGrants, WORKSPACE_AUTHORIZATION_CODE } from '../lib/authorization.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
 
 async function fixture(t) {
   const repo = await makeRepo('zero-check-verification', { '.gitignore': 'node_modules/\n', 'research.md': 'baseline\n' })
   const grants = await loadWorkspaceGrants([{ path: repo.source }])
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(repo.root, 'worktrees'),
-    checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, checkConcurrency: 1, grants, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(repo.root, { checkConcurrency: 1, grants })
   t.after(async () => { await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   await mkdir(join(repo.source, 'node_modules'))
   await writeFile(join(repo.source, 'node_modules', 'fixture-dependency'), 'installed\n')

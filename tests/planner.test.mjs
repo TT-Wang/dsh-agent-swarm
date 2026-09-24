@@ -10,7 +10,6 @@ import CommandRuntime from '@deepseek-ai/dsh-commands'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { registerAutomaticStart } from '../lib/planner.js'
-import { Workspaces } from '../lib/workspaces.js'
 
 /**
  * The slice of an Agent inbox the planner's owner fixtures exercise. 0.1.3 exported a runtime Inbox from
@@ -37,7 +36,8 @@ function fakeInbox(session) {
     },
   }
 }
-import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
+import { SubprocessLocal } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 const budget = { maxTokens: 10000, maxSteps: 50, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 10, maxExperiments: 1 }
 async function eventually(read) {
   const until = Date.now() + 3000
@@ -51,7 +51,7 @@ async function fixture(t, options = {}) {
   git(['init', '-q']); git(['-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'initial'])
   const ctx = new Context()
   await ctx.plugin(SessionStore); await ctx.plugin(CommandRuntime); await ctx.plugin(SubprocessLocal)
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
+  const workspaces = makeWorkspaces(snapshotRoot, { workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000 })
   const runtime = new SwarmRuntime({ statePath: join(root, '.git', 'swarm.sqlite'), tickMs: 60000, leaseMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3, ...options.config }, { bind() {}, async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: () => workspaces.dispose() })
   await runtime.start()
   const session = await ctx.sessions.create(SessionId('planner-owner'), { meta: { cwd: root } })

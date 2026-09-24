@@ -27,14 +27,10 @@ import assert from 'node:assert/strict'
 import { mkdir, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DependencyMaterialisationError } from '../lib/workspaces.js'
-import { MISSION_ACCEPTANCE, WorkspaceWorkers, Workspaces, eventually, events, git, makeRepo, setup, taskOf } from './faults/harness.mjs'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { MISSION_ACCEPTANCE, WorkspaceWorkers, eventually, events, git, makeRepo, setup, taskOf, makeWorkspaces } from './faults/harness.mjs'
 
 const CHECK = 'test -f node_modules/dep/index.js'
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-const workspaceOptions = (root, extra = {}) => ({
-  subprocess: subprocessSeam, workspacesRoot: join(root, 'worktrees'), checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv, ...extra,
-})
 
 /** The pnpm/npm workspace shape: a gitignored `node_modules` whose package entry links out of the checkout. */
 async function escapingInstall(repo) {
@@ -56,7 +52,7 @@ async function verificationCheckouts(root) {
 async function reviewFixture(t, install = escapingInstall) {
   const repo = await makeRepo('r19-h2', { 'src/answer.txt': 'base\n', '.gitignore': 'node_modules/\n' })
   await install(repo)
-  const workspaces = new Workspaces(workspaceOptions(repo.root))
+  const workspaces = makeWorkspaces(repo.root)
   const workers = new WorkspaceWorkers(workspaces)
   const f = await setup({ workers, workspace: repo.source, config: { tickMs: 60_000 } })
   const disposals = [workspaces]
@@ -105,7 +101,7 @@ test('R19-H2: an escaping dependency link defers the review as infrastructure, a
 
   // The host operator takes the first way out: a restart with the explicit
   // link-read opt-in. The same review resumes against the same artifact.
-  const repaired = new Workspaces(workspaceOptions(f.repo.root, { verificationDependencyMode: 'link', allowDependencyLinkReads: true }))
+  const repaired = makeWorkspaces(f.repo.root, { verificationDependencyMode: 'link', allowDependencyLinkReads: true })
   f.disposals.push(repaired)
   f.workers.workspaces = repaired
   await f.runtime.controlTask(f.owner, f.mission.id, f.review.id, 'resume', {}, 'host enabled dependency link reads')
@@ -124,7 +120,7 @@ test('R19-H2: an escaping dependency link defers the review as infrastructure, a
 test('R19-H2: a dangling dependency root is the same typed error, returned as a preparation row, and the checkout is cleaned up', async t => {
   const repo = await makeRepo('r19-h2-dangling', { 'src/answer.txt': 'base\n', '.gitignore': 'node_modules\n' })
   await symlink(join(repo.root, 'missing-installation'), join(repo.source, 'node_modules'))
-  const workspaces = new Workspaces(workspaceOptions(repo.root))
+  const workspaces = makeWorkspaces(repo.root)
   t.after(async () => { await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   const mission = { id: 'mission-dangling', workspace: repo.source }
   const member = { id: 'member-dangling', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-dangling') }
@@ -209,7 +205,7 @@ test('R19-M-d: dependency materialisation runs before the check slot is taken an
   await mkdir(join(repo.source, 'node_modules', 'dep'), { recursive: true })
   await writeFile(join(repo.source, 'node_modules', 'dep', 'index.js'), 'module.exports = 1\n')
   // One slot, and a check deadline shorter than the hold on the copy below.
-  const workspaces = new Workspaces(workspaceOptions(repo.root, { checkConcurrency: 1, checkTimeoutMs: HOLD_MS / 2 }))
+  const workspaces = makeWorkspaces(repo.root, { checkConcurrency: 1, checkTimeoutMs: HOLD_MS / 2 })
   t.after(async () => { await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   const mission = { id: 'mission-slot', workspace: repo.source }
   const prepared = []
@@ -276,7 +272,7 @@ test('a dependency directory whose parent the artifact turned into a file is ski
     await mkdir(join(repo.source, root, 'dep'), { recursive: true })
     await writeFile(join(repo.source, root, 'dep', 'index.js'), 'module.exports = 2\n')
   }
-  const workspaces = new Workspaces(workspaceOptions(repo.root))
+  const workspaces = makeWorkspaces(repo.root)
   const f = await setup({ workers: new WorkspaceWorkers(workspaces), workspace: repo.source, config: { tickMs: 60_000 } })
   t.after(async () => { await f.cleanup(); await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
   const source = f.propose({ checks: ['test -f pkg && test -f node_modules/dep/index.js'] })
