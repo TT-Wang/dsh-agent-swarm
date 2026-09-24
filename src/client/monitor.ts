@@ -1,6 +1,5 @@
 import type { LiveState, LiveUpdate } from '../live-types.ts'
 import { readSnapshot } from './projection.ts'
-export type { LiveState } from '../live-types.ts'
 interface MonitorState {
   ownerSessionId?: string
   data?: LiveState

@@ -10,7 +10,6 @@ import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
-export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
 
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
@@ -301,7 +300,6 @@ class CheckSemaphore {
       totalWaitMs: this.totalWaitMs, maxWaitMs: this.maxWaitMs, totalRunMs: this.totalRunMs, maxRunMs: this.maxRunMs }
   }
 }
-export type { RecoveryFallback, VerificationCleanupFailure } from './types.js'
 /** Persisted on the task workspace record so the fallback survives restarts. */
 interface TaskRecovery { commit: string; previousOwnerId: string; preserved: boolean; reason: string; at: number }
 /** Reject a symlink whose target string alone leaves its owning workspace (fast pre-commit check). */

@@ -3,7 +3,7 @@ import type { DeliveryApplication, DeliveryInspection, Snapshot, WorkspaceBaseli
 import type { Request } from './monitor.ts'
 import { useCopy } from './locale.tsx'
 import { deliverableCommit } from './projection.ts'
-import type { LiveState } from './monitor.ts'
+import type { LiveState } from '../live-types.ts'
 import { requestWithDeadline, RequestDeadlineError } from './request-deadline.ts'
 import { checkDeliveryOutcome, projectDeliveryState, type DeliveryObservation } from './delivery-state.ts'
 
