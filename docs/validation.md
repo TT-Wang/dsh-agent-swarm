@@ -62,6 +62,15 @@ The other candidates:
 
 ## Round-28 host versions: 0.1.5-rc.3 and 0.1.7-rc.1 only (2026-09-24)
 
+**Final gate at 06bc7c4 (after the batch-8 adversarial fixes).** On 0.1.5-rc.3: `typecheck` and `build` clean,
+1509 of 1509 behavioral tests, `test:replay` (digest unchanged), `test:harness` (the composition and the new
+boundary-compaction composition), `test:pack` (248 files), `test:profile`, `test:bundle` 7/7, `test:faults` 24/24,
+`test:web`, `test:command-web` and `test:load` passed. On 0.1.7-rc.1: the same gates passed (`test:pack` 242 files),
+and the behavioral suite ran 1508 of 1509; the one failure was R15-D2, the documented timing-bound hung-stop test.
+The batch-8 adversarial verification also corrected the worktree measurement (the saving it reported holds only at
+the swarm's budget weights, not at DeepSeek list prices) and found boundary compaction had never run; see the
+boundary-compaction entry above.
+
 The plugin now supports exactly two Harness releases, `0.1.5-rc.3` (npm `latest`, the default host) and
 `0.1.7-rc.1` (npm `next`); `0.1.2-rc.1`, `0.1.3-alpha.2`, `0.1.5-rc.1` and `0.1.6-alpha.2` are dropped.
 
