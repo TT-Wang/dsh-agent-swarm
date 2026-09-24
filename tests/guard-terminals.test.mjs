@@ -51,7 +51,7 @@ import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, g
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
-import { setup, eventually, events, FakeClock } from './faults/harness.mjs'
+import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
@@ -218,7 +218,7 @@ test('R14: the terminal classification names the first chain that cannot progres
  * ------------------------------------------------------------------------- */
 
 test('R17 runtime pair (dirty workspace x preparation): deterministic failure preserves work and requests same-task owner recovery', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     let calls = 0
@@ -240,7 +240,7 @@ test('R17 runtime pair (dirty workspace x preparation): deterministic failure pr
 })
 
 test('R14 runtime pair (attempt close-out x "Member has uncommitted commits"): the throw is contained and escalated', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     const held = f.propose({ title: 'Held work', assigneeId: f.author.id })
@@ -388,7 +388,7 @@ test('R12-F9: an owner amendment that strips the content-carrying edge is refuse
 })
 
 test('R14 runtime (workspace chain): a revoked workspace escalates with the coded workspace terminal', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     const { WorkspaceRevokedError } = await import('../lib/workspace-admission.js')
@@ -408,7 +408,7 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
 })
 
 test('R14 runtime (budget chain): a refused worker proposal escalates as a coded owner decision', async () => {
-  const f = await setup({ config: { tickMs: 10 }, budget: { maxTasks: 1 } })
+  const f = await setup({ budget: { maxTasks: 1 } })
   try {
     f.propose({ title: 'Owner fills the only slot' })
     const stream = f.runtime.store.list('workstreams', f.mission.id)[0]
@@ -432,7 +432,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
   // passes the context it already has. The test proves the path end to end from
   // inside this branch, so the integration task can wire a site without guessing
   // what the mechanism returns or how a repeat is suppressed.
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Held work' })
     const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)' }
@@ -471,7 +471,7 @@ test('R12-F9 has no dispatch half: the sweep dispatches the first ready task as 
   // Every write of a dependency set is refused at its own call now, so dispatch
   // reads no prose: a stored row whose text resumes from prior work is prepared
   // and dispatched like any other ready task, and no guard terminal names it.
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     const seed = f.propose({ title: 'Seed row', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.author.id })
@@ -487,7 +487,7 @@ test('R12-F9 has no dispatch half: the sweep dispatches the first ready task as 
 })
 
 test('S4r-D3: the admission guard refuses at propose() and at plan validation', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     // T3b precedent, at the production call shape: propose() must refuse it.
     assert.throws(() => f.propose({ title: 'Resume prior work', objective: 'Resume from your own artifact `09883f3` and finish the guard.' }),
@@ -506,7 +506,6 @@ test('S4r-D3: the admission guard refuses at propose() and at plan validation', 
     // The same guard fires at plan validation (plans.ts), where the task never
     // reaches propose() at all.
     const { validatePlan } = await import('../lib/plans.js')
-    const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
     const base = {
       title: 'Plan', objective: 'Deliver verified code', workspace: f.dir, scope: ['src/'], acceptance: ['works'], budget,
       members: [{ key: 'builder', name: 'Builder', role: 'implementation' }],
@@ -520,7 +519,7 @@ test('S4r-D3: the admission guard refuses at propose() and at plan validation', 
 })
 
 test('S4r-D4: guardBoard reports review liveness from the same predicate the scheduler uses', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Submitted source' })
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -541,7 +540,7 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
 })
 
 test('S4r-D5: a budget-blocked mission still escalates, and the terminal emission is unconditional', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); mission.usedTokens = mission.budget.maxTokens; f.runtime.store.put('missions', mission) })
     await eventually(() => f.runtime.mission(f.mission.id).status === 'blocked', 'the exhausted budget blocks the mission', 8_000)
@@ -574,7 +573,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
  * ------------------------------------------------------------------------- */
 
 test('S4b pair (workspace capture x close-out): a failed close-out checkpoint escalates the attempt terminal', async () => {
-  const f = await setup({ config: { tickMs: 10, maxIdleCloseouts: 0 } })
+  const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Held attempt', maxRecoveryAttempts: 3 })
@@ -602,7 +601,7 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
   // Measured on the owner's instrument: task/closeout-abandoned 7 of 8 silent,
   // task/closeout-exhausted 2 of 2 silent. Both are terminals of the
   // attempt/lease chain now.
-  const f = await setup({ config: { tickMs: 10, maxIdleCloseouts: 0 } })
+  const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Close-out exhaustion', maxRecoveryAttempts: 1 })
@@ -628,7 +627,7 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
 })
 
 test('S4b pair (lease expiry x workspace capture): the checkpoint failure and the exhausted recovery both escalate', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Expiring attempt', maxRecoveryAttempts: 1 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -654,7 +653,7 @@ test('S4b pair (lease expiry x workspace capture): the checkpoint failure and th
 })
 
 test('S4b (task ceiling): the blocked task escalates with the coded ceiling terminal', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Ceiling bound', maxSteps: 1 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -688,7 +687,7 @@ test('S4b (task ceiling): the ceiling block is stamped on the runtime clock', as
 })
 
 test('S4b (owner-side ceiling): the refusal is a recorded coded decision, not only a thrown error', async () => {
-  const f = await setup({ config: { tickMs: 10 }, budget: { maxTasks: 1 } })
+  const f = await setup({ budget: { maxTasks: 1 } })
   try {
     f.propose({ title: 'Only slot' })
     assert.throws(() => f.propose({ title: 'Overflow' }), /task budget exhausted/)
@@ -702,7 +701,7 @@ test('S4b (owner-side ceiling): the refusal is a recorded coded decision, not on
 })
 
 test('S4b pair (isolation x workspace): a refused dispatch escalates with the violation as the detail', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     // The isolation guard is the workspace chain's predicate; force the violation
@@ -722,7 +721,7 @@ test('S4b pair (isolation x workspace): a refused dispatch escalates with the vi
 })
 
 test('S4b (workspace fence): fenceWorkspace itself emits the coded terminal for every caller', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Fenced work' })
     f.runtime.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')

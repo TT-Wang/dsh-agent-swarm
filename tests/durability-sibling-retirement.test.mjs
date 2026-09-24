@@ -8,40 +8,19 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class ReviewWorkers {
-  prepared = []; stopped = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-retire-'))
-  const workers = new ReviewWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'retire-owner' }
   const mission = runtime.create(owner, { title: 'Retire', objective: 'Retire moot reviews', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
