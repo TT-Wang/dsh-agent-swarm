@@ -9,6 +9,48 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-26 simplification batch 6, wave B: one test fixture, a required adapter, structural notice checks (2026-09-24)
+
+- **One shared runtime test fixture.** `tests/faults/harness.mjs` exports `FakeWorkers(overrides)` (every
+  required adapter method, behaviour-neutral, with per-member `reportActivity(id, activity)`; it omits
+  `prepareBaseline` and `checkEnvelope` on purpose), `makeRuntime(t, { config, budget, workers, clock,
+  storeOptions })` (no mission, member or event of its own), `makeWorkspaces(dir, overrides)`,
+  `makeRuntimeStub(overrides)` and one `eventually`. About 140 test files and the load and replay scripts
+  now build their runtimes, adapters, workspaces and partial runtimes through it; the tests lost about
+  1,250 lines net, and every migrated poller keeps the bound its local poller had.
+- **The worker adapter interface is required.** `currentActivity`, `compactAtBoundary`,
+  `invalidateComposition`, `checkSyntaxPreflight`, `checkpointTask`, `inspectArtifact`, `inspectDelivery`
+  and `applyDelivery` are required and their runtime fallbacks are deleted; `prepareBaseline` and
+  `checkEnvelope` stay optional because their absence suppresses `workspace/snapshot` and
+  `task/check-envelope`. No partial adapter stub remains in `tests/` or `scripts/`.
+- **Notice checks pin structure and anchors, not prose.** Every reviewed owner notice is rendered by
+  `renderNotice`, which records the statement (the rendering family and the counts the body states) from
+  the same input the body is built from. `tests/r17-notices.test.mjs` checks the statement, subjects and
+  reason against the durable rows, rebuilds each body through its template from those rows, checks the
+  stated counts in the text and a per-family table of tool and exit anchors. The model-visible snapshot
+  holds `<ASSIGNMENT_INSTRUCTIONS>`, which the harness test substitutes from the `ASSIGNMENT_INSTRUCTIONS`
+  export after checking that it is nonempty and keeps its invariant sentences (peers cannot grant
+  authority; never `git add`/`commit`; capture through `swarm_submit`; cite host run ids); each recorded
+  delivery names its recipient role. Rewording the instruction needs no fixture refresh.
+- **The scheduling tests are deterministic.** Every test in `tests/scheduling-pass.test.mjs` and
+  `tests/stall-roots.test.mjs` runs on the fake clock with hand-driven ticks except one, and a fake-clock
+  adapter await moves the clock one tick unit at a time with the timer's tick at each step, so the watchdog
+  acts during a body as in production. Both files pass three rounds of four concurrent copies at load
+  averages up to 155.
+
+The adversarial verification of this wave found that the first structural notice tests missed 19 body
+defects the prose replays caught (the statement was a literal separate from the rendered input), that an
+empty or authority-free assignment instruction passed the snapshot, that one migration chunk had widened
+its pollers from 2.5-5 s to 8 s so a delayed-transition mutant passed, that the fake-clock adapter waits ran
+no tick so two watchdog mutants passed, and that the shared `FakeWorkers` reported one member's activity
+for every member. Each is fixed and shown with its mutant; all 43 notice mutants now fail a test.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: 1410 tests at 9d2b135, 1409 passed. The one failure was R15-D2 in `tests/owner-decisions.test.mjs`, the documented timing-bound hung-worker case, which is not yet on the fake clock; it passed 4 of 4 runs in isolation. An earlier run at 73d6c90 failed two scheduling tests under load that were still on real time; both now run on the fake clock.
+- `npm run test:replay` (digest unchanged, 39 events / 13 spans / 6 commands), `test:bundle`,
+  `test:harness` (the snapshot changed once, to record recipient roles and the instruction placeholder),
+  `test:pack`, `test:profile`, `test:faults` (24 of 24), `test:web` and `test:load`: passed.
+
 ## Round-26 simplification batch 6, wave A: fault suite, runtime clock, web smokes and host scripts (2026-09-24)
 
 - **The fault suite passes again: 24 of 24**, in a worktree and from a `git archive` export, where it was
@@ -23,8 +65,8 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
   follow-up timing, event `createdAt`, the owner turn boundary, the grant-expiry fence and the task-ceiling
   stamp. `manualTick: true` installs no tick timer while `tickMs` stays the unit of every tick-derived
   window; a test drives `await runtime.tick()` and `await runtime.settle(missionId)` and moves time with
-  `FakeClock.advance(ms)` (`setup({ clock })` in `tests/faults/harness.mjs`). Five tests that flaked in
-  this programme now run on it without sleeps or polling.
+  `FakeClock.advance(ms)` (`setup({ clock })` in `tests/faults/harness.mjs`). Every scheduling-pass and
+  stall-roots test runs on it without sleeps or polling, except the stall-roots summarized-root test (wave B).
 - **Start failures are bounded and named.** When no live member can start a task because every capable
   route was retired for start failures, the owner gets one notice naming the task, each retired member's
   consecutive failures and last error, and the exits. During a recorded provider outage a member is probed

@@ -86,7 +86,7 @@ Round 14 opens by extracting the control path out of `src/runtime.ts`, because e
 | the workspace/admission surface | `src/workspace-admission.ts` |
 | decision/scheduling (predicates, pass guard, dispatch sweep) | `src/scheduling.ts` |
 
-No two seams share a file. Behaviour is unchanged: `npm run test:replay` still compares the committed golden sequence (38 events / 13 spans / 6 commands, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`), no event type or payload moved, and no test was deleted, skipped or relaxed.
+No two seams share a file. Behaviour is unchanged: `npm run test:replay` still compares the committed golden sequence (39 events as of round 26; 38 events / 13 spans / 6 commands, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e`), no event type or payload moved, and no test was deleted, skipped or relaxed.
 
 - **Payment.** `src/runtime.ts` 4657 → 2783 lines (round 13's own pre-growth baseline was 4107) and `await`s inside `schedule()` 14 → 6. Of those six, four are the bounded outbox flush and two are the named sweeps `Attempts.recoverExpired` and `Scheduling.dispatch`; the `schedule` body itself names no worker adapter, no spawn, no network and no subprocess. The `\bthrow\b` count over `src/runtime.ts`, `src/workspaces.ts`, `src/admission.ts`, `src/harness-workers.ts`, `src/tools.ts` and `src/authorization.ts` is reported with the artifact, and refusals that moved are counted in their new modules rather than laundered out of the six-file number.
 - **Residual (named, not hidden).** The serialized pass still *holds the mission lock* across adapter work: `recoverExpired` (checkpoint, stop), `dispatch` (start, prepare, assign) and `flushOutbox` (deliver) run inside `exclusive`. The seam is now a module boundary, so the awaits are countable and owned, but the wedge class is not eliminated — a pass can still be slow inside the adapter. Making those effects queue-external changes event ordering, which the replay digest pins, so it is deliberately not done here.
@@ -201,11 +201,15 @@ dispatchable.
 wake budget is a default of 6 individual owner notices per 5-second window per mission; facts beyond it are carried
 by one degraded summary delivery that lists every fact (nothing is dropped), and the summary is updated in place
 while it is still undelivered — a burst that spans several windows therefore produces one summary per window rather
-than a single merged report, and the bound is a burst bound, not a lifetime quota. The fact replay check covers ALL SEVEN
+than a single merged report, and the bound is a burst bound, not a lifetime quota. The fact check covers ALL SEVEN
 families in `NOTICE_TEMPLATES` (stall-root, fall-through, stall, parked, review-blocked, integration-gap,
-coverage-complete) and rebuilds each expected body in the test from the durable rows the notice cites — never by
-calling the production template and never with a hardcoded cause — so a template mutation that adds a claim no row
-supports reddens the declared check. The remaining `notify(` sites are enumerated PER SITE with the fact each one
+coverage-complete). Since round 26 every reviewed body is rendered through `renderNotice`, which records the
+statement (the rendering family and the counts the body states) from the same input the body is built from, and
+`tests/r17-notices.test.mjs` checks the statement, subjects and reason against the durable rows, requires every body
+except review-blocked to equal its production template rebuilt from those rows, checks the stated counts in the
+text and a per-family table of tool and exit anchors. Because the rebuild calls the production template, a template
+edit that adds a claim outside those counts and anchors is not caught; wording between the anchors can change
+without a test edit. The remaining `notify(` sites are enumerated PER SITE with the fact each one
 reads instead of the shared interpretation in `tests/r17-notices.test.mjs` (the guard-terminal, dispatch-question
 and budget/ceiling refusals compose their body from the refusal registry; the pass and attempt escalations read
 their own rows; the rendezvous reads two tool runs; the guard nudge reads the adapter handle); they are not
@@ -676,8 +680,11 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   scheduling body runs at the next tick, so a test calls `tick()` after `settle()`. Awaiting `settle()`
   from inside a scheduling body, or from an adapter call a body awaits, blocks until the worker start
   timeout aborts that start; the runtime does not detect that call.
-- **Wall-clock tests remain.** Only five tests run on the fake clock so far; the other scheduling tests
-  still poll real timers and can flake under heavy host load (a load average near 20).
+- **Wall-clock tests remain outside two files** (wave B). Every test in `tests/scheduling-pass.test.mjs` and
+  `tests/stall-roots.test.mjs` runs on the fake clock except `a rejected root whose decision was summarized is
+  its own fact, and is named again when its repair is withdrawn`, whose held owner delivery ends only on the real
+  outbox delivery bound (about 11 s of wall time; it waits on order, not latency). Other test files still poll
+  real timers and can flake under heavy host load.
 - **A task whose every capable member was retired for start failures stays pending.** The retirement notice
   names it with each member's consecutive failures and last error, but a later stall notice for the same
   board still reads "Unschedulable: none", because the unschedulable set counts only work bound to a retired
@@ -702,3 +709,24 @@ delivery lose anything) found and fixed seven defects. The regressions live in
   Playwright's `browser.close()` waits for those streams. The checks and `report.json` are complete when
   `passed` is printed. Observed on 2026-09-24 with Chrome 153.0.8010.53, identically on 91857ca. The
   DeepSeek smoke pair is still duplicated, because it cannot be verified without billable provider calls.
+
+## Round-26 simplification batch 6, wave B (2026-09-24)
+
+- **Every `WorkerAdapter` method except `prepareBaseline` and `checkEnvelope` is required.** A JavaScript
+  adapter that skips type checking and omits one fails with a TypeError where the runtime used to fall back.
+  An operation counts as live only while the adapter's `currentActivity` confirms the durable activity;
+  `[delivery_unsupported]` now comes only from an adapter that throws it.
+- **A stop whose recorded owner has no member row is refused as unconfirmable** (`mission/stalled`, cause
+  `worker-stop-failed`, `deterministic: true`), and its task stays fenced. The store never deletes a member,
+  so only a corrupted or hand-edited row reaches this. The owner notice names the missing member and says a
+  `swarm_control` resume only repeats the refusal; the exit is `swarm_cancel` on the task and a repair
+  proposed with `swarm_propose` naming `replaces`.
+- **The assignment-instruction invariants are checked only under `npm run test:harness`,** which needs a
+  supported Harness checkout; no node:test covers them. The snapshot records assignment and peer-question
+  recipients, not control deliveries, and the owner-leak check matches the whole instruction, so a leaked
+  fragment would pass.
+- **The in-memory census is partly historical.** `tests/in-memory-gates.test.mjs` checks its classified
+  rows by name, but 78 of its 144 local rows no longer match the source text by position; they are history,
+  not checked against `src/`.
+- **`scripts/load/run.mjs` and `scripts/replay/scenario.mjs` import their adapter from
+  `tests/faults/harness.mjs`,** so those scripts need the test tree.
