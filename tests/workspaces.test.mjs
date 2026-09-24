@@ -506,11 +506,20 @@ test('verification cleanup failure never masks the check result and is reported 
   assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
 })
 
+/** Register `count` more worktrees of `source` under `temp`, so its worktree listing outgrows a small output bound. */
+const crowd = async (source, temp, count) => {
+  const crowded = Array.from({ length: count }, (_, index) => path.join(temp, `crowd-${index}`))
+  for (const worktree of crowded) await git(source, 'worktree', 'add', '--detach', worktree)
+  return crowded
+}
+
 test('the next verification of a mission reclaims every checkout a crash left, tree and registration, without reporting it', async t => {
   const failures = []
-  const { source, head, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  // The source repository's worktree listing is larger than the check output bound.
+  const { source, head, workspaces, member, task, temp } = await fixture(t, { maxCheckOutputBytes: 1024, onCleanupFailure: info => failures.push(info) })
   await workspaces.prepareTask(member, task, [])
   const artifact = await workspaces.captureArtifact(member, task)
+  const crowded = await crowd(source, temp, 8)
   const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
   const leftover = name => path.join(verification, name)
   await mkdir(verification, { recursive: true })
@@ -526,11 +535,28 @@ test('the next verification of a mission reclaims every checkout a crash left, t
   await git(source, 'worktree', 'lock', '--reason', 'initializing', leftover('tree-gone'))
   await rm(leftover('tree-gone'), { recursive: true, force: true })
   await mkdir(path.join(leftover('unregistered'), 'src'), { recursive: true })
+  assert.ok((await git(source, 'worktree', 'list', '--porcelain')).length > 1024, 'the listing outgrows the bound')
   const results = await workspaces.verifyArtifact(member, { ...task, checks: ['true'] }, artifact)
   assert.equal(results[0].exitCode, 0)
   assert.deepEqual(await readdir(verification), [], 'every leftover tree is removed')
-  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/, 'and, in the same pass, every registration, locked ones included')
+  const listed = await git(source, 'worktree', 'list', '--porcelain')
+  assert.doesNotMatch(listed, /verification/, 'and, in the same pass, every registration, locked ones included')
+  for (const worktree of crowded) assert.ok(listed.split('\n').includes(`worktree ${worktree}`), 'no other worktree is touched')
   assert.deepEqual(failures, [], 'a leftover is not a cleanup failure of the verification that reclaimed it')
+})
+
+test("a verification drops its own registration when git refused its checkout, whatever the size of the source's worktree listing", async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { maxCheckOutputBytes: 1024, onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  await crowd(source, temp, 8)
+  // Without its `.git` link, git refuses to remove the checkout.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['rm .git'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.equal(failures.length, 1, 'the refusal is reported')
+  assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [])
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/, 'and its registration is gone with its tree')
 })
 
 test('the reclaim removes a link under verification/ without following it, and a checkout whose root a check made unreadable', async t => {
@@ -539,22 +565,51 @@ test('the reclaim removes a link under verification/ without following it, and a
   await workspaces.prepareTask(member, task, [])
   const artifact = await workspaces.captureArtifact(member, task)
   const verification = path.join(temp, 'worktrees', 'mission-one', 'verification')
-  // A link something left in verification/ reaches the user's files elsewhere.
+  // Links something left in verification/ reach the user's files and two registered worktrees with uncommitted work.
   const outside = path.join(temp, 'outside')
   await mkdir(path.join(outside, 'kept'), { recursive: true })
   await writeFile(path.join(outside, 'kept', 'notes.txt'), 'mine\n')
   await chmod(path.join(outside, 'kept'), 0o755)
   await chmod(path.join(outside, 'kept', 'notes.txt'), 0o644)
+  const feature = path.join(temp, 'user-feature')
+  await git(source, 'worktree', 'add', '-b', 'feature', feature)
+  for (const worktree of [member.workspace, feature]) await writeFile(path.join(worktree, 'src', 'wip.txt'), 'work in progress\n')
   await mkdir(verification, { recursive: true })
   await symlink(outside, path.join(verification, 'link'))
+  await symlink(member.workspace, path.join(verification, 'member-link'))
+  await symlink(feature, path.join(verification, 'feature-link'))
   const results = await workspaces.verifyArtifact(member, { ...task, checks: ['chmod 000 .'] }, artifact)
   assert.equal(results[0].exitCode, 0)
-  assert.deepEqual(await readdir(verification), [], 'the link and the unreadable checkout are both removed')
-  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /verification/)
+  const listed = await git(source, 'worktree', 'list', '--porcelain')
+  for (const worktree of [member.workspace, feature]) {
+    assert.ok(listed.split('\n').includes(`worktree ${worktree}`), `a worktree a link names is never removed: ${worktree}`)
+    assert.equal(await readFile(path.join(worktree, 'src', 'wip.txt'), 'utf8'), 'work in progress\n', 'with its uncommitted work')
+  }
   assert.equal((await lstat(path.join(outside, 'kept'))).mode & 0o777, 0o755, 'the link was never followed')
   assert.equal((await lstat(path.join(outside, 'kept', 'notes.txt'))).mode & 0o777, 0o644)
   assert.equal(await readFile(path.join(outside, 'kept', 'notes.txt'), 'utf8'), 'mine\n')
+  assert.deepEqual(await readdir(verification), [], 'the links and the unreadable checkout are all removed')
+  assert.doesNotMatch(listed, /verification/)
   assert.equal(failures.length, 1, "only the verification's own checkout, which git could not remove, is reported")
+})
+
+test('a verification/ that is itself a link reclaims only the checkout the verification made behind it', async t => {
+  const failures = []
+  const { source, workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
+  await workspaces.prepareTask(member, task, [])
+  const artifact = await workspaces.captureArtifact(member, task)
+  const elsewhere = path.join(temp, 'elsewhere')
+  await mkdir(path.join(elsewhere, 'project'), { recursive: true })
+  await writeFile(path.join(elsewhere, 'project', 'notes.txt'), 'mine\n')
+  await writeFile(path.join(elsewhere, 'todo.txt'), 'mine\n')
+  await symlink(elsewhere, path.join(temp, 'worktrees', 'mission-one', 'verification'))
+  // Git refuses the checkout without its `.git` link, so the fallback runs through the link too.
+  const results = await workspaces.verifyArtifact(member, { ...task, checks: ['rm .git'] }, artifact)
+  assert.equal(results[0].exitCode, 0)
+  assert.equal(failures.length, 1)
+  assert.deepEqual((await readdir(elsewhere)).sort(), ['project', 'todo.txt'], 'only its own checkout is removed behind the link')
+  assert.equal(await readFile(path.join(elsewhere, 'project', 'notes.txt'), 'utf8'), 'mine\n')
+  assert.doesNotMatch(await git(source, 'worktree', 'list', '--porcelain'), /elsewhere|verification/, 'and its registration')
 })
 
 test("a verification never prunes the source repository's own worktrees, even when its cleanup needs the permission repair", async t => {

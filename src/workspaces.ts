@@ -406,7 +406,7 @@ async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T
   try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
 }
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
-/** Verification checkouts in flight in this process; any other under a mission's `verification/` was left by one that died. */
+/** Verification checkouts in flight in this process, until their cleanup ends; any other under a mission's `verification/` was left by one that died. */
 const verificationCheckouts = new Set<string>()
 
 /**
@@ -933,9 +933,9 @@ export class Workspaces {
     })
   }
 
-  /** Serialized worktree metadata mutation (remove/prune) for one repository. */
+  /** Serialized worktree metadata access (remove, list) for one repository; a listing is an inventory. */
   private async worktreeGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
-    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal))
+    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal, undefined, INVENTORY_BYTES))
   }
 
   private async missionRecord(missionId: string): Promise<MissionWorkspace> {
@@ -2033,8 +2033,8 @@ export class Workspaces {
         return results
       } finally {
         release?.()
-        verificationCheckouts.delete(checkout)
         await this.cleanupVerification(member, task, mission.source, checkout)
+        verificationCheckouts.delete(checkout)
       }
     }, signal)
   }
@@ -2055,26 +2055,26 @@ export class Workspaces {
   }
 
   /**
-   * Reclaim this verification's checkout and every checkout of its mission no verification in this
-   * process owns (a crash left it): each entry under `verification/`, then each registration still
-   * naming a path there, locked ones included; nothing else in the source repository is touched or
-   * pruned. The owner-permission repair removes a tree a check left unreadable. Best effort by
-   * contract: only this verification's own failure is reported, and nothing is thrown.
+   * Remove this verification's checkout, then every checkout of its mission no verification in this
+   * process owns (a crash left it): the entries of its canonical `verification/` and the registrations
+   * naming a path there. Git removes the own checkout; a refusal is reported and the checkout reclaimed.
+   * Reclaiming removes the tree as what it is (a link is never followed), then the registration of the
+   * now missing path, which git cannot resolve to another worktree. Nothing else is touched or pruned.
+   * Best effort by contract: what resists stays for the mission's next verification; nothing is thrown.
    */
   private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
+    const remove = async (candidate: string): Promise<string> => await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', candidate])
+    const reclaim = async (candidate: string): Promise<void> => { await this.forceRemove(candidate); await remove(candidate).catch(() => undefined) }
+    await remove(checkout).catch(async (removal: unknown) => {
+      if (!(await lstat(checkout).then(() => true, () => false))) return
+      const failure = await reclaim(checkout).then(() => removal, (error: unknown) => error)
+      try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
+    })
     const directory = path.dirname(checkout)
-    const reclaim = async (candidate: string): Promise<void> => {
-      if (verificationCheckouts.has(candidate)) return
-      await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', candidate]).catch(async (removal: unknown) => {
-        if (!(await lstat(candidate).then(() => true, () => false))) return
-        const failure = await this.forceRemove(candidate).then(() => removal, (error: unknown) => error)
-        if (candidate !== checkout) return
-        try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
-      })
-    }
-    for (const name of await readdir(directory).catch(() => [])) await reclaim(path.join(directory, name))
-    const registered = await this.worktreeGit(source, ['worktree', 'list', '--porcelain']).catch(() => '')
-    for (const [, candidate] of registered.matchAll(/^worktree (.+)$/gm)) if (path.dirname(candidate!) === directory) await reclaim(candidate!)
+    if (await realpath(directory).catch(() => undefined) !== directory) return
+    const registered = (await this.worktreeGit(source, ['worktree', 'list', '--porcelain', '-z']).catch(() => '')).split('\0').flatMap(line => line.startsWith('worktree ') ? [line.slice('worktree '.length)] : [])
+    const leftovers = new Set([...(await readdir(directory).catch(() => [])).map(name => path.join(directory, name)), ...registered.filter(candidate => path.dirname(candidate) === directory)])
+    for (const candidate of leftovers) if (!verificationCheckouts.has(candidate)) await reclaim(candidate).catch(() => undefined)
   }
 
   /** Remove `target` after restoring owner access to each directory in it (unlink needs no more); a link is never followed. */
