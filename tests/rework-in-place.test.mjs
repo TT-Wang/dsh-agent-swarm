@@ -7,9 +7,9 @@
  *
  * Pinned here: a dependent admitted before the rejection runs on the reworked
  * artifact with no replacement row; the claims the rejection refuted are never
- * verified or re-stamped again; the reworked artifact gets a fresh independent
- * review through the existing review path, from a member who authored none of
- * its attempts; the rework bound refuses with its exit; and the rework attempt
+ * verified or re-stamped again; the rejecting review re-opens in place and
+ * re-reviews the reworked artifact, from a member who authored none of its
+ * attempts (tests/rework-review.test.mjs); the rework bound refuses with its exit; and the rework attempt
  * starts from the rejected commit in a real worktree. A rejected experiment is
  * not reworkable (tests/task-needs-replacement.test.mjs).
  */
@@ -103,12 +103,16 @@ test('a dependent admitted before the rejection runs on the reworked artifact, w
     reason: 'The artifact misses the acceptance criterion', evidenceIds: [refuted.id] }])
   assert.match(reopened.handoff, new RegExp(`Rejected by review ${firstReview.id} at ${rejected.artifact.commit}: The artifact misses the acceptance criterion`), 'the author reads the rejection')
   assert.equal(f.workers.stopped.includes(f.author.id), false, 'the author holds no live attempt, so it is not stopped')
-  const retired = f.current(firstReview)
-  assert.equal(retired.status, 'cancelled', 'the rejecting review is retired')
-  assert.equal(retired.reviewedCommit, rejected.artifact.commit, 'and keeps the commit it judged')
-  assert.match(retired.output, /^The artifact misses the acceptance criterion/, 'and its verdict')
-  assert.ok(f.events('task/review-retired').some(event => event.data.taskId === firstReview.id && event.data.reviewOf === source.id))
-  assert.equal(f.events('task/amended').at(-1).data.rework.reviewTaskId, firstReview.id, 'the rework is durable')
+  const judged = f.current(firstReview)
+  assert.equal(judged.status, 'pending', 'the rejecting review re-opens for the next submission')
+  assert.equal(judged.assigneeId, f.reviewer.id, 'with the rejecting reviewer as its assignee')
+  assert.equal(judged.reviewedCommit, undefined)
+  assert.equal(judged.output, undefined)
+  assert.deepEqual(judged.rejections.map(entry => [entry.commit, entry.reviewTaskId, entry.reason]), [[rejected.artifact.commit, firstReview.id, 'The artifact misses the acceptance criterion']], 'its verdict is archived on its own history')
+  assert.deepEqual(f.events('task/review-retired'), [], 'nothing is retired')
+  const amended = f.events('task/amended')
+  assert.equal(amended.find(event => event.data.taskId === source.id).data.rework.reviewTaskId, firstReview.id, 'the rework is durable')
+  assert.equal(amended.find(event => event.data.taskId === firstReview.id).data.rework.commit, rejected.artifact.commit, 'and so is the review re-open')
 
   // The reviewer cannot take the author's rework, so it stays independent of it.
   await assert.rejects(f.runtime.claim(f.actor(f.reviewer), f.mission.id, source.id), /not ready/)
@@ -121,9 +125,9 @@ test('a dependent admitted before the rejection runs on the reworked artifact, w
 
   await f.pastReviewGrace()
   const freshReview = f.pendingReviewOf(source)
-  assert.ok(freshReview, 'the reworked artifact gets its own review through the existing path')
-  assert.notEqual(freshReview.id, firstReview.id)
-  assert.deepEqual(f.events('task/review-blocked'), [], 'the retired review is not read as a withdrawn one')
+  assert.equal(freshReview.id, firstReview.id, 'the paired review re-reviews the reworked artifact')
+  assert.deepEqual(f.tasks().filter(task => task.reviewOf === source.id).map(task => task.id), [firstReview.id], 'no review is admitted per rework')
+  assert.deepEqual(f.events('task/review-blocked'), [])
   await assert.rejects(f.runtime.claim(f.actor(f.author), f.mission.id, freshReview.id), /not ready/, 'the author never reviews its own rework')
   await f.verify(freshReview, 'accept', 'The rework meets the criterion')
   assert.equal(f.current(source).status, 'accepted')
