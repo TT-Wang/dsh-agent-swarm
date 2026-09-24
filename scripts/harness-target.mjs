@@ -7,11 +7,14 @@ import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+/** An explicit root is taken as given; a default candidate only when it is a supported release. */
 export function resolveHarnessRoot(explicit) {
   const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
   if (supplied) return realpathSync(resolve(supplied))
-  for (const candidate of [join(homedir(), '.dsh/source/current'), join(project, '../deepseek-harness-rc1'), join(project, '../deepseek-harness-latest')]) {
-    if (existsSync(join(candidate, 'package.json'))) return realpathSync(candidate)
+  const supported = new Set(JSON.parse(readFileSync(join(project, 'compatibility.json'), 'utf8')).supportedHosts.map(host => host.version))
+  for (const candidate of [join(homedir(), '.dsh/source/current'), join(project, '../deepseek-harness-015rc3'), join(project, '../deepseek-harness-017rc1')]) {
+    const manifest = join(candidate, 'package.json')
+    if (existsSync(manifest) && supported.has(JSON.parse(readFileSync(manifest, 'utf8')).version)) return realpathSync(candidate)
   }
   throw new Error('Set DSH_HARNESS_ROOT to a built supported Harness checkout; see compatibility.json')
 }
