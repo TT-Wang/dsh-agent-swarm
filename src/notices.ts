@@ -48,7 +48,7 @@ export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mi
  * failure notices). Those callers fall back to `missionSubject`, so this guard
  * is reachable only from a genuine programming error.
  */
-export function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<Mission, 'id'>): string[] {
+function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<Mission, 'id'>): string[] {
   const clean = Array.isArray(subjects) ? subjects.filter(subject => typeof subject === 'string' && subject.length > 0) : []
   if (clean.length === 0) {
     // R15-A1: a caller that dropped its subjects must not produce an anonymous
@@ -118,7 +118,7 @@ export interface NotifyOptions {
  * the body states. A fact carried by a wake-budget summary is recorded in its
  * `aggregatedFacts` constituent, which has no statement.
  */
-export interface NoticeStatement {
+interface NoticeStatement {
   family: keyof typeof NOTICE_TEMPLATES
   /** Named counts the body states (dependents, implementations, unschedulable); empty when it states none. */
   counts: Record<string, number>
@@ -138,7 +138,7 @@ export const REJECTION_DECISION_TRIGGER = 'task/rejected'
  * read through this view. `claimedAt` is deliberately absent: it was stamped
  * from `deliveredAt` and carried no information beyond the transport.
  */
-export interface NoticeFactRecord {
+interface NoticeFactRecord {
   subjects: string[]
   trigger: string
   reason: string
@@ -160,9 +160,9 @@ export interface NoticeFactRecord {
   /** R17-G2: what a reviewed-template body states (`NoticeStatement`). */
   statement?: NoticeStatement
 }
-export type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
+type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
 /** The fact view of one delivery row, or undefined when it is not a notice. */
-export const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undefined => delivery.notice === undefined ? undefined : delivery.notice as NoticeRow
+const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undefined => delivery.notice === undefined ? undefined : delivery.notice as NoticeRow
 
 /**
  * OWNER QUIET: whether an owner delivery is moot because the owner has taken the
@@ -224,8 +224,8 @@ export function factKey(missionId: string, fact: { trigger: string; reason: stri
  * (never dropped). Values are public fields so a test can tighten the budget
  * without inventing a second code path.
  */
-export const DEFAULT_WAKE_BUDGET = 6
-export const DEFAULT_WAKE_WINDOW_MS = 5_000
+const DEFAULT_WAKE_BUDGET = 6
+const DEFAULT_WAKE_WINDOW_MS = 5_000
 const WAKE_SUMMARY_HEADER = 'Wake budget reached: further facts in this window are summarized here, none is dropped.'
 /** Bound generated owner text; full facts remain on the same durable delivery. */
 const MAX_OWNER_NOTICE_CHARS = 3200
@@ -397,7 +397,7 @@ export const AUTO_REVIEW_GRACE_MS = 1000
  * delivery-time relevance check consume ONE implementation (`SwarmRuntime`
  * satisfies it structurally; a test can supply the same shape).
  */
-export interface LineageRuntime {
+interface LineageRuntime {
   readonly store: { list: (table: 'tasks', missionId: string) => Task[] }
   readonly config: { tickMs: number }
   readonly stallPassTimeoutMs: number
@@ -418,7 +418,7 @@ export interface LineageRuntime {
  * fall-through, which may name a subject only when this set does not contain it.
  * The walk is the task graph's `replacedLineage`.
  */
-export function replacementCoverage(tasks: Task[]): Set<string> {
+function replacementCoverage(tasks: Task[]): Set<string> {
   const graph = taskGraphIndex(tasks)
   const replaced = new Set<string>()
   for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
@@ -430,7 +430,7 @@ export function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
+function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
   const replaced = replacementCoverage(tasks)
   return tasks.filter(task => {
@@ -454,7 +454,7 @@ export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'n
  * back-off (a permanent failure has no `retryAt`; `blockCauses` reads it as a
  * block cause). One bound for `waitsLegitimately` and the witness dedup.
  */
-export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task, 'status' | 'preparationFailure'>): number | undefined {
+function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task, 'status' | 'preparationFailure'>): number | undefined {
   const retryAt = task.status === 'pending' ? task.preparationFailure?.retryAt : undefined
   return retryAt === undefined ? undefined : retryAt + rt.config.tickMs
 }
@@ -468,7 +468,7 @@ export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task
  * back-off forever. The witness therefore compares F(S) plus this one clock
  * fact, read from its own durable `at`; F(S) itself stays clock-free.
  */
-export function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: readonly Task[], since: number, now = rt.now()): boolean {
+function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: readonly Task[], since: number, now = rt.now()): boolean {
   return tasks.some(task => {
     const bound = backoffBound(rt, task)
     return bound !== undefined && since <= bound && bound < now

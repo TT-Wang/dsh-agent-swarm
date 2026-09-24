@@ -64,7 +64,7 @@ export function memberPhaseOf(member: Pick<Member, 'phase'> & { status?: MemberS
 }
 
 /** Whether a member currently owns a running task attempt. */
-export function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boolean {
+function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boolean {
   return tasks.some(task => task.status === 'running' && task.attempt !== undefined && task.attempt.ownerId === memberId)
 }
 
@@ -91,13 +91,13 @@ export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean)
 }
 
 /** One member view: the durable row plus the derived status, from the one derivation. */
-export function memberView(member: Member, tasks: readonly Task[]): Member {
+function memberView(member: Member, tasks: readonly Task[]): Member {
   const phase = memberPhaseOf(member)
   return { ...member, phase, status: deriveMemberStatus(phase, ownsLiveAttempt(member.id, tasks)) }
 }
 
 /** The derived view of every member row, in the input order. */
-export function memberViews(members: readonly Member[], tasks: readonly Task[]): Member[] {
+function memberViews(members: readonly Member[], tasks: readonly Task[]): Member[] {
   return members.map(member => memberView(member, tasks))
 }
 

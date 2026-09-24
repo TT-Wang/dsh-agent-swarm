@@ -270,7 +270,7 @@ export class RefusalRegistry {
 export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
-export interface DecisionExit {
+interface DecisionExit {
   tool: string
   parameter: string
   instruction: string
@@ -367,7 +367,7 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
 }
 
 /** The durable dedup key of one terminal decision request: one per chain and board state. */
-export function guardTerminalKey(chain: GuardChainId, code: string, fingerprint: string): string {
+function guardTerminalKey(chain: GuardChainId, code: string, fingerprint: string): string {
   return `guard-terminal:${chain}:${code}:${fingerprint}`
 }
 

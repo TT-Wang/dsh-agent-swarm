@@ -5,11 +5,10 @@ import { constants } from 'node:fs'
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, readlink, realpath, rename, rm, rmdir, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import type { DeliveryApplication, DeliveryInspection } from './types.js'
 import { assertContainedSymlinkChain, type SymlinkChainLookup } from './workspaces.js'
 
-export interface DeliveryInput { source: string; baselineCommit: string; resultCommit: string }
-export interface DeliveryInspection { baselineCommit: string; resultCommit: string; changedPaths: string[]; diff: string; truncated: boolean }
-export interface DeliveryApplication { status: 'applied' | 'conflicts'; changedPaths: string[]; conflicts: string[] }
+interface DeliveryInput { source: string; baselineCommit: string; resultCommit: string }
 interface Entry { kind: 'file' | 'symlink'; bytes: Buffer; mode: number }
 interface Local { entry?: Entry; fingerprint: string; directory?: boolean }
 interface Change { relative: string; original: Local; output?: Entry }

@@ -21,7 +21,7 @@ declare module '@deepseek-ai/dsh-llm' {
  * data. Planning rules live once in the owner system prompt; this message carries
  * only the dynamic request facts and the turn contract.
  */
-export function planningMessage(request: AutoStart): UserMessage {
+function planningMessage(request: AutoStart): UserMessage {
   const epoch = request.planningEpoch ?? 1
   return freezeMessage({
     id: MessageId(`swarm-start:${request.id}:${epoch}:planning`), role: 'user',
@@ -52,7 +52,7 @@ The saved request, project snapshot and recorded usage are retained. Read swarm_
 }
 
 /** Same request and epoch: the warning offers extension before planning expires. */
-export function planningWarningMessage(request: AutoStart): UserMessage {
+function planningWarningMessage(request: AutoStart): UserMessage {
   const epoch = request.planningEpoch ?? 1
   const deadline = request.planningWarning!.deadline
   return freezeMessage({

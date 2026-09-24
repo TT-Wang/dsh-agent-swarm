@@ -16,7 +16,7 @@ import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
-export const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
+const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
 export const emptyUsage = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
 
@@ -27,13 +27,13 @@ export function addUsage(base: UsageBuckets | undefined, delta: UsageBuckets): U
 }
 
 /** Cumulative logs never shrink; a smaller bucket means a replayed snapshot and contributes nothing. */
-export function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
+function usageDelta(next: UsageBuckets, previous: UsageBuckets | undefined): UsageBuckets {
   const result = emptyUsage()
   for (const key of USAGE_KEYS) result[key] = Math.max(0, next[key] - (previous?.[key] ?? 0))
   return result
 }
 
-export function validUsage(value: unknown): value is UsageBuckets {
+function validUsage(value: unknown): value is UsageBuckets {
   return value !== null && typeof value === 'object' && USAGE_KEYS.every(key => Number.isSafeInteger((value as Record<string, unknown>)[key]) && Number((value as Record<string, unknown>)[key]) >= 0)
 }
 
@@ -54,7 +54,7 @@ export interface MissionFingerprintBoard {
  * `unreviewed` are derived by the runtime from durable state (`ready()` and the
  * live review path); they are never supplied by a caller's claim.
  */
-export interface MissionFingerprintTask {
+interface MissionFingerprintTask {
   id: string
   status: Task['status']
   /** The attempt owner only; a planned assignee is not an observed owner. */
@@ -93,7 +93,7 @@ export function missionFingerprint(board: MissionFingerprintBoard): string {
 export const BOARD_DELTA_POSTS = 3
 
 /** Extra lease headroom per allowed output token while a model stream is observably live. */
-export const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
+const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
 
 /**
  * Bounded board projection. `full` is used only by the single-post read; every
@@ -118,7 +118,7 @@ export function postView(post: Post, now: number, full = false): Record<string, 
 }
 
 /** A board page shows a bounded body excerpt; the full body is read by postId. */
-export const BOARD_BODY_EXCERPT = 600
+const BOARD_BODY_EXCERPT = 600
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 

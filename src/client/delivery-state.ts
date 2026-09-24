@@ -8,7 +8,7 @@ export interface DeliveryObservation {
   snapshot?: Snapshot
   result?: DeliveryApplication
 }
-export interface DeliveryState { applied: boolean; result?: DeliveryApplication }
+interface DeliveryState { applied: boolean; result?: DeliveryApplication }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 function strings(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === 'string') }
@@ -36,7 +36,7 @@ export function projectDeliveryState(snapshot: Snapshot, commit: string | undefi
   return { applied: false, ...(result?.status === 'conflicts' ? { result } : {}) }
 }
 
-export type DeliveryCheck = { kind: 'missing' } | { kind: 'applied' | 'conflicts' | 'retry'; observation: DeliveryObservation }
+type DeliveryCheck = { kind: 'missing' } | { kind: 'applied' | 'conflicts' | 'retry'; observation: DeliveryObservation }
 /** A negative read unlocks an explicit user retry; it never sends another mutation itself. */
 export function checkDeliveryOutcome(baseSnapshot: Snapshot, commit: string | undefined, latest?: Snapshot): DeliveryCheck {
   if (!commit || !latest || latest.mission.id !== baseSnapshot.mission.id || deliverableCommit(latest) !== commit) return { kind: 'missing' }

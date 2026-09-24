@@ -12,7 +12,7 @@ declare module '@deepseek-ai/dsh-client-ui-chat/client' {
   interface ChatNodeDataMap { 'agent-swarm': Snapshot }
 }
 
-export interface SwarmCardState { snapshot?: Snapshot }
+interface SwarmCardState { snapshot?: Snapshot }
 
 /** 0.1.7 flags the tool-role message itself; 0.1.5 flags the one tool-result block it carries. */
 function isErrorResult(message: { isError?: boolean; content: readonly { type: string; isError?: boolean }[] }): boolean {

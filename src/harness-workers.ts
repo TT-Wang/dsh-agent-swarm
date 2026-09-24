@@ -76,7 +76,7 @@ export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: st
   return prune
 }
 
-export interface HarnessWorkerOptions {
+interface HarnessWorkerOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
@@ -122,11 +122,11 @@ export interface HarnessWorkerOptions {
   checkConcurrency?: number
 }
 /** The confinement surface a declared verification check must pass through. */
-export interface VerificationSandbox {
+interface VerificationSandbox {
   /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
   confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
 }
-export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
+interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
 /**
  * F-29: run a declared check only under FULL host enforcement. A partial
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
@@ -146,7 +146,7 @@ export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: stri
  * is the member's own scratch root; `TMP`/`TEMP` carry the same root for hosts
  * that read those names instead.
  */
-export type SessionEnvironment = { TMPDIR: string; TMP: string; TEMP: string }
+type SessionEnvironment = { TMPDIR: string; TMP: string; TEMP: string }
 interface Composition {
   version: 1
   sessionId: string
@@ -296,7 +296,7 @@ export function assertCompositionScratch(value: unknown, expectedTmpdir: string,
   throw new Error('Worker composition scratch root is invalid or belongs to a different member')
 }
 /** The round-16 scratch root of one (mission, member) pair, tolerated on resume only. */
-export function legacyScratchRoot(workspaces: Workspaces, missionId: string, memberId: string): string {
+function legacyScratchRoot(workspaces: Workspaces, missionId: string, memberId: string): string {
   return path.join(path.dirname(workspaces.metadataPath(missionId, memberId)), 'scratch', memberId)
 }
 
@@ -1161,5 +1161,3 @@ export class HarnessWorkers implements WorkerAdapter {
     })()
   }
 }
-
-export { HarnessWorkers as HarnessWorkerAdapter }

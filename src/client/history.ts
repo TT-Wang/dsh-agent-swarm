@@ -1,8 +1,8 @@
 /** Cold native inspection projected by worker-history RPC; data stays inert text. */
-export interface HistoryEntry { event: { seq: number; type: string; data: unknown; timestamp?: number; createdAt?: number } }
+interface HistoryEntry { event: { seq: number; type: string; data: unknown; timestamp?: number; createdAt?: number } }
 export interface HistoryPage { events: HistoryEntry[]; hasMore: boolean }
-export interface TranscriptState { sessionId?: string; title?: string; entries: HistoryEntry[]; loading: boolean; hasMore: boolean; error?: string }
-export type ReadHistory = (sessionId: string, beforeSeq?: number) => Promise<HistoryPage>
+interface TranscriptState { sessionId?: string; title?: string; entries: HistoryEntry[]; loading: boolean; hasMore: boolean; error?: string }
+type ReadHistory = (sessionId: string, beforeSeq?: number) => Promise<HistoryPage>
 
 /** On-demand, paginated cold transcript; no session activation or list writes. */
 export class WorkerHistory {

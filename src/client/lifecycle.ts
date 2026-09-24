@@ -14,7 +14,7 @@
  *    mounts during unload cannot leave a poller behind;
  *  - nothing in this file starts work: registration is bookkeeping only.
  */
-export interface Disposable { dispose(): void }
+interface Disposable { dispose(): void }
 export class DisposalRegistry {
   private items = new Set<Disposable>()
   private closed = false

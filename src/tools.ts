@@ -34,7 +34,7 @@ export const MANAGEMENT_TOOLS: readonly string[] = OWNER_ONLY_TOOLS
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
 /** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */
-export const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
+const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
 export type SwarmRole = 'entry' | 'owner' | 'historical-owner' | 'worker' | 'none'
 /** Global tool names hidden from a session in the given role. */
 export function hiddenToolsFor(role: SwarmRole): string[] {
@@ -48,7 +48,7 @@ export function hiddenToolsFor(role: SwarmRole): string[] {
 }
 
 /** Shared task semantics for primary planning and worker proposals. */
-export const TASK_PLANNING_RULES = `scope contains only repository-relative paths: exact files, directory prefixes ending in /, or ** only when the authorized task covers the entire repository. Put read-only restrictions, coverage instructions, methodology and other prose in objective/acceptance, never in scope; preserve those instructions when correcting paths. Do not broaden scope to make validation pass.
+const TASK_PLANNING_RULES = `scope contains only repository-relative paths: exact files, directory prefixes ending in /, or ** only when the authorized task covers the entire repository. Put read-only restrictions, coverage instructions, methodology and other prose in objective/acceptance, never in scope; preserve those instructions when correcting paths. Do not broaden scope to make validation pass.
 Choose kind from the deliverable: research includes read-only code audits, analysis and synthesis of reports from accepted research dependencies. Report synthesis does not require a code integration task. Research and synthesis must publish their own current-attempt findings backed by host-recorded tool runs before submission; citing earlier task IDs alone is insufficient. implementation changes code; integration assembles or delivers code artifacts. Both code kinds require nonempty checks chosen from actual repository acceptance commands, which run on the clean committed artifact. Do not invent an always-passing check or relabel real code work as research to evade verification. verification names reviewOf and inherits the source artifact/checks; ordinary dependencies are other accepted prerequisites, not the reviewed source.
 A task validation error is feedback for you to repair and retry the same request or proposal, not a request for the user to configure fields. Read every field diagnostic, inspect the repository if needed, preserve the user goal, task identity, acceptance and chosen budget, and retry with all required fields. Do not create a second mission to escape an error. End the turn only after successful launch/proposal or a concrete blocker you cannot resolve from available tools.`
 

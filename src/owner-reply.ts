@@ -35,7 +35,7 @@ interface Booking {
 }
 
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
-export function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking, attempt: number, limit: number): string {
+function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking, attempt: number, limit: number): string {
   return [
     `[owner_reply_missing] ${booking.from} asked a question that this turn did not answer (nudge ${attempt} of ${limit}).`,
     '',

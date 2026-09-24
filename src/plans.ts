@@ -36,7 +36,7 @@ function keyed(value: unknown, label: string): Map<string, Record<string, unknow
 }
 
 /** One declared check with the plan location the launch preflight cites. */
-export interface DeclaredPlanCheck { command: string; location: string }
+interface DeclaredPlanCheck { command: string; location: string }
 
 /** The checks a plan declares, flattened in task order, each with its `tasks[<key>].checks[<index>]` location. */
 export function declaredPlanChecks(tasks: readonly Pick<PlanTask, 'key' | 'checks'>[]): DeclaredPlanCheck[] {
@@ -66,7 +66,7 @@ export function checkSyntaxDetail(declared: readonly DeclaredPlanCheck[], issues
  */
 const CATEGORY_PRECEDENCE: readonly PolicyErrorCategory[] = ['authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'validation_error', 'tool_error']
 
-export interface PlanValidationOptions {
+interface PlanValidationOptions {
   /**
    * Validate for launch: every task must declare `outputs` ([] allowed). A
    * staged draft may omit it; the launch that would store the task may not.

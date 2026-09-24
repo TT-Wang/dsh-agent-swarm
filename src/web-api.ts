@@ -20,7 +20,7 @@ import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
 /** Payload bound is additional to the native Connection carrier's HTTP limit. */
-export interface WebApiOptions {
+interface WebApiOptions {
   defaultBudget: Budget
   maxPayloadBytes: number
   /**

@@ -22,7 +22,7 @@ import { memberPhaseOf } from './projection.ts'
 import type { Delivery, Escalation, Evidence, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /** Owner-observable board, as durable records; no wall-clock value participates. */
-export interface FingerprintInput {
+interface FingerprintInput {
   mission: Pick<Mission, 'status'>
   tasks: readonly Task[]
   members: readonly Member[]
@@ -40,11 +40,6 @@ const byId = <T extends { id: string }>(left: T, right: T): number => (left.id <
 export function liveCarrier(tasks: readonly Task[], dependencyId: string, seen: Set<string> = new Set()): Task | undefined {
   if (seen.has(dependencyId)) return undefined
   return taskGraphIndex(tasks).effective(dependencyId)
-}
-
-/** Whether one dependency reference is satisfied by an accepted live carrier. */
-export function dependencyAccepted(tasks: readonly Task[], dependencyId: string): boolean {
-  return liveCarrier(tasks, dependencyId)?.status === 'accepted'
 }
 
 /** A submitted task's live review path: the scheduler's one live-review rule (`liveReviewFor`). */
@@ -123,7 +118,7 @@ function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pe
 }
 
 /** Compatibility projection of the aggregate mission task safety limit. */
-export interface ProposalAllowance {
+interface ProposalAllowance {
   limit: number
   ceiling: number
   /** Informational capacity; increasing workers never reduces proposal room. */
@@ -141,7 +136,7 @@ export function proposalAllowance(mission: Pick<Mission, 'budget'>, _members: re
 }
 
 /** One owner notice as the ledger exposes it: immutable, read-only projection. */
-export interface NoticeLedgerEntry {
+interface NoticeLedgerEntry {
   id: string
   missionId: string
   class: NoticeClass
@@ -165,7 +160,7 @@ export interface NoticeLedgerEntry {
 }
 
 /** Project one delivery into a ledger entry, or undefined when it is not an owner notice. */
-export function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
+function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
   if (delivery.notice === undefined || delivery.to !== 'owner') return undefined
   return {
     id: delivery.id, missionId: delivery.missionId, class: delivery.notice.class, dedupKey: delivery.notice.dedupKey,
@@ -211,7 +206,7 @@ export function hasNotice(deliveries: readonly Delivery[], match: { class: Notic
 }
 
 /** Per-member arena row: presence, activity, current attempt age and pending dependencies. */
-export interface ArenaMemberView {
+interface ArenaMemberView {
   id: string
   name: string
   role: string
@@ -240,7 +235,7 @@ export interface ArenaMemberView {
  * The read-only arena view: what the owner can observe without reading code.
  * It is a projection of durable records only; calling it writes nothing.
  */
-export interface ArenaView {
+interface ArenaView {
   missionId: string
   status: Mission['status']
   fingerprint: string

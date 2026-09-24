@@ -7,12 +7,12 @@ import { useCopy } from './locale.tsx'
 import { useVisibleClock } from './clock.ts'
 import { MissionProgress, ResultSummary } from './MissionProgress.tsx'
 
-export function useLiveWork(snapshot: Snapshot, connection: ConnectionState = 'connected', live = true, observedAt?: number): LiveWorkProjection {
+function useLiveWork(snapshot: Snapshot, connection: ConnectionState = 'connected', live = true, observedAt?: number): LiveWorkProjection {
   const { now, visible } = useVisibleClock(live && connection === 'connected' && snapshot.mission.status === 'active' && !snapshot.mission.budgetPause)
   return projectLiveWork(snapshot, { connection: live && visible ? connection : 'paused', now: live ? Math.max(now, observedAt ?? 0) : snapshot.mission.updatedAt, observedAt })
 }
 const duration = (value: number) => { const seconds = Math.max(0, Math.floor(value / 1000)); return seconds >= 60 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : `${seconds}s` }
-export function avatarState(row: LiveWorkRow): AgentAvatarState {
+function avatarState(row: LiveWorkRow): AgentAvatarState {
   return row.animate ? 'active' : row.state === 'stale' || row.state === 'quiet' ? 'stale'
     : ['paused', 'waiting'].includes(row.state) ? 'waiting' : ['complete', 'stopped'].includes(row.state) ? 'stopped' : 'idle'
 }
@@ -41,7 +41,7 @@ function MemberLine({ row, onOpen, compact = false }: { row: LiveWorkRow; onOpen
 }
 
 /** Native activity drives the busy display. No timers produce fake events or completion percentages. */
-export function LiveExecution({ view, onOpen }: { view: LiveWorkProjection; onOpen?: (member: Member) => void }) {
+function LiveExecution({ view, onOpen }: { view: LiveWorkProjection; onOpen?: (member: Member) => void }) {
   const t = useCopy(), [expanded, setExpanded] = useState(false)
   // Activity changes update a member in place instead of shuffling the list each tick.
   const active = view.rows.filter(row => row.task || row.activity).sort((a, b) => a.member.id.localeCompare(b.member.id))
@@ -60,7 +60,7 @@ export function LiveExecution({ view, onOpen }: { view: LiveWorkProjection; onOp
   </section>
 }
 
-export function LiveEvents({ view }: { view: LiveWorkProjection }) {
+function LiveEvents({ view }: { view: LiveWorkProjection }) {
   const t = useCopy()
   return <section className="sw-live-view sw-live-events" data-swarm-progress="" aria-label={t('Recent activity')}>
     <div className="sw-live-top"><h3>{t('Recent activity')}</h3><small>{t('Recorded events only')}</small></div>
@@ -72,7 +72,7 @@ export function LiveEvents({ view }: { view: LiveWorkProjection }) {
   </section>
 }
 
-export function LiveMembers({ view, onOpen, all = false }: { view: LiveWorkProjection; onOpen?: (member: Member) => void; all?: boolean }) {
+function LiveMembers({ view, onOpen, all = false }: { view: LiveWorkProjection; onOpen?: (member: Member) => void; all?: boolean }) {
   const t = useCopy(), [expanded, setExpanded] = useState(false)
   const rows = all ? view.rows : view.rows.filter(row => !row.task && !row.activity)
   return <section className="sw-live-view sw-live-team" data-swarm-team="">

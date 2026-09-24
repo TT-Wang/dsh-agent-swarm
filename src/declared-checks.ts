@@ -10,12 +10,12 @@
  */
 import type { SwarmRuntime } from './runtime.ts'
 import { randomUUID } from 'node:crypto'
-import type { Artifact, Member, Task, ToolRun } from './types.ts'
+import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Host verification timeout when a task chose none; matches the plugin config default. */
-export const DEFAULT_CHECK_TIMEOUT_MS = 60000
+const DEFAULT_CHECK_TIMEOUT_MS = 60000
 
 /** A rejection names at most this many failing checks; the rest are counted. */
 export const MAX_REPORTED_CHECK_FAILURES = 4
@@ -25,9 +25,6 @@ export function excerpt(value: unknown, limit: number): string {
   const raw = typeof value === 'string' ? value : JSON.stringify(value) ?? ''
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
-
-/** One declared check's outcome, as the host recorded it. */
-export type CheckResult = import('./types.ts').CheckResult
 
 export class DeclaredChecks {
   /**

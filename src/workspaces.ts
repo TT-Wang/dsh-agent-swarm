@@ -36,7 +36,7 @@ export const DEFAULT_VERIFICATION_DEPENDENCY_DIRS: readonly string[] = ['node_mo
  * installed toolchain.
  */
 export const SWARM_SCRATCH_DIRNAME = '.swarm-scratch'
-export interface WorkspaceOptions {
+interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
@@ -135,7 +135,7 @@ const DEFAULT_CHECK_CONCURRENCY = 2
  */
 export const HOST_GIT_TIMEOUT_MS = 5 * 60_000
 
-export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
+const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
 /**
  * ENV: the measured envelope plus the declared-check environment.
  * `environment` is the declared envelope the runtime delivers to the assignee
@@ -148,7 +148,7 @@ export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
  * of a check that actually ran live on its own `CheckResult` row
  * (`environment`, `attribution`), which is what the durable `tool_runs` record carries.
  */
-export interface DeclaredCheckEnvelope extends CheckEnvelope {
+interface DeclaredCheckEnvelope extends CheckEnvelope {
   environment: CheckEnvironment
   selfRunEnvironment: CheckEnvironment
 }
@@ -238,13 +238,13 @@ class CheckOutputScanner {
   }
 }
 /** ENV: what the scanner extracts from a stream before the call site labels it. */
-export interface CheckAttributionShot { stage: string | null; subtest: string | null; failingTests: string[]; failingTestCount: number; tapSummary: string[]; outputTruncated: boolean }
+interface CheckAttributionShot { stage: string | null; subtest: string | null; failingTests: string[]; failingTestCount: number; tapSummary: string[]; outputTruncated: boolean }
 /**
  * R11-19: a per-host FIFO semaphore over declared-check executions. A queued
  * verification is not lost and not run unconfined; its wait is measured so the
  * owner can see the queueing the lease has to survive.
  */
-export class CheckSemaphore {
+class CheckSemaphore {
   private active = 0
   private readonly waiters: Array<{ resolve: (handedOff: boolean) => void; reject: (error: unknown) => void; signal?: AbortSignal; onAbort?: () => void }> = []
   private maxActive = 0
@@ -312,7 +312,7 @@ function assertContainedSymlink(workspace: string, relative: string, target: str
   if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
 }
 /** One resolved component of a symlink-chain walk; a non-link entry stops resolution. */
-export type SymlinkChainEntry = { kind: 'file' } | { kind: 'directory' } | { kind: 'symlink'; target: string }
+type SymlinkChainEntry = { kind: 'file' } | { kind: 'directory' } | { kind: 'symlink'; target: string }
 /** Look up one workspace-relative path in the tree being validated, or undefined when absent. */
 export type SymlinkChainLookup = (relative: string) => Promise<SymlinkChainEntry | undefined>
 /** Bound a chain so a symlink cycle cannot spin; the kernel's own limit is platform-specific. */
@@ -379,14 +379,14 @@ interface TaskWorkspace { version: 1; missionId: string; memberId: string; works
  * belong to the provider behind the seam (its TERM-before-KILL staging, its
  * spill and drain bounds, its host-exit force-stop).
  */
-export interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
+interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
 /**
  * Resolve the seam at the moment a command starts. A resolver rather than a
  * value because the provider's mount order is the host's business: a workspace
  * built during plugin load must still execute commands once the service is
  * active, and a host that mounts none refuses at the point of use.
  */
-export type ProcessSeamSource = () => ProcessSeam | undefined
+type ProcessSeamSource = () => ProcessSeam | undefined
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean; subprocess?: ProcessSeamSource }
 /**
  * Worktree metadata mutation queues keyed by canonical git common dir. Git
@@ -602,7 +602,7 @@ function ambientEnvironment(): Record<string, string> {
   return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
 /** ENV: the scoped roots one declared check receives live under this checkout subdirectory. */
-export const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
+const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
 /**
  * R16-B: the temp root one declared check receives, beside the scoped cache
  * roots. The check sandbox is rooted at the disposable verification checkout, so

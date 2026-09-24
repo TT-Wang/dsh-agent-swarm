@@ -115,9 +115,9 @@ function attempt(value: unknown): boolean {
  * declarations in `types.ts`; reading them through a validating accessor keeps
  * this projection honest about untrusted payloads and independent of that landing.
  */
-export interface DeliveryTargetProjection { taskId: string; commit: string }
-export interface CompletionProjection { eligible: boolean; reason?: string }
-export interface AppliedDeliveryProjection { resultCommit: string; appliedAt?: number }
+interface DeliveryTargetProjection { taskId: string; commit: string }
+interface CompletionProjection { eligible: boolean; reason?: string }
+interface AppliedDeliveryProjection { resultCommit: string; appliedAt?: number }
 function projected(snapshot: Snapshot, key: string): unknown {
   return (snapshot as unknown as Record<string, unknown>)[key]
 }
@@ -399,7 +399,7 @@ export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): Retire
 const ACTOR_LABELS: Record<string, string> = {
   owner: 'Owner conversation', runtime: 'Runtime', config: 'Configuration', host: 'Harness',
 }
-export interface ActivityGroup { actor: string; name: string; member?: Member; events: SwarmEvent[] }
+interface ActivityGroup { actor: string; name: string; member?: Member; events: SwarmEvent[] }
 export function activityGroups(snapshot: Snapshot): ActivityGroup[] {
   const members = new Map(snapshot.members.map(member => [member.id, member]))
   const groups = new Map<string, ActivityGroup>()
