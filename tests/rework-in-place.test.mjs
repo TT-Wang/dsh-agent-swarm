@@ -101,7 +101,7 @@ test('a dependent admitted before the rejection runs on the reworked artifact, w
   assert.equal(reopened.reworkCount, 1)
   assert.deepEqual(reopened.rejections, [{ commit: rejected.artifact.commit, epoch: rejected.epoch, reviewTaskId: firstReview.id,
     reason: 'The artifact misses the acceptance criterion', evidenceIds: [refuted.id] }])
-  assert.match(reopened.handoff, new RegExp(`Rejected by review ${firstReview.id} at ${rejected.artifact.commit}: The artifact misses the acceptance criterion`), 'the author reads the rejection')
+  assert.ok(reopened.handoff.includes(`Rejected by review ${firstReview.id} at ${rejected.artifact.commit}; its reason is rejections[0].reason.`), 'the author is pointed at the rejection')
   assert.equal(f.workers.stopped.includes(f.author.id), false, 'the author holds no live attempt, so it is not stopped')
   const judged = f.current(firstReview)
   assert.equal(judged.status, 'pending', 'the rejecting review re-opens for the next submission')
@@ -279,6 +279,21 @@ test('the rework bound refuses with its exit, and raising maxRework through swar
   assert.equal(raised.maxRework, 3)
   assert.equal(raised.reworkCount, 3)
   assert.equal(raised.rejections.length, 3)
+})
+
+test('the reworking author reads each rejection reason once', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  const reasons = ['First rejection: ' + 'a'.repeat(400), 'Second rejection: ' + 'b'.repeat(400)]
+  for (const reason of reasons) {
+    await f.submit(source)
+    await f.reject(source, reason)
+    f.resume(source)
+  }
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const assignment = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.kind === 'assignment' && delivery.attemptId === claimed.attempt.id)
+  for (const reason of reasons) assert.equal(assignment.content.split(reason).length - 1, 1, 'the reason travels once, in rejections')
+  assert.deepEqual(JSON.parse(assignment.content).task.rejections.map(rejection => rejection.reason), reasons)
 })
 
 test('a budget-only amendment of a rejected task stores the ceiling and leaves it blocked; only a resume reworks it', async t => {

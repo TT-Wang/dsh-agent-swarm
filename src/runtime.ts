@@ -2378,7 +2378,8 @@ export class SwarmRuntime {
     if (author !== undefined) { task.assigneeId = author; task.plannedAssigneeId = author; task.assignmentMode = 'pinned' }
     delete task.artifact
     this.dropAttempt(task); task.epoch++
-    task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}: ${reason}\nRework it from that commit, then resubmit.`.trim()
+    // The reason is carried once, in `rejections`; the handoff points at it.
+    task.handoff = `${task.handoff ?? ''}\nRejected by review ${review.id} at ${commit}; its reason is rejections[${task.rejections.length - 1}].reason. Rework it from that commit, then resubmit.`.trim()
   }
   /**
    * A rework re-opens its source's review in place too: the rejecting review is
