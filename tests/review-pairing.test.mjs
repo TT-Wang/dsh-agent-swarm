@@ -14,7 +14,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { pairReviews, validatePlan } from '../lib/plans.js'
 import { registerTools } from '../lib/tools.js'
-import { DraftEditor } from '../lib/types/client/DraftEditor.js'
+import { DraftEditor, removeTask } from '../lib/types/client/DraftEditor.js'
 import { completionBlocker } from '../lib/types/client/projection.js'
 import { FakeClock, FakeWorkers, makeRuntime, makeRuntimeStub, taskOf } from './faults/harness.mjs'
 
@@ -229,6 +229,18 @@ test('the review override schema states the defaults the added review really tak
     assert.doesNotMatch(description, /acceptance and limits/, `${name}: the step ceiling is not this task's`)
     assert.match(description, /this task's acceptance and maxRecoveryAttempts, and the default maxSteps/, name)
   }
+})
+
+test('removing a deliverable in the draft editor removes the review that pairs it, so the next save is admitted', async t => {
+  const f = await fixture(t)
+  const { members: _members, ...rest } = plan(f.dir, { tasks: [deliverable({ key: 'build', title: 'Build' }), deliverable({ key: 'second', title: 'Second', dependencies: ['build'] })] })
+  const draft = f.runtime.createDraft(f.owner, { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) })
+  assert.deepEqual(draft.input.tasks.map(task => task.key), ['build', 'build-review', 'second', 'second-review'])
+  const edited = removeTask(draft.input, 'build')
+  assert.deepEqual(edited.tasks.map(task => [task.key, task.reviewOf ?? null, task.dependencies ?? []]), [['second', null, []], ['second-review', 'second', []]],
+    'the paired review goes with its source, and a dependency on the source is dropped')
+  const saved = f.runtime.updateDraft(f.owner, draft.id, draft.revision, edited)
+  assert.deepEqual(saved.input.tasks.map(task => task.key), ['second', 'second-review'])
 })
 
 test('swarm_stage and swarm_launch declare the review override, and the registered launch forwards it', async () => {
