@@ -123,7 +123,6 @@ test('submission and missing-review identity survive event-window truncation and
   assert.ok(submitted)
   assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), true)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
-  f.runtime.reviewPathReported.clear()
   assert.equal(f.runtime.latestSubmission(f.mission.id, task.id).seq, submitted.seq)
   assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), false)
 })

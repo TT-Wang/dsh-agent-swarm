@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { validatePlan } from '../lib/plans.js'
+import { pairReviews, validatePlan } from '../lib/plans.js'
 import { AdmissionError } from '../lib/admission.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
@@ -214,7 +214,9 @@ test('equivalent scope notation and duplicate review edges canonicalize without 
   assert.deepEqual(canonical.budget, before.budget)
   assert.deepEqual(f.input, before)
   const draft = f.runtime.createDraft(f.owner, f.input)
-  assert.deepEqual(f.runtime.drafts(f.owner)[0].input, JSON.parse(JSON.stringify(canonical)))
+  // The saved draft also carries the review the host adds for the unreviewed research task.
+  assert.deepEqual(f.runtime.drafts(f.owner)[0].input, JSON.parse(JSON.stringify(pairReviews(canonical))))
+  assert.deepEqual(draft.input.tasks.map(task => task.key), ['review', 'code', 'preparation', 'preparation-review'])
   assert.deepEqual(draft.input.tasks[0].dependencies, ['preparation'])
   assert.equal(f.workers.starts.length, 0)
 })

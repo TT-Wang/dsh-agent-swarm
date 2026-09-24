@@ -21,10 +21,10 @@ import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from '.
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { assignmentAllows, canBorrowTask } from './assignment.ts'
+import { canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
-import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
+import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
 import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
@@ -372,18 +372,6 @@ export class SwarmRuntime {
   private timer?: ReturnType<typeof setInterval>
   closed = false
   shuttingDown = false
-  /**
-   * Exact owner notices already sent for an unreviewable source. Automatic
-   * review admissions are read directly from durable task events; the set
-   * keeps a persistent blocker from waking the owner on
-   * every tick.
-   */
-  
-  /** Missing-review records already written, keyed by mission:source:submission seq. */
-  private readonly reviewPathReported = new Set<string>()
-  
-  
-  
   /** Open runtime transactions; a cached F(S) is not trusted inside one. */
   commitDepth = 0
   /** R11-15: bounded per-path shared-temp mentions, newest last. */
@@ -1434,8 +1422,7 @@ export class SwarmRuntime {
       const source = this.task(missionId, input.reviewOf)
       if (source.kind === 'verification') throw new PolicyError('verification_review_source_invalid', 'tool_error', 'Verification cannot review another verification task')
       if (source.status === 'cancelled' || source.status === 'accepted') throw new PolicyError('review_source_not_submitted', 'tool_error', `reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
-      const authors = this.authorIds(source)
-      if (input.assigneeId !== undefined && authors.has(input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
+      if (input.assigneeId !== undefined && !canOwnReview(source, input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
     // declared check. Acceptance is already inherited above; a check
@@ -1500,18 +1487,7 @@ export class SwarmRuntime {
     this.kick(missionId)
     return task
   }
-  
-  /**
-   * X1 (P0): current assignment and every actual prior owner cannot review this
-   * work. An unused initial preference is not added to history when borrowed;
-   * independence follows actual ownership, not a discarded planning preference.
-   */
-  authorIds(task: Task): Set<string> {
-    const ids = new Set(task.priorOwnerIds ?? [])
-    if (task.attempt?.ownerId !== undefined) ids.add(task.attempt.ownerId)
-    if (task.assigneeId !== undefined) ids.add(task.assigneeId)
-    return ids
-  }
+
 
   /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
   private declaredCheckEnvelope(): DeclaredCheckEnvelope | undefined {
@@ -1758,7 +1734,7 @@ export class SwarmRuntime {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind !== 'verification' || !task.reviewOf) throw new Error('[not_a_verification_task] This is not a verification task. Call `swarm_verify` with `taskId` and `verdict`, then retry.')
       const source = this.task(missionId, task.reviewOf)
-      if (source.status !== 'submitted' || !source.artifact || this.authorIds(source).has(member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
+      if (source.status !== 'submitted' || !source.artifact || !canOwnReview(source, member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
       // The reviewer's own reason is required and bounded; the check-failure
       // report is appended to it, never substituted for it.
       this.bounded(input.reason)
@@ -2310,7 +2286,7 @@ export class SwarmRuntime {
     // author of the reviewed source, so a handoff that skipped the check left the
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
-    if (input.to !== undefined && task.reviewOf !== undefined && this.authorIds(this.task(missionId, task.reviewOf)).has(input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    if (input.to !== undefined && task.reviewOf !== undefined && !canOwnReview(this.task(missionId, task.reviewOf), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
@@ -2440,13 +2416,9 @@ export class SwarmRuntime {
    * scheduling and the owner notice agree on what "has a review" means.
    */
   private liveReview(missionId: string, source: Task): Task | undefined {
-    const author = source.attempt?.ownerId ?? source.assigneeId
-    const authors = this.authorIds(source)
     const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
-    const tasks = this.store.list('tasks', missionId)
-    return liveReviewFor(tasks, source.id, author, live,
-      review => (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
-        && [...live].some(memberId => !authors.has(memberId) && assignmentAllows(review, memberId, tasks)))
+    return liveReviewFor(this.store.list('tasks', missionId), source, live,
+      review => review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
   }
   /**
    * F2/R11-16: why a freshly submitted artifact has no review path, or
@@ -2496,13 +2468,10 @@ export class SwarmRuntime {
   }
   /** Record the missing review once per submission; false when it is already recorded. */
   private reportMissingReview(mission: Mission, source: Task, submissionSeq: number): boolean {
-    const key = `${mission.id}:${source.id}:${submissionSeq}`
-    // S5: the durable `task/review-missing` event for this exact submission is
-    // the gate; this re-read makes the in-memory set a pure cache.
+    // S5: the durable `task/review-missing` event for this exact submission is the gate.
     if (this.missingReviewRecorded(mission.id, source.id, submissionSeq)) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
-    this.reviewPathReported.add(key)
     return true
   }
   /**
@@ -2543,9 +2512,8 @@ export class SwarmRuntime {
     if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
-    const authors = this.authorIds(source)
     const author = source.attempt?.ownerId ?? source.assigneeId
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && !authors.has(member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable. */
@@ -2846,11 +2814,14 @@ export class SwarmRuntime {
     })
     return request
   }
-  /** Automatic requests must contain a complete independently verifiable topology. */
+  /**
+   * Automatic requests must contain a complete topology. The one independent
+   * review each deliverable needs is the host's: `pairReviews` adds it unless
+   * the plan names one, so the planner never has to author the pairing.
+   */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
-    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
-    // New automatic plans use preferences; old/manual task rows keep their binding.
-    for (const task of plan.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
+    const options = { launch: true, dependencyDirs: this.config.verificationDependencyDirs }
+    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, options)
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
     const issues: string[] = []
     if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
@@ -2861,11 +2832,7 @@ export class SwarmRuntime {
       if (task.maxRecoveryAttempts === undefined) issues.push(`tasks[${task.key}].maxRecoveryAttempts is required: choose the allowed automatic recovery attempts`)
       if (task.kind !== 'verification' && task.checks?.length && task.checkTimeoutMs === undefined) issues.push(`tasks[${task.key}].checkTimeoutMs is required because it has checks`)
     }
-    for (const source of sources) {
-      if (!source.assigneeKey || !plan.tasks.some(review => review.kind === 'verification' && review.reviewOf === source.key && review.assigneeKey && review.assigneeKey !== source.assigneeKey)) {
-        issues.push(`tasks[${source.key}] requires an assigned independent verification task (kind verification, reviewOf ${source.key}, assigneeKey different from ${source.assigneeKey ?? 'its assignee'})`)
-      }
-    }
+    for (const source of sources) if (source.assigneeKey === undefined) issues.push(`tasks[${source.key}].assigneeKey is required: choose the member who delivers this task`)
     const missingCriteria = plan.acceptance.filter(criterion => !sources.some(task => task.acceptance.includes(criterion)))
     if (missingCriteria.length) issues.push(`Deliverables must cover every mission acceptance criterion. Missing exact acceptance strings: ${JSON.stringify(missingCriteria)}. Copy each missing string into the acceptance array of the deliverable task that satisfies it; a paraphrase does not match.`)
     const implementations = sources.filter(task => task.kind === 'implementation')
@@ -2888,7 +2855,10 @@ export class SwarmRuntime {
       issues.push(`The integration task must depend on implementation ${implementations[0]!.key}, or be omitted so the reviewed implementation is delivered directly`)
     }
     if (issues.length) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
-    return plan
+    const paired = pairReviews(plan)
+    // New automatic plans use preferences; old/manual task rows keep their binding.
+    for (const task of paired.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
+    return paired
   }
   /**
    * Launch one validated generated plan under the saved human request's workspace
@@ -3020,7 +2990,9 @@ export class SwarmRuntime {
     return draft
   }
   private prepareDraftInput(input: PlanInput) {
-    const admitted = validatePlan(input, { dependencyDirs: this.config.verificationDependencyDirs })
+    // The saved draft already shows the review the host adds for each deliverable.
+    const options = { dependencyDirs: this.config.verificationDependencyDirs }
+    const admitted = pairReviews(validatePlan(input, options))
     const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
     // Store the authorization anchor on the draft, outside its canonical plan.
     const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
@@ -3183,7 +3155,8 @@ export class SwarmRuntime {
           || (current.planningEpoch ?? 1) !== (automatic!.planningEpoch ?? 1))) throw new PolicyError('plan_assembly_interrupted', 'conflict_error', 'Plan assembly was interrupted')
       }
       assertCurrent()
-      const input = automatic ? this.automaticPlan(draft.input, automatic) : validatePlan(draft.input, { launch: true, dependencyDirs: this.config.verificationDependencyDirs })
+      const launching = { launch: true, dependencyDirs: this.config.verificationDependencyDirs }
+      const input = automatic ? this.automaticPlan(draft.input, automatic) : pairReviews(validatePlan(draft.input, launching))
       draft.input = input
       draft.advisories = planAdvisories(input).slice(0, 20).map(formatDiagnostic)
       // P4: the parse-only check preflight runs on EVERY launch path, at the one
@@ -3660,7 +3633,7 @@ export class SwarmRuntime {
       else {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
-        if (task.reviewOf && this.authorIds(this.task(missionId, task.reviewOf)).has(member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }

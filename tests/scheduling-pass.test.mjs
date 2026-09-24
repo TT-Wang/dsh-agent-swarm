@@ -967,7 +967,6 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     f.runtime.idleSignals.clear()
     f.runtime.startFailures.clear()
     f.runtime.budgetStops.clear()
-    f.runtime.reviewPathReported.clear()
     f.runtime.fingerprintCache.clear()
     const task = f.propose()
     const running = await ticksUntil(f, () => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,

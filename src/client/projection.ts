@@ -1,6 +1,6 @@
 import type { Member, Snapshot, SwarmEvent, Task, Evidence } from '../types.ts'
 import { taskGraphIndex, selectAcceptedDelivery } from '../task-graph.ts'
-import { assignmentAllows } from '../assignment.ts'
+import { assignmentAllows, canOwnReview } from '../assignment.ts'
 
 export type BoardLane = 'ready' | 'queued' | 'active' | 'review' | 'blocked' | 'cancelled' | 'done'
 /**
@@ -57,8 +57,7 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
     if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
     if (members !== undefined) {
       const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
-      const authors = new Set([...(source?.priorOwnerIds ?? []), source?.attempt?.ownerId, source?.assigneeId])
-      if (!members.some(member => member.status !== 'stopped' && !authors.has(member.id)
+      if (!members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
         && assignmentAllows(task, member.id, tasks))) return 'blocked'
     }
     return 'ready'

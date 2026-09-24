@@ -9,7 +9,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { selectAcceptedDelivery } from './task-graph.ts'
-import { assignmentAllows, canBorrowTask } from './assignment.ts'
+import { assignmentAllows, canBorrowTask, canOwnReview } from './assignment.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
@@ -510,7 +510,7 @@ export class Scheduling {
     if (task.reviewOf) {
       const source = this.rt.task(task.missionId, task.reviewOf)
       if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
-      if (this.rt.authorIds(source).has(member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
+      if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
     }
     return undefined
   }
@@ -537,7 +537,7 @@ export class Scheduling {
           || (task.reviewOf !== undefined && (() => {
             const source = this.rt.task(mission.id, task.reviewOf)
             return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
-              || !live.some(member => assignmentAllows(task, member.id, tasks) && !this.rt.authorIds(source).has(member.id))
+              || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
           })())
           || (task.assigneeId !== undefined && !live.some(member => assignmentAllows(task, member.id, tasks)))
         if (stuck) { dead.add(task.id); changed = true }

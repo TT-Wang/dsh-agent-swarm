@@ -1,5 +1,5 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
-import { assignmentAllows, type AssignmentCandidate } from './assignment.ts'
+import { assignmentAllows, canOwnReview, type AssignmentCandidate, type AuthoredTask } from './assignment.ts'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
@@ -53,10 +53,10 @@ export interface ReviewPathCandidate extends AssignmentCandidate {
 }
 
 /** A live review needs at least one live member allowed to own it independently. */
-export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], sourceId: string, authorId: string | undefined, liveMemberIds: ReadonlySet<string>,
+export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], source: AuthoredTask & { id: string }, liveMemberIds: ReadonlySet<string>,
   isLiveStatus: (review: T) => boolean = review => review.status === 'pending' || review.status === 'running'): T | undefined {
-  return reviews.find(review => review.kind === 'verification' && review.reviewOf === sourceId && isLiveStatus(review)
-    && [...liveMemberIds].some(memberId => memberId !== authorId && assignmentAllows(review, memberId, reviews)))
+  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id && isLiveStatus(review)
+    && [...liveMemberIds].some(memberId => canOwnReview(source, memberId) && assignmentAllows(review, memberId, reviews)))
 }
 
 /* ------------------------------------------------------------------------- *

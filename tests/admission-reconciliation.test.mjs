@@ -175,9 +175,11 @@ test('existing cycle, missing-review, uncovered-acceptance and integration-topol
   )
   await attempt(topology, /several implementation tasks require a final integration/, 'command-topology')
 
-  const unreviewed = automatic()
-  unreviewed.tasks = [unreviewed.tasks[0]]
-  await attempt(unreviewed, /requires an assigned independent verification task/, 'command-unreviewed')
+  // A deliverable without a review is no longer a rejection: the host adds it
+  // (tests/review-pairing.test.mjs). An unassigned deliverable still is.
+  const unassigned = automatic()
+  unassigned.tasks[0].assigneeKey = undefined
+  await attempt(unassigned, /tasks\[deliver\]\.assigneeKey is required/, 'command-unassigned')
 })
 
 /**
