@@ -483,10 +483,8 @@ const GATE_TESTS = {
     try {
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
-      const statePath = join(g.dir, 'swarm.sqlite')
       await g.runtime.dispose()
-      // fixture gap: setup() returns no RuntimeConfig to reopen its state file with.
-      restarted = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10, messageChars: 16000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, new FakeWorkers())
+      restarted = new SwarmRuntime(g.runtime.config, new FakeWorkers())
       assert.equal(restarted.store.get('members', g.author.id).startFailures, 2, 'the count survives a restart')
       restarted.onStartFailure(restarted.mission(g.mission.id), restarted.store.get('members', g.author.id), new Error('injected start failure'))
       assert.equal(restarted.store.get('members', g.author.id).status, 'stopped', 'and the restarted runtime retires on the third failure')

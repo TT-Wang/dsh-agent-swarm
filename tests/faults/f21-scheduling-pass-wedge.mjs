@@ -50,11 +50,8 @@
  * injects the wedge the runtime actually bounds.
  */
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
-import { realpath, rm } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { FakeWorkers, SwarmRuntime, MISSION_ACCEPTANCE, budget, setup, eventually, events, runScenario, taskOf } from './harness.mjs'
-import { tempDirectory } from '../temp-root.mjs'
+import { FakeWorkers, MISSION_ACCEPTANCE, budget, setup, makeRuntime, eventually, events, runScenario, taskOf } from './harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const wedgeEvents = (runtime, missionId) => events(runtime, missionId, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
@@ -92,11 +89,10 @@ class SlowPrepareWorkers extends FakeWorkers {
 /** I5: the first naming tick runs while a second connection holds the SQLite writer lock. */
 async function namingCommitFailsOnce() {
   const workers = new WedgeStartWorkers()
-  const dir = await realpath(await tempDirectory('swarm-faults-f21-busy-'))
-  const statePath = join(dir, 'swarm.sqlite')
-  // fixture gap: setup/makeRuntime cannot pass SwarmRuntime's store options (busyTimeoutMs, writerAttempts, writerDelayMs) nor export the default RuntimeConfig.
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
-    stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 1_500 }, workers, { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 })
+  // fixture gap: makeRuntime takes a node:test context and a scenario has none, so its cleanup is collected here and run in finally.
+  let cleanup
+  const { dir, config: { statePath }, runtime } = await makeRuntime({ after: fn => { cleanup = fn } }, { workers,
+    config: { stallPassTimeoutMs: 60, stallPasses: 30, workerStartTimeoutMs: 1_500 }, storeOptions: { busyTimeoutMs: 5, writerAttempts: 1, writerDelayMs: 0 } })
   const tickFailures = []
   const write = process.stderr.write.bind(process.stderr)
   process.stderr.write = (chunk, ...rest) => { if (/tick failed/.test(String(chunk))) { tickFailures.push(String(chunk)); return true } return write(chunk, ...rest) }
@@ -132,8 +128,7 @@ async function namingCommitFailsOnce() {
     return { namedAfterFailedCommit: true, runId: event.data.runId, escalations: 1 }
   } finally {
     process.stderr.write = write
-    await runtime.dispose()
-    await rm(dir, { recursive: true, force: true })
+    await cleanup()
   }
 }
 

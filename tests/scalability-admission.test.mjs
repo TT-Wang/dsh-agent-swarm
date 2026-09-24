@@ -8,13 +8,11 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { AdmissionRefusedError, decideAdmission, defaultLimitRules, effectiveLimit, scopeKeysOverlap } from '../lib/scheduler.js'
 import { SwarmStore } from '../lib/store.js'
 import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
-import { tempDirectory } from './temp-root.mjs'
 
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 32 }
 const owner = { sessionId: 'd8-owner' }
@@ -24,15 +22,7 @@ async function fixture(t, options = {}) {
   const workers = new FakeWorkers({ artifact: { commit: 'inert', baseCommit: 'inert', workspace: '/inert', changes: [] }, checks: [],
     async prepareWorkspace(mission, memberId) { return `/inert/${memberId}` } })
   const config = { tickMs: options.tickMs ?? 3600000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined }
-  let root, runtime, settings
-  if (options.storeOptions === undefined) ({ dir: root, runtime, config: settings } = await makeRuntime(t, { workers, config }))
-  else {
-    // fixture gap: makeRuntime takes no SwarmStore options, so the busy-writer runtime is built on its own temp dir here.
-    root = await realpath(await tempDirectory('swarm-d8-admission-'))
-    settings = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, ...config }
-    runtime = new SwarmRuntime(settings, workers, options.storeOptions)
-    t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
-  }
+  const { dir: root, runtime, config: settings } = await makeRuntime(t, { workers, config, storeOptions: options.storeOptions })
   await runtime.start()
   return { root, runtime, workers, config: settings }
 }
@@ -167,12 +157,12 @@ test('recordAdmission merges counts in place for a repeated decision identity', 
 })
 
 test('a classified writer conflict becomes a durable writer_busy row before the retried admission', async t => {
-  const { runtime, root } = await fixture(t, { storeOptions: { busyTimeoutMs: 1, writerAttempts: 2, writerDelayMs: 1 } })
+  const { runtime, config } = await fixture(t, { storeOptions: { busyTimeoutMs: 1, writerAttempts: 2, writerDelayMs: 1 } })
   const m = await mission(runtime)
   const stream = runtime.workstream(owner, m.id, { title: 'w', objective: 'o' })
   const alice = await addWorker(runtime, m, 'alice')
   const task = propose(runtime, m, stream, alice, 'src/a/')
-  const blocker = new DatabaseSync(join(root, 'state.sqlite'))
+  const blocker = new DatabaseSync(config.statePath)
   blocker.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE')
   try {
     await assert.rejects(runtime.claim(actorFor(alice), m.id, task.id), error => error instanceof AdmissionRefusedError && error.reason === 'writer_busy')
