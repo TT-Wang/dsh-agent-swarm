@@ -5,11 +5,11 @@ import { StringDecoder } from 'node:string_decoder'
 import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
+import { reauthorizeWorkspace } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
-import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
+import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline, WorkspaceGrantSnapshot } from './types.js'
 export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
 
 /** Full-repository path inventories are metadata, not user-visible check output. */

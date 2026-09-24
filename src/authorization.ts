@@ -9,32 +9,12 @@
  * the profile/`cordis.patch.yml` and restarting the host.
  *
  * This module is deliberately free of any dependency on the runtime, the store
- * or the tool registry: it is the pure authorization predicate every admission
+ * or the tool registry: it holds the one authorization rule every admission
  * and re-validation site shares, so no call site can quietly weaken it.
  */
 import { realpath } from 'node:fs/promises'
 import { isAbsolute, relative, sep } from 'node:path'
-
-/** One human-configured root. `note` and `expiresAt` are audit metadata only. */
-export interface WorkspaceGrant {
-  /** Absolute configured root, exactly as the human wrote it. */
-  path: string
-  /** Human-readable reason shown in the audit event; never consulted by the check. */
-  note?: string
-  /** Absolute epoch milliseconds after which the root is no longer consulted. */
-  expiresAt?: number
-}
-
-/**
- * The roots as loaded once at start. `loadedAt` makes the "loaded once"
- * property auditable; `unresolved` names configured roots that do not resolve
- * or were already expired at start (a root must exist to authorize anything).
- */
-export interface WorkspaceGrantSnapshot {
-  grants: readonly WorkspaceGrant[]
-  loadedAt: number
-  unresolved: readonly string[]
-}
+import type { WorkspaceGrant, WorkspaceGrantSnapshot } from './types.ts'
 
 /** Why a workspace was accepted; `session` means the calling session's own cwd. */
 export type WorkspaceAuthorizationSource = 'session' | 'grant'
@@ -112,22 +92,29 @@ function activeGrants(loaded: WorkspaceGrantSnapshot, now: number): WorkspaceGra
 }
 
 /**
- * The single containment check every admission and re-validation site uses.
- * Both sides are realpath-resolved before comparison, so a symlinked root or
- * workspace is judged by where it actually points; prefix confusion and
- * traversal cannot pass because containment is decided on resolved path
- * components, not string prefixes.
+ * The one matching rule: the most specific (longest) configured root that is
+ * still active at `now` and contains `path`. Admission, the synchronous create
+ * path and re-validation all select through it, so nested roots can never make
+ * them disagree.
+ */
+export function grantFor(path: string, loaded: WorkspaceGrantSnapshot, now: number): WorkspaceGrant | undefined {
+  return loaded.grants
+    .filter(grant => (grant.expiresAt === undefined || grant.expiresAt > now) && isContained(grant.path, path))
+    .sort((left, right) => right.path.length - left.path.length)[0]
+}
+
+/**
+ * Admission: the requested path is realpath-resolved before `grantFor`, so a
+ * symlinked root or workspace is judged by where it actually points; prefix
+ * confusion and traversal cannot pass because containment is decided on
+ * resolved path components, not string prefixes.
  */
 export async function authorizeWorkspace(requested: string, sessionCwd: string | undefined, loaded: WorkspaceGrantSnapshot, now = Date.now()): Promise<WorkspaceAuthorization> {
   const workspace = await realpath(requested).catch(() => undefined)
   if (workspace === undefined) return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded, 'the path does not exist or cannot be resolved') }
   const session = typeof sessionCwd === 'string' && sessionCwd.trim() !== '' ? await realpath(sessionCwd).catch(() => undefined) : undefined
   if (session !== undefined && workspace === session) return { ok: true, workspace, source: 'session', grantRoot: session }
-  // The most specific (longest) matching root wins, so admission, re-derivation
-  // and revocation fencing all agree when configured roots are nested.
-  const grant = activeGrants(loaded, now)
-    .filter(candidate => isContained(candidate.path, workspace))
-    .sort((left, right) => right.path.length - left.path.length)[0]
+  const grant = grantFor(workspace, loaded, now)
   if (grant !== undefined) return { ok: true, workspace, source: 'grant', grantRoot: grant.path, grant }
   return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded) }
 }

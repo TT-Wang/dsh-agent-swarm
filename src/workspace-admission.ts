@@ -10,7 +10,7 @@
 import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
-import { isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
+import { grantFor, isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
@@ -392,7 +392,6 @@ export class WorkspaceAdmission {
     if (!isContained(claimed, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claimed} [${WORKSPACE_AUTHORIZATION_CODE}]`)
     const grants = this.rt.config.grants
     if (this.rt.config.authorizeWorkspace === undefined || grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
-    const now = this.rt.now()
     // A session authorization wins over a root that happens to contain the
     // session cwd: the human authorized that directory directly, so removing a
     // root must not fence it. The admission site computed this source.
@@ -401,9 +400,7 @@ export class WorkspaceAdmission {
     // workspace — never the caller's claim. A caller that fabricates a wider
     // root therefore cannot record it, and a fabricated narrower root is
     // refused by the containment check above.
-    const matched = grants.grants
-      .filter(grant => isContained(grant.path, workspace) && (grant.expiresAt === undefined || grant.expiresAt > now))
-      .sort((left, right) => right.path.length - left.path.length)[0]
+    const matched = grantFor(workspace, grants, this.rt.now())
     if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
     if (claimed === workspace) return { grantRoot: claimed, source: source ?? 'session' }
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)

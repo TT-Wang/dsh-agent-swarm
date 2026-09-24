@@ -1220,12 +1220,15 @@ export interface RuntimeConfig {
 }
 
 /**
- * Structural mirror of the authorization types in `src/authorization.ts`. They
- * live here so the browser typecheck (which includes this file) never pulls in
- * Node built-ins; the runtime values are assignable to these shapes.
+ * One human-configured root and the set loaded at start. They live here, not in
+ * `src/authorization.ts`, so the browser typecheck (which includes this file)
+ * never pulls in Node built-ins. `note` is audit metadata; past `expiresAt`
+ * (epoch ms) a root is no longer consulted. `unresolved` names configured roots
+ * that did not resolve or had already expired at start.
  */
 export interface WorkspaceGrant { path: string; note?: string; expiresAt?: number }
 export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; loadedAt: number; unresolved: readonly string[] }
+/** Structural mirror of the `authorizeWorkspace` result, for `RuntimeConfig.authorizeWorkspace`. */
 export interface WorkspaceAuthorization {
   ok: boolean
   workspace?: string
