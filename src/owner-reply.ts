@@ -26,8 +26,8 @@ import { emitGuardTerminal } from './refusals.ts'
  */
 export interface OwnerReplyOptions {
   /**
-   * `nudge` (default) records the miss and instructs; `block` additionally
-   * refuses the owner's next step while the receipt stays open.
+   * `nudge` records the miss and instructs. Legacy `block` is accepted as an
+   * alias: the owner control channel must remain available to answer it.
    */
   guard: 'nudge' | 'block'
   /** Nudges spent on one question before the guard terminal; default 2. */
@@ -40,7 +40,8 @@ interface Booking {
   from: string
   taskId?: string
   content: string
-  deliveredAt: number
+  deliveredAt?: number
+  consumedAt?: number
 }
 
 /** The nudge body: the question, the exact call, and the rule the owner must know. */
@@ -58,8 +59,6 @@ export function ownerReplyNudge(missionId: string, delivery: Delivery, booking: 
 
 export class OwnerReplyGuard {
   private readonly bookings = new Map<string, Map<string, Booking>>()
-  private readonly blocking = new Map<string, Set<string>>()
-  private readonly attached = new Set<string>()
   private readonly removals: Array<() => void> = []
   private closed = false
 
@@ -73,9 +72,8 @@ export class OwnerReplyGuard {
 
   dispose(): void {
     this.closed = true
-    for (const remove of this.removals.splice(0)) remove()
+    for (const remove of this.removals.splice(0)) { try { remove() } catch { /* Continue releasing the other registrations. */ } }
     this.bookings.clear()
-    this.blocking.clear()
   }
 
   /**
@@ -86,27 +84,49 @@ export class OwnerReplyGuard {
   observe(sessionId: string, type: string, data?: unknown): void {
     if (this.closed) return
     if (type === 'user/message') this.startTurn(sessionId, data)
-    else if (type === 'turn/end') this.endTurn(sessionId)
+    else if (type === 'turn/end') {
+      const reason = (data as { reason?: { kind?: string } } | undefined)?.reason?.kind
+      if (reason === 'completed') this.endTurn(sessionId)
+      else this.bookings.delete(sessionId)
+    }
   }
 
   /** Owner missions that are still live for this session. */
   private ownerMissions(sessionId: string): Mission[] {
-    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !this.rt.isMissionTerminal(mission))
+    return this.rt.store.list('missions').filter(mission => mission.ownerSessionId === sessionId && !this.rt.isMissionTerminal(mission) && mission.status !== 'paused')
   }
 
   /**
    * Book the questions this turn is expected to settle: delivered before it
    * started and still open. A turn with no such question books nothing, so an
-   * ordinary owner turn is never nudged.
+   * ordinary owner turn is never nudged. The turn starts when its message is
+   * observed, on the runtime clock that stamps `deliveredAt`, never on the
+   * host's message `createdAt`: two clocks cannot order one question.
    */
   private startTurn(sessionId: string, data?: unknown): void {
-    const at = typeof (data as { createdAt?: unknown } | undefined)?.createdAt === 'number' ? (data as { createdAt: number }).createdAt : Date.now()
-    const booked = new Map<string, Booking>()
+    const at = this.rt.now()
+    const source = (data as { source?: { kind?: string; deliveryId?: string } } | undefined)?.source
+    const consumedId = source?.kind === 'swarm' ? source.deliveryId : undefined
+    // Several admitted messages (including the generated context snapshot) can
+    // arrive in one step. Merge bookings until turn/end instead of replacing
+    // the question booked by the preceding relay.
+    const booked = this.bookings.get(sessionId) ?? new Map<string, Booking>()
     for (const mission of this.ownerMissions(sessionId)) {
       for (const delivery of this.rt.openAsks(mission.id, 'owner')) {
-        if (delivery.deliveredAt === undefined || delivery.deliveredAt > at) continue
+        const consumedNow = delivery.id === consumedId
+        if (consumedNow && delivery.consumedAt === undefined) {
+          this.rt.commit(mission.id, () => {
+            const current = this.rt.store.get('deliveries', delivery.id)
+            if (current === undefined || current.consumedAt !== undefined) return
+            current.consumedAt = at
+            this.rt.store.put('deliveries', current)
+          })
+        }
+        const seenAt = consumedNow ? at : delivery.consumedAt ?? delivery.deliveredAt
+        if (seenAt === undefined || seenAt > at) continue
         booked.set(delivery.id, {
           missionId: mission.id, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt,
+          consumedAt: consumedNow ? at : delivery.consumedAt,
           ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
         })
       }
@@ -123,7 +143,7 @@ export class OwnerReplyGuard {
       const current = this.rt.store.get('deliveries', deliveryId)
       // Settled during the turn (answered or dismissed), or gone: nothing to report.
       if (current === undefined || current.answeredBy !== undefined) continue
-      this.missing(sessionId, deliveryId, current, booking)
+      this.missing(deliveryId, current, booking)
     }
   }
 
@@ -132,9 +152,9 @@ export class OwnerReplyGuard {
    * spent. Every step is durable, so a restart resumes at the same nudge count
    * instead of starting the count over.
    */
-  private missing(sessionId: string, deliveryId: string, delivery: Delivery, booking: Booking): void {
+  private missing(deliveryId: string, delivery: Delivery, booking: Booking): void {
     const mission = this.rt.store.get('missions', booking.missionId)
-    if (mission === undefined || this.rt.isMissionTerminal(mission)) return
+    if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status === 'paused') return
     const spent = delivery.replyNudges ?? 0
     // The durable miss record is bounded with the nudges: after the bound the
     // guard terminal is the outcome, so a later turn cannot keep writing rows
@@ -145,6 +165,7 @@ export class OwnerReplyGuard {
       emitGuardTerminal(this.rt, booking.missionId, 'owner_reply', {
         detail: `question ${deliveryId} from ${booking.from} still has no answer after ${spent} nudge(s)`,
         memberId: booking.from,
+        questionId: deliveryId,
         ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }),
       })
       return
@@ -152,7 +173,8 @@ export class OwnerReplyGuard {
     this.rt.commit(booking.missionId, () => {
       this.rt.store.event(booking.missionId, 'owner/reply-missing', 'runtime', {
         deliveryId, memberId: booking.from, taskId: booking.taskId ?? null,
-        deliveredAt: booking.deliveredAt, nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
+        deliveredAt: delivery.deliveredAt ?? booking.deliveredAt ?? null, consumedAt: delivery.consumedAt ?? booking.consumedAt ?? null,
+        nudges: spent, question: booking.content.replace(/\s+/g, ' ').slice(0, 200),
       })
       delivery.replyNudges = spent + 1
       this.rt.store.put('deliveries', delivery)
@@ -160,39 +182,7 @@ export class OwnerReplyGuard {
       // row together so restart cannot spend a nudge without retaining it.
       this.rt.notify(booking.missionId, ownerReplyNudge(booking.missionId, delivery, booking, spent + 1, this.options.maxNudges),
         this.rt.noticeSubjectsFor(booking.missionId, { ...(booking.taskId === undefined ? {} : { taskId: booking.taskId }), memberId: booking.from }),
-        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}` })
-    })
-    if (this.options.guard === 'block') this.block(sessionId, deliveryId)
-  }
-
-  /**
-   * Hard mode: hold the next step of the owner's session until the receipt is
-   * settled. Attached lazily to the owner agent, because the owner is an
-   * ordinary conversation the plugin does not create; a host that cannot supply
-   * the agent keeps the nudge and loses nothing durable.
-   */
-  private block(sessionId: string, deliveryId: string): void {
-    const tracked = this.blocking.get(sessionId) ?? new Set<string>()
-    tracked.add(deliveryId)
-    this.blocking.set(sessionId, tracked)
-    if (this.attached.has(sessionId)) return
-    const agent = this.ctx.agents.get(sessionId as never)
-    const agentCtx = (agent as { ctx?: Context } | undefined)?.ctx
-    if (agent === undefined || agentCtx === undefined) return
-    this.attached.add(sessionId)
-    agentCtx.on('agent/pre-step', async (_payload, next) => {
-      const open = await next()
-      if (open.kind === 'reject') return open
-      for (const id of [...(this.blocking.get(sessionId) ?? [])]) {
-        const delivery = this.rt.store.get('deliveries', id)
-        if (delivery === undefined || delivery.answeredBy !== undefined) { this.blocking.get(sessionId)?.delete(id); continue }
-        if ((delivery.replyNudges ?? 0) > this.options.maxNudges) { this.blocking.get(sessionId)?.delete(id); continue }
-        const booking = { missionId: delivery.missionId, from: delivery.from, content: delivery.content, deliveredAt: delivery.deliveredAt ?? Date.now(), ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }) }
-        this.rt.notify(delivery.missionId, ownerReplyNudge(delivery.missionId, delivery, booking, (delivery.replyNudges ?? 0), this.options.maxNudges),
-          this.rt.noticeSubjectsFor(delivery.missionId, { memberId: delivery.from }), { dedupe: true, dedupKey: `owner-reply-blocked:${id}` })
-        return { kind: 'reject' }
-      }
-      return open
+        { dedupe: true, dedupKey: `owner-reply-missing:${deliveryId}:${spent + 1}`, questionId: deliveryId })
     })
   }
 }

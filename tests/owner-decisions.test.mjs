@@ -4,8 +4,8 @@
  * The five measured round-14 gaps, each pinned by a test that fails without its
  * mechanism:
  *
- * 1. `subjects` on every `notify()` site, enforced by an ENUMERATION of the call
- *    sites in `src/` (not a sample) plus durable-readback assertions for the
+ * 1. `subjects` on every `notify()` site, with the shared parsed-source check
+ *    in r17-notices.test.mjs plus durable-readback assertions for the
  *    classes the round-14 review read back without subjects (the guard-terminal
  *    notice behind the task-ceiling path, the W3 stall notice, the escalation).
  * 2. Off-pass decision generation: with `workers.start` hung — the failure-first
@@ -23,50 +23,52 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { rm } from 'node:fs/promises'
+import { join } from 'node:path'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
 import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
+import { guardBoard } from './guard-model.mjs'
+import { wakePrecision } from './instruments.mjs'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 }
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-class Workers {
-  constructor(options = {}) { this.options = options; this.started = []; this.delivered = [] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
+/** `options`: hangStart, hangStop, an `idle(memberId)` predicate (always idle without one) and an `onDeliver` hook. */
+class Workers extends FakeWorkers {
+  artifact = { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }
+  checks = []
+  delivered = []
+  constructor(options = {}) { super(); this.options = options }
   async start(spec) { this.started.push(spec.member.id); if (this.options.hangStart === true) return new Promise(() => {}) }
   async deliver(member, delivery) { this.delivered.push({ memberId: member.id, deliveryId: delivery.id }); if (this.options.onDeliver) await this.options.onDeliver(member, delivery) }
   async stop() { if (this.options.hangStop === true) return new Promise(() => {}) }
   isIdle(memberId) { return this.options.idle === undefined ? true : this.options.idle(memberId) }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
 }
 
-async function fixture(t, config = {}, workers = undefined, directory = undefined) {
-  const dir = directory ?? await tempDirectory('swarm-owner-decisions-')
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, workers ?? new Workers())
-  t.after(async () => { await runtime.dispose(); if (directory === undefined) await rm(dir, { recursive: true, force: true }) })
-  return { directory: dir, runtime }
+/** A runtime on a fresh fixture state, or, with `reopen` (an earlier fixture's config), on that same state file. */
+async function fixture(t, config = {}, workers = new Workers(), reopen = undefined) {
+  if (reopen !== undefined) {
+    const runtime = new SwarmRuntime({ ...reopen, ...config }, workers)
+    t.after(async () => { await runtime.dispose() })
+    return { runtime }
+  }
+  const { dir: directory, config: settings, runtime } = await makeRuntime(t, { workers,
+    config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config } })
+  return { directory, config: settings, runtime }
 }
 
-async function scenario(t, { workers = new Workers(), config = {}, directory } = {}) {
-  const f = await fixture(t, config, workers, directory)
+async function scenario(t, { workers = new Workers(), config = {} } = {}) {
+  const f = await fixture(t, config, workers)
   await f.runtime.start()
   const owner = { sessionId: 'owner-decisions' }
   const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => f.runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const actorFor = member => ({ sessionId: member.sessionId })
-  const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
+  const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
   const notices = () => f.runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const block = (task, extra = {}) => {
     const row = f.runtime.store.get('tasks', task.id)
@@ -78,132 +80,8 @@ async function scenario(t, { workers = new Workers(), config = {}, directory } =
   return { ...f, owner, mission, stream, addMember, actorFor, propose, notices, block }
 }
 
-/** Skip one string or template literal (including `${...}` substitutions). */
-function skipString(text, start) {
-  const quote = text[start]
-  let index = start + 1
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '\\') { index += 2; continue }
-    if (char === quote) return index + 1
-    if (quote === '`' && char === '$' && text[index + 1] === '{') {
-      let depth = 1
-      index += 2
-      while (index < text.length && depth > 0) {
-        const inner = text[index]
-        if (inner === '\\') { index += 2; continue }
-        if (inner === '"' || inner === "'" || inner === '`') { index = skipString(text, index); continue }
-        if (inner === '{') depth += 1
-        else if (inner === '}') depth -= 1
-        index += 1
-      }
-      continue
-    }
-    index += 1
-  }
-  return index
-}
-
-/** Skip one regular-expression literal (a quote inside one must not open a string). */
-function skipRegex(text, start) {
-  let index = start + 1
-  let inClass = false
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '\\') { index += 2; continue }
-    if (char === '[') { inClass = true; index += 1; continue }
-    if (char === ']') { inClass = false; index += 1; continue }
-    if (char === '/' && !inClass) return index + 1
-    if (char === '\n') return start + 1
-    index += 1
-  }
-  return start + 1
-}
-
-/** Offsets of every `.notify(` call OUTSIDE strings, comments and regexes. */
-function notifyCallOffsets(text) {
-  const offsets = []
-  let index = 0
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '/' && text[index + 1] === '/') { while (index < text.length && text[index] !== '\n') index += 1; continue }
-    if (char === '/' && text[index + 1] === '*') { const end = text.indexOf('*/', index + 2); if (end === -1) break; index = end + 2; continue }
-    if (char === '/' && !/[/*]/.test(text[index + 1] ?? '')) {
-      let before = index - 1
-      while (before >= 0 && /\s/.test(text[before])) before -= 1
-      if (before < 0 || '([{,;:=!&|?+-*%<>~^'.includes(text[before])) { index = skipRegex(text, index); continue }
-    }
-    if (char === '"' || char === "'" || char === '`') { index = skipString(text, index); continue }
-    if (char === '.' && text.startsWith('.notify(', index)) { offsets.push(index + '.notify('.length - 1); index += '.notify('.length; continue }
-    index += 1
-  }
-  return offsets
-}
-
-/** The top-level comma-separated arguments of the call whose `(` is at `open`. */
-function topLevelArguments(text, open) {
-  let depth = 0
-  let index = open + 1
-  let start = open + 1
-  const args = []
-  while (index < text.length) {
-    const char = text[index]
-    if (char === '/' && text[index + 1] === '/') { while (index < text.length && text[index] !== '\n') index += 1; continue }
-    if (char === '/' && text[index + 1] === '*') { const end = text.indexOf('*/', index + 2); if (end === -1) return undefined; index = end + 2; continue }
-    if (char === '"' || char === "'" || char === '`') { index = skipString(text, index); continue }
-    if (char === '(' || char === '[' || char === '{') depth += 1
-    else if (char === ')' || char === ']' || char === '}') {
-      if (char === ')' && depth === 0) { args.push(text.slice(start, index)); return args }
-      depth -= 1
-    } else if (char === ',' && depth === 0) { args.push(text.slice(start, index)); start = index + 1 }
-    index += 1
-  }
-  return undefined
-}
-
-test('R15-A1: every notify() call site in src/ passes a subject argument (enumeration, not a sample)', async () => {
-  const entries = await readdir(join(root, 'src'), { recursive: true, withFileTypes: true })
-  const files = entries.filter(entry => entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')))
-    .map(entry => join(entry.parentPath ?? entry.path, entry.name))
-  let sites = 0
-  const offenders = []
-  const isSubjectArgument = value => value.startsWith('[')
-    || /^(subjects|subjectList|[a-zA-Z.]*Subjects)$/.test(value)
-    // R17-B2r: the shared interpretation's own subject helper
-    // (`view.subjectsOf`, `this.interpretation(id).subjectsOf`, a ternary over it).
-    || /subjectsOf\(/.test(value)
-    || /^[a-zA-Z.]*SubjectsFor\(/.test(value)
-    || /^[a-zA-Z.]*subjectsOfTasks\(/.test(value)
-    || /^[a-zA-Z.]*(Subjects|subjects)\(/.test(value)
-    || /^question\.subjects$/.test(value)
-    || /^noticeSubjects\(/.test(value)
-  const stripComments = value => value.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '')
-  for (const file of files) {
-    const text = await readFile(file, 'utf8')
-    // The scanner must see every raw occurrence: a file it mis-parses would make
-    // this enumeration quietly incomplete, which is the failure mode it exists to
-    // prevent.
-    assert.equal(notifyCallOffsets(text).length, (text.match(/\.notify\(/g) ?? []).length, `every raw .notify( occurrence in ${file.slice(root.length + 1)} is parsed by the enumeration scanner`)
-    for (const open of notifyCallOffsets(text)) {
-      sites += 1
-      const args = topLevelArguments(text, open)
-      if (args === undefined) { offenders.push(`${file.slice(root.length + 1)}: unparsed argument list`); continue }
-      const third = stripComments(args[2] ?? '').trim()
-      if (!isSubjectArgument(third)) offenders.push(`${file.slice(root.length + 1)}: ${third.slice(0, 60)}`)
-    }
-  }
-  // The count is part of the claim: a NEW call site must be visited and given a
-  // subject, and this number is what makes the enumeration complete. R16-D added
-  // `Scheduling.escalateSilentAttempt` (src/scheduling.ts, `[taskSubject(task)]`),
-  // moving 23 -> 24. R17-B2 adds exactly one more — `Notices.absenceNet`
-  // (src/notices.ts), the absence net, whose third argument is `[subject]` built
-  // from `missionSubject(mission)`. The count moves 24 -> 25; nothing else in
-  // this test changed, and the new site is visited and checked like every other.
-  // L2 adds the owner-reply nudge and its block-mode twin (src/owner-reply.ts),
-  // both passing `noticeSubjectsFor(...)`; the count moves 25 -> 27.
-  assert.equal(sites, 27, `every .notify() site enumerated (found ${sites})`)
-  assert.deepEqual(offenders, [], `every notify() site passes subjects as its third argument: ${offenders.join(' | ')}`)
-})
+// The parsed source subject-presence check lives in r17-notices.test.mjs.
+// These tests verify the durable subject attribution and owner behavior.
 
 test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carries subjects in its own durable row', async t => {
   const f = await scenario(t)
@@ -216,9 +94,9 @@ test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carri
   const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } })
   const stream = limited.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const builder = await limited.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
-  await limited.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
+  await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
   let refusal
-  try { await limited.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Second', objective: 'Second', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id }) }
+  try { await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Second', objective: 'Second', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id }) }
   catch (error) { refusal = error }
   assert.ok(refusal instanceof Error, `the second proposal is refused: ${String(refusal)}`)
   assert.match(String(refusal), /task budget|ceiling/i)
@@ -265,12 +143,10 @@ test('R15-A1: the W3 stall notice names an unschedulable subject, and an escalat
 })
 
 test('R15-A2: a hung workers.start still names the pending task in a durable decision notice (failure-first)', async t => {
-  const directory = await tempDirectory('swarm-hung-start-')
-  t.after(async () => { await rm(directory, { recursive: true, force: true }) })
   // Phase 1: a durable board with a running task a pending dependent waits on.
   // That state is legitimately waiting — no escalation and no witness yet — so
   // phase 2 cannot be suppressed by a stale witness from the previous life.
-  const first = await scenario(t, { directory })
+  const first = await scenario(t)
   const builder = await first.addMember('Builder')
   const pending = first.propose('Runs across the restart', { assigneeId: builder.id })
   await first.runtime.claim(first.actorFor(builder), first.mission.id, pending.id)
@@ -283,7 +159,7 @@ test('R15-A2: a hung workers.start still names the pending task in a durable dec
 
   // Phase 2: the same durable store, an adapter whose start() never settles.
   const workers = new Workers({ hangStart: true })
-  const second = await fixture(t, { stallPassTimeoutMs: 60 }, workers, directory)
+  const second = await fixture(t, { stallPassTimeoutMs: 60 }, workers, first.config)
   const startedAt = Date.now()
   void second.runtime.start().catch(() => undefined)
   await sleep(500)
@@ -428,13 +304,16 @@ test('R15-A1/B: the owner ledger carries subjects, reports consumption unknown, 
 test('R15-F1: a pending verification waits on its live source and is named only when the source closes', async t => {
   const f = await scenario(t)
   const builder = await f.addMember('Builder')
+  // The review waits only while a live member may own it independently (the
+  // one live-review rule): its assignee never authored the source.
+  const reviewer = await f.addMember('Reviewer')
   const source = f.propose('Reviewed source', { assigneeId: builder.id })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, source.id)
   // Verification tasks carry `reviewOf`, not `dependencies`: the protocol puts the
   // prerequisite in the review link.
   // `research` keeps the fixture free of the integration-gap notice, whose
   // subjects legitimately name every implementation branch.
-  const review = f.propose('Pending review', { assigneeId: builder.id, kind: 'research' })
+  const review = f.propose('Pending review', { assigneeId: reviewer.id, kind: 'research' })
   const row = f.runtime.store.get('tasks', review.id)
   row.kind = 'verification'; row.reviewOf = source.id; row.dependencies = []
   f.runtime.store.put('tasks', row)
@@ -464,7 +343,7 @@ test('R15-F2/R17-G7: a member owning a live attempt can never read idle — impo
   // The projection derives the phase from the durable task rows, not from the row.
   assert.equal(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection shows the live attempt even while a stale status write is presented')
   // The guard board derives the same fact for the model-facing progress action.
-  const board = f.runtime.scheduling.guardBoard(f.mission.id)
+  const board = guardBoard(f.runtime, f.mission.id)
   assert.equal(board.members.find(member => member.id === builder.id).status, 'working', 'the guard board derives a working member from the live attempt')
   // Every read on every tick derives the same value; nothing writes the row.
   await sleep(250)
@@ -488,7 +367,7 @@ test('R15-F2/R17-G7: a member owning a live attempt can never read idle — impo
   f.runtime.store.put('tasks', done)
   await sleep(250)
   assert.notEqual(sidebarState(f.runtime.snapshot(f.owner, f.mission.id), 'connected', Date.now()).phase, 'working', 'the projection stops reporting work once the attempt is gone')
-  const after = f.runtime.scheduling.guardBoard(f.mission.id)
+  const after = guardBoard(f.runtime, f.mission.id)
   assert.equal(after.members.find(member => member.id === builder.id).status, 'idle', 'with no live attempt the same derivation is idle')
   assert.equal(f.runtime.store.get('members', builder.id).status, 'idle', 'the derived read stops claiming work once the attempt is gone')
   // The idle callback removes the attempt through the close-out path; the status
@@ -516,7 +395,8 @@ test('R15-D1: a hung workers.start is named while a healthy sibling holds a live
     && (delivery.notice.dedupKey.startsWith('fallthrough:') || delivery.notice.dedupKey.startsWith('dispatch-question:'))
     && Array.isArray(delivery.subjects) && delivery.subjects.some(subject => subject.startsWith(`${pending.id}@`)))
   assert.ok(named, `the pending task is named while the sibling's lease is live: ${JSON.stringify(fresh.map(delivery => ({ key: delivery.notice?.dedupKey, subjects: delivery.subjects, content: delivery.content.slice(0, 70) })))}`)
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged past its declared bound')
+  assert.ok(f.runtime.store.events(f.mission.id, 500).some(event => event.type === 'mission/stalled' && event.data.wedged === true), 'the physical operation crossed its bound and was durably named')
+  assert.ok(f.runtime.queues.has(f.mission.id), 'a newer logical pass cannot release the still-hung physical operation')
   assert.equal(named.subjects.some(subject => subject.startsWith(`${sibling.id}@`)), false, 'the healthy sibling is not named as the stuck subject')
   assert.equal(f.runtime.store.get('tasks', pending.id).status, 'pending', 'the task really is still undispatched')
 })
@@ -675,6 +555,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (referenceCarried(runtime, missionId, task, tasks)) return true
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
+    if (runtime.reviewable(task, tasks)) return true
     const submission = runtime.latestSubmission(missionId, task.id)
     return submission === undefined || submission.age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
@@ -684,7 +565,12 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   }
   if (task.status === 'pending' && task.reviewOf !== undefined) {
     const source = tasks.find(candidate => candidate.id === task.reviewOf)
-    return source !== undefined && !TERMINAL_STATES.has(source.status)
+    return source !== undefined && !TERMINAL_STATES.has(source.status) && runtime.reviewable(source, tasks)
+  }
+  if (task.status === 'pending' && task.resumeAfterStop?.epoch === task.epoch
+    && task.dependencies.every(id => tasks.some(candidate => candidate.id === id) && runtime.effectiveDependency(missionId, id, tasks).status === 'accepted')) {
+    const stop = task.resumeAfterStop
+    return stop.at !== undefined && Date.now() - stop.at <= runtime.stallPassTimeoutMs
   }
   return task.dependencies.some(id => {
     if (!tasks.some(candidate => candidate.id === id)) return false
@@ -1006,7 +892,8 @@ test('R16-A4 pair: the off-pass sweep of a wedged pass applies the lineage-resol
   const startedAt = Date.now()
   workers.options.hangStart = true
   await sleep(700)
-  assert.equal(f.runtime.scheduling.passWedged(f.mission.id), true, 'the pass really is wedged past its declared bound')
+  assert.ok(f.runtime.store.events(f.mission.id, 500).some(event => event.type === 'mission/stalled' && event.data.wedged === true), 'the physical operation crossed its bound and was durably named')
+  assert.ok(f.runtime.queues.has(f.mission.id), 'the still-hung operation keeps physical ownership despite logical pass revocation')
   const fresh = f.notices().filter(delivery => delivery.createdAt >= startedAt)
   const falseWake = fresh.filter(delivery => typeof delivery.notice?.dedupKey === 'string'
     && delivery.notice.dedupKey.startsWith('fallthrough:')
@@ -1044,7 +931,7 @@ test('R16-A5: the wake-precision projection counts decisions, false wakes and mi
   deliver('msg_r16a5_fallthrough', 'fallthrough', [`${dependent.id}@${dependent.epoch}`])
   // A stall root whose blocked subject is carried by a live replacement again.
   deliver('msg_r16a5_stall_root', 'stall-root', [`${covered.id}@${covered.epoch}`])
-  const precision = f.runtime.wakePrecision(f.owner, f.mission.id)
+  const precision = wakePrecision(f.runtime, f.mission.id)
   assert.equal(precision.decisions.byFamily.fallthrough, 1, 'the fall-through family is counted')
   assert.equal(precision.decisions.byFamily['stall-root'], 1, 'the stall-root family is counted')
   assert.equal(precision.falseWakes.byFamily.fallthrough, 1, 'a fall-through naming a live-waiting subject is a false wake')
@@ -1060,12 +947,10 @@ test('R16-A5: the wake-precision projection counts decisions, false wakes and mi
   // Pair: a fall-through naming a genuinely dead subject is not a false wake, and
   // stops being a missed obligation once a decision names it.
   deliver('msg_r16a5_fallthrough_dead', 'fallthrough', [`${root.id}@${root.epoch}`])
-  const reread = f.runtime.wakePrecision(f.owner, f.mission.id)
+  const reread = wakePrecision(f.runtime, f.mission.id)
   assert.equal(reread.decisions.byFamily.fallthrough, 2, 'the second fall-through is counted')
   assert.equal(reread.falseWakes.byFamily.fallthrough, 1, 'the dead subject is not counted as a false wake')
   assert.equal(reread.missedObligations.subjects.includes(`${root.id}@${root.epoch}`), false, 'and the decision clears the missed obligation')
-  // A non-owner cannot read the instrument.
-  assert.throws(() => f.runtime.wakePrecision(f.actorFor(builder), f.mission.id), /owner/)
 })
 
 test('R16-A6 pair: the lineage rule reaches an ordinary dependent but not a review identity (review grace × lineage)', async t => {

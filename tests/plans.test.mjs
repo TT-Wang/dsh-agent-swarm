@@ -1,31 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { validatePlan } from '../lib/plans.js'
+import { pairReviews, validatePlan } from '../lib/plans.js'
+import { AdmissionError } from '../lib/admission.js'
+import { PolicyError } from '../lib/policy-error.js'
+import { errorTypeFor } from '../lib/trace.js'
+import { WORKER_NAME_POOL } from '../lib/types.js'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-async function eventually(read) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const result = read(); if (result) return result; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail('Expected runtime transition did not occur')
-}
-class Workers {
-  prepared = []
+/** Records member workspaces (not task preparations) as `prepared`, full start specs and raw deliveries. */
+class Workers extends FakeWorkers {
+  autoIdle = true
   starts = []
   delivered = []
   onStart = async () => {}
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { this.prepared.push(id); return join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec); await this.onStart(spec) }
   async prepareTask() {}
   async deliver(member, message) { this.delivered.push({ member, message }) }
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
 }
 function plan(workspace) {
   return { title: 'Editable plan', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
@@ -33,19 +29,68 @@ function plan(workspace) {
       { key: 'reviewer', name: 'Reviewer', role: 'verification' }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     // Deliberately put review first: the runtime must topologically admit it.
-    tasks: [{ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification',
+    tasks: [{ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify artifact', kind: 'verification', outputs: [],
       scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'code' },
-    { key: 'code', workstreamKey: 'main', title: 'Deliver', objective: 'Implement change', kind: 'integration',
+    { key: 'code', workstreamKey: 'main', title: 'Deliver', objective: 'Implement change', kind: 'integration', outputs: [],
       scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'] }] }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-plans-'))
-  const config = { statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
-  const workers = new Workers(), runtime = new SwarmRuntime(config, workers)
+  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'plan-owner' }
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { directory, config, workers, runtime, owner, input: plan(directory) }
 }
+
+test('plan names reserve explicit identities and assign stable human defaults without changing roles', () => {
+  const input = plan('/workspace')
+  input.budget = { ...input.budget, maxWorkers: 5 }
+  delete input.members[0].name
+  input.members[1].name = 'Ada'
+  input.members.push({ key: 'custom', name: 'Research team lead', role: 'Plan the research' },
+    { key: 'analyst', role: 'Analyse evidence' }, { key: 'reserved', name: 'Alan', role: 'Review evidence' })
+  const before = structuredClone(input)
+  const canonical = validatePlan(input)
+  assert.deepEqual(canonical.members.map(member => member.name), ['Anita', 'Ada', 'Research team lead', 'Barbara', 'Alan'])
+  assert.deepEqual(canonical.members.map(member => member.role), input.members.map(member => member.role))
+  assert.deepEqual(input, before, 'normalization must not mutate the caller plan')
+  assert.deepEqual(validatePlan(input), canonical, 'raw retries assign the same names')
+  assert.deepEqual(validatePlan(canonical), canonical, 'persisted names survive revalidation')
+})
+
+test('explicit duplicate and invalid plan names are refused rather than silently replaced', () => {
+  for (const name of ['Builder', '', '  ', null, 7]) {
+    const input = plan('/workspace')
+    input.members[1].name = name
+    assert.throws(() => validatePlan(input), /members\[reviewer\]\.name/)
+  }
+})
+
+test('plans exceeding the default name pool can supply a unique explicit name', () => {
+  const input = plan('/workspace')
+  input.budget = { ...input.budget, maxWorkers: WORKER_NAME_POOL.length + 1 }
+  input.members = WORKER_NAME_POOL.map((name, index) => ({ key: index === 0 ? 'builder' : index === 1 ? 'reviewer' : `member_${index}`, name, role: 'Review evidence' }))
+  input.members.push({ key: 'additional', role: 'Research an independent question' })
+  assert.throws(() => validatePlan(input), /\[worker_name_pool_exhausted\].*members\[additional\]\.name/)
+  input.members.at(-1).name = 'Custom researcher'
+  assert.equal(validatePlan(input).members.at(-1).name, 'Custom researcher')
+})
+
+test('manual drafts retain legacy binding and round-trip only valid explicit assignment modes', async t => {
+  const f = await fixture(t)
+  const draft = f.runtime.createDraft(f.owner, f.input)
+  assert.ok(draft.input.tasks.every(task => task.assignmentMode === undefined))
+  const changed = structuredClone(f.input)
+  changed.tasks[0].assignmentMode = 'pinned'
+  changed.tasks[1].assignmentMode = 'preferred'
+  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, changed)
+  assert.deepEqual(edited.input.tasks.map(task => task.assignmentMode), ['pinned', 'preferred'])
+  changed.tasks[0].assignmentMode = 'surprise'
+  assert.throws(() => validatePlan(changed), /assignmentMode/)
+  changed.tasks[0].assignmentMode = 'pinned'
+  delete changed.tasks[0].assigneeKey
+  assert.throws(() => validatePlan(changed), /assignmentMode requires assigneeKey/)
+  assert.equal(f.runtime.drafts(f.owner)[0].revision, edited.revision)
+})
 
 test('draft edits are durable, optimistic and cannot consume workers before launch', async t => {
   const f = await fixture(t)
@@ -85,7 +130,7 @@ test('launch holds execution until roster and dependency/review topology are com
   const review = snapshot.tasks.find(task => task.kind === 'verification')
   assert.equal(review.reviewOf, snapshot.tasks.find(task => task.kind === 'integration').id)
   assert.deepEqual(review.dependencies, [])
-  await eventually(() => f.workers.delivered.some(({ message }) => message.kind === 'assignment'))
+  await eventually(() => f.workers.delivered.some(({ message }) => message.kind === 'assignment'), 'Expected runtime transition did not occur', 2500)
   const duplicate = await f.runtime.launchDraft(f.owner, draft.id, draft.revision)
   assert.equal(duplicate.mission.id, snapshot.mission.id)
   assert.equal(f.workers.prepared.length, 2)
@@ -101,9 +146,10 @@ test('failed launch resumes existing admissions without duplicating workers or r
   assert.equal(failed.status, 'failed')
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
-  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input), /unlaunched/)
+  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input)
+  assert.equal(revised.revision, failed.revision + 1)
   fail = false
-  const snapshot = await f.runtime.launchDraft(f.owner, failed.id, failed.revision)
+  const snapshot = await f.runtime.launchDraft(f.owner, revised.id, revised.revision)
   assert.equal(snapshot.members.length, 2)
   assert.equal(f.workers.prepared.length, 2)
   assert.equal(f.runtime.list(f.owner.sessionId).length, 1)
@@ -156,7 +202,7 @@ test('equivalent scope notation and duplicate review edges canonicalize without 
   f.input.tasks[0].scope = ['./src/']
   f.input.tasks[1].scope = ['./src/value.cjs']
   f.input.tasks.push({ key: 'preparation', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository',
-    kind: 'research', scope: ['src/**'], acceptance: ['context recorded'], assigneeKey: 'builder' })
+    kind: 'research', outputs: [], scope: ['src/**'], acceptance: ['context recorded'], assigneeKey: 'builder' })
   f.input.tasks[0].dependencies = ['code', 'preparation', 'code']
   const before = structuredClone(f.input)
   const canonical = validatePlan(f.input)
@@ -168,7 +214,9 @@ test('equivalent scope notation and duplicate review edges canonicalize without 
   assert.deepEqual(canonical.budget, before.budget)
   assert.deepEqual(f.input, before)
   const draft = f.runtime.createDraft(f.owner, f.input)
-  assert.deepEqual(f.runtime.drafts(f.owner)[0].input, JSON.parse(JSON.stringify(canonical)))
+  // The saved draft also carries the review the host adds for the unreviewed research task.
+  assert.deepEqual(f.runtime.drafts(f.owner)[0].input, JSON.parse(JSON.stringify(pairReviews(canonical))))
+  assert.deepEqual(draft.input.tasks.map(task => task.key), ['review', 'code', 'preparation', 'preparation-review'])
   assert.deepEqual(draft.input.tasks[0].dependencies, ['preparation'])
   assert.equal(f.workers.starts.length, 0)
 })
@@ -211,6 +259,93 @@ test('scope and missing code checks are diagnosed together before any admission,
   assert.deepEqual(admitted.input.budget, before.budget)
 })
 
+test('plan refusals are one typed admission refusal carrying every diagnostic, with the legacy bytes', () => {
+  const refusal = input => { try { validatePlan(input) } catch (error) { return error } assert.fail('the plan must be refused') }
+  const workspace = tmpdir()
+  // One early refusal is its own diagnostic, typed with the category the trace gave its text.
+  const title = refusal({ ...plan(workspace), title: '' })
+  assert.ok(title instanceof AdmissionError && title instanceof PolicyError)
+  assert.equal(title.message, 'Title must be nonempty text of at most 16000 characters')
+  assert.equal(title.code, 'plan_text_invalid')
+  assert.equal(errorTypeFor(title), errorTypeFor(new Error(title.message)))
+  assert.deepEqual(title.diagnostics, [{ code: 'plan_text_invalid', location: 'Title', message: title.message }])
+  // Collected issues become one refusal: the message is their text joined as
+  // before, and the category is the one the trace gave that joined text.
+  const several = plan(workspace)
+  several.tasks[0].priority = 101
+  several.tasks[1].scope = ['lib/value.cjs']
+  const joined = refusal(several)
+  assert.ok(joined instanceof AdmissionError)
+  assert.equal(joined.code, 'plan_invalid')
+  assert.deepEqual(joined.diagnostics.map(diagnostic => diagnostic.code), ['plan_priority_invalid', 'scope_selector_out_of_scope'])
+  assert.equal(joined.message, joined.diagnostics.map(diagnostic => diagnostic.message).join('\n'))
+  assert.match(joined.message, /^tasks\[0\] \(review\)\.priority must be 0–100\ntasks\[1\]\.scope exceeds mission scope: "lib\/value\.cjs"/)
+  assert.equal(joined.category, 'budget_error')
+  assert.equal(errorTypeFor(joined), errorTypeFor(new Error(joined.message)))
+  // A single collected issue keeps its own code.
+  const single = plan(workspace)
+  single.tasks[0].priority = 101
+  const priority = refusal(single)
+  assert.equal(priority.code, 'plan_priority_invalid')
+  assert.equal(priority.message, 'tasks[0] (review).priority must be 0–100')
+  assert.equal(errorTypeFor(priority), errorTypeFor(new Error(priority.message)))
+  // Several issues that share one code keep that code rather than plan_invalid.
+  const twice = plan(workspace)
+  twice.tasks[0].priority = 101
+  twice.tasks[1].priority = 102
+  const shared = refusal(twice)
+  assert.equal(shared.code, 'plan_priority_invalid')
+  assert.equal(shared.message, 'tasks[0] (review).priority must be 0–100\ntasks[1] (code).priority must be 0–100')
+})
+
+test('a task scope entry that is not a string is one diagnostic among the others, not a TypeError that drops them', async t => {
+  const refusal = input => { try { validatePlan(input) } catch (error) { return error } assert.fail('the plan must be refused') }
+  // Before batch 2 this plan was refused with three joined lines, the middle one
+  // the TypeError that matching outputs against a non-string selector raised.
+  // Outputs are now matched only against a scope of strings, so that line is
+  // gone and the scope and priority diagnostics are the whole refusal.
+  const expected = 'tasks[0] (review).scope must be nonempty text of at most 16000 characters\ntasks[0] (review).priority must be 0–100'
+  for (const scope of [[{ path: 'src/' }], [null], ['src/', 7]]) {
+    const input = plan(tmpdir())
+    Object.assign(input.tasks[0], { scope, outputs: ['src/a.ts'], priority: 500 })
+    const error = refusal(input)
+    assert.ok(error instanceof AdmissionError, `${JSON.stringify(scope)}: ${error}`)
+    assert.equal(error.message, expected)
+    assert.equal(error.code, 'plan_invalid')
+    assert.equal(error.category, 'validation_error')
+    assert.deepEqual(error.diagnostics.map(diagnostic => diagnostic.code), ['plan_text_invalid', 'plan_priority_invalid'])
+  }
+  // A scope that is not an array is refused by its own diagnostic too; outputs
+  // are no longer reported as outside the empty scope `[]` beside it.
+  for (const scope of ['src/', undefined]) {
+    const input = plan(tmpdir())
+    Object.assign(input.tasks[0], { scope, outputs: ['src/a.ts'], priority: 500 })
+    assert.equal(refusal(input).message, 'tasks[0] (review).scope must be a nonempty string array\ntasks[0] (review).priority must be 0–100')
+  }
+  // The staged draft path refuses with the same text and saves nothing.
+  const f = await fixture(t)
+  Object.assign(f.input.tasks[0], { scope: [{ path: 'src/' }], outputs: ['src/a.ts'], priority: 500 })
+  assert.throws(() => f.runtime.createDraft(f.owner, f.input), error => error instanceof AdmissionError && error.message === expected)
+  assert.deepEqual(f.runtime.drafts(f.owner), [])
+})
+
+test('a check that fails without an authored refusal is collected with the plan issues instead of aborting them', () => {
+  // No plan input reaches this path any more, so a throwing accessor stands in
+  // for a check that fails with a plain TypeError partway through validation.
+  const input = plan(tmpdir())
+  input.tasks[0].priority = 500
+  Object.defineProperty(Object.prototype, 'checkTimeoutMs', { configurable: true, get() { throw new TypeError('checkTimeoutMs probe failed') } })
+  let error
+  try { validatePlan(input) } catch (caught) { error = caught } finally { delete Object.prototype.checkTimeoutMs }
+  assert.ok(error instanceof AdmissionError, `the plan issues survive the plain failure: ${error}`)
+  assert.equal(error.message, 'checkTimeoutMs probe failed\ntasks[0] (review).priority must be 0–100\ncheckTimeoutMs probe failed')
+  assert.equal(error.code, 'plan_invalid')
+  assert.equal(error.category, 'validation_error')
+  assert.deepEqual(error.diagnostics.map(diagnostic => [diagnostic.code, diagnostic.location]),
+    [['plan_invalid', 'plan'], ['plan_priority_invalid', 'tasks[0] (review).priority'], ['plan_invalid', 'plan']])
+  assert.equal(error.message, error.diagnostics.map(diagnostic => diagnostic.message).join('\n'))
+})
+
 test('missing plan keys identify the exact field and explain how to repair references', () => {
   for (const field of ['members', 'workstreams', 'tasks']) {
     const input = plan('/workspace')
@@ -240,7 +375,7 @@ test('large valid topology is bounded by the primary-selected budget rather than
   }))
   input.tasks = input.workstreams.flatMap((stream, index) => {
     const source = { key: `source_${index}`, workstreamKey: stream.key, title: stream.title, objective: stream.objective,
-      kind: 'research', scope: ['src/'], acceptance: ['works'], assigneeKey: `member_${index}`, maxRecoveryAttempts: 2 }
+      kind: 'research', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: `member_${index}`, maxRecoveryAttempts: 2 }
     return [source, { ...source, key: `review_${index}`, kind: 'verification', reviewOf: source.key,
       assigneeKey: `member_${(index + 1) % size}` }]
   })
@@ -304,4 +439,77 @@ test('interrupted assembly journals recover without duplicating prior admissions
     assert.equal(workers.prepared.length, 0, 'durable member workspaces must not be admitted twice')
     assert.equal(recovered.list(f.owner.sessionId).length, 1)
   } finally { await recovered.dispose() }
+})
+
+test('R24: plan staging and launch check declared outputs against the host-configured dependency directories', async t => {
+  const f = await fixture(t)
+  const generated = structuredClone(f.input)
+  generated.tasks[1].outputs = ['src/gen/out.txt']
+  const vendored = structuredClone(f.input)
+  vendored.tasks[1].outputs = ['src/vendor/patch.txt']
+  const refusedFor = name => error => error instanceof AdmissionError && error.code === 'output_outside_scope' && error.message.includes(`"${name}"`)
+  // The option replaces the engine default in both directions.
+  assert.doesNotThrow(() => validatePlan(generated, { launch: true }))
+  assert.throws(() => validatePlan(generated, { launch: true, dependencyDirs: ['node_modules', 'gen'] }), refusedFor('gen'))
+  assert.throws(() => validatePlan(vendored, { launch: true }), refusedFor('vendor'))
+  assert.doesNotThrow(() => validatePlan(vendored, { launch: true, dependencyDirs: ['node_modules', 'gen'] }))
+  // A draft staged under the default set is refused at launch by a host configured with gen/.
+  const draft = f.runtime.createDraft(f.owner, generated)
+  await f.runtime.dispose()
+  const configured = new SwarmRuntime({ ...f.config, verificationDependencyDirs: ['node_modules', 'gen'] }, f.workers)
+  t.after(() => configured.dispose())
+  await assert.rejects(configured.launchDraft(f.owner, draft.id, draft.revision), refusedFor('gen'))
+  assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
+  assert.throws(() => configured.createDraft(f.owner, generated), refusedFor('gen'), 'staging uses the configured set too')
+  const request = configured.requestStart(f.owner, { commandId: 'configured-dirs', goal: 'Deliver verified code', workspace: f.directory })
+  await assert.rejects(configured.startPlan(f.owner, request.id, generated), refusedFor('gen'), 'the automatic launch path uses it too')
+  const admitted = configured.createDraft(f.owner, vendored)
+  const snapshot = await configured.launchDraft(f.owner, admitted.id, admitted.revision)
+  assert.deepEqual(snapshot.tasks.find(task => task.title === 'Deliver').outputs, ['src/vendor/patch.txt'], 'a default name the host removed launches')
+})
+
+test('R24: a staged draft may omit outputs, but launch refuses each task that does not declare them', async t => {
+  const f = await fixture(t)
+  for (const task of f.input.tasks) delete task.outputs
+  assert.doesNotThrow(() => validatePlan(f.input), 'staging leaves outputs optional')
+  const draft = f.runtime.createDraft(f.owner, f.input)
+  assert.ok(draft.input.tasks.every(task => task.outputs === undefined), 'the staged draft keeps the omission')
+  const schemaIndex = await toolSchemaIndex()
+  await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
+    assert.ok(error instanceof AdmissionError)
+    assert.equal(error.category, 'validation_error')
+    assert.deepEqual(error.diagnostics.map(item => [item.code, item.location]),
+      [['outputs_required', 'tasks[0] (review).outputs'], ['outputs_required', 'tasks[1] (code).outputs']], 'one diagnostic names each task')
+    // Every diagnostic shares one code, so the refusal keeps it and renders one
+    // token listing every location instead of `plan_invalid` with one per task.
+    assert.equal(error.code, 'outputs_required')
+    assert.equal(error.message, '[outputs_required] tasks[0] (review).outputs, tasks[1] (code).outputs are required to launch. Set `outputs` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
+    assert.deepEqual(assessText(error.message, schemaIndex), [], 'the combined refusal satisfies the refusal contract')
+    return true
+  })
+  // Beside another issue the plan is `plan_invalid`, and the undeclared tasks are still one line with one token.
+  const mixed = structuredClone(f.input)
+  mixed.tasks[0].priority = 101
+  assert.throws(() => validatePlan(mixed, { launch: true }), error => {
+    assert.equal(error.code, 'plan_invalid')
+    assert.equal(error.message, 'tasks[0] (review).priority must be 0–100\n[outputs_required] tasks[0] (review).outputs, tasks[1] (code).outputs are required to launch. Set `outputs` on each of those tasks to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
+    return true
+  })
+  assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
+  assert.equal(f.runtime.drafts(f.owner)[0].status, 'draft', 'the draft stays editable')
+
+  const single = structuredClone(f.input)
+  single.tasks[0].outputs = []
+  assert.throws(() => validatePlan(single, { launch: true }), error => {
+    assert.equal(error.code, 'outputs_required')
+    assert.equal(error.message, '[outputs_required] tasks[1] (code).outputs is required to launch. Set `outputs` on that task to the repository-relative files it writes, or to [] for analysis-only work, and relaunch the complete plan.')
+    assert.deepEqual(assessText(error.message, schemaIndex), [], 'the refusal satisfies the refusal contract')
+    return true
+  })
+  const request = f.runtime.requestStart(f.owner, { commandId: 'outputs-required', goal: 'Deliver verified code', workspace: f.directory })
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, single), /\[outputs_required\] tasks\[1\] \(code\)\.outputs/, 'the automatic launch path refuses the same plan')
+
+  const declared = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.map(task => ({ ...task, outputs: [] })) })
+  const snapshot = await f.runtime.launchDraft(f.owner, declared.id, declared.revision)
+  assert.deepEqual(snapshot.tasks.map(task => task.outputs), [[], []], 'an empty declaration launches')
 })

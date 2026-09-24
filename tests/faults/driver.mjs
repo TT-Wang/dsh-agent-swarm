@@ -12,10 +12,9 @@
  */
 import assert from 'node:assert/strict'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { SwarmRuntime, Workspaces, WorkspaceWorkers, PROJECT, events, eventually, setup, acceptThroughReview } from './harness.mjs'
-import { subprocessSeam } from '../subprocess-seam.mjs'
+import { SwarmRuntime, WorkspaceWorkers, PROJECT, events, eventually, setup, acceptThroughReview, makeWorkspaces } from './harness.mjs'
 
 const { applyDelivery: realApplyDelivery } = await import(pathToFileURL(join(PROJECT, 'lib/delivery.js')).href)
 
@@ -30,10 +29,9 @@ const taskId = value('--task')
 const marker = value('--marker')
 assert(phase && stateDir && workspacesRoot, 'driver requires a phase, --state and --worktrees')
 
-const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+const workspaces = makeWorkspaces(dirname(workspacesRoot), { workspacesRoot })
 
 class DriverWorkers extends WorkspaceWorkers {
-  async prepareBaseline(mission, signal) { return await this.workspaces.prepareBaseline(mission, signal) }
   async applyDelivery(mission, resultCommit, signal) {
     // The real delivery engine materializes the delta; the crash then lands
     // after the effect but before the runtime commits its receipt.
@@ -45,6 +43,7 @@ class DriverWorkers extends WorkspaceWorkers {
 }
 
 await mkdir(stateDir, { recursive: true })
+// fixture gap: the harness exports no default RuntimeConfig for a runtime that reopens a state file outside makeRuntime/setup (no node:test context here).
 const config = {
   statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000, tickMs: 20, maxMessageChars: 16_000,
   maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
@@ -60,9 +59,9 @@ if (phase === 'f4-crash') {
   await acceptThroughReview(f, first)
   await acceptThroughReview(f, second)
   const integration = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Integrate both implementations', objective: 'Assemble the deliverable',
+    outputs: [], workstreamId: f.stream.id, title: 'Integrate both implementations', objective: 'Assemble the deliverable',
     kind: 'integration', dependencies: [first.id, second.id], scope: ['**'], acceptance: ['fault recovery is proven from durable state'],
-    checks: ['true'], assigneeId: f.author.id,
+    checks: ['test -s src/answer.txt'], assigneeId: f.author.id,
   })
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, integration.id)
   assert.equal(claimed.status, 'running', 'the crashed host owns a running integration attempt')

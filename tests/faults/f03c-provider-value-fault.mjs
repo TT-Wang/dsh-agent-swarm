@@ -5,7 +5,9 @@ import { eventually } from './harness.mjs'
 
 await runProviderFault({
   id: 'F3c', title: 'A corrupted tool-call value is rejected instead of executed as valid', mode: 'corrupt-tool-value',
-  fault: state => ({ kind: 'fault-value', name: 'swarm_claim', args: { missionId: 'mission_not_ours', taskId: state.taskId, attemptId: 'bogus-attempt' } }),
+  // Only the declared missionId value is corrupted: an undeclared key would be
+  // refused by the schema check (00e0e55) before the value reached the runtime.
+  fault: state => ({ kind: 'fault-value', name: 'swarm_claim', args: { missionId: 'mission_not_ours', taskId: state.taskId } }),
   assertFault: async fixture => {
     const call = await eventually(() => fixture.sessionEvents.find(event => event.type === 'call' && event.name === 'swarm_claim'), 'the corrupted call reaches the tool boundary', 15_000)
     assert.match(call.arguments, /mission_not_ours/, 'the corrupted value is the injected fault')

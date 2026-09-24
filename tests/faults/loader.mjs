@@ -9,23 +9,29 @@
  */
 import assert from 'node:assert/strict'
 import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { PROJECT } from './harness.mjs'
+import { assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
 
 const catalogs = new Map()
 
+/**
+ * The release gates' own selection (scripts/harness-target.mjs), with the fault
+ * suite's message, and their support check: an explicitly supplied checkout of
+ * a release outside compatibility.json is refused, never booted. The generic
+ * message is for an empty default search only; a supplied root that cannot be
+ * used (a missing path, say) reports its own cause.
+ */
 export function resolveHarnessRoot(explicit) {
-  const candidates = [
-    explicit, process.env.DSH_HARNESS_ROOT, process.env.DSH_SOURCE,
-    join(homedir(), '.dsh/source/current'),
-    resolve(PROJECT, '../deepseek-harness-rc1'),
-    resolve(PROJECT, '../deepseek-harness-latest'),
-  ].filter(Boolean)
-  for (const candidate of candidates) if (existsSync(join(candidate, 'package.json'))) return resolve(candidate)
-  throw new Error('The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
+  const supplied = explicit ?? process.env.DSH_HARNESS_ROOT ?? process.env.DSH_SOURCE
+  let root
+  try { root = resolveTarget(explicit) } catch (error) {
+    if (supplied) throw new Error(`The fault suite cannot use the Harness checkout ${supplied}: ${error.message}`, { cause: error })
+    throw new Error('The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
+  }
+  assertSupportedHarness(root)
+  return root
 }
 
 export async function harnessCatalog(root) {

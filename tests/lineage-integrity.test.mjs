@@ -1,53 +1,35 @@
 /** W2 regressions: duplicate replacement admission and deterministic repair lineage. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-/** Only the external execution adapter is replaced; admission, lineage and store stay real. */
-class LineageWorkers {
-  prepared = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask(member, task, dependencies, reviewSource) {
-    this.prepared.push(structuredClone({ member: member.id, task, dependencies: dependencies.map(item => item.id), reviewSource: reviewSource?.id }))
-  }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-lineage-'))
-  const workers = new LineageWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  // Only the external execution adapter is replaced; admission, lineage and store stay real.
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'a'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'lineage-owner' }
   const mission = runtime.create(owner, { title: 'Lineage', objective: 'Keep repair lineage deterministic', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   /** Drive one real proposal through independent rejection so the task is durably blocked. */
   async function block(task) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     workers.checks = [{ command: 'test', exitCode: 1, output: 'host check failed' }]

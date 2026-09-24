@@ -9,9 +9,10 @@
  */
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
+import { FakeWorkers } from '../../tests/faults/harness.mjs'
 
 const BUDGET = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 /**
@@ -21,19 +22,25 @@ const BUDGET = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs
  */
 const LEASE_MS = 60000
 
-/** Records every adapter command and counts any provider invocation (always zero). */
-export class RecordingWorkers {
-  constructor(root) { this.root = root; this.commands = []; this.providerCalls = 0; this.deliveries = []; this.checks = [{ command: 'replay-check', exitCode: 0, output: 'ok' }]; this.artifacts = 0 }
-  bind(callbacks) { this.callbacks = callbacks }
+/**
+ * Records every adapter command and counts any provider invocation (always
+ * zero); the shared FakeWorkers answers every other adapter method. Like it,
+ * this adapter deliberately has no `prepareBaseline` and no `checkEnvelope`:
+ * either would add `workspace/snapshot` or `task/check-envelope` events to the
+ * durable log the golden digest is taken from.
+ */
+export class RecordingWorkers extends FakeWorkers {
+  commands = []
+  providerCalls = 0
+  checks = [{ command: 'replay-check', exitCode: 0, output: 'ok' }]
+  artifacts = 0
+  autoIdle = true
+  constructor(root) { super(); this.root = root }
   async prepareWorkspace(_mission, memberId) { return join(this.root, 'worktrees', memberId) }
-  async start() {}
-  async deliver(_member, delivery) { this.deliveries.push(delivery) }
   async stop(memberId) { this.commands.push({ kind: 'stop', memberId }) }
-  isIdle() { return true }
   async captureArtifact() { this.artifacts++; return { commit: `commit-${this.artifacts}`, baseCommit: 'base', workspace: join(this.root, 'worktrees', 'capture'), changedPaths: ['src/a.ts'] } }
   async verifyArtifact(_member, source) { this.commands.push({ kind: 'verify', sourceTaskId: source.id }); return this.checks }
   async prepareTask(member, task) { this.commands.push({ kind: 'dispatch', taskId: task.id, memberId: member.id }) }
-  async dispose() {}
 }
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -73,7 +80,7 @@ export async function runScenario(options = {}) {
     const builder = (await call('swarm_add_member', { missionId: mission.id, name: 'Builder', role: 'implementation' }, owner)).result
     const reviewer = (await call('swarm_add_member', { missionId: mission.id, name: 'Reviewer', role: 'verification' }, owner)).result
     const missionId = mission.id
-    const propose = async (extra, sessionId = owner) => (await call('swarm_propose', { missionId, workstreamId: stream.id, scope: ['src/'], acceptance: ['works'], ...extra }, sessionId)).result
+    const propose = async (extra, sessionId = owner) => (await call('swarm_propose', { missionId, workstreamId: stream.id, outputs: [], scope: ['src/'], acceptance: ['works'], ...extra }, sessionId)).result
     const publish = async (taskId, sessionId) => {
       const runId = await workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'true' }, result: { output: 'ok' }, isError: false })
       await call('swarm_publish', { missionId, taskId, attemptId: attemptOf(taskId), claim: `Evidence for ${taskId}`, outcome: 'supported', toolRunIds: [runId] }, sessionId)
@@ -108,7 +115,7 @@ export async function runScenario(options = {}) {
     const commands = workers.commands
     const providerCalls = workers.providerCalls
     await runtime.dispose()
-    return { root, ownsRoot, workspace, statePath, payloadDir: join(dirname(statePath), 'trace-payloads'), missionId,
+    return { root, ownsRoot, workspace, statePath, missionId,
       commands, providerCalls, builderId: builder.id, reviewerId: reviewer.id, tasks: { first: first.id, second: second.id, review: review.id } }
   } catch (error) {
     await runtime.dispose().catch(() => {})

@@ -1,8 +1,7 @@
 /** Real Harness tool registry and prompt assembly: sessions see only their role's swarm tools and protocol. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -17,29 +16,29 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import Approval from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import { HarnessWorkers } from '../lib/harness-workers.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { RoleScoper } from '../lib/roles.js'
 import { registerTools, ENTRY_PROMPT, HISTORICAL_OWNER_PROMPT, OWNER_PROMPT, WORKER_PROMPT, SWARM_PROMPT, MEMBER_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
+import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
 
 /**
- * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
- * passed it as `options.system`; from the 0.1.5 line the agent-loop invariant
- * requires `options.system === undefined` and carries the prompt inside
- * `messages` as surface node 0 (a `system`-role message). Reading both keeps one
- * assertion set valid on either host.
+ * The provider-visible system prompt. The agent loop requires
+ * `options.system === undefined` and carries the prompt inside `messages` as
+ * surface node 0 (a `system`-role message).
  */
-const systemTextOf = request => request.system ?? (request.messages ?? [])
+const systemTextOf = request => (request.messages ?? [])
   .filter(message => message.role === 'system')
   .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
   .join('\n')
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const swarmNames = tools => (tools ?? []).map(tool => tool.name).filter(name => name.startsWith('swarm_')).sort()
 
 async function fixture(t, responder, workerOptions = {}) {
-  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-roles-')))
+  // fixture gap: a temp tree that exists before the runtime; the Harness session store and HarnessWorkers are rooted in it.
+  const root = await realpath(await tempDirectory('swarm-roles-'))
   const source = path.join(root, 'source')
   await mkdir(source)
   for (const args of [['init', '-b', 'main'], ['-c', 'user.name=Swarm', '-c', 'user.email=swarm@localhost', 'commit', '--allow-empty', '-m', 'base']]) {
@@ -75,12 +74,15 @@ async function fixture(t, responder, workerOptions = {}) {
   ctx.llm.registerAdapter(['swarm-test'], new Scripted())
   const options = { workspacesRoot: path.join(root, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, ...workerOptions }
   const workers = new HarnessWorkers(ctx, options)
-  const runtime = new SwarmRuntime({ statePath: path.join(root, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3 }, workers)
+  // Cleanup runs in registration order: the scoper, then makeRuntime's runtime and state, then the Harness context and this tree.
+  let scoper
+  t.after(() => { scoper?.dispose() })
+  const { runtime } = await makeRuntime(t, { workers, config: { tickMs: 20, maxEvents: 100, checkTimeoutMs: undefined } })
+  t.after(async () => { await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
   registerTools(ctx, runtime, budget)
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
-  const scoper = new RoleScoper(ctx, runtime)
+  scoper = new RoleScoper(ctx, runtime)
   await runtime.start()
-  t.after(async () => { scoper.dispose(); await runtime.dispose(); await ctx.fiber.dispose(); await rm(root, { recursive: true, force: true }) })
   return { ctx, runtime, workers, requests, source, scoper }
 }
 const prompt = text => ({ kind: 'text', text })
@@ -220,6 +222,11 @@ test('all nonterminal missions and unresolved owner questions retain the full ow
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'terminal status does not settle an open question')
   f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', { ...question, state: 'dismissed', answeredBy: 'owner', answeredAt: Date.now() }))
   assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner')
+  f.runtime.commit(mission.id, () => f.runtime.store.put('deliveries', {
+    id: 'obsolete-review-action', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Admit a review for an old task',
+    subjects: ['old-source@1'], createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'review-blocked:old-source:missing', queuedAt: Date.now(), sentAt: Date.now() },
+  }))
+  assert.equal(f.scoper.roleOf(owner.agent), 'historical-owner', 'an obsolete queued action that the outbox will suppress cannot pin the owner prompt')
   f.runtime.commit(mission.id, () => {
     f.runtime.store.put('missions', { ...mission, status: 'stopped' })
     f.runtime.store.put('deliveries', { id: 'moot-stop-notice', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'A former stall', createdAt: Date.now(), notice: { class: 'decision', dedupKey: 'old-stall', sentAt: Date.now(), queuedAt: Date.now() } })
@@ -298,12 +305,13 @@ test('workers see only member tools and the member protocol, and each tool resul
   assert.ok(worker, 'the adapter started a real worker agent')
   assert.deepEqual(swarmNames(f.ctx.tools.schemas(worker)), SWARM_TOOLS.filter(name => !MANAGEMENT_TOOLS.includes(name)).sort())
   assert.deepEqual(swarmNames(f.ctx.tools.schemas(owner.agent)), SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort(), 'creating a mission promotes the owner')
-  const task = f.runtime.propose(actor, missionId, { workstreamId: stream.id, title: 'Probe', objective: 'Run the probe', kind: 'research', scope: ['**'], acceptance: ['done'], assigneeId: builder.id })
+  const task = f.runtime.propose(actor, missionId, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Run the probe', kind: 'research', scope: ['**'], acceptance: ['done'], assigneeId: builder.id })
   const diagnostics = () => JSON.stringify({ task: f.runtime.store.get('tasks', task.id)?.status, worker: worker.status, runs: f.runtime.store.list('tool_runs', missionId).length,
     builderRequests: f.requests.filter(r => r.sessionId === builder.sessionId).map(r => JSON.stringify(r.messages.at(-1)).slice(0, 200)),
     events: f.runtime.store.events(missionId, 12).map(e => [e.type, JSON.stringify(e.data).slice(0, 160)]),
     deliveries: f.runtime.store.list('deliveries', missionId).map(d => [d.kind, d.to, Boolean(d.deliveredAt)]),
     workerEvents: worker.session.snapshotEvents().map(e => e.type).slice(-12), inbox: worker.inbox.hasPending })
+  // fixture gap: the shared eventually takes a fixed message; this one reports the board as it stands at the deadline.
   const eventually = async (read, what) => {
     const deadline = Date.now() + 20000
     while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 20)) }
@@ -359,4 +367,49 @@ test('boundary compaction uses the native engine only when idle and over the pro
     await new Promise(resolve => setTimeout(resolve, 50))
     assert.equal(compacted.length, expected, 'the same boundary never compacts twice without a new request')
   }
+})
+
+test('a boundary requested mid-turn compacts at the next idle, before a re-woken tail starts the next unit', async t => {
+  // The member is inside a tool when its unit closes, parks itself, and a next-turn
+  // input is already queued: its turn ends on a rejected step and the idle handler
+  // re-wakes that tail. The compaction must run first, while the agent is idle,
+  // and the tail's turn must wait for it; before the fix the tail ran first.
+  const timeline = []
+  let releaseHold
+  const held = new Promise(resolve => { releaseHold = resolve })
+  const f = await fixture(t, options => {
+    if (options.sessionId === 'owner-session') return prompt('owner idle')
+    const all = JSON.stringify(options.messages)
+    if (all.includes('NEXT_UNIT')) { timeline.push('next-unit-request'); return prompt('next unit done') }
+    return all.includes('held released') ? prompt('unit done') : { kind: 'tool', name: 'swarm_hold', arguments: {} }
+  }, { boundaryCompactionTokens: 10 })
+  // A swarm_-prefixed name: the runtime guard admits it for a member with no claimed task.
+  f.ctx.tools.register(defineContentToolFixture({ name: 'swarm_hold', description: 'Hold', parameters: {}, execute: async () => { await held; return [{ type: 'text', text: 'held released' }] } }))
+  f.ctx.provide('compaction', { compactNow(agent) {
+    timeline.push(`compact-while-${agent.status}`)
+    return agent.runMaintenance(async () => { await new Promise(resolve => setTimeout(resolve, 50)); timeline.push('compact-end'); return null })
+  } })
+  const actor = { sessionId: 'owner-session' }
+  await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
+  const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Compact at the next idle', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const builder = await f.runtime.addMember(actor, mission.id, { name: 'Builder', role: 'implementation' })
+  const worker = f.ctx.agents.get(SessionId(builder.sessionId))
+  await f.workers.deliver(builder, { id: 'd1', missionId: mission.id, from: 'owner', to: builder.id, kind: 'question', content: 'Hold.', createdAt: 1 })
+  const deadline = Date.now() + 20000
+  while (!f.requests.some(request => request.sessionId === builder.sessionId) || worker.status !== 'running') {
+    assert.ok(Date.now() < deadline, 'the worker enters its held tool'); await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  await new Promise(resolve => setTimeout(resolve, 50))
+  f.workers.compactAtBoundary(builder.id)
+  f.runtime.wait({ sessionId: builder.sessionId }, mission.id)
+  worker.send({ id: 'next-unit', role: 'user', content: [{ type: 'text', text: 'NEXT_UNIT' }], source: { kind: 'user' } }, 'next-turn', true)
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.deepEqual(timeline, [], 'a running member keeps the request instead of compacting')
+  releaseHold()
+  while (!timeline.includes('next-unit-request') || worker.status !== 'idle') {
+    assert.ok(Date.now() < deadline, `the tail's unit runs: ${JSON.stringify(timeline)}`); await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  await worker.whenIdle()
+  assert.ok(worker.session.snapshotEvents().some(event => event.type === 'turn/end' && event.data.reason.kind === 'blocked'), 'the held unit ended on the parked member\'s rejected step')
+  assert.deepEqual(timeline, ['compact-while-idle', 'compact-end', 'next-unit-request'], 'the compaction runs once, while idle, before the next unit')
 })

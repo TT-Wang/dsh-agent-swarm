@@ -8,7 +8,7 @@
  *    (raw SQLite rows, decoded and validated) and requires it to equal both the
  *    adapter's recorded command sequence and the committed golden sequence.
  * 3. Re-runs the replay to prove determinism, and reports trace-level metrics
- *    (contract compliance, first violating step, payload verification).
+ *    (contract compliance, first violating step, payload references).
  * 4. Fault-injects a truncated log, a corrupted log and a tampered log and
  *    requires the named errors `ReplayTruncationError`, `ReplayCorruptionError`,
  *    `TraceContractError` and `ReplayDivergenceError`.
@@ -18,7 +18,7 @@ import { readFile, rm, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import {
-  TraceContractError, TracePayloadStore, ReplayCorruptionError, ReplayDivergenceError, ReplayGraphError, ReplayTruncationError,
+  TraceContractError, ReplayCorruptionError, ReplayDivergenceError, ReplayGraphError, ReplayTruncationError,
   assertReplayParity, decodeDurableLog, orchestratorCommands, replayDigest, replayLabels, stableCommandKey, traceMetrics,
 } from '../../lib/trace.js'
 import { runScenario } from './scenario.mjs'
@@ -79,13 +79,15 @@ async function main() {
 
     // Trace-level metrics (F-44) over the durable span rows.
     const spans = events.filter(event => event.type === 'trace/span').map(event => event.data)
-    const metrics = await traceMetrics(spans, { payloads: new TracePayloadStore(scenario.payloadDir) })
+    const metrics = await traceMetrics(spans)
     expect(spans.length >= 10, `expected a span row per orchestration step, saw ${spans.length}`)
     expect(metrics.contractCompliance === 1, `span contract compliance is ${metrics.contractCompliance}: ${JSON.stringify(metrics.violations)}`)
     expect(metrics.firstViolatingStep === undefined, `unexpected first violating step: ${JSON.stringify(metrics.firstViolatingStep)}`)
     expect(metrics.orphanParents === 0, `causal closure broken for ${metrics.orphanParents} span(s)`)
-    expect(metrics.payloads.stored > 0 && metrics.payloads.verified === metrics.payloads.stored, `payload digests did not verify: ${JSON.stringify(metrics.payloads)}`)
-    expect(metrics.payloads.omitted === 0, `unexpected omitted payloads: ${metrics.payloads.omitted}`)
+    // Every span names its input and its output by digest, and no payload bytes
+    // are retained anywhere: a current row is always `stored: false`.
+    expect(metrics.payloads.referenced === spans.length * 2, `expected one input and one output reference per span, saw ${metrics.payloads.referenced} for ${spans.length} spans`)
+    expect(metrics.payloads.stored === 0 && metrics.payloads.omitted === metrics.payloads.referenced, `a recorded span still spilled payload bytes: ${JSON.stringify(metrics.payloads)}`)
 
     // Fault injection: corruption, truncation and divergence are named failures.
     await expectFailure('corrupted JSON row', 'ReplayCorruptionError', () => {
@@ -145,7 +147,7 @@ async function main() {
     console.log(`  sequence: ${replayKeys.join(' -> ')}`)
     console.log(`  digest: ${replayDigest(replayKeys)}`)
     console.log(`  trace: contract compliance ${metrics.contractCompliance.toFixed(3)}, causal closure ${metrics.causalClosure.toFixed(3)}, first violating step ${metrics.firstViolatingStep === undefined ? 'none' : `${metrics.firstViolatingStep.step}: ${metrics.firstViolatingStep.reason}`}`)
-    console.log(`  payloads: ${metrics.payloads.referenced} referenced, ${metrics.payloads.stored} stored, ${metrics.payloads.verified} verified, ${metrics.payloads.omitted} omitted`)
+    console.log(`  payloads: ${metrics.payloads.referenced} referenced, ${metrics.payloads.stored} stored, ${metrics.payloads.omitted} omitted`)
     console.log(`  provider calls: scenario ${scenario.providerCalls}, network ${fetchCalls}`)
   } finally {
     if (scenario.ownsRoot) await rm(scenario.root, { recursive: true, force: true })

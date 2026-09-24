@@ -3,6 +3,7 @@ import type { CommandRowOwnerProps, CommandRowProps } from '@deepseek-ai/dsh-cli
 import type {} from '@deepseek-ai/dsh-client-ui-commands/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { useSyncExternalStore } from 'react'
+import { currentSessionId } from './navigation.ts'
 
 export const SWARM_COMMAND = 'agent-swarm'
 
@@ -40,12 +41,12 @@ export function SwarmCommandCard({ node, onOpenSidebar, copy = text => text }: C
  */
 export function registerSwarmCommandUi(ctx: Context, { openSidebar, copy }: CommandUiOptions): void {
   ctx.on('command/executed', (sessionId, name, result) => {
-    if (name === SWARM_COMMAND && result.kind === 'success' && ctx.sessions.list.getSnapshot().current === sessionId) openSidebar()
+    if (name === SWARM_COMMAND && result.kind === 'success' && currentSessionId(ctx.sessions) === sessionId) openSidebar()
   })
   function CommandCard({ node, sessionId }: CommandRowProps) {
     useSyncExternalStore(listener => ctx.locale.subscribe(listener), () => ctx.locale.getSnapshot(), () => ctx.locale.getSnapshot())
     return <SwarmCommandCard node={node} copy={copy} onOpenSidebar={() => {
-      if (ctx.sessions.list.getSnapshot().current === sessionId) openSidebar()
+      if (currentSessionId(ctx.sessions) === sessionId) openSidebar()
     }} />
   }
   ctx.slots.inject('conversation.chat.commandview', () => ctx.slots.register({

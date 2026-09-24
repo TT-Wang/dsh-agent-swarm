@@ -9,11 +9,13 @@
  * coordination and is out of scope. See `scripts/load/README.md`.
  */
 import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { mkdirSync, openSync, closeSync, readSync, fsyncSync, readFileSync, unlinkSync, writeFileSync, chmodSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, statSync, lstatSync, constants } from 'node:fs'
 import { dirname, join, basename, resolve } from 'node:path'
-import { randomUUID } from 'node:crypto'
-import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SchedulingPass, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
+import { createHash, randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
+import type { EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -29,10 +31,13 @@ interface Tables {
   starts: AutoStart
   admissions: AdmissionRecord
   limits: LimitRule
-  passes: SchedulingPass
 }
 export type Table = keyof Tables
-const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits', 'passes']
+/**
+ * A store written before the scheduling pass guard moved into memory also holds
+ * a `passes` table; nothing reads it, and it is left in place untouched.
+ */
+const TABLES: Table[] = ['missions', 'members', 'workstreams', 'tasks', 'evidence', 'tool_runs', 'deliveries', 'drafts', 'starts', 'admissions', 'limits']
 /** Bounded board filters. `inboxFor` means "addressed to this key or mission-wide". */
 export interface PostFilter {
   kind?: PostKind
@@ -65,6 +70,8 @@ const DEFAULT_SNAPSHOT_KEEP = 5
 const SNAPSHOT_SUFFIX = '.snapshot.sqlite'
 /** Tuning for the single-writer boundary; tests and the load harness shorten it. */
 export interface StoreOptions {
+  /** The clock event `createdAt` is stamped from; the runtime hands its own (`RuntimeConfig.now`). */
+  now?: () => number
   /** How long SQLite waits for a competing writer before raising SQLITE_BUSY. */
   busyTimeoutMs?: number
   /** Bounded retries after a classified SQLITE_BUSY. */
@@ -139,7 +146,6 @@ export interface StaleTaskRefusal {
   taskId: string
   expected: number
   current: number
-  at: number
 }
 /** The durable event type every refused stale task write is recorded under. */
 export const STALE_TASK_REFUSAL_EVENT = 'task/stale-revision-refused'
@@ -178,6 +184,111 @@ export function withWriterRetry<T>(operation: () => T, options: { attempts?: num
   const message = lastError instanceof Error ? lastError.message : String(lastError)
   throw new WriterBusyError(`SQLite writer stayed busy after ${attempts} attempt(s): ${message}`, attempts, lastError)
 }
+
+interface RuntimeLock { pid: number; nonce?: string; birth?: string }
+
+function validProcessBirth(birth: string): boolean {
+  return /^linux:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:\d+$/.test(birth)
+    || /^darwin:(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth)
+}
+
+/** A PID is reusable. Unknown platforms or inaccessible identity remain conservative. */
+function processBirth(pid: number): string | undefined {
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+      if (start === undefined || !/^\d+$/.test(start)) return undefined
+      return `linux:${readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()}:${start}`
+    }
+    if (process.platform === 'darwin') {
+      const start = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+        encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      }).trim()
+      return start ? `darwin:${start}` : undefined
+    }
+  } catch { /* No trustworthy identity: retain the lock while the PID lives. */ }
+  return undefined
+}
+
+function acquireRuntimeLock(lockPath: string, nonce: string): void {
+  try {
+    const fd = openSync(lockPath, 'wx', 0o600)
+    try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce, birth: processBirth(process.pid) })); fsyncSync(fd) }
+    finally { closeSync(fd) }
+    return
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+  }
+  const original = readFileSync(lockPath, 'utf8')
+  let lock: RuntimeLock
+  try { lock = JSON.parse(original) as RuntimeLock } catch { throw new Error(`Unrecognized runtime lock: ${lockPath}; inspect it before removing`) }
+  if (!Number.isInteger(lock?.pid) || lock.pid < 1) throw new Error('Invalid swarm runtime lock')
+  let abandoned = false
+  try { process.kill(lock.pid, 0) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') abandoned = true
+    else if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error
+  }
+  if (!abandoned && typeof lock.birth === 'string' && validProcessBirth(lock.birth)) {
+    const current = processBirth(lock.pid)
+    abandoned = current !== undefined && validProcessBirth(current) && current.split(':')[0] === lock.birth.split(':')[0] && current !== lock.birth
+  }
+  if (!abandoned) throw new Error(`Swarm database is already owned by process ${lock.pid}`)
+  if (readFileSync(lockPath, 'utf8') !== original) throw new Error(`Swarm runtime lock changed during recovery: ${lockPath}; retry opening`)
+  unlinkSync(lockPath)
+  acquireRuntimeLock(lockPath, nonce)
+}
+
+function releaseRuntimeLock(lockPath: string, nonce: string): void {
+  try {
+    const value = JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce?: string }
+    if (value.nonce === nonce) unlinkSync(lockPath)
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+}
+
+const RESTORE_INTENT_SUFFIX = '.restore-intent.json'
+interface RestoreIntent { version: 1; staging: string; sha256: string }
+function hashFile(path: string): string {
+  const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(1024 * 1024), fd = openSync(path, 'r')
+  try { for (let size; (size = readSync(fd, buffer, 0, buffer.length, null)) > 0;) hash.update(buffer.subarray(0, size)) }
+  finally { closeSync(fd) }
+  return hash.digest('hex')
+}
+function syncFile(path: string): void { const fd = openSync(path, 'r'); try { fsyncSync(fd) } finally { closeSync(fd) } }
+function syncDirectory(path: string): void {
+  try { syncFile(dirname(path)) }
+  catch (error) {
+    // Some platforms cannot fsync directory descriptors. File contents remain synced.
+    if (!['EINVAL', 'ENOTSUP', 'EPERM', 'EISDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+  }
+}
+
+/** Caller holds the runtime lock. Finish the exact restore authorized by the durable marker. */
+function finishRestore(statePath: string): void {
+  const intentPath = `${statePath}${RESTORE_INTENT_SUFFIX}`
+  if (!existsSync(intentPath)) return
+  let intent: RestoreIntent
+  try {
+    intent = JSON.parse(readFileSync(intentPath, 'utf8')) as RestoreIntent
+    const prefix = `${basename(statePath)}.restore-`
+    if (intent?.version !== 1 || typeof intent.staging !== 'string' || !intent.staging.startsWith(prefix)
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(intent.staging.slice(prefix.length))
+      || typeof intent.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(intent.sha256)) throw new Error('invalid restore marker')
+  } catch (error) { throw new StoreRecoveryError('restore_blocked', `Invalid restore intent ${intentPath}; inspect it before opening the database: ${String(error)}`, statePath) }
+  const staging = join(dirname(statePath), intent.staging)
+  const candidate = existsSync(staging) ? staging : statePath
+  if (!existsSync(candidate) || !lstatSync(candidate).isFile() || hashFile(candidate) !== intent.sha256) {
+    throw new StoreRecoveryError('restore_blocked', `Restore intent ${intentPath} does not match its staged or installed database; files were preserved for inspection`, statePath)
+  }
+  if (candidate === staging) renameSync(staging, statePath)
+  // A crash after rename leaves the marker, so startup removes OLD sidecars
+  // before SQLite can replay them over the restored main database.
+  for (const suffix of ['-wal', '-shm']) rmSync(`${statePath}${suffix}`, { force: true })
+  syncDirectory(statePath)
+  rmSync(intentPath)
+  syncDirectory(statePath)
+}
 export interface StoreChange { revision: number; scopes: string[] }
 /** SQLite-backed source of truth. Only one live runtime may own a state file. */
 export class SwarmStore {
@@ -187,6 +298,7 @@ export class SwarmStore {
   private readonly busyTimeoutMs: number
   private readonly writerAttempts: number
   private readonly writerDelayMs: number
+  private readonly now: () => number
   private readonly statePath: string
   private readonly snapshotDir: string
   private readonly snapshotIntervalMs: number
@@ -208,6 +320,7 @@ export class SwarmStore {
     this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
     this.writerAttempts = Math.max(1, Math.trunc(options.writerAttempts ?? DEFAULT_WRITER_ATTEMPTS))
     this.writerDelayMs = Math.max(0, Math.trunc(options.writerDelayMs ?? DEFAULT_WRITER_DELAY_MS))
+    this.now = options.now ?? (() => Date.now())
     this.statePath = path
     this.snapshotDir = options.snapshotDir ?? `${path}.snapshots`
     this.snapshotIntervalMs = Math.max(0, Math.trunc(options.snapshotIntervalMs ?? DEFAULT_SNAPSHOT_INTERVAL_MS))
@@ -215,6 +328,7 @@ export class SwarmStore {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.lockPath = `${path}.lock`
     this.acquireLock()
+    try { finishRestore(path) } catch (error) { this.releaseLock(); throw error }
     // R11-02: a state file that disappeared while snapshots exist is data loss,
     // not a fresh install. Fail closed and name the recovery path instead of
     // silently starting an empty board.
@@ -244,6 +358,8 @@ export class SwarmStore {
         // updated in place: a post is immutable once recorded.
         this.db.exec('CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, mission_id TEXT NOT NULL, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS posts_mission ON posts(mission_id, seq);')
         this.db.exec('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, mission_id TEXT NOT NULL, type TEXT NOT NULL, actor TEXT NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS events_mission ON events(mission_id, seq);')
+        this.db.exec("CREATE INDEX IF NOT EXISTS events_task_fact ON events(mission_id, type, json_extract(data,'$.taskId'), seq); CREATE INDEX IF NOT EXISTS events_type ON events(mission_id, type, seq);")
+        this.db.exec("CREATE INDEX IF NOT EXISTS events_trace_attempt ON events(mission_id, json_extract(data,'$.attemptId'), json_extract(data,'$.step'), seq) WHERE type='trace/span';")
         this.db.exec('CREATE TABLE IF NOT EXISTS state_revision (id INTEGER PRIMARY KEY CHECK (id=1), revision INTEGER NOT NULL); INSERT OR IGNORE INTO state_revision(id,revision) VALUES(1,0); CREATE TABLE IF NOT EXISTS state_changes (revision INTEGER PRIMARY KEY, scopes TEXT NOT NULL);')
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}; COMMIT`)
       } catch (error) { this.db.exec('ROLLBACK'); throw error }
@@ -260,30 +376,10 @@ export class SwarmStore {
     }
   }
   private acquireLock(): void {
-    try {
-      const fd = openSync(this.lockPath, 'wx', 0o600)
-      try { writeFileSync(fd, JSON.stringify({ pid: process.pid, nonce: this.nonce })) } finally { closeSync(fd) }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      let lock: { pid: number }
-      try { lock = JSON.parse(readFileSync(this.lockPath, 'utf8')) as { pid: number } }
-      catch { throw new Error(`Unrecognized runtime lock: ${this.lockPath}; inspect it before removing`) }
-      if (!Number.isInteger(lock.pid) || lock.pid < 1) throw new Error('Invalid swarm runtime lock')
-      try { process.kill(lock.pid, 0) }
-      catch (check) {
-        if ((check as NodeJS.ErrnoException).code !== 'ESRCH') throw check
-        unlinkSync(this.lockPath)
-        this.acquireLock()
-        return
-      }
-      throw new Error(`Swarm database is already owned by process ${lock.pid}`)
-    }
+    acquireRuntimeLock(this.lockPath, this.nonce)
   }
   private releaseLock(): void {
-    try {
-      const value = JSON.parse(readFileSync(this.lockPath, 'utf8')) as { nonce?: string }
-      if (value.nonce === this.nonce) unlinkSync(this.lockPath)
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    releaseRuntimeLock(this.lockPath, this.nonce)
   }
   /** Commit a synchronous group of state changes and outbox events atomically. */
   transaction<T>(operation: () => T): T {
@@ -296,6 +392,10 @@ export class SwarmStore {
     let result: T, changed = false
     try {
       result = operation()
+      // A caller may catch a stale-write refusal and successfully commit other
+      // work. Its audit belongs to this same commit, not an eventual rollback.
+      const refused = this.pendingStaleRefusals.length
+      for (const refusal of this.pendingStaleRefusals) this.event(refusal.missionId, STALE_TASK_REFUSAL_EVENT, 'runtime', { taskId: refusal.taskId, expected: refusal.expected, current: refusal.current })
       changed = this.transactionScopes.size > 0
       if (changed) {
         this.db.exec('UPDATE state_revision SET revision=revision+1 WHERE id=1')
@@ -304,6 +404,7 @@ export class SwarmStore {
         this.db.prepare('DELETE FROM state_changes WHERE revision<=?').run(revision - CHANGE_HISTORY)
       }
       withWriterRetry(() => this.db.exec('COMMIT'), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+      this.pendingStaleRefusals.splice(0, refused)
     } catch (error) {
       try { this.db.exec('ROLLBACK') } catch { /* A failed commit may already have ended the transaction. */ }
       // S5: the rollback erased the refused write, not the evidence of it. The
@@ -444,7 +545,7 @@ export class SwarmStore {
   }
   /** Record the refusal durably and hand the caller the diagnostic to throw. */
   private refuseStaleTask(value: Task, expected: number, current: number): StaleTaskRevisionError {
-    const refusal: StaleTaskRefusal = { missionId: value.missionId, taskId: value.id, expected, current, at: Date.now() }
+    const refusal: StaleTaskRefusal = { missionId: value.missionId, taskId: value.id, expected, current }
     // Inside a caller transaction the record is flushed after its rollback;
     // outside one there is nothing to roll back, so it is committed now.
     if (this.transactionScopes === undefined) this.recordStaleRefusals([refusal])
@@ -472,10 +573,14 @@ export class SwarmStore {
       })
     } catch { /* The write was still refused; the record is best-effort bookkeeping. */ }
   }
-  /** Append an immutable coordination event inside the same state transaction. */
-  event(missionId: string, type: string, actor: string, data: unknown): void {
+  /**
+   * Append an immutable coordination event inside the same state transaction.
+   * `type` is the registered kind set, so an unregistered kind fails to compile
+   * at the emit site instead of reaching the durable log as an undescribed row.
+   */
+  event(missionId: string, type: EventKind, actor: string, data: unknown): void {
     const statement = this.db.prepare('INSERT INTO events(mission_id,type,actor,data,created_at) VALUES(?,?,?,?,?)')
-    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), Date.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
+    withWriterRetry(() => statement.run(missionId, type, actor, JSON.stringify(data), this.now()), { attempts: this.writerAttempts, delayMs: this.writerDelayMs })
     this.transactionScopes?.add(missionId)
   }
   /**
@@ -487,7 +592,7 @@ export class SwarmStore {
     const previous = this.get('admissions', next.id)
     const merged: AdmissionRecord = previous === undefined
       ? next
-      : { ...next, count: previous.count + 1, firstAt: previous.firstAt, lastAt: Math.max(previous.lastAt, next.lastAt) }
+      : { ...next, count: previous.count + next.count, firstAt: previous.firstAt, lastAt: Math.max(previous.lastAt, next.lastAt) }
     this.put('admissions', merged)
     return merged
   }
@@ -589,6 +694,25 @@ export class SwarmStore {
       : this.db.prepare('SELECT * FROM (SELECT * FROM events WHERE mission_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq').all(missionId, limit)
     return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
   }
+  /** Durable task fact lookup, independent of the presentation event window. */
+  latestTaskEvent(missionId: string, taskId: string, type: string, key: 'taskId' | 'reviewOf' = 'taskId'): SwarmEvent | undefined {
+    const field = key === 'reviewOf' ? '$.reviewOf' : '$.taskId'
+    const row = this.db.prepare(`SELECT * FROM events WHERE mission_id=? AND type=? AND json_extract(data,'${field}')=? ORDER BY seq DESC LIMIT 1`).get(missionId, type, taskId)
+    return row === undefined ? undefined : { seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }
+  }
+  /** Trace-only window; unrelated coordination events cannot evict parent spans. */
+  traceEvents(missionId: string, limit: number, filter: { taskId?: string; attemptId?: string; step?: string } = {}): SwarmEvent[] {
+    const where = ["mission_id=?", "type='trace/span'"]
+    const values: Array<string | number> = [missionId]
+    for (const key of ['taskId', 'attemptId', 'step'] as const) {
+      if (filter[key] === undefined) continue
+      where.push(`json_extract(data,'$.${key}')=?`)
+      values.push(filter[key]!)
+    }
+    values.push(limit)
+    const rows = this.db.prepare(`SELECT * FROM (SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY seq DESC LIMIT ?) ORDER BY seq`).all(...values)
+    return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
+  }
   /** Snapshot files, oldest first; the name orders by revision then timestamp. */
   listSnapshots(): string[] {
     try {
@@ -656,32 +780,36 @@ export class SwarmStore {
   static restore(statePath: string, snapshotPath: string): { restoredFrom: string; bytes: number } {
     if (!existsSync(snapshotPath)) throw new StoreRecoveryError('snapshot_invalid', `Snapshot ${snapshotPath} does not exist`, statePath)
     const lockPath = `${statePath}.lock`
-    if (existsSync(lockPath)) {
-      let pid: number | undefined
-      try { pid = (JSON.parse(readFileSync(lockPath, 'utf8')) as { pid?: number }).pid } catch { pid = undefined }
-      let alive = false
-      if (typeof pid === 'number' && Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 0); alive = true } catch (error) { alive = (error as NodeJS.ErrnoException).code === 'EPERM' }
-      }
-      if (alive || pid === undefined) {
-        throw new StoreRecoveryError('restore_blocked',
-          `Swarm state ${statePath} is owned by a live runtime${alive && pid !== undefined ? ` (pid ${pid})` : ''}; stop the host before restoring a snapshot. If no host is running, delete ${lockPath} and retry.`, statePath)
-      }
-      // OWNER PASS 2026-09-11: a crashed host leaves its lock behind, and the
-      // store's own acquire path already reclaims a dead pid — restore did not,
-      // so the recovery path was unavailable exactly when it was needed: a host
-      // killed while a restore request was staged could never apply it again.
-      // Reclaim the same way acquireLock does, then continue.
-      rmSync(lockPath, { force: true })
-    }
-    SwarmStore.validateSnapshot(statePath, snapshotPath)
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 })
+    const nonce = randomUUID()
+    try { acquireRuntimeLock(lockPath, nonce) }
+    catch (error) { throw new StoreRecoveryError('restore_blocked', `Cannot restore ${statePath}: ${String(error)}. Stop its host or inspect ${lockPath} before retrying.`, statePath) }
     const staging = `${statePath}.restore-${randomUUID()}.tmp`
-    copyFileSync(snapshotPath, staging)
-    chmodSync(staging, 0o600)
-    renameSync(staging, statePath)
-    for (const suffix of ['-wal', '-shm']) rmSync(`${statePath}${suffix}`, { force: true })
-    return { restoredFrom: snapshotPath, bytes: statSync(statePath).size }
+    const intentPath = `${statePath}${RESTORE_INTENT_SUFFIX}`
+    const writingIntent = `${intentPath}.${nonce}.tmp`
+    try {
+      SwarmStore.validateSnapshot(statePath, snapshotPath)
+      finishRestore(statePath)
+      copyFileSync(snapshotPath, staging, constants.COPYFILE_EXCL)
+      chmodSync(staging, 0o600)
+      syncFile(staging)
+      // Validate the copy, too: a concurrently changed source cannot authorize
+      // installing corrupt bytes after only an earlier source validation.
+      SwarmStore.validateSnapshot(statePath, staging)
+      const intent: RestoreIntent = { version: 1, staging: basename(staging), sha256: hashFile(staging) }
+      writeFileSync(writingIntent, JSON.stringify(intent), { flag: 'wx', mode: 0o600 })
+      syncFile(writingIntent)
+      renameSync(writingIntent, intentPath)
+      syncDirectory(statePath)
+      finishRestore(statePath)
+      return { restoredFrom: snapshotPath, bytes: statSync(statePath).size }
+    } finally {
+      try {
+        rmSync(writingIntent, { force: true })
+        // Once the intent is durable, keep its staging file for startup recovery.
+        if (!existsSync(intentPath)) rmSync(staging, { force: true })
+      } finally { releaseRuntimeLock(lockPath, nonce) }
+    }
   }
   /** R11-02: validate a snapshot without applying it (existence, integrity and schema). */
   static validateSnapshot(statePath: string, snapshotPath: string): { bytes: number } {

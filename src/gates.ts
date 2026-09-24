@@ -8,10 +8,13 @@
  */
 import { randomUUID, createHash } from 'node:crypto'
 import { arenaView as projectArenaView } from './arena.ts'
+import { currentEvidenceIds } from './attempts.ts'
 import { excerpt } from './declared-checks.ts'
+import { executionElapsed } from './resource-time.ts'
+import { memberPhaseOf } from './projection.ts'
 import { emitGuardTerminal } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets } from './types.ts'
+import type { Delivery, Evidence, Member, Mission, Post, Task, UsageBuckets, UsageSnapshotSource } from './types.ts'
 
 export const USAGE_KEYS = ['uncachedInputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens', 'requests'] as const
 
@@ -98,7 +101,7 @@ export const DEFAULT_BUDGET_WARN_AT: readonly number[] = [0.7, 0.9]
  * board page can never flood a model context. TTL expiry is reported, never
  * enforced by mutating the post.
  */
-export function postView(post: Post, full = false): Record<string, unknown> {
+export function postView(post: Post, now: number, full = false): Record<string, unknown> {
   return {
     id: post.id, seq: post.seq, kind: post.kind, fromMemberId: post.fromMemberId,
     ...(post.toMemberId === undefined ? {} : { toMemberId: post.toMemberId }),
@@ -110,7 +113,7 @@ export function postView(post: Post, full = false): Record<string, unknown> {
     ...(post.toolRunIds.length ? { toolRunIds: post.toolRunIds } : {}),
     ...(post.replyTo === undefined ? {} : { replyTo: post.replyTo }),
     createdAt: post.createdAt,
-    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: Date.now() >= post.createdAt + post.ttlMs }),
+    ...(post.ttlMs === undefined ? {} : { ttlMs: post.ttlMs, expiresAt: post.createdAt + post.ttlMs, expired: now >= post.createdAt + post.ttlMs }),
   }
 }
 
@@ -196,14 +199,14 @@ export class RuntimeGates {
    */
   ownerInstruments(missionId: string, full: boolean): Record<string, unknown> {
     const records = this.fingerprintRecords(missionId)
-    const view = projectArenaView({ ...records, missionId, now: Date.now(), leaseMs: this.rt.config.leaseMs })
+    const view = projectArenaView({ ...records, missionId, now: this.rt.now(), leaseMs: this.rt.config.leaseMs })
     const counts = { sent: view.notices.length, queued: view.notices.filter(entry => entry.state === 'queued').length, claimed: view.notices.filter(entry => entry.state === 'claimed').length }
     return {
       // T3d: the owner-visible fingerprint is the no-silent-state F(S) the
       // witness record and F19 use, never the arena ledger's dedup digest.
       fingerprint: this.fingerprint(missionId),
       noticeDedupKey: this.rt.noticeKey(missionId),
-      pendingDispatchable: view.pendingDispatchable,
+      pendingDispatchable: this.fingerprintBoard(missionId).tasks.filter(task => task.ready).length,
       ...(view.lastNotice === undefined ? {} : { lastWitness: view.lastNotice }),
       notices: counts,
       // L3: the receipts nobody has settled yet. A question with no answer is a
@@ -225,7 +228,7 @@ export class RuntimeGates {
         to: delivery.to === 'owner' ? 'owner' : delivery.to,
         from: delivery.from,
         ...(delivery.taskId === undefined ? {} : { taskId: delivery.taskId }),
-        ageMs: Math.max(0, Date.now() - (delivery.deliveredAt ?? delivery.createdAt)),
+        ageMs: Math.max(0, this.rt.now() - (delivery.deliveredAt ?? delivery.createdAt)),
         nudges: delivery.replyNudges ?? 0,
         question: delivery.content.replace(/\s+/g, ' ').slice(0, 200),
       }))
@@ -248,7 +251,7 @@ export class RuntimeGates {
     return {
       count,
       addressed: this.rt.store.countPosts(missionId, { inboxFor: memberId, afterSeq }),
-      newest: newest.map(post => postView(post)),
+      newest: newest.map(post => postView(post, this.rt.now())),
       ...(count > newest.length ? { omitted: count - newest.length } : {}),
       ...(newest.length ? { nextAfter: newest.at(-1)!.seq } : {}),
     }
@@ -266,19 +269,33 @@ export class RuntimeGates {
   }
 
   /** Reconcile durable Harness usage cumulatively, including after a crash before SQLite accounting. */
-  async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void> {
+  async usageSnapshot(memberId: string, totalTokens: number, usage?: UsageBuckets, source?: UsageSnapshotSource): Promise<void> {
     if (this.rt.closed) return
     if (!Number.isSafeInteger(totalTokens) || totalTokens < 0) throw new Error('Invalid authoritative usage snapshot')
     if (usage !== undefined && !validUsage(usage)) throw new Error('Invalid usage buckets')
+    if (source !== undefined && (!Number.isSafeInteger(source.generation) || source.generation < 0 || typeof source.restored !== 'boolean')) throw new Error('Invalid usage session generation')
     const member = this.rt.store.get('members', memberId)
     if (!member) throw new Error('Unknown worker in usage accounting')
     const mission = this.rt.mission(member.missionId)
-    const previouslyAccounted = member.accountedTokens ?? 0
-    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, member.usage)
-    if (totalTokens <= previouslyAccounted && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0))) return
-    member.accountedTokens = Math.max(previouslyAccounted, totalTokens)
-    mission.usedTokens += Math.max(0, totalTokens - previouslyAccounted)
-    if (bucketDelta !== undefined) { member.usage = usage; mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
+    // New native sessions restart their cumulative log at zero. Never use a
+    // member's lifetime total as that new log's watermark or erase old costs.
+    // A late observation from a retired generation must not reopen its ledger.
+    if (source !== undefined && member.usageSession !== undefined && source.generation < member.usageSession.generation) return
+    const sameSession = source !== undefined && member.usageSession?.generation === source.generation
+    const migrate = source !== undefined && member.usageSession === undefined && source.restored
+    const previous = source === undefined || migrate ? { accountedTokens: member.accountedTokens ?? 0, usage: member.usage }
+      : sameSession ? member.usageSession! : { accountedTokens: 0, usage: undefined }
+    const tokenDelta = Math.max(0, totalTokens - previous.accountedTokens)
+    const bucketDelta = usage === undefined ? undefined : usageDelta(usage, previous.usage)
+    if (tokenDelta === 0 && (bucketDelta === undefined || USAGE_KEYS.every(key => bucketDelta[key] === 0)) && (source === undefined || sameSession)) return
+    member.accountedTokens = (member.accountedTokens ?? 0) + tokenDelta
+    mission.usedTokens += tokenDelta
+    if (bucketDelta !== undefined) { member.usage = addUsage(member.usage, bucketDelta); mission.workerUsage = addUsage(mission.workerUsage, bucketDelta) }
+    if (source !== undefined) member.usageSession = {
+      generation: source.generation,
+      accountedTokens: Math.max(previous.accountedTokens, totalTokens),
+      ...(bucketDelta === undefined ? previous.usage === undefined ? {} : { usage: previous.usage } : { usage: addUsage(previous.usage, bucketDelta) }),
+    }
     this.rt.commit(mission.id, () => { this.rt.store.put('members', member); this.rt.store.put('missions', mission) })
     this.warnBudget(mission)
     if (mission.usedTokens >= mission.budget.maxTokens) this.blockBudget(mission)
@@ -294,13 +311,13 @@ export class RuntimeGates {
     if (this.rt.closed || this.rt.shuttingDown || !validUsage(usage) || this.rt.isWorkerSession(sessionId)) return
     const mission = this.rt.store.list('missions').filter(item => item.ownerSessionId === sessionId && !this.rt.isMissionTerminal(item)).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (mission) {
-      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = Date.now()
+      mission.ownerUsage = addUsage(mission.ownerUsage, usage); mission.updatedAt = this.rt.now()
       this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
       return
     }
     const request = this.rt.store.list('starts').filter(item => item.ownerSessionId === sessionId && (item.status === 'planning' || item.status === 'launching')).sort((a, b) => b.createdAt - a.createdAt)[0]
     if (!request) return
-    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = Date.now()
+    request.ownerUsage = addUsage(request.ownerUsage, usage); request.updatedAt = this.rt.now()
     this.rt.commit(request.id, () => this.rt.store.put('starts', request))
   }
 
@@ -309,40 +326,82 @@ export class RuntimeGates {
     const dimensions: string[] = []
     if (mission.usedTokens >= mission.budget.maxTokens) dimensions.push('maxTokens')
     if (mission.usedSteps >= mission.budget.maxSteps) dimensions.push('maxSteps')
-    if (Date.now() >= mission.deadline) dimensions.push('maxDurationMs')
+    if (this.rt.now() >= mission.deadline) dimensions.push('maxDurationMs')
     return dimensions
   }
 
   /**
    * Emit at most one approaching-limit warning per dimension per threshold. The
-   * first signal is an event, not a fatal pause; thresholds default to 0.7/0.9.
+   * first signal is a durable owner review notice; thresholds default to 0.7/0.9.
    */
   warnBudget(mission: Mission): void {
     if (mission.status !== 'active' || mission.budgetPause) return
     const thresholds = [...(this.rt.config.budgetWarnAt ?? DEFAULT_BUDGET_WARN_AT)]
       .filter(value => Number.isFinite(value) && value > 0 && value < 1).sort((a, b) => a - b)
     if (!thresholds.length) return
-    const dimensions: Array<{ dimension: string; used: number; limit: number }> = [
-      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens },
-      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps },
-      { dimension: 'maxDurationMs', used: Math.max(0, Date.now() - mission.createdAt), limit: mission.budget.maxDurationMs },
+    const members = this.rt.store.list('members', mission.id)
+    const inFlight = members.filter(member => memberPhaseOf(member) !== 'stopped'
+      && (this.rt.workers.currentActivity(member.id) ?? member.activity)?.kind === 'model')
+    const tasks = this.rt.store.list('tasks', mission.id)
+    const pairedSources = new Set(tasks.filter(task => task.kind === 'verification' && task.status !== 'cancelled').map(task => task.reviewOf))
+    const pendingReviewSlots = tasks.filter(task => task.kind !== 'verification' && !['accepted', 'cancelled'].includes(task.status) && !pairedSources.has(task.id)).length
+    const dimensions: Array<{ dimension: string; used: number; limit: number; inFlight: number; reviewSlots?: number; task?: Task }> = [
+      { dimension: 'maxTokens', used: mission.usedTokens, limit: mission.budget.maxTokens, inFlight: this.rt.inFlightEstimate(members) },
+      { dimension: 'maxSteps', used: mission.usedSteps, limit: mission.budget.maxSteps, inFlight: inFlight.length },
+      { dimension: 'maxDurationMs', used: executionElapsed(mission, this.rt.now()), limit: mission.budget.maxDurationMs, inFlight: 0 },
+      { dimension: 'maxTasks', used: tasks.length, limit: mission.budget.maxTasks, inFlight: 0, reviewSlots: pendingReviewSlots },
     ]
-    let changed = false
+    for (const task of tasks) {
+      if (['accepted', 'cancelled'].includes(task.status)) continue
+      if (task.maxSteps !== undefined) dimensions.push({ dimension: 'maxSteps', used: task.usedSteps ?? 0, limit: task.maxSteps,
+        inFlight: inFlight.some(member => member.id === task.attempt?.ownerId) ? 1 : 0, task })
+      // A claim a rework archived is history of a rejected round, so it counts toward no round's findings.
+      if (task.maxFindings !== undefined) dimensions.push({ dimension: 'maxFindings', used: currentEvidenceIds(task).length, limit: task.maxFindings, inFlight: 0, task })
+    }
+    const warnings: Array<{ gate: string; threshold: number; key: string; content: string; subjects: string[]; data: Record<string, string | number> }> = []
+    let missionProgress: string | undefined
     for (const item of dimensions) {
       if (!(item.limit > 0)) continue
-      const crossed = thresholds.filter(threshold => item.used / item.limit >= threshold).at(-1)
-      if (crossed === undefined || crossed <= (mission.budgetWarned?.[item.dimension] ?? 0)) continue
-      mission.budgetWarned = { ...(mission.budgetWarned ?? {}), [item.dimension]: crossed }
-      changed = true
-      // F11: the division can land one ulp above an exact ceiling (700 / 0.7 is
-      // 1000.0000000000001), so Math.ceil alone suggests 1001. Round the ratio to
-      // six decimals first; the suggestion stays the smallest integer limit that
-      // holds the dimension at or below the crossed threshold.
-      const suggestedLimit = Math.ceil(Number((item.used / crossed).toFixed(6)))
-      this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
-        remaining: Math.max(0, item.limit - item.used), suggestedLimit })
+      const projected = item.used + item.inFlight + (item.reviewSlots ?? 0)
+      const crossed = thresholds.filter(threshold => projected / item.limit >= threshold).at(-1)
+      const gate = `${item.task?.id ?? 'mission'}:${item.dimension}:${item.limit}`
+      if (crossed === undefined || crossed <= (this.rt.mission(mission.id).budgetWarned?.[gate] ?? 0)) continue
+      // This is only the numeric floor that restores threshold headroom, never
+      // an estimate of the resources needed to finish the mission.
+      const recommendation = Math.max(item.limit + 1, Math.ceil(Number((projected / thresholds[0]!).toFixed(6))))
+      const suggestedLimit = Number.isSafeInteger(recommendation) ? recommendation : undefined
+      const scope = item.task === undefined ? 'Mission' : `Task ${item.task.id} (${item.task.title})`
+      const progress = item.task === undefined
+        ? missionProgress ??= `${tasks.filter(task => task.status === 'accepted').length}/${tasks.length} tasks accepted; ${this.rt.store.list('evidence', mission.id).length} evidence records`
+        : `status ${item.task.status}; ${item.task.evidenceIds.length} evidence records; artifact ${item.task.artifact?.commit ?? 'not submitted'}`
+      const data = { dimension: item.dimension, threshold: crossed, used: item.used, limit: item.limit,
+        remaining: Math.max(0, item.limit - item.used), inFlightEstimate: item.inFlight, projected,
+        projectionBasis: item.dimension === 'maxTokens' ? 'settled-plus-current-model-requests' : item.reviewSlots !== undefined ? 'admitted-plus-unpaired-reviews' : 'settled-plus-in-flight',
+        ...(item.reviewSlots === undefined ? {} : { pendingReviewSlots: item.reviewSlots, remainingAfterReviews: Math.max(0, item.limit - projected) }),
+        ...(suggestedLimit === undefined ? {} : { suggestedLimit, suggestedLimitBasis: 'threshold-headroom-only' }), ...(item.task === undefined ? {} : { taskId: item.task.id }), progress }
+      warnings.push({ gate, threshold: crossed, key: `budget-review:${mission.id}:${gate}:${crossed}`, data,
+        subjects: this.rt.noticeSubjectsFor(mission.id, item.task === undefined ? {} : { taskId: item.task.id }),
+        content: `${scope}: ${item.dimension} ${item.reviewSlots === undefined ? 'settled' : 'admitted'} ${item.used}/${item.limit}, remaining ${data.remaining}; ${item.reviewSlots === undefined ? `in-flight estimate ${item.inFlight}` : `${item.reviewSlots} known review slots still needed`}, projected ${projected}, threshold ${crossed}.${suggestedLimit === undefined ? '' : ` Threshold-headroom floor for ${item.dimension}: ${suggestedLimit}; decide the actual allowance from remaining work.`} Progress: ${progress}.${item.dimension === 'maxTokens' ? ' Token projection covers current requests only, not the cost of completing remaining tasks.' : ''}${item.dimension === 'maxFindings' ? ' Finding count is advisory.' : ''}` })
     }
-    if (changed) this.rt.commit(mission.id, () => this.rt.store.put('missions', mission))
+    if (!warnings.length) return
+    // One owner wake for this pass; each dimension keeps its durable event and
+    // identity so a later threshold, changed limit or restart remains distinct.
+    this.rt.commit(mission.id, () => {
+      const current = this.rt.mission(mission.id)
+      current.budgetWarned = { ...(current.budgetWarned ?? {}) }
+      for (const warning of warnings) {
+        current.budgetWarned[warning.gate] = warning.threshold
+        this.rt.store.event(mission.id, 'mission/budget-warning', 'runtime', warning.data)
+      }
+      this.rt.store.put('missions', current)
+      const keys = warnings.map(warning => warning.key)
+      const dedupKey = warnings.length === 1 ? keys[0]! : `budget-review:${mission.id}:batch:${createHash('sha256').update(keys.join('\n')).digest('hex').slice(0, 20)}`
+      const instructions = 'Review remaining work and use swarm_budget with reason: budget for the mission, or taskId and taskBudget for a task. Exhaustion preserves work; an extension never overrides a user pause or fixed deadline.'
+      this.rt.notify(mission.id, `Resource review (${warnings.length} threshold${warnings.length === 1 ? '' : 's'}):\n${warnings.map(warning => `- ${warning.content}`).join('\n')}\n${instructions}`,
+        [...new Set(warnings.flatMap(warning => warning.subjects))], { noticeClass: 'budget', dedupe: true, dedupKey, trigger: 'mission/budget-warning', reason: keys.join('\n'),
+          facts: [...warnings.map(warning => warning.content), instructions],
+          aggregatedIdentities: warnings.map(warning => ({ class: 'budget', dedupKey: warning.key, from: 'runtime', contentDigest: createHash('sha256').update(warning.content).digest('hex') })) })
+    })
   }
 
   blockBudget(mission: Mission): void {
@@ -396,10 +455,10 @@ export class RuntimeGates {
     const pause = mission.budgetPause
     if (pause === undefined || pause.id !== pauseId || pause.quiesced) return
     const claim = pause.stopping
-    if (claim !== undefined && claim.instanceId === this.rt.instanceId && Date.now() - claim.at < this.rt.stallPassTimeoutMs) return
+    if (claim !== undefined && claim.instanceId === this.rt.instanceId && this.rt.now() - claim.at < this.rt.stallPassTimeoutMs) return
     // The durable claim lands BEFORE the first await, so it is the gate for any
     // later caller, whether or not this process still holds the mirror entry.
-    pause.stopping = { instanceId: this.rt.instanceId, at: Date.now() }
+    pause.stopping = { instanceId: this.rt.instanceId, at: this.rt.now() }
     this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
     this.budgetStops.add(pauseId)
     this.rt.defer(async () => {
@@ -440,17 +499,17 @@ export class RuntimeGates {
           this.rt.store.event(mission.id, 'task/budget-resume-skipped', 'runtime', { taskId: task.id, pauseId: pause.id })
           continue
         }
-        task.attempt.leaseUntil = Math.min(mission.deadline, Date.now() + this.rt.config.leaseMs)
+        task.attempt.leaseUntil = Math.min(mission.deadline, this.rt.now() + this.rt.config.leaseMs)
         this.rt.store.putTask(task)
-        const member = this.rt.store.get('members', task.attempt.ownerId)
-        if (member && member.status !== 'stopped') { member.status = 'working'; this.rt.store.put('members', member) }
+        // The resumed attempt is what makes its owner `working`; the status is
+        // derived from that on every read, so there is nothing to write here.
         for (const delivery of this.rt.store.list('deliveries', mission.id)) {
           if (delivery.kind === 'assignment' && delivery.taskId === task.id && !delivery.deliveredAt) {
-            delivery.deliveredAt = Date.now(); this.rt.store.put('deliveries', delivery)
+            delivery.deliveredAt = this.rt.now(); this.rt.store.put('deliveries', delivery)
           }
         }
         this.rt.store.put('deliveries', { id: id('msg'), missionId: mission.id, from: 'runtime', to: task.attempt.ownerId, kind: 'assignment',
-          taskId: task.id, attemptId: task.attempt.id, createdAt: Date.now(),
+          taskId: task.id, attemptId: task.attempt.id, createdAt: this.rt.now(),
           content: JSON.stringify({ missionId: mission.id, task, instructions: 'Resume this same task and attempt after the primary agent adjusted the mission budget. The previous worker activity has fully stopped. Your previously recorded host tool-run IDs from this attempt remain valid. Inspect the saved workspace and evidence, continue unfinished work, and use this exact attemptId. Do not repeat completed effects or claim a new task.',
             // ENV-R2: the resumed attempt is the same attempt, so its assignment
             // must carry the same declared-check envelope a first assignment

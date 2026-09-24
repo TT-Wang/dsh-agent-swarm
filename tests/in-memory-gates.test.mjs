@@ -5,16 +5,19 @@
  * 120 minutes after `task/lease-expired` while the same host kept serving
  * another mission, because the in-memory `scheduled` Set in `Runtime.kick()`
  * swallowed the tick timer's only liveness action. Round 13's T1 converted that
- * guard to the durable per-mission `passes` row and deleted the Set; this file
+ * guard to a durable per-mission `passes` row and deleted the Set; this file
  * includes that work as the `scheduled` absence claim below and does not
- * duplicate it.
+ * duplicate it. The guard is in memory again (`Scheduling.passes`, the one body
+ * queued or running on the mission's serial queue), labelled `in-flight`: every
+ * await in the body is bounded, so the body releases it, and the tick watchdog
+ * names a body past its bound while it still holds it.
  *
- * What this file is: an EXHAUSTIVE census of every `new Map`/`new Set`/
+ * The historical table below records the original `new Map`/`new Set`/
  * `new WeakMap`/`new WeakSet` occurrence in `src/` (excluding `src/client`, the
  * browser bundle), each classified, plus one behaviour test per gate entry.
- * Absence claims here are backed by the census, never by example: the first
- * test fails if any occurrence in the tree is unclassified, so "there is no
- * other in-memory gate" is a machine check, not a reading.
+ * The active check inventories class fields and module bindings by identity,
+ * including new recovery state. Function-local scratch collections do not need
+ * an ordinal or full-source-text registration. Existing gate behavior tests remain.
  *
  * The unit that carries a LABEL is the runtime's own decision path:
  * `SwarmRuntime`, its seven extracted seams (`attempts`, `gates`, `notices`,
@@ -25,24 +28,26 @@
  * enumerated, but no label claimed for them and no runtime test written, because
  * the runtime reaches them only through an injected adapter.
  *
- * The two labels, defined operationally:
+ * The labels, defined operationally:
  *  - `derivable`: the gate consults durable state before it acts, so clearing
  *    the collection cannot make the gate wrong. The test re-reads the store.
  *  - `cache-only`: clearing the collection cannot change a durable outcome or
  *    produce a wrong durable transition; the worst case is duplicated idempotent
  *    work or a lost in-process notification. The test clears it and shows the
  *    durable result is unchanged.
+ *  - `in-flight`: physical operations are still owned by this process. They
+ *    must settle before their serialization entry can be released; durable CAS
+ *    does not undo Git effects and is not a substitute for this ownership.
  *
- * A third label was possible while a gate was neither; S5c closed it. Every
- * behaviour-gating entry in `src/` is now `derivable` or `cache-only`, and the
- * census test asserts that by NAME for the five entries that used to be reported
- * as neither (`queues`, `operations`, `startControllers`, `startFailures`,
- * `releasedPasses`): a new unlabelled state cannot hide behind an edited count.
- * The five fixes are structural, not re-labelling — the mission queue no longer
- * chains past the declared bound, the launch's cancellation is re-read from the
+ * Existing policy gates retain these labels and their behavior tests. New
+ * recovery entries also distinguish native lifecycle ownership and an audit
+ * buffer that has not yet become durable; neither is relabelled as a harmless
+ * cache. Registration follows the binding name, so a new persistent collection
+ * cannot hide behind an edited occurrence count.
+ * The mission queue refuses waiters past its declared bound while retaining
+ * the in-flight operation; the launch's cancellation is re-read from the
  * durable start row before activation, the consecutive-failure count lives on
- * the member row, every deferred body re-derives from durable state, and the
- * pass watchdog stamps `releasedRunId` on the durable pass row.
+ * the member row, and every deferred body re-derives from durable state.
  *
  * Co-firing guards (every guard must name what it can fire with):
  *  - the per-task revision CAS in `SwarmStore.putTask` fires with the mission
@@ -51,16 +56,17 @@
  *  - the fingerprint cache fires with `commitDepth` (bypassed inside a
  *    transaction) — pinned below;
  *  - the notice-dedup sets fire with the durable delivery ledger — pinned below;
- *  - the durable pass-release fence fires with the pass watchdog
- *    (`checkSchedulingPasses`), the mission queue's bound and `openPass`'s
- *    carry-forward — pinned in the `releasedPasses` test below.
+ *  - the in-memory pass guard (`passes`) fires with the pass watchdog
+ *    (`checkSchedulingPasses`) and the mission queue's bound — pinned in the
+ *    `passes` test below.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
-import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime } from './faults/harness.mjs'
+import { setup, eventually, events, taskOf, FakeWorkers, SwarmRuntime, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
+import { persistentCollections } from './source-semantics.mjs'
 
 const PROJECT = fileURLToPath(new URL('../', import.meta.url))
 
@@ -83,14 +89,14 @@ class GatedWorkers extends FakeWorkers {
 
 /** A valid automatic plan (the shape `startPlan` accepts), copied from tests/automatic.test.mjs. */
 function automaticPlan(workspace) {
-  const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+  const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
   return {
     title: 'Automatic delivery', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
-      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ],
   }
 }
@@ -142,21 +148,17 @@ const CENSUS = [
   ["src/harness-workers.ts",7,"Set","const claimedIds = new Set(messages.map(message => message.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/notices.ts",3,"Set","const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])","constant","","module-level immutable lookup table; excludes recursive and receipt followups, no mutable recovery state"],
   ["src/notices.ts",1,"Set","const TERMINAL_STATES = new Set(['accepted', 'cancelled'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/notices.ts",2,"Set","const NO_LIVE_PATH_FAMILIES = new Set(['stall-root', 'fallthrough'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/notices.ts",3,"Set","const FOLLOWUP_EXCLUDED_FAMILIES = new Set(['obligation-followup', 'absence', 'owner-reply-missing', 'owner-reply-blocked'])","constant","","module-level immutable lookup table; excludes recursive and receipt followups, no mutable recovery state"],
   ["src/notices.ts",3,"Set","const replaced = new Set<string>()","local","","function-local: created and discarded inside one synchronous call (the shared lineage helper `replacementCoverage`), so it cannot gate a later call"],
   ["src/notices.ts",4,"Set","const roots = new Set(stallRootsFor(rt, tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside the one synchronous call of the R17-G9 refusal predicate, which re-reads the durable task rows on every call, so it cannot gate a later call"],
-  ["src/notices.ts",5,"Set","readonly parkedNotices = new Set<string>()","gate","derivable","the durable delivery ledger (class, dedupKey, sender) is the gate; the set only avoids the read"],
-  ["src/notices.ts",6,"Set","readonly integrationGapWarned = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
-  ["src/notices.ts",7,"Set","readonly reviewPathNotices = new Set<string>()","gate","derivable","the durable delivery ledger is the gate; the set only avoids the read"],
   ["src/notices.ts",8,"Map","private readonly delivering = new Map<string, number>()","gate","cache-only","per-attempt claim; the durable deliveredAt row is the real gate and adapter acceptance is idempotent"],
   ["src/notices.ts",9,"Set","private readonly pendingTransitions = new Set<string>()","gate","derivable","R17-G5: the missions whose committed transition still owes a publication. The durable commit is the gate; losing the pending set skips at most one publication, which the next commit (or the absence net) re-derives, and the probe below clears it and observes the fact still published by a later transition"],
   ["src/notices.ts",10,"Set","private readonly wedgedReleases = new Set<string>()","gate","derivable","R17-G5: missions whose pass was just released as wedged, so the next publication runs the wedged branch. The release is durable (the pass row plus the mission/stalled event); losing the marker degrades the next publication to the ordinary off-pass branch, which the probe below exercises"],
-  ["src/notices.ts",11,"Set","const roots = new Set(this.stallRoots(tasks).map(task => taskSubject(task)))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",12,"Set","const named = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",13,"Set","const uniqueFalseSubjects = [...new Set(falseSubjects)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",14,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/notices.ts",15,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",11,"Set","const roots = new Set(view.stallRoots.map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/notices.ts",12,"Map","const found = new Map<string, Task>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   // L2 owner-reply guard: a plugin-side observer of host session events, not a
   // participant in the runtime's decision path. Every durable fact it reports
   // (the open receipt, its nudge count, the guard terminal) lives on the
@@ -175,18 +177,12 @@ const CENSUS = [
   ["src/roles.ts",2,"Map","private readonly handling = new Map<string, Handling>()","outside","","outside the runtime decision path: per-session prompt presentation tracks admitted notices and completed handling, reconstructed from the durable session log when an agent is attached; it never authorizes a runtime action"],
   ["src/roles.ts",3,"Set","const handling: Handling = { admitted: new Set(), pending: new Set(), handled: new Set() }","outside","","outside the runtime decision path: these sets are retained in the role adapter's handling map, not discarded at function return; session inbox/user-message and completed-turn events rebuild them, and their result only chooses the full or historical-owner prompt"],
   ["src/roles.ts",4,"Set","const visible = new Set(agent.ctx.tools.schemas(agent).map(schema => schema.name))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",1,"Set","const SELF_RUN_FACTS = new Set(['HOME', 'XDG_CACHE_HOME', 'npm_config_cache', 'YARN_CACHE_FOLDER', 'PIP_CACHE_DIR', 'GOCACHE'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/runtime.ts",2,"Set","const SELF_RUN_SHELLS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/runtime.ts",3,"Set","const UNSET_VARIABLE_OPTIONS = new Set(['-v', '--'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
-  ["src/runtime.ts",4,"Set","const ENV_CHDIR_OPTIONS = new Set(['-C', '--chdir'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/runtime.ts",5,"Set","private readonly listeners = new Set<(missionId: string) => void>()","gate","cache-only","in-process change fan-out; a lost notification changes no durable state and a subscriber re-reads on its next request"],
-  ["src/runtime.ts",6,"Map","readonly queues = new Map<string, Promise<unknown>>()","gate","cache-only","S5c: the chain is an in-process ordering cache. `exclusive` waits for a predecessor only up to the declared bound (stallPassTimeoutMs) and then starts the next operation, so a wedged body can no longer swallow it, and two bodies that overlap after the bound cannot lose an update because every commit is a single-writer transaction and every task write is a compare-and-swap on the task revision (SwarmStore.putTask). Clearing it removes ordering only, never a durable outcome (probe below)"],
+  ["src/runtime.ts",6,"Map","readonly queues = new Map<string, Promise<unknown>>()","gate","in-flight","Physical operations remain serialized until their promises settle; bounded waiters are refused without releasing a still-running predecessor. The watchdog and notices run outside the queue. This ownership cannot safely be cleared while adapter I/O is live; restart recovery comes from task/workspace records."],
   ["src/runtime.ts",7,"Set","private readonly operations = new Set<Promise<unknown>>()","gate","cache-only","S5c: the drain registry orders shutdown; the deferred body is registered by `defer` and runs regardless, so clearing the registry does not cancel it and its durable write still lands (probe below). Every deferred body the runtime schedules re-derives its work from durable state (the pass row, the budget `stopping` claim, the durable outbox), so losing the drain lets dispose() return earlier but cannot make a durable transition wrong"],
   ["src/runtime.ts",8,"Map","private readonly startControllers = new Map<string, AbortController>()","gate","derivable","S5c: the abort handle is an accelerator. `failStart` records the failed request durably and `launchDraft` re-reads that row immediately before it activates the mission, so a cancelled launch cannot come active even when the registry is lost or raced (probe below)"],
   ["src/runtime.ts",9,"Map","readonly startFailures = new Map<string, number>()","gate","derivable","S5c: the count is read from and written to the durable member row (`startFailures` field) and cleared there by the same successful start that clears the provider outage; the Map is the in-process mirror, so a lost map or a restart continues the count instead of resetting the route budget (probe below)"],
   ["src/runtime.ts",10,"Map","private readonly observeCursors = new Map<string, DeliveredCursor>()","gate","cache-only","delivered-position context cache; loss re-sends one bounded focused view and a cursor can never exceed the durable log"],
-  ["src/runtime.ts",11,"Map","private readonly autoReviewAdmissions = new Map<string, string>()","gate","derivable","the durable task/review-admitted event is read first; the map is only a fallback for an admission whose event write failed"],
-  ["src/runtime.ts",12,"Set","private readonly reviewPathReported = new Set<string>()","gate","derivable","the durable task/review-missing event for the exact submission is re-read before the set is trusted"],
   ["src/runtime.ts",13,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",14,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",15,"Map","const byId = new Map(rows.map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -203,7 +199,7 @@ const CENSUS = [
   ["src/runtime.ts",26,"Set","if (input.replaces?.length) task.replaces = [...new Set(input.replaces)]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",27,"Set","const ids = new Set(task.priorOwnerIds ?? [])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",28,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/runtime.ts",29,"Set","if (this.workers.compactAtBoundary) for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/runtime.ts",29,"Set","for (const memberId of new Set([source.attempt?.ownerId, member.id])) if (memberId) this.workers.compactAtBoundary(memberId)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",30,"Set","const interrupted = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",31,"Set","const invalidated = new Set([source.id])","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",32,"Set","const released = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -215,19 +211,14 @@ const CENSUS = [
   ["src/runtime.ts",38,"Set","const memberMissions = new Set(this.store.list('members').filter(m => m.sessionId === actor.sessionId && memberPhaseOf(m) !== 'stopped').map(m => m.missionId))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",39,"Set","const leftover = options.cancelUnschedulable ? new Set(this.unschedulable(mission, tasks, this.store.list('members', mission.id)).map(task => task.id)) : new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/runtime.ts",40,"Set","const dead = new Set(tasks.filter(task => task.status === 'cancelled' || leftover.has(task.id)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",1,"Set","readonly releasedPasses = new Set<string>()","gate","derivable","S5c: the watchdog stamps `releasedRunId` on the durable passes row before releasing, and `openPass`/`closePass` carry it forward across the once-per-pass overwrite; `passReleased` reads that row first, so clearing the Set cannot let a released body resume and dispatch (probe below)"],
-  ["src/scheduling.ts",2,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",3,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  // R16-D: the four function-local indexes and two inline dedups of
-  // `silenceReport` and `escalateSchedulingStall`. Every one is built from the
+  ["src/scheduling.ts",1,"Map","readonly passes = new Map<string, SchedulingPass>()","gate","in-flight","the scheduling body queued or running on a mission's serial queue, removed only when that body settles; every await in the body is bounded and the tick watchdog names a body past its bound, and losing the record can only queue a second body that the mission queue refuses while the first is in flight (probe below)"],
+  ["src/scheduling.ts",2,"Map","private readonly noProgress = new Map<string, number>()","gate","cache-only","consecutive no-progress passes carried to the next pass; losing it restarts the declared window, and the escalation's dedup key is durable on the mission row (probe below)"],
+  ["src/scheduling.ts",3,"Set","const dead = new Set(tasks.filter(task => task.status === 'blocked' && !this.quiescencePending(task)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  ["src/scheduling.ts",4,"Set","const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  // R16-D: the inline dedup of `escalateSchedulingStall`, built from the
   // durable rows inside one synchronous, read-only call and discarded with it;
-  // none is retained, none is read by a later call and none can gate one.
-  ["src/scheduling.ts",4,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",5,"Map","const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",6,"Map","const byAttempt = new Map<string, Interval>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",7,"Map","const open = new Map<string, Interval>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",8,"Map","const escalations = new Map<string, string[]>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/scheduling.ts",9,"Set","const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
+  // it is not retained, not read by a later call and cannot gate one.
+  ["src/scheduling.ts",5,"Set","const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/store.ts",1,"Set","private readonly listeners = new Set<() => void>()","gate","cache-only","observer fan-out for committed changes; the durable revision and change cursor carry the state"],
   ["src/store.ts",2,"Set","this.transactionScopes = new Set()","transient","","created and destroyed inside one store transaction; the revision-bump decision it feeds is re-derived on every call"],
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
@@ -240,7 +231,7 @@ const CENSUS = [
   ["src/trace.ts",6,"Set","const known = new Set(spans.map(span => span?.spanId))","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",7,"Map","const counts = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",8,"Map","const tasks = new Map<string, string>(), members = new Map<string, string>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
-  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
+  ["src/trace.ts",9,"Set","const ATTEMPT_CLOSERS: ReadonlySet<string> = new Set(ATTEMPT_FENCING_EVENTS)","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/trace.ts",10,"Map","const open = new Map<string, { taskId: string; memberId: string }>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   // R17-G12: the roster lookup inside `nextWorkerName`. It is rebuilt from the
   // mission's durable member rows at every admission and discarded with the
@@ -302,46 +293,63 @@ function occurrences(root) {
 const GATES = CENSUS.filter(entry => entry[4] === 'gate')
 const key = entry => `${entry[0]}:${entry[1]}`
 
-test('S5 census: every in-memory collection in src/ is classified, and none is unclassified', () => {
-  const found = occurrences(join(PROJECT, 'src'))
-  const declared = new Map(CENSUS.map(entry => [key(entry), entry]))
-  const seen = new Set()
-  for (const [file, index, kind, source] of found) {
-    const id = `${file}:${index}`
-    const entry = declared.get(id)
-    assert.ok(entry, `UNCLASSIFIED in-memory collection at ${id} (${kind}): ${source}\n` +
-      'Classify it in CENSUS: a gate needs a label (derivable | cache-only) and a test body in GATE_TESTS; a transient, constant or out-of-unit collection needs that class and a reason.')
-    assert.equal(entry[2], kind, `${id} changed constructor from ${entry[2]} to ${kind}; re-classify it`)
-    assert.equal(entry[3], source, `${id} changed text; if it is still the same collection, update CENSUS, otherwise classify the new one`)
-    seen.add(id)
+const RECOVERY_COLLECTIONS = {
+  'src/runtime.ts:ownerObserveCursors': { kind: 'Map', label: 'cache-only', proof: 'tests/observe-owner-delta.test.mjs',
+    behavior: 'owner cursors are replayable, scoped, bounded and disposable',
+    reason: 'At most64 immutable compact baselines belong to explicit owner/mission cursors; loss or eviction returns a complete compact view, never gates execution or settles an obligation.' },
+  'src/workspaces.ts:preparations': { kind: 'Map', label: 'in-flight', proof: 'tests/rule-workspace-recovery.test.mjs',
+    behavior: 'overlapping preparation of one member and epoch reuses its workspace after the first preparation settles',
+    reason: 'Per-member preparation promises serialize concurrent workspace I/O and release in finally; stop/dispose abort queued work. Durable workspace manifests, not this process-local queue, own restart recovery.' },
+  'src/workspaces.ts:summary': { kind: 'Map', label: 'per-run', proof: 'tests/r12-workspace-fixes.test.mjs',
+    behavior: 'shell stages and repeated names are counted', reason: 'A CheckOutputScanner owns one declared-check run; this summary is discarded with that run and never decides later scheduling.' },
+  'src/attempts.ts:stopRetries': { kind: 'Map', label: 'derivable', proof: 'tests/r12-protocol-fixes.test.mjs',
+    behavior: 'one in-flight stop cannot duplicate or resurrect a cancelled epoch',
+    reason: 'Task.resumeAfterStop carries the fenced epoch and old owner; this map only coalesces attempts and delays retries.' },
+  'src/runtime.ts:workerStarts': { kind: 'Map', label: 'lifecycle', proof: 'tests/r12-native-start-fixes.test.mjs',
+    behavior: 'cancelled unpublished setup fences', reason: 'One cancellable native-start operation per member; durable member/mission checks fence late settlement, and adapter disposal owns handles.' },
+  'src/refusals.ts:writerRecoveries': { kind: 'WeakMap', label: 'pending-audit', proof: 'tests/r12-protocol-fixes.test.mjs',
+    behavior: 'writer recovery retains distinct refusals',
+    reason: 'Coalesced admission/guard persistence failures; never grants or blocks task authority. Until SQLite accepts a write this audit buffer is process-local.' },
+}
+const bindingName = source => /\b(?:readonly|const|let)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=/.exec(source)?.[1] ?? /this\.([A-Za-z_$][\w$]*)\s*=/.exec(source)?.[1]
+
+test('S5 census: persistent collection identities have a recovery classification and behavior evidence', () => {
+  const files = [...new Set(occurrences(join(PROJECT, 'src')).map(entry => entry[0]))]
+  const found = new Map()
+  for (const file of files) {
+    for (const item of persistentCollections(readFileSync(join(PROJECT, file), 'utf8'), file)) {
+      const id = `${file}:${item.name}`
+      found.set(id, item)
+      const registered = RECOVERY_COLLECTIONS[id]
+      const inherited = CENSUS.find(entry => entry[0] === file && entry[4] !== 'local' && bindingName(entry[3]) === item.name)
+      assert.ok(registered || inherited, `UNCLASSIFIED persistent collection ${id}; record its owner, recovery semantics and behavior evidence`)
+      assert.equal(registered?.kind ?? inherited[2], item.kind, `${id}: changed collection kind`)
+      assert.ok((registered?.reason ?? inherited[6]).length > 15, `${id}: explain what survives cache loss or disposal`)
+    }
   }
-  for (const entry of CENSUS) assert.ok(seen.has(key(entry)), `stale census entry ${key(entry)} is no longer in the tree`)
-  const counts = CENSUS.reduce((all, entry) => ({ ...all, [entry[4]]: (all[entry[4]] ?? 0) + 1 }), {})
-  assert.equal(counts.gate, GATES.length)
-  // S5c: zero unlabelled behaviour-gating entries, asserted BY NAME for the five
-  // that used to carry the third state, not by a count that could be edited.
-  const CLOSED = {
-    'src/runtime.ts:6': 'cache-only',
-    'src/runtime.ts:7': 'cache-only',
-    'src/runtime.ts:8': 'derivable',
-    'src/runtime.ts:9': 'derivable',
-    'src/scheduling.ts:1': 'derivable',
+  for (const entry of GATES) {
+    const id = `${entry[0]}:${bindingName(entry[3])}`
+    assert.ok(found.has(id), `${id}: a registered policy gate disappeared; review its behavior test`)
+    assert.ok(['derivable', 'cache-only', 'in-flight'].includes(entry[5]), `${id}: policy and physical ownership require an explicit tested label`)
   }
-  for (const label of new Set(GATES.map(entry => entry[5]))) {
-    assert.ok(label === 'derivable' || label === 'cache-only',
-      `gate ${key(GATES.find(entry => entry[5] === label))} carries ${JSON.stringify(label)}; every gate must be derivable or cache-only`)
-  }
-  for (const [entryKey, label] of Object.entries(CLOSED)) {
-    const entry = GATES.find(candidate => key(candidate) === entryKey)
-    assert.ok(entry !== undefined, `${entryKey} must still be a labelled gate entry`)
-    assert.equal(entry[5], label, `${entryKey} must be ${label}: S5c closed the gate that used to be reported as neither`)
+  for (const [id, entry] of Object.entries(RECOVERY_COLLECTIONS)) {
+    assert.ok(found.has(id), `${id}: stale recovery registration`)
+    const proof = readFileSync(join(PROJECT, entry.proof), 'utf8')
+    assert.ok(proof.includes(entry.behavior), `${id}: behavior evidence must exist in ${entry.proof}`)
   }
 })
 
-test('S5 census: the round-13 `scheduled` Set stays deleted and the guard stays durable (T1, included here)', () => {
+test('S5 census recognizes persistent bindings without turning local refactors into new gates', () => {
+  assert.deepEqual(persistentCollections('const registry = new Map(); function f() { const transient = new Set(); } class Runtime { cache = new Map(); method() { return new Set(); } }'),
+    [{ name: 'registry', kind: 'Map' }, { name: 'cache', kind: 'Map' }])
+})
+
+test('S5 census: the round-13 `scheduled` Set stays deleted; the pass guard is the in-flight body record (T1, included here)', () => {
   const found = occurrences(join(PROJECT, 'src'))
   assert.equal(found.filter(([, , , source]) => /scheduled\s*=\s*new Set/.test(source)).length, 0,
-    'the Row-13 in-memory scheduling guard must not come back; the guard is the durable `passes` row')
+    'the Row-13 in-memory scheduling guard must not come back; the guard is the record of the body the mission queue holds')
+  assert.equal(CENSUS.find(entry => entry[0] === 'src/scheduling.ts' && bindingName(entry[3]) === 'passes')?.[5], 'in-flight',
+    'the pass guard is physical ownership, released by its bounded body, never a presence cache')
   const runtime = readFileSync(join(PROJECT, 'src/runtime.ts'), 'utf8')
   assert.match(runtime, /There is deliberately no in-memory `scheduled` Set/,
     'the deletion is documented at the field that used to hold it (T1, Round 13)')
@@ -370,43 +378,25 @@ const GATE_TESTS = {
   },
   'src/runtime.ts:6': async t => {
     const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 50 } })
+    const gate = deferred()
+    const keepAlive = setInterval(() => {}, 1000)
+    let pending
     try {
-      // Live work plus a wedged queued body: before S5c the next mission
-      // operation chained behind the promise that never settles and was
-      // swallowed (the Row-13 shape). The assertion is deliberately inverted
-      // from the predecessor's probe, so a regression to a swallowing chain
-      // fails this test.
       const task = f.propose({ title: 'Live work under a wedged queue' })
       await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      void f.runtime.exclusive(f.mission.id, () => new Promise(() => {}))
+      pending = f.runtime.exclusive(f.mission.id, async () => { await gate.promise; return 'settled' })
       assert.ok(f.runtime.queues.size > 0, 'the wedged body holds a chain entry')
-      const ran = await Promise.race([
-        f.runtime.exclusive(f.mission.id, async () => 'ran'),
-        new Promise(resolve => setTimeout(() => resolve('SWALLOWED'), 1_000)),
-      ])
-      assert.equal(ran, 'ran', 'a predecessor wedged past the declared bound must not swallow the next mission operation')
-
-      // The loss on a non-empty collection: clearing the ordering cache removes
-      // serialization only. The gated body still runs and its durable write
-      // still lands, and the mission's durable attempt is untouched.
-      const gate = deferred()
-      const pending = f.runtime.exclusive(f.mission.id, async () => {
-        await gate.promise
-        const mission = f.runtime.mission(f.mission.id)
-        mission.updatedAt += 1
-        f.runtime.commit(f.mission.id, () => f.runtime.store.put('missions', mission))
-        return 'gated'
-      })
-      assert.ok(f.runtime.queues.size > 0, 'the loss must be exercised on a non-empty collection')
-      const revision = f.runtime.store.revision()
-      f.runtime.queues.clear()   // the loss
+      let ran = false
+      await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ran = true }), /mission_operation_pending/)
+      await assert.rejects(f.runtime.exclusive(f.mission.id, async () => { ran = true }), /mission_operation_pending/)
+      assert.equal(ran, false, 'neither a timeout nor its cleanup authorizes overlapping physical effects')
+      assert.equal(await f.runtime.exclusive('unrelated-queue', async () => 'available'), 'available')
       gate.resolve()
-      assert.equal(await pending, 'gated', 'clearing the ordering cache does not cancel the body it was ordering')
-      assert.ok(f.runtime.store.revision() > revision, 'the gated body still committed its durable write')
-      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'the durable attempt is untouched by the lost ordering cache')
+      assert.equal(await pending, 'settled')
+      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'timeouts do not revoke the durable attempt')
       const rejected = await f.runtime.exclusive(f.mission.id, () => { throw new Error('probe rejection') }).then(() => 'resolved', error => `rejected:${error.message}`)
       assert.equal(rejected, 'rejected:probe rejection', 'a rejected body does not swallow the chain')
-    } finally { await f.cleanup() }
+    } finally { gate.resolve(); await pending; clearInterval(keepAlive); await f.cleanup() }
   },
   'src/runtime.ts:7': async t => {
     // The loss on a non-empty collection: clear the drain registry while a
@@ -492,9 +482,8 @@ const GATE_TESTS = {
     try {
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
       g.runtime.onStartFailure(g.mission, g.author, new Error('injected start failure'))
-      const statePath = join(g.dir, 'swarm.sqlite')
       await g.runtime.dispose()
-      restarted = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10, messageChars: 16000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, new FakeWorkers())
+      restarted = new SwarmRuntime(g.runtime.config, new FakeWorkers())
       assert.equal(restarted.store.get('members', g.author.id).startFailures, 2, 'the count survives a restart')
       restarted.onStartFailure(restarted.mission(g.mission.id), restarted.store.get('members', g.author.id), new Error('injected start failure'))
       assert.equal(restarted.store.get('members', g.author.id).status, 'stopped', 'and the restarted runtime retires on the third failure')
@@ -514,47 +503,6 @@ const GATE_TESTS = {
       assert.equal(f.runtime.store.events(f.mission.id, 500).length, durableEvents.length, 'and no durable event is changed or lost')
       const cursor = f.runtime.observeCursors.get(f.author.id)
       assert.ok(cursor.eventSeq <= durableEvents.at(-1).seq, 'a cursor can never exceed the durable log, so presence cannot hide an event')
-    } finally { await f.cleanup() }
-  },
-  'src/runtime.ts:11': async t => {
-    // The durable `task/review-admitted` event is the gate: a withdrawn review
-    // still blocks with the map cleared, and a phantom map entry cannot block.
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Withdrawn review' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'the automatic review is admitted')
-      f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S5: withdraw the automatic review' })
-      assert.ok(f.runtime.autoReviewAdmissions.size > 0, 'the automatic admission is cached; the loss must be exercised on a non-empty collection')
-      f.runtime.autoReviewAdmissions.clear()   // the loss
-      const blocked = await eventually(() => events(f.runtime, f.mission.id, 'task/review-blocked').at(-1),
-        'the withdrawal blocker is re-derived from the durable admission event')
-      assert.match(blocked.data.reason, /withdrawn/, 'the gate follows the durable event, not the lost map')
-    } finally { await f.cleanup() }
-    const phantom = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = phantom.propose({ title: 'Phantom map entry' })
-      phantom.runtime.autoReviewAdmissions.set(task.id, 'task_phantom')
-      const claimed = await phantom.runtime.claim(phantom.actor(phantom.author), phantom.mission.id, task.id)
-      await phantom.runtime.submit(phantom.actor(phantom.author), phantom.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => phantom.runtime.store.list('tasks', phantom.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'a map entry with no durable admission cannot block a legitimate automatic review')
-      assert.notEqual(review.id, 'task_phantom')
-    } finally { await phantom.cleanup() }
-  },
-  'src/runtime.ts:12': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Missing review record' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const submission = await eventually(() => events(f.runtime, f.mission.id, 'task/submitted').at(-1), 'the submission is recorded durably')
-      f.runtime.reviewPathReported.add(`${f.mission.id}:${task.id}:${submission.seq}`)   // phantom presence
-      const missing = await eventually(() => events(f.runtime, f.mission.id, 'task/review-missing').at(-1),
-        'the missing-review record is written from the durable submission even though the cache claims it was reported')
-      assert.equal(missing.data.taskId, task.id, 'the set cannot swallow the durable missing-review record')
     } finally { await f.cleanup() }
   },
   'src/gates.ts:1': async t => {
@@ -646,22 +594,6 @@ const GATE_TESTS = {
       assert.ok(closed)
     } finally { await f.cleanup() }
   },
-  'src/notices.ts:5': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Parked holder' })
-      await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      const epoch = taskOf(f.runtime, task.id).epoch
-      // Phantom presence: the set claims the notice for this attempt was sent,
-      // but the durable delivery ledger has no such notice.
-      f.runtime.parkedNotices.add(`parked:${f.mission.id}:${task.id}:${epoch}`)
-      // R17-G7: the park is durable state (`phase`); the live `status` is derived from it.
-      f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', f.author.id); member.phase = 'parked'; f.runtime.store.put('members', member) })
-      const notice = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.to === 'owner' && /parked member/.test(delivery.content)),
-        'the parked-holder notice is emitted from the durable state despite the phantom cache entry')
-      assert.equal(notice.notice.dedupKey, `parked:${f.mission.id}:${task.id}:${epoch}`, 'the durable ledger is the gate')
-    } finally { await f.cleanup() }
-  },
   'src/notices.ts:9': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
@@ -687,35 +619,6 @@ const GATE_TESTS = {
       const state = f.runtime.passState(f.mission.id)
       assert.equal(typeof state.passLive, 'boolean')
       assert.equal(typeof state.wedged, 'boolean')
-    } finally { await f.cleanup() }
-  },
-  'src/notices.ts:6': async t => {
-    const f = await setup()
-    try {
-      f.runtime.integrationGapWarned.add(`integration-gap:${f.mission.id}:2`)   // phantom presence
-      f.propose({ title: 'First implementation' })
-      f.propose({ title: 'Second implementation' })
-      const notice = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.notice?.dedupKey === `integration-gap:${f.mission.id}:2`),
-        'the integration-gap notice is emitted because the durable ledger has no such row')
-      assert.ok(notice)
-    } finally { await f.cleanup() }
-  },
-  'src/notices.ts:7': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      const task = f.propose({ title: 'Blocked review path' })
-      const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
-      await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-      const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
-        'the automatic review is admitted')
-      // The blocker reason is deterministic; seed the set with the exact key
-      // before the review is withdrawn, so the cache claims the notice was sent.
-      const reason = `the automatically admitted review ${review.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${task.id}) or cancel the source task`
-      f.runtime.reviewPathNotices.add(`review-blocked:${f.mission.id}:${task.id}:${reason}`)
-      f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S5: withdraw' })
-      const delivery = await eventually(() => f.runtime.store.list('deliveries', f.mission.id).find(item => item.notice?.dedupKey === `review-blocked:${f.mission.id}:${task.id}:${reason}`),
-        'the durable ledger, not the set, decides whether the blocked-review notice is sent')
-      assert.ok(delivery)
     } finally { await f.cleanup() }
   },
   'src/notices.ts:8': async t => {
@@ -749,37 +652,52 @@ const GATE_TESTS = {
     } finally { await f.cleanup() }
   },
   'src/scheduling.ts:1': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
+    // In-flight: the record is the one scheduling body the mission queue holds,
+    // and it is released only when that body settles.
+    const f = await setup({ config: { tickMs: 10, stallPassTimeoutMs: 50 } })
+    const gate = deferred()
+    let starts = 0
     try {
       f.workers.autoIdle = true
-      const task = f.propose({ title: 'Abandoned pass body' })
-      // The abandoned pass body a watchdog released after its bound: the same
-      // object `Scheduling.dispatch(mission, missionId, pass)` receives.
-      const abandonedPass = {
-        id: `pass_${f.mission.id}`, runId: 'abandoned-pass-run', instanceId: f.runtime.instanceId, missionId: f.mission.id,
-        status: 'running', startedAt: Date.now() - 60_000, revisionBefore: f.runtime.store.revision(),
-        fingerprintBefore: f.runtime.fingerprint(f.mission.id), noProgressPasses: 0,
-      }
-      f.runtime.releasedPasses.add(abandonedPass.runId)
-      assert.ok(f.runtime.releasedPasses.size > 0, 'the loss must be exercised on a non-empty collection')
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
-        'while the release is recorded, the abandoned pass body is fenced and dispatches nothing')
-      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'the fenced body changed no task state')
-      // THE VERIFIER'S REPRODUCTION, closed: the in-memory Set is cleared while
-      // the durable `releasedRunId` on the pass row is present. The watchdog
-      // stamps that field before releasing, so the fence must survive.
-      f.runtime.releasedPasses.clear()
-      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...abandonedPass, status: 'finished', releasedRunId: abandonedPass.runId, releasedAt: Date.now() }))
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, abandonedPass), false,
-        'with the Set cleared but the durable release present, the abandoned pass body still dispatches nothing')
-      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'and it still cannot drive a task to running')
-      // Positive control: a pass that was never released is not fenced (the fence
-      // is the durable release record, not a blanket refusal).
-      const live = { ...abandonedPass, runId: 'never-released-run' }
-      f.runtime.store.transaction(() => f.runtime.store.put('passes', { ...live, status: 'running' }))
-      assert.equal(await f.runtime.scheduling.dispatch(f.mission, f.mission.id, live), true, 'a live pass body still dispatches')
-      assert.equal(taskOf(f.runtime, task.id).status, 'running', 'and assigns the work normally')
-      assert.ok(taskOf(f.runtime, task.id).attempt?.leaseUntil > Date.now(), 'with a real attempt')
+      const task = f.propose({ title: 'Work behind an in-flight pass' })
+      f.workers.start = async () => { starts += 1; if (starts === 1) await gate.promise }
+      const held = await eventually(() => starts === 1 ? f.runtime.scheduling.passes.get(f.mission.id) : undefined, 'a pass body is in flight inside the adapter start')
+      await new Promise(resolve => setTimeout(resolve, 120))
+      assert.equal(f.runtime.scheduling.passes.get(f.mission.id), held, 'no tick replaces or duplicates the in-flight body')
+      assert.equal(starts, 1, 'and no second body starts a worker beside it')
+      assert.ok(f.runtime.scheduling.passes.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.scheduling.passes.clear()   // the loss
+      f.runtime.kick(f.mission.id)
+      await new Promise(resolve => setTimeout(resolve, 120))
+      assert.equal(starts, 1, 'a body queued after the loss is refused by the mission queue, never run beside the in-flight one')
+      assert.equal(taskOf(f.runtime, task.id).status, 'pending', 'and no durable transition happened behind the in-flight body')
+      gate.resolve()
+      const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
+        'once the in-flight body settles, a later pass dispatches the work')
+      assert.equal(running.attempt.ownerId, f.author.id)
+    } finally { gate.resolve(); await f.cleanup() }
+  },
+  'src/scheduling.ts:2': async t => {
+    // Cache-only: the carried no-progress count. Its loss restarts the declared
+    // window; the escalation still fires, once per unchanged board.
+    const f = await setup({ config: { tickMs: 3_600_000, stallPasses: 3 } })
+    try {
+      const scheduling = f.runtime.scheduling
+      await eventually(() => scheduling.passes.size === 0 ? true : undefined, 'the passes setup kicked must settle')
+      scheduling.boardCannotProgress = () => true
+      const stalls = () => events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === false)
+      const unchangedPass = () => { const pass = scheduling.openPass(f.mission.id); scheduling.closePass(f.mission.id, pass) }
+      unchangedPass(); unchangedPass()
+      assert.equal(scheduling.noProgress.get(f.mission.id), 2, 'two unchanged passes are counted')
+      assert.ok(scheduling.noProgress.size > 0, 'the loss must be exercised on a non-empty collection')
+      scheduling.noProgress.clear()   // the loss
+      unchangedPass(); unchangedPass()
+      assert.equal(stalls().length, 0, 'the lost count restarts the window instead of escalating early')
+      unchangedPass()
+      assert.equal(stalls().length, 1, 'the declared window of unchanged passes still escalates')
+      scheduling.noProgress.clear()
+      unchangedPass(); unchangedPass(); unchangedPass()
+      assert.equal(stalls().length, 1, 'and the durable dedup key on the mission row keeps one escalation per unchanged board')
     } finally { await f.cleanup() }
   },
   'src/store.ts:1': async t => {
@@ -839,9 +757,8 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   // `STALE_TASK_REFUSAL_EVENT`. S5r pinned the resulting gap (the static emitter
   // scan could not see it, and `eventVocabularyReport` reported the durable row
   // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
-  // point: `src/trace.ts` registers the row and the scanner in
-  // tests/event-vocabulary.test.mjs resolves exported constants, so the type is
-  // enforced exactly like a literal emission.
+  // point: the registry names the row, and because `store.event` takes
+  // `EventKind`, a constant emission is checked exactly like a literal one.
   const { EVENT_VOCABULARY } = await import('../lib/trace.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
@@ -854,7 +771,7 @@ test('S5 gate src/runtime.ts:7 pair: the mission queue never forks two waiters o
   // both waited on one predecessor each registered themselves as the tail and
   // ran their bodies concurrently. Mission-scoped work (dispatch, claim,
   // prepareTask) must be serialized, so this pins the ordering, not the timing.
-  const f = await setup(t, { workers: new FakeWorkers() })
+  const f = await makeRuntime(t)
   const events = []
   const body = name => async () => {
     events.push(`start:${name}`)

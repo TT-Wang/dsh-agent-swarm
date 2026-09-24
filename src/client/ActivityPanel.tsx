@@ -15,8 +15,9 @@ import { BaselineNotice, DeliveryPanel } from './DeliveryPanel.tsx'
 import type { ConnectionState } from './progress.ts'
 import { mergeStartResponse, requestStartControl, type StartAction } from './start-controls.ts'
 import { RequestDeadlineError } from './request-deadline.ts'
+import { currentSessionId } from './navigation.ts'
 
-export const OPEN_MONITOR = 'agent-swarm:open-monitor'
+interface PendingOperation { context: string; generation: number; action: string }
 const connectionLabels: Record<ConnectionState, string> = { connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting', paused: 'Updates paused' }
 /**
  * Completion is offered only when the runtime would accept it. The runtime
@@ -35,22 +36,22 @@ export function CompletionControls({ snapshot, disabled, onComplete }: { snapsho
     {reason !== undefined && <span className="sw-small" data-swarm-completion="blocked" title={`${t('Cannot complete')}: ${reason}`}>{t('Cannot complete')}: {reason}</span>}
   </div>
 }
-export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true, onClose }: {
+export function ActivityPanel({ sessions, modelDirectories, monitor, history, onOpenWorker, sessionId, active = true }: {
   sessions: Context['sessions']; modelDirectories: Context['modelDirectories']; monitor: SwarmMonitor;
   history: WorkerHistory; onOpenWorker: (member: Member) => void;
-  sessionId?: string; active?: boolean; onClose?: () => void;
+  sessionId?: string; active?: boolean;
 }) {
   const t = useCopy()
   const sessionState = useSyncExternalStore(sessions.list.subscribe, sessions.list.getSnapshot, sessions.list.getSnapshot)
   const state = useSyncExternalStore(monitor.subscribe, monitor.getSnapshot, monitor.getSnapshot)
   const transcript = useSyncExternalStore(history.subscribe, history.getSnapshot, history.getSnapshot)
-  const owner = sessionId === undefined ? sessionState.current : sessionId as SessionId
+  const owner = (sessionId === undefined ? currentSessionId(sessions) : sessionId) as SessionId | undefined
   const [selection, setSelection] = useState(''), [localDraft, setLocalDraft] = useState<DraftPlan>(), [localMission, setLocalMission] = useState<Snapshot>()
-  const [error, setError] = useState(''), [busy, setBusy] = useState(''), [stopArmed, setStopArmed] = useState(false), [editorOpen, setEditorOpen] = useState(false)
+  const [error, setError] = useState(''), [busyOperation, setBusyOperation] = useState<PendingOperation>(), [stopArmed, setStopArmed] = useState(false), [editorOpen, setEditorOpen] = useState(false)
   const [editorMounted, setEditorMounted] = useState(false)
   const [localStart, setLocalStart] = useState<AutoStart>(), [startUnconfirmed, setStartUnconfirmed] = useState(false)
-  const pendingStart = useRef<string>()
-  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setLocalStart(undefined); setStartUnconfirmed(false); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }, [owner, monitor, history])
+  const pendingOperation = useRef<PendingOperation>()
+  useEffect(() => { history.close(); setSelection(''); setLocalDraft(undefined); setLocalMission(undefined); setLocalStart(undefined); setStartUnconfirmed(false); setError(''); setBusyOperation(undefined); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }, [owner, monitor, history])
   useEffect(() => { monitor.select(owner, active) }, [active, owner, monitor])
   const data = state.ownerSessionId === owner ? state.data : undefined
   const connection: ConnectionState = state.ownerSessionId === owner ? (state.connection ?? (state.loading ? 'connecting' : state.error ? 'reconnecting' : state.data ? 'connected' : 'connecting')) : 'connecting'
@@ -93,40 +94,56 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
     if (selectedContext.current.key === context) return
     selectedContext.current = { key: context, generation: selectedContext.current.generation + 1 }
     setGeneration(selectedContext.current.generation)
+    pendingOperation.current = undefined
+    setBusyOperation(undefined)
+    setError(''); setStopArmed(false)
   }, [context])
   const stillSelected = () => selectedContext.current.key === context && selectedContext.current.generation === generation
+  const busy = busyOperation?.context === context && busyOperation.generation === generation ? busyOperation.action : ''
+  const beginOperation = (action: string) => {
+    if (!stillSelected() || (pendingOperation.current?.context === context && pendingOperation.current.generation === generation)) return undefined
+    const token = { context, generation, action }
+    pendingOperation.current = token
+    setBusyOperation(token); setError('')
+    return () => {
+      if (pendingOperation.current === token) pendingOperation.current = undefined
+      setBusyOperation(current => current === token ? undefined : current)
+    }
+  }
   const selectedStart = starts.find(item => `start:${item.id}` === selected) ?? (snapshot ? starts.find(item => item.missionId === snapshot.mission.id) : selected === 'new' || draft ? undefined : latestStart)
   const start = selectedStart && (['planning', 'launching', 'failed'].includes(selectedStart.status) || (selectedStart.status === 'stopped' && !snapshot)) ? selectedStart : undefined
   useEffect(() => { setStartUnconfirmed(false) }, [state.updatedAt, context])
   const directory = useMemo(() => {
-    if (!owner || (!sessionId && sessionState.currentAddress)) return undefined
+    // A selected subagent address (0.1.5 `currentAddress`) has no model directory of its own; 0.1.7 panes always name their session.
+    const currentAddress = (sessionState as { currentAddress?: unknown }).currentAddress
+    if (!owner || (!sessionId && currentAddress)) return undefined
     try { return modelDirectories.directoryFor(owner) } catch { return undefined }
-  }, [owner, sessionId, modelDirectories, sessionState.currentAddress])
-  const choose = (value: string) => { history.close(); setSelection(value); setError(''); setBusy(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }
+  }, [owner, sessionId, modelDirectories, sessionState])
+  const choose = (value: string) => { history.close(); setSelection(value); setError(''); setStopArmed(false); setEditorOpen(false); setEditorMounted(false) }
   const control = async (action: 'pause' | 'resume' | 'stop' | 'complete') => {
     if (!owner || !snapshot || !data?.writable || connection !== 'connected') return
-    setBusy(action); setError('')
+    const release = beginOperation(action)
+    if (!release) return
     await selectedOperation(stillSelected,
       () => monitor.request<{ snapshot: Snapshot }>('control', { sessionId: owner, missionId: snapshot.mission.id, action, reason: `User selected ${action} in the Agent Swarm monitor.` }), {
         success: async result => { setLocalMission(result.snapshot); setStopArmed(false); await monitor.refresh() },
         failure: failure => setError(failure instanceof Error ? failure.message : String(failure)),
-        settled: () => setBusy(''),
+        release,
       })
   }
   const disabled = Boolean(busy) || connection !== 'connected'
   const controlStart = async (action: StartAction) => {
-    if (!owner || !start || !data?.writable || connection !== 'connected' || pendingStart.current === context || busy || startUnconfirmed) return
-    pendingStart.current = context; setBusy(`start:${action}`); setError('')
-    try {
-      await selectedOperation(stillSelected, () => requestStartControl(monitor.request, owner, start, action), {
-        success: request => { setLocalStart(request); void monitor.refresh() },
-        failure: failure => {
-          setError(t(failure instanceof Error ? failure.message : String(failure)))
-          if (failure instanceof RequestDeadlineError) { setStartUnconfirmed(true); void monitor.refresh() }
-        },
-        settled: () => setBusy(''),
-      })
-    } finally { if (pendingStart.current === context) pendingStart.current = undefined }
+    if (!owner || !start || !data?.writable || connection !== 'connected' || busy || startUnconfirmed) return
+    const release = beginOperation(`start:${action}`)
+    if (!release) return
+    await selectedOperation(stillSelected, () => requestStartControl(monitor.request, owner, start, action), {
+      success: request => { setLocalStart(request); void monitor.refresh() },
+      failure: failure => {
+        setError(t(failure instanceof Error ? failure.message : String(failure)))
+        if (failure instanceof RequestDeadlineError) { setStartUnconfirmed(true); void monitor.refresh() }
+      },
+      release,
+    })
   }
   const status = snapshot?.mission.status
   // OWNER PASS 2026-09-11 #2: Pause/Resume and Stop/Complete used to be two
@@ -148,18 +165,18 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
   </div>
   const cancelTask = async (task: Task) => {
     if (!owner || !snapshot || !data?.writable || connection !== 'connected') return
-    setBusy(`cancel:${task.id}`); setError('')
+    const release = beginOperation(`cancel:${task.id}`)
+    if (!release) return
     await selectedOperation(stillSelected,
       () => monitor.request<{ snapshot: Snapshot }>('cancel', { sessionId: owner, missionId: snapshot.mission.id, taskId: task.id, reason: `User cancelled task ${task.id} in the Agent Swarm monitor.` }), {
         success: async result => { setLocalMission(result.snapshot); await monitor.refresh() },
         failure: failure => setError(failure instanceof Error ? failure.message : String(failure)),
-        settled: () => setBusy(''),
+        release,
       })
   }
   return <aside data-swarm="" data-swarm-panel="" data-swarm-session={owner} aria-label={t('Mission control')}>
     <header className="sw-panel-title">
       <div><strong>{t('Agent Swarm')}</strong><small data-swarm-connection={connection}><span className="sw-live-dot" data-connection={connection} />{t(connectionLabels[connection])}</small></div>
-      {onClose && <div className="sw-panel-buttons"><button title={t('Collapse sidebar')} aria-label={t('Collapse sidebar')} onClick={onClose}>›</button></div>}
     </header>
     <div className="sw-panel-toolbar">{showMissionPicker && <select aria-label={t('Missions')} value={selected} onChange={event => choose(event.currentTarget.value)}>
       {!drafts.length && !snapshots.length && <option value="">{t('No missions yet')}</option>}
@@ -200,7 +217,7 @@ export function ActivityPanel({ sessions, modelDirectories, monitor, history, on
           onLaunched={value => { if (!stillSelected()) return; setLocalDraft(undefined); setLocalMission(value); setSelection(`mission:${value.mission.id}`); void monitor.refresh() }}
           onDiscarded={() => { if (!stillSelected()) return; setLocalDraft(undefined); setSelection(''); void monitor.refresh() }} />}
       </details>}
-      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live connection={connection} observedAt={state.updatedAt} actions={
+      {snapshot && <SwarmBoard key={`${owner}:${snapshot.mission.id}`} snapshot={snapshot} live={active} connection={connection} observedAt={state.updatedAt} actions={
         controls || advancedControls ? <div className="sw-actions" data-swarm-actions="">{controls}{advancedControls}</div> : undefined}
         onCancelTask={data?.writable ? task => { void cancelTask(task) } : undefined}
         technicalDetails={snapshot.mission.baseline ? <BaselineNotice baseline={snapshot.mission.baseline} /> : undefined}

@@ -1,45 +1,32 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { SwarmStore } from '../lib/store.js'
 import { withinScope, scopeSubset } from '../lib/scope.js'
+import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, budget as defaultBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-async function eventually(read, message) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
+const budget = { ...defaultBudget, maxTokens: 1000, maxSteps: 10, maxTasks: 12, maxExperiments: 2 }
 /** Only the external execution adapter is replaced; store/admission/state/outbox are real. */
-class ControlledWorkers {
-  callbacks; deliveries = []; stopped = []; checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }; stopGate; prepared = []
-  bind(c) { this.callbacks = c }
-  async prepareWorkspace(m, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver(m, d) { this.deliveries.push(d) }
+class ControlledWorkers extends FakeWorkers {
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  artifact = { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
+  stopGate
   async stop(id) { if (this.stopGate) await this.stopGate; this.stopped.push(id) }
-  isIdle() { return false }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
+  async captureArtifact(_member, task) { return task.kind === 'research' ? { ...this.artifact, changedPaths: [] } : this.artifact }
+  /** Records the epoch each preparation was for. */
   async prepareTask(member,task) { this.prepared.push(task.epoch) }
-  async dispose() {}
 }
 async function setup(t, overrides = {}, options = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-runtime-'))
-  const workers = new ControlledWorkers()
-  const config = { statePath: join(dir,'db.sqlite'), leaseMs:60000, tickMs:1000, maxMessageChars:16000, maxEvents:100, maxTasksPerMember:3, ...options.config }
-  const runtime = new SwarmRuntime(config, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir,{recursive:true,force:true}) })
+  const { runtime, workers, config } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { tickMs:1000, maxEvents:100, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId:'owner-session' }
   const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}})
   const stream = runtime.workstream(owner,mission.id,{title:'Core',objective:'Fix module'})
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
   const actorA = {sessionId:a.sessionId}, actorB = {sessionId:b.sessionId}
-  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
+  const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{ outputs: [],workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
   return {runtime,workers,config,owner,mission,stream,a,b,actorA,actorB,propose}
 }
 test('participants propose work within the same scope and budget, without captain relaying',async t=>{
@@ -65,6 +52,13 @@ test('evidence must reference actual executions from the publishing attempt',asy
   assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,input),/host-recorded/)
   await f.workers.callbacks.toolRun(f.a.id,{tool:'bash',arguments:{command:'test'},result:{exitCode:1},isError:false})
   const runs=f.runtime.observe(f.actorA,f.mission.id).toolRuns
+  // The exported runtime API has no tool schema in front of it: an unknown or
+  // missing outcome is refused, typed, instead of being stored and verified.
+  for (const outcome of ['maybe', undefined, 'Supported']) {
+    assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,{...input,outcome,toolRunIds:[runs[0].id]}),
+      error=>error.name==='PolicyError'&&error.code==='invalid_evidence_outcome'&&error.category==='validation_error'&&/^\[invalid_evidence_outcome\] Evidence `outcome` must be supported, disproved or inconclusive/.test(error.message))
+  }
+  assert.equal(f.runtime.store.list('evidence',f.mission.id).length,0,'a refused outcome stores no evidence')
   const evidence=f.runtime.publish(f.actorA,f.mission.id,{...input,toolRunIds:[runs[0].id]})
   assert.equal(evidence.status,'unverified'); assert.equal(evidence.outcome,'disproved')
   assert.equal(f.runtime.observe(f.actorB,f.mission.id).toolRuns.length,0)
@@ -79,7 +73,7 @@ test('a claimed pass cannot override failing host verification',async t=>{
   await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:claimed.attempt.id,verdict:'accept',reason:'I think it passes'})
   const snapshot=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(snapshot.tasks.find(t=>t.id===task.id).status,'blocked')
-  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/cover every mission acceptance criterion.*Blocked work still needs repair/)
+  assert.throws(()=>f.runtime.control(f.owner,f.mission.id,'complete','done'),/unfinished or blocked required work/)
 })
 test('handoff fences immediately but replacement waits for quiescence',async t=>{
   const f=await setup(t); const task=await f.runtime.claim(f.actorA,f.mission.id,f.propose().id)
@@ -106,16 +100,22 @@ test('all workers draw from one step budget and peer text cannot alter authority
 test('pause preserves mission accounting and revokes old task attempts',async t=>{
   const f=await setup(t); const task=await f.runtime.claim(f.actorA,f.mission.id,f.propose().id)
   await f.workers.callbacks.usage(f.a.id,51)
+  let releaseStop
+  f.workers.stopGate=new Promise(resolve=>{releaseStop=resolve})
+  t.after(()=>releaseStop())
   f.runtime.control(f.owner,f.mission.id,'pause','User interruption')
   let s=f.runtime.snapshot(f.owner,f.mission.id)
-  assert.equal(s.tasks[0].status,'pending'); assert.equal(s.tasks[0].attempt,undefined)
+  assert.equal(s.tasks[0].status,'blocked'); assert.equal(s.tasks[0].attempt,undefined)
+  assert.equal(s.tasks[0].resumeAfterStop.memberId,f.a.id)
   f.runtime.control(f.owner,f.mission.id,'resume','Continue')
   s=f.runtime.snapshot(f.owner,f.mission.id)
   assert.equal(s.mission.usedTokens,51)
   assert.throws(()=>f.runtime.publish(f.actorA,f.mission.id,{taskId:task.id,attemptId:task.attempt.id,claim:'late',outcome:'supported',toolRunIds:[]}),/Stale/)
+  releaseStop()
+  await eventually(()=>f.runtime.task(f.mission.id,task.id).resumeAfterStop===undefined,'pause stop must settle before reassignment', 2500)
 })
 test('store rejects concurrent runtime ownership and rolls back outbox with state',async t=>{
-  const dir=await mkdtemp(join(tmpdir(),'swarm-store-'));const path=join(dir,'state.sqlite')
+  const dir=await tempDirectory('swarm-store-');const path=join(dir,'state.sqlite')
   const store=new SwarmStore(path);t.after(async()=>{store.close();await rm(dir,{recursive:true,force:true})})
   assert.throws(()=>new SwarmStore(path),/already owned/)
   assert.throws(()=>store.transaction(()=>{store.put('deliveries',{id:'m',missionId:'x',from:'a',to:'b',kind:'finding',content:'hello',createdAt:1});store.event('x','test','a',{});throw new Error('rollback')}),/rollback/)
@@ -177,6 +177,7 @@ test('duplicate review source edges are removed but submission and unrelated acc
 test('missing code checks reject a proposal without admitting work and permit correction on the same mission', async t => {
   const f = await setup(t)
   const before = f.runtime.snapshot(f.owner, f.mission.id)
+  const storedMission = f.runtime.store.get('missions', f.mission.id)
   assert.throws(() => f.propose(f.actorA, { title: 'Implement value', checks: [] }), error => {
     assert.match(error.message, /task\.checks \(task "Implement value"\)/)
     assert.match(error.message, /real repository acceptance command/)
@@ -189,7 +190,8 @@ test('missing code checks reject a proposal without admitting work and permit co
   }
   const after = f.runtime.snapshot(f.owner, f.mission.id)
   assert.deepEqual(after.tasks, before.tasks)
-  assert.deepEqual(after.mission, before.mission)
+  assert.deepEqual(f.runtime.store.get('missions', f.mission.id), storedMission, 'rejected admission does not change durable authority or accounting')
+  assert.equal(after.mission.executionTime.usedMs, before.mission.executionTime.usedMs)
   const corrected = f.propose(f.actorA, { title: 'Implement value', checks: ['node check.cjs'] })
   assert.equal(corrected.kind, 'implementation')
   assert.deepEqual(corrected.acceptance, ['works'])
@@ -237,16 +239,28 @@ test('an independently accepted repair retires blocked obligations and can conve
     await f.runtime.verify(f.actorB,f.mission.id,{taskId:review.id,attemptId:rc.attempt.id,verdict:'accept',reason:'Checked exact artifact'})
     return review
   }
-  const original=f.propose(); await submitAndReview(original,true)
-  assert.throws(()=>f.propose(f.actorA,{replaces:[original.id],acceptance:['unrelated']}),/original obligations/)
-  const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id]});await submitAndReview(repaired)
-  assert.equal(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===original.id).status,'cancelled')
+  const original=f.propose(); const oldReview=await submitAndReview(original,true)
+  const oldVerdict=structuredClone(f.runtime.snapshot(f.owner,f.mission.id).tasks.find(t=>t.id===oldReview.id))
+  assert.equal(oldVerdict.status,'blocked')
+  // The repair inherits the replaced obligations; a new criterion is appended, never substituted.
+  const repaired=f.propose(f.actorA,{title:'Repair',replaces:[original.id],acceptance:['unrelated','works']})
+  assert.deepEqual(repaired.acceptance,[...original.acceptance,'unrelated'],'replaced criteria first, in order, without duplicates')
+  await submitAndReview(repaired)
+  const repairedBoard=f.runtime.snapshot(f.owner,f.mission.id)
+  assert.equal(repairedBoard.tasks.find(t=>t.id===original.id).status,'cancelled')
+  const retiredReview=repairedBoard.tasks.find(t=>t.id===oldReview.id)
+  assert.equal(retiredReview.status,'cancelled', 'accepted repair closes the obsolete negative review without owner cleanup')
+  assert.equal(retiredReview.reviewedCommit,oldVerdict.reviewedCommit)
+  assert.deepEqual(retiredReview.evidenceIds,oldVerdict.evidenceIds)
+  assert.ok(retiredReview.output.startsWith(oldVerdict.output), 'the historical negative verdict remains intact')
+  assert.match(retiredReview.output,/Superseded by review of replacement/)
   const integration=f.propose(f.actorA,{title:'Integrate',kind:'integration',dependencies:[repaired.id]});await submitAndReview(integration)
   assert.equal(f.runtime.control(f.owner,f.mission.id,'complete','Accepted integrated repair').status,'completed')
 })
 
 test('a disproved research hypothesis remains an accepted useful result after independent checks',async t=>{
   const f=await setup(t)
+  f.workers.artifact = { ...f.workers.artifact, changedPaths: [] }
   const source=f.propose(f.actorA,{kind:'research',checks:[]})
   const claimed=await f.runtime.claim(f.actorA,f.mission.id,source.id)
   await f.workers.callbacks.toolRun(f.a.id,{tool:'bash',arguments:{command:'experiment'},result:{observation:'counterexample'},isError:false})
@@ -390,7 +404,7 @@ test('lease expiry restores the plan-intended assignee without losing recovery a
   const stored = f.runtime.store.get('tasks', task.id)
   stored.attempt.leaseUntil = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
-  const pending = await eventually(() => { const current = f.runtime.store.get('tasks', task.id); return current.status === 'pending' ? current : undefined }, 'the expired attempt must be re-pended')
+  const pending = await eventually(() => { const current = f.runtime.store.get('tasks', task.id); return current.status === 'pending' ? current : undefined }, 'the expired attempt must be re-pended', 2500)
   assert.equal(pending.assigneeId, f.a.id, 'the planned assignee survives the expiry')
   assert.equal(pending.plannedAssigneeId, f.a.id)
   assert.equal(pending.recoveryCount, 1)
@@ -407,7 +421,7 @@ test('approaching-limit warnings fire once per dimension and threshold', async t
   await f.workers.callbacks.usageSnapshot(f.a.id, 950)
   assert.deepEqual(warnings().map(event => [event.data.dimension, event.data.threshold]), [['maxTokens', 0.7], ['maxTokens', 0.9]])
   assert.equal(warnings().at(-1).data.remaining, 50)
-  assert.equal(warnings().at(-1).data.suggestedLimit, Math.ceil(950 / 0.9))
+  assert.equal(warnings().at(-1).data.suggestedLimit, Math.ceil(950 / 0.7))
 })
 
 test('budget exhaustion names the exhausted dimension in the reason and event', async t => {
@@ -418,4 +432,15 @@ test('budget exhaustion names the exhausted dimension in the reason and event', 
   assert.match(snapshot.mission.reason, /maxTokens/)
   const exhausted = snapshot.events.find(event => event.type === 'mission/budget-exhausted')
   assert.deepEqual(exhausted.data.dimensions, ['maxTokens'])
+})
+test('runtime.propose reads a null priority or experiment as omitted, as the tool path does, and still refuses a mistyped one', async t => {
+  // The exported runtime API and the browser propose RPC pass the caller's
+  // input through without a tool schema; d81a3fb and 5347f5b stored null here
+  // as the defaults, and the restored type checks refused it.
+  const f = await setup(t)
+  const task = f.propose(f.owner, { title: 'Null defaults', kind: 'research', checks: [], priority: null, experiment: null })
+  assert.deepEqual([task.priority, task.experiment], [50, false])
+  assert.deepEqual([f.runtime.store.get('tasks', task.id).priority, f.runtime.store.get('tasks', task.id).experiment], [50, false])
+  assert.throws(() => f.propose(f.owner, { title: 'String priority', kind: 'research', checks: [], priority: '3' }), /\[task_priority_invalid\]/)
+  assert.throws(() => f.propose(f.owner, { title: 'String experiment', kind: 'research', checks: [], experiment: 'false' }), /\[task_experiment_invalid\]/)
 })

@@ -3,48 +3,30 @@
  * review path is recorded, repaired by an automatic independent review when the
  * board can afford one, and escalated to the owner with the exact task id when
  * it cannot. The normal two-step owner flow (admit the source, then its review)
- * keeps working, and the launch-time plan validation still rejects a code
- * deliverable without an assigned independent review.
+ * keeps working, and a launched plan never lacks a review: the host adds one
+ * for a code deliverable the plan does not pair.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, SwarmRuntime, eventually, makeRuntime } from './faults/harness.mjs'
 
-async function eventually(read, message, timeout = 3000) {
-  const until = Date.now() + timeout
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class ReviewWorkers {
-  deliveries = []; prepared = []; stopped = []
+/** Each task's artifact is its own commit. */
+class ReviewWorkers extends FakeWorkers {
   checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(task.id) }
   async captureArtifact(member, task) { return { commit: createHash('sha1').update(task.id).digest('hex'), baseCommit: 'b'.repeat(40), workspace: member.workspace, changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
 }
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
+const reviewConfig = { maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined }
+const reviewBudget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 }
 
 async function fixture(t, { members = ['author', 'reviewer'], budget: overrides = {} } = {}) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-review-path-'))
-  const workers = new ReviewWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: { ...reviewBudget, ...overrides } })
   const owner = { sessionId: 'review-path-owner' }
   const mission = runtime.create(owner, { title: 'Review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget: { ...budget, ...overrides } })
+    scope: ['src/'], acceptance: ['done'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const added = {}
   for (const name of members) {
@@ -54,7 +36,7 @@ async function fixture(t, { members = ['author', 'reviewer'], budget: overrides 
   // escalates an unreviewable submission, so the regression must run it.
   await runtime.start()
   const actor = name => ({ sessionId: added[name].sessionId })
-  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const propose = (title, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', assigneeId: added.author.id, scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
   const submit = async (task, name = 'author') => {
     const claimed = await runtime.claim(actor(name), mission.id, task.id)
@@ -72,7 +54,6 @@ async function fixture(t, { members = ['author', 'reviewer'], budget: overrides 
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner' && delivery.kind === 'control')
   const reviewPathNotices = () => ownerNotices().filter(delivery => /review_path_missing/.test(delivery.content))
   const reviewsOf = source => tasks().filter(task => task.kind === 'verification' && task.reviewOf === source.id)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   return { runtime, workers, owner, mission, stream, added, actor, propose, submit, review, current, tasks, events, ownerNotices, reviewPathNotices, reviewsOf }
 }
 
@@ -83,11 +64,11 @@ test('a submitted implementation with no live review is recorded and automatical
   const submitted = f.events('task/submitted').find(event => event.data.taskId === source.id)
   assert.equal(submitted.data.reviewPath?.missing, true, 'the submission records the missing review path atomically')
   assert.match(submitted.data.reviewPath.reason, /reviewOf/)
-  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === source.id), 'the missing review was never recorded durably')
+  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === source.id), 'the missing review was never recorded durably', 3000)
   assert.equal(missing.data.kind, 'implementation')
   assert.match(missing.data.reason, new RegExp(source.id))
   assert.match(missing.data.reason, /reviewOf/)
-  const review = await eventually(() => f.reviewsOf(source)[0], 'an independent review was never admitted for the submitted artifact')
+  const review = await eventually(() => f.reviewsOf(source)[0], 'an independent review was never admitted for the submitted artifact', 3000)
   assert.equal(review.status, 'pending')
   assert.equal(review.assigneeId, undefined, 'the review is left unassigned so any independent member can claim it')
   assert.equal(review.maxRecoveryAttempts, 2)
@@ -136,9 +117,9 @@ test('a replaces repair gets the same detection and automatic review as a fresh 
   await f.submit(repair)
   const submitted = f.events('task/submitted').filter(event => event.data.taskId === repair.id).at(-1)
   assert.equal(submitted.data.reviewPath?.missing, true, 'the repair submission records the missing review path atomically')
-  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === repair.id), 'the repair was never recorded as missing a review')
+  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === repair.id), 'the repair was never recorded as missing a review', 3000)
   assert.equal(missing.data.kind, 'implementation')
-  const automatic = await eventually(() => f.reviewsOf(repair)[0], 'the repair was never automatically reviewed')
+  const automatic = await eventually(() => f.reviewsOf(repair)[0], 'the repair was never automatically reviewed', 3000)
   assert.equal(automatic.maxRecoveryAttempts, 2)
   assert.deepEqual(automatic.checks, repair.checks)
   assert.deepEqual(f.events('task/review-admitted').map(event => event.data.reviewOf), [repair.id])
@@ -153,12 +134,12 @@ test('an unreviewable submission wakes the owner once with the task id when no i
   const f = await fixture(t, { members: ['author'] })
   const source = f.propose('Implement alone')
   await f.submit(source)
-  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === source.id), 'the missing review was never recorded durably')
+  const missing = await eventually(() => f.events('task/review-missing').find(event => event.data.taskId === source.id), 'the missing review was never recorded durably', 3000)
   assert.equal(missing.data.taskId, source.id)
-  const blocked = await eventually(() => f.events('task/review-blocked').find(event => event.data.taskId === source.id), 'the unreviewable submission never blocked')
+  const blocked = await eventually(() => f.events('task/review-blocked').find(event => event.data.taskId === source.id), 'the unreviewable submission never blocked', 3000)
   assert.match(blocked.data.reason, /no live member other than the author/)
   assert.equal(f.reviewsOf(source).length, 0, 'no review is admitted without an independent member')
-  const notice = await eventually(() => f.reviewPathNotices().find(delivery => delivery.content.includes(source.id)), 'the owner notice must name the task id')
+  const notice = await eventually(() => f.reviewPathNotices().find(delivery => delivery.content.includes(source.id)), 'the owner notice must name the task id', 3000)
   assert.match(notice.content, /\[review_path_missing\]/)
   assert.match(notice.content, new RegExp(`reviewOf ${source.id}`))
   await new Promise(resolve => setTimeout(resolve, 80))
@@ -169,10 +150,10 @@ test('an exhausted task budget blocks automatic review and tells the owner why',
   const f = await fixture(t, { budget: { maxTasks: 1 } })
   const source = f.propose('Implement alone')
   await f.submit(source)
-  const blocked = await eventually(() => f.events('task/review-blocked').find(event => event.data.taskId === source.id), 'the exhausted task budget never blocked')
+  const blocked = await eventually(() => f.events('task/review-blocked').find(event => event.data.taskId === source.id), 'the exhausted task budget never blocked', 3000)
   assert.match(blocked.data.reason, /task budget is exhausted/)
   assert.equal(f.reviewsOf(source).length, 0)
-  const notice = await eventually(() => f.reviewPathNotices().find(delivery => delivery.content.includes(source.id)), 'the owner notice must name the task id')
+  const notice = await eventually(() => f.reviewPathNotices().find(delivery => delivery.content.includes(source.id)), 'the owner notice must name the task id', 3000)
   assert.match(notice.content, /task budget is exhausted/)
 })
 
@@ -188,18 +169,17 @@ test('replacing a verification task no longer claims a review starts by itself',
 })
 
 test('an unreviewable submission survives a host restart and is repaired on recovery', async t => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-review-path-restart-'))
-  const config = { statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }
-  const owner = { sessionId: 'restart-owner' }
-  let first = new SwarmRuntime(config, new ReviewWorkers())
+  // Registered before makeRuntime's cleanup, so the recovered runtime is disposed before the temp dir goes.
   let second
-  t.after(async () => { await first.dispose(); await second?.dispose(); await rm(directory, { recursive: true, force: true }) })
+  t.after(async () => { await second?.dispose() })
+  const { dir: directory, config, runtime: first, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: reviewBudget })
+  const owner = { sessionId: 'restart-owner' }
   const mission = first.create(owner, { title: 'Restart review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['done'], budget })
   const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const author = await first.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   await first.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
-  const source = first.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement before restart', objective: 'Implement before restart',
+  const source = first.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement before restart', objective: 'Implement before restart',
     kind: 'implementation', assigneeId: author.id, scope: ['src/'], acceptance: ['done'], checks: ['npm test'] })
   const claimed = await first.claim({ sessionId: author.sessionId }, mission.id, source.id)
   await first.submit({ sessionId: author.sessionId }, mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Candidate before restart' })
@@ -207,32 +187,42 @@ test('an unreviewable submission survives a host restart and is repaired on reco
   second = new SwarmRuntime(config, new ReviewWorkers())
   await second.start()
   const missing = await eventually(() => second.store.events(mission.id, 500).find(event => event.type === 'task/review-missing' && event.data.taskId === source.id),
-    'the recovered runtime never recorded the missing review')
+    'the recovered runtime never recorded the missing review', 3000)
   assert.equal(missing.data.kind, 'implementation')
   const review = await eventually(() => second.store.list('tasks', mission.id).find(task => task.kind === 'verification' && task.reviewOf === source.id),
-    'the recovered runtime never admitted an independent review')
+    'the recovered runtime never admitted an independent review', 3000)
   assert.equal(review.maxRecoveryAttempts, 2)
   assert.deepEqual(review.checks, ['npm test'])
   assert.equal(review.status, 'pending')
 })
 
-test('automatic plan admission still rejects a code deliverable without an assigned independent review', async t => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-review-path-plan-'))
-  const workers = new ReviewWorkers()
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 10 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+test('automatic plan admission adds the independent review a code deliverable lacks, and keeps an authored one', async t => {
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new ReviewWorkers(),
+    config: { ...reviewConfig, tickMs: 60000, maxTasksPerMember: 10 },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 },
+  })
   const owner = { sessionId: 'plan-owner' }
   const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Deliver verified code', workspace: directory })
   const plan = { title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'],
-    budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 },
+    budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
-    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', scope: ['src/'], acceptance: ['works'],
+    tasks: [{ key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'],
       assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 }] }
-  await assert.rejects(runtime.startPlan(owner, request.id, plan), /requires an assigned independent verification task/)
-  plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', scope: ['src/'],
+  const synthesized = await runtime.startPlan(owner, request.id, plan)
+  assert.equal(synthesized.mission.status, 'active')
+  const source = synthesized.tasks.find(task => task.kind === 'integration')
+  const reviews = synthesized.tasks.filter(task => task.kind === 'verification' && task.reviewOf === source.id)
+  assert.equal(reviews.length, 1, 'exactly one review is added')
+  assert.equal(reviews[0].assigneeId, undefined)
+  assert.equal(reviews[0].maxRecoveryAttempts, 5, 'the added review takes the source\'s recovery limit')
+
+  const authoredOwner = { sessionId: 'plan-owner-authored' }
+  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory })
+  plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'],
     acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 })
-  const snapshot = await runtime.startPlan(owner, request.id, plan)
+  const snapshot = await runtime.startPlan(authoredOwner, authoredRequest.id, plan)
   assert.equal(snapshot.mission.status, 'active')
+  assert.deepEqual(snapshot.tasks.filter(task => task.kind === 'verification').map(task => task.objective), ['Verify immutable artifact'], 'the authored review is the only one')
 })

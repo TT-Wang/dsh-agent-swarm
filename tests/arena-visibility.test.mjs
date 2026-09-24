@@ -23,34 +23,23 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, rm, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { runProcess } from '../lib/workspaces.js'
 import { registerTools, SWARM_TOOLS, MANAGEMENT_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+// fixture gap: the shared git asserts success; these probes need the failure itself.
 const gitFails = async (cwd, ...args) => {
   const result = await runProcess(['git', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 10000 })
   return result.exitCode !== 0
 }
 async function gitFixture(t) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-arena-visibility-')))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'src'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const { root: temp, source } = await makeRepo('swarm-arena-visibility')
+  const workspaces = makeWorkspaces(temp)
   t.after(async () => { await workspaces.dispose(); await rm(temp, { recursive: true, force: true }) })
   return { temp, source, workspaces, artifactsOf: missionId => path.join(temp, 'worktrees', missionId, 'artifacts.git') }
 }
@@ -136,31 +125,19 @@ test('T1c2: the per-mission artifact repository is self-contained, so a source g
   assert.ok(tree.includes('src/answer.txt'), 'an unchanged base blob is readable without the source')
 })
 
-/** Fake adapter: deterministic artifacts, no auto-dispatch, no filesystem effects. */
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'artifact-commit', baseCommit: 'base-commit', workspace: '/isolated', changedPaths: ['src/a.txt'] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+/** A runtime whose fake adapter gives deterministic artifacts, no auto-dispatch and no filesystem effects. */
 async function runtimeFixture(t) {
-  const root = await mkdtemp(path.join(tmpdir(), 'swarm-arena-registry-'))
-  const stateDirectory = path.join(root, 'state')
+  const { dir: root, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      artifact: { commit: 'artifact-commit', baseCommit: 'base-commit', workspace: '/isolated', changedPaths: ['src/a.txt'] },
+      async verifyArtifact(_member, task) { return task.checks.map(command => ({ command, exitCode: 0, output: 'fixture check passed' })) },
+    }),
+    config: { maxEvents: 500, maxTasksPerMember: 4, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 8, maxExperiments: 1 },
+  })
   const workspace = path.join(root, 'workspace')
-  await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(path.join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
-  const runtime = new SwarmRuntime({ statePath: path.join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 4 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
-  const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 8, maxExperiments: 1 }
   const owner = { sessionId: `owner-${randomUUID()}` }
   const mission = runtime.create(owner, { title: 'Arena visibility', objective: 'Exercise the registry and arena view', workspace, scope: ['src/'], acceptance: ['arena works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Arena work' })
@@ -175,9 +152,9 @@ async function runtimeFixture(t) {
     aliceActor: { sessionId: alice.sessionId }, bobActor: { sessionId: bob.sessionId }, carolActor: { sessionId: carol.sessionId },
   }
 }
-function definitions(runtime) {
+function definitions(runtime, budget) {
   const registered = new Map()
-  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 8, maxExperiments: 1 })
+  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget)
   return registered
 }
 const execution = sessionId => ({ signal: new AbortController().signal, agent: { id: sessionId } })
@@ -185,7 +162,7 @@ const execution = sessionId => ({ signal: new AbortController().signal, agent: {
 /** Submit one artifact-bearing task in a mission and return it. */
 async function submitArtifact(f, actor, stream, title) {
   const source = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: stream.id, title, objective: 'Produce an artifact', kind: 'implementation',
+    outputs: [], workstreamId: stream.id, title, objective: 'Produce an artifact', kind: 'implementation',
     scope: ['src/'], acceptance: ['arena works'], checks: ['node --test'],
   })
   const claimed = await f.runtime.claim(actor, f.mission.id, source.id)
@@ -198,7 +175,7 @@ test('the cross-mission artifact registry is the sanctioned read path: scoped, r
   const source = await submitArtifact(f, f.aliceActor, f.stream, 'Implement the arena')
   // Deterministic independent review: proposed before submission, accepted after.
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review the arena', objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: 'Review the arena', objective: 'Independent review', kind: 'verification',
     reviewOf: source.id, assigneeId: f.bob.id, scope: ['src/'], acceptance: ['arena works'], checks: [],
   })
   const reviewClaim = await f.runtime.claim(f.bobActor, f.mission.id, review.id)
@@ -216,7 +193,7 @@ test('the cross-mission artifact registry is the sanctioned read path: scoped, r
 
   // The other tenant has its own artifact.
   const otherSource = f.runtime.propose(f.otherOwner, f.other.id, {
-    workstreamId: f.otherStream.id, title: 'Other artifact', objective: 'Other work', kind: 'implementation',
+    outputs: [], workstreamId: f.otherStream.id, title: 'Other artifact', objective: 'Other work', kind: 'implementation',
     scope: ['src/'], acceptance: ['other works'], checks: ['node --test'],
   })
   const otherClaim = await f.runtime.claim(f.carolActor, f.other.id, otherSource.id)
@@ -257,16 +234,16 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
   // A pending task assigned to alice whose dependency is not accepted: the arena
   // must show what she is waiting on even though she holds no attempt.
   const first = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'First', objective: 'Prerequisite', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
+    outputs: [], workstreamId: f.stream.id, title: 'First', objective: 'Prerequisite', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
   })
   const waiting = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Waiting', objective: 'Depends on first', kind: 'research',
-    dependencies: [first.id], assigneeId: f.alice.id, scope: ['src/'], acceptance: ['arena works'],
+    outputs: [], workstreamId: f.stream.id, title: 'Waiting', objective: 'Depends on first', kind: 'research',
+    dependencies: [first.id], assigneeId: f.alice.id, priority: 100, scope: ['src/'], acceptance: ['arena works'],
   })
   let view = f.runtime.observe(f.owner, f.mission.id, { detail: 'full' })
   let row = view.arena.members.find(member => member.id === f.alice.id)
   assert.equal(row.status, 'idle')
-  assert.equal(row.pendingTaskId, waiting.id, 'the next pending task is named')
+  assert.equal(row.pendingTaskId, waiting.id, 'the highest-priority pending obligation is shown as diagnostic context, not a dispatch prediction')
   assert.deepEqual(row.pendingDependencies, [first.id], 'the unaccepted dependency is named')
   assert.equal(row.currentTaskId, undefined)
   assert.match(view.fingerprint, /^[a-f0-9]{32}$/, 'the owner sees the no-silent-state F(S), not the 64-hex ledger digest')
@@ -274,7 +251,7 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
 
   // A live attempt shows the current task, its attempt id and an age.
   const running = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Running', objective: 'Give alice a live attempt', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
+    outputs: [], workstreamId: f.stream.id, title: 'Running', objective: 'Give alice a live attempt', kind: 'research', scope: ['src/'], acceptance: ['arena works'],
   })
   const claimed = await f.runtime.claim(f.aliceActor, f.mission.id, running.id)
   f.runtime.escalate(f.aliceActor, f.mission.id, { body: 'Owner: the check command is ambiguous' })
@@ -301,7 +278,7 @@ test('the arena view exposes presence, activity, current task, attempt age, pend
 test('swarm_registry joins the single registry as an owner-only read tool and a closed trace step', async t => {
   const f = await runtimeFixture(t)
   await submitArtifact(f, f.aliceActor, f.stream, 'Registry artifact')
-  const tools = definitions(f.runtime)
+  const tools = definitions(f.runtime, f.budget)
   assert.deepEqual([...tools.keys()], [...SWARM_TOOLS], 'registration order is the cached schema prefix')
   for (const name of SWARM_TOOLS) assert(TRACE_STEPS.includes(name), `${name} must be a closed trace step`)
   assert(SWARM_TOOLS.includes('swarm_registry'))

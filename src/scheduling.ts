@@ -1,22 +1,27 @@
 /**
- * The scheduling seam: the readiness and stall predicates, the durable pass guard
- * (open/close/release) and the dispatch sweep of one serialized pass. M1a seam 7/7.
+ * The scheduling seam: the readiness and stall predicates, the in-memory pass
+ * guard (open/close and the wedge watchdog) and the dispatch sweep of one
+ * serialized pass. M1a seam 7/7.
  *
  * Behaviour-identical to the code moved from src/runtime.ts; the runtime keeps
  * thin forwarding methods and `schedule` calls `dispatch` exactly where its
  * member loop used to be.
  */
 import { randomUUID } from 'node:crypto'
-import { dependencyAssumptions, taskCeilingExhaustion } from './admission.ts'
+import { selectAcceptedDelivery } from './task-graph.ts'
+import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
+import { liveReviewFor } from './admission.ts'
+import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
-import { emitGuardTerminal, guardTerminal, type DecisionExit, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
+import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { WorkspaceRevokedError } from './workspace-admission.ts'
+import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
+import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import { ATTEMPT_FENCING_EVENTS, type Actor, type Attempt, type Member, type Mission, type SchedulingPass, type SwarmEvent, type Task } from './types.ts'
+import { type Actor, type Attempt, type Member, type Mission, type Task } from './types.ts'
 
 /**
  * Round-8 F1: scheduling passes an unreviewed submission must persist before
@@ -47,45 +52,91 @@ export interface DispatchQuestion {
 }
 
 /**
- * S5c: the durable release record on the pass row. `SchedulingPass`
- * (src/types.ts) is outside this task's write scope, so the two fields are
- * declared here and travel as plain JSON properties on the same durable row;
- * the integration task records the schema addition. `releasedRunId` is the runId
- * of the most recent pass the watchdog released, carried forward by `openPass`
- * (and preserved by `closePass`) because the row is overwritten once per pass.
+ * The scheduling body that is queued or running for one mission. `openPass`
+ * (called by `kick`) records it before the body is queued on the mission's
+ * serial queue (`SwarmRuntime.exclusive`), and `closePass` removes it when the
+ * body settles, so at most one scheduling body per mission is queued or running.
+ * It is in-memory on purpose: it describes an operation this process owns, and
+ * a restarted process owns none. The durable row it replaces never gated or
+ * named anything after a restart either (it carried the dead process's
+ * instance id); it only carried the no-progress count, which now restarts with
+ * the process.
  *
- * R16-D: the same row also accumulates what the release bound could not keep:
- * `releases` counts every released wedge and `worstRelease` keeps the widest
- * release-to-bound gap seen (with the bound it was measured against). The row is
- * the single durable carrier of these facts for the same reason as
- * `releasedRunId`: the once-per-pass overwrite would otherwise erase the only
- * record of a bounded release, and the silence projection (below) must not
- * depend on the retained event window.
+ * Why no release and no fence: the queue is strictly serial and a waiter past
+ * its bound is refused, never run (`boundedQueueWait`), so a successor body
+ * cannot start until this body settles; a wedged body can never write after its
+ * successor starts. The watchdog therefore only names a body past its bound
+ * (`checkSchedulingPasses`) and marks the mission wedged for notices; the body
+ * itself ends at the bound of whichever await it is in (`workerStartTimeoutMs`,
+ * the per-attempt delivery bound, each git subprocess's `HOST_GIT_TIMEOUT_MS`),
+ * and a member that held it for a whole bound makes it stop at the next member
+ * boundary so the next body resumes from lease recovery (`dispatch`).
  */
-interface ReleaseRecord {
-  runId: string
+export interface SchedulingPass {
+  /** The mission's stable pass name (`pass_<missionId>`), named by the stall event and the owner notice. */
+  id: string
+  /** This body's identity; the stall event and the owner notice name it as the run. */
+  operationId: string
+  missionId: string
   startedAt: number
+  /** Store revision and mission digest when the pass was opened. */
+  revisionBefore: number
+  fingerprintBefore: string
+  /** Consecutive earlier passes that changed no durable mission state. */
+  noProgressPasses: number
+  /** Set once the watchdog's naming of this body past its bound has committed; it is then wedged, not live. */
+  escalatedAt?: number
+  /**
+   * Set with `escalatedAt` when the naming's owner notice was recorded, not
+   * suppressed by the notice dedup. Only such a naming spends the durable
+   * wedge key when the body settles (`closePass`).
+   */
+  wedgeNotified?: boolean
+  /**
+   * The body's own last progress: when one of its own awaits returned (stamped
+   * before it commits the result) or it reached a member boundary (`progressed`).
+   * A call that commits before its promise settles stamps the record the body
+   * handed it at the instant its adapter call settles, before that commit: the
+   * worker start (`SwarmRuntime.startWorker`), the workspace authorization
+   * check and the preparation's recovery-fallback report. Only the body's own
+   * record is stamped, so a worker turn one of its adapter calls woke commits
+   * without crediting the body; progress proves the body is running, not
+   * sitting in an await (`passState`).
+   */
+  progressAt?: number
+  /**
+   * The member whose task this body is preparing, while its `prepareTask` await
+   * is in flight: the adapter's recovery-fallback report, committed from inside
+   * that call, stamps the body's progress first (`SwarmRuntime.onRecoveryFallback`).
+   */
+  preparing?: string
+  /** The member this body's sweep starts from: the one its predecessor stopped before. */
+  sweepFrom?: string
+  /**
+   * The member where the chain of early-stopped bodies this body belongs to
+   * started. A chained body's sweep ends before it, so the chain covers at most
+   * one rotation and its last body runs the pass-end steps.
+   */
+  chainFrom?: string
+  /** Set when this body stopped early at a member boundary: the first member it did not sweep. */
+  stoppedBefore?: string
+}
+
+/**
+ * R16-D: what the watchdog measured when it named a wedged body: the whole
+ * time the body had held the mission when it was named, the bound it was
+ * measured against, and the live work that held the naming to its second bound.
+ * The durable `mission/stalled` event carries these facts. Nothing is released:
+ * the `release*` names are kept for the event's existing readers.
+ */
+interface WedgeRecord {
+  /** The instant of the tick whose naming committed (a retried naming measures its own tick). */
   releasedAt: number
-  /** `releasedAt - startedAt`: the whole time the wedged pass held the guard. */
+  /** `releasedAt - startedAt`: how long the body had held the mission when it was named. */
   gapMs: number
-  /** The declared bound this release was measured against. */
-  boundMs: number
-  /** True when live work (a live lease, an in-flight stop acknowledgement) held the release to its second bound. */
-  heldByLiveWork: boolean
-  /** The subjects whose live work held it, preserved by the release. */
+  /** The live subjects that held the naming to its second bound. */
   liveSubjects: string[]
 }
-interface ReleasedPassFields {
-  releasedRunId?: string
-  releasedAt?: number
-  releases?: number
-  worstRelease?: ReleaseRecord
-}
-const releasedPassFields = (row: SchedulingPass): SchedulingPass & ReleasedPassFields => row as SchedulingPass & ReleasedPassFields
-
-/** Keep the wider of two release records; ties keep the earlier one. */
-const widerRelease = (previous: ReleaseRecord | undefined, next: ReleaseRecord): ReleaseRecord =>
-  previous === undefined || next.gapMs > previous.gapMs ? next : previous
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
 export const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
@@ -105,58 +156,6 @@ export interface SilentAttempt {
   boundMs: number
 }
 
-/** R16-D: one subject whose silence was measured against the bound that applied to it. */
-export interface SubjectSilence {
-  subject: string
-  kind: 'scheduling-pass' | 'attempt'
-  gapMs: number
-  /** The declared bound it was measured against. */
-  boundMs: number
-  /** When the measurement was taken (release instant or escalation instant). */
-  at: number
-}
-
-/** R16-D: the durable per-attempt reporting record, for one attempt of the retained window. */
-export interface AttemptReport {
-  attemptId: string
-  taskId: string
-  epoch: number
-  memberId: string
-  claimedAt: number
-  /** When the attempt stopped being current; undefined while the task row still carries it. */
-  endedAt?: number
-  lastDurableAt: number
-  /** Longest interval between consecutive durable elements (or to `endedAt` / now). */
-  worstReportingGapMs: number
-  /** The current silence: `(endedAt ?? now) - lastDurableAt`. */
-  silentMs: number
-  /** Owner escalations naming this attempt, by dedup key. */
-  escalations: string[]
-  /** The attempt ended with nothing durable after its own dispatch (no report, no escalation). */
-  endedUnreported: boolean
-}
-
-/**
- * R16-D: the round's silence projection, read from the durable store alone.
- * Read-only: it changes no task, member, pass or delivery state.
- */
-export interface SilenceReport {
-  missionId: string
-  bounds: { passMs: number; passReleaseMs: number; attemptMs: number }
-  /** Every subject whose silence was measured, with the bound it was measured against. */
-  subjects: SubjectSilence[]
-  worstSubjectSilence: SubjectSilence | undefined
-  attempts: AttemptReport[]
-  worstAttemptReportingGap: { attemptId: string; taskId: string; gapMs: number } | undefined
-  attemptsEnded: number
-  /** Attempts that ended with no durable report or escalation after their own dispatch. */
-  attemptsEndedUnreported: number
-  attemptSilenceEscalations: number
-  /** The durable pass-row release record: how many wedges were released and the widest one. */
-  passReleases: { count: number; worst: ReleaseRecord | undefined }
-  note: string
-}
-
 /** Human form of an elapsed bound for a notice; the raw milliseconds stay on the witness. */
 function formatSpan(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
@@ -166,30 +165,46 @@ function formatSpan(ms: number): string {
 }
 
 /**
- * R16-D: the durable events after which a task no longer holds its attempt. The
- * vocabulary is declared ONCE in `src/types.ts` (`ATTEMPT_FENCING_EVENTS`) and
- * read here and by the replay decoder, which is what stops the two readers from
- * drifting: the hand-mirrored copy this function replaced had lost
- * `task/restart-repended` and `task/ceiling-exhausted`, so the replay refused
- * logs its own runtime wrote. A frozen array, not a Set: it is a lookup
- * vocabulary, and the S5 in-memory census classifies every collection in src/.
+ * A scheduling body's own progress stamp (`SchedulingPass.progressAt`). The body
+ * calls it itself, with the record `kick` handed it, when it starts, at each
+ * member boundary and when one of its own awaits returns (`awaited`). A call
+ * that commits before its promise settles is handed the record and stamps it
+ * where its adapter work settles, before that commit (`SchedulingPass.progressAt`).
+ * Nothing else stamps it: commits made by a worker turn the body woke inside an
+ * adapter call are that turn's, not the body's. Without a record (a direct
+ * `schedule` or `dispatch` call) it does nothing.
  */
-const isAttemptCloser = (type: string): boolean => ATTEMPT_FENCING_EVENTS.includes(type)
+export function progressed(pass: SchedulingPass | undefined, now: number): void {
+  if (pass !== undefined) pass.progressAt = now
+}
+
+/**
+ * One of a scheduling body's own awaits: `work` settles, the body stamps its
+ * progress (`progressed`), and only then does it act on the result, so the
+ * commit of that result publishes as a running body's.
+ */
+export function awaited<T>(pass: SchedulingPass | undefined, work: Promise<T>, now: () => number): Promise<T> {
+  return pass === undefined ? work : work.finally(() => progressed(pass, now()))
+}
 
 export class Scheduling {
   /**
-   * S1: pass ids the watchdog released after the declared bound, so an
-   * abandoned pass body cannot dispatch into the newer pass's turn. S5c: this
-   * Set is the in-process mirror of the durable `releasedRunId` on the pass row
-   * (`passReleased` reads the row first), so losing it cannot let a released
-   * body resume — it is a fast path for the same durable fact.
+   * The scheduling body queued or running per mission (see `SchedulingPass`).
+   * It is removed only when that body settles, so `kick` never queues a second
+   * body behind one the queue could not run anyway, and the tick watchdog reads
+   * `startedAt` to name a body past its bound.
    */
-  readonly releasedPasses = new Set<string>()
+  readonly passes = new Map<string, SchedulingPass>()
   /**
-   * Identity of this runtime process in the pass row. A row written by a
-   * different instance is a crashed process's leftover: it never gates this
-   * runtime (the next open pass overwrites it), so a restart does not wait out
-   * a dead pass's bound.
+   * Consecutive no-progress passes per mission, carried from one pass to the
+   * next for the S1 no-progress escalation. Its loss only restarts the count;
+   * the escalation's dedup key is durable on the mission row.
+   */
+  private readonly noProgress = new Map<string, number>()
+  /**
+   * Identity of this runtime process in durable claims (the budget stop claim
+   * in src/gates.ts). A claim written by a different instance is a crashed
+   * process's leftover and never gates this runtime.
    */
   readonly instanceId = id('runtime')
 
@@ -198,8 +213,25 @@ export class Scheduling {
   /**
    * The dispatch sweep of one serialized pass (M1a: moved out of `schedule`
    * unchanged). It returns false when the pass must be abandoned exactly where
-   * the original early returns did: on shutdown, on a mission that stopped being
-   * active during an adapter await, or when the pass guard was released.
+   * the original early returns did: on shutdown or on a mission that stopped
+   * being active during an adapter await. It runs only inside the mission's
+   * serial queue, so no other pass body runs while it awaits.
+   *
+   * A body also returns false at the next member boundary when the member it
+   * just swept held it for a whole bound (`stallPassTimeoutMs`), and records
+   * where it stopped (`stoppedBefore`). `kick` then queues the next body at
+   * once, which starts from lease recovery and sweeps from that member onwards,
+   * wrapping round to the ones before it. Each member's long awaits (a worker
+   * start up to `workerStartTimeoutMs`, task preparation, a close-out capture)
+   * therefore delay lease recovery, automatic completion and the budget check
+   * by at most one such member, not by their sum over every member. A body
+   * whose members each take less than a bound finishes its sweep, however long
+   * the sweep takes in total. The chain of early stops is bounded: a chained
+   * body's sweep ends before the member the chain started from (`chainFrom`),
+   * so the body that completes the rotation returns true, runs the pass-end
+   * steps (`ensureWitness`, `flushOutbox`) and the next body waits for the tick.
+   * `pass` is the body's own record, handed down by `kick`; a direct call
+   * without one never stamps progress and never stops early.
    */
   async dispatch(mission: Mission, missionId: string, pass?: SchedulingPass): Promise<boolean> {
         // R17-G1: the dispatcher reads the SAME shared interpretation every
@@ -207,12 +239,24 @@ export class Scheduling {
         // member rows), so no notice can describe a board the dispatcher would
         // act on differently. The view is rebuilt after each await, so it is
         // never staler than the per-step store reads it replaces.
-        for (const member of this.rt.interpretation(missionId).members) {
+        const members = this.rt.interpretation(missionId).members
+        const from = pass?.sweepFrom === undefined ? -1 : members.findIndex(member => member.id === pass.sweepFrom)
+        const rotation = from > 0 ? [...members.slice(from), ...members.slice(0, from)] : members
+        const end = pass?.chainFrom === undefined ? -1 : rotation.findIndex((member, index) => index > 0 && member.id === pass.chainFrom)
+        const order = end > 0 ? rotation.slice(0, end) : rotation
+        let memberSince = this.rt.now()
+        for (const [index, member] of order.entries()) {
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
+          if (pass !== undefined && index > 0 && this.rt.now() - memberSince >= this.rt.stallPassTimeoutMs) {
+            pass.stoppedBefore = member.id
+            // A chain whose start member is gone restarts from this body's first one.
+            pass.chainFrom = end > 0 ? pass.chainFrom : order[0]!.id
+            return false
+          }
+          memberSince = this.rt.now()
+          progressed(pass, this.rt.now())
           if (memberPhaseOf(member) === 'stopped') continue
-          // S1: an abandoned pass body (its guard was released after the declared
-          // bound) must never dispatch into the newer pass's turn.
-          if (this.passReleased(pass)) return false
+          if (pendingStopOwner(this.rt.store.list('tasks', missionId), member.id)) continue
           // Round 14: one member's guard chain must never abort the whole sweep.
           // Before this, a guard that threw here (the field evidence: "Member has
           // uncommitted commits" while an owner tried to preserve a cut-off
@@ -223,18 +267,16 @@ export class Scheduling {
           // dispatching the other members.
           try {
           if (!this.rt.isolationAllows(missionId, member)) continue
-          try { await this.rt.workers.start({ mission, member, ownerSessionId: mission.ownerSessionId }) }
+          try { await awaited(pass, this.rt.startWorker(mission, member, { pass }), this.rt.now) }
           catch (error) {
             // Disposing the adapter cancels in-flight starts. This is recoverable host
             // shutdown, not a permanent worker failure to persist across restart.
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            this.rt.onStartFailure(mission, member, error)
             continue
           }
           this.rt.startFailures.delete(member.id)
           this.rt.clearProviderOutage(missionId, member.id)
           if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-          if (this.passReleased(pass)) return false
           // R10-09/S3: a parked member is dispatchable. The adapter's idle
           // precondition can be false for a parked agent (a pending inbox item or a
           // non-idle handle); an assignment is exactly the fresh input that unparks
@@ -246,6 +288,7 @@ export class Scheduling {
           // parked-member hatch keeps priority: a parked member is dispatchable.
           if (this.startBlocker(member) !== undefined) continue
           const view = this.rt.interpretation(missionId)
+          if (pendingStopOwner(view.tasks, member.id)) continue
           const open = view.tasks.find(t => t.status === 'running' && t.attempt?.ownerId === member.id)
           if (open !== undefined) {
             // W6: the worker ended its turn with an open attempt. Nudge within a
@@ -256,48 +299,32 @@ export class Scheduling {
             // is only a cache for an attempt whose row write is still in flight.
             const durableIdle = open.idleSignal?.attemptId === open.attempt?.id
             const cachedIdle = this.rt.attempts.idleSignals.get(member.id)?.attemptId === open.attempt?.id
-            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open)
+            if (!parkedMember && (durableIdle || cachedIdle)) await this.rt.closeOutIdleAttempt(mission, member, open, pass)
             continue
           }
           const all = view.tasks
           const ready = all.filter(t => view.ready(t, member)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt)
-          // R12-F9, dispatch-time half: a task whose own text assumes prior work
-          // is already in the worktree while no content-carrying edge provides it
-          // would be prepared from the bare mission baseline and surprise the
-          // member at submit (T3b lost a cycle to "Artifact changes path outside
-          // task scope"; INT2 was repaired by hand). The admission-time call site
-          // refuses it at propose()/plan validation; this is the last guard before
-          // preparation.
-          //
-          // S4r-D1: the ineligible task is removed from THIS member's candidate
-          // set before the first candidate is chosen. Skipping the member's whole
-          // iteration here used to starve every later ready task on that member
-          // forever — the admission guard and the dispatch sweep co-firing into a
-          // trap, exactly the pair class this round is about. One escalation per
-          // ineligible task, and the sweep still dispatches the next ready task.
-          // A review's source is prepared into the worktree like a dependency
-          // (`prepareTask` receives it as the review source), so it is a
-          // content-carrying edge too.
-          const ineligible: Array<{ task: Task; detail: string }> = []
-          const candidates = ready.filter(candidate => {
-            const carryingEdges = [...candidate.dependencies, ...(candidate.reviewOf === undefined ? [] : [candidate.reviewOf])]
-            const assumptions = dependencyAssumptions({ objective: candidate.objective, acceptance: candidate.acceptance, dependencies: carryingEdges, replaces: candidate.replaces }, `task ${JSON.stringify(candidate.id)}`)
-            if (!assumptions.length) return true
-            ineligible.push({ task: candidate, detail: assumptions.map(item => `${item.location}: ${item.message}`).join(' ') })
-            return false
-          })
-          for (const refused of ineligible) this.escalateGuardTerminal(missionId, 'admission', { taskId: refused.task.id, detail: refused.detail })
-          const task = candidates[0]
+          // R12-F9 (a task whose text assumes prior work no content-carrying edge
+          // provides) is refused where a dependency set is written: plan
+          // validation, propose() and the owner's `changes.dependencies`
+          // amendment. Dispatch takes the first ready task as admitted.
+          const task = ready[0]
           if (!task) continue
           try {
             // Revocation fencing: a mission whose human authorization was withdrawn
             // is blocked here, before any adapter prepares a workspace or checkout.
-            await this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId))
-            await this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined)
+            this.rt.assertAdmission(task, member)
+            await awaited(pass, this.rt.assertWorkspaceAuthorized(this.rt.mission(missionId), pass), this.rt.now)
+            // The adapter reports a recovery fallback from inside this call
+            // (`SwarmRuntime.onRecoveryFallback`), which stamps the body that
+            // marked the member it prepares before it commits the report.
+            if (pass !== undefined) pass.preparing = member.id
+            try { await awaited(pass, this.rt.workers.prepareTask(member, { ...task, epoch: task.epoch + 1 }, this.rt.effectiveDependencies(missionId, task), task.reviewOf ? this.rt.task(missionId, task.reviewOf) : undefined), this.rt.now) }
+            finally { if (pass !== undefined) delete pass.preparing }
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            if (this.passReleased(pass)) return false
             const fresh = this.rt.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
+            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
+              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
             // S7: re-read the isolation invariant after the external preparation
             // await. A state change during it (a member added into this worktree, a
             // second running task admitted) is refused here, never dispatched.
@@ -320,31 +347,28 @@ export class Scheduling {
               return false
             }
             const fresh = this.rt.task(missionId, task.id)
-            if (fresh.epoch !== task.epoch || !this.ready(fresh, member)) continue
-            // W18: a workspace or worker preparation failure is recoverable, not
-            // terminal. Mirror the attempt-failure, close-out and lease-expiry
-            // policy: spend exactly one recovery credit per failure, re-pend while
-            // the limit is not exhausted, and block only once it is.
-            const reason = `Workspace or worker preparation failed: ${String(error)}`
-            fresh.recoveryCount = (fresh.recoveryCount ?? 0) + 1
-            fresh.output = reason
+            if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
+              || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
+            // Retry only identified transient host failures, with durable bounded
+            // backoff. Repeating unchanged deterministic work is not recovery.
+            const reason = `Workspace or worker preparation failed: ${String(error).slice(0, Math.max(0, this.rt.config.maxMessageChars - 650))}`
+            const code = error instanceof Error && 'code' in error ? String(error.code) : ''
+            const transient = ['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ETIMEDOUT'].includes(code)
+              || (error instanceof Error && error.name === 'ProcessTimeoutError')
+            const attempts = (fresh.preparationFailure?.attempts ?? 0) + 1
+            const limit = Math.max(1, Math.min(3, fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember))
+            const retry = transient && attempts < limit
+            fresh.preparationFailure = { reason, transient, attempts,
+              ...(retry ? { retryAt: this.rt.now() + Math.min(30_000, 1000 * 2 ** (attempts - 1)) } : {}) }
+            fresh.output = `${reason}\n${retry ? 'The host will retry after bounded backoff.' : `Work remains preserved. Correct the reported condition, then resume this same task with swarm_control(action: "resume", taskId: "${fresh.id}", reason: "condition repaired").`}`
             fresh.epoch++
-            const limit = fresh.maxRecoveryAttempts ?? this.rt.config.maxTasksPerMember
-            const exhausted = fresh.recoveryCount >= limit
-            fresh.status = exhausted ? 'blocked' : 'pending'
+            fresh.status = retry ? 'pending' : 'blocked'
             this.rt.commit(missionId, () => {
               this.rt.store.put('tasks', fresh)
-              this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, recoveryCount: fresh.recoveryCount, maxRecoveryAttempts: limit, status: fresh.status })
-              if (!exhausted) return false
-              this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason })
-            })
-            // Round 14: this is the terminal element of the dispatch-precondition
-            // chain. The task cannot be prepared again (its recovery limit is
-            // spent), so no earlier element of the chain can yield an action; the
-            // escalation is unconditional and names the executable exits instead
-            // of leaving the owner a bare reason string.
-            if (exhausted) this.escalateGuardTerminal(missionId, 'dispatch_preconditions', {
-              taskId: fresh.id, detail: `its recovery limit of ${limit} is exhausted after preparation failures: ${reason}`,
+              this.rt.store.event(missionId, 'task/preparation-failed', 'runtime', { taskId: fresh.id, epoch: fresh.epoch, reason, ...fresh.preparationFailure, status: fresh.status })
+              if (retry) return
+              this.rt.store.event(missionId, 'task/blocked', 'runtime', { taskId: fresh.id, reason: fresh.output })
+              this.rt.notify(missionId, fresh.output!, this.rt.interpretation(missionId).subjectsOf([fresh]), { from: 'runtime' })
             })
           }
           } catch (error) {
@@ -388,31 +412,35 @@ export class Scheduling {
    * - no eligible member exists at all (nothing is ready for a member; the board
    *   is someone else's witness, not this notice's).
    *
-   * Otherwise the returned notice is one of exactly two honest answers:
+   * Otherwise the notice names a handle holder, a current prerequisite failure,
+   * or an unexplained dispatch gap. An idle handle alone proves no budget refusal.
    * - `handle-busy`: every member eligible for the task is working by the
    *   adapter's contract. The named holder is the task's assignee when the task
    *   is pinned, else the first eligible member whose handle is busy;
-   * - admission: at least one eligible member is startable, so the dispatcher
-   *   could have dispatched and did not — the refusal came from admission limits,
-   *   budget or a task ceiling.
    */
   dispatchQuestion(missionId: string, tasks: Task[], members: Member[], dispatchable: Task[]): DispatchQuestion | undefined {
     for (const task of dispatchable) {
       // An open attempt is not a dispatch candidate: the close-out path nudges it
       // (W6) or the lease path recovers it, and a second owner wake would be noise.
       if (task.attempt !== undefined) continue
-      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && this.ready(task, member, tasks))
+      const eligible = members.filter(member => memberPhaseOf(member) !== 'stopped' && !pendingStopOwner(tasks, member.id) && this.ready(task, member, tasks))
       if (!eligible.length) continue
       const subjects = [taskSubject(task)]
       const dedupKey = `dispatch-question:${missionId}:${task.id}@${task.epoch}`
       if (eligible.some(member => this.startBlocker(member) === undefined)) {
+        const issues = isolationIssues(members, tasks, (left, right) => this.rt.scopesOverlap(left, right))
+        const startable = eligible.filter(member => this.startBlocker(member) === undefined)
+        const isolated = startable.filter(member => !issues.some(issue => issue.memberIds.includes(member.id)))
+        const detail = isolated.length === 0
+          ? `Workspace isolation prevents dispatch: ${issues.filter(issue => startable.some(member => issue.memberIds.includes(member.id))).map(issue => issue.message).join(' ')} Inspect the named members and repair their isolated workspaces before retrying.`
+          : 'An idle handle alone does not identify the dispatch blocker. Inspect the task and recorded admission/preparation diagnostics with swarm_observe; repair the reported cause or withdraw the task with swarm_cancel.'
         return { task, subjects, dedupKey,
-          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for an eligible member the dispatcher could start but was not dispatched this tick, and no member handle is holding it: the dispatch was refused by mission admission limits or budget. Free a slot, raise a limit with swarm_budget, or withdraw the blocking work with swarm_cancel.` }
+          message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) has an eligible idle member but was not dispatched this tick. ${detail}` }
       }
       const pinned = task.assigneeId === undefined ? undefined : eligible.find(member => member.id === task.assigneeId)
       const holder = pinned ?? eligible[0]!
       return { task, holder, subjects, dedupKey,
-        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), re-propose the task with a different assigneeId, or withdraw it with swarm_cancel.` }
+        message: `Task ${task.id} (${task.title}, epoch ${task.epoch}) is ready for member ${holder.name} (${holder.id})${pinned === undefined ? ', one of its eligible members,' : ', the member it is assigned to,'} whose worker handle still holds an unfinished turn, so the dispatcher cannot start it: no admission limit and no budget refusal was recorded for this board. The task is not undispatched for lack of an eligible member. Wait for that turn to end (the close-out path re-pends or completes it), amend this task's assigneeId with swarm_control(taskId: "${task.id}", action: "amend", changes: { assigneeId: "member id" }, reason: "reassign"), or withdraw it with swarm_cancel.` }
     }
     return undefined
   }
@@ -436,73 +464,30 @@ export class Scheduling {
     return emitGuardTerminal(this.rt, missionId, chain, context)
   }
 
-  /**
-   * The durable board as the guard-chain model sees it: the production view the
-   * terminal classification and the property test share. Every field is derived
-   * from a durable row (or a durable event), never from an in-memory gate.
-   */
-  guardBoard(missionId: string, mission?: Mission): GuardBoard {
-    const row = mission ?? this.rt.store.get('missions', missionId)
-    const tasks = this.rt.store.list('tasks', missionId)
-    const now = Date.now()
-    const revoked = this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')
-    return {
-      mission: {
-        status: row?.status ?? 'active',
-        workspace: revoked ? 'revoked' : 'authorized',
-        ...(row?.budgetPause === undefined ? {} : { budgetPaused: true }),
-      },
-      tasks: tasks.map(task => {
-        const exhaustion = taskCeilingExhaustion(task)
-        const source = task.reviewOf === undefined ? undefined : this.rt.task(missionId, task.reviewOf)
-        const reviewSourceLive = task.reviewOf === undefined
-          ? (task.status === 'submitted' ? this.reviewable(task, tasks) : undefined)
-          // A review whose named source is missing can never be dispatched: the
-          // scheduler's `capable` reads the source row, so a dangling review is
-          // reported as no live source rather than omitted.
-          : source !== undefined && source.status === 'submitted'
-        return {
-          id: task.id, status: task.status,
-          ...(task.attempt === undefined ? {} : { attempt: { leaseLive: task.attempt.leaseUntil >= now } }),
-          ...(exhaustion === undefined ? {} : { ceilingExhausted: true }),
-          dependenciesSatisfied: task.dependencies.every(dependency => this.rt.dependencySatisfied(missionId, dependency, tasks)),
-          dependenciesDead: task.dependencies.some(dependency => this.rt.effectiveDependency(missionId, dependency, tasks).status === 'cancelled'),
-          ...(task.reviewOf === undefined ? {} : { reviewOf: task.reviewOf }),
-          // S4r-D4: `reviewSourceLive` is the SAME predicate the scheduler uses,
-          // for every task the model reports progress on. A review task is live
-          // exactly while its source is submitted (`capable`); a submitted source
-          // is live exactly while `reviewable` finds a live independent review.
-          // Reporting a source as progress without consulting that predicate made
-          // the review_admission terminal unable to classify its canonical case.
-          ...(reviewSourceLive === undefined ? {} : { reviewSourceLive }),
-          ...(source === undefined ? {} : { authorMemberIds: [...this.rt.authorIds(source)] }),
-          preparationExhausted: task.status === 'blocked' && typeof task.output === 'string' && task.output.startsWith('Workspace or worker preparation failed'),
-          ...(task.dependencies.length === 0 && task.reviewOf === undefined
-            && dependencyAssumptions({ objective: task.objective, acceptance: task.acceptance, dependencies: task.dependencies, replaces: task.replaces }, `task ${JSON.stringify(task.id)}`).length > 0
-            ? { assumedContent: true } : {}),
-        }
-      }),
-      // R17-G6/G7: the member half of the guard board is READ from the runtime's
-      // derived member board — the registered host projection's current state
-      // when this process published one, otherwise the same single derivation —
-      // so the model-facing guard model is an instance of the projection being
-      // read, not a second interpretation of the rows. The stored mirror and its
-      // upgrade-only rule are gone: there is no row to fall behind the attempt,
-      // and no write here can churn F(S). Co-firing guards, named: the W6 idle
-      // close-out (which owns the attempt until it fences it), the parked-member
-      // hatch (`parked` wins over work in flight and keeps the member
-      // dispatchable), the dispatch decision (which asks `startBlocker` about the
-      // handle, never this status) and the coverage/stall notices, whose F(S) key
-      // no status write can move any more. A dead lease stays the guard model's
-      // own classification (`guardTerminalChain` reads the task rows and returns
-      // `attempt_lease`), so this status never has to encode lease liveness.
-      members: this.rt.memberBoard(missionId).map(member => ({ id: member.id, status: member.status })),
-    }
+  ready(task: Task, member: Member, tasks?: Task[]): boolean {
+    return this.readinessBlocker(task, member, tasks) === undefined
   }
 
-  ready(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (task.status !== 'pending' || (task.assigneeId && task.assigneeId !== member.id)) return false
-    return this.capable(task, member, tasks)
+  /** The same readiness decision supplies a concrete refusal without another policy model. */
+  readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
+    if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
+    if ((task.preparationFailure?.retryAt ?? 0) > this.rt.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
+    if (task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
+    if (task.assigneeId !== undefined && !canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
+    const all = tasks ?? this.rt.store.list('tasks', task.missionId)
+    if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is the assignee of review ${strandedReview(all, task.id, { assigneeId: member.id })?.id} of this task, so owning this task would make it that review's author; another member can take it, or the owner can amend that review's assigneeId with swarm_control`
+    const incapable = this.capabilityBlocker(task, member, all)
+    if (incapable !== undefined || task.assigneeId === undefined) return incapable
+    // Keep useful context on the preferred member when it can take this work
+    // now. A busy, stopping, retired or non-independent preference cannot reserve
+    // an untouched task while another member is idle. This adds no reservation.
+    const preferred = this.rt.store.get('members', task.assigneeId)
+    const availableForBorrowing = preferred === undefined || memberPhaseOf(preferred) === 'stopped'
+      || all.some(candidate => candidate.status === 'running' && candidate.attempt?.ownerId === preferred.id)
+      || pendingStopOwner(all, preferred.id)
+      || this.startBlocker(preferred) !== undefined
+      || !this.capable(task, preferred, all)
+    return availableForBorrowing ? undefined : `preferred member ${task.assigneeId} is available for this task; the owner can amend assigneeId to change the preference`
   }
 
   /**
@@ -514,19 +499,30 @@ export class Scheduling {
    * never assign a verification to the author of the source it reviews.
    */
   capable(task: Task, member: Member, tasks?: Task[]): boolean {
-    if (!task.dependencies.every(dep => this.rt.dependencySatisfied(task.missionId, dep, tasks))) return false
+    return this.capabilityBlocker(task, member, tasks) === undefined
+  }
+
+  private capabilityBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
+    const waiting = task.dependencies.find(dep => !this.rt.dependencySatisfied(task.missionId, dep, tasks))
+    if (waiting !== undefined) {
+      const effective = this.rt.effectiveDependency(task.missionId, waiting, tasks)
+      return `dependency ${waiting}${effective.id === waiting ? '' : ` (effective replacement ${effective.id})`} is ${effective.status}, not accepted; inspect it or amend the dependency plan`
+    }
     if (task.reviewOf) {
       const source = this.rt.task(task.missionId, task.reviewOf)
-      if (source.status !== 'submitted' || this.rt.authorIds(source).has(member.id)) return false
+      if (source.status !== 'submitted') return `review source ${source.id} is ${source.status}; review begins only after its artifact is submitted`
+      if (!canOwnReview(source, member.id)) return `member ${member.id} authored review source ${source.id}; assign an independent reviewer`
     }
-    return true
+    return undefined
   }
 
   /**
-   * Tasks that can never be dispatched again: pending work whose dependency
-   * lineage or review source is dead, reviews assigned to their own author, and
-   * blocked work. They contribute nothing further; completion may cancel them
-   * once every acceptance criterion is independently covered.
+   * Tasks that cannot be dispatched under the current plan: pending work whose dependency
+   * lineage or review source is dead, reviews assigned to their own author,
+   * pending work no live member may take (`assignmentAllows`: a source only its
+   * own bound reviewer is left to take included), and blocked work. This is a
+   * diagnostic for owner repair, not permission to
+   * cancel obligations or mark the mission complete.
    */
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
     const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
@@ -544,9 +540,9 @@ export class Scheduling {
           || (task.reviewOf !== undefined && (() => {
             const source = this.rt.task(mission.id, task.reviewOf)
             return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
-              || (task.assigneeId !== undefined && this.rt.authorIds(source).has(task.assigneeId))
+              || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
           })())
-          || (task.assigneeId !== undefined && !live.some(member => member.id === task.assigneeId))
+          || !live.some(member => assignmentAllows(task, member.id, tasks))
         if (stuck) { dead.add(task.id); changed = true }
       }
     }
@@ -554,16 +550,16 @@ export class Scheduling {
   }
 
   /**
-   * A submitted task is progress only while a live review can still accept it.
-   * A review that was never admitted or was retired leaves the submission
-   * unreviewable forever; counting it as progress hid a stalled board from the
-   * owner (Round-8 F1). Pending and running reviews are live, and a parked
-   * review (blocked with a matching stop marker) re-pends after the stop
-   * acknowledgement, so it still counts.
+   * A submitted task is progress only while a live review can still accept it,
+   * under the one live-review rule (`liveReviewFor`). A review that was never
+   * admitted or was retired leaves the submission unreviewable forever;
+   * counting it as progress hid a stalled board from the owner (Round-8 F1).
+   * So does a review no live member may own: counting it silenced the owner's
+   * review-blocked decision. A parked review (blocked with a matching stop
+   * marker) re-pends after the stop acknowledgement, so it still counts.
    */
-  reviewable(task: Task, tasks: Task[]): boolean {
-    return tasks.some(review => review.kind === 'verification' && review.reviewOf === task.id
-      && (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)))
+  reviewable(task: Task, tasks: Task[], members: Member[] = this.rt.store.list('members', task.missionId)): boolean {
+    return liveReviewFor(tasks, task, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
   }
 
   /**
@@ -575,13 +571,9 @@ export class Scheduling {
    */
   unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
     const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
     return unreviewed.every(task => {
-      for (let index = events.length - 1; index >= 0; index--) {
-        const event = events[index]!
-        if (event.type !== 'task/submitted' || (event.data as { taskId?: string } | undefined)?.taskId !== task.id) continue
-        return Date.now() - event.createdAt >= grace
-      }
+      const event = this.rt.store.latestTaskEvent(missionId, task.id, 'task/submitted')
+      if (event !== undefined) return this.rt.now() - event.createdAt >= grace
       // No durable submission record: the grace cannot have elapsed yet.
       return false
     })
@@ -592,7 +584,7 @@ export class Scheduling {
     // An empty board is a mission the owner has not planned yet, not a stall.
     if (!tasks.length) return false
     if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks))
+    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members))
     if (unreviewed.length) {
       if (!this.unreviewedStall(mission.id, unreviewed)) return false
     }
@@ -605,84 +597,59 @@ export class Scheduling {
    * old worker handle acknowledges the stop, then it re-pends. Every scheduler
    * and completion decision treats it as live work.
    */
-  quiescencePending(task: Task): boolean { return task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch }
+  quiescencePending(task: Task): boolean { return task.status === 'blocked' && stopPending(task) }
 
   /** The runtime's unique deliverable among accepted artifacts; throws when none is unique. */
-  selectDeliveryTarget(missionId: string, tasks: Task[]): Task {
-    const implementations = tasks.filter(task => task.kind === 'implementation' && task.status === 'accepted')
-    // A dependency reference to a replaced original also covers its accepted repair.
-    const covers = (task: Task, sourceId: string, seen = new Set<string>()): boolean => {
-      if (seen.has(task.id)) return false
-      seen.add(task.id)
-      return task.dependencies.some(id => {
-        const identities = this.rt.dependencyIdentities(missionId, id, tasks)
-        return identities.has(sourceId) || tasks.some(parent => identities.has(parent.id) && covers(parent, sourceId, seen))
-      })
-    }
-    if (!tasks.some(task => task.kind === 'integration')) {
-      // A single reviewed implementation is the deliverable when the plan needed no assembly step.
-      if (implementations.length === 1 && implementations[0]!.artifact) return implementations[0]!
-      throw new Error('A unique independently accepted implementation artifact is required when the plan has no integration task')
-    }
-    const candidates = tasks.filter(task => task.kind === 'integration' && task.status === 'accepted' && task.artifact && implementations.every(source => covers(task, source.id)))
-    // A later integration may subsume an earlier one; never guess among independent final artifacts.
-    const finals = candidates.filter(candidate => !candidates.some(other => other.id !== candidate.id && covers(other, candidate.id)))
-    if (finals.length !== 1) throw new Error('A unique accepted integration of all implementation results is required')
-    return finals[0]!
+  selectDeliveryTarget(_missionId: string, tasks: Task[]): Task {
+    return selectAcceptedDelivery(tasks)
   }
 
   /** One completion policy is shared by manual controls and automatic requests. */
   deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } {
     actor.signal?.throwIfAborted()
-    if (this.rt.shuttingDown) throw new Error('Swarm runtime is shutting down')
+    if (this.rt.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     const mission = this.rt.mission(missionId)
-    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new Error('Only the mission owner can access deliverables')
-    if (mission.status !== 'completed') throw new Error('Complete independent acceptance before applying results')
-    if (!mission.baseline) throw new Error('This historical mission has no saved delivery baseline; inspect its retained artifact')
+    if (mission.ownerSessionId !== actor.sessionId || this.rt.isWorkerSession(actor.sessionId)) throw new PolicyError('delivery_owner_required', 'authorization_error', 'Only the mission owner can access deliverables')
+    if (mission.status !== 'completed') throw new PolicyError('delivery_acceptance_required', 'tool_error', 'Complete independent acceptance before applying results')
+    if (!mission.baseline) throw new PolicyError('delivery_baseline_missing', 'tool_error', 'This historical mission has no saved delivery baseline; inspect its retained artifact')
     return { mission, task: this.selectDeliveryTarget(missionId, this.rt.store.list('tasks', missionId)) }
   }
 
-  /** One durable pass row per mission; the row is the guard, never an in-memory Set. */
+  /** The mission's stable pass name, carried by the stall event (`passId`) and the owner notice. */
   passKey(missionId: string): string { return `pass_${missionId}` }
 
   /**
-   * The pass that may still hold the guard. Re-read from the store on every
-   * call: a `running` row older than the declared bound is NOT a guard, so a
-   * pass that never returns cannot swallow the tick timer's liveness action.
+   * The pass that still owns the dispatcher's decisions: the body queued or
+   * running for the mission, inside its declared bound and not yet named wedged.
    *
    * While the mission has live work (a renewed lease, an in-flight quiescence)
-   * the row keeps gating inside the second, bounded window (`stallPassReleaseBoundMs`
-   * = `stallPassTimeoutMs` + `stallPassLiveGraceMs`): the pass may legitimately
-   * be inside a long adapter await for that live attempt. R16-D closes the half
-   * round 15 left open: past that window the row is not a guard at all, so a
-   * `kick` is never swallowed indefinitely by a healthy sibling's lease. The
-   * watchdog records and names the release; `openPass` records it durably too
-   * when a fresh pass supersedes a still-running wedged row, so the fence
-   * (`passReleased`) is closed on both paths.
+   * the body stays live inside the second, bounded window
+   * (`stallPassReleaseBoundMs` = `stallPassTimeoutMs` + `stallPassLiveGraceMs`):
+   * it may legitimately be inside a long adapter await for that live attempt.
+   * R16-D: past that window it is not live however long a healthy sibling's
+   * lease lives, and the watchdog names it. `kick` does not read this: it skips
+   * while any body is queued or running, because the serial queue could not run
+   * a second one anyway.
    */
   livePass(missionId: string): SchedulingPass | undefined {
-    const row = this.rt.store.get('passes', this.passKey(missionId))
-    if (row === undefined || row.missionId !== missionId) return undefined
-    if (row.instanceId !== this.instanceId) return undefined
-    if (row.status !== 'running') return undefined
-    const age = Date.now() - row.startedAt
-    if (age < this.rt.stallPassTimeoutMs) return row
-    // Past the declared pass bound the row is a guard only while the mission has
-    // live work to progress AND the bounded live-work hold has not elapsed. With
-    // no live work it is not a guard at all, so the tick timer's kick is never
-    // swallowed; the watchdog releases and escalates it.
-    if (age < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return row
+    const pass = this.passes.get(missionId)
+    if (pass === undefined || pass.escalatedAt !== undefined) return undefined
+    const now = this.rt.now()
+    if (!this.pastBound(pass, now)) return pass
+    // Past the declared pass bound the body is live only while the mission has
+    // live work to progress AND the bounded live-work hold has not elapsed.
+    if (now - pass.startedAt < this.rt.stallPassReleaseBoundMs && this.hasLiveWork(missionId)) return pass
     return undefined
   }
 
   /**
    * The subjects whose live work keeps `hasLiveWork` true: a running attempt
-   * under a live lease, or a task in its durable stop transition. The release
-   * names them so the owner can see what held the guard and that the release
-   * preserved it (it cancels no task, drops no attempt and changes no lease).
+   * under a live lease, or a task in its durable stop transition. The wedge
+   * notice names them so the owner can see what held it, and that it preserved
+   * them (it cancels no task, drops no attempt and changes no lease).
    */
   liveWorkHolders(missionId: string): Array<{ subject: string; memberId?: string }> {
-    const now = Date.now()
+    const now = this.rt.now()
     const holders: Array<{ subject: string; memberId?: string }> = []
     for (const task of this.rt.store.list('tasks', missionId)) {
       const live = this.quiescencePending(task) || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now)
@@ -694,211 +661,190 @@ export class Scheduling {
   }
 
   /**
-   * R15-D1/D2: a pass body that is still `running` past its declared bound, from
-   * THIS instance. `livePass` deliberately keeps such a row as a guard while the
-   * mission has live work (a sibling lease, an in-flight stop acknowledgement),
-   * so the watchdog does not abandon a pass that may legitimately be inside a long
-   * adapter await. That gate must not silence another subject's clock: the
-   * queue-external decision sweep reads this predicate and names the subjects the
-   * wedged pass cannot finish, even while a healthy sibling holds its lease.
+   * R15-D1/D2: a pass body that is still queued or running past its declared
+   * bound. `livePass` deliberately keeps such a body live while the mission has
+   * live work (a sibling lease, an in-flight stop acknowledgement), so the
+   * watchdog does not name a pass that may legitimately be inside a long adapter
+   * await. That hold must not silence another subject's clock: the notices
+   * publish with the wedged branch while this is true, and the attempt-silence
+   * escalation says the pass is wedged.
    *
-   * Co-firing guards: `livePass` (still the scheduling gate inside the bounded
-   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which
-   * releases inside the declared bound or the bounded live-work window), the
-   * off-pass decision sweep (the only caller) and `hasLiveWork`. R16-D: the
-   * bounded release does not weaken this predicate — it is still true for every
-   * `running` row past the first bound, so the off-pass sweep keeps naming the
-   * subjects the wedged pass cannot finish.
+   * Co-firing guards: `livePass` (still the generation owner inside the bounded
+   * live-work window), the wedge watchdog (`checkSchedulingPasses`, which names
+   * the body inside the declared bound or the bounded live-work window), the
+   * notice publication (`SwarmRuntime.passState`) and `hasLiveWork`. It stays
+   * true from the first bound until the body settles, named or not.
    */
   passWedged(missionId: string): boolean {
-    const row = this.rt.store.get('passes', this.passKey(missionId))
-    if (row === undefined || row.missionId !== missionId) return false
-    if (row.instanceId !== this.instanceId || row.status !== 'running') return false
-    return Date.now() - row.startedAt > this.rt.stallPassTimeoutMs
+    const pass = this.passes.get(missionId)
+    return pass !== undefined && this.pastBound(pass)
   }
 
-  /** Open a pass and record it durably before any scheduling work starts. */
+  /**
+   * The one bound predicate: a body is past its bound once it has held the
+   * mission for a whole `stallPassTimeoutMs`. The watchdog names it by this
+   * (`checkSchedulingPasses`), the notices publish it wedged by this
+   * (`passWedged`, `livePass`, `passState`) and the sweep stops it early by
+   * this, so no instant exists at which one of them already acts on the bound
+   * and another does not yet.
+   */
+  pastBound(pass: SchedulingPass, now = this.rt.now()): boolean {
+    return now - pass.startedAt >= this.rt.stallPassTimeoutMs
+  }
+
+  /**
+   * R17-G5: the pass state a committed transition publishes with
+   * (`SwarmRuntime.passState`, read by the notice publication). A body past its
+   * bound that has itself made progress within the last bound (`progressAt`:
+   * one of its own awaits returned, or it reached a member boundary) is not
+   * sitting in the wedged await: it is running and reaches its own dispatch
+   * question when it settles (or hands the unswept members to the next body),
+   * so the transition publishes as inside a live pass. The wedged branch would
+   * instead ask "was not dispatched this tick" about work the same sweep is
+   * about to dispatch. Otherwise the body is live inside its bound (`livePass`)
+   * and wedged past it (`passWedged`), as before; a body without progress for a
+   * whole bound is wedged again, whatever a worker turn it woke commits.
+   */
+  passState(missionId: string): { passLive: boolean; wedged: boolean } {
+    const pass = this.passes.get(missionId)
+    const bound = this.rt.stallPassTimeoutMs
+    if (pass?.progressAt !== undefined && this.pastBound(pass, pass.progressAt) && this.rt.now() - pass.progressAt <= bound) return { passLive: true, wedged: false }
+    return { passLive: this.livePass(missionId) !== undefined, wedged: this.passWedged(missionId) }
+  }
+
+  /**
+   * Record the scheduling body `kick` is about to queue, or return undefined
+   * when one is already queued or running for the mission: the serial queue
+   * could not start a second body before that one settles.
+   */
   openPass(missionId: string): SchedulingPass | undefined {
     if (this.rt.closed || this.rt.shuttingDown) return undefined
     if (this.rt.store.get('missions', missionId) === undefined) return undefined
-    if (this.livePass(missionId) !== undefined) return undefined
-    const prior = this.rt.store.get('passes', this.passKey(missionId))
-    // R16-D: a still-running predecessor is past every bound (else `livePass`
-    // above would have returned it), so opening this pass SUPERSEDES and
-    // RELEASES it. The slow path (the tick watchdog) normally gets there first;
-    // when it does not — a `kick` from a control path between ticks — the
-    // release must still be durable, fenced and named instead of being silently
-    // overwritten by the row write below.
-    if (prior !== undefined && prior.status === 'running' && prior.instanceId === this.instanceId) {
-      const held = this.hasLiveWork(missionId)
-      this.recordRelease(missionId, prior, releasedPassFields(prior), held, held ? this.liveWorkHolders(missionId) : [])
-    }
-    // Re-read: a supersede released the row above, and the durable release facts
-    // must travel onto this row (the once-per-pass overwrite erases them
-    // otherwise).
-    const carried = this.rt.store.get('passes', this.passKey(missionId))
-    const release = carried === undefined ? undefined : releasedPassFields(carried)
-    const pass: SchedulingPass & ReleasedPassFields = {
-      // One row per mission, overwritten each pass: `get(passKey)` is the gate.
-      id: this.passKey(missionId), runId: id('run'), instanceId: this.instanceId, missionId, status: 'running', startedAt: Date.now(),
+    if (this.passes.has(missionId)) return undefined
+    const pass: SchedulingPass = {
+      id: this.passKey(missionId), operationId: id('operation'), missionId, startedAt: this.rt.now(),
       revisionBefore: this.rt.store.revision(), fingerprintBefore: this.rt.fingerprint(missionId),
-      noProgressPasses: carried?.status === 'finished' ? carried.noProgressPasses : 0,
+      noProgressPasses: this.noProgress.get(missionId) ?? 0,
     }
-    // S5c: the durable release record survives the once-per-pass overwrite.
-    if (release?.releasedRunId !== undefined) {
-      pass.releasedRunId = release.releasedRunId
-      pass.releasedAt = release.releasedAt
-    }
-    if (release?.releases !== undefined) pass.releases = release.releases
-    if (release?.worstRelease !== undefined) pass.worstRelease = release.worstRelease
-    this.rt.commit(missionId, () => this.rt.store.put('passes', pass))
+    this.passes.set(missionId, pass)
     return pass
   }
 
   /**
-   * R16-D: release a wedged pass durably and name it. One path for both
-   * generators — the tick watchdog and a superseding `openPass` — so a release
-   * can never happen without the durable `releasedRunId` fence, the accumulated
-   * `releases`/`worstRelease` record and the owner escalation that names the
-   * wedged pass and the live work the release preserved.
+   * R16-D: name a body past its bound. One path, from the tick watchdog: the
+   * durable stall event, the owner notice that names the body and the live
+   * work that held it, and the wedged mark the notices publish with.
    *
-   * The in-memory chain entry is dropped as well: the abandoned body is fenced
-   * by `passReleased`, and a later `kick` must not queue behind a promise that
-   * never settles.
+   * The body counts as named only once that event and notice have committed
+   * for an active mission (`escalatedAt` is set after the commit, never
+   * before). A naming that did not commit (a busy writer on that tick) or was
+   * skipped (the mission paused, blocked or already carrying this board's wedge
+   * key) leaves the body unnamed, so the next tick retries; the durable
+   * `schedulingWedgeNotice` key makes every retry idempotent, and `closePass`
+   * clears it when a named body whose naming reached the owner settles, so the
+   * next body that wedges on the same board is named as well. A naming whose
+   * notice the dedup suppressed (the same subjects at the same epochs, as when
+   * a provider outage keeps a member's every start failing without spending
+   * its start-failure count) keeps the key, so the bodies after it that wedge
+   * on that board are not named again.
+   *
+   * This revokes nothing: the operation queue keeps the body as the physical
+   * owner until it actually returns, and a later kick is skipped until then.
+   * The independent watchdog and outbox keep reporting the blocker.
    */
-  private recordRelease(missionId: string, pass: SchedulingPass, previous: ReleasedPassFields, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): void {
-    const now = Date.now()
+  private escalateWedge(missionId: string, pass: SchedulingPass, heldByLiveWork: boolean, holders: Array<{ subject: string; memberId?: string }>): boolean {
+    const now = this.rt.now()
+    const fingerprintNow = this.rt.fingerprint(missionId)
+    if (this.rt.store.get('missions', missionId)?.schedulingWedgeNotice === fingerprintNow) return false
     const boundMs = heldByLiveWork ? this.rt.stallPassReleaseBoundMs : this.rt.stallPassTimeoutMs
     const unschedulable = this.unschedulable(this.rt.mission(missionId), this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
-    const fingerprintNow = this.rt.fingerprint(missionId)
-    const release: ReleaseRecord = { runId: pass.runId, startedAt: pass.startedAt, releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), boundMs, heldByLiveWork, liveSubjects: holders.map(holder => holder.subject) }
-    const closed: SchedulingPass & ReleasedPassFields = {
-      ...pass, status: 'finished', finishedAt: now, revisionAfter: this.rt.store.revision(), fingerprintAfter: fingerprintNow,
-      stalled: { reason: 'pass-timeout', at: now, boundMs: this.rt.stallPassTimeoutMs, unschedulable },
-    }
-    // S5c: the release is recorded DURABLY on the row before anything else, so
-    // `passReleased` reads it and the fence survives a cleared Set, a restart,
-    // or the once-per-pass overwrite (openPass carries it forward).
-    closed.releasedRunId = pass.runId
-    closed.releasedAt = now
-    closed.releases = (previous.releases ?? 0) + 1
-    closed.worstRelease = widerRelease(previous.worstRelease, release)
-    // Release both halves of the guard: the durable row stops gating and the
-    // in-memory chain no longer queues later ticks behind a promise that never
-    // settles. A newer pass that has already registered its own chain entry is
-    // never clobbered (its `exclusive` finally compares identity).
-    this.releasedPasses.add(pass.runId)
-    this.rt.queues.delete(missionId)
-    this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
-    this.escalateSchedulingStall(missionId, {
-      pass: closed, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: closed.revisionAfter!, fingerprintNow,
-      releaseBoundMs: boundMs, heldByLiveWork, release, liveHolders: holders,
+    const wedge: WedgeRecord = { releasedAt: now, gapMs: Math.max(0, now - pass.startedAt), liveSubjects: holders.map(holder => holder.subject) }
+    const naming = this.escalateSchedulingStall(missionId, {
+      pass, reason: 'pass-timeout', boundMs: this.rt.stallPassTimeoutMs, revisionNow: this.rt.store.revision(), fingerprintNow,
+      unschedulable, releaseBoundMs: boundMs, heldByLiveWork, wedge, liveHolders: holders,
     })
+    if (naming === undefined) return false
+    pass.escalatedAt = now
+    pass.wedgeNotified = naming.ownerNotified
+    return true
   }
 
   /**
-   * Close a pass: record `(fingerprint-before, fingerprint-after)` and
-   * `(revision-before, revision-after)`, count consecutive passes that advanced
-   * nothing and terminated nothing, and escalate once the declared window of
-   * such passes has been reached. Never throws: pass bookkeeping must not break
-   * scheduling.
+   * Close a pass when its body settles: remove the in-memory record first (so
+   * the next kick may queue a successor), then compare the mission digest with
+   * the one it opened on, count consecutive passes that advanced nothing and
+   * terminated nothing, and escalate once the declared window of such passes
+   * has been reached. Never throws: pass bookkeeping must not break scheduling.
    */
   closePass(missionId: string, pass: SchedulingPass): void {
+    if (this.passes.get(missionId) === pass) this.passes.delete(missionId)
     try {
-      // A graceful shutdown must still release the guard: skipping this write
-      // leaves a `running` row behind that the next runtime would treat as live.
       if (this.rt.closed) return
-      const row = this.rt.store.get('passes', this.passKey(missionId))
-      // Compare the per-run identity, never the stable row key: another pass may
-      // have overwritten the row while this body was in flight.
-      if (row?.runId !== pass.runId) return
+      // R17-G5: the close is a transition. While the pass was live, notices left
+      // its mid-pass commits unpublished for the pass end to publish.
+      this.rt.passSettled(missionId)
       const revisionAfter = this.rt.store.revision()
       const fingerprintAfter = this.rt.fingerprint(missionId)
       const progressed = fingerprintAfter !== pass.fingerprintBefore
       const noProgressPasses = progressed ? 0 : pass.noProgressPasses + 1
-      const closed: SchedulingPass & ReleasedPassFields = { ...pass, status: 'finished', finishedAt: Date.now(), revisionAfter, fingerprintAfter, noProgressPasses }
-      // S5c: never erase a release record the watchdog wrote for this same row.
-      const rowRelease = releasedPassFields(row)
-      if (rowRelease.releasedRunId !== undefined && closed.releasedRunId === undefined) {
-        closed.releasedRunId = rowRelease.releasedRunId
-        closed.releasedAt = rowRelease.releasedAt
-      }
-      // R16-D: the accumulated release facts are the only durable record of a
-      // bounded release (the row is overwritten per pass), so a body that closes
-      // after its release must carry them, never drop them.
-      if (rowRelease.releases !== undefined && closed.releases === undefined) closed.releases = rowRelease.releases
-      if (rowRelease.worstRelease !== undefined && closed.worstRelease === undefined) closed.worstRelease = rowRelease.worstRelease
-      this.rt.commit(missionId, () => this.rt.store.put('passes', closed))
+      this.noProgress.set(missionId, noProgressPasses)
       // Change-and-return: the board left the no-progress class, so a later
       // return to it re-notifies instead of staying silent behind a stale key.
+      // A named body whose naming reached the owner has spent its wedge key
+      // too: the key dedups the retried naming of that one body (`escalatedAt`
+      // keeps one naming per body), so a later body that wedges on this same
+      // board is named once. A naming the notice dedup suppressed told the
+      // owner nothing new, so its key stays and ends the renaming.
       const mission = this.rt.store.get('missions', missionId)
-      if (progressed && mission?.schedulingStallNotice !== undefined) {
-        delete mission.schedulingStallNotice
+      const clearStall = progressed && mission?.schedulingStallNotice !== undefined
+      const clearWedge = (progressed || pass.wedgeNotified === true) && mission?.schedulingWedgeNotice !== undefined
+      if (mission !== undefined && (clearStall || clearWedge)) {
+        if (clearStall) delete mission.schedulingStallNotice
+        if (clearWedge) delete mission.schedulingWedgeNotice
         this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
       }
       if (!progressed && noProgressPasses >= this.rt.stallPasses && this.boardCannotProgress(missionId)) {
-        this.escalateSchedulingStall(missionId, { pass: closed, reason: 'no-progress', boundMs: this.rt.config.tickMs * this.rt.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
+        this.escalateSchedulingStall(missionId, { pass: { ...pass, noProgressPasses }, reason: 'no-progress', boundMs: this.rt.config.tickMs * this.rt.stallPasses, revisionNow: revisionAfter, fingerprintNow: fingerprintAfter })
       }
     } catch { /* A closed store or a concurrent owner transition must not break scheduling. */ }
   }
 
   /**
-   * True while `pass` still owns the mission's guard (used to fence an abandoned
-   * pass body). Only an explicit release after the declared bound stops a body:
-   * a long pass that is still making progress (a live lease, an in-flight
-   * quiescence) keeps running, while an abandoned one must never dispatch into
-   * the newer pass's turn.
-   *
-   * S5c: the DURABLE `releasedRunId` on the pass row is the authority — the
-   * watchdog writes it when it releases, and `openPass` carries it forward
-   * across the once-per-pass overwrite — so clearing the in-memory Set cannot
-   * let a released body resume (the verifier's reproduction). The Set is only
-   * the fast path for the same durable fact.
-   */
-  passReleased(pass: SchedulingPass | undefined): boolean {
-    if (pass === undefined) return false
-    const row = this.rt.store.get('passes', this.passKey(pass.missionId))
-    if (row !== undefined && releasedPassFields(row).releasedRunId === pass.runId) return true
-    return this.releasedPasses.has(pass.runId)
-  }
-
-  /**
    * S1/S2: the wedge detector. Runs from the tick timer, outside every mission
-   * queue and outside the pass it watches. A pass still `running` past the
-   * declared bound is declared stalled: the durable stall event is committed,
-   * the owner notice is delivered by an unqueued flush, and the guard is
-   * released (both the durable row and the in-memory serialization chain) so the
-   * next tick is not swallowed.
+   * queue and outside the pass it watches. A body still queued or running past
+   * the declared bound is named: the durable stall event is committed, the owner
+   * notice is delivered by an unqueued flush, and the mission publishes as
+   * wedged until the body settles. The queue keeps the body as the physical
+   * owner; each await it can be in carries its own bound.
    *
-   * R16-D: the release is bounded even when the mission still has live work. A
-   * live lease or an in-flight quiescence may be progress, so the pass is not
-   * abandoned at the first bound; but a healthy sibling's lease must not own the
-   * whole board's clock forever, so past `stallPassReleaseBoundMs` the pass is
-   * released anyway, with the live work it was held by named on the escalation
-   * and preserved untouched. Co-firing guards, named: `livePass` (mirrors the
-   * same bound, so no `kick` is swallowed after the release), the fence
-   * (`passReleased`, durable before the next pass opens), the off-pass decision
-   * sweep (which runs while the row is wedged and names the subjects no live
-   * path advances), the notice dedup (one escalation per unchanged board) and
-   * the lease-renewal path (a released pass changes no task, attempt or lease).
+   * R16-D: the naming is bounded even when the mission still has live work. A
+   * live lease or an in-flight quiescence may be progress, so the body is not
+   * named at the first bound; but a healthy sibling's lease must not own the
+   * whole board's clock forever, so past `stallPassReleaseBoundMs` it is named
+   * anyway, with the live work it was held by named and preserved untouched.
+   * Co-firing guards, named: `livePass` (mirrors the same bound, so no notice
+   * stays suppressed after the naming), the off-pass decision sweep (which runs
+   * while the body is wedged and names the subjects no live path advances), the
+   * notice dedup (one escalation per body and per unchanged board) and the
+   * lease-renewal path (the naming changes no task, attempt or lease). `now` is
+   * the tick's one instant, read once for every body (`pastBound`).
    */
-  checkSchedulingPasses(): void {
+  checkSchedulingPasses(now = this.rt.now()): void {
     if (this.rt.closed || this.rt.shuttingDown) return
-    const now = Date.now()
-    for (const mission of this.rt.store.list('missions')) {
-      if (this.rt.isMissionTerminal(mission)) continue
-      const pass = this.rt.store.get('passes', this.passKey(mission.id))
-      if (pass === undefined || pass.instanceId !== this.instanceId || pass.status !== 'running') continue
-      const age = now - pass.startedAt
-      if (age < this.rt.stallPassTimeoutMs) continue
-      if (this.rt.store.get('passes', this.passKey(mission.id))?.runId !== pass.runId) continue
-      const held = this.hasLiveWork(mission.id)
-      // Inside the second bound live work keeps the guard: a pass that may
-      // legitimately be inside a long adapter await for that work must not be
-      // abandoned. Past it the window is over, and the release below names the
-      // subject that held it instead of leaving the guard unreleased.
-      if (held && age < this.rt.stallPassReleaseBoundMs) continue
-      this.recordRelease(mission.id, pass, releasedPassFields(pass), held, held ? this.liveWorkHolders(mission.id) : [])
+    for (const [missionId, pass] of this.passes) {
+      if (pass.escalatedAt !== undefined) continue
+      const mission = this.rt.store.get('missions', missionId)
+      // A paused or blocked mission is not named now; the body stays unnamed and
+      // the first tick after the owner resumes it names the body if it is still
+      // held (the resume does not go through the mission queue).
+      if (mission?.status !== 'active') continue
+      if (!this.pastBound(pass, now)) continue
+      const held = this.hasLiveWork(missionId)
+      // Inside the second bound live work keeps the body live: a pass that may
+      // legitimately be inside a long adapter await for that work is not named.
+      // Past it the window is over, and the notice names the subject that held it.
+      if (held && now - pass.startedAt < this.rt.stallPassReleaseBoundMs) continue
+      this.escalateWedge(missionId, pass, held, held ? this.liveWorkHolders(missionId) : [])
     }
   }
 
@@ -911,6 +857,8 @@ export class Scheduling {
    * (`mission.witness`, the board-level stall notice or the coverage notice)
    * suppresses the escalation entirely: that state is already escalated, so a
    * second durable event for it would be duplicate evidence, not new evidence.
+   * Returns undefined when nothing was committed; otherwise whether the owner
+   * notice was recorded, which the event states as `ownerNotified`.
    */
   escalateSchedulingStall(missionId: string, info: {
     pass: SchedulingPass
@@ -918,21 +866,24 @@ export class Scheduling {
     boundMs: number
     revisionNow: number
     fingerprintNow: string
-    /** R16-D: the bound the release was measured against (the live-work window when one applied). */
+    /** What was unschedulable when the wedge was named; computed here when absent. */
+    unschedulable?: string[]
+    /** R16-D: the bound the wedge was measured against (the live-work window when one applied). */
     releaseBoundMs?: number
-    /** R16-D: true when live work held the release to its second bound. */
+    /** R16-D: true when live work held the naming to its second bound. */
     heldByLiveWork?: boolean
-    /** R16-D: the release record written to the pass row, named in the event. */
-    release?: ReleaseRecord
-    /** R16-D: the live work the release preserved, as subjects and members. */
+    /** R16-D: what the watchdog measured when it named the wedge, carried by the event. */
+    wedge?: WedgeRecord
+    /** R16-D: the live work the naming preserved, as subjects and members. */
     liveHolders?: Array<{ subject: string; memberId?: string }>
-  }): void {
+  }): { ownerNotified: boolean } | undefined {
     const mission = this.rt.store.get('missions', missionId)
-    if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return
+    if (mission === undefined || this.rt.isMissionTerminal(mission) || mission.status !== 'active') return undefined
     const fingerprint = info.fingerprintNow
-    if (mission.schedulingStallNotice === fingerprint) return
-    // A pass-timeout wedge is its own subject: the pass body was abandoned and its
-    // guard released. A board-level witness (another notice that announced the
+    const noticeKey = info.reason === 'pass-timeout' ? 'schedulingWedgeNotice' : 'schedulingStallNotice'
+    if (mission[noticeKey] === fingerprint) return undefined
+    // A pass-timeout wedge is its own subject: the pass body is past its bound
+    // and the dispatch question it owes is unasked. A board-level witness (another notice that announced the
     // same fingerprint) must not suppress it — that cross-subject conflation is
     // exactly what round 15 removes, and fault F21 requires the wedge to be named
     // inside the declared bound whether or not the board was already announced.
@@ -941,8 +892,8 @@ export class Scheduling {
     const witnessed = info.reason === 'pass-timeout'
       ? false
       : mission.stallNotice === fingerprint || mission.coverageNotice === fingerprint || mission.witness?.fingerprint === fingerprint
-    if (witnessed) return
-    const unschedulable = info.pass.stalled?.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
+    if (witnessed) return undefined
+    const unschedulable = info.unschedulable ?? this.unschedulable(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId)).map(task => `${task.id} (${task.status})`)
     // R15-A1/A2: a wedged or no-progress pass names the work it never reached, so
     // the notice carries subjects even though `unschedulable` is legitimately
     // empty (nothing is unschedulable: the pass simply never ran to a decision).
@@ -950,10 +901,10 @@ export class Scheduling {
     // one board, and each keeps its own subject and dedup key; the mission root is
     // the fallback only when the board has no non-terminal task left.
     const unreached = this.rt.store.list('tasks', missionId).filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-    // R16-D: a release held to its second bound names the live work that held it
+    // R16-D: a naming held to its second bound names the live work that held it
     // as a subject too. The claim is still "this pass cannot finish", but the
     // owner must be able to see which subjects made the wait unavoidable, and
-    // that the release preserved them (it cancels no task, drops no attempt and
+    // that the naming preserved them (it cancels no task, drops no attempt and
     // changes no lease). Guard pair: this naming x the off-pass sweep — the sweep
     // names what no live path advances, this names what the wedged pass never
     // reached and what held it; both carry task@epoch and neither consumes the
@@ -961,70 +912,93 @@ export class Scheduling {
     const holders = info.liveHolders ?? []
     const subjects = [...new Set([...subjectsOfTasks(unreached, mission), ...holders.map(holder => holder.subject)])]
     const heldText = info.heldByLiveWork === true && holders.length
-      ? ` The release was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
+      ? ` The naming was held to its ${info.releaseBoundMs ?? info.boundMs}ms live-work bound by work that is preserved untouched: ${holders.map(holder => holder.memberId === undefined ? holder.subject : `${holder.subject} held by ${holder.memberId}`).join(', ')}.`
       : ''
     const unreachedText = unreached.length ? unreached.map(task => `${task.id} (${task.status})`).join(', ') : 'none'
     // R15-D2: when a subject of this escalation is a blocked task whose stop is
     // past its declared bound (or carries no recorded start), the escalation
-    // states that row-supported fact — the pass's release is exactly what makes
+    // states that row-supported fact — the wedged pass is exactly what makes
     // the stop unbounded.
-    const stopFacts = unreached.filter(task => task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch)
+    const stopFacts = unreached.filter(task => task.status === 'blocked' && stopPending(task))
       .map(task => {
         const stop = task.resumeAfterStop
         return stop?.at === undefined
           ? `${task.id} is blocked and its stop carries no recorded start, so the declared bound (${info.boundMs}ms) cannot be shown to hold`
-          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, Date.now() - stop.at)}ms, past its declared bound`
+          : `${task.id} is blocked and its stop has been awaited for ${Math.max(0, this.rt.now() - stop.at)}ms, past its declared bound`
       })
     const stopText = stopFacts.length ? ` Stop state: ${stopFacts.join('; ')}.` : ''
     const passes = info.pass.noProgressPasses
     const stateUnchanged = info.pass.fingerprintBefore === fingerprint
-    mission.schedulingStallNotice = fingerprint
-    mission.updatedAt = Date.now()
-    mission.witness = { fingerprint, kind: 'W3', at: Date.now() }
+    // A wedge naming's fact: its subjects, and each member's counted
+    // consecutive start failures. A wedge after a counted start failure is a
+    // new fact (the member is one failure nearer retirement, which bounds the
+    // renaming); a repeat on the same subjects with no failure counted (a
+    // provider outage counts none) is suppressed by the notice dedup. The
+    // no-progress notice keeps its generic identity.
+    const failures = this.rt.store.list('members', missionId)
+      .flatMap(member => { const count = (member as Member & { startFailures?: number }).startFailures; return count === undefined ? [] : [`${member.id}:${count}`] })
+    const identity = info.reason === 'pass-timeout' ? { trigger: 'scheduling-pass', reason: [info.reason, ...failures].join(' ') } : {}
+    mission[noticeKey] = fingerprint
+    mission.updatedAt = this.rt.now()
+    mission.witness = { fingerprint, kind: 'W3', at: this.rt.now() }
+    let ownerNotified = false
     this.rt.commit(missionId, () => {
       this.rt.store.put('missions', mission)
+      // The notice is recorded first, so the event states what it did: a
+      // naming whose notice the dedup suppressed reached no owner.
+      ownerNotified = this.rt.notify(missionId, info.reason === 'pass-timeout'
+        ? `Scheduling pass ${info.pass.id} (run ${info.pass.operationId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). This pass keeps the mission's scheduling until the call it awaits returns at its own bound; the next pass then resumes from lease recovery. Unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
+        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
+        // R17-G5: the pass naming is its own fact, not the board's witness. A
+        // wedged-pass escalation must not consume the board's W2 witness for a
+        // fingerprint whose decision the transition-driven classifier still owes
+        // (the dispatch question the dead pass never reached). A wedge naming's
+        // trigger is its own too: under the generic `decision` identity an
+        // unrelated notice with the same subjects (a member's start-failure
+        // notice) suppressed it.
+        { stampWitness: false, ...identity })
       // Reuse the registered board-stall event rather than inventing a new type:
       // `cause: 'scheduling-pass'` and `wedged` make the pass-level escalation
       // distinguishable in the durable log and in every existing read path.
       this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'scheduling-pass',
-        passId: info.pass.id, runId: info.pass.runId,
+        passId: info.pass.id, runId: info.pass.operationId,
         reason: info.reason === 'pass-timeout'
           ? `scheduling pass did not return within its ${info.boundMs}ms bound and advanced no durable state`
           : `no durable state change for ${passes} consecutive scheduling passes`,
         wedged: info.reason === 'pass-timeout',
         passStartedAt: info.pass.startedAt, passes, boundMs: info.boundMs,
         revisionBefore: info.pass.revisionBefore, revisionAtStall: info.revisionNow,
-        missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified: true,
-        // R16-D: what the release was measured against, whether live work held it,
-        // and the subjects whose work the release preserved. `boundMs` keeps its
-        // original meaning (the pass's own stall bound) so every existing reader
-        // is unchanged; the release facts are additive and only present on a
-        // release, never on the no-progress variant.
-        ...(info.release === undefined ? {} : {
-          releasedAt: info.release.releasedAt,
+        missionFingerprint: fingerprint, stateUnchanged, unschedulable, ownerNotified,
+        // R16-D: what the wedge was measured against, whether live work held it,
+        // and the subjects whose work it preserved. Nothing is released; the
+        // `release*` names are kept for every existing reader and describe the
+        // naming: `releasedAt` is the instant of the tick whose naming committed,
+        // `releaseGapMs` how long the body had held the mission by then,
+        // `releaseBoundMs` the bound the naming was measured against (the
+        // live-work bound when live work held it) and `releasedWhileLive` whether
+        // live work held it. `boundMs` keeps its original meaning (the pass's own
+        // stall bound); these facts are additive and only present on a wedge,
+        // never on the no-progress variant.
+        ...(info.wedge === undefined ? {} : {
+          releasedAt: info.wedge.releasedAt,
           releaseBoundMs: info.releaseBoundMs ?? info.boundMs,
-          releaseGapMs: info.release.gapMs,
+          releaseGapMs: info.wedge.gapMs,
           releasedWhileLive: info.heldByLiveWork === true,
-          liveSubjects: info.release.liveSubjects,
+          liveSubjects: info.wedge.liveSubjects,
         }),
       })
-      // R17-G5: the release is a transition that still owes the dead pass's own
-      // dispatch question, so the next fact publication runs with the wedged
-      // branch even though the pass row is released by the time it runs.
-      this.rt.expectWedgedRelease(missionId)
-      this.rt.notify(missionId, info.reason === 'pass-timeout'
-        ? `Scheduling pass ${info.pass.id} (run ${info.pass.runId}) for mission ${missionId} did not return within ${info.boundMs}ms and produced no durable state change (fingerprint ${fingerprint.slice(0, 12)}). The runtime released the mission's scheduling guard so later ticks proceed; unschedulable: ${unschedulable.join(', ') || 'none'}.${heldText} Work the pass never reached: ${unreachedText}.${stopText} Decide: inspect the named tasks, admit a repair with swarm_propose, or withdraw the blocking work with swarm_cancel.`
-        : `Mission ${missionId} left its durable state unchanged for ${passes} consecutive scheduling passes (window ${info.boundMs}ms, revision ${info.pass.revisionBefore} → ${info.revisionNow}, fingerprint ${fingerprint.slice(0, 12)}) and terminated nothing. Unschedulable: ${unschedulable.join(', ') || 'none'}. Work with no progress: ${unreachedText}. Decide: admit work with swarm_propose, adjust the budget, or complete/stop the mission.`, subjects,
-        // R17-G5: the pass release is its own fact, not the board's witness. A
-        // wedged-pass escalation must not consume the board's W2 witness for a
-        // fingerprint whose decision the transition-driven classifier still owes
-        // (the dispatch question the dead pass never reached).
-        { stampWitness: false })
     })
+    // R17-G5: the naming is a transition that still owes the wedged pass's own
+    // dispatch question, so the next fact publication runs with the wedged
+    // branch even if the body settles before that publication runs. Marked only
+    // once the naming committed; the publication it marks runs after this
+    // synchronous call returns.
+    this.rt.expectWedgedRelease(missionId)
     // The notice path must not share the fate of the pass that could not report
     // it: the queue-external pump delivers it, never the wedged mission queue.
     this.rt.pumpOutbox()
+    return { ownerNotified }
   }
 
   /**
@@ -1051,7 +1025,7 @@ export class Scheduling {
    * that wedged long enough for every lease to lapse is still detected.
    */
   hasLiveWork(missionId: string): boolean {
-    const now = Date.now()
+    const now = this.rt.now()
     return this.rt.store.list('tasks', missionId).some(task =>
       this.quiescencePending(task)
       || (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseUntil >= now))
@@ -1087,8 +1061,8 @@ export class Scheduling {
    *  - the parked member (`waiting`): `notifyParkedHolder` names the holder;
    *    the park is the owner's intent, not silence.
    *  - the budget pause: a deliberate host pause is not a stalled worker.
-   *  - the wedge release (`recordRelease`): the tick this guard runs on is the
-   *    same queue-external tick that releases a wedged pass, so a pass that
+   *  - the wedge watchdog (`checkSchedulingPasses`): the tick this guard runs on
+   *    is the same queue-external tick that names a wedged pass, so a pass that
    *    cannot run its own recovery sweep cannot hide the attempt.
    *  - the notice dedup: the key is `attempt-silent:<attemptId>:<lastDurableAt>`,
    *    so one silence escalates once and a recording re-arms the clock.
@@ -1098,7 +1072,7 @@ export class Scheduling {
    * R16-D: one live attempt whose durable progress is past its declared bound.
    * `subject` is the attempt's task@epoch, the identity the escalation carries.
    */
-  silentAttempt(task: Task, mission: Mission, now = Date.now()): SilentAttempt | undefined {
+  silentAttempt(task: Task, mission: Mission, now = this.rt.now()): SilentAttempt | undefined {
     const attempt = task.attempt
     if (attempt === undefined || task.status !== 'running') return undefined
     const boundMs = this.rt.attemptSilenceBoundMs
@@ -1153,9 +1127,9 @@ export class Scheduling {
     // The pass state is part of the honesty of the claim: the same guard fires
     // whether or not the pass is running, and the reader must know which path
     // would otherwise have named the attempt.
-    const pass = this.rt.store.get('passes', this.passKey(mission.id))
-    const passState = pass !== undefined && pass.status === 'running' && this.passWedged(mission.id)
-      ? ` The mission's scheduling pass ${pass.runId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
+    const pass = this.passes.get(mission.id)
+    const passState = pass !== undefined && this.passWedged(mission.id)
+      ? ` The mission's scheduling pass ${pass.operationId} is wedged past its ${this.rt.stallPassTimeoutMs}ms bound, so the in-pass recovery sweep cannot run either.`
       : ''
     const message = `${name} has held task ${task.id} "${task.title}" at epoch ${task.epoch} (attempt ${silent.attemptId}) for ${formatSpan(silent.silentMs)} (${silent.silentMs}ms) with no durable report past its declared bound of ${formatSpan(silent.boundMs)} (${silent.boundMs}ms): no durable event, no task state transition and no recorded tool run names this attempt since ${since}; no operation is in flight and the idle close-out is not handling it.${passState} Nothing was stopped or re-pended by this notice: the attempt may still be working. Owner actions: inspect it with swarm_observe (taskId ${task.id}), send it input or finish it with swarm_handoff, raise attemptSilenceBoundMs if this silence is healthy, or withdraw the work with swarm_cancel. [witness: attempt-silent, subject ${silent.subject}, attempt ${silent.attemptId}, member ${silent.ownerId}, lastDurableAt ${silent.lastDurableAt}, silentMs ${silent.silentMs}, boundMs ${silent.boundMs}]`
     this.rt.commit(mission.id, () => { this.rt.notify(mission.id, message, [taskSubject(task)], { noticeClass: 'stall', dedupe: true, dedupKey }) })
@@ -1194,149 +1168,6 @@ export class Scheduling {
   }
 
   /**
-   * R16-D: the round's silence projection. Read from the durable store alone —
-   * the retained event window, the tool-run rows, the delivery rows, the current
-   * task rows and the one durable pass row — and it changes nothing.
-   *
-   * The two numbers the round quotes:
-   *  - the worst per-subject silent gap, each subject carrying the declared bound
-   *    it was measured against (a released scheduling pass against the pass
-   *    release bound; an escalated attempt against the attempt reporting bound);
-   *  - the worst per-attempt reporting gap, plus how many attempts ended with no
-   *    durable report or escalation at all.
-   *
-   * Definitions, stated so a reader can falsify them:
-   *  - an attempt's durable elements are its `task/claimed` dispatch (and the
-   *    assignment delivery written with it), every durable event naming its task
-   *    or attempt while it was current, every delivery naming them, and every
-   *    recorded tool run of the attempt;
-   *  - its reporting gap is the longest interval between consecutive elements,
-   *    closed at its end (or at read time while it is live);
-   *  - it ended unreported when it is no longer the task's current attempt and no
-   *    durable event or delivery after its dispatch ever named it — the dispatch
-   *    itself is not a report about the attempt.   *
-   * LIMITS, named rather than hidden: the attempt intervals come from the
-   * retained event window (`maxEvents`), so an attempt whose dispatch has aged
-   * out is not reconstructed; an attempt that ended with no closing event is
-   * dated at its last durable element; the attempt bound quoted is the bound in
-   * force at read time, not necessarily the one in force when an old escalation
-   * fired (the escalation's own `[witness: …]` token carries that one).
-   */
-  silenceReport(missionId: string): SilenceReport {
-    const now = Date.now()
-    const bounds = { passMs: this.rt.stallPassTimeoutMs, passReleaseMs: this.rt.stallPassReleaseBoundMs, attemptMs: this.rt.attemptSilenceBoundMs }
-    const events = this.rt.store.events(missionId, this.rt.config.maxEvents)
-    const deliveries = this.rt.store.list('deliveries', missionId)
-    const current = new Map(this.rt.store.list('tasks', missionId).map(task => [task.id, task]))
-    type ElementKind = 'claim' | 'event' | 'delivery' | 'run'
-    interface Element { at: number; kind: ElementKind; isClaim: boolean }
-    interface Interval { attemptId: string; taskId: string; epoch: number; memberId: string; claimedAt: number; endedAt?: number; elements: Element[] }
-    const byAttempt = new Map<string, Interval>()
-    const open = new Map<string, Interval>()
-    const claimStart = (event: SwarmEvent): void => {
-      const data = event.data as { taskId?: unknown; attempt?: { id?: unknown; ownerId?: unknown; epoch?: unknown } } | undefined
-      const taskId = typeof data?.taskId === 'string' ? data.taskId : undefined
-      const attemptId = typeof data?.attempt?.id === 'string' ? data.attempt.id : undefined
-      const ownerId = typeof data?.attempt?.ownerId === 'string' ? data.attempt.ownerId : undefined
-      if (taskId === undefined || attemptId === undefined || ownerId === undefined) return
-      const prior = open.get(taskId)
-      // A re-dispatch is the durable close of the attempt it replaces.
-      if (prior !== undefined) prior.endedAt = Math.min(prior.endedAt ?? event.createdAt, event.createdAt)
-      const interval: Interval = { attemptId, taskId, epoch: typeof data?.attempt?.epoch === 'number' ? data.attempt.epoch : 0, memberId: ownerId, claimedAt: event.createdAt, elements: [{ at: event.createdAt, kind: 'claim', isClaim: true }] }
-      byAttempt.set(attemptId, interval)
-      open.set(taskId, interval)
-    }
-    for (const event of events) {
-      if (event.type === 'task/claimed') { claimStart(event); continue }
-      // The event is attributed to the open attempt of each task it names; a
-      // closer ends that attempt at this instant and takes it out of the open
-      // set, so a later event about the same task is never attributed to a
-      // closed attempt (a later delivery or run that names the attempt id is
-      // still attributed, because that identity is exact).
-      let closedTask: string | undefined
-      for (const [taskId, interval] of open) {
-        if (!this.identityIn(event.data, taskId, interval.attemptId)) continue
-        interval.elements.push({ at: event.createdAt, kind: 'event', isClaim: false })
-        if (isAttemptCloser(event.type)) { interval.endedAt = Math.min(interval.endedAt ?? event.createdAt, event.createdAt); closedTask = taskId }
-      }
-      if (closedTask !== undefined) open.delete(closedTask)
-    }
-    for (const run of this.rt.store.toolRuns(missionId)) {
-      const interval = byAttempt.get(run.attemptId)
-      if (interval === undefined) continue
-      interval.elements.push({ at: run.createdAt, kind: 'run', isClaim: false })
-    }
-    for (const delivery of deliveries) {
-      const interval = delivery.attemptId === undefined ? open.get(delivery.taskId ?? '') : byAttempt.get(delivery.attemptId)
-      if (interval === undefined) continue
-      // The assignment delivery is written in the same transaction as the
-      // dispatch: it is the claim, not a report about the attempt.
-      interval.elements.push({ at: delivery.createdAt, kind: 'delivery', isClaim: delivery.kind === 'assignment' })
-    }
-    const escalations = new Map<string, string[]>()
-    for (const delivery of deliveries) {
-      const key = delivery.notice?.dedupKey
-      if (typeof key !== 'string') continue
-      const attemptId = /^(?:attempt-silent|operation-silent):([^:]+):/.exec(key)?.[1]
-      if (attemptId === undefined) continue
-      const list = escalations.get(attemptId) ?? []
-      list.push(key)
-      escalations.set(attemptId, list)
-    }
-    const reports: AttemptReport[] = []
-    const subjects: SubjectSilence[] = []
-    for (const interval of byAttempt.values()) {
-      const task = current.get(interval.taskId)
-      const stillCurrent = task?.status === 'running' && task.attempt?.id === interval.attemptId
-      const lastDurableAt = interval.elements.reduce((latest, element) => Math.max(latest, element.at), interval.claimedAt)
-      // No closer was recorded but the task no longer carries the attempt: the
-      // attempt ended at its last durable element, without a report.
-      const endedAt = interval.endedAt ?? (stillCurrent ? undefined : lastDurableAt)
-      const instants = [...new Set(interval.elements.map(element => element.at))].sort((a, b) => a - b)
-      const end = endedAt === undefined ? now : Math.max(endedAt, instants.at(-1) ?? endedAt)
-      let worstReportingGapMs = 0
-      let previousInstant = interval.claimedAt
-      for (const instant of instants) { worstReportingGapMs = Math.max(worstReportingGapMs, instant - previousInstant); previousInstant = instant }
-      worstReportingGapMs = Math.max(worstReportingGapMs, end - previousInstant)
-      const endedUnreported = endedAt !== undefined && !interval.elements.some(element => !element.isClaim && element.kind !== 'run')
-      const attemptEscalations = escalations.get(interval.attemptId) ?? []
-      reports.push({
-        attemptId: interval.attemptId, taskId: interval.taskId, epoch: interval.epoch, memberId: interval.memberId,
-        claimedAt: interval.claimedAt, ...(endedAt === undefined ? {} : { endedAt }), lastDurableAt,
-        worstReportingGapMs, silentMs: Math.max(0, end - lastDurableAt), escalations: attemptEscalations, endedUnreported,
-      })
-      for (const key of attemptEscalations) {
-        const delivery = deliveries.find(candidate => candidate.notice?.dedupKey === key)
-        const silentSince = Number(key.slice(key.lastIndexOf(':') + 1))
-        if (delivery === undefined || !Number.isSafeInteger(silentSince)) continue
-        subjects.push({ subject: delivery.subjects?.[0] ?? `${interval.taskId}@${interval.epoch}`, kind: 'attempt', gapMs: Math.max(0, delivery.createdAt - silentSince), boundMs: bounds.attemptMs, at: delivery.createdAt })
-      }
-    }
-    // The released scheduling passes: the durable pass row is the carrier (the
-    // once-per-pass overwrite erases per-run detail, so it accumulates the worst).
-    const passRow = this.rt.store.get('passes', this.passKey(missionId))
-    const passRelease = passRow === undefined ? undefined : releasedPassFields(passRow)
-    const worstRelease = passRelease?.worstRelease
-    if (worstRelease !== undefined) {
-      subjects.push({ subject: `pass:${worstRelease.runId}`, kind: 'scheduling-pass', gapMs: worstRelease.gapMs, boundMs: worstRelease.boundMs, at: worstRelease.releasedAt })
-    }
-    const worstSubjectSilence = subjects.reduce<SubjectSilence | undefined>((worst, item) =>
-      worst === undefined || item.gapMs > worst.gapMs || (item.gapMs === worst.gapMs && item.gapMs - item.boundMs > worst.gapMs - worst.boundMs) ? item : worst, undefined)
-    const worstAttempt = reports.reduce<{ attemptId: string; taskId: string; gapMs: number } | undefined>((worst, report) =>
-      worst === undefined || report.worstReportingGapMs > worst.gapMs ? { attemptId: report.attemptId, taskId: report.taskId, gapMs: report.worstReportingGapMs } : worst, undefined)
-    return {
-      missionId, bounds, subjects, worstSubjectSilence,
-      attempts: reports,
-      worstAttemptReportingGap: worstAttempt,
-      attemptsEnded: reports.filter(report => report.endedAt !== undefined).length,
-      attemptsEndedUnreported: reports.filter(report => report.endedUnreported).length,
-      attemptSilenceEscalations: subjects.filter(item => item.kind === 'attempt').length,
-      passReleases: { count: passRelease?.releases ?? 0, worst: worstRelease },
-      note: 'Read-only projection over the durable rows at read time. A subject silence is measured against the declared bound carried next to it: a released scheduling pass against the pass release bound it was released under, an escalated attempt against the attempt reporting bound in force at read time. The worst subject silence is the widest gap (ties: the widest overrun). The worst per-attempt reporting gap is the longest interval between durable elements attributable to one attempt, closed at its end or at read time. `attemptsEndedUnreported` counts attempts no longer current whose only durable element is their own dispatch. Limits: attempt intervals come from the retained event window, an attempt that ended with no closing event is dated at its last durable element, and a second release of an unchanged board is deduped into the first escalation (the pass row still counts it in `releases`).',
-    }
-  }
-
-  /**
    * F2: the board makes no progress except for submitted work. Unlike `stalled`,
    * a submitted task is not progress: an artifact whose review path is broken
    * can never reach a verdict by itself.
@@ -1347,210 +1178,21 @@ export class Scheduling {
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
 
+  /**
+   * R5-02: the live members a failed attempt may be re-routed to, in store
+   * order: capable of the task, and never the member one of its own reviews is
+   * bound to (`strandedReview`), whom a reroute would make that review's author.
+   */
+  rerouteCandidates(missionId: string, task: Task, failedId: string): Member[] {
+    const tasks = this.rt.store.list('tasks', missionId)
+    return this.rt.store.list('members', missionId).filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
+      && this.capable(task, member, tasks) && strandedReview(tasks, task.id, { assigneeId: member.id }) === undefined)
+  }
+
   /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
   rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
-    const candidates = this.rt.store.list('members', missionId)
-      .filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped' && this.capable(task, member))
+    const candidates = this.rerouteCandidates(missionId, task, failedId)
     const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
     return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }
-}
-
-/* ------------------------------------------------------------------------- *
- * Round 14: the guard-chain board model.
- *
- * The kernel obligation is structural: every guard chain ends in an escalation
- * that has no conditions of its own, so a dead end is impossible. This model is
- * the shared vocabulary for that claim. `guardDispatchActions` and
- * `guardProgressActions` describe every action an earlier element of a chain can
- * still produce; `guardTerminalChain` names the chain whose earlier elements
- * have all answered "no"; `terminalEscalation` turns that into the coded,
- * actionable decision request `Scheduling.escalateGuardTerminal` emits.
- *
- * The model is pure: no store, no clock, no cache. `tests/guard-terminals.test.mjs`
- * enumerates generated board states (task status x attempt presence x workspace
- * state x member status x budget pause), walks the reachable subset through a
- * transition relation and asserts the property over every reachable non-terminal
- * state, so the guarantee is checked against the same functions the dispatch
- * path uses. The states the generator does not reach are named in that test.
- * ------------------------------------------------------------------------- */
-
-/** One generated board: the five dimensions the property test enumerates. */
-export interface GuardTask {
-  id: string
-  status: Task['status']
-  /** An attempt is attached to a running task; `leaseLive` is its lease state. */
-  attempt?: { leaseLive: boolean }
-  /** The task already spent its own step/finding ceiling (`taskCeilingExhaustion`). */
-  ceilingExhausted?: boolean
-  /** An ordinary dependency edge waits for acceptance; a dead edge never resolves. */
-  dependenciesSatisfied?: boolean
-  dependenciesDead?: boolean
-  /** This task reviews the named source; the source may have no live review left. */
-  reviewOf?: string
-  reviewSourceLive?: boolean
-  /** Members who authored the reviewed source and can never review it. */
-  authorMemberIds?: string[]
-  /** Preparation failures exhausted the task's recovery limit. */
-  preparationExhausted?: boolean
-  /**
-   * The task's own text assumes prior content that no dependency carries
-   * (R12-F9): the admission guard's terminal input.
-   */
-  assumedContent?: boolean
-}
-
-export interface GuardMember {
-  id: string
-  status: Member['status']
-  /** False only for a member the isolation invariant refuses. */
-  isolated?: boolean
-}
-
-export interface GuardBoard {
-  mission: {
-    status: Mission['status']
-    workspace: 'authorized' | 'revoked' | 'dirty' | 'unprovisioned'
-    budgetPaused?: boolean
-    budgetBlocked?: string
-  }
-  tasks: GuardTask[]
-  members: GuardMember[]
-}
-
-export interface GuardDispatchAction {
-  kind: 'dispatch'
-  chain: 'dispatch_preconditions'
-  taskId: string
-  memberId: string
-}
-
-/** Work already in flight: an action an earlier chain element is executing. */
-export interface GuardProgressAction {
-  kind: 'progress'
-  chain: GuardChainId
-  detail: string
-  taskId?: string
-  memberId?: string
-}
-
-export interface GuardEscalationAction {
-  kind: 'escalate'
-  chain: GuardChainId
-  code: string
-  message: string
-  exits: DecisionExit[]
-  coFires: GuardChainId[]
-  taskId?: string
-}
-
-export type GuardAction = GuardDispatchAction | GuardProgressAction | GuardEscalationAction
-
-const isLiveMember = (member: GuardMember): boolean => member.status === 'idle' || member.status === 'waiting'
-
-/**
- * Every (task, member) pair an earlier element of the dispatch-precondition
- * chain can still act on. A task is dispatchable only when the whole chain
- * before the terminal answered "yes": the mission is active, the budget is not
- * paused or exhausted, the workspace is authorized, the task is pending, it has
- * not spent its own ceiling or its preparation recovery, its dependency lineage
- * is alive and satisfied, its review source is live when it is a review, and a
- * live member who did not author that source can take it.
- */
-export function guardDispatchActions(board: GuardBoard): GuardDispatchAction[] {
-  const mission = board.mission
-  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
-  const actions: GuardDispatchAction[] = []
-  for (const task of board.tasks) {
-    if (task.status !== 'pending' || task.ceilingExhausted === true || task.preparationExhausted === true || task.assumedContent === true) continue
-    if (task.dependenciesSatisfied === false || task.dependenciesDead === true) continue
-    if (task.reviewOf !== undefined && task.reviewSourceLive === false) continue
-    const member = board.members.find(candidate => isLiveMember(candidate) && candidate.isolated !== false
-      && !(task.authorMemberIds ?? []).includes(candidate.id))
-    if (member !== undefined) actions.push({ kind: 'dispatch', chain: 'dispatch_preconditions', taskId: task.id, memberId: member.id })
-  }
-  return actions
-}
-
-/**
- * Work already in flight. A live lease, a working member or a submitted source
- * whose review is still live is progress, so the board is not a dead end and no
- * terminal escalation is owed. This is deliberately derived from the board, not
- * from the terminal function, so the property test cannot be circular.
- *
- * "In flight" is only progress while the chains that gate it can still let it
- * land: an attempt whose workspace cannot produce an artifact, or whose mission
- * is paused or out of budget, is executing but can never reach its terminal
- * step — that is exactly the 2026-09-10 trap, and it must count as a dead end
- * rather than as liveness.
- */
-export function guardProgressActions(board: GuardBoard): GuardProgressAction[] {
-  const mission = board.mission
-  if (mission.status !== 'active' || mission.budgetPaused === true || mission.budgetBlocked !== undefined || mission.workspace !== 'authorized') return []
-  const actions: GuardProgressAction[] = []
-  for (const task of board.tasks) {
-    if (task.status === 'running' && task.attempt !== undefined && task.attempt.leaseLive) {
-      actions.push({ kind: 'progress', chain: 'attempt_lease', taskId: task.id, detail: 'a running attempt holds a live lease' })
-    }
-    if (task.status === 'submitted' && task.reviewOf === undefined && task.reviewSourceLive !== false) {
-      actions.push({ kind: 'progress', chain: 'review_admission', taskId: task.id, detail: 'a submitted source has a live review path' })
-    }
-  }
-  for (const member of board.members) {
-    if (member.status === 'working') actions.push({ kind: 'progress', chain: 'dispatch_preconditions', memberId: member.id, detail: 'the member is working' })
-  }
-  return actions
-}
-
-/**
- * The chain whose earlier elements have all answered "no". Ordered so the
- * classification names the *first* chain that cannot progress: a board with an
- * exhausted budget and a revoked workspace is a budget decision first, because
- * no lease can be admitted until the ceiling moves.
- */
-export function guardTerminalChain(board: GuardBoard): GuardChainId {
-  const live = board.tasks.filter(task => task.status !== 'accepted' && task.status !== 'cancelled')
-  if (board.mission.budgetBlocked !== undefined || board.mission.budgetPaused === true) return 'budget'
-  if (live.length > 0 && board.mission.workspace !== 'authorized') return 'workspace'
-  if (board.tasks.some(task => task.status === 'running' && task.attempt !== undefined && !task.attempt.leaseLive)) return 'attempt_lease'
-  if (board.tasks.some(task => task.ceilingExhausted === true && task.status !== 'accepted' && task.status !== 'cancelled')) return 'task_ceiling'
-  if (board.tasks.some(task => task.assumedContent === true && task.status === 'pending')) return 'admission'
-  if (board.tasks.some(task => task.status === 'submitted' && task.reviewSourceLive === false)) return 'review_admission'
-  return 'dispatch_preconditions'
-}
-
-/**
- * The unconditional terminal element: total by construction. It takes a board
- * and always returns an escalation — the only branch that carries no earlier
- * failure is the generic "no executable action remains" one — so no caller can
- * reach a state where the chain has ended and nothing is emitted.
- */
-export function terminalEscalation(board: GuardBoard): GuardEscalationAction {
-  const chain = guardTerminalChain(board)
-  const task = board.tasks.find(candidate => candidate.status !== 'accepted' && candidate.status !== 'cancelled')
-  const member = board.members.find(candidate => candidate.status === 'working') ?? board.members[0]
-  const terminal = guardTerminal(chain, { ...(task === undefined ? {} : { taskId: task.id }), ...(member === undefined ? {} : { memberId: member.id }) })
-  return { kind: 'escalate', ...terminal, ...(task === undefined ? {} : { taskId: task.id }) }
-}
-
-/** Every action the model can see: dispatch, progress, or the unconditional terminal. */
-/**
- * True only for the mission statuses no actor can bring back: `completed` and
- * `stopped`. Everything else — including `blocked` (a budget stop) and `paused` —
- * still owes the owner an executable action, which is the whole point of the
- * terminal element (`emitGuardTerminal` bails only on a terminal mission).
- */
-export function guardMissionTerminal(board: GuardBoard): boolean {
-  return board.mission.status === 'completed' || board.mission.status === 'stopped'
-}
-
-export function guardActions(board: GuardBoard): GuardAction[] {
-  const dispatch = guardDispatchActions(board)
-  const progress = guardProgressActions(board)
-  // S4r-D5: the terminal is appended for every non-terminal mission status, not
-  // only for `active`. A budget-blocked mission (`status: 'blocked'`,
-  // `budgetPause` set) is exactly when the owner needs the coded exit, and the
-  // old predicate returned an empty action list for it.
-  if (dispatch.length > 0 || progress.length > 0 || guardMissionTerminal(board)) return [...dispatch, ...progress]
-  return [...dispatch, ...progress, terminalEscalation(board)]
 }

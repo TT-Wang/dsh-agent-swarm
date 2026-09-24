@@ -21,6 +21,7 @@ export class SwarmMonitor {
   private disposed = false
   private active = true
   private failures = 0
+  private needsSnapshot = false
   constructor(readonly request: Request) {}
   getSnapshot = () => this.state
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener) } }
@@ -38,6 +39,7 @@ export class SwarmMonitor {
     this.pending?.abort()
     this.pending = undefined
     this.failures = 0
+    this.needsSnapshot = false
     this.publish({ ownerSessionId, loading: Boolean(ownerSessionId), connection: active ? 'connecting' : 'paused' })
     if (ownerSessionId) void this.refresh()
   }
@@ -72,9 +74,14 @@ export class SwarmMonitor {
       if (this.disposed || generation !== this.generation || this.pending !== controller) return
       validateState(data, owner)
       this.failures = 0
+      this.needsSnapshot = false
       this.publish({ ownerSessionId: owner, data, loading: false, updatedAt: Date.now(), connection: 'connected' })
     } catch (error) {
       if (this.disposed || generation !== this.generation || this.pending !== controller || (controller.signal.aborted && !timedOut)) return
+      // A corrupt delta cannot be repaired by replaying the same cursor. Keep
+      // the last good view and retry full snapshots with the ordinary backoff
+      // until the host supplies a valid state; never loop a fallback inline.
+      if (error instanceof InvalidSwarmStateError) this.needsSnapshot = true
       this.failures++
       this.publish({ ...this.state, loading: false, connection: 'reconnecting', error: timedOut ? 'Swarm connection timed out' : error instanceof Error ? error.message : String(error) })
     } finally {
@@ -84,7 +91,7 @@ export class SwarmMonitor {
         const supportsWatch = this.state.data?.revision !== undefined
         // Legacy cached clients retain polling compatibility. Current hosts wait for commits.
         const interval = this.failures ? Math.min(15_000, 1000 * 2 ** (this.failures - 1)) : supportsWatch ? 40 : 2000
-        this.timer = setTimeout(() => { void this.read(supportsWatch) }, interval)
+        this.timer = setTimeout(() => { void this.read(supportsWatch && !this.needsSnapshot) }, interval)
       }
     }
   }
@@ -97,40 +104,42 @@ export class SwarmMonitor {
   }
 }
 
+class InvalidSwarmStateError extends Error {}
+
 function validateState(data: LiveState, owner: string): void {
   if (!data || data.ownerSessionId !== owner || !Array.isArray(data.snapshots) || !Array.isArray(data.drafts)
     || data.snapshots.some(snapshot => !readSnapshot(snapshot))
-    || (data.revision !== undefined && (!Number.isSafeInteger(data.revision) || data.revision < 0))) throw new Error('Invalid swarm state from host')
+    || (data.revision !== undefined && (!Number.isSafeInteger(data.revision) || data.revision < 0))) throw new InvalidSwarmStateError('Invalid swarm state from host')
 }
 
 /** Reconcile authoritative mission membership without resetting unchanged cards or editor state. */
 export function mergeUpdate(previous: LiveState | undefined, update: LiveUpdate, owner: string): LiveState {
-  if (!update || update.ownerSessionId !== owner || !Number.isSafeInteger(update.revision) || update.revision < 0) throw new Error('Invalid swarm update from host')
+  if (!update || update.ownerSessionId !== owner || !Number.isSafeInteger(update.revision) || update.revision < 0) throw new InvalidSwarmStateError('Invalid swarm update from host')
   if (update.kind === 'snapshot') {
     validateState(update.state, owner)
-    if (update.state.revision !== update.revision) throw new Error('Mismatched swarm snapshot revision')
+    if (update.state.revision !== update.revision) throw new InvalidSwarmStateError('Mismatched swarm snapshot revision')
     return update.state
   }
-  if (!previous || update.revision < (previous.revision ?? 0)) throw new Error('Swarm update cursor is out of order')
+  if (!previous || update.revision < (previous.revision ?? 0)) throw new InvalidSwarmStateError('Swarm update cursor is out of order')
   if (update.kind === 'heartbeat') {
-    if ((update.ownerLive !== undefined && typeof update.ownerLive !== 'boolean') || (update.writable !== undefined && typeof update.writable !== 'boolean')) throw new Error('Invalid swarm connection metadata')
-    if (update.workspace !== undefined && typeof update.workspace !== 'string') throw new Error('Invalid swarm workspace metadata')
-    if (update.defaultBudget !== undefined && (!update.defaultBudget || ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].some(key => !Number.isSafeInteger(update.defaultBudget![key as keyof typeof update.defaultBudget])))) throw new Error('Invalid swarm budget metadata')
+    if ((update.ownerLive !== undefined && typeof update.ownerLive !== 'boolean') || (update.writable !== undefined && typeof update.writable !== 'boolean')) throw new InvalidSwarmStateError('Invalid swarm connection metadata')
+    if (update.workspace !== undefined && typeof update.workspace !== 'string') throw new InvalidSwarmStateError('Invalid swarm workspace metadata')
+    if (update.defaultBudget !== undefined && (!update.defaultBudget || ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'].some(key => !Number.isSafeInteger(update.defaultBudget![key as keyof typeof update.defaultBudget])))) throw new InvalidSwarmStateError('Invalid swarm budget metadata')
     return { ...previous, revision: update.revision,
       ...(update.ownerLive === undefined ? {} : { ownerLive: update.ownerLive }),
       ...(update.writable === undefined ? {} : { writable: update.writable }),
       ...(update.defaultBudget === undefined ? {} : { defaultBudget: update.defaultBudget }),
       ...(update.workspace === undefined ? {} : { workspace: update.workspace }) }
   }
-  if (update.kind !== 'delta') throw new Error('Unknown swarm update kind')
+  if (update.kind !== 'delta') throw new InvalidSwarmStateError('Unknown swarm update kind')
   validateState(update.state, owner)
   if (update.state.revision !== update.revision || !Array.isArray(update.missionIds)
-    || update.missionIds.some(id => typeof id !== 'string') || new Set(update.missionIds).size !== update.missionIds.length) throw new Error('Invalid swarm delta membership')
+    || update.missionIds.some(id => typeof id !== 'string') || new Set(update.missionIds).size !== update.missionIds.length) throw new InvalidSwarmStateError('Invalid swarm delta membership')
   const snapshots = new Map(previous.snapshots.map(snapshot => [snapshot.mission.id, snapshot]))
   for (const snapshot of update.state.snapshots) {
-    if (!update.missionIds.includes(snapshot.mission.id)) throw new Error('Swarm delta contains an unexpected mission')
+    if (!update.missionIds.includes(snapshot.mission.id)) throw new InvalidSwarmStateError('Swarm delta contains an unexpected mission')
     snapshots.set(snapshot.mission.id, snapshot)
   }
-  if (update.missionIds.some(id => !snapshots.has(id))) throw new Error('Swarm delta is missing a mission snapshot')
+  if (update.missionIds.some(id => !snapshots.has(id))) throw new InvalidSwarmStateError('Swarm delta is missing a mission snapshot')
   return { ...update.state, snapshots: update.missionIds.map(id => snapshots.get(id)!) }
 }

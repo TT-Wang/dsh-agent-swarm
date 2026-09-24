@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { HOST_GIT_TIMEOUT_MS, Workspaces, runProcess } from '../lib/workspaces.js'
+import { HOST_GIT_TIMEOUT_MS, runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -22,7 +23,7 @@ async function fixture(t, options = {}) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const head = await git(source, 'rev-parse', 'HEAD')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Implement answer', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -113,7 +114,7 @@ test('concurrent members and restarted workspace managers reuse the exact origin
   assert.equal(await git(first, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   assert.equal(await git(second, 'rev-parse', 'HEAD'), baseline.snapshotCommit)
   await writeFile(path.join(source, 'src', 'answer.txt'), 'later source edits\n')
-  const resumed = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv })
+  const resumed = makeWorkspaces(temp)
   try {
     assert.deepEqual(await resumed.prepareBaseline(mission), baseline)
     const third = await resumed.prepareWorkspace(mission, 'third')
@@ -355,23 +356,30 @@ test('handoff checkpoints partial work, and a later handoff back uses the latest
   assert.deepEqual(artifact.changedPaths, ['src/answer.txt'])
 })
 
-test('handoff scope failure preserves previous owner files and re-creates a clean baseline for the new owner', async t => {
-  const { temp, head, workspaces, mission, member, task } = await fixture(t)
+test('handoff scope failure preserves previous owner files and carries them to the new owner as a preservation snapshot', async t => {
+  const reports = []
+  const { temp, head, workspaces, mission, member, task } = await fixture(t, { onRecoveryFallback: info => reports.push(info) })
   const peer = { id: 'member-peer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-peer') }
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'outside.txt'), 'out of scope partial edit\n')
-  // W9: a previous owner's uncapturable workspace can no longer dead-end the
-  // task. The partial work stays in place and the new owner starts from the
-  // recorded base with a durable recovery record instead of a permanent block.
+  // W9/H-3: a previous owner's uncapturable workspace can no longer dead-end the
+  // task, and its partial work is not left behind either: the worktree stays in
+  // place, its snapshot goes into the preservation refs, and the new owner starts
+  // from that snapshot with a durable recovery record.
   await workspaces.prepareTask(peer, { ...task, epoch: 3 }, [])
   assert.equal(await readFile(path.join(member.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the previous owner worktree is never modified')
-  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'original\n', 'the new owner starts from the recorded base')
-  assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD'), head)
-  assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner baseline is clean')
-  assert(workspaces.recoveryFallbacks().some(entry => entry.includes(task.id) && /outside task scope/.test(entry)), 'the fallback is recorded for the host')
+  assert.equal(await readFile(path.join(peer.workspace, 'outside.txt'), 'utf8'), 'out of scope partial edit\n', 'the new owner inherits the uncaptured work')
+  const snapshot = await git(peer.workspace, 'rev-parse', 'HEAD')
+  assert.notEqual(snapshot, head, 'the new owner starts from the preservation snapshot, not the bare base')
+  assert.equal(await git(peer.workspace, 'rev-parse', 'HEAD^'), head, 'the snapshot sits on the recorded base')
+  assert.equal(await git(peer.workspace, 'status', '--porcelain'), '', 'the new owner checkout is clean')
+  assert.equal(reports.length, 1, 'the fallback is reported once to the host callback')
+  assert.deepEqual({ ...reports[0], reason: undefined }, { missionId: mission.id, taskId: task.id, epoch: 3, memberId: peer.id, previousOwnerId: member.id, commit: snapshot, preserved: true, reason: undefined })
+  assert.match(reports[0].reason, /outside task scope/)
   const record = JSON.parse(await readFile(path.join(temp, 'worktrees', mission.id, 'tasks', `${task.id}.json`), 'utf8'))
   assert.equal(record.memberId, peer.id, 'the recovered record names the new owner')
-  assert.equal(record.task.recovery.commit, head, 'the durable recovery record names the fallback commit')
+  assert.equal(record.task.recovery.commit, snapshot, 'the durable recovery record names the inherited snapshot')
+  assert.equal(record.task.recovery.preserved, true)
 })
 
 test('reviewer reads the submitted exact commit while its edits cannot change the source artifact', async t => {
@@ -389,6 +397,41 @@ test('reviewer reads the submitted exact commit while its edits cannot change th
   await writeFile(path.join(reviewer.workspace, 'src', 'answer.txt'), 'reviewer experiment\n')
   assert.equal(await readFile(path.join(member.workspace, 'src', 'answer.txt'), 'utf8'), 'proposed change\n')
   assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer.txt`), 'proposed change')
+})
+
+test('explicit ignored report is frozen with a blob manifest; later author writes do not alter review', async t => {
+  const { workspaces, mission, member, task } = await fixture(t)
+  const reportTask = { ...task, kind: 'research', scope: ['**'], objective: 'Write review/final.md', acceptance: ['Write review/final.md'] }
+  await workspaces.prepareTask(member, reportTask, [])
+  await writeFile(path.join(member.workspace, '.gitignore'), 'review/\n.env\n')
+  await mkdir(path.join(member.workspace, 'review'))
+  await writeFile(path.join(member.workspace, 'review/final.md'), 'Reviewed version\n')
+  await writeFile(path.join(member.workspace, '.env'), 'private unrelated fixture\n')
+  const omitted = await workspaces.captureArtifact(member, reportTask)
+  assert.ok(!omitted.changedPaths.includes('review/final.md'), 'an ignored file the task does not declare is not captured')
+  assert.equal(omitted.files, undefined)
+  const artifact = await workspaces.captureArtifact(member, reportTask, ['review/final.md'])
+  assert.ok(artifact.changedPaths.includes('review/final.md'))
+  assert.deepEqual(artifact.files, [{ path: 'review/final.md', blob: await git(member.workspace, 'rev-parse', `${artifact.commit}:review/final.md`), bytes: 17 }])
+  assert.ok(!artifact.changedPaths.includes('.env'))
+  await writeFile(path.join(member.workspace, 'review/final.md'), 'Later overwritten version\n')
+  const reviewer = { id: 'report-reviewer', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'report-reviewer') }
+  const review = { ...reportTask, id: 'report-review', kind: 'verification', reviewOf: task.id, attempt: { sourceCommit: artifact.commit } }
+  await workspaces.prepareTask(reviewer, review, [], { ...reportTask, status: 'submitted', artifact })
+  assert.equal(await readFile(path.join(reviewer.workspace, 'review/final.md'), 'utf8'), 'Reviewed version\n')
+  assert.equal(await git(reviewer.workspace, 'hash-object', 'review/final.md'), artifact.files[0].blob)
+  await assert.rejects(workspaces.prepareTask(reviewer, { ...review, attempt: { sourceCommit: '0'.repeat(40) } }, [], { ...reportTask, status: 'submitted', artifact }), /review_source_changed/)
+})
+
+test('explicit output capture rejects directories, pathspecs, out-of-scope paths and symlink ancestors', async t => {
+  const { workspaces, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  await symlink('answer.txt', path.join(member.workspace, 'src/link.txt'))
+  await symlink('src', path.join(member.workspace, 'linked'))
+  for (const name of ['src/', 'src', '../outside.txt', 'outside.txt', 'src/*.txt', 'src/link.txt', 'linked/answer.txt', '.git/config']) {
+    await assert.rejects(workspaces.captureArtifact(member, task, [name]), error => error.code?.startsWith('invalid_deliverable'))
+  }
+  assert.equal(await git(member.workspace, 'log', '-1', '--format=%s'), 'initial', 'invalid requests publish no commit')
 })
 
 test('scope enforcement rejects a rename that moves a path out of scope and keeps in-scope renames', async t => {
@@ -443,8 +486,9 @@ test('capture refuses symlinks that escape the member workspace and keeps contai
   assert.equal(await git(member.workspace, 'show', `${artifact.commit}:src/answer-link`), 'answer.txt')
 })
 
-test('verification cleanup failure never masks the check result and is recorded', async t => {
-  const { workspaces, member, task, temp } = await fixture(t)
+test('verification cleanup failure never masks the check result and is reported to the host', async t => {
+  const failures = []
+  const { workspaces, member, task, temp } = await fixture(t, { onCleanupFailure: info => failures.push(info) })
   await workspaces.prepareTask(member, task, [])
   await writeFile(path.join(member.workspace, 'src', 'answer.txt'), '42\n')
   const artifact = await workspaces.captureArtifact(member, task)
@@ -453,7 +497,12 @@ test('verification cleanup failure never masks the check result and is recorded'
   assert.equal(results.length, 1)
   assert.equal(results[0].exitCode, 0, JSON.stringify(results))
   assert.match(results[0].output, /checked/)
-  assert.ok(workspaces.cleanupFailures().some(issue => /cleanup failed/.test(issue)), 'the cleanup failure is recorded separately')
+  assert.equal(failures.length, 1, 'the cleanup failure is reported separately from the check result')
+  assert.equal(failures[0].missionId, task.missionId)
+  assert.equal(failures[0].taskId, task.id)
+  assert.equal(failures[0].memberId, member.id)
+  assert.match(failures[0].checkout, /verification/, 'the report names the checkout that could not be removed')
+  assert.ok(failures[0].reason.length > 0, 'the removal failure reaches the host')
   assert.deepEqual(await readdir(path.join(temp, 'worktrees', 'mission-one', 'verification')), [], 'the fallback still reclaims the checkout')
 })
 

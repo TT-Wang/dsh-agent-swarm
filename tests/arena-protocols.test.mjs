@@ -24,46 +24,25 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
+import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MEMBER_TOOLS, hiddenToolsFor } from '../lib/tools.js'
 import { TRACE_STEPS } from '../lib/trace.js'
-import { arenaLedgerDigest, noticeFingerprint, pendingReadiness, proposalAllowance } from '../lib/arena.js'
+import { arenaLedgerDigest, hasNotice, noticeFingerprint, noticeLedger, pendingReadiness, proposalAllowance } from '../lib/arena.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const DEFAULT_BUDGET = { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 600000, maxTasks: 6, maxExperiments: 1 }
-
-/** Fake adapter: no auto-dispatch, records every delivery, no filesystem effects. */
-class Workers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+const DEFAULT_BUDGET = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxTasks: 6, maxExperiments: 1 }
 
 async function fixture(t, options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-arena-'))
-  const stateDirectory = join(root, 'state')
+  // Fake adapter: no auto-dispatch, records every delivery, no filesystem effects.
+  const { dir: root, config, runtime, workers } = await makeRuntime(t, {
+    workers: new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] }),
+    config: { maxEvents: 500, maxTasksPerMember: 4, checkTimeoutMs: undefined } })
   const workspace = join(root, 'workspace')
-  await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
-  const config = { statePath: join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 4 }
-  // Production composition: src/index.ts spreads the plugin config into the
-  // runtime and adds maxTasksPerMember, the loaded grants and the authorization
-  // predicate. Nothing below injects a value the production path does not get.
-  const runtime = new SwarmRuntime({ ...config, maxTasksPerMember: config.maxTasksPerMember }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const budget = { ...DEFAULT_BUDGET, ...(options.budget ?? {}) }
   const owner = { sessionId: `owner-${randomUUID()}` }
   const mission = runtime.create(owner, {
@@ -74,7 +53,7 @@ async function fixture(t, options = {}) {
   const alice = await runtime.addMember(owner, mission.id, { name: 'alice', role: 'implementation' })
   const bob = await runtime.addMember(owner, mission.id, { name: 'bob', role: 'reviewer' })
   return {
-    root, stateDirectory, workspace, workers, runtime, config, owner, mission, stream, alice, bob,
+    root, workspace, workers, runtime, config, owner, mission, stream, alice, bob,
     budget, aliceActor: { sessionId: alice.sessionId }, bobActor: { sessionId: bob.sessionId },
   }
 }
@@ -87,7 +66,7 @@ function definitions(runtime) {
 const execution = sessionId => ({ signal: new AbortController().signal, agent: { id: sessionId } })
 const proposal = (f, overrides = {}) => ({
   missionId: f.mission.id, workstreamId: f.stream.id, title: 'Worker task',
-  objective: 'Exercise the arena contract', kind: 'research', scope: ['src/'], acceptance: ['the arena works'], ...overrides,
+  objective: 'Exercise the arena contract', kind: 'research', scope: ['src/'], acceptance: ['the arena works'], outputs: [], ...overrides,
 })
 const notices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice !== undefined)
 const records = f => ({
@@ -104,69 +83,26 @@ const authorityRecords = f => JSON.stringify({
   members: f.runtime.store.list('members', f.mission.id),
   evidence: f.runtime.store.list('evidence', f.mission.id),
 })
-async function eventually(read, message, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-
-test('R11-17: the per-member allowance is derived from the owner-set ceiling, and refusal wakes the owner with member, limit and reason', async t => {
+test('proposal capacity is the aggregate mission budget and never shrinks when the roster expands', async t => {
   const f = await fixture(t, { budget: { maxTasks: 6, maxWorkers: 2 } })
-  const tools = definitions(f.runtime)
-  const propose = tools.get('swarm_propose')
+  const propose = definitions(f.runtime).get('swarm_propose')
   const alice = execution(f.alice.sessionId)
-  const bob = execution(f.bob.sessionId)
-
-  // ceil(6 / 2) = 3. The owner-proposed count is not a worker allowance.
-  for (let index = 0; index < 3; index++) {
+  for (let index = 0; index < 6; index++) {
     const admitted = await propose.execute(proposal(f, { title: `Alice task ${index}` }), alice)
-    assert.equal(admitted.result.proposedBy, f.alice.id, 'the durable proposer key is host-derived')
+    assert.equal(admitted.result.proposedBy, f.alice.id)
   }
-  const before = f.runtime.store.list('tasks', f.mission.id).length
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3' }), alice), /per-member proposal allowance/)
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, before, 'a refused proposal admits nothing')
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).filter(task => task.proposedBy === f.alice.id).length, 3)
-
-  const refusal = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/proposal-refused').at(-1)
-  assert.ok(refusal, 'the refusal is a durable event')
-  assert.equal(refusal.data.memberId, f.alice.id)
-  assert.equal(refusal.data.limit, 3)
-  assert.match(refusal.data.reason, /allowance/)
-  const allowanceNotice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
-  assert.ok(allowanceNotice, 'the refusal records an owner notice')
-  assert.match(allowanceNotice.content, new RegExp(f.alice.id), 'the notice names the member')
-  assert.match(allowanceNotice.content, /limit 3/, 'the notice names the limit')
-  assert.match(allowanceNotice.content, /allowance/, 'the notice names the reason')
-
-  // An identical retry, and a retry with a different title, are the same
-  // decision in the same state: one notice, no spam.
-  const afterFirst = notices(f).length
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3' }), alice), /per-member proposal allowance/)
-  await assert.rejects(propose.execute(proposal(f, { title: 'Alice task 3 renamed' }), alice), /per-member proposal allowance/)
-  assert.equal(notices(f).length, afterFirst, 'an unchanged state does not spam the owner')
-  // No tool argument is a lever: the allowance is a function of durable state.
-  await assert.rejects(propose.execute({ ...proposal(f, { title: 'Alice task 3' }), maxProposalsPerMember: 99 }, alice), /per-member proposal allowance/)
-  assert.equal(notices(f).length, afterFirst, 'an extra tool argument grants nothing')
-
-  // A different member's refusal in that state is a different decision.
-  for (let index = 0; index < 3; index++) await propose.execute(proposal(f, { title: `Bob task ${index}` }), bob)
-  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 6, 'the mission ceiling is now full')
-  await assert.rejects(propose.execute(proposal(f, { title: 'Bob task 3' }), bob), /task budget exhausted/)
-  const ceilingNotice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
-  assert.equal(notices(f).length, afterFirst + 1, 'a different member is a new decision')
-  assert.match(ceilingNotice.content, new RegExp(f.bob.id))
-  assert.match(ceilingNotice.content, /task budget exhausted \(6\/6/, 'the ceiling reason and its numbers are named')
-  assert.match(ceilingNotice.content, /limit 6/)
-
-  // A member cannot raise its own allowance: budget updates are owner-only.
-  assert.throws(() => f.runtime.updateBudget(f.aliceActor, f.mission.id, { ...f.budget, maxTasks: 30 }, 'raise my allowance'), /Only the primary user session/)
-
-  // The owner raises the ceiling and the allowance follows; the member can work again.
-  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxTasks: 12 }, 'more board for repairs')
-  const raised = proposalAllowance(f.runtime.store.get('missions', f.mission.id), f.runtime.store.list('members', f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.alice.id)
-  assert.equal(raised.limit, 6, 'ceil(12 / 2)')
-  const admitted = await propose.execute(proposal(f, { title: 'Alice task 4' }), alice)
-  assert.equal(admitted.result.proposedBy, f.alice.id, 'the owner-set ceiling raises the allowance')
+  await assert.rejects(propose.execute(proposal(f, { title: 'Over aggregate' }), alice), /task budget exhausted/)
+  const notice = notices(f).filter(delivery => delivery.notice.class === 'budget').at(-1)
+  assert.match(notice.content, /6\/6/)
+  const count = notices(f).length
+  await assert.rejects(propose.execute(proposal(f, { title: 'Still over aggregate' }), alice), /task budget exhausted/)
+  assert.equal(notices(f).length, count)
+  assert.throws(() => f.runtime.updateBudget(f.aliceActor, f.mission.id, { ...f.budget, maxTasks: 30 }, 'self increase'), /Only the primary user session/)
+  f.runtime.updateBudget(f.owner, f.mission.id, { ...f.budget, maxTasks: 12, maxWorkers: 6 }, 'more repair capacity')
+  const allowance = proposalAllowance(f.runtime.mission(f.mission.id), f.runtime.store.list('members', f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.alice.id)
+  assert.equal(allowance.limit, 12)
+  const admitted = await propose.execute(proposal(f, { title: 'Same member continues' }), alice)
+  assert.equal(admitted.result.proposedBy, f.alice.id)
 })
 
 test('R11-17: the experiment ceiling refuses a worker proposal with an owner notice naming the reason', async t => {
@@ -184,10 +120,15 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   const f = await fixture(t)
   const propose = definitions(f.runtime).get('swarm_propose')
   const alice = execution(f.alice.sessionId)
-  for (let index = 0; index < 3; index++) await propose.execute(proposal(f, { title: `Ledger task ${index}` }), alice)
-  // Trigger the refusal synchronously so the outbox has not drained yet: the
-  // same call through the tool awaits a trace write, which lets setImmediate run.
-  assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger task 3' })), /per-member proposal allowance/)
+  for (let index = 0; index < 6; index++) await propose.execute(proposal(f, { title: `Ledger task ${index}` }), alice)
+  // Let the outbox deliver what the proposals queued, so every pending row below
+  // belongs to the refusal. This used to happen implicitly: each tool call awaited
+  // a trace payload file write, and that I/O yielded to the scheduler pass. The
+  // trace now records only the digest, so the wait is stated instead of implied.
+  await eventually(() => f.runtime.store.list('deliveries', f.mission.id).every(delivery => delivery.deliveredAt !== undefined), 'the proposals\' deliveries never drained', 5000)
+  // Trigger the refusal synchronously so the outbox has not drained its notice yet:
+  // the same call through the tool would yield to the scheduler before the read.
+  assert.throws(() => f.runtime.propose(f.aliceActor, f.mission.id, proposal(f, { title: 'Ledger over capacity' })), /task budget exhausted/)
 
   // Synchronous read: the notice is recorded and queued, not yet delivered.
   const queuedView = f.runtime.noticeLedger(f.owner, f.mission.id)
@@ -214,7 +155,7 @@ test('the notice ledger records sent, queued and claimed with the state fingerpr
   const deliveredEntry = await eventually(() => {
     const entry = f.runtime.noticeLedger(f.owner, f.mission.id).ledger.find(row => row.class === 'budget')
     return entry?.state === 'claimed' ? entry : undefined
-  }, 'the owner notice was never delivered')
+  }, 'the owner notice was never delivered', 5000)
   assert.ok(deliveredEntry.deliveredAt >= deliveredEntry.sentAt)
   const delivered = f.runtime.store.list('deliveries', f.mission.id).find(delivery => delivery.id === deliveredEntry.deliveryId)
   assert.equal(delivered.deliveredAt, deliveredEntry.deliveredAt, 'the transport fact is the adapter delivery timestamp')
@@ -246,7 +187,7 @@ test('swarm_escalate is a typed durable owner escalation that grants no authorit
   assert.match(escalate.description, /grants no authority/)
 
   const source = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Owned work', objective: 'Give alice a live attempt',
+    outputs: [], workstreamId: f.stream.id, title: 'Owned work', objective: 'Give alice a live attempt',
     kind: 'research', scope: ['src/'], acceptance: ['the arena works'],
   })
   const claimed = await f.runtime.claim(f.aliceActor, f.mission.id, source.id)
@@ -324,6 +265,11 @@ test('the arena ledger digest is stable and order-independent; the notice channe
   const notice = { id: 'd1', missionId: 'm', from: 'runtime', to: 'owner', kind: 'control', content: 'x', createdAt: 1, notice: { dedupKey: 'k', class: 'decision', sentAt: 1, queuedAt: 1 } }
   assert.notEqual(arenaLedgerDigest({ ...base, deliveries: [notice] }), arenaLedgerDigest(base), 'the ledger digest counts pending deliveries')
   assert.equal(noticeFingerprint({ ...base, deliveries: [notice] }), noticeFingerprint(base), 'the notice channel is not board state')
+  // A covered fact (recorded against the delivery that carried it) is never sent.
+  const covered = { ...notice, id: 'd3', createdAt: 2, notice: { ...notice.notice, dedupKey: 'k3', sentAt: 2, queuedAt: 2, coveredBy: notice.id } }
+  assert.equal(arenaLedgerDigest({ ...base, deliveries: [covered] }), arenaLedgerDigest(base), 'a covered fact is no pending delivery')
+  assert.deepEqual(noticeLedger([{ ...notice, deliveredAt: 1 }, covered]).map(entry => [entry.id, entry.state]), [['d1', 'claimed']], 'a covered fact is neither a queued entry nor the last notice')
+  assert.equal(hasNotice([covered], { class: 'decision', dedupKey: 'k3', from: 'runtime' }), true, 'a covered fact still deduplicates')
   const assignment = { id: 'd2', missionId: 'm', from: 'runtime', to: 'member_a', kind: 'assignment', content: 'x', createdAt: 1 }
   assert.notEqual(noticeFingerprint({ ...base, deliveries: [assignment] }), noticeFingerprint(base), 'member-bound deliveries still count')
 

@@ -9,17 +9,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { authorizeWorkspace, loadWorkspaceGrants, reauthorizeWorkspace, WORKSPACE_AUTHORIZATION_CODE, WORKSPACE_AUTHORIZATION_REQUIREMENT } from '../lib/authorization.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { registerTools } from '../lib/tools.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { Config } from '../lib/index.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeClock, FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime, makeWorkspaces, makeRuntimeStub } from './faults/harness.mjs'
+import { tempDirectory } from './temp-root.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 const plan = (workspace, extra = {}) => ({
   title: 'Authorized workspace plan', objective: 'Prove the workspace is human-authorized', workspace, scope: ['src/'], acceptance: ['works'],
   budget, members: [{ key: 'analyst', name: 'Analyst', role: 'analysis' }],
@@ -27,6 +27,8 @@ const plan = (workspace, extra = {}) => ({
   tasks: [{ key: 'inspect', workstreamKey: 'main', title: 'Inspect', objective: 'Inspect the repository', kind: 'research', scope: ['src/'], acceptance: ['works'] }],
   ...extra,
 })
+/** swarm_create takes the mission fields only; members, workstreams and tasks are not its parameters. */
+const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
 function definitions(runtime, grants) {
   const registered = new Map()
   registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget, grants)
@@ -34,31 +36,18 @@ function definitions(runtime, grants) {
 }
 function fakeRuntime() {
   const calls = { created: [], staged: [] }
-  return { calls,
+  return makeRuntimeStub({ calls,
     create: (_actor, input) => { calls.created.push(input); return { id: 'mission-1', ...input } },
     createDraft: (_actor, input) => { calls.staged.push(input); return { id: 'draft-1', revision: 1, status: 'draft', input } },
     snapshot: () => undefined,
-  }
+  })
 }
 const execution = (cwd, id = 'owner') => ({ agent: { id, ...(cwd === undefined ? {} : { session: { header: { cwd } } }) }, signal: new AbortController().signal })
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
-}
-class TickingWorkers extends Workers {
-  deliveries = []
-  prepared = 0
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async prepareTask() { this.prepared++ }
-  async captureArtifact() { return { commit: 'artifact', baseCommit: 'base', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-}
+const workspaceWorkers = () => new FakeWorkers({ autoIdle: true, artifact: { commit: 'artifact', baseCommit: 'base', workspace: '/isolated', changedPaths: [] }, checks: [],
+  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
 async function fixture(t) {
-  const temp = await realpath(await mkdtemp(join(tmpdir(), 'swarm-authorized-')))
+  // fixture gap: a temp tree that exists before the runtime, whose grants name paths inside it.
+  const temp = await realpath(await tempDirectory('swarm-authorized-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   const session = join(temp, 'session'), granted = join(temp, 'granted'), foreign = join(temp, 'foreign')
   await mkdir(session); await mkdir(granted); await mkdir(foreign)
@@ -66,12 +55,7 @@ async function fixture(t) {
   await mkdir(project); await mkdir(outside)
   return { temp, session, granted, foreign, project, outside }
 }
-async function eventually(read, message, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-const runtimeConfig = directory => ({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 })
+const runtimeConfig = { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined }
 
 /** Criterion 1: an unauthorized foreign path is refused with the grant diagnostic. */
 test('AC1: a path outside the session cwd and every configured root is refused with the grant-requirement diagnostic', async t => {
@@ -90,40 +74,38 @@ test('AC1: a path outside the session cwd and every configured root is refused w
   const runtime = tools.get('swarm_create')
   const calls = []
   const exec = execution(session)
-  await assert.rejects(runtime.execute(plan(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(runtime.execute(missionFields(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   await assert.rejects(tools.get('swarm_stage').execute(plan(outside), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_create').execute(plan(join(session, '..', 'foreign')), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(join(session, '..', 'foreign')), exec), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   assert.deepEqual(calls, [])
 })
 
 /** Criterion 2: a granted path is accepted, recorded, and audited durably. */
 test('AC2: a granted repository is accepted and the mission records the matched root plus the resolved path', async t => {
-  const { temp, session, granted, project } = await fixture(t)
+  const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
-  const workers = new Workers(), runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, workers)
-  t.after(async () => { await runtime.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
   await runtime.start(grants)
   const loaded = runtime.store.events('swarm/install', 50).filter(event => event.type === 'workspace/grant-loaded')
   assert.equal(loaded.length, 1, 'one grant-loaded audit event per configured root')
   assert.equal(loaded[0].data.path, await realpath(granted))
   assert.equal(loaded[0].data.note, 'human-approved tree')
   const tools = definitions(runtime, grants)
-  const created = await tools.get('swarm_create').execute(plan(project), execution(session))
-  const mission = runtime.store.get('missions', created.result.id)
-  assert.equal(mission.workspace, await realpath(project), 'the resolved path is recorded')
-  assert.equal(mission.workspaceGrantRoot, await realpath(granted), 'the matched root is recorded durably')
-  const bound = runtime.store.events(mission.id, 50).filter(event => event.type === 'mission/workspace-bound')
+  const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
+  const recorded = runtime.store.get('missions', created.result.id)
+  assert.equal(recorded.workspace, await realpath(project), 'the resolved path is recorded')
+  assert.equal(recorded.workspaceGrantRoot, await realpath(granted), 'the matched root is recorded durably')
+  const bound = runtime.store.events(recorded.id, 50).filter(event => event.type === 'mission/workspace-bound')
   assert.equal(bound.length, 1)
-  assert.deepEqual({ workspace: bound[0].data.workspace, grantRoot: bound[0].data.grantRoot }, { workspace: mission.workspace, grantRoot: mission.workspaceGrantRoot })
+  assert.deepEqual({ workspace: bound[0].data.workspace, grantRoot: bound[0].data.grantRoot }, { workspace: recorded.workspace, grantRoot: recorded.workspaceGrantRoot })
   assert.equal(created.result.workspaceGrantRoot, await realpath(granted), 'the tool result exposes the binding')
 })
 
 /** Criterion 3: no model-callable tool can introduce or widen a root. */
 test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen an authorization root', async t => {
-  const { temp, session, granted, project, outside } = await fixture(t)
+  const { session, granted, project, outside } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const workers = new Workers(), runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, workers)
-  t.after(async () => { await runtime.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
   const tools = definitions(runtime, grants)
   // No workspace-bound tool exposes a grant field in its model-visible schema.
   for (const name of ['swarm_create', 'swarm_stage', 'swarm_propose']) {
@@ -133,20 +115,27 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
       assert(!properties.includes(forbidden), `${name} must not expose ${forbidden}`)
     }
   }
-  // A model-supplied wider root is ignored: the configured root wins.
-  const created = await tools.get('swarm_create').execute({ ...plan(project), workspaceGrantRoot: '/', authorizedWorkspaces: [{ path: '/' }], grants: { grants: [{ path: '/' }] } }, execution(session))
-  const mission = runtime.store.get('missions', created.result.id)
-  assert.equal(mission.workspaceGrantRoot, await realpath(granted), 'the model cannot widen the recorded root')
-  // An ungranted path stays refused even when the model supplies a root for it.
-  await assert.rejects(tools.get('swarm_create').execute({ ...plan(outside), workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  // A model-supplied root is not a parameter: the schema check refuses it by
+  // name before the workspace is bound, and nothing is created.
+  await assert.rejects(tools.get('swarm_create').execute({ ...missionFields(project), workspaceGrantRoot: '/', authorizedWorkspaces: [{ path: '/' }], grants: { grants: [{ path: '/' }] } }, execution(session)),
+    /\[tool_arguments_invalid\] swarm_create was called with arguments its parameters schema refuses: "workspaceGrantRoot", "authorizedWorkspaces", "grants" are not parameters/)
+  assert.deepEqual(runtime.store.list('missions'), [])
+  // Without them the configured root wins.
+  const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
+  const recorded = runtime.store.get('missions', created.result.id)
+  assert.equal(recorded.workspaceGrantRoot, await realpath(granted), 'the model cannot widen the recorded root')
+  // An ungranted path stays refused, and a root supplied for it never reaches the binding.
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_create').execute({ ...missionFields(outside), workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)), /\[tool_arguments_invalid\]/)
+  await assert.rejects(tools.get('swarm_stage').execute(plan(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), /\[tool_arguments_invalid\]/)
   // swarm_propose accepts no workspace and cannot re-point an existing mission.
-  const stream = runtime.workstream({ sessionId: 'owner' }, mission.id, { title: 'Main', objective: 'Main' })
-  await runtime.propose({ sessionId: 'owner' }, mission.id, { workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  const stream = runtime.workstream({ sessionId: 'owner' }, recorded.id, { title: 'Main', objective: 'Main' })
+  await runtime.propose({ sessionId: 'owner' }, recorded.id, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   // Extra grant-shaped arguments are ignored: the call may admit an in-mission
   // task or fail for its own reasons, but it can never re-point the mission.
-  await tools.get('swarm_propose').execute({ missionId: mission.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
-  assert.deepEqual({ workspace: runtime.store.get('missions', mission.id).workspace, root: runtime.store.get('missions', mission.id).workspaceGrantRoot }, { workspace: mission.workspace, root: mission.workspaceGrantRoot })
+  await tools.get('swarm_propose').execute({ missionId: recorded.id, workstreamId: stream.id, title: 'Foreign', objective: 'Try to re-point', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [], workspace: outside, workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)).catch(() => undefined)
+  assert.deepEqual({ workspace: runtime.store.get('missions', recorded.id).workspace, root: runtime.store.get('missions', recorded.id).workspaceGrantRoot }, { workspace: recorded.workspace, root: recorded.workspaceGrantRoot })
   // The configured set is a snapshot: mutating the caller's array cannot widen it.
   const mutable = [{ path: granted }]
   const snapshot = await loadWorkspaceGrants(mutable)
@@ -184,7 +173,7 @@ test('AC4: prefix confusion, traversal and symlink escapes are refused; a symlin
   await mkdir(source)
   const git = async (...args) => { const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd: source, timeoutMs: 30000, maxBytes: 100000 }); assert.equal(result.exitCode, 0, result.output); return result.output.trim() }
   await git('init', '-b', 'main'); await writeFile(join(source, 'file.txt'), 'x\n'); await git('add', '.'); await git('commit', '-m', 'initial')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(foreign, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, grants: await loadWorkspaceGrants([]) })
+  const workspaces = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([]) })
   t.after(async () => { await workspaces.dispose() })
   const mission = { id: 'mission-revoked', workspace: await realpath(source), workspaceGrantRoot: await realpath(granted) }
   await assert.rejects(workspaces.prepareBaseline(mission), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
@@ -205,10 +194,9 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
   }
   await initRepo(session); await initRepo(project)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: join(temp, 'snapshots'), checkTimeoutMs: 30000, maxCheckOutputBytes: 100000, confineCheck: argv => argv, grants })
-  const adapter = { bind() {}, prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() }
-  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, adapter)
-  t.after(async () => { await runtime.dispose() })
+  const workspaces = makeWorkspaces(temp, { workspacesRoot: join(temp, 'snapshots'), maxCheckOutputBytes: 100000, grants })
+  const adapter = new FakeWorkers({ prepareBaseline: (mission, signal) => workspaces.prepareBaseline(mission, signal), dispose: () => workspaces.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: adapter, config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
 
   // The native command path records a session authorization for the session cwd.
   const owner = { sessionId: 'owner-t3e', agent: { id: 'owner-t3e', session: { header: { cwd: session } } } }
@@ -233,10 +221,9 @@ test('T3e: prepareStart authorizes a session-cwd baseline and still fences a rem
 
 /** Criterion 5: workers never create missions or use grants; missions cannot be re-pointed. */
 test('AC5: a worker session cannot create a mission or use a grant, and another session cannot re-point a mission', async t => {
-  const { temp, session, granted, project } = await fixture(t)
+  const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const workers = new Workers(), runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants }, workers)
-  t.after(async () => { await runtime.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), grants } })
   const owner = { sessionId: 'owner-a' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = runtime.create(owner, { title: 'Owned', objective: 'Own the workspace', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -245,7 +232,7 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
   assert.throws(() => runtime.create({ sessionId: workerSession }, { title: 'Worker mission', objective: 'Escape', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }), /Workers cannot/)
   assert.throws(() => runtime.createDraft({ sessionId: workerSession }, plan(projectPath, { workspaceGrantRoot: grantedPath })), /Workers cannot/)
   const tools = definitions(runtime, grants)
-  await assert.rejects(tools.get('swarm_create').execute(plan(projectPath), execution(session, workerSession)), /Workers cannot/)
+  await assert.rejects(tools.get('swarm_create').execute(missionFields(projectPath), execution(session, workerSession)), /Workers cannot/)
   // Another owner session of this install cannot re-point the mission, and
   // cannot launch the owner's draft.
   const draft = runtime.createDraft(owner, plan(projectPath, { workspaceGrantRoot: grantedPath }))
@@ -264,26 +251,25 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
 
 /** Criterion 6: removing a root refuses new missions and fences a running one. */
 test('AC6: a removed root refuses new missions and fences a running mission with a blocked reason and an owner notice', async t => {
-  const { temp, session, granted, project } = await fixture(t)
+  const { session, granted, project } = await fixture(t)
   const before = await loadWorkspaceGrants([{ path: granted }])
-  const workers = new TickingWorkers()
-  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, before), grants: before }, workers)
+  const { config, runtime, workers } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, before), grants: before } })
   const owner = { sessionId: 'owner' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = runtime.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   await runtime.start(before)
-  await eventually(() => workers.prepared > 0, 'the mission never started working')
+  await eventually(() => workers.prepared.length > 0, 'the mission never started working', 15000)
   await runtime.dispose()
   // Human removes the root and restarts: the same durable state, no grant.
   const after = await loadWorkspaceGrants([])
-  const restarted = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after), grants: after }, new TickingWorkers())
+  const restarted = new SwarmRuntime({ ...config, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after), grants: after }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   assert.throws(() => restarted.create(owner, { title: 'New', objective: 'New mission in a revoked root', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   await restarted.start(after)
-  const blocked = await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced')
+  const blocked = await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced', 15000)
   assert.match(blocked.output, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
   assert.equal(revoked.length, 1, 'revocation is recorded durably')
@@ -312,7 +298,7 @@ test('AC7: README.md and docs/known-limitations.md document the authorization mo
 
 /** D1 (review task_fb92df98): the runtime must decide fencing from the configured predicate. */
 test('D1: a runtime wired like the plugin keeps a configured-root mission staffable and unfenced', async t => {
-  const { temp, granted, project } = await fixture(t)
+  const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   // Two production wirings of the same loaded snapshot. `closure only` is the
@@ -320,7 +306,7 @@ test('D1: a runtime wired like the plugin keeps a configured-root mission staffa
   // is the repaired shape. Fencing must depend on the configured predicate, so
   // both must keep a configured-root mission alive while the root is configured.
   for (const [label, extra] of [['closure only', {}], ['closure + grants', { grants }]]) {
-    const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), ...extra }, new Workers())
+    const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants), ...extra } })
     const owner = { sessionId: `owner-${label}` }
     const mission = runtime.create(owner, { title: 'Wired', objective: 'Stay staffable', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
     const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
@@ -333,7 +319,7 @@ test('D1: a runtime wired like the plugin keeps a configured-root mission staffa
   const nestedRepo = join(project, 'nested')
   await mkdir(nestedRepo)
   const nested = await loadWorkspaceGrants([{ path: granted }, { path: project }])
-  const nestedRuntime = new SwarmRuntime({ ...runtimeConfig(temp), grants: nested, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, nested) }, new Workers())
+  const { runtime: nestedRuntime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: nested, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, nested) } })
   const nestedOwner = { sessionId: 'owner-nested' }
   const nestedMission = nestedRuntime.create(nestedOwner, { title: 'Nested', objective: 'Most specific root', workspace: await realpath(nestedRepo), workspaceGrantRoot: await realpath(granted), scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   assert.equal(nestedMission.workspaceGrantRoot, await realpath(project), 'the most specific configured root is recorded')
@@ -341,8 +327,7 @@ test('D1: a runtime wired like the plugin keeps a configured-root mission staffa
   await nestedRuntime.dispose()
   // Revocation under the same wiring still fences.
   const revoked = await loadWorkspaceGrants([])
-  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, revoked) }, new Workers())
-  t.after(async () => { await runtime.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, revoked) } })
   const owner = { sessionId: 'owner-revoked' }
   const mission = runtime.create(owner, { title: 'Revoked', objective: 'Fence', workspace: projectPath, workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await assert.rejects(runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
@@ -363,9 +348,7 @@ test('D2: a verification checkout re-validates the persisted anchor and refuses 
   await writeFile(join(source, 'src', 'answer.txt'), 'base\n')
   await git('add', '.')
   await git('commit', '-m', 'initial')
-  const workspacesRoot = join(foreign, 'worktrees')
-  const options = { workspacesRoot, checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv }
-  const live = new Workspaces({ subprocess: subprocessSeam, ...options, grants: await loadWorkspaceGrants([{ path: granted }]) })
+  const live = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([{ path: granted }]) })
   t.after(async () => { await live.dispose() })
   const mission = { id: 'mission-d2', workspace: await realpath(source), workspaceGrantRoot: await realpath(granted) }
   const member = { id: 'member-d2', missionId: mission.id, workspace: await live.prepareWorkspace(mission, 'member-d2') }
@@ -378,17 +361,17 @@ test('D2: a verification checkout re-validates the persisted anchor and refuses 
   assert.equal(control.length, 1)
   assert.equal(control[0].exitCode, 0, 'the live snapshot still creates the verification checkout')
   // Revoked: the persisted anchor must be read back, so the checkout is refused.
-  const revoked = new Workspaces({ subprocess: subprocessSeam, ...options, grants: await loadWorkspaceGrants([]) })
+  const revoked = makeWorkspaces(foreign, { grants: await loadWorkspaceGrants([]) })
   t.after(async () => { await revoked.dispose() })
   await assert.rejects(revoked.verifyArtifact(member, task, artifact), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
 })
 
 /** D3 (review task_5be8e5d8): an exact-root grant mission must be fenced on revocation. */
 test('D3: a mission whose workspace equals the configured root is staffable and fenced on revocation', async t => {
-  const { temp, session, granted } = await fixture(t)
+  const { session, granted } = await fixture(t)
   const grantedPath = await realpath(granted), sessionPath = await realpath(session)
   const live = await loadWorkspaceGrants([{ path: granted }])
-  const before = new SwarmRuntime({ ...runtimeConfig(temp), grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) }, new Workers())
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) } })
   const owner = { sessionId: 'owner-exact' }
   // The workspace IS the configured root: admission authorizes it as a grant,
   // and the mission must record that source so revocation can be detected.
@@ -407,13 +390,15 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
   // a durable reason, exactly one revocation event and an owner notice, while
   // the session-cwd mission keeps working.
   const after = await loadWorkspaceGrants([])
-  const restarted = new SwarmRuntime({ ...runtimeConfig(temp), grants: after, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after) }, new Workers())
+  const restarted = new SwarmRuntime({ ...config, grants: after, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after) }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   await assert.rejects(restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
   assert.equal(revoked.length, 1, 'exactly one durable revocation event')
   const notice = restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.kind === 'control')
   assert.ok(notice, 'the owner is notified of the revocation')
+  await restarted.settle(mission.id)
+  assert.ok(restarted.store.get('deliveries', notice.id).deliveredAt, 'the adapter delivered the revocation notice to the owner')
   // S4b: `fenceWorkspace` now emits the shared coded workspace terminal, so the
   // owner notice carries that stable code plus the substantive revocation
   // reason; the underlying authorization code stays in the durable event detail.
@@ -430,7 +415,7 @@ test('D3: a mission whose workspace equals the configured root is staffable and 
  * shortcut, at both the module and the runtime site.
  */
 test('X3: a recorded root equal to the workspace fails closed when its source is missing and the root is revoked', async t => {
-  const { temp, granted } = await fixture(t)
+  const { granted } = await fixture(t)
   const grantedPath = await realpath(granted)
   const live = await loadWorkspaceGrants([{ path: granted }])
   const removed = await loadWorkspaceGrants([])
@@ -449,7 +434,7 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
 
   // Runtime path: a durable record that carries the anchor but no source must
   // fence on revocation, and must stay staffable while the root is configured.
-  const before = new SwarmRuntime({ ...runtimeConfig(temp), grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) }, new Workers())
+  const { config, runtime: before } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, grants: live, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, live) } })
   const owner = { sessionId: 'owner-x3' }
   const mission = before.create(owner, { title: 'Missing source', objective: 'Fail closed on revocation', workspace: grantedPath, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
@@ -461,11 +446,38 @@ test('X3: a recorded root equal to the workspace fails closed when its source is
   assert.equal(before.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 0, 'the live root keeps the source-less record authorized')
   await before.dispose()
 
-  const restarted = new SwarmRuntime({ ...runtimeConfig(temp), grants: removed, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, removed) }, new Workers())
+  const restarted = new SwarmRuntime({ ...config, grants: removed, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, removed) }, workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   await assert.rejects(restarted.addMember(owner, mission.id, { name: 'Second', role: 'implementation' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
   assert.equal(revoked.length, 1, 'the source-less record is fenced exactly once on revocation')
   assert.match(revoked[0].data.reason, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  assert.ok(restarted.store.list('deliveries', mission.id).some(delivery => delivery.to === 'owner' && delivery.kind === 'control'), 'the owner is notified of the revocation')
+  const notice = restarted.store.list('deliveries', mission.id).find(delivery => delivery.to === 'owner' && delivery.kind === 'control')
+  assert.ok(notice, 'the owner is notified of the revocation')
+  await restarted.settle(mission.id)
+  assert.ok(restarted.store.get('deliveries', notice.id).deliveredAt, 'the adapter delivered the revocation notice to the owner')
+})
+
+test('G1: grant expiry is judged at the runtime clock\'s instant by admission and by the dispatch fence alike', async t => {
+  // Admission read the runtime clock, but the dispatch and verification fence
+  // called config.authorizeWorkspace, which judged expiry on the wall clock. With
+  // the runtime clock past expiresAt, admission refused a new mission under the
+  // grant while the fence kept the admitted one live.
+  const { granted, project } = await fixture(t)
+  const second = join(granted, 'second')
+  await mkdir(second)
+  const grants = await loadWorkspaceGrants([{ path: granted, expiresAt: Date.now() + 5_000 }])
+  const clock = new FakeClock()
+  // Wired as src/index.ts wires the plugin runtime.
+  const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: { ...runtimeConfig, manualTick: true, now: clock.now, grants,
+    authorizeWorkspace: (workspace, cwd, now) => authorizeWorkspace(workspace, cwd, grants, now) } })
+  const owner = { sessionId: 'owner-expiry' }
+  const grantedPath = await realpath(granted), projectPath = await realpath(project), secondPath = await realpath(second)
+  const input = workspace => ({ title: 'Expiring grant', objective: 'Fence at expiry', workspace, workspaceGrantRoot: grantedPath, workspaceAuthorizationSource: 'grant', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const mission = runtime.create(owner, input(projectPath))
+  await runtime.assertWorkspaceAuthorized(runtime.mission(mission.id))
+  clock.advance(10_000)
+  assert.throws(() => runtime.create(owner, input(secondPath)), /not inside a currently authorizedWorkspaces root/, 'admission refuses the expired grant')
+  await assert.rejects(runtime.assertWorkspaceAuthorized(runtime.mission(mission.id)), /was removed from authorizedWorkspaces or has expired/, 'the dispatch fence refuses it at the same instant')
+  assert.equal(runtime.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked').length, 1, 'the admitted mission is fenced once')
 })

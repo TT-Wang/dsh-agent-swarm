@@ -8,31 +8,17 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { HarnessWorkers } from '../lib/harness-workers.js'
 import { Config } from '../lib/index.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
-
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
+import { tempDirectory } from './temp-root.mjs'
+import { eventually, makeRepo, makeWorkspaces } from './faults/harness.mjs'
 
 async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sleep 0.15') {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-semaphore-')))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'src'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, 'src', 'answer.txt'), 'base\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'fixture baseline')
+  const { root: temp, source } = await makeRepo('swarm-semaphore')
   const checkStarts = []
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    confineCheck: (argv) => { checkStarts.push(Date.now()); return argv }, ...options })
+  const workspaces = makeWorkspaces(temp, { confineCheck: (argv) => { checkStarts.push(Date.now()); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const prepared = []
   for (let index = 0; index < members; index++) {
@@ -50,29 +36,47 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
 
 /**
  * Deadline on hanging, not on speed: the predicates below wait for real check work
- * (git checkout, process spawn, the FIFO slot). The former 4 s default assumed an
- * unloaded host; the assertions are unchanged.
+ * (git checkout, process spawn, the FIFO slot), so each passes a 30 s bound. The
+ * former 4 s default assumed an unloaded host; the assertions are unchanged.
  */
-const eventually = async (read, message, timeoutMs = 30000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
 
 test('R11-19: checkConcurrency 1 serializes declared checks and records the measured envelope', async t => {
-  const f = await semaphoreFixture(t, { checkConcurrency: 1 })
-  const results = await Promise.all(f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact)))
-  for (const result of results) assert.deepEqual(result.map(check => check.exitCode), [0])
+  // Order instead of a wall-clock threshold: each check holds its only slot
+  // until this test releases it (and consumes the release), so the queue and
+  // the serial order are observed by construction. The previous form asserted
+  // `maxWaitMs >= 100` against `sleep 0.15`, which a loaded host broke by
+  // staggering the verifications' Git preparation (saw maxWaitMs=76).
+  let sentinel
+  const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 3, temp => {
+    sentinel = path.join(temp, 'serial-release')
+    return `node -e "const fs=require('fs');const d=Date.now()+30000;while(!fs.existsSync('${sentinel}')&&Date.now()<d){}fs.rmSync('${sentinel}',{force:true})"`
+  })
+  const results = f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact))
+  await eventually(() => { const state = f.workspaces.checkEnvelope(); return state.active === 1 && state.queued === 2 }, 'two declared checks never queued behind the one holding the slot', 30000)
+  const queuedAt = Date.now()
+  const releasedAt = []
+  for (let completed = 1; completed <= 3; completed++) {
+    releasedAt.push(Date.now())
+    await writeFile(sentinel, 'release\n')
+    await eventually(() => f.workspaces.checkEnvelope().completed === completed, `release ${completed} never completed exactly one more check`, 30000)
+    const state = f.workspaces.checkEnvelope()
+    assert.equal(state.maxActive, 1, 'no two checks ran at once')
+    assert.equal(state.active + state.queued, 3 - completed, 'each release let exactly one check through, in turn')
+  }
+  for (const result of await Promise.all(results)) assert.deepEqual(result.map(check => check.exitCode), [0])
   const envelope = f.workspaces.checkEnvelope()
   assert.equal(envelope.limit, 1)
   assert.equal(envelope.maxActive, 1, 'no two checks ran at once')
   assert.equal(envelope.completed, 3)
-  assert.ok(envelope.maxWaitMs >= 100, `two checks had to wait, saw maxWaitMs=${envelope.maxWaitMs}`)
-  assert.ok(envelope.totalRunMs >= 400, 'the checks really ran serially')
-  const samples = f.workspaces.checkEnvelopeSamples()
-  assert.equal(samples.length, 3)
-  for (const sample of samples) { assert.equal(sample.limit, 1); assert.ok(sample.active <= 1) }
-  assert.ok(samples.some(sample => sample.waitMs > 0), 'the queue wait is measured per check')
+  // The third check was queued before `queuedAt` and could only take the slot
+  // once the second check, released second, had finished, so its measured wait
+  // covers that whole interval: the queue wait is really measured, whatever the
+  // host's speed.
+  const queuedFor = releasedAt[1] - queuedAt
+  assert.ok(envelope.maxWaitMs >= queuedFor, `the third check waited for its turn, saw maxWaitMs=${envelope.maxWaitMs} over ${queuedFor} ms queued`)
+  assert.ok(envelope.totalWaitMs >= envelope.maxWaitMs, 'the wait total accumulates every check, not only the longest')
+  assert.equal(envelope.active, 0, 'every slot was released: a leak here would queue every later check forever')
+  assert.equal(envelope.queued, 0, 'no check is left waiting for a slot')
 })
 
 test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', async t => {
@@ -93,9 +97,8 @@ test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', 
   assert.equal(envelope.limit, 3)
   assert.equal(envelope.maxActive, 3, 'all three checks overlapped')
   assert.equal(envelope.completed, 3)
-  const samples = f.workspaces.checkEnvelopeSamples()
-  assert.equal(samples.length, 3)
-  assert.ok(samples.some(sample => sample.active > 1), 'at least two declared checks executed concurrently')
+  // `maxActive === 3` above is the concurrency observation: at least two declared
+  // checks executed at once, measured over the same three completed checks.
   // `CheckSemaphore.acquire` reports `waitMs` as the elapsed time of its whole
   // prologue, not only a real queue wait, so a busy event loop can report 1 ms for a
   // check that never queued: the exact-zero form of this assertion was an unstated
@@ -103,8 +106,9 @@ test('R11-19: checkConcurrency 3 lets checks overlap and records the envelope', 
   // check queued behind another below the limit, which is stated in the units of the
   // hold itself: the default check sleeps 0.15 s, so a genuinely queued check waits
   // at least that long, while the measurement artefact is a millisecond.
+  // `maxWaitMs` is the maximum over every check, so this is exactly "no check
+  // waited for a slot below the limit" — stated once, over all three.
   assert.ok(envelope.maxWaitMs < 100, `no check queued below the limit, saw maxWaitMs=${envelope.maxWaitMs}`)
-  assert.equal(samples.filter(sample => sample.waitMs >= 100).length, 0, 'no check waited for a slot below the limit')
 })
 
 test('R11-19: an aborted queued verification leaves the queue instead of running', async t => {
@@ -118,10 +122,10 @@ test('R11-19: an aborted queued verification leaves the queue instead of running
   const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 2, 'sleep 5')
   const [first, second] = f.prepared
   const running = f.workspaces.verifyArtifact(first.member, first.task, first.artifact)
-  await eventually(() => f.checkStarts.length === 1, 'the first check never started')
+  await eventually(() => f.checkStarts.length === 1, 'the first check never started', 30000)
   const controller = new AbortController()
   const queued = f.workspaces.verifyArtifact(second.member, second.task, second.artifact, controller.signal)
-  await eventually(() => f.workspaces.checkEnvelope().queued === 1, 'the second check was not queued')
+  await eventually(() => f.workspaces.checkEnvelope().queued === 1, 'the second check was not queued', 30000)
   controller.abort(new Error('reviewer cancelled'))
   await assert.rejects(queued, /reviewer cancelled/)
   await running
@@ -131,7 +135,7 @@ test('R11-19: an aborted queued verification leaves the queue instead of running
 })
 
 test('R11-19: the plugin config declares the limit and the composition passes it to the owned Workspaces', async t => {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-semaphore-config-')))
+  const temp = await realpath(await tempDirectory('swarm-semaphore-config-'))
   t.after(async () => rm(temp, { recursive: true, force: true }))
   const base = { statePath: path.join(temp, 'state.sqlite'), workspacesRoot: path.join(temp, 'worktrees') }
   assert.equal(Config(base).checkConcurrency, 2, 'the production default bounds the host')

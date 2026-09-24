@@ -8,57 +8,36 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class RepairWorkers {
-  prepared = []; deliveries = []; stopped = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ to: member.id, ...delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-w12-'))
-  const workers = new RepairWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'w12-owner' }
   const mission = runtime.create(owner, { title: 'W12', objective: 'Repair withdrawn obligations', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
-  const research = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Analyse', objective: 'Analyse',
+  const research = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Analyse', objective: 'Analyse',
     kind: 'research', scope: ['src/'], acceptance: ['works'], ...extra })
   async function accept(task) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     await runtime.verify(actor(reviewer), mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
@@ -75,13 +54,13 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
   assert.equal(f.current(original.id).status, 'cancelled')
   const [cancelled] = f.events('task/cancelled')
   assert.deepEqual(cancelled.data.strandedDependents, [admitted.id], 'the durable event names the stranded dependent')
-  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal')
+  await eventually(() => f.workers.deliveries.find(delivery => delivery.to === 'owner' && /stranded admitted dependents/.test(delivery.content)), 'the owner is told to repair the withdrawal', 2500)
   // A new dependent is still refused while no live repair exists.
   assert.throws(() => f.research({ title: 'New dependent', dependencies: [original.id] }), /no live replacement/)
-  // The repair must keep the original acceptance obligations verbatim.
-  assert.throws(() => f.propose({ title: 'Bad repair', replaces: [original.id], acceptance: ['other'] }), /Missing: \["works"\]/)
   const before = structuredClone(f.current(original.id))
-  const repair = f.propose({ title: 'Corrected repair', replaces: [original.id] })
+  // The repair inherits the withdrawn obligations; its own criterion is added after them.
+  const repair = f.propose({ title: 'Corrected repair', replaces: [original.id], acceptance: ['other', 'works'] })
+  assert.deepEqual(repair.acceptance, ['works', 'other'], 'replaced criteria first, in order, without duplicates')
   assert.equal(repair.status, 'pending', 'a cancelled task admits one live repair')
   assert.deepEqual(repair.replaces, [original.id])
   assert.deepEqual(f.current(original.id), before, 'the cancelled record is byte-for-byte unchanged by the repair')
@@ -100,6 +79,7 @@ test('W12: cancelling a task admits one live repair and re-resolves its dependen
     assert.equal(claimed.status, 'running', 'the dependent becomes ready through the repair lineage')
     // Release the author for the next dependent; the claim itself is the assertion.
     f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: dependent.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'Continue elsewhere' })
+    await eventually(() => f.current(dependent.id).resumeAfterStop === undefined, 'the old worker must stop before it claims different work', 2500)
   }
 })
 

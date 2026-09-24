@@ -1,0 +1,212 @@
+/**
+ * Round-20 control-path fencing regressions.
+ *
+ * Each test pins one defect the 2026-09-18 audit reproduced with a probe on the
+ * unmodified head, and each fails there:
+ *
+ *  1. Every control path that stopped work in flight assembled the same five
+ *     writes by hand and they disagreed. `fenceWorkspace` set a running task to
+ *     blocked and bumped its epoch but left the attempt on the row, left its
+ *     owner out of `priorOwnerIds`, installed no stop marker and never stopped
+ *     the handle: the human withdrew the workspace authorization and the worker
+ *     kept writing to it.
+ *  2. Mission pause/stop and challenge closed attempts with only their own
+ *     domain event, so the trace replay decoder refused — as truncated — a
+ *     durable log this runtime had just written. `task/start-failed` drops the
+ *     attempt too and had the same gap.
+ *  3. Fresh input arriving while a stop barrier was in flight was admitted and
+ *     charged a mission step, and a task cancelled after its ceiling barrier had
+ *     settled left its member parked forever, because the barrier only ever
+ *     releases a member named by a live marker or a running attempt.
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import path from 'node:path'
+import { orchestratorCommands } from '../lib/trace.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
+
+const artifact = commit => ({ commit, baseCommit: '0'.repeat(40), workspace: '/w', changedPaths: ['src/x.ts'] })
+
+async function fixture(t) {
+  // A held stop is released before dispose whatever the test did, so a failed
+  // assertion reports itself instead of wedging the runner on a pending barrier:
+  // registered before makeRuntime's cleanup, which disposes the runtime.
+  const held = {}
+  t.after(() => { held.release?.() })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      autoIdle: true,
+      checks: [{ command: 'npm test', exitCode: 0, output: 'ok' }],
+      async prepareWorkspace(mission, memberId) { return path.join(mission.workspace, memberId) },
+      async captureArtifact(member) { return { ...artifact('a'.repeat(40)), workspace: member.workspace } },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 1000000, maxSteps: 5000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 60 },
+  })
+  runtime.kick = () => {}
+  runtime.pumpOutbox = () => {}
+  const holdStop = () => {
+    workers.stop = async memberId => { workers.stopped.push(memberId); await new Promise(resolve => { held.release = resolve }) }
+    return () => held.release?.()
+  }
+  const owner = { sessionId: `r20-owner-${Math.random()}` }
+  const mission = runtime.create(owner, { title: 'R20', objective: 'Deliver verified work', workspace: directory,
+    scope: ['src/', 'docs/'], acceptance: ['done'], budget })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
+  const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
+  const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  return { directory, runtime, workers, owner, mission, stream, author, reviewer, holdStop, actor: member => ({ sessionId: member.sessionId }) }
+}
+const propose = (f, title, extra = {}) => f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title, objective: title,
+  kind: 'implementation', scope: ['src/'], acceptance: ['done'], checks: ['npm test'], ...extra })
+const current = (f, id) => f.runtime.store.get('tasks', typeof id === 'string' ? id : id.id)
+const memberStatus = (f, memberId) => f.runtime.snapshot(f.owner, f.mission.id).members.find(member => member.id === memberId).status
+const replay = f => orchestratorCommands(f.runtime.store.events(f.mission.id, 2000))
+const barrierSettled = (f, task) => eventually(() => current(f, task).resumeAfterStop === undefined, 'the stop barrier settled', 2000)
+
+// ---------------------------------------------------------------------------
+
+test('R20-1: fencing a revoked workspace drops the attempt, records the owner and stops the handle', async t => {
+  const f = await fixture(t)
+  const task = propose(f, 'Work under a revoked grant', { assigneeId: f.author.id })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  const epoch = current(f, task).epoch
+
+  f.runtime.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')
+
+  const row = current(f, task)
+  assert.equal(row.status, 'blocked', 'the task is blocked with the revocation reason')
+  assert.equal(row.attempt, undefined, 'the fenced attempt is gone from the row')
+  assert.deepEqual(row.priorOwnerIds, [f.author.id], 'the outgoing owner is durable, so a later review stays independent of it')
+  assert.equal(row.epoch, epoch + 1, 'the epoch bump invalidates the outstanding lease')
+  assert.equal(row.resumeAfterStop?.epoch, row.epoch, 'the stop obligation is recorded at the current epoch')
+  assert.equal(row.resumeAfterStop?.memberId, f.author.id)
+  assert.equal(row.resumeAfterStop?.reason, 'invalidated', 'revocation is terminal for this host process; the barrier must not re-pend it')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the fenced handle was actually stopped', 2000)
+  await barrierSettled(f, task)
+  assert.equal(current(f, task).status, 'blocked', 'the settled barrier leaves the revoked task blocked')
+  // The fenced attempt can never resume against the revoked root.
+  assert.throws(() => f.runtime.attempts.ownAttempt(f.actor(f.author), f.mission.id, task.id, claimed.attempt.id),
+    /Stale or unauthorized/, 'the fenced attempt no longer owns the task')
+})
+
+test('R20-2: replay accepts the log a mission pause, resume and re-claim writes', async t => {
+  const f = await fixture(t)
+  const task = propose(f, 'Paused work', { assigneeId: f.author.id })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.runtime.control(f.owner, f.mission.id, 'pause', 'Owner pauses the mission')
+  await barrierSettled(f, task)
+  f.runtime.control(f.owner, f.mission.id, 'resume', 'Owner resumes the mission')
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Withdraw the work' })
+
+  const replayed = replay(f)
+  assert.deepEqual(replayed.unresolved, [], 'both dispatches reached a closing event')
+  assert.equal(replayed.commands.filter(command => command.kind === 'dispatch').length, 2, 'the replay keeps both dispatches')
+  const fenced = f.runtime.store.events(f.mission.id, 2000).filter(event => event.type === 'attempt/fenced')
+  assert.deepEqual(fenced.map(event => event.data.cause), ['mission-pause', 'owner-cancel'], 'one uniform closer per fence, naming its cause')
+  assert.equal(fenced[0].data.taskId, task.id)
+})
+
+test('R20-3: replay accepts the log an owner stop writes', async t => {
+  const f = await fixture(t)
+  const task = propose(f, 'Stopped work', { assigneeId: f.author.id })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.runtime.control(f.owner, f.mission.id, 'stop', 'Owner stops the mission')
+
+  const replayed = replay(f)
+  assert.deepEqual(replayed.unresolved, [], 'the stopped attempt reached a closing event')
+  assert.equal(current(f, task).status, 'cancelled')
+  assert.deepEqual(f.runtime.store.events(f.mission.id, 2000).filter(event => event.type === 'attempt/fenced').map(event => event.data.cause), ['mission-stop'])
+})
+
+test('R20-4: replay accepts the log a failed worker start writes', async t => {
+  const f = await fixture(t)
+  const task = propose(f, 'Re-routed work', { assigneeId: f.author.id })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.runtime.onStartFailure(f.runtime.mission(f.mission.id), f.runtime.store.get('members', f.author.id), new Error('worker could not start'))
+  assert.equal(current(f, task).attempt, undefined, 'the start failure dropped the attempt')
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Withdraw the work' })
+
+  const replayed = replay(f)
+  assert.deepEqual(replayed.unresolved, [], 'the attempt the start failure dropped reached a closing event')
+  assert.equal(replayed.commands.filter(command => command.kind === 'dispatch').length, 2)
+})
+
+test('R20-5: a fence in flight refuses every further step of the outgoing handle, uncharged', async t => {
+  const f = await fixture(t)
+  const releaseStop = f.holdStop()
+  const task = propose(f, 'Cancelled mid-flight', { assigneeId: f.author.id })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the claimed attempt steps normally')
+
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Withdraw the work' })
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the cancel barrier asked the adapter to stop the handle', 2000)
+  const charged = f.runtime.mission(f.mission.id).usedSteps
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the outgoing handle takes no further step while its stop is in flight')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and the refused step is never charged to the mission')
+  releaseStop()
+  await barrierSettled(f, task)
+})
+
+test('R20-6: fresh input does not buy a step from a handle whose ceiling barrier is in flight', async t => {
+  const f = await fixture(t)
+  const releaseStop = f.holdStop()
+  const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the first step is admitted')
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the second step blocks at the task ceiling')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the ceiling barrier asked the adapter to stop the exhausted handle', 2000)
+
+  const charged = f.runtime.mission(f.mission.id).usedSteps
+  // The adapter's recovery inbox preserves rejected input across the stop, so a
+  // step bought with `hasFreshInput` is a step the fenced handle never had to
+  // spend: the member sees the same input on its next turn.
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), false, 'fresh input does not bypass the fence')
+  assert.equal(f.runtime.mission(f.mission.id).usedSteps, charged, 'and nothing is charged for it')
+  releaseStop()
+  await barrierSettled(f, bound)
+})
+
+test('R20-7: cancelling a ceiling-blocked task after its barrier settled leaves the member dispatchable', async t => {
+  const f = await fixture(t)
+  const bound = propose(f, 'Bound work', { assigneeId: f.author.id, maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.author), f.mission.id, bound.id)
+  await f.workers.callbacks.beforeStep(f.author.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false, 'the second step blocks at the task ceiling')
+  await barrierSettled(f, bound)
+  assert.equal(current(f, bound).ceiling?.code, 'task_ceiling_exhausted')
+
+  // The barrier has settled, so it can no longer release anyone: the withdrawal
+  // is the last decision that could, and it left the member stranded.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: bound.id, reason: 'The ceiling is not worth raising' })
+  assert.equal(f.runtime.store.get('members', f.author.id).phase, 'active', 'the member is not left waiting on a withdrawn task')
+  assert.equal(memberStatus(f, f.author.id), 'idle')
+  assert.equal(f.runtime.scheduling.startBlocker(f.runtime.store.get('members', f.author.id)), undefined, 'and it is dispatchable again')
+  const next = propose(f, 'Follow-up work', { assigneeId: f.author.id })
+  assert.equal(await f.workers.callbacks.beforeStep(f.author.id), undefined, 'the member can take the step that claims its next task')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, next.id)
+  assert.equal(claimed.attempt.ownerId, f.author.id)
+})
+
+test('R20-8: the cross-mission registry reports a refutation only when the review reached a verdict', async t => {
+  const f = await fixture(t)
+  const source = propose(f, 'Reviewable work', { assigneeId: f.author.id })
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the work',
+    objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id,
+    scope: ['src/'], acceptance: ['done'], checks: [], maxSteps: 1 })
+  await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await f.workers.callbacks.beforeStep(f.reviewer.id)
+  assert.equal(await f.workers.callbacks.beforeStep(f.reviewer.id), false, 'the review blocks at its own step ceiling')
+  await barrierSettled(f, review)
+  assert.equal(current(f, review).status, 'blocked', 'the review is blocked, and no reviewer ever judged the artifact')
+  assert.equal(current(f, review).reviewedCommit, undefined, 'because it never reached the verdict transaction')
+
+  const row = f.runtime.artifacts(f.owner).artifacts.find(item => item.taskId === source.id)
+  assert.equal(row.review.taskId, review.id)
+  assert.equal(row.review.status, 'blocked')
+  assert.equal(row.review.verdict, 'pending', 'a review blocked short of a verdict is not a refutation of the artifact')
+})

@@ -21,17 +21,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { SwarmRuntime } from '../../lib/runtime.js'
+import { FakeWorkers } from '../../tests/faults/harness.mjs'
 
-class InertWorkers {
-  callbacks; prepared = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/inert/${memberId}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(task.id) }
-  async dispose() {}
+/**
+ * The shared recording adapter, never idle, so nothing is dispatched behind the
+ * explicit claims. Only its workspace root is its own, so the member rows (and
+ * the observation bytes printed below) keep their size.
+ */
+class InertWorkers extends FakeWorkers {
+  async prepareWorkspace(_mission, memberId) { return `/inert/${memberId}` }
 }
 
 export function percentile(values, p) {
@@ -61,7 +59,7 @@ export async function runEnvelope({ workerCount }) {
     const members = []
     for (let index = 0; index < workerCount; index++) members.push(await runtime.addMember(owner, mission.id, { name: `load-${index}`, role: 'worker', maxOutputTokens: 1000 }))
     const tasks = members.map((member, index) => runtime.propose(owner, mission.id, {
-      workstreamId: stream.id, title: `load task ${index}`, objective: `run synthetic work ${index}`, kind: 'implementation',
+      outputs: [], workstreamId: stream.id, title: `load task ${index}`, objective: `run synthetic work ${index}`, kind: 'implementation',
       scope: [`src/w${index}/`], acceptance: ['measured'], checks: ['node -e "process.exit(0)"'], assigneeId: member.id,
     }))
     // Hierarchical per-scope limits: a free scope, a task-class cap that must bind

@@ -1,39 +1,66 @@
 /** Admission uses native commands, real Git status, durable runtime and the owner inbox boundary. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, realpath, readFile, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { Context } from '@deepseek-ai/cordis'
-import { Inbox } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerAutomaticStart } from '../lib/planner.js'
-import { Workspaces } from '../lib/workspaces.js'
-import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
-const budget = { maxTokens: 10000, maxSteps: 50, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 10, maxExperiments: 1 }
-async function eventually(read) {
-  const until = Date.now() + 3000
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail('Expected native planner recovery transition did not occur')
+
+/**
+ * The slice of an Agent inbox the planner's owner fixtures exercise. dsh-agent exports no runtime Inbox (the
+ * loop keeps it as ReactLoopInbox), so the fixture models the contract itself:
+ * every insertion is the durable `agent/inbox/spliced` record the planner reads back to decide whether a
+ * recovery notice was already delivered (src/planner.ts), and the queues mirror what the record says.
+ */
+function fakeInbox(session) {
+  const queues = { 'next-turn': [], 'next-step': [] }
+  return {
+    get nextTurn() { return queues['next-turn'] },
+    get nextStep() { return queues['next-step'] },
+    append(target, message) {
+      const event = session.append('agent/inbox/spliced', { target, start: queues[target].length, inserted: [message] })
+      queues[target].push(...event.data.inserted)
+    },
+    remove(id) {
+      for (const [target, queue] of Object.entries(queues)) {
+        const at = queue.findIndex(message => message.id === id)
+        if (at < 0) continue
+        session.append('agent/inbox/spliced', { target, start: at, removedCount: 1, inserted: [], outcome: 'canceled' })
+        queue.splice(at, 1)
+      }
+    },
+  }
 }
+import { SubprocessLocal } from './subprocess-seam.mjs'
+import { FakeClock, FakeWorkers, eventually as poll, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
+const eventually = read => poll(read, 'Expected native planner recovery transition did not occur', 3000)
 async function fixture(t, options = {}) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'swarm-planner-')))
-  const snapshotRoot = await realpath(await mkdtemp(join(tmpdir(), 'swarm-planner-snapshots-')))
+  // Registered before makeRuntime's own cleanup, so the plugin, the idle gates,
+  // the runtime and then the context are released in that order.
+  const ctx = new Context(), idleGates = []
+  let fiber, runtime, workspaces
+  t.after(async () => { await fiber?.dispose(); for (const gate of idleGates) gate.resolve(); await runtime?.dispose(); await ctx.fiber.dispose() })
+  const made = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: async () => { await workspaces?.dispose() } }),
+    config: { tickMs: 60000, maxEvents: 100, checkTimeoutMs: undefined, ...options.config },
+  })
+  runtime = made.runtime
+  // The repository sits beside the state file and the snapshot worktrees, so neither is in its status.
+  const root = join(made.dir, 'source')
+  await mkdir(root)
   const git = args => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
   git(['init', '-q']); git(['-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'initial'])
-  const ctx = new Context()
   await ctx.plugin(SessionStore); await ctx.plugin(CommandRuntime); await ctx.plugin(SubprocessLocal)
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: snapshotRoot, checkTimeoutMs: 10000, maxCheckOutputBytes: 100000, confineCheck: argv => argv })
-  const runtime = new SwarmRuntime({ statePath: join(root, '.git', 'swarm.sqlite'), tickMs: 60000, leaseMs: 60000, maxMessageChars: 16000, maxEvents: 100, maxTasksPerMember: 3, ...options.config }, { bind() {}, async prepareBaseline(mission, signal) { await options.beforeSnapshot?.(signal); return workspaces.prepareBaseline(mission, signal) }, dispose: () => workspaces.dispose() })
+  workspaces = makeWorkspaces(made.dir, { checkTimeoutMs: 10000, maxCheckOutputBytes: 100000 })
   await runtime.start()
   const session = await ctx.sessions.create(SessionId('planner-owner'), { meta: { cwd: root } })
   const pending = Promise.withResolvers()
-  const idleGates = [pending]
+  idleGates.push(pending)
   const messages = []
-  const inbox = new Inbox(session, { inserted() {}, discarded() {}, claimed() {} })
+  const inbox = fakeInbox(session)
   const agent = { id: session.id, session, inbox, options: { provider: 'current', model: 'current-model' },
     send(message, target) { inbox.append(target, message); messages.push(message) },
     followup(message) { this.send(message, 'next-turn') }, whenIdle() { return idleGates.at(-1).promise },
@@ -43,9 +70,8 @@ async function fixture(t, options = {}) {
   ctx.provide('llm', { async resolveCallConfig(selection) { assert.equal(selection.provider, 'current'); assert.equal(selection.model, 'current-model'); if (options.resolve) await options.resolve(); return selection } })
   if (options.flush) ctx.on('session/flush', options.flush)
   const plugin = { name: 'planner-test', inject: ['commands', 'agents', 'llm', 'sessions'], apply(scope) { registerAutomaticStart(scope, runtime) } }
-  let fiber = ctx.plugin(plugin)
+  fiber = ctx.plugin(plugin)
   await fiber
-  t.after(async () => { await fiber.dispose(); for (const gate of idleGates) gate.resolve(); await runtime.dispose(); await ctx.fiber.dispose(); await rm(snapshotRoot, { recursive: true, force: true }); await rm(root, { recursive: true, force: true }) })
   return { root, ctx, runtime, agent, agents, messages, pending, get fiber() { return fiber },
     nextIdle() { const gate = Promise.withResolvers(); idleGates.push(gate); return gate },
     async reload() { await fiber.dispose(); fiber = ctx.plugin(plugin); await fiber },
@@ -200,7 +226,7 @@ test('one owner with a hung flush cannot block another owner recovery notice', a
   const [request] = f.runtime.starts({ sessionId: f.agent.id })
   f.runtime.failStart({ sessionId: f.agent.id }, request.id, 'first owner needs recovery', 1)
   const session = await f.ctx.sessions.create(SessionId('other-planner-owner'), { meta: { cwd: f.root } })
-  const inbox = new Inbox(session, { inserted() {}, discarded() {}, claimed() {} })
+  const inbox = fakeInbox(session)
   const received = []
   const other = { id: session.id, session, inbox, send(message, target) { inbox.append(target, message); received.push(message) } }
   f.agents.set(other.id, other)
@@ -235,6 +261,9 @@ test('an unrepaired validation failure becomes one fenced recovery notice when p
   await assert.rejects(f.runtime.startPlan(actor, request.id, {}, 1))
   const invalid = f.runtime.store.get('starts', request.id)
   assert.equal(invalid.status, 'failed')
+  // The recorded reason the recovery notice quotes is the plain Error rendering,
+  // byte for byte, although the refusal is now typed.
+  assert.equal(invalid.error, 'Error: Title must be nonempty text of at most 16000 characters')
   assert.notEqual(invalid.planningFenced, true, 'same-turn validation repair remains allowed')
   assert.equal(f.messages.filter(message => message.source.phase === 'failure').length, 0)
   f.pending.resolve()
@@ -248,17 +277,26 @@ test('an unrepaired validation failure becomes one fenced recovery notice when p
 })
 
 test('retry snapshot preparation uses the planning deadline rather than the shorter outbox timeout', async t => {
-  let snapshots = 0
-  const f = await fixture(t, { config: { tickMs: 10, stallPassTimeoutMs: 20, planningTimeoutMs: 10000 },
-    async beforeSnapshot(signal) { snapshots++; await new Promise(resolve => setTimeout(resolve, 60)); signal.throwIfAborted() },
+  // Order, not speed. The preparation holds on a timer armed after the dispatch
+  // started, and longer than the outbox timeout, so under the old rule that
+  // timeout's abort always lands first; the hold records what its signal saw.
+  // The planning deadline runs on a frozen fake clock, so a slow host can
+  // neither expire it nor abort the preparation through it, and the wait for
+  // the delivery below bounds a hang, not the speed of the Git snapshot.
+  const clock = new FakeClock()
+  const preparations = []
+  const f = await fixture(t, { config: { tickMs: 10, stallPassTimeoutMs: 20, planningTimeoutMs: 10000, now: clock.now },
+    async beforeSnapshot(signal) { await new Promise(resolve => setTimeout(resolve, 60)); preparations.push(signal.aborted ? 'aborted' : 'held past the outbox timeout'); signal.throwIfAborted() },
   })
   const actor = { sessionId: f.agent.id }
   const request = f.runtime.requestStart(actor, { commandId: 'slow-snapshot', goal: 'finish a slow snapshot', workspace: f.root })
   f.runtime.failStart(actor, request.id, 'snapshot needs a retry', 1)
   f.runtime.controlStart(actor, request.id, 'retry', 'allow the snapshot to finish')
-  await eventually(() => f.messages.some(message => message.source.phase === 'planning' && message.source.planningEpoch === 2)
-    && !f.runtime.store.get('starts', request.id).planningDispatchPending)
-  assert.equal(snapshots, 1, 'the short transport timeout must not repeatedly abort a healthy preparation')
+  await poll(() => preparations.length > 0, 'the retried preparation never reached its snapshot', 30_000)
+  assert.deepEqual(preparations, ['held past the outbox timeout'], 'the short transport timeout must not abort a healthy preparation')
+  await poll(() => f.messages.some(message => message.source.phase === 'planning' && message.source.planningEpoch === 2)
+    && !f.runtime.store.get('starts', request.id).planningDispatchPending, 'the prepared planning message was never delivered', 30_000)
+  assert.deepEqual(preparations, ['held past the outbox timeout'], 'and it ran once, never repeated')
   assert.ok(f.runtime.store.get('starts', request.id).baseline)
   assert.equal(f.runtime.store.get('starts', request.id).status, 'planning')
 })

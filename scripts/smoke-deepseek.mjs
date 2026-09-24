@@ -7,13 +7,14 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv, promisify } from 'node:util'
-import { bootHarness, importHarness } from '../tests/fixtures/built-harness.mjs'
+import { bootHarness, importHarness, toolResultBlocks } from '../tests/fixtures/built-harness.mjs'
 
 const execute = promisify(execFile)
 const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback
 const harnessRoot = resolveHarnessRoot(argument('--harness', undefined))
+assertSupportedHarness(harnessRoot)
 const artifactRoot = resolve(argument('--artifact', project))
 const envPath = argument('--env', undefined)
 const reportPath = resolve(argument('--report', join(project, 'artifacts/deepseek-smoke.json')))
@@ -88,7 +89,7 @@ try {
     })
     if (event.type === 'assistant/message' && event.data.usage) usage.push({ sessionId, ...event.data.usage })
     if (event.type === 'tool/result') {
-      for (const block of event.data.message.content.filter(block => block.type === 'tool-result')) {
+      for (const block of toolResultBlocks([event.data.message])) {
         const call = calls.find(call => call.sessionId === sessionId && call.callId === block.toolCallId)
         toolResults.push({ sessionId, name: call?.name, callId: block.toolCallId, isError: Boolean(block.isError) })
         if (block.isError) toolErrors.push({ sessionId, name: call?.name, detail: redact(JSON.stringify(block)).slice(0, 1200) })
@@ -118,7 +119,7 @@ try {
   await owner.dispose()
   owner = undefined
   const task = ctx.swarm.propose(actor, missionId, {
-    workstreamId: stream.id, title: 'Deliver value two', kind: 'integration', assigneeId: builder.id,
+    outputs: [], workstreamId: stream.id, title: 'Deliver value two', kind: 'integration', assigneeId: builder.id,
     scope: ['value.cjs'], acceptance: ['value.cjs exports 2 and node check.cjs passes'], checks: ['node check.cjs'],
     objective: [
       'Change value.cjs to export 2, preserving check.cjs. Work only in your assigned directory. Be concise.',

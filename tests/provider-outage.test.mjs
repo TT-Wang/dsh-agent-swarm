@@ -8,53 +8,39 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { classifyProviderOutage } from '../lib/scheduler.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class OutageWorkers {
-  started = []
+class OutageWorkers extends FakeWorkers {
+  autoIdle = true
+  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
+  checks = []
   failFor
   failWith
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
   async start(spec) {
     if (spec.member.id === this.failFor) throw this.failWith ?? Object.assign(new Error('provider unavailable'), { status: 503 })
     this.started.push(spec.member.id)
   }
-  async deliver() {}
-  async stop() {}
-  isIdle() { return true }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
 }
 
 async function fixture(t, workers = new OutageWorkers()) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-outage-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  // The runtime clock can be moved past a provider outage window (5 min).
+  const clock = { skew: 0 }
+  const { dir: directory, runtime, budget } = await makeRuntime(t, { workers,
+    config: { maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined, now: () => Date.now() + clock.skew },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'outage-owner' }
   const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: first.id, maxRecoveryAttempts: 1, ...extra })
-  return { directory, runtime, workers, owner, mission, first, second, propose }
-}
-
-const eventually = async (read, message, timeoutMs = 4000) => {
-  const until = Date.now() + timeoutMs
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
+  return { directory, runtime, workers, owner, mission, first, second, propose, clock }
 }
 
 test('R11-01: the adapter classifier maps HTTP status and Harness codes to the closed outage vocabulary', () => {
@@ -101,7 +87,7 @@ test('R11-01: a start failure classified as an outage re-routes without spending
   const routed = await eventually(() => {
     const current = f.runtime.store.get('tasks', task.id)
     return current.assigneeId === f.second.id && current.status === 'running' ? current : undefined
-  }, 'the outage did not re-route the task to the live member')
+  }, 'the outage did not re-route the task to the live member', 4000)
   assert.equal(routed.recoveryCount ?? 0, 0, 'the outage spends no recovery credit')
   const events = f.runtime.store.events(f.mission.id, 500)
   assert.ok(events.some(event => event.type === 'provider/outage' && event.data.class === 'quota'))
@@ -110,9 +96,11 @@ test('R11-01: a start failure classified as an outage re-routes without spending
   assert.equal(startFailed[0].data.quiescent, true, 'the start-failure row is marked as an outage, not a member fault')
   assert.ok(events.some(event => event.type === 'task/reassigned' && event.data.to === f.second.id))
   assert.notEqual(f.runtime.store.get('members', f.first.id).status, 'stopped', 'a quiescent route stays live for a later retry')
-  // Recovery clears the marker durably once the route answers again.
+  // Recovery clears the marker durably once the route answers again. A route
+  // inside its outage window is probed once per window, so move past it.
   workers.failFor = undefined
-  const recovered = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'provider/recovered'), 'the recovered route was not recorded')
+  f.clock.skew += 5 * 60_000 + 1
+  const recovered = await eventually(() => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'provider/recovered'), 'the recovered route was not recorded', 4000)
   assert.equal(recovered.data.memberId, f.first.id)
   assert.equal(f.runtime.store.get('members', f.first.id).providerOutage, undefined)
 })

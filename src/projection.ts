@@ -31,7 +31,23 @@
  * face whether or not a projection registry is mounted.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Member, MemberPhase, MemberStatus, Task, WorkerAdapter } from './types.ts'
+import type { Delivery, Member, MemberPhase, MemberStatus, Task, WorkerAdapter } from './types.ts'
+
+/** Current transport trouble, derived from pending delivery rows rather than another health state machine. */
+export function memberDeliveryHealth(deliveries: readonly Delivery[]): Map<string, { pending: number; failed: number; since: number; reason: string }> {
+  const pending = new Map<string, number>()
+  const failures = new Map<string, { pending: number; failed: number; since: number; reason: string }>()
+  for (const delivery of deliveries) {
+    if (delivery.to === 'owner' || delivery.deliveredAt !== undefined) continue
+    pending.set(delivery.to, (pending.get(delivery.to) ?? 0) + 1)
+    if (delivery.deliveryFailure === undefined) continue
+    const current = failures.get(delivery.to)
+    failures.set(delivery.to, { pending: 0, failed: (current?.failed ?? 0) + 1,
+      since: Math.min(current?.since ?? Infinity, delivery.deliveryFailure.at), reason: delivery.deliveryFailure.reason.slice(0, 500) })
+  }
+  for (const [memberId, value] of failures) value.pending = pending.get(memberId) ?? 0
+  return failures
+}
 
 /** One derived member row: the durable phase plus the derived live status. */
 export interface MissionBoardMember {
@@ -65,7 +81,8 @@ export function ownsLiveAttempt(memberId: string, tasks: readonly Task[]): boole
  * parked member dispatchable), the W6 idle close-out (which owns the attempt
  * until it fences it, so this agrees with it rather than racing it), the dispatch
  * decision (which asks `startBlocker` about the handle, never this status) and
- * the guard board (`guardProgressActions` reads `working` as progress).
+ * the test-side guard model (tests/guard-model.mjs, whose `guardProgressActions`
+ * reads `working` as progress).
  */
 export function deriveMemberStatus(phase: MemberPhase, ownsLiveAttempt: boolean): MemberStatus {
   if (phase === 'stopped') return 'stopped'

@@ -18,8 +18,9 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -36,7 +37,7 @@ async function fixture(t, options = {}) {
   await git(source, 'add', '.')
   await git(source, 'commit', '-m', 'initial')
   const head = await git(source, 'rev-parse', 'HEAD')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-advisory', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Prepare', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -103,8 +104,8 @@ test('A2: a real untracked dependency directory is excluded from preparation and
   assert.equal(await readFile(path.join(member.workspace, 'node_modules', 'dep', 'value.txt'), 'utf8'), 'toolchain\n', 'the dependency directory stays in the workspace')
 })
 
-test('A2: a staged dependency directory is unstaged, while lookalike files and unrelated paths still refuse', async t => {
-  const { workspaces, member, task } = await fixture(t)
+test('A2: a staged dependency directory is unstaged while ordinary lookalike work is preserved before moving on', async t => {
+  const { temp, mission, workspaces, member, task } = await fixture(t)
   await workspaces.prepareTask(member, task, [])
   await mkdir(path.join(member.workspace, 'node_modules', 'dep'), { recursive: true })
   await writeFile(path.join(member.workspace, 'node_modules', 'dep', 'value.txt'), 'toolchain\n')
@@ -127,5 +128,7 @@ test('A2: a staged dependency directory is unstaged, while lookalike files and u
   // A regular file that merely shares a dependency name is ordinary work.
   await rm(path.join(member.workspace, 'vendor'), { recursive: true, force: true })
   await writeFile(path.join(member.workspace, 'node_modules'), 'not a directory\n')
-  await assert.rejects(workspaces.prepareTask(member, { ...task, id: 'task-lookalike' }, []), /uncommitted work/)
+  await workspaces.prepareTask(member, { ...task, id: 'task-lookalike' }, [])
+  const saved = JSON.parse(await readFile(path.join(temp, 'worktrees', mission.id, 'tasks', `${nested.id}.json`), 'utf8'))
+  assert.equal(await git(member.workspace, 'show', `${saved.task.preservedCommit}:node_modules`), 'not a directory')
 })

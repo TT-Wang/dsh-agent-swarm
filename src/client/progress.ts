@@ -1,4 +1,7 @@
+import { EVENT_PANEL_LABELS, type EventKind } from '../events.ts'
 import type { Evidence, Member, Snapshot, Task, WorkerActivity } from '../types.ts'
+import { completionExempt } from '../task-graph.ts'
+import type { LiveWorkRow } from './live-work.ts'
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'paused'
 export interface CurrentProgress { label: string; note?: string; member?: Member; task?: Task; activity?: WorkerActivity; observedAt?: number; stale: boolean }
@@ -31,128 +34,50 @@ export function memberActivity(member: Member, tasks: readonly Task[] | Readonly
 }
 
 /** A transport refresh is not work. Only native activity and persisted task state drive this projection. */
-export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected'): CurrentProgress {
+export function currentProgress(snapshot: Snapshot, connection: ConnectionState = 'connected', rows?: readonly LiveWorkRow[]): CurrentProgress {
   const { mission } = snapshot
   const stale = connection !== 'connected'
   if (statusLabels[mission.status]) return { label: statusLabels[mission.status]!, note: mission.reason, stale }
   const running = runningByOwner(snapshot.tasks)
-  const observed = snapshot.members.flatMap(member => {
+  const observed = (rows ? rows.flatMap(row => row.activity ? [{ member: row.member, activity: row.activity, task: row.task }] : []) : snapshot.members.flatMap(member => {
     const activity = memberActivity(member, running)
     if (!activity) return []
     // A lifecycle notification for a revoked attempt cannot describe the current task.
     return [{ member, activity, task: running.get(member.id) }]
-  }).sort((a, b) => activityPriority[b.activity.kind] - activityPriority[a.activity.kind]
+  })).sort((a, b) => activityPriority[b.activity.kind] - activityPriority[a.activity.kind]
     || b.activity.startedAt - a.activity.startedAt || a.member.id.localeCompare(b.member.id) || a.activity.id.localeCompare(b.activity.id))
   const latest = observed[0]
   if (latest) return { label: activityLabels[latest.activity.kind], ...latest, observedAt: latest.activity.updatedAt, stale }
   const firstRunning = running.values().next().value as Task | undefined
   if (firstRunning) return { label: 'Task in progress', task: firstRunning, note: 'Waiting for the next observed activity.', stale }
   if (snapshot.tasks.some(task => task.status === 'submitted')) return { label: 'Waiting for acceptance', note: 'Submitted work is waiting for independent review.', stale }
-  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || (task.experiment && task.status === 'blocked'))) return { label: 'Preparing the final result', stale }
+  if (snapshot.tasks.length > 0 && snapshot.tasks.every(task => ['accepted', 'cancelled'].includes(task.status) || completionExempt(task, snapshot.tasks))) return { label: 'Preparing the final result', stale }
   return { label: 'Waiting for worker activity', note: mission.reason ?? 'No current worker activity has been observed.', stale }
 }
 
 /** Elapsed wall time describes an observed operation; it is never a completion estimate. */
-/**
- * OWNER PASS 2026-09-11: one member's live row — the state, the task it holds and
- * the bar under it. The bar is determinate only when the snapshot carries a real
- * bound; otherwise it is an indeterminate live bar rather than an invented
- * percentage:
- *  - `steps`: the task's own step ceiling (`usedSteps`/`maxSteps`, both durable);
- *  - `lease`: the attempt's lease countdown (a countdown, not a ratio — the
- *    attempt record has no start instant, so a fraction would be a guess);
- *  - no bound: `percent` is undefined and the CSS animation carries "working".
- */
-export type MemberRowState = 'working' | 'waiting' | 'idle' | 'stopped'
-export interface MemberProgressView {
-  state: MemberRowState
-  task?: Task
-  activity?: WorkerActivity
-  /** 0..100 when a durable bound exists; undefined means an indeterminate live bar. */
-  percent?: number
-  basis?: 'steps' | 'lease'
-  /** `used/limit` for a step ceiling; rendered with the caller's locale. */
-  basisCount?: string
-  /** Whole seconds left on the attempt lease; 0 means it already expired. */
-  leaseRemaining?: number
-}
-export function memberProgress(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>, now: number): MemberProgressView {
-  const task = memberTask(member, tasks)
-  const activity = member.activity ?? memberActivity(member, tasks)
-  const state: MemberRowState = member.phase === 'stopped' || member.status === 'stopped' ? 'stopped'
-    : member.status === 'working' || (task !== undefined && member.status !== 'waiting') ? 'working'
-      : member.status === 'waiting' ? 'waiting' : 'idle'
-  if (task?.usedSteps !== undefined && task.maxSteps !== undefined && task.maxSteps > 0) {
-    const percent = Math.max(0, Math.min(100, (task.usedSteps / task.maxSteps) * 100))
-    return { state, task, ...(activity === undefined ? {} : { activity }), percent, basis: 'steps', basisCount: `${task.usedSteps}/${task.maxSteps}` }
-  }
-  if (task?.attempt !== undefined) {
-    return { state, task, ...(activity === undefined ? {} : { activity }), basis: 'lease',
-      leaseRemaining: Math.max(0, Math.round((task.attempt.leaseUntil - now) / 1000)) }
-  }
-  return { state, task, ...(activity === undefined ? {} : { activity }) }
-}
-/** The running task one member owns, or undefined when it holds none. */
-function memberTask(member: Member, tasks: readonly Task[] | ReadonlyMap<string, Task>): Task | undefined {
-  if (!Array.isArray(tasks)) return (tasks as ReadonlyMap<string, Task>).get(member.id)
-  return (tasks as readonly Task[]).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-}
-
 export function activityDuration(startedAt: number, now: number): { minutes: number; seconds: number } {
   const elapsed = Number.isFinite(startedAt) && Number.isFinite(now) ? Math.max(0, Math.floor((now - startedAt) / 1000)) : 0
   return { minutes: Math.floor(elapsed / 60), seconds: elapsed % 60 }
 }
 
 export interface ProgressEvent { seq: number; createdAt: number; label: string; detail?: string }
+/**
+ * Compatibility label: no writer in this repository's history emits
+ * `attempt/started` (the live kind is `task/claimed`), but a historical card may
+ * still hold rows with it, so the decoder outlives the writer that stopped
+ * emitting. It is the one label that is not a registry kind.
+ */
+const LEGACY_EVENT_LABELS = { 'attempt/started': 'Task started' } as const satisfies Record<string, string>
+/**
+ * The compact panel's labels, derived from the one registry: a kind carries its
+ * label beside its description, or it carries the reason the panel omits it.
+ * There is no second list to keep in step, so a new kind cannot be invisible
+ * here by accident.
+ */
 const meaningfulEvents: Record<string, string> = {
-  'workspace/snapshot': 'Project snapshot saved', 'plan/launched': 'Collaboration started',
-  // Compatibility label: no writer in this repository's history emits
-  // `attempt/started` (the live kind is `task/claimed`), but a historical card
-  // may still hold rows with it — see tests/reader-census.test.mjs, decision
-  // `keep (compatibility)`.
-  'task/claimed': 'Task started', 'attempt/started': 'Task started', 'task/submitted': 'Work submitted for review',
-  'task/accepted': 'Work accepted', 'task/rejected': 'Review requested changes', 'task/blocked': 'Task needs attention',
-  'task/invalidated': 'Dependent work needs another review', 'task/handoff-started': 'Task handoff started',
-  'task/handoff-ready': 'Task handoff completed', 'task/lease-expired': 'Task execution expired',
-  // Round-2 recovery and owner-control events (F-14): these were emitted but invisible on the compact panel.
-  'task/cancelled': 'Task cancelled', 'task/cancelled-at-completion': 'Task cancelled at completion',
-  'task/checkpointed': 'Task workspace checkpointed', 'task/checkpoint-failed': 'Task workspace checkpoint failed',
-  'task/closeout-nudged': 'Worker asked to close out', 'task/closeout-abandoned': 'Abandoned task workspace recovered',
-  'task/closeout-failed': 'Task close-out failed', 'task/git-write-denied': 'Worker git write denied',
-  'mission/stalled': 'Mission stalled',
-  'evidence/published': 'A finding was recorded', 'evidence/challenged': 'A finding was challenged',
-  'evidence/verified': 'A finding was verified', 'evidence/refuted': 'A finding was refuted',
-  'task/review-retired': 'A redundant review was retired', 'member/effort-downgraded': 'Worker reasoning effort downgraded',
-  'mission/recovered': 'Mission recovered', 'mission/budget-warning': 'Budget warning',
-  'task/closeout-ready': 'Task ready to close out', 'task/closeout-exhausted': 'Task close-out limit reached',
-  'task/lease-expiring': 'Task lease expiring', 'task/quiescence-recovered': 'Task recovered after quiescence',
-  'task/ceiling-exhausted': 'Task ceiling reached',
-  'task/preparation-failed': 'Task preparation failed',
-  'task/budget-resumed': 'Task resumed after budget pause', 'task/budget-resume-skipped': 'Task resume skipped',
-  'member/added': 'Worker added', 'member/subscribed': 'Worker subscriptions updated',
-  // L1/L2 receipts: an answer bound to a question, a deliberate dismissal, and a
-  // question an owner turn left unanswered.
-  'message/answered': 'A question was answered', 'message/dismissed': 'A question was closed without an answer',
-  'owner/reply-missing': 'A question to the owner is still unanswered',
-  'mission/pause': 'Mission paused', 'mission/resume': 'Mission resumed', 'mission/stop': 'Mission stopped',
-  'mission/complete': 'Collaboration completed', 'automatic/completed': 'Collaboration completed',
-  'mission/budget-exhausted': 'Resource limit reached', 'member/failure': 'Worker reported a failure',
-  'member/failed': 'Worker could not start', 'automatic/failed': 'Collaboration could not start',
-  'delivery/applied': 'Result applied to project', 'delivery/conflicts': 'Result needs conflict resolution',
-  // R11-08: the review-path, check-change and workspace-authorization families
-  // were emitted but invisible on the compact panel.
-  'task/review-missing': 'Submitted work has no review', 'task/review-admitted': 'Independent review admitted',
-  'task/review-blocked': 'Submitted work cannot be reviewed', 'task/check-changed': 'A declared check changed',
-  // Restart/re-route recovery: a member or task that could not resume is not silent.
-  'member/resume-failed': 'Worker could not resume after restart', 'task/start-failed': 'Task failed to start',
-  'task/reassigned': 'Task re-routed to another member', 'mission/coordinator': 'Mission coordinator set',
-  // The promoted authorized-workspace feature's durable audit events.
-  'workspace/grant-loaded': 'Authorized workspace root loaded', 'mission/workspace-bound': 'Mission bound to an authorized workspace',
-  'mission/workspace-revoked': 'Mission workspace authorization revoked',
-  // T3 integration: the arena-protocol and host-cap emitters (R11-01/07/14/15/17).
-  'escalation/raised': 'A worker escalated to the owner', 'task/proposal-refused': 'Work proposal refused',
-  'provider/outage': 'Provider route paused', 'provider/recovered': 'Provider route recovered',
-  'task/restart-repended': 'Task re-pended after host restart', 'isolation/temp-rendezvous': 'Members shared a temp path',
+  ...LEGACY_EVENT_LABELS,
+  ...Object.fromEntries(Object.entries(EVENT_PANEL_LABELS).map(([kind, panel]) => [kind, panel.en])),
 }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 /**
@@ -170,8 +95,8 @@ const DETAIL_EXCERPT = 400
 function brief(value: unknown): string | undefined { return typeof value === 'string' && value.trim() ? value.slice(0, DETAIL_EXCERPT) : undefined }
 function present(value: string | undefined): value is string { return value !== undefined }
 /** Events whose reason is the owner-facing detail; the task title is only a fallback. */
-const reasonFirst = new Set(['task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
-  'task/review-blocked', 'mission/workspace-revoked'])
+const reasonFirst: ReadonlySet<string> = new Set<EventKind>(['task/verification-deferred', 'task/amended', 'mission/scope-amended', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion', 'task/checkpoint-failed', 'task/closeout-failed', 'mission/stalled',
+  'task/review-blocked', 'mission/workspace-revoked', 'task/recovery-fallback'])
 /** A bounded preview of a changed check list; the Activity view carries the full summary. */
 function checkPreview(value: unknown): string | undefined {
   if (!Array.isArray(value)) return undefined
@@ -212,6 +137,8 @@ function eventDetail(type: string, data: Record<string, unknown>, task: Task | u
   if (type === 'provider/outage') return [brief(data.class), typeof data.status === 'number' ? `HTTP ${data.status}` : undefined].filter(present).join(' · ') || task?.title
   if (type === 'task/restart-repended') return [reason, recoveryCredit(data)].filter(present).join(' · ') || task?.title
   if (type === 'isolation/temp-rendezvous') return brief(data.path) ?? task?.title
+  // The leftover checkout is what the owner has to find; the task itself was verified.
+  if (type === 'task/verification-cleanup-failed') return [brief(data.checkout), reason].filter(present).join(' · ') || task?.title
   if (reasonFirst.has(type)) return reason ?? task?.title ?? evidence?.claim
   return task?.title ?? reason ?? evidence?.claim ?? brief(data.title) ?? brief(data.claim)
 }
@@ -250,9 +177,11 @@ export function acceptanceSummary(snapshot: Snapshot): { accepted: number; total
 
 /**
  * The latest owner-facing reason per task from durable recovery/control events.
- * The W9 preparation failure, checkpoints, close-outs and git denials carry the
- * only actionable explanation; the board surfaces it on the card instead of
- * leaving it in the raw event stream (F-14/F-35).
+ * The W9 preparation failure, checkpoints, close-outs, git denials and the H-3
+ * cross-owner recovery fallback (`task/recovery-fallback`, the capture refusal
+ * and whether the WIP was preserved) carry the only actionable explanation; the
+ * board surfaces it on the card instead of leaving it in the raw event stream
+ * (F-14/F-35).
  */
 export function taskReasons(snapshot: Snapshot): Map<string, string> {
   const reasons = new Map<string, string>()
@@ -345,7 +274,7 @@ export interface SidebarStateView {
 }
 
 const submissionEventTypes = new Set(['task/submitted'])
-const recoveryEventTypes = new Set(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
+const recoveryEventTypes: ReadonlySet<string> = new Set<EventKind | keyof typeof LEGACY_EVENT_LABELS>(['task/claimed', 'attempt/started', 'task/start-failed', 'task/lease-expired', 'task/preparation-failed', 'task/restart-repended', 'task/quiescence-recovered', 'task/checkpointed', 'member/resume-failed'])
 
 /** Newest persisted event for one task among `types`, or undefined. */
 function lastEventAt(snapshot: Snapshot, taskId: string, types: ReadonlySet<string>): number | undefined {

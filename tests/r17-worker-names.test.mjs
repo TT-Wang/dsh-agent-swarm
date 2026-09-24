@@ -1,58 +1,23 @@
 /**
- * R17-G12 (mission acceptance 12): every worker carries a human English name
- * from a fixed pool of at least 40 names containing no vendor or product name,
- * unique within its mission and never reused while the mission is active, with
- * its responsibility kept separately in `role`; the sidebar renders `name · role`
- * beside a deterministic minimal pixel avatar derived from the name; distinct
- * sprites are proven over the whole pool; and every protocol address stays the
- * member id.
- *
- * The proof obligations, in the order the acceptance states them:
- *  1. the pool is exactly the fixed 40-name assignment order and contains no
- *     vendor or product name (test 1);
- *  2. `swarm_add_member` assigns the next unused pooled name when the caller
- *     supplies none — driven THROUGH the registered tool boundary, whose schema
- *     the host's own validator accepts with no `name` — while an explicit name
- *     is still honoured, a duplicate is refused, and `role` is preserved
- *     verbatim (test 2);
- *  3. assignment is deterministic and unique, a name is never reused while the
- *     mission is active (including a stopped member's name), and the name is
- *     chosen by the runtime with no model turn: it is durable even when the
- *     worker itself cannot start (test 3);
- *  4. the pool is the bound: exhausting it refuses a name-less admission with a
- *     named exit while an explicit name still works (test 4);
- *  5. `avatarCells` is pure and deterministic, 8x8 and left-right symmetric with
- *     3-4 colours from the fixed palette and a bounded rect count (test 5);
- *  6. the whole pool yields 40 distinct sprites, the deterministic salt widens
- *     the hash without any hand-drawn per-name exception, and no name literal
- *     appears in the module (test 6);
- *  7. the sprite renders as inline SVG `<rect>`s with `shape-rendering:
- *     crispEdges`, is `aria-hidden`, and adds no image asset, no network
- *     request and no dependency (test 7).
- *
- * Pre-fix evidence: on the pre-change tree this file fails at module load — the
- * pool and `nextWorkerName` are absent from `lib/types.js` and
- * `lib/types/client/avatar.js` does not exist. Independently of that, the
- * no-name admission of test 2 is refused before the runtime is reached on the
- * pre-change tree: `swarm_add_member` declared `required: ['missionId','name',
- * 'role']` and read it through `text(a,'name')`, which throws
- * `[tool_argument_invalid]` for an absent value while the host validator
- * reports `missing required property "name"`.
+ * The fixed human name pool and runtime assignment remain protocol contracts.
+ * The current sidebar renders each durable member identity with the geometric
+ * robot portrait, preserving the separate name and responsibility fields.
+ * Pixel-grid implementation tests were retired with the unused pixel renderer;
+ * agent-identity.test.mjs covers the current deterministic portrait generator.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
+import { validatePlan } from '../lib/plans.js'
+import { PolicyError } from '../lib/policy-error.js'
 import { WORKER_NAME_POOL, nextWorkerName } from '../lib/types.js'
-import { AVATAR_CELL, AVATAR_GRID, AVATAR_MAX_CELLS, AVATAR_PALETTE, avatarCells, fnv1a32 } from '../lib/types/client/avatar.js'
-import { MissionProgress } from '../lib/types/client/MissionProgress.js'
+import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
-import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
 /** The pool as the specification fixes it, in assignment order. */
 const POOL = ['Ada', 'Alan', 'Anita', 'Barbara', 'Beatrice', 'Ben', 'Carol', 'Dennis', 'Dora', 'Ed',
@@ -65,26 +30,17 @@ const VENDORS = ['claude', 'anthropic', 'openai', 'chatgpt', 'gpt', 'gemini', 'b
   'vertex', 'nvidia', 'apple', 'cohere', 'perplexity', 'huggingface', 'replit', 'tabnine', 'codex',
   'dsh', 'harness', 'swarm', 'agent']
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 6, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
-const spriteKey = sprite => JSON.stringify(sprite.cells.map(cell => [cell.x, cell.y, cell.color]))
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 6, maxTasks: 10, maxExperiments: 2 }
 
 /** The only external boundary the runtime talks to; every host operation is controlled by the test. */
-class Workers {
-  started = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start(spec) { this.started.push(spec.member.id); if (this.refuseStart) throw new Error('worker refused to start') }
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
-}
+const newWorkers = (overrides = {}) => new FakeWorkers({ autoIdle: true, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }, ...overrides })
 
 async function scenario(t, options = {}) {
-  const directory = await tempDirectory('swarm-worker-names-')
-  const workers = options.workers ?? new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  const { dir: directory, runtime, workers } = await makeRuntime(t, {
+    workers: options.workers ?? newWorkers(),
+    config: { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+  })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner-worker-names' }
   const mission = runtime.create(owner, { title: 'Worker identity', objective: 'Name every worker from the fixed pool',
     workspace: directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: options.maxWorkers ?? budget.maxWorkers } })
@@ -180,7 +136,7 @@ test('assignment is unique, never reused while the mission is active, and needs 
 
   // The name is chosen by the runtime, before and independently of any worker
   // start: a worker that cannot start still leaves its pooled name durable.
-  const refusing = await scenario(t, { workers: Object.assign(new Workers(), { refuseStart: true }) })
+  const refusing = await scenario(t, { workers: newWorkers({ startError: new Error('worker refused to start') }) })
   await assert.rejects(refusing.add({ role: 'refused' }), /refused to start/)
   const stopped = refusing.rows().find(row => row.status === 'stopped')
   assert.ok(stopped, 'the failed admission is durable')
@@ -196,101 +152,58 @@ test('the pool is the bound: exhaustion refuses a name-less admission by name an
   }
   await assert.rejects(f.add({ role: 'overflow' }), /pool|name/i, 'an exhausted pool refuses a name-less admission with a named exit')
   await assert.rejects(f.add({ role: 'overflow' }), error => /explicit/i.test(error.message), 'the refusal names the explicit-name exit')
+  // The same inline code is typed here as on the plan path, with the same category and unchanged bytes.
+  await assert.rejects(f.add({ role: 'overflow' }), error => {
+    assert.ok(error instanceof PolicyError, `the refusal is typed: ${error}`)
+    assert.equal(error.code, 'worker_name_pool_exhausted')
+    assert.equal(error.category, 'budget_error')
+    assert.equal(error.message, '[worker_name_pool_exhausted] The fixed worker-name pool has no unused name left Supply an explicit `name` with `swarm_add_member` and retry, or admit this worker into a new mission.')
+    assert.equal(String(error), `Error: ${error.message}`)
+    return true
+  })
+  const planned = { title: 'P', objective: 'O', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: POOL.length + 1 },
+    members: [...POOL.map((name, index) => ({ key: `m${index}`, name, role: 'worker' })), { key: 'extra', role: 'worker' }],
+    workstreams: [{ key: 'w', title: 'W', objective: 'W' }],
+    tasks: [{ key: 't', workstreamKey: 'w', title: 'T', objective: 'Read', kind: 'research', scope: ['src/'], acceptance: ['works'] }] }
+  assert.throws(() => validatePlan(planned), error => error.code === 'worker_name_pool_exhausted' && error.category === 'budget_error')
   assert.equal(f.rows().length, POOL.length, 'the refusal admitted nothing')
   const named = await f.add({ role: 'overflow', name: 'Zoe' })
   assert.equal(named.name, 'Zoe', 'a caller-supplied name still admits after pool exhaustion')
   assert.equal(new Set(f.rows().map(row => row.name)).size, f.rows().length)
 })
 
-test('avatarCells is pure, deterministic, symmetric, palette-bound and rect-bounded', () => {
-  // FNV-1a, 32-bit, against its published vectors.
-  assert.equal(fnv1a32(''), 0x811c9dc5)
-  assert.equal(fnv1a32('a'), 0xe40c292c)
-  assert.equal(fnv1a32('foobar'), 0xbf9cf968)
-  assert.equal(AVATAR_GRID, 8, 'the sprite is an 8x8 grid')
-  assert.ok(AVATAR_CELL > 0)
-  assert.ok(AVATAR_PALETTE.length >= 4, 'a fixed palette of at least four colours')
-  assert.equal(new Set(AVATAR_PALETTE).size, AVATAR_PALETTE.length)
-  for (const name of [...POOL, 'Atlas', '', 'x', 'Yukihiro']) {
-    const sprite = avatarCells(name)
-    assert.equal(sprite.grid, AVATAR_GRID)
-    assert.equal(sprite.cell, AVATAR_CELL)
-    assert.deepEqual([...sprite.colors], [...new Set(sprite.colors)], 'the sprite names each of its colours once')
-    assert.ok(sprite.colors.length >= 3 && sprite.colors.length <= 4, `${name}: 3-4 colours (got ${sprite.colors.length})`)
-    for (const color of sprite.colors) assert.ok(AVATAR_PALETTE.includes(color), `${color} comes from the fixed palette`)
-    assert.ok(sprite.cells.length >= 24, `${name}: a sprite is not a sliver (${sprite.cells.length} rects)`)
-    assert.equal(sprite.cells.length % 2, 0, 'cells come in mirrored pairs')
-    assert.ok(sprite.cells.length <= AVATAR_MAX_CELLS, `${name}: the rect count is bounded (${sprite.cells.length} <= ${AVATAR_MAX_CELLS})`)
-    // Every cell is on the grid, carries a selected colour, and its mirror exists with the same colour.
-    const byKey = new Map(sprite.cells.map(cell => [`${cell.x}:${cell.y}`, cell.color]))
-    assert.equal(byKey.size, sprite.cells.length, 'no cell is drawn twice')
-    for (const cell of sprite.cells) {
-      assert.ok(Number.isInteger(cell.x) && cell.x >= 0 && cell.x < AVATAR_GRID, `${name}: x ${cell.x} is on the grid`)
-      assert.ok(Number.isInteger(cell.y) && cell.y >= 0 && cell.y < AVATAR_GRID, `${name}: y ${cell.y} is on the grid`)
-      assert.ok(sprite.colors.includes(cell.color))
-      assert.equal(byKey.get(`${AVATAR_GRID - 1 - cell.x}:${cell.y}`), cell.color, 'the grid is left-right symmetric')
-    }
-    assert.equal(spriteKey(avatarCells(name)), spriteKey(sprite), 'the same name always yields the same sprite')
-    assert.deepEqual(sprite.cells, avatarCells(name).cells, 'the sprite is a pure function of the name')
-  }
-  // Purity is order-independent: the pool rendered backwards yields the same sprites.
-  const forward = POOL.map(name => spriteKey(avatarCells(name)))
-  const backward = [...POOL].reverse().map(name => spriteKey(avatarCells(name))).reverse()
-  assert.deepEqual(backward, forward, 'no call order or shared state changes a sprite')
-})
-
-test('the whole pool yields 40 distinct sprites, widened by salt and never by a hand-drawn exception', async () => {
-  const sprites = POOL.map(name => spriteKey(avatarCells(name)))
-  assert.equal(sprites.length, 40)
-  assert.equal(new Set(sprites).size, 40, '40 names yield 40 distinct sprites')
-  // The deterministic widening knob: every salt re-derives the whole family, and
-  // the pool stays collision-free at each of them, so a collision is fixed by
-  // salting the hash rather than by a per-name exception.
-  for (const salt of [0, 1, 2, 3]) {
-    const salted = POOL.map(name => spriteKey(avatarCells(name, salt)))
-    assert.equal(new Set(salted).size, 40, `the pool stays 40/40 distinct at salt ${salt}`)
-    assert.deepEqual(POOL.map(name => spriteKey(avatarCells(name, salt))), salted, 'the salt is deterministic')
-  }
-  let widened = 0
-  for (const name of POOL) {
-    if (spriteKey(avatarCells(name, 1)) !== spriteKey(avatarCells(name))) widened++
-    if (spriteKey(avatarCells(name, 2)) !== spriteKey(avatarCells(name))) widened++
-  }
-  assert.ok(widened > 40, 'salting genuinely re-derives the family instead of being inert')
-  // No hand-drawn exception: the module never names a pool member.
-  const source = await readFile(new URL('../src/client/avatar.ts', import.meta.url), 'utf8')
-  for (const name of POOL) assert.ok(!source.includes(`'${name}'`) && !source.includes(`"${name}"`), `avatar.ts must not special-case ${name}`)
-  assert.ok(!/https?:|fetch\(|XMLHttpRequest|new Image|\.png|\.svg|\.jpg|\.webp/.test(source), 'no asset, no network, no image format')
-  assert.ok(!/^\s*import\s/m.test(source) && !/\brequire\(/.test(source), 'the avatar module depends on nothing')
-  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
-  assert.equal(Object.hasOwn(pkg, 'dependencies'), false, 'no runtime dependency was added for the avatar')
-})
-
-test('the sidebar renders name · role beside an aria-hidden crispEdges sprite and adds no asset or request', async t => {
+test('the sidebar renders name · role beside a stable accessible inline robot portrait without remote assets', async t => {
   const f = await scenario(t)
   const role = 'Replacement slot; implements exactly the acceptance strings it replaces'
   const member = await f.add({ role })
   // The real observation path the worker adapter uses, so the snapshot is durable state.
-  f.workers.callbacks.activity(member.id, { id: 'operation-1', kind: 'model', startedAt: Date.now() - 1000, updatedAt: Date.now() })
+  f.workers.reportActivity(member.id, { id: 'operation-1', kind: 'model', startedAt: Date.now() - 1000, updatedAt: Date.now() })
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.members.find(row => row.id === member.id).activity.kind, 'model')
-  const focus = renderToStaticMarkup(React.createElement(MissionProgress, { snapshot, live: true }))
+  const overview = renderToStaticMarkup(React.createElement(MissionOverview, { snapshot, live: true }))
+  const focus = overview.slice(0, overview.indexOf('class="sw-live-view'))
   assert.ok(focus.includes(`${member.name} · ${role}`), 'the focus line names the member with the role beside it')
   assert.ok(focus.includes(`data-swarm-worker-name="${member.name}"`), 'the name is addressable in the projection')
   assert.ok(focus.includes(`data-swarm-worker-role="${role}"`), 'the role is addressable in the projection')
-  // OWNER PASS 2026-09-11: the sprite is drawn in the member's own row (the team
-  // strip), not floating in the mission focus line where it used to be; the focus
-  // line keeps the identity text and the row carries name · role beside the sprite.
   assert.ok(!focus.includes('<svg'), 'the mission focus line draws no avatar')
-  const markup = renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot, onOpenWorker() {} }))
-  assert.ok(markup.includes('data-swarm-team'), 'the team strip is part of the default overview')
-  const row = markup.slice(markup.indexOf(`data-swarm-member="${member.id}"`), markup.indexOf('Open conversation'))
-  assert.ok(row.includes(`${member.name}`) && row.includes(`${role}`), 'the member row shows the name with the role beside it')
-  assert.ok(row.includes('shape-rendering="crispEdges"'), 'the sprite is rendered with crispEdges in the member row')
-  assert.ok(markup.includes('aria-hidden="true"'), 'the sprite is decorative; the name text carries identity')
-  const rects = (markup.match(/<rect /g) ?? []).length >= avatarCells(member.name).cells.length ? markup.match(/<rect /g) : []
-  assert.equal(rects.length, avatarCells(member.name).cells.length * snapshot.members.length, 'one sprite per member, each drawn as inline rects')
-  assert.ok(rects.length <= AVATAR_MAX_CELLS && rects.length >= 24, `the drawn rect count is bounded (${rects.length})`)
-  assert.ok(!/<image|xlink:href|url\(|https?:|data:/i.test(markup), 'the sprite is inline: no image asset and no network request')
-  assert.ok(!markup.includes('<img'), 'no image element is introduced')
+  t.mock.method(globalThis, 'fetch', () => assert.fail('rendering a member portrait must not make a network request'))
+  const render = value => renderToStaticMarkup(React.createElement(SwarmBoard, { snapshot: value, onOpenWorker() {} }))
+  const memberRow = markup => {
+    const start = markup.indexOf(`data-swarm-member="${member.id}"`)
+    assert.ok(start >= 0, 'the member has an addressable conversation button')
+    return markup.slice(start, markup.indexOf('</button>', start))
+  }
+  const markup = render(snapshot), row = memberRow(markup)
+  assert.ok(row.includes(member.name) && row.includes(role), 'the member row shows the name with the role beside it')
+  assert.ok(row.includes(`aria-label="Open conversation: ${member.name}"`), 'the member navigation remains accessible')
+  assert.ok(row.includes(`data-agent-identity="${member.id}"`), 'the portrait is bound to the durable member, not its display name')
+  assert.ok(row.includes(`role="img" aria-label="${member.name}`), 'the portrait has an accessible identity label')
+  assert.match(row, /<svg\b[^>]*aria-hidden="true"[^>]*focusable="false"/, 'decorative SVG geometry is hidden from focus and assistive technology')
+  const renamed = structuredClone(snapshot)
+  Object.assign(renamed.members.find(item => item.id === member.id), { name: 'Renamed worker', role: 'Updated responsibility' })
+  const updated = memberRow(render(renamed))
+  assert.ok(updated.includes('Renamed worker') && updated.includes('Updated responsibility'))
+  assert.ok(updated.includes(`data-agent-identity="${member.id}"`))
+  assert.deepEqual(updated.match(/<svg\b[\s\S]*?<\/svg>/)?.[0], row.match(/<svg\b[\s\S]*?<\/svg>/)?.[0], 'renaming or changing the role does not change the robot portrait')
+  assert.ok(!/<(?:image|img|iframe|script|link)\b|\b(?:href|src)=|url\(/i.test(markup), 'the inline portrait introduces no external asset references')
 })

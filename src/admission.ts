@@ -1,9 +1,13 @@
 /** Shared input normalization and repair guidance; matching and authority stay strict. */
-import { spawnSync } from 'node:child_process'
+import { assignmentAllows, canOwnReview, type AssignmentCandidate, type AuthoredTask } from './assignment.ts'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { scopeSubset, validScope, withinScope } from './scope.ts'
+// Declared outputs are checked against the same toolchain names the workspace
+// engine excludes from capture; both sides must never drift apart.
+import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS, SWARM_SCRATCH_DIRNAME } from './workspaces.ts'
 import type { TaskCeiling, TaskCeilingDimension, TaskCeilingProvenance } from './types.ts'
+import { PolicyError, type PolicyErrorCategory } from './policy-error.ts'
 
 /** Accept equivalent notation without guessing a wider path or a repository root. */
 export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
@@ -17,14 +21,24 @@ export function normalizeScopeSelectors(scopes: readonly string[]): string[] {
 
 export function assertScopeSelectors(scopes: readonly string[], location: string, parent?: readonly string[]): void {
   const invalid = scopes.findIndex(selector => !validScope(selector))
-  // The code token trails the pinned `location[` prefix so the browser's
-  // actionable-message allowlist in src/web-api.ts (out of this task's scope)
-  // keeps exposing this refusal; every refusal still carries its stable code.
-  if (invalid !== -1) throw new Error(`${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_invalid]`)
+  // The code token trails the legacy `location[` prefix so the message bytes
+  // stay the ones tests and callers pin; the category is the one errorTypeFor
+  // always derived from this text (it says "budget").
+  if (invalid !== -1) throw new AdmissionError('scope_selector_invalid', 'budget_error', `${location}[${invalid}] is invalid: ${JSON.stringify(scopes[invalid])}. Use literal workspace-relative file paths, directory prefixes ending in "/", or "**". Do not use absolute paths, traversal, wildcard patterns or descriptive prose. Correct \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_invalid]`, `${location}[${invalid}]`)
   if (parent && !scopeSubset(scopes, parent)) {
     const offending = scopes.find(selector => !scopeSubset([selector], parent))
-    throw new Error(`${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow \`scope\` to a subset of the mission \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]`)
+    throw new AdmissionError('scope_selector_out_of_scope', 'budget_error', `${location} exceeds mission scope: ${JSON.stringify(offending)} is not covered by allowed mission selectors ${JSON.stringify(parent)}. Use literal workspace-relative paths or directory prefixes ending in "/", not descriptive prose. Each task selector must match or narrow a mission selector. Narrow \`scope\` to a subset of the mission \`scope\` and retry the same task/request, preserving its kind, acceptance criteria and budget; never broaden scope just to pass validation. [scope_selector_out_of_scope]`, location)
   }
+}
+
+/**
+ * The criteria a repair's stored `acceptance` holds beyond the list its
+ * proposal supplied: what the host inherited from the replaced tasks. An
+ * omitted or malformed proposal list supplied nothing.
+ */
+export function inheritedAcceptance(acceptance: readonly string[], proposed: unknown): string[] {
+  const supplied: readonly unknown[] = Array.isArray(proposed) ? proposed : []
+  return acceptance.filter(criterion => !supplied.includes(criterion))
 }
 
 /** reviewOf already waits for submission; an ordinary edge would wait for acceptance. */
@@ -33,28 +47,25 @@ export function normalizeReviewDependencies(kind: string, reviewOf: string | und
 }
 
 /** The minimal task shape a review path needs: one verification task and its source. */
-export interface ReviewPathCandidate {
+export interface ReviewPathCandidate extends AssignmentCandidate {
   id: string
   kind: string
-  reviewOf?: string
-  status: string
-  assigneeId?: string
+  resumeAfterStop?: { epoch?: number }
 }
 
 /**
- * The live independent review of one source, if any review can still reach a
- * verdict. A review is live only while it can still start: its status is live
- * (pending/running, or a quiescence-parked review the caller supplies), it does
- * not review itself, it is not assigned to the source author, and it is not
- * pinned to a retired member. A cancelled, accepted or author-assigned review is
- * not a review path, so a submitted artifact that only has one is unreviewable
- * and would otherwise sit submitted forever.
+ * The one live-review rule: the review of `source` that can still reach a
+ * verdict. Its status is pending, running or parked (blocked behind a stop at
+ * its own epoch, the `stopPending` marker, so it re-pends once the stop
+ * settles), and at least one live member may own it: independently
+ * (`canOwnReview`) and by assignment (`assignmentAllows`). A review nobody live
+ * may own is no path. The dispatcher's stall, the owner notices, the arena
+ * digest and the runtime's own review admission all answer from this.
  */
-export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], sourceId: string, authorId: string | undefined, liveMemberIds: ReadonlySet<string>,
-  isLiveStatus: (review: T) => boolean = review => review.status === 'pending' || review.status === 'running'): T | undefined {
-  return reviews.find(review => review.kind === 'verification' && review.reviewOf === sourceId && isLiveStatus(review)
-    && (authorId === undefined || review.assigneeId !== authorId)
-    && (review.assigneeId === undefined || liveMemberIds.has(review.assigneeId)))
+export function liveReviewFor<T extends ReviewPathCandidate>(reviews: readonly T[], source: AuthoredTask & { id: string }, liveMemberIds: ReadonlySet<string>): T | undefined {
+  return reviews.find(review => review.kind === 'verification' && review.reviewOf === source.id
+    && (review.status === 'pending' || review.status === 'running' || (review.status === 'blocked' && review.resumeAfterStop !== undefined && review.resumeAfterStop.epoch === review.epoch))
+    && [...liveMemberIds].some(memberId => canOwnReview(source, memberId) && assignmentAllows(review, memberId, reviews)))
 }
 
 /* ------------------------------------------------------------------------- *
@@ -147,12 +158,30 @@ export function taskGraphDiagnostic(defect: TaskGraphDefect, location: string): 
   return { code: defect.code, location, path: defect.target, message: defect.message }
 }
 
+/**
+ * An authored admission refusal: typed for the RPC boundary and the trace, and
+ * carrying the machine-checkable diagnostics it refuses with. A single refusal
+ * is its own diagnostic at `location`; a refusal with several diagnostics
+ * passes them, and its message is their formatted join.
+ */
+export class AdmissionError extends PolicyError {
+  readonly diagnostics: readonly AdmissionDiagnostic[]
+  constructor(code: string, category: PolicyErrorCategory, message: string, location: string, diagnostics?: readonly AdmissionDiagnostic[]) {
+    super(code, category, message)
+    this.name = 'AdmissionError'
+    this.diagnostics = diagnostics ?? [{ code, location, message }]
+  }
+}
+
 /** Authored graph validation, distinguishable from an internal host failure at RPC. */
-export class TaskGraphAdmissionError extends Error {
+export class TaskGraphAdmissionError extends AdmissionError {
   constructor(readonly defects: readonly TaskGraphDefect[]) {
-    super(defects.map(defect => formatDiagnostic(taskGraphDiagnostic(defect, 'task'))).join('\n'))
+    super('task_graph_invalid', 'validation_error', defects.map(defect => formatDiagnostic(taskGraphDiagnostic(defect, 'task'))).join('\n'), 'task',
+      defects.map(defect => taskGraphDiagnostic(defect, 'task')))
     this.name = 'TaskGraphAdmissionError'
   }
+  /** Named before it was typed, so its recorded rendering keeps the name. */
+  override toString(): string { return `${this.name}: ${this.message}` }
 }
 
 /** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
@@ -170,6 +199,8 @@ export function missingReviewDiagnostic(taskId: string, reason: string): Admissi
  * of parsing prose.
  */
 export interface AdmissionDiagnostic {
+  /** Heuristics explain potential risks without granting or denying authority. */
+  severity?: 'advisory'
   code: string
   location: string
   message: string
@@ -201,7 +232,7 @@ export const DEFAULT_TASK_MAX_STEPS = 150
 export const DEFAULT_TASK_MAX_FINDINGS = 50
 
 function assertCeilingValue(value: number, location: string, dimension: TaskCeilingDimension): void {
-  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Set \`maxSteps\` or \`maxFindings\` on this task to a positive safe integer and retry the same task/request.`)
+  if (!Number.isSafeInteger(value) || value < 1) throw new AdmissionError('task_ceiling_invalid', 'validation_error', `[task_ceiling_invalid] ${location}.${dimension} must be a positive safe integer; a zero, fractional or unsafe ceiling cannot bound a task. Set \`maxSteps\` or \`maxFindings\` on this task to a positive safe integer and retry the same task/request.`, `${location}.${dimension}`)
 }
 
 /**
@@ -214,7 +245,7 @@ export function normalizeTaskCeilings(task: TaskCeilingInput, missionMaxSteps: n
   const maxFindings = task.maxFindings ?? DEFAULT_TASK_MAX_FINDINGS
   assertCeilingValue(maxSteps, location, 'maxSteps')
   assertCeilingValue(maxFindings, location, 'maxFindings')
-  if (maxSteps > missionMaxSteps) throw new Error(`[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`)
+  if (maxSteps > missionMaxSteps) throw new AdmissionError('task_ceiling_exceeds_mission_budget', 'budget_error', `[task_ceiling_exceeds_mission_budget] ${location}.maxSteps is ${maxSteps} but the mission maxSteps budget is ${missionMaxSteps}; a task ceiling above the mission ceiling can never bind before the mission budget does. Pass a lower \`maxSteps\` on the task (at most the mission budget) and retry the same task/request, or ask the mission owner to raise \`maxSteps\` inside \`swarm_budget\`'s \`budget\` argument first.`, `${location}.maxSteps`)
   const provenance = (dimension: TaskCeilingDimension, value: number): NonNullable<TaskCeilingProvenance[TaskCeilingDimension]> => {
     const prior = task.ceilingProvenance?.[dimension]
     // Revalidation receives filled-in numbers. Retain their saved origin only
@@ -234,7 +265,6 @@ export interface TaskCeilingState extends TaskCeilingInput {
 /** The exhausted dimension, if the task already consumed its own ceiling. */
 export function taskCeilingExhaustion(task: TaskCeilingState): { dimension: TaskCeilingDimension; limit: number; used: number } | undefined {
   if (task.maxSteps !== undefined && (task.usedSteps ?? 0) >= task.maxSteps) return { dimension: 'maxSteps', limit: task.maxSteps, used: task.usedSteps ?? 0 }
-  if (task.maxFindings !== undefined && (task.evidenceIds?.length ?? 0) >= task.maxFindings) return { dimension: 'maxFindings', limit: task.maxFindings, used: task.evidenceIds?.length ?? 0 }
   return undefined
 }
 
@@ -249,199 +279,81 @@ export function taskCeilingBlock(task: TaskCeilingState, now = Date.now()): Task
   return {
     dimension: exhausted.dimension, limit: exhausted.limit, used: exhausted.used, code: 'task_ceiling_exhausted',
     // The durable reason is thrown and notified verbatim, so the code travels in
-    // the message itself and the exit names the two parameters that exist on
-    // `swarm_propose` after S3 exposed them.
-    reason: `[task_ceiling_exhausted] Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. The task blocks at its own ceiling instead of consuming the mission budget; raise this task's ceiling by proposing its replacement with \`swarm_propose\` — name this task in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` within the mission budget — while keeping its acceptance criteria and kind verbatim.`,
+    // the message itself and the exit names the owner's same-task budget repair.
+    reason: `[task_ceiling_exhausted] Task ceiling exhausted: ${exhausted.dimension} ${exhausted.used}/${exhausted.limit}. Review progress and raise this task's finite \`maxSteps\` through \`swarm_budget\` with \`taskId\`, \`taskBudget\` and \`reason\`, within the mission budget. The original task, acceptance, artifacts and consumed work are preserved.`,
     at: now,
   }
 }
 
-const WRITE_VERBS = new Set([
-  'add', 'adds', 'added', 'adding', 'append', 'appends', 'appended', 'appending',
-  'commit', 'commits', 'committed', 'committing', 'create', 'creates', 'created', 'creating',
-  'delete', 'deletes', 'deleted', 'deleting', 'deliver', 'delivers', 'delivered', 'delivering',
-  'document', 'documents', 'documented', 'documenting', 'edit', 'edits', 'edited', 'editing',
-  'emit', 'emits', 'emitted', 'emitting', 'generate', 'generates', 'generated', 'generating',
-  'implement', 'implements', 'implemented', 'implementing', 'introduce', 'introduces', 'introduced', 'introducing',
-  'modify', 'modifies', 'modified', 'modifying', 'move', 'moves', 'moved', 'moving',
-  'place', 'places', 'placed', 'placing', 'produce', 'produces', 'produced', 'producing',
-  'publish', 'publishes', 'published', 'publishing', 'record', 'records', 'recorded', 'recording',
-  'remove', 'removes', 'removed', 'removing', 'rename', 'renames', 'renamed', 'renaming',
-  'save', 'saves', 'saved', 'saving', 'ship', 'ships', 'shipped', 'shipping',
-  'store', 'stores', 'stored', 'storing', 'update', 'updates', 'updated', 'updating',
-  'write', 'writes', 'wrote', 'written', 'writing',
-])
-const WRITE_VERB_PATTERN = new RegExp(`\\b(?:${[...WRITE_VERBS].sort((a, b) => b.length - a.length).join('|')})\\b`, 'gi')
-const NEGATION_PATTERN = /\b(?:not|never|no|without|avoid|cannot|can't|don't|doesn't|didn't|mustn't|won't|isn't|aren't|shouldn't|wouldn't|couldn't)\b/i
-const DIRECTIVE_CUE = /\b(?:must|shall|should|will|need(?:s|ed)?\s+to|required\s+to|requires|required|tasked\s+(?:to|with)|responsible\s+for|expected\s+to|ensure|make\s+sure|please|to)\b/i
-const CLAUSE_SPLIT = /(?:[.;!?]\s+|\n+)/
-
-/** A conservative path token: a file with an extension, or a directory prefix ending in "/". */
-export function looksLikePath(token: string): boolean {
-  if (token.length < 3 || token.length > 240) return false
-  if (token.startsWith('-') || token.startsWith('/') || token.includes('*') || token.includes('://')) return false
-  if (!/^[A-Za-z0-9_.@/-]+$/.test(token)) return false
-  const cleaned = token.replace(/^\.\//, '').replace(/\/$/, '')
-  if (!cleaned || cleaned === '.' || cleaned === '..') return false
-  const hasExtension = /\.[A-Za-z][A-Za-z0-9]{0,9}$/.test(cleaned)
-  if (!hasExtension && !token.endsWith('/')) return false
-  const segments = cleaned.split('/')
-  if (segments.some(segment => segment === '' || segment === '.' || segment === '..' || segment.includes('..'))) return false
-  return true
+/**
+ * Why one declared output is unusable, or undefined when it is exact. The rules
+ * are the capture gate's own (`Workspaces.captureArtifact`), stated at
+ * admission: literal in-scope file, no directory, no glob, no traversal, no Git
+ * metadata, no dependency or scratch directory. `dependencyDirs` is the name
+ * set the host's workspace engine was configured with.
+ */
+function declaredOutputFault(output: unknown, scope: readonly string[], dependencyDirs: readonly string[]): string | undefined {
+  if (typeof output !== 'string' || !output.trim()) return 'is not a nonempty path string'
+  if (output.endsWith('/')) return 'ends in "/", so it names a directory rather than one file'
+  if (/[*?[\]]/.test(output)) return 'contains a glob character, and only literal paths can be captured'
+  if (isAbsolute(output) || output.startsWith('/') || output.includes('\\')) return 'is not a repository-relative path'
+  if (/[ -]/.test(output)) return 'contains a control character'
+  const parts = output.split('/')
+  if (parts.some(part => part === '' || part === '.')) return 'has an empty or "." path segment'
+  if (parts.includes('..')) return 'has a ".." segment, which could escape the repository'
+  if (parts.some(part => part.toLowerCase() === '.git')) return 'names Git metadata'
+  // The same names the workspace engine treats as toolchain state by name alone,
+  // so a declared output can never force-capture an installed dependency.
+  const toolchain = parts.find(part => part === SWARM_SCRATCH_DIRNAME || dependencyDirs.includes(part))
+  if (toolchain !== undefined) return `lies under ${JSON.stringify(toolchain)}, a dependency or scratch directory that is never captured as work`
+  if (!withinScope(output, scope)) return `is outside the task scope ${JSON.stringify([...scope])}`
+  return undefined
 }
 
-/** Whether a write verb reads as a directive (imperative, modal or requirement), not a factual statement. */
-function directiveContext(clause: string, verbIndex: number): boolean {
-  const before = clause.slice(0, verbIndex)
-  if (/^\s*(?:[-*•]|\d+[.)])?\s*$/.test(before)) return true
-  if (/[:：]\s*$/.test(before)) return true
-  return DIRECTIVE_CUE.test(before.slice(-80))
-}
-
-export interface WriteDirectiveOptions {
-  /** Strict mode ignores factual/passive statements ("X is committed at ...") and only keeps directives. */
-  strict?: boolean
+/** The context of one `assertDeclaredOutputs` call, which decides the refusal's exit. */
+export interface DeclaredOutputsOptions {
+  /**
+   * The outputs are the task's stored declaration, re-checked because the
+   * owner amended only its scope. The caller never passed `outputs`, so the
+   * exit names adding them to the same `swarm_control` amendment.
+   */
+  scopeAmendment?: boolean
+  /**
+   * The dependency directory names the host configured for its workspace
+   * engine (`verificationDependencyDirs`), which capture treats as toolchain
+   * state. Omitted means the engine's own default,
+   * `DEFAULT_VERIFICATION_DEPENDENCY_DIRS`.
+   */
+  dependencyDirs?: readonly string[]
 }
 
 /**
- * Repository paths that a text names as write targets. Only a write verb that
- * precedes the path in the same clause counts, and a negated verb ("do not
- * edit", "never change") does not: prohibitions are not write directives.
- * Strict mode additionally requires an imperative or modal context, so a
- * factual sentence such as "the file is committed at docs/x.md" is not a
- * directive while "add a file under docs/" is.
+ * The one exact check of a task's declared outputs, shared by plan validation,
+ * `propose` and the owner amendment. It returns the detached list the caller
+ * stores, so no call site can admit an entry it did not validate.
  */
-export function writeDirectivePaths(text: string, options: WriteDirectiveOptions = {}): string[] {
-  const strict = options.strict ?? true
-  const found: string[] = []
-  const seen = new Set<string>()
-  for (const clause of text.split(CLAUSE_SPLIT)) {
-    const verbs: Array<{ index: number; end: number; directive: boolean }> = []
-    WRITE_VERB_PATTERN.lastIndex = 0
-    for (let match = WRITE_VERB_PATTERN.exec(clause); match !== null; match = WRITE_VERB_PATTERN.exec(clause)) {
-      verbs.push({ index: match.index, end: match.index + match[0].length, directive: directiveContext(clause, match.index) })
-    }
-    if (!verbs.length) continue
-    const candidates: Array<{ index: number; token: string }> = []
-    const tokenPattern = /[A-Za-z0-9_.@/-]+/g
-    for (let match = tokenPattern.exec(clause); match !== null; match = tokenPattern.exec(clause)) {
-      if (looksLikePath(match[0])) candidates.push({ index: match.index, token: match[0].replace(/^\.\//, '') })
-    }
-    for (const candidate of candidates) {
-      // The nearest preceding verb decides negation; an earlier imperative verb
-      // in the same clause still makes an imperative chain a directive.
-      const preceding = verbs.filter(verb => verb.end <= candidate.index)
-      if (!preceding.length) continue
-      const nearest = preceding[preceding.length - 1]!
-      if (NEGATION_PATTERN.test(clause.slice(0, nearest.index)) || NEGATION_PATTERN.test(clause.slice(nearest.end, candidate.index))) continue
-      const directive = preceding.some(verb => {
-        if (strict && !verb.directive) return false
-        if (NEGATION_PATTERN.test(clause.slice(0, verb.index))) return false
-        return !NEGATION_PATTERN.test(clause.slice(verb.end, candidate.index))
-      })
-      if (!directive) continue
-      if (!seen.has(candidate.token)) { seen.add(candidate.token); found.push(candidate.token) }
-    }
+export function assertDeclaredOutputs(outputs: unknown, scope: readonly string[], location: string, options: DeclaredOutputsOptions = {}): string[] {
+  if (!Array.isArray(outputs)) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs must be an array of repository-relative file paths. Set \`outputs\` to that array — empty for analysis-only work that writes no file — and retry the same request.`, `${location}.outputs`)
+  for (const output of outputs) {
+    const fault = declaredOutputFault(output, scope, options.dependencyDirs ?? DEFAULT_VERIFICATION_DEPENDENCY_DIRS)
+    if (fault === undefined) continue
+    if (options.scopeAmendment) throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault} once this amendment applies, so every later submit would be refused. Pass \`changes\` with \`outputs\` that fit the new \`scope\` in the same \`swarm_control\` call, or keep a \`scope\` that contains every declared output, then retry.`, `${location}.outputs`)
+    throw new AdmissionError('output_outside_scope', 'validation_error', `[output_outside_scope] ${location}.outputs declares ${JSON.stringify(output)}, which ${fault}. Correct that entry of \`outputs\` to a literal repository-relative file this task writes inside its own \`scope\`, drop it if the task only reads that path, and retry the same request.`, `${location}.outputs`)
   }
-  return found
-}
-
-/** Reconcile an objective's write directives with the scope the task may commit. */
-export function reconcileObjectiveScope(objective: string, scope: readonly string[], location: string): AdmissionDiagnostic[] {
-  return writeDirectivePaths(objective).filter(path => !withinScope(path, scope)).map(path => ({
-    code: 'objective_write_outside_scope',
-    location,
-    path,
-    message: `the objective directs a write to ${JSON.stringify(path)}, which the scope ${JSON.stringify(scope)} does not cover. A worker cannot commit that path (capture rejects out-of-scope changes), so the objective would fail at submit after the work is done. Narrow the \`objective\` to an in-scope path or widen the task \`scope\` within mission scope, then retry the same task/request; never broaden scope just to pass validation.`,
-  }))
-}
-
-/** Path tokens named anywhere in a text, excluding clauses that prohibit them. */
-export function namedPaths(text: string): string[] {
-  const found: string[] = []
-  const seen = new Set<string>()
-  for (const clause of text.split(CLAUSE_SPLIT)) {
-    const tokenPattern = /[A-Za-z0-9_.@/-]+/g
-    for (let match = tokenPattern.exec(clause); match !== null; match = tokenPattern.exec(clause)) {
-      if (!looksLikePath(match[0])) continue
-      const token = match[0].replace(/^\.\//, '')
-      if (seen.has(token)) continue
-      if (NEGATION_PATTERN.test(clause.slice(0, match.index))) continue
-      seen.add(token); found.push(token)
-    }
-  }
-  return found
+  return [...outputs as string[]]
 }
 
 /**
- * Deliverable paths named by an objective or its acceptance criteria. Objectives
- * use write directives (including factual ones) so a read-only input reference
- * is not mistaken for a deliverable; an acceptance criterion names an
- * obligation, so every non-negated path token in it counts.
+ * The admission refusals that need only the task text and its edges: the
+ * dependency-assumption guard and the graph validator. Advisory hints (the
+ * check preflight) are the draft UI's (`planAdvisories`); the propose path
+ * refuses only on these, so it computes only these.
  */
-export function deliverablePaths(objective: string, acceptance: readonly string[] = []): string[] {
-  const found: string[] = []
-  const seen = new Set<string>()
-  const add = (path: string): void => { if (!seen.has(path)) { seen.add(path); found.push(path) } }
-  for (const path of writeDirectivePaths(objective, { strict: false })) add(path)
-  for (const text of acceptance) {
-    for (const path of writeDirectivePaths(text, { strict: false })) add(path)
-    for (const path of namedPaths(text)) add(path)
-  }
-  return found
-}
-
-export interface IgnoredPath { path: string; source: string; line: number; pattern: string }
-
-/**
- * Deliverable paths that the workspace's effective ignore rules would hide from
- * capture. `git check-ignore` without `-v` lists exactly the hidden paths, so a
- * later `!` negation is never reported (verbose mode does report the negation
- * pattern and would falsely reject an un-ignored deliverable). The verbose run
- * only supplies the source, line and pattern for the paths already known to be
- * hidden, and is silent when the workspace is not a git work tree or git is
- * unavailable.
- */
-export function ignoredDeliverablePaths(workspace: string, paths: readonly string[]): IgnoredPath[] {
-  const candidates = [...new Set(paths.map(path => path.replace(/^\.\//, '')).filter(path => path && !path.endsWith('/') && !isAbsolute(path) && !path.includes('*') && !path.split('/').some(part => part === '..')))]
-  if (!candidates.length) return []
-  const input = candidates.map(candidate => `${candidate}\0`).join('')
-  const run = (args: string[]) => spawnSync('git', ['-C', workspace, 'check-ignore', '--stdin', ...args], { input, encoding: 'utf8', timeout: 5000, maxBuffer: 1048576 })
-  const ignored = run(['-z'])
-  // Exit 1 means no candidate is ignored; 128 means git or a work tree is unavailable. Neither is an admission failure.
-  if (ignored.error || ignored.status !== 0) return []
-  const hidden = new Set(String(ignored.stdout).split('\0').filter(Boolean))
-  if (!hidden.size) return []
-  const verbose = run(['-v', '-z'])
-  if (verbose.error || verbose.status !== 0) return [...hidden].map(path => ({ path, source: '.gitignore', line: 0, pattern: '' }))
-  const fields = String(verbose.stdout).split('\0')
-  const hits: IgnoredPath[] = []
-  for (let index = 0; index + 3 < fields.length; index += 4) {
-    const source = fields[index], line = Number(fields[index + 1]), pattern = fields[index + 2], path = fields[index + 3]
-    if (!path || !hidden.has(path)) continue
-    if (pattern?.startsWith('!')) continue
-    hits.push({ path, source: source || '.gitignore', line: Number.isSafeInteger(line) ? line : 0, pattern: pattern ?? '' })
-  }
-  return hits
-}
-
-/** Reject admission when a named deliverable would be silently absent from the captured artifact. */
-export function reconcileDeliverableIgnores(workspace: string, objective: string, acceptance: readonly string[], location: string): AdmissionDiagnostic[] {
-  return ignoredDeliverablePaths(workspace, deliverablePaths(objective, acceptance)).map(hit => ({
-    code: 'deliverable_path_ignored',
-    location,
-    path: hit.path,
-    message: `the named deliverable ${JSON.stringify(hit.path)} is ignored by ${hit.source}:${hit.line} (${JSON.stringify(hit.pattern)}). Capture only records untracked, non-ignored paths, so this deliverable would be silently absent from the artifact. Add a negation for this exact path inside the task's own \`scope\`, or rename the deliverable in the \`objective\` and \`acceptance\`, and retry the same task/request.`,
-  }))
-}
-
-/** Every admission reconciliation that needs only the task text, scope and workspace. */
-export function reconcileTaskAdmission(task: TaskAdmissionInput, workspace: string, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
-  const diagnostics = reconcileObjectiveScope(task.objective, task.scope, location)
-  diagnostics.push(...reconcileDeliverableIgnores(workspace, task.objective, task.acceptance ?? [], location))
-  // R12-F9, admission-time half: the terminal element of the admission chain.
-  // It fires only when the caller supplies the task's dependency set, so a call
-  // site that does not know the edges can never refuse a legitimate task.
+export function reconcileTaskAdmission(task: DependencyAssumptionInput, location: string, context: DependencyAssumptionContext = {}): AdmissionDiagnostic[] {
+  const diagnostics: AdmissionDiagnostic[] = []
+  // R12-F9: refused where the dependency set is written (there is no dispatch
+  // half). It fires only when the caller supplies the task's dependency set, so
+  // a call site that does not know the edges can never refuse a legitimate task.
   diagnostics.push(...dependencyAssumptions(task, location, context))
   // DEAD, admission-time half: the same graph validator the replay path runs.
   // It fires only when the caller supplies the mission's durable identities —
@@ -489,16 +401,18 @@ export interface DependencyAssumptionInput {
   replaces?: readonly string[]
 }
 
-export interface TaskAdmissionInput extends DependencyAssumptionInput {
-  scope: readonly string[]
-}
-
 export interface DependencyAssumptionContext {
   /** The declared dependency set. Absent means unknown, never "empty". */
   dependencies?: readonly string[]
   replaces?: readonly string[]
-  /** Durable task ids, artifact commits and evidence ids this mission already holds. */
+  /** Identities this mission already holds; every caller passes its durable task ids. */
   knownContents?: ReadonlySet<string>
+  /**
+   * The dependency set is an owner amendment of an admitted task
+   * (`swarm_control` `changes.dependencies`), whose text can no longer change,
+   * so the diagnostic names the amendment's exits instead of a new proposal's.
+   */
+  amendment?: boolean
 }
 
 /** A clause that claims prior work is already available in the worktree. */
@@ -507,6 +421,8 @@ const WORKTREE_PRESENCE = /\b(?:already\s+in|already\s+present\s+in|is\s+already
 const RESUME_PRESENCE = /\b(?:resum(?:e|es|ing)\s+from|continu(?:e|es|ing)\s+from|prepared?\s+from|start(?:s|ing)?\s+from)\b/i
 /** A weaker claim, kept only for a *named* artifact identity. */
 const AVAILABILITY_PRESENCE = /\balready\s+(?:present|available|committed|merged|checked\s+out)\b/i
+/** Sentence and line boundaries: the guard reads one clause at a time. */
+const CLAUSE_SPLIT = /(?:[.;!?]\s+|\n+)/
 const CONTENT_WORD = /\b(?:artifact|assembly|checkpoint|commit|evidence|snapshot|previous\s+attempt|prior\s+work|replaced\s+task)\b/i
 
 /** Named artifact/evidence/task identities and commit-like tokens appearing in a clause. */
@@ -521,20 +437,32 @@ export function namedContentTokens(text: string): string[] {
 
 /**
  * The coded diagnostic for one clause that assumes content no dependency
- * carries. `known` is the caller's answer to "does this mission already hold
- * that content"; undefined names both executable exits.
+ * carries. `known` is the caller's answer to "is that name one of this
+ * mission's identities" (its task ids); undefined names both executable exits.
+ * An unknown name is only that: a commit named by hex may still be an ancestor
+ * of the mission baseline, and nothing here runs git to find out (every caller
+ * is synchronous, and the workspace git seam is not), so the text claims no
+ * provenance it did not check. `amendment` is an owner
+ * amendment of an admitted task's dependencies: its objective and acceptance
+ * are fixed, so the exits are the amendment itself or a withdrawal.
  */
-export function dependencyAssumptionDiagnostic(named: string, field: string, clause: string, location: string, known?: boolean): AdmissionDiagnostic {
+export function dependencyAssumptionDiagnostic(named: string, field: string, clause: string, location: string, known?: boolean, amendment = false): AdmissionDiagnostic {
   const provenance = known === true
     ? 'That content exists in this mission, so a dependency edge is what carries it into a prepared worktree.'
     : known === false
-      ? 'That content is not in the mission baseline, so the worktree will not contain it.'
+      ? 'That name is not a task id of this mission; whether the mission baseline or a task artifact already contains it was not checked.'
       : 'No declared dependency carries that content into the prepared worktree.'
+  if (amendment) return {
+    code: 'dependency_assumption_missing',
+    location,
+    path: named,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but this amendment leaves the task no dependency that carries it. ${provenance} Keep the task that carries that content in \`changes\` \`dependencies\` and retry \`swarm_control\` with the same \`taskId\`, or withdraw the task with \`swarm_cancel\` and propose it again with \`swarm_propose\`, stating in \`objective\` how it obtains that content. The task is unchanged.`,
+  }
   return {
     code: 'dependency_assumption_missing',
     location,
     path: named,
-    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\` while keeping its acceptance criteria verbatim.`,
+    message: `the ${field} assumes ${JSON.stringify(named)} is already available${clause === '' ? '' : ` (${JSON.stringify(clause)})`}, but the task declares no dependency that carries it. ${provenance} Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task; a repair may instead name the blocked task in \`replaces\`; the repair inherits its acceptance.`,
   }
 }
 
@@ -572,7 +500,7 @@ export function dependencyAssumptions(task: DependencyAssumptionInput, location:
       const named = tokens[0] ?? replaced[0] ?? (/(?:artifact|assembly|checkpoint|commit|evidence|snapshot)/i.exec(clause)?.[0] ?? 'the assumed prior work')
       if (seen.has(named)) continue
       seen.add(named)
-      found.push(dependencyAssumptionDiagnostic(named, field, clause.trim(), location, context.knownContents === undefined ? undefined : context.knownContents.has(named)))
+      found.push(dependencyAssumptionDiagnostic(named, field, clause.trim(), location, context.knownContents === undefined ? undefined : context.knownContents.has(named), context.amendment === true))
     }
   }
   return found
@@ -583,39 +511,12 @@ export interface CheckClassification {
   runnable: 'worker' | 'host-only'
   code?: 'check_requires_host'
   requirement?: string
+  preflight?: string
 }
 
-/**
- * Commands that cannot run under the worker's workspace-write sandbox. They are
- * host-gate suites (Harness composition, the pack/profile smokes that compose a
- * nested workspace-write profile, web/command-web smoke, isolation) or a nested
- * sandbox invocation; declaring one as a task check guarantees an unrunnable
- * verification (W14).
- */
+/** Actual confinement requirements, independent of project script and file names. */
 const HOST_ONLY_CHECKS: Array<{ pattern: RegExp; requirement: string }> = [
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:harness(?:\s|$)/, requirement: 'the Harness composition suite needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:pack(?:\s|$)/, requirement: 'the pack smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:profile(?:\s|$)/, requirement: 'the profile smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:web(?:\s|$)/, requirement: 'the web smoke suite needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:command-web(?:\s|$)/, requirement: 'the command-web smoke suite needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:isolation(?:\s|$)/, requirement: 'the isolation suite asserts a real sandbox refusal and only runs on an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+run\s+verify(?:\s|$)/, requirement: '`npm run verify` includes the host-only test:harness, test:pack, test:profile, test:web and test:command-web suites' },
-  { pattern: /node\s+--expose-internals\s+tests\/harness-composition\.mjs/, requirement: 'Harness composition needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /node\s+scripts\/smoke-pack\.mjs/, requirement: 'the pack smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /node\s+scripts\/smoke-profile\.mjs/, requirement: 'the profile smoke composes a real Harness profile whose nested workspace-write sandbox is denied under worker confinement (scripts/sandbox-prerequisite.mjs)' },
-  { pattern: /node\s+scripts\/smoke-web\.mjs/, requirement: 'the web smoke suite needs the host web/session boundary' },
-  { pattern: /node\s+scripts\/smoke-command-web\.mjs/, requirement: 'the command-web smoke suite needs the host web/session boundary' },
-  { pattern: /tests\/verification-isolation\.mjs/, requirement: 'the isolation suite asserts a real sandbox refusal and only runs on an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])(?:sandbox-exec|dsh\s+sandbox)\b/, requirement: 'a nested sandbox invocation is refused inside a worker sandbox' },
-  // R11-06: the remaining declared host-gate entry points. The name patterns
-  // keep plan validation honest without a manifest, and `classifyCheck` also
-  // resolves the script body when the manifest is available (see below).
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:deepseek(?:\s|$)/, requirement: 'the deepseek smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:command-deepseek(?:\s|$)/, requirement: 'the command-deepseek smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:sidebar-service(?:\s|$)/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
-  { pattern: /(?:^|[\s;&|()])npm\s+(?:run\s+)?test:validation-repair-web(?:\s|$)/, requirement: 'the validation-repair web smoke needs the host web/session boundary' },
-  { pattern: /node\s+--expose-internals\s+scripts\/smoke-[\w.-]+\.mjs/, requirement: 'an expose-internals smoke needs a built Harness checkout and an unsandboxed host' },
-  { pattern: /node\s+scripts\/smoke-better-sidebar\.mjs/, requirement: 'the sidebar-service smoke needs the host web/session boundary' },
+  { pattern: /(?:^|[\s;&|()])(?:sandbox-exec|dsh\s+sandbox)\b/, requirement: 'a nested sandbox invocation is refused inside the verifier workspace-write sandbox; run it through an available host check route or provide an equivalent artifact check supported by this verifier' },
 ]
 
 /**
@@ -624,7 +525,7 @@ const HOST_ONLY_CHECKS: Array<{ pattern: RegExp; requirement: string }> = [
  * the name actually resolves to, so a host-only suite cannot hide behind a
  * neutral script name and a worker-runnable script is never refused by name.
  * Returns undefined when the manifest is absent, unreadable, oversized or
- * malformed; the name patterns above still apply.
+ * malformed; unresolved scripts remain preflight hints, never name-based refusals.
  */
 export function loadPackageScripts(workspace: string): Record<string, string> | undefined {
   try {
@@ -664,7 +565,8 @@ export function classifyCheck(command: string, scripts?: Record<string, string>)
     const resolved = resolveHostOnlyScript(command, scripts, new Set(), 0)
     if (resolved !== undefined) return { command, runnable: 'host-only', code: 'check_requires_host', requirement: resolved }
   }
-  return { command, runnable: 'worker' }
+  const unresolved = [...command.matchAll(/(?:^|[\s;&|()])npm\s+(?:run\s+|run-script\s+)([A-Za-z0-9:_.-]+)/g)].map(match => match[1]!).filter(name => scripts?.[name] === undefined)
+  return { command, runnable: 'worker', ...(unresolved.length ? { preflight: `Unresolved target package scripts: ${unresolved.join(', ')}. Inspect the target manifest before execution; the immutable artifact must still pass its declared checks.` } : {}) }
 }
 
 /**
@@ -928,20 +830,37 @@ export function reconcileCheckPaths(command: string, location: string): Admissio
   }))
 }
 
+export function isNoopCheck(command: string): boolean { return /^(?:true|:|exit\s+0)\s*;?$/.test(command.trim()) }
+
+/**
+ * A control character a declared check cannot need. The check reaches the host
+ * as one `/bin/sh -c` argument: a NUL byte there is refused by the process API
+ * itself, and the others (a carriage return, an escape) are never part of a
+ * real command. Tab and newline are admitted: a multi-line script is a check.
+ */
+const CHECK_CONTROL_CHARACTER = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/
+
 export function requireHostChecks(kind: string, checks: readonly string[] | undefined, location: string, taskIdentity?: string, scripts?: Record<string, string>): void {
   if (checks !== undefined) {
-    if (!Array.isArray(checks)) throw new Error(`${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`)
+    if (!Array.isArray(checks)) throw new AdmissionError('check_not_array', 'budget_error', `${location}.checks must be an array of real repository acceptance commands. Pass a nonempty \`checks\` array of shell command strings and retry the same task/request, preserving acceptance criteria and budget. [check_not_array]`, `${location}.checks`)
     const invalid = checks.findIndex(command => typeof command !== 'string' || !command.trim() || command.length > 16000)
-    if (invalid !== -1) throw new Error(`${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`)
+    if (invalid !== -1) throw new AdmissionError('check_invalid', 'budget_error', `${location}.checks[${invalid}] must be a nonempty shell command of at most 16000 characters that proves the task's acceptance criteria. Empty or whitespace-only commands do not verify work. Repair that \`checks\` entry and retry the same task/request, preserving acceptance criteria and budget. [check_invalid]`, `${location}.checks[${invalid}]`)
+    const control = checks.findIndex(command => CHECK_CONTROL_CHARACTER.test(command))
+    if (control !== -1) {
+      const codePoint = checks[control]!.match(CHECK_CONTROL_CHARACTER)![0].codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')
+      throw new AdmissionError('check_control_character', 'validation_error', `[check_control_character] ${location}.checks[${control}] contains the control character U+${codePoint}; a declared check may contain tab and newline but no other control character. Remove it from \`checks\` and retry with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`, `${location}.checks[${control}]`)
+    }
+    const noop = checks.findIndex(isNoopCheck)
+    if (noop !== -1) throw new AdmissionError('check_noop', 'validation_error', `[check_noop] ${location}.checks[${noop}] is an always-passing no-op. Supply a real assertion in \`checks\` with \`swarm_propose\`, or amend \`changes\` with \`swarm_control\`; keep the same task and acceptance criteria.`, `${location}.checks[${noop}]`)
     const hostOnly = checks.map((command, index) => ({ command, index, classification: classifyCheck(command, scripts) })).find(item => item.classification.runnable === 'host-only')
-    if (hostOnly) throw new Error(`[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there and force a re-proposal (W14). Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`)
+    if (hostOnly) throw new AdmissionError('check_requires_host', 'budget_error', `[check_requires_host] ${location}.checks[${hostOnly.index}] ${JSON.stringify(hostOnly.command)} cannot run in the worker execution environment: ${hostOnly.classification.requirement}. The verifier runs declared checks inside the workspace-write sandbox, so this command would fail there until the check route is repaired. Declare only worker-runnable commands in \`checks\` (typecheck, build, unit tests, faults, load, replay) and leave host-only suites to the owner's host gate; retry the same task/request, preserving acceptance criteria and budget.`, `${location}.checks[${hostOnly.index}]`)
     // Round 9-C: a check that names a host-absolute path cannot run in the
     // disposable checkout. Refuse it here, at the shared admission point, so a
     // repair cannot silently swap its check for the source toolchain.
-    const absolute = checks.map((command, index) => ({ index, diagnostics: reconcileCheckPaths(command, `${location}.checks[${index}]`) })).find(item => item.diagnostics.length > 0)
-    if (absolute) throw new Error(formatDiagnostic(absolute.diagnostics[0]!))
+    const absolute = checks.map((command, index) => reconcileCheckPaths(command, `${location}.checks[${index}]`)[0]).find(diagnostic => diagnostic !== undefined)
+    if (absolute) throw new AdmissionError(absolute.code, 'validation_error', formatDiagnostic(absolute), absolute.location, [absolute])
   }
   if ((kind === 'implementation' || kind === 'integration') && !checks?.length) {
-    throw new Error(`${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. [check_required] Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add a real \`checks\` command and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`)
+    throw new AdmissionError('check_required', 'budget_error', `${location}.checks${taskIdentity ? ` (task ${JSON.stringify(taskIdentity)})` : ''} is required: code tasks of kind ${JSON.stringify(kind)} need at least one real repository acceptance command, supplied by the primary agent. [check_required] Inspect existing project test/build scripts or choose a meaningful assertion proving this task's acceptance criteria. Commands belong on the source implementation/integration task, even when it has a separate reviewOf task; the host runs them on its committed artifact. If this task changes code, keep its kind, add a real \`checks\` command and retry the same task/request, preserving acceptance criteria and budget. If its actual objective is only a read-only audit or report synthesis, the primary agent should explicitly classify it as research with dependencies and host-recorded evidence. Never change a code deliverable to research to bypass verification or substitute trivial always-passing checks.`, `${location}.checks`)
   }
 }

@@ -5,7 +5,6 @@
  * side of F-12/F-13 (durable verdict naming, retained event window).
  */
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import React from 'react'
@@ -14,11 +13,12 @@ import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import  {  boardIndex, dependencyMet, durableVerdict, eventSummary, readSnapshot, retiredReviews, snapshotFromResult, taskLane , cancellationNotes }  from '../lib/types/client/projection.js'
 import { recentProgress, taskReasons } from '../lib/types/client/progress.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
-import { RecentProgress } from '../lib/types/client/MissionProgress.js'
+import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
 import { DraftEditor, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
 import { graphLayout } from '../lib/types/client/DependencyGraph.js'
+import { EVENTS } from '../lib/events.js'
 
 const render = (component, props, chinese = false) => {
   const element = React.createElement(component, props)
@@ -26,51 +26,14 @@ const render = (component, props, chinese = false) => {
 }
 
 /**
- * The emitted event vocabulary, re-derived from `src/*.ts` exactly like
- * `tests/event-vocabulary.test.mjs`: a new emitter that is neither labeled by
- * the compact projection nor named in `OMITTED` fails the F-14/F-33 guards.
+ * The registry is the list. A kind carries either a compact-panel label or the
+ * reason the panel omits it, so the F-14/F-33 guards below iterate the rows
+ * themselves instead of re-deriving an emitted set from source text: a new kind
+ * cannot be added without making that choice, and the choice is what is checked.
  */
-const SRC = new URL('../src/', import.meta.url)
-const DYNAMIC_EVENTS = ['mission/pause', 'mission/stop', 'mission/complete', 'mission/resume', 'mission/coordinator',
-  'delivery/applied', 'delivery/conflicts']
-function emittedEventTypes() {
-  const emitted = new Set()
-  for (const file of readdirSync(SRC)) {
-    if (!file.endsWith('.ts')) continue
-    const text = readFileSync(new URL(file, SRC), 'utf8')
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*'([^']+)'/g)) emitted.add(match[1])
-    for (const match of text.matchAll(/\.event\(\s*[^,]+,\s*[^,?]+\?\s*'([^']+)'\s*:\s*'([^']+)'/g)) {
-      emitted.add(match[1]); emitted.add(match[2])
-    }
-  }
-  return [...new Set([...emitted, ...DYNAMIC_EVENTS])].sort()
-}
-/** Emitted types deliberately kept off the compact panel, each with its owner-facing surface. */
-const OMITTED = {
-  'member/activity': 'lease-liveness heartbeat; the activity projection already shows it',
-  'tool/recorded': 'per-tool counter; the transcript and evidence provenance own it',
-  'trace/span': 'trace payload; the trace/replay surface owns it',
-  'message/queued': 'transport; the delivery panel owns it',
-  'mission/created': 'the mission header and status show creation',
-  'plan/edited': 'draft-scoped; never in a mission snapshot',
-  'plan/staged': 'draft-scoped; never in a mission snapshot',
-  'task/proposed': 'the pending task card appears on the board',
-  'workstream/created': 'board structure, not progress',
-  'member/stopped': 'the team disclosure shows member status',
-  'member/waiting': 'the activity projection shows the parked member',
-  'admission/limit': 'owner notice; no task event',
-  'admission/refused': 'owner notice; no task event',
-  'evidence/verdict': 'normalized duplicate of evidence/verified|refuted',
-  'automatic/requested': 'planning start; automatic/completed|failed carry the outcome',
-  'member/effort-rejected': 'paired with member/failed (Worker could not start)',
-  'mission/budget-quiesced': 'follow-up to mission/budget-exhausted',
-  'mission/budget-updated': 'accounting; the metrics show the new ceilings',
-  // T3 integration: install-scoped and metrics rows the merged branches emit.
-  'store/snapshot': 'install-scoped VACUUM INTO row; never in a mission snapshot (the store audit owns it)',
-  'store/restore-requested': 'install-scoped owner tool result; the restore happens at the next host start',
-  'store/restored': 'install-scoped startup row; emitted before any mission exists',
-  'task/check-envelope': 'measured check envelope; the verification verdict and check-failure rows carry the owner-facing outcome',
-}
+const REGISTERED = Object.keys(EVENTS)
+const omitReason = kind => 'omit' in EVENTS[kind].panel ? EVENTS[kind].panel.omit : undefined
+
 /** One isolated durable event so a projection test cannot pass on another event's label. */
 function eventOnlySnapshot(type, data = {}) {
   const snapshot = uiSnapshot()
@@ -154,29 +117,35 @@ test('F-14: the compact panel surfaces every recovery/control event type and pre
   assert.match(binding, /path: \/granted/)
   assert.match(binding, /blockedTasks: t2/)
 
-  // R11-08 vocabulary guard: every emitted type is either labeled by the
-  // compact projection or explicitly omitted here. A new emitter with no
-  // classification fails this suite instead of staying silently invisible.
-  const allEmitted = emittedEventTypes()
-  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
-  for (const type of allEmitted) {
+  // R11-08 vocabulary guard, now over the registry: every registered kind is
+  // either labeled by the compact projection or carries the reason the panel
+  // omits it. A new kind with no panel decision fails to compile; a kind whose
+  // decision the projection contradicts fails here.
+  assert.ok(REGISTERED.length >= 70, `the registry must carry the runtime kinds, saw ${REGISTERED.length}`)
+  for (const type of REGISTERED) {
     const surfaced = recentProgress(eventOnlySnapshot(type), 20)
-    if (OMITTED[type]) {
+    const omitted = omitReason(type)
+    if (omitted) {
+      assert.ok(omitted.length > 8, `${type}: an omit decision must say why`)
       assert.deepEqual(surfaced, [], `${type} is declared omitted from the compact panel but produced a label`)
       continue
     }
-    assert.equal(surfaced.length, 1, `${type} is emitted but has no compact label; add one or name it in OMITTED with a reason`)
+    assert.equal(surfaced.length, 1, `${type} carries a panel label but the compact projection does not surface it`)
     const label = surfaced[0].label
+    assert.equal(label, EVENTS[type].panel.en, `${type}: the panel renders a label the registry does not declare`)
     assert.ok(zh[label], `the compact label for ${type} has no zh translation: ${label}`)
-    assert.ok(render(RecentProgress, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
+    assert.ok(render(LiveWorkOverview, { snapshot: eventOnlySnapshot(type) }, true).includes(zh[label]),
       `the compact panel does not translate ${label} for ${type}`)
   }
   // The R11-08 families and the promoted workspace-audit types are labeled.
   for (const type of ['task/review-missing', 'task/review-admitted', 'task/review-blocked', 'task/check-changed',
     'workspace/grant-loaded', 'mission/workspace-bound', 'mission/workspace-revoked']) {
-    assert.ok(!OMITTED[type], `${type} must be labeled, not omitted`)
+    assert.equal(omitReason(type), undefined, `${type} must be labeled, not omitted`)
     assert.equal(recentProgress(eventOnlySnapshot(type), 20).length, 1, `${type} must surface on the compact panel`)
   }
+  // The one label that is not a registry kind: a historical card may still hold
+  // `attempt/started` rows, and the client decodes them.
+  assert.equal(recentProgress(eventOnlySnapshot('attempt/started'), 20)[0].label, 'Task started')
 })
 
 test('R11-08: the review-path, check-change and restart-recovery payloads are the compact detail', () => {
@@ -203,14 +172,14 @@ test('R11-08: the review-path, check-change and restart-recovery payloads are th
   const reassigned = recentProgress(eventOnlySnapshot('task/reassigned', { taskId: 't2', from: 'b', to: 'a', reason: 'start failed twice' }), 20)[0]
   assert.equal(reassigned.label, 'Task re-routed to another member')
   assert.equal(reassigned.detail, 'b → a · start failed twice')
-  const chinese = render(RecentProgress, { snapshot: eventOnlySnapshot('task/check-changed', { taskId: 't2', reason: 'replacement', checks: ['npm run build'] }) }, true)
+  const chinese = render(LiveWorkOverview, { snapshot: eventOnlySnapshot('task/check-changed', { taskId: 't2', reason: 'replacement', checks: ['npm run build'] }) }, true)
   assert.match(chinese, /声明的检查已变更/)
   assert.doesNotMatch(chinese, />A declared check changed</)
 })
 
 test('task/ceiling-exhausted renders a compact ceiling block with a translated label', () => {
   const snapshot = uiSnapshot(), at = snapshot.mission.updatedAt
-  snapshot.events.push({ seq: 30, type: 'task/ceiling-exhausted', actor: 'runtime',
+  snapshot.events.push({ seq: 30, missionId: snapshot.mission.id, type: 'task/ceiling-exhausted', actor: 'runtime',
     data: { taskId: 't2', dimension: 'steps', limit: 8, used: 8, code: 'task_ceiling_exhausted' }, createdAt: at })
   const events = recentProgress(snapshot, 20)
   const ceiling = events.find(event => event.label === 'Task ceiling reached')
@@ -218,8 +187,8 @@ test('task/ceiling-exhausted renders a compact ceiling block with a translated l
   assert.equal(ceiling.detail, 'steps · 8/8 · task_ceiling_exhausted', 'the dimension and exhausted limit are the owner-facing detail')
   assert.equal(ceiling.detail === snapshot.tasks.find(task => task.id === 't2').title, false)
   // The panel translates the label in both languages.
-  assert.match(render(RecentProgress, { snapshot }), /Task ceiling reached/)
-  const chinese = render(RecentProgress, { snapshot }, true)
+  assert.match(render(LiveWorkOverview, { snapshot }), /Task ceiling reached/)
+  const chinese = render(LiveWorkOverview, { snapshot }, true)
   assert.match(chinese, /子任务超出执行上限/)
   assert.doesNotMatch(chinese, />Task ceiling reached</)
   assert.equal(zh['ceiling-exhausted'], '执行上限已耗尽', 'the event-type token is translated too')
@@ -230,7 +199,7 @@ test('task/ceiling-exhausted renders a compact ceiling block with a translated l
 
 test('task/preparation-failed renders the reason and recovery credit with a translated label', () => {
   const snapshot = uiSnapshot(), at = snapshot.mission.updatedAt
-  snapshot.events.push({ seq: 30, type: 'task/preparation-failed', actor: 'runtime',
+  snapshot.events.push({ seq: 30, missionId: snapshot.mission.id, type: 'task/preparation-failed', actor: 'runtime',
     data: { taskId: 't2', epoch: 2, reason: 'Workspace preparation failed: uncommitted work', recoveryCount: 1, maxRecoveryAttempts: 3, status: 'blocked' }, createdAt: at })
   const events = recentProgress(snapshot, 20)
   const failure = events.find(event => event.label === 'Task preparation failed')
@@ -238,8 +207,8 @@ test('task/preparation-failed renders the reason and recovery credit with a tran
   assert.equal(failure.detail, 'Workspace preparation failed: uncommitted work · recovery 1/3', 'the cause and the spent recovery credit are the owner-facing detail')
   assert.equal(failure.detail === snapshot.tasks.find(task => task.id === 't2').title, false)
   // The panel translates the label in both languages.
-  assert.match(render(RecentProgress, { snapshot }), /Task preparation failed/)
-  const chinese = render(RecentProgress, { snapshot }, true)
+  assert.match(render(LiveWorkOverview, { snapshot }), /Task preparation failed/)
+  const chinese = render(LiveWorkOverview, { snapshot }, true)
   assert.match(chinese, /子任务准备失败/)
   assert.doesNotMatch(chinese, />Task preparation failed</)
   assert.equal(zh['preparation-failed'], '准备失败', 'the event-type token is translated too')
@@ -344,13 +313,12 @@ test('F-33: zh translates dynamic verdict, kind and event vocabulary', () => {
   const translated = render(SwarmBoard, { snapshot: vocabularySnapshot, initialView: 'activity' }, true)
   assert.doesNotMatch(translated, /task \/ rejected|mission \/ recovered|budget-warning|member \/ added|subscribed|lease-expiring|closeout-ready|closeout-exhausted|budget-resumed|budget-resume-skipped|quiescence-recovered|workstream \/ created|member \/ activity|resume-failed|automatic \/ requested|review-retired|effort-downgraded|budget-quiesced|preparation-failed/)
 
-  // Derived vocabulary guard: every path segment of every emitted type has a
-  // zh token and the Activity view renders the translation, so a new emitter
-  // with an untranslated token fails the suite instead of rendering English.
-  const allEmitted = emittedEventTypes()
-  assert.ok(allEmitted.length >= 70, `the scanner must see the runtime emitters, saw ${allEmitted.length}`)
-  for (const type of allEmitted) for (const token of type.split('/')) assert.ok(zh[token], `zh token ${token} missing for ${type}`)
-  for (const type of allEmitted) {
+  // Derived vocabulary guard: every path segment of every registered kind has a
+  // zh token and the Activity view renders the translation, so a new kind with
+  // an untranslated token fails the suite instead of rendering English.
+  assert.ok(REGISTERED.length >= 70, `the registry must carry the runtime kinds, saw ${REGISTERED.length}`)
+  for (const type of REGISTERED) for (const token of type.split('/')) assert.ok(zh[token], `zh token ${token} missing for ${type}`)
+  for (const type of REGISTERED) {
     const cell = (render(SwarmBoard, { snapshot: eventOnlySnapshot(type), initialView: 'activity' }, true)
       .match(/<div class="sw-event-type">([\s\S]*?)<\/div>/) ?? [])[1]
     assert.ok(cell, `the Activity view did not render ${type}`)
@@ -474,6 +442,29 @@ test('F-12/F-13 client surface: durable verdict naming, retired siblings, retain
   assert.equal((activity.match(/class="sw-event"/g) ?? []).length, 60)
   assert.match(activity, /events retained in this snapshot\./)
   assert.doesNotMatch(activity, /Showing the latest 40/)
+})
+
+test('a retired lineage row names the accepted repair that retired it and the live fork, not its first withdrawn repair', () => {
+  const snapshot = uiSnapshot()
+  snapshot.mission.status = 'active'
+  const base = snapshot.tasks[4]
+  const original = { ...base, id: 't20', title: 'Original', status: 'cancelled' }
+  const withdrawn = { ...base, id: 't21', title: 'First repair', status: 'cancelled', replaces: [original.id] }
+  const accepted = { ...base, id: 't22', title: 'Repair of the withdrawn repair', status: 'accepted', replaces: [withdrawn.id] }
+  const fork = { ...base, id: 't23', title: 'Sibling repair', status: 'running', replaces: [original.id] }
+  const retirement = { taskId: original.id, supersededBy: accepted.id, previousStatus: 'blocked', liveReplacements: [fork.id] }
+  const at = snapshot.mission.updatedAt
+  const board = { ...snapshot, tasks: [...snapshot.tasks, original, withdrawn, accepted, fork], events: [...snapshot.events,
+    { seq: 90, missionId: snapshot.mission.id, type: 'task/cancelled', actor: 'owner', data: { taskId: withdrawn.id, reason: 'Wrong approach' }, createdAt: at },
+    { seq: 91, missionId: snapshot.mission.id, type: 'task/superseded', actor: 'runtime', data: retirement, createdAt: at }] }
+  assert.deepEqual(cancellationNotes(board).get(original.id), { kind: 'superseded', detail: accepted.title, live: [fork.title] }, 'the durable retirement names the accepting repair and the fork')
+  assert.deepEqual(cancellationNotes({ ...board, events: snapshot.events }).get(original.id), { kind: 'superseded', detail: fork.title },
+    'without the record in the window, a live repair is named before a withdrawn one')
+  const summary = eventSummary(retirement)
+  assert.match(summary, /supersededBy: t22/)
+  assert.match(summary, /liveReplacements: t23/)
+  assert.match(eventSummary({ taskId: fork.id, carriedBy: accepted.id, status: 'running', code: 'lineage_duplicate_carrier' }), /carriedBy: t22/)
+  assert.match(render(SwarmBoard, { snapshot: board, initialView: 'board' }), /superseded by a repair · Repair of the withdrawn repair · live replacement left alone: Sibling repair/)
 })
 
 test('OWNER PASS 2026-09-11: the cancelled lane names why each task was withdrawn', () => {

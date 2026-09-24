@@ -1,35 +1,42 @@
 /**
  * D6 trace contracts: a closed span vocabulary, digest-addressed payloads that
- * live outside the durable event log, causal closure across worker hops, an
+ * never enter the durable event log, causal closure across worker hops, an
  * executable replay gate over the durable log, event surfacing for the read
  * path and trace-level metrics (contract compliance, first violating step).
  *
  * Design boundaries:
  * - `src/store.ts` and `src/types.ts` are owned by other tasks and are not
  *   modified. Spans are therefore appended through the existing
- *   `SwarmStore.event`/`transaction` API as `trace/span` events; the payload
- *   bytes they digest live in a content-addressed directory beside the state
- *   file, so the log stays bounded by construction.
+ *   `SwarmStore.event`/`transaction` API as `trace/span` events; a span carries
+ *   only the digest and byte count of its input and output, so the log stays
+ *   bounded by construction and the bytes are never copied anywhere.
  * - The replay gate reads the durable event log (SQLite rows) and replays the
  *   orchestrator's externally visible command sequence with no provider call.
  *   It fails with a named error on a corrupted or truncated log and on a
  *   command sequence that diverges from the recorded/golden sequence.
  * - R17-G10 (host-contract adoption): recorded spans are handed to the host
  *   telemetry sink (`ctx.sessionTelemetry`, the `session-telemetry` contract)
- *   when the deployment mounts a backend, and the payload spill beside the state
- *   file is bounded and swept (`sweepTraceSpill`, the `spill-local` sweep
- *   semantics plus the size bound that sweep does not have). The declared bound
- *   is a ceiling on the put path — a payload that would take the root above
- *   `maxFiles`/`maxBytes` reserves room with a sweep before it is written. The
- *   durable `trace/span` row stays because replay, the trace tests and the
- *   reader census read it and the sink has no read-back; the retained bespoke
- *   pieces and the reason that decided each are named at their definitions below.
+ *   when the deployment mounts a backend. The durable `trace/span` row stays
+ *   because replay, the trace tests and the reader census read it and the sink
+ *   has no read-back; the retained bespoke pieces and the reason that decided
+ *   each are named at their definitions below.
+ * - The payload bytes themselves are not retained: a span keeps only the digest
+ *   and size of its input and output. Spans are recorded for the swarm_* tools,
+ *   which the worker adapter deliberately does not record as `ToolRun` rows, and
+ *   the digested input of a workspace-bound call carries host-added fields no
+ *   session log holds, so a span digest cannot be resolved back to its payload.
+ *   It identifies a step and orders the causal chain; it is not an audit copy.
+ *   Builds before round 20 kept the bytes in a `trace-payloads` directory beside
+ *   the state file; `forRuntime` removes that directory once, since nothing
+ *   reads it and the retention sweep that bounded it is gone.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { lstat, mkdir, readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
+import { EVENT_VOCABULARY, type EventKind } from './events.ts'
 import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
+import { PolicyError } from './policy-error.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
 export const TRACE_OPERATIONS = ['agent', 'tool', 'llm', 'retrieval', 'review', 'merge'] as const
@@ -56,6 +63,7 @@ export const isTraceStatus = (value: unknown): value is TraceStatus => value ===
 export const isTraceErrorType = (value: unknown): value is TraceErrorType => typeof value === 'string' && (TRACE_ERROR_TYPES as readonly string[]).includes(value)
 /** Map a thrown orchestration failure onto the closed `error.type` vocabulary. */
 export function errorTypeFor(error: unknown): TraceErrorType {
+  if (error instanceof PolicyError) return error.category
   const message = error instanceof Error ? error.message : String(error)
   if (/not a participant|unauthorized|Only the mission owner|Only a member|Only the primary user|Workers cannot|authenticated|bypass mission authority|owner session|workspace_not_authorized/i.test(message)) return 'authorization_error'
   if (/budget|exhausted|deadline/i.test(message)) return 'budget_error'
@@ -109,7 +117,21 @@ export const digestText = (text: string): string => `sha256:${createHash('sha256
 export const traceIdFor = (missionId: string): string => createHash('sha256').update(missionId, 'utf8').digest('hex').slice(0, 32)
 export const traceparentFor = (traceId: string, spanId: string): string => `00-${traceId}-${spanId}-01`
 
+/**
+ * The durable reference a span carries for its input and its output.
+ *
+ * `stored` says whether the bytes are held anywhere this layer can read back.
+ * Nothing spills them any more, so every reference this process writes is
+ * `stored: false`; the flag stays because rows written by older builds carry
+ * `stored: true` and `spanContractViolation` still validates both.
+ */
 export interface TracePayloadRef { digest: string; bytes: number; stored: boolean }
+/** Digest and size one span payload, without retaining the bytes. */
+export function payloadRef(value: unknown): TracePayloadRef {
+  const text = canonicalJson(value)
+  return { digest: digestText(text), bytes: Buffer.byteLength(text, 'utf8'), stored: false }
+}
+
 export interface TraceSpan {
   traceId: string
   spanId: string
@@ -129,359 +151,11 @@ export interface TraceSpan {
   output: TracePayloadRef
 }
 
-/** Milliseconds in one day; retention is configured in days like the host spill's `cleanupPeriodDays`. */
-const MS_PER_DAY = 24 * 60 * 60 * 1000
-/**
- * R17-G10: the declared bound on the content-addressed payload spill.
- *
- * The durable log keeps only digests, so the payload bytes beside the state file
- * are a cache and are bounded like one. `retentionMs` mirrors the host spill's
- * `cleanupPeriodDays` semantics (a regular file strictly older than the cutoff is
- * reclaimable); `maxFiles`/`maxBytes` are hard bounds the host sweep has no
- * equivalent for, applied oldest-first so the newest review window survives.
- *
- * The bound is a ceiling, not a cadence. `TracePayloadStore.put` reserves room
- * with a sweep before it writes, and the check-and-write is serialized per
- * store, so after every `put` resolves the root holds at most `maxFiles` regular
- * files and at most `maxBytes` payload bytes and no concurrent put can overtake
- * that check. Between two of this store's writes the root only shrinks (every
- * other operation is a read or a deletion), so the residue between two writes is
- * itself bounded by the two ceilings. The one exception is a payload that cannot
- * fit under `maxBytes` by itself: it is omitted (`stored: false`) rather than
- * written above the bound. A second process writing into the same root is
- * outside this invariant, and every host start re-applies it
- * (`TraceRecorder.startupSweep`).
- *
- * Measured basis: the leaked directory held 4 683 files / 22.9 MB of payload
- * bytes (33 MB on disk) on 2026-09-11 after three days of six-member rounds
- * (~5 KB per payload), so 2 048 files / 16 MiB holds a full live round's span
- * payloads while capping growth. A payload evicted under the bound is reported
- * as `missing` by `traceMetrics`, never silently.
- */
-export interface TraceSpillLimits {
-  /** Ceiling on the payload bytes the root holds after any `put` resolves; oldest files are evicted first. */
-  maxBytes: number
-  /** Ceiling on the regular files the root holds after any `put` resolves; oldest files are evicted first. */
-  maxFiles: number
-  /** Age after which a regular file may be reclaimed; `0` disables age retention (the bound still applies). */
-  retentionMs: number
-}
-/** Days of payload retention that produced {@link DEFAULT_TRACE_SPILL_LIMITS.retentionMs}. */
-export const TRACE_SPILL_RETENTION_DAYS = 7
-export const DEFAULT_TRACE_SPILL_LIMITS: TraceSpillLimits = {
-  maxBytes: 16 * 1024 * 1024, maxFiles: 2048, retentionMs: TRACE_SPILL_RETENTION_DAYS * MS_PER_DAY,
-}
-/** What one {@link sweepTraceSpill} call found, reclaimed (or would reclaim under `dryRun`), and left. */
-export interface TraceSpillReport {
-  root: string
-  dryRun: boolean
-  now: number
-  limits: TraceSpillLimits
-  /** Directory entries inspected. */
-  scanned: number
-  /** Regular files found before the sweep. */
-  files: number
-  /** Bytes held by those regular files before the sweep. */
-  bytes: number
-  /** Files reclaimed because their `mtime` was strictly older than the retention cutoff. */
-  expired: number
-  /** Files reclaimed because the `maxFiles`/`maxBytes` bound still did not hold. */
-  evicted: number
-  /** Files reclaimed in total (`expired + evicted`). */
-  deleted: number
-  bytesDeleted: number
-  /** Entries left untouched because they are not regular files (symlinks, directories, sockets). */
-  skipped: number
-  filesAfter: number
-  bytesAfter: number
-  /** Contained failures, in the order they happened; the sweep still never rejects. */
-  errors: string[]
-}
-
-/**
- * R17-G10: one bounded sweep of a payload spill root — the thin adapter the
- * acceptance allows where the host exposes no equivalent for a capability we
- * genuinely use. Evidence that decided it:
- * - `@deepseek-ai/dsh-spill-local` v0.1.3-alpha.2 (`src/cleanup.ts`,
- *   `sweepSpillRoots`, harness commit 82a5fd61) does export its sweep as a
- *   module function, but this package does not declare that dependency
- *   (package.json is outside this branch's scope) and it is not resolvable from
- *   the deployed plugin's 26-package `node_modules`, so the export cannot be
- *   called from this file's runtime;
- * - the host exposes no sweep as a service: `ctx.spillStore` is the `SpillStore`
- *   seam with `saveText` only;
- * - the host sweep descends only into its own `session-<12 hex>` directories
- *   with age retention and no size or file bound, while this spill is
- *   content-addressed flat files and the acceptance requires a bound.
- *
- * The adapter therefore mirrors the host sweep's semantics — regular files only,
- * a strict `mtime` cutoff, symlinks never followed or deleted, idempotent unlink
- * on ENOENT, every filesystem failure contained through a warn sink — and adds
- * the oldest-first `maxFiles`/`maxBytes` eviction. `dryRun` returns the same
- * counts without touching a file, so an operator can measure what a live sweep
- * would reclaim. `reserveFiles`/`reserveBytes` are the room a caller needs
- * *after* the sweep (the put path reserves one file and its payload size), so
- * eviction runs until `limit - reserve` holds and the caller can write without
- * the directory ever exceeding the declared bound. Never rejects: failures land
- * in `errors` and in `warn`.
- */
-export async function sweepTraceSpill(options: {
-  root: string
-  limits?: Partial<TraceSpillLimits>
-  now?: number
-  dryRun?: boolean
-  warn?: (message: string) => void
-  /** Files the caller must be able to add after the sweep; eviction targets `maxFiles - reserveFiles`. */
-  reserveFiles?: number
-  /** Bytes the caller must be able to add after the sweep; eviction targets `maxBytes - reserveBytes`. */
-  reserveBytes?: number
-}): Promise<TraceSpillReport> {
-  const limits: TraceSpillLimits = { ...DEFAULT_TRACE_SPILL_LIMITS, ...options.limits }
-  const now = options.now ?? Date.now()
-  const dryRun = options.dryRun === true
-  // The room the caller asked to keep is subtracted from the eviction target, so
-  // one sweep both re-bounds the directory and makes space for the next write.
-  const targetFiles = limits.maxFiles - Math.max(0, options.reserveFiles ?? 0)
-  const targetBytes = limits.maxBytes - Math.max(0, options.reserveBytes ?? 0)
-  const errors: string[] = []
-  const warn = (message: string): void => {
-    errors.push(message)
-    // The warn sink is observational: cleanup stays best-effort even when it throws.
-    try { options.warn?.(message) } catch { /* contained by contract */ }
-  }
-  const report = (fields: Partial<TraceSpillReport>): TraceSpillReport => ({
-    root: options.root, dryRun, now, limits, scanned: 0, files: 0, bytes: 0, expired: 0, evicted: 0,
-    deleted: 0, bytesDeleted: 0, skipped: 0, filesAfter: 0, bytesAfter: 0, errors, ...fields,
-  })
-  let names: string[]
-  try {
-    names = await readdir(options.root)
-  } catch (error) {
-    // A root no spill ever wrote into is the common case, not an error.
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') warn(`spill sweep: failed to read ${options.root}: ${String(error)}`)
-    return report({})
-  }
-  const files: Array<{ path: string; name: string; mtimeMs: number; bytes: number }> = []
-  let skipped = 0
-  let bytes = 0
-  for (const name of names) {
-    const path = join(options.root, name)
-    let stats
-    try {
-      stats = await lstat(path)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') warn(`spill sweep: failed to stat ${path}: ${String(error)}`)
-      continue
-    }
-    // Only regular files expire. A symlink or a directory is counted and left
-    // untouched — `lstat` never follows a link, so a planted link can neither be
-    // deleted nor redirect the sweep (co-fires with the age and bound guards).
-    if (!stats.isFile()) { skipped++; continue }
-    files.push({ path, name, mtimeMs: stats.mtimeMs, bytes: stats.size })
-    bytes += stats.size
-  }
-  files.sort((left, right) => left.mtimeMs - right.mtimeMs || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
-  const cutoff = now - limits.retentionMs
-  const reclaimed = new Set<string>()
-  let kept = files
-  // Age guard first, then the bound. A file already reclaimed for age is never
-  // charged twice when the bound eviction guard co-fires on the same file.
-  if (limits.retentionMs > 0) {
-    for (const file of files) if (file.mtimeMs < cutoff) reclaimed.add(file.path)
-    kept = files.filter(file => !reclaimed.has(file.path))
-  }
-  let keptBytes = kept.reduce((total, file) => total + file.bytes, 0)
-  let evicted = 0
-  for (const file of kept) {
-    // Stop at the reserved target, not at the declared bound: the caller is
-    // about to add its own file and bytes, and that addition is what must land
-    // inside the bound (co-fires with the age guard above and the put-path
-    // headroom guard in `TracePayloadStore`).
-    if (kept.length <= targetFiles && keptBytes <= targetBytes) break
-    reclaimed.add(file.path)
-    kept = kept.filter(candidate => candidate.path !== file.path)
-    keptBytes -= file.bytes
-    evicted++
-  }
-  const expired = reclaimed.size - evicted
-  let deleted = 0
-  let bytesDeleted = 0
-  for (const file of files) {
-    if (!reclaimed.has(file.path)) continue
-    if (dryRun) { deleted++; bytesDeleted += file.bytes; continue }
-    try {
-      await unlink(file.path)
-      deleted++
-      bytesDeleted += file.bytes
-    } catch (error) {
-      // A parallel sweep or the store itself may have removed it first: the goal
-      // (file gone) already holds, so ENOENT is success, everything else is named.
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') { deleted++; bytesDeleted += file.bytes; continue }
-      warn(`spill sweep: failed to delete ${file.path}: ${String(error)}`)
-    }
-  }
-  return report({
-    scanned: names.length, files: files.length, bytes, expired, evicted, deleted, bytesDeleted,
-    skipped, filesAfter: files.length - deleted, bytesAfter: bytes - bytesDeleted,
-  })
-}
-
-/** Per-store spill policy: limit overrides merged over {@link DEFAULT_TRACE_SPILL_LIMITS} and a failure sink. */
-export interface TraceSpillOptions {
-  limits?: Partial<TraceSpillLimits>
-  warn?: (message: string) => void
-}
-/** Payload writes between two opportunistic sweeps; the startup sweep is separate. */
-const PAYLOAD_SWEEP_INTERVAL = 256
-
-/**
- * Content-addressed payload store beside the state file; digests, not payloads, enter the log.
- *
- * R17-G10 adoption note — why the host spill *store* is not used here:
- * `ctx.spillStore` (`@deepseek-ai/dsh-spill`'s `SpillStore.saveText`) is
- * session-scoped, writes one fresh unpredictably-named file per call and returns
- * an opaque path locator, so it can express neither "same bytes, same digest"
- * dedup nor the `{digest, bytes, stored}` reference that the persisted span
- * contract and the replay/metrics readers validate. Replacing the reference
- * would rename a persisted payload field with no named reader for the change,
- * which the acceptance forbids without a consumer-pair regression. The host
- * *sweep* semantics, which this store does adopt, are in {@link sweepTraceSpill},
- * and {@link TraceRecorder.startupSweep} re-applies the bound on every host start.
- *
- * Ceiling (R17-G10 repair): the declared `maxFiles`/`maxBytes` bound holds after
- * every `put` resolves, not only at a sweep cadence. Puts and sweeps are
- * serialized per store, and a put reserves its own room (`reserveFiles: 1`,
- * `reserveBytes: bytes`) with a sweep whenever the last observed directory state
- * has no room, so the check cannot be overtaken by an interleaved write or an
- * unrelated in-flight sweep. `tracked` is this store's last observation (a sweep
- * report or the count after a write); it may lag a background sweep by being too
- * high, which only costs one extra sweep and never hides an overshoot.
- */
-export class TracePayloadStore {
-  private puts = 0
-  /** Serializes put's check-and-write: two concurrent puts cannot pass one headroom check. */
-  private writes: Promise<unknown> = Promise.resolve()
-  /** Serializes sweeps so a reservation sweep is never satisfied by an unrelated in-flight one. */
-  private sweeps: Promise<unknown> = Promise.resolve()
-  /** Regular files and payload bytes this store last observed in its root. */
-  private tracked?: { files: number; bytes: number }
-  private last?: TraceSpillReport
-  constructor(readonly directory: string, readonly maxBytes = 262144, readonly spill: TraceSpillOptions = {}) {}
-  pathFor(digest: string): string { return join(this.directory, `${digest.slice('sha256:'.length)}.json`) }
-  /** The declared bound this store enforces, with the caller's overrides merged in. */
-  get limits(): TraceSpillLimits { return { ...DEFAULT_TRACE_SPILL_LIMITS, ...this.spill.limits } }
-  async put(value: unknown): Promise<TracePayloadRef> {
-    // The queue keeps the check-and-write atomic with respect to other puts: the
-    // headroom guard, the write and the counter update cannot interleave, so the
-    // ceiling holds for concurrent callers too. A rejected write rejects its own
-    // caller and leaves the queue running.
-    const write = this.writes.then(() => this.putQueued(value), () => this.putQueued(value))
-    this.writes = write.then(() => undefined, () => undefined)
-    return write
-  }
-  private async putQueued(value: unknown): Promise<TracePayloadRef> {
-    const text = canonicalJson(value)
-    const digest = digestText(text)
-    const bytes = Buffer.byteLength(text, 'utf8')
-    // Co-fires with `verify`: an omitted payload has no file, so `verify` returns
-    // true without reading — the pair that keeps a big payload out of the spill.
-    if (bytes > this.maxBytes) return { digest, bytes, stored: false }
-    // A payload that cannot fit under the whole spill bound by itself can never be
-    // held under it: omit it instead of writing a file the ceiling forbids.
-    if (bytes > this.limits.maxBytes) return { digest, bytes, stored: false }
-    if (!await this.reserveRoom(bytes)) return { digest, bytes, stored: false }
-    await mkdir(this.directory, { recursive: true, mode: 0o700 })
-    let created = false
-    try { await writeFile(this.pathFor(digest), text, { flag: 'wx', mode: 0o600 }); created = true }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
-    if (created) {
-      const state = this.tracked ?? { files: 0, bytes: 0 }
-      this.tracked = { files: state.files + 1, bytes: state.bytes + bytes }
-    }
-    // Retention backstop for a long-lived process that never reaches the bound;
-    // the bound itself is already enforced above, and the startup sweep
-    // (`TraceRecorder.startupSweep`) re-applies it at every host restart.
-    this.puts++
-    if (this.puts >= PAYLOAD_SWEEP_INTERVAL) { this.puts = 0; void this.sweep() }
-    return { digest, bytes, stored: true }
-  }
-  /**
-   * Room for one payload of `bytes`: true when the write may proceed. The first
-   * call observes the root with a sweep; when the observation has no room, one
-   * reservation sweep runs and the caller either has room or (only possible when
-   * `bytes` exceeds the whole bound or the bound allows no file) must omit.
-   */
-  private async reserveRoom(bytes: number): Promise<boolean> {
-    const limits = this.limits
-    const hasRoom = (files: number, held: number): boolean => files + 1 <= limits.maxFiles && held + bytes <= limits.maxBytes
-    if (this.tracked !== undefined && hasRoom(this.tracked.files, this.tracked.bytes)) return true
-    const report = await this.sweep({ reserveFiles: 1, reserveBytes: bytes })
-    this.tracked = { files: report.filesAfter, bytes: report.bytesAfter }
-    return hasRoom(report.filesAfter, report.bytesAfter)
-  }
-  async read(digest: string): Promise<string | undefined> {
-    if (!DIGEST.test(digest)) return undefined
-    try { return await readFile(this.pathFor(digest), 'utf8') } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
-  }
-  /** Re-hash the stored bytes: true only when the file is present and intact. */
-  async verify(ref: TracePayloadRef): Promise<boolean> {
-    if (!ref.stored) return true
-    const text = await this.read(ref.digest)
-    return text !== undefined && digestText(text) === ref.digest
-  }
-  /** The last completed real sweep of this store: at a host start, a reservation, a cadence or a caller. */
-  get lastSweep(): TraceSpillReport | undefined { return this.last }
-  /**
-   * One bounded sweep of this store's directory, queued behind any sweep already
-   * running so two sweeps cannot race and a reservation is honoured by the sweep
-   * that sees it. A dry run measures without replacing {@link lastSweep}, which
-   * records what the last real sweep reclaimed.
-   */
-  sweep(options: { dryRun?: boolean; now?: number; reserveFiles?: number; reserveBytes?: number } = {}): Promise<TraceSpillReport> {
-    const run = (): Promise<TraceSpillReport> => sweepTraceSpill({
-      root: this.directory, limits: this.spill.limits,
-      ...(this.spill.warn === undefined ? {} : { warn: this.spill.warn }), ...options,
-    }).then(report => {
-      if (!report.dryRun || this.last === undefined) this.last = report
-      return report
-    })
-    const queued = this.sweeps.then(run, run)
-    this.sweeps = queued.then(() => undefined, () => undefined)
-    return queued
-  }
-  /**
-   * The live instrument (`traceMetrics().payloads.spill`): what the directory
-   * holds now and what a sweep would reclaim, measured by a dry run so reading
-   * the metric never changes the store.
-   */
-  async spillState(): Promise<TraceSpillState> {
-    const report = await this.sweep({ dryRun: true })
-    return {
-      files: report.files, bytes: report.bytes, cleanable: report.files - report.filesAfter,
-      cleanableBytes: report.bytes - report.bytesAfter, maxFiles: report.limits.maxFiles,
-      maxBytes: report.limits.maxBytes, retentionMs: report.limits.retentionMs,
-      ...(this.last === undefined ? {} : { lastSweep: this.last }),
-    }
-  }
-}
-/** Bound, cleanable headroom and the last sweep, as reported by `traceMetrics`. */
-export interface TraceSpillState {
-  /** Regular files currently in the spill root. */
-  files: number
-  /** Bytes currently held. */
-  bytes: number
-  /** Regular files a sweep would reclaim right now. */
-  cleanable: number
-  cleanableBytes: number
-  maxFiles: number
-  maxBytes: number
-  retentionMs: number
-  lastSweep?: TraceSpillReport
-}
-
 /** Structural slice of `SwarmStore` the trace layer needs; keeps store.ts untouched. */
 export interface TraceStore {
   events(missionId: string, limit: number, after?: number): SwarmEvent[]
+  /** Newest matching spans in chronological order; optional for older store adapters. */
+  traceEvents?(missionId: string, limit: number, filter?: { taskId?: string; attemptId?: string; step?: string }): SwarmEvent[]
   event(missionId: string, type: string, actor: string, data: unknown): void
   transaction<T>(operation: () => T): T
 }
@@ -489,8 +163,8 @@ export interface TraceStore {
 /**
  * R17-G10: the host telemetry sink (`session-telemetry`), declared structurally.
  *
- * The host package `@deepseek-ai/dsh-session-telemetry` v0.1.3-alpha.2
- * (harness commit 82a5fd61) defines `SessionTelemetryRecord` and
+ * The host package `@deepseek-ai/dsh-session-telemetry` (the same contract on
+ * 0.1.5-rc.3 and 0.1.7-rc.1) defines `SessionTelemetryRecord` and
  * `SessionTelemetrySink` and registers the sink as the `sessionTelemetry`
  * service; the record shape below is that contract verbatim
  * (`channel`/`time`/`severity`/`attributes`/`body`, with `emit` a non-blocking
@@ -591,31 +265,22 @@ export function bindHostTelemetry(runtime: object): HostTelemetryLink {
 const hostTelemetryFor = (runtime: unknown): HostTelemetryLink | undefined =>
   runtime !== null && typeof runtime === 'object' ? hostTelemetryLinks.get(runtime) : undefined
 
-/**
- * R17-G10: the declared spill limits a runtime config asks for, with the
- * defaults applied for an omitted or invalid value. `src/tools.ts` builds the
- * recorder from the runtime (out of this branch's scope), so the bound travels
- * on the runtime's own config, whose schema defaults live in `src/index.ts`.
- */
-export function traceSpillLimits(config: unknown): TraceSpillLimits {
-  const row = (config ?? {}) as Record<string, unknown>
-  const positive = (value: unknown): number | undefined =>
-    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
-  const days = (value: unknown): number | undefined =>
-    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
-  return {
-    maxBytes: positive(row.traceSpillMaxBytes) ?? DEFAULT_TRACE_SPILL_LIMITS.maxBytes,
-    maxFiles: positive(row.traceSpillMaxFiles) ?? DEFAULT_TRACE_SPILL_LIMITS.maxFiles,
-    retentionMs: (days(row.traceSpillRetentionDays) ?? TRACE_SPILL_RETENTION_DAYS) * MS_PER_DAY,
-  }
-}
-
 const SEED_LIMIT = 20000
 const HISTORY_SCAN_LIMIT = 100000
 const HISTORY_PAGE_DEFAULT = 50
 const HISTORY_PAGE_MAX = 500
 
+export interface TraceWindow {
+  limit: number
+  spans: number
+  truncated: boolean
+  source: 'trace-spans' | 'events'
+  firstSpanId?: string
+  lastSpanId?: string
+}
 interface SpanIndex {
+  truncated: boolean
+  source: TraceWindow['source']
   byTask: Map<string, TraceSpan[]>
   byAttempt: Map<string, TraceSpan[]>
   all: TraceSpan[]
@@ -630,15 +295,12 @@ export class TraceRecorder {
   private readonly indexes = new Map<string, SpanIndex>()
   private readonly unscoped = new Map<string, number>()
   /**
-   * R17-G10: one bounded sweep per recorder — and a recorder is built once per
-   * plugin start, so the spill is re-bounded on every host restart without
-   * anyone having to remember to run a sweeper. Never rejects; the report is
-   * recorded as `payloads.spill.lastSweep` on the metrics path.
+   * The best-effort removal of the payload directory earlier builds kept beside
+   * the state file. Exposed so a caller can await it; a failure is swallowed,
+   * because a leftover directory is inert and must never block plugin start.
    */
-  readonly startupSweep: Promise<TraceSpillReport>
-  constructor(readonly store: TraceStore, readonly payloads: TracePayloadStore, readonly telemetry?: HostTelemetryLink) {
-    this.startupSweep = payloads.sweep()
-  }
+  legacyCleanup?: Promise<void>
+  constructor(readonly store: TraceStore, readonly telemetry?: HostTelemetryLink) {}
   /** A recorder exists only when the runtime owns a durable store and state path. */
   static forRuntime(runtime: unknown): TraceRecorder | undefined {
     const candidate = runtime as { config?: { statePath?: unknown } & Record<string, unknown>; store?: Partial<TraceStore> } | undefined
@@ -646,14 +308,17 @@ export class TraceRecorder {
     const store = candidate?.store
     if (typeof statePath !== 'string' || !statePath) return undefined
     if (!store || typeof store.event !== 'function' || typeof store.transaction !== 'function' || typeof store.events !== 'function') return undefined
-    const spill: TraceSpillOptions = { limits: traceSpillLimits(candidate?.config) }
-    return new TraceRecorder(store as TraceStore, new TracePayloadStore(join(dirname(statePath), 'trace-payloads'), 262144, spill), hostTelemetryFor(runtime))
+    const recorder = new TraceRecorder(store as TraceStore, hostTelemetryFor(runtime))
+    recorder.legacyCleanup = rm(join(dirname(statePath), 'trace-payloads'), { recursive: true, force: true }).catch(() => undefined)
+    return recorder
   }
   private index(missionId: string): SpanIndex {
     const existing = this.indexes.get(missionId)
     if (existing) return existing
-    const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }
-    for (const event of this.store.events(missionId, SEED_LIMIT, 0)) {
+    const source = this.store.traceEvents ? 'trace-spans' : 'events'
+    const events = this.store.traceEvents?.(missionId, SEED_LIMIT + 1) ?? this.store.events(missionId, SEED_LIMIT + 1, 0)
+    const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [], source, truncated: events.length > SEED_LIMIT }
+    for (const event of events.slice(-SEED_LIMIT)) {
       if (event.type !== 'trace/span') continue
       const span = event.data as TraceSpan | undefined
       if (span === null || typeof span !== 'object' || typeof span.spanId !== 'string') continue
@@ -666,8 +331,24 @@ export class TraceRecorder {
     index.all.push(span)
     if (span.taskId) { const list = index.byTask.get(span.taskId) ?? []; list.push(span); index.byTask.set(span.taskId, list) }
     if (span.attemptId) { const list = index.byAttempt.get(span.attemptId) ?? []; list.push(span); index.byAttempt.set(span.attemptId, list) }
+    if (index.all.length > SEED_LIMIT) {
+      const expired = index.all.shift()!
+      for (const [map, key] of [[index.byTask, expired.taskId], [index.byAttempt, expired.attemptId]] as const) {
+        if (!key) continue
+        const list = map.get(key)!
+        list.shift()
+        if (list.length === 0) map.delete(key)
+      }
+      index.truncated = true
+    }
   }
   spansFor(missionId: string): TraceSpan[] { return [...this.index(missionId).all] }
+  /** Metrics explicitly describe the retained window, never imply complete history. */
+  windowFor(missionId: string): TraceWindow {
+    const index = this.index(missionId)
+    return { limit: SEED_LIMIT, spans: index.all.length, truncated: index.truncated, source: index.source,
+      ...(index.all.length ? { firstSpanId: index.all[0]!.spanId, lastSpanId: index.all.at(-1)!.spanId } : {}) }
+  }
   /**
    * A step with no mission scope (draft planning, the mission list) cannot
    * carry a valid `mission_id`, so it is counted rather than recorded. The
@@ -688,18 +369,33 @@ export class TraceRecorder {
       for (let position = spans.length - 1; position >= 0; position--) { const span = spans[position]!; if (predicate(span)) return span }
       return undefined
     }
+    // Once history exceeds the cache, resolve scoped parents directly in the
+    // durable span rows. Activity/tool events cannot hide a claim or submission,
+    // and a missing scoped parent must not attach this task to an unrelated one.
+    const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => {
+      const event = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)
+      const span = event?.data as TraceSpan | undefined
+      return span && typeof span.spanId === 'string' ? span : undefined
+    }
+    const lookup = (filter: { taskId?: string; attemptId?: string; step?: string }, spans: TraceSpan[] | undefined) =>
+      index.truncated && this.store.traceEvents ? stored(filter)
+        : latest(spans, span => filter.step === undefined || span.step === filter.step)
     if (context.step === 'swarm_verify' && context.reviewOfTaskId) {
-      const reviewed = index.byTask.get(context.reviewOfTaskId)
-      return (latest(reviewed, span => span.step === 'swarm_submit') ?? latest(reviewed))?.spanId ?? index.all.at(-1)?.spanId
+      const taskId = context.reviewOfTaskId, reviewed = index.byTask.get(taskId)
+      return (lookup({ taskId, step: 'swarm_submit' }, reviewed)
+        ?? (index.truncated && !this.store.traceEvents ? undefined : lookup({ taskId }, reviewed)))?.spanId
     }
     if (context.step !== 'swarm_claim' && context.attemptId) {
-      const attempt = index.byAttempt.get(context.attemptId)
-      const parent = latest(attempt, span => span.step === 'swarm_claim') ?? latest(attempt)
-      if (parent) return parent.spanId
+      const attemptId = context.attemptId, attempt = index.byAttempt.get(attemptId)
+      return (lookup({ attemptId, step: 'swarm_claim' }, attempt)
+        ?? (index.truncated && !this.store.traceEvents ? undefined : lookup({ attemptId }, attempt)))?.spanId
     }
     if (context.taskId) {
-      const parent = latest(index.byTask.get(context.taskId))
-      if (parent) return parent.spanId
+      const parent = lookup({ taskId: context.taskId }, index.byTask.get(context.taskId))
+      if (parent || context.step !== 'swarm_propose') return parent?.spanId
+      // A new proposal joins a mission-level setup span, never another task.
+      return (latest(index.all, span => !span.taskId && !span.attemptId)
+        ?? stored({ step: 'swarm_launch' }) ?? stored({ step: 'swarm_create' }) ?? stored({ step: 'swarm_stage' }))?.spanId
     }
     return index.all.at(-1)?.spanId
   }
@@ -707,8 +403,8 @@ export class TraceRecorder {
   async record(context: { missionId: string; actor: string; step: TraceStep; taskId?: string; attemptId?: string; reviewOfTaskId?: string; input: unknown; output: unknown; status: TraceStatus; errorType?: TraceErrorType; startedAt: number; endedAt?: number }): Promise<TraceSpan> {
     const spanId = randomUUID().replaceAll('-', '').slice(0, 16)
     const traceId = traceIdFor(context.missionId)
-    const input = await this.payloads.put(context.input)
-    const output = await this.payloads.put(context.output)
+    const input = payloadRef(context.input)
+    const output = payloadRef(context.output)
     const parentSpanId = this.parentFor(context)
     const span: TraceSpan = {
       traceId, spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }), missionId: context.missionId,
@@ -756,6 +452,7 @@ export function spanContractViolation(span: unknown): string | undefined {
 
 export interface TraceViolation { seq?: number; spanId?: string; step?: string; reason: string }
 export interface TraceMetrics {
+  window?: TraceWindow
   spans: number
   roots: number
   contractCompliance: number
@@ -764,16 +461,20 @@ export interface TraceMetrics {
   violations: TraceViolation[]
   firstViolatingStep?: TraceViolation
   operations: Record<string, number>
-  payloads: { referenced: number; stored: number; omitted: number; verified: number; missing: number; mismatched: number; spill?: TraceSpillState }
+  /**
+   * Payload references seen in this window. `stored` counts the rows an older
+   * build spilled to disk; nothing writes them any more, so a window of current
+   * rows reports `stored: 0` and `omitted === referenced`.
+   */
+  payloads: { referenced: number; stored: number; omitted: number }
 }
 /** Contract compliance, causal closure and first-violating-step over a span window (F-44). */
-export async function traceMetrics(spans: readonly TraceSpan[], options: { payloads?: TracePayloadStore; seqOf?: (span: TraceSpan, index: number) => number | undefined } = {}): Promise<TraceMetrics> {
+export async function traceMetrics(spans: readonly TraceSpan[], options: { seqOf?: (span: TraceSpan, index: number) => number | undefined; window?: TraceWindow } = {}): Promise<TraceMetrics> {
   const violations: TraceViolation[] = []
   const operations: Record<string, number> = {}
-  const payloads: TraceMetrics['payloads'] = { referenced: 0, stored: 0, omitted: 0, verified: 0, missing: 0, mismatched: 0 }
+  const payloads: TraceMetrics['payloads'] = { referenced: 0, stored: 0, omitted: 0 }
   const known = new Set(spans.map(span => span?.spanId))
   let roots = 0, orphans = 0
-  const refs: TracePayloadRef[] = []
   spans.forEach((span, index) => {
     const reason = spanContractViolation(span)
     if (reason) violations.push({ seq: options.seqOf?.(span, index), spanId: span?.spanId, step: span?.step, reason })
@@ -786,18 +487,13 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
       const ref = span?.[key]
       if (ref === null || typeof ref !== 'object') continue
       payloads.referenced++
-      if (ref.stored) { payloads.stored++; refs.push(ref) } else payloads.omitted++
+      if (ref.stored) payloads.stored++; else payloads.omitted++
     }
   })
-  if (options.payloads) {
-    for (const ref of refs) { if (await options.payloads.verify(ref)) payloads.verified++; else { payloads.missing++; payloads.mismatched++ } }
-    // R17-G10: the live instrument for the declared spill bound — files/bytes
-    // held, what a sweep would reclaim, and the last sweep's report.
-    payloads.spill = await options.payloads.spillState()
-  }
   const total = spans.length
   const first = violations.find(violation => violation.seq !== undefined) ?? violations[0]
   return {
+    ...(options.window === undefined ? {} : { window: options.window }),
     spans: total, roots, contractCompliance: total === 0 ? 1 : (total - violations.length) / total,
     causalClosure: total === 0 ? 1 : (total - orphans) / total, orphanParents: orphans, violations,
     ...(first === undefined ? {} : { firstViolatingStep: first }), operations, payloads,
@@ -805,122 +501,11 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { paylo
 }
 
 /**
- * Event vocabulary the read path recognizes. Every type the round-2 review found
- * unsurfaced (F-14) is named here, together with the verdict and retired-review
- * events (F-12) and the trace rows themselves.
+ * The read path's view of the registry in `src/events.ts`. The rows live there
+ * because that module imports nothing and both tsconfigs compile it, so the
+ * client renders the same registry the host writes.
  */
-export const EVENT_VOCABULARY: Record<string, string> = {
-  'mission/created': 'Mission admitted with its frozen scope and budget',
-  'mission/recovered': 'Host restarted and recovered the mission from durable state',
-  'mission/budget-updated': 'Owner changed the resource ceilings without resetting usage',
-  'mission/stalled': 'No schedulable work remains and every live worker is idle',
-  'automatic/completed': 'Runtime completed an automatic mission after independent acceptance',
-  'workspace/snapshot': 'Member workspace baseline snapshot recorded',
-  'member/added': 'Worker admitted with its isolated worktree',
-  'member/failed': 'Worker could not be created',
-  'member/resume-failed': 'Worker could not resume after restart',
-  'member/stopped': 'Worker handle stopped',
-  'member/activity': 'Worker activity heartbeat for lease liveness',
-  'workstream/created': 'Workstream admitted',
-  'task/proposed': 'Task admitted under a workstream',
-  'task/claimed': 'Attempt dispatched: ownership, attempt id and lease recorded',
-  'task/submitted': 'Artifact captured and submitted for independent review',
-  'task/accepted': 'Independent verification accepted the source artifact',
-  'task/rejected': 'Independent verification rejected the source artifact',
-  'task/blocked': 'Task blocked with the reason that must be repaired',
-  'task/cancelled': 'Owner withdrew admitted work; dependents named as stranded',
-  'task/cancelled-at-completion': 'Unschedulable leftover cancelled at mission completion',
-  'task/lease-expired': 'Attempt lease expired and the owner was released',
-  'task/ceiling-exhausted': 'Task exhausted its own step or finding ceiling and blocked without charging the mission budget',
-  'task/checkpointed': 'Workspace checkpoint captured before reassignment',
-  'task/checkpoint-failed': 'Checkpoint capture failed; workspace preserved, recovery refuses a dirty tree',
-  'task/closeout-nudged': 'Idle worker nudged to finish its open attempt',
-  'task/closeout-abandoned': 'Idle close-out exhausted: checkpoint captured and the task re-pended',
-  'task/closeout-failed': 'Idle close-out could not capture a checkpoint',
-  'task/handoff-started': 'Ownership revoked; reassignment waits for the previous worker to stop',
-  'task/handoff-ready': 'Previous worker stopped and the handed-off task is schedulable again',
-  'task/review-retired': 'Sibling review retired because its source can never reach a verdict',
-  'task/invalidated': 'Dependent work invalidated by a challenged prerequisite',
-  'task/git-write-denied': 'Sandbox refused a worker git write; the supported exit is named',
-  'task/budget-resume-skipped': 'Budget-resume marker was stale and skipped',
-  // S5c: emitted by `SwarmStore.putTask` through the exported constant
-  // `STALE_TASK_REFUSAL_EVENT` (src/store.ts). The vocabulary check resolves
-  // shared constants now, so this row is required, not optional.
-  'task/stale-revision-refused': 'A task write presented a revision another accepted write had moved past; the durable revision was named and the write refused',
-  'task/quiescence-recovered': 'Parked task recovered after host restart',
-  'evidence/published': 'Unverified claim published with host-recorded run ids',
-  'evidence/challenged': 'Claim challenged with counterevidence',
-  'evidence/verified': 'Verdict verified the claim and names the retired reviews',
-  'evidence/refuted': 'Verdict refuted the claim and names the retired reviews',
-  'evidence/verdict': 'Normalized verdict row: evidence id, verdict and retired reviews',
-  'trace/span': 'One orchestration step span with digests of its input and output',
-  'message/queued': 'Directed message or topic broadcast queued durably',
-  'message/answered': 'The addressed recipient bound an answer to a question delivery id (L1 receipt)',
-  'message/dismissed': 'The addressed recipient closed a question delivery without an answer, recording the reason (L1 receipt)',
-  'owner/reply-missing': 'An owner turn ended with a delivered question still unanswered: the receipt was not bound by any tool call in that turn (L2)',
-  // Every remaining type the runtime emits (F-14). The read path must name them
-  // so an operator can reconstruct a decision instead of seeing an unknown row.
-  'automatic/requested': 'Automatic planning request admitted with its goal and workspace',
-  'automatic/failed': 'Automatic planning or launch failed with the recorded reason',
-  'member/failure': 'Worker operation failed with the recorded error',
-  'member/subscribed': 'Worker topic subscriptions replaced',
-  'member/waiting': 'Worker parked itself until fresh peer input arrives',
-  'mission/budget-exhausted': 'Aggregate budget exhausted; mission paused pending quiescence and a raise',
-  'mission/budget-quiesced': 'Every worker stopped after budget exhaustion; attempts preserved for resume',
-  'mission/budget-warning': 'Approaching-limit threshold crossed for one budget dimension',
-  'plan/edited': 'Saved draft plan edited with a new revision',
-  'plan/launched': 'Saved draft plan activated as an active mission',
-  'plan/staged': 'Draft plan staged without creating workers or worktrees',
-  'task/budget-resumed': 'Preserved attempt resumed after the budget raise',
-  'task/lease-expiring': 'Attempt lease is approaching expiry with no live operation',
-  'tool/recorded': 'Host tool run recorded for evidence and audit',
-  // Round 9-C: the remaining types the runtime emits, including the four added
-  // by the liveness/review/check fixes. `eventVocabularyReport` must never
-  // report an emitted type as unrecognized; tests/event-vocabulary.test.mjs
-  // re-derives this set from src/ and fails if a new emitter is unregistered.
-  'admission/limit': 'Owner set an admission limit rule; recorded with its level, key and limit',
-  'admission/refused': 'Admission refused a task or member against a limit; recorded once per refusal row',
-  'member/effort-downgraded': 'Provider rejected the requested reasoning effort; the member runs without it',
-  'member/effort-rejected': 'Provider rejected the effort retry; admission failed and the member was stopped',
-  'task/check-changed': 'A replaced or re-submitted task declared a different check than the stored record',
-  'task/closeout-ready': 'Idle close-out re-pended the task after a checkpoint instead of abandoning it',
-  'task/closeout-exhausted': 'Idle close-out reached the recovery limit and left the task blocked',
-  'task/preparation-failed': 'Task preparation failed; the reason and recovery credit were recorded',
-  'task/reassigned': 'A failed attempt was re-routed to another live member',
-  'task/review-admitted': 'The runtime admitted an independent verification for a submitted task with no review',
-  'task/review-blocked': 'A submitted task has no review and no eligible reviewer; the reason is recorded',
-  'task/review-missing': 'A submitted task was detected without a review on the scheduler tick',
-  'task/start-failed': 'Worker start failed; the attempt was recovered or re-routed with the reason',
-  'mission/pause': 'Owner paused the mission',
-  'mission/stop': 'Owner stopped the mission',
-  'mission/complete': 'Owner completed the mission',
-  'mission/resume': 'Owner resumed the mission',
-  'mission/coordinator': 'Owner set the mission coordinator',
-  'delivery/applied': 'Owner applied an accepted result to the source checkout',
-  'delivery/conflicts': 'Owner applied a result that conflicted; no source write was kept',
-  // User-authorized per-mission workspace: the human authorization surface and
-  // its durable binding/revocation audit.
-  'workspace/grant-loaded': 'One human-configured authorizedWorkspaces root loaded at plugin start, or named as unresolvable',
-  'mission/workspace-bound': 'Mission bound to its resolved workspace and the matched authorized root',
-  'mission/workspace-revoked': 'Mission fenced: its workspace is no longer inside a human-authorized root',
-  // Round 11 arena protocols: the typed owner escalation and the bounded
-  // per-member proposal allowance refusal (both recorded before the owner
-  // notice that carries the decision).
-  'escalation/raised': 'A member raised a typed durable owner escalation with its mission-state fingerprint',
-  'task/proposal-refused': 'A worker proposal was refused for the per-member allowance or a mission budget/ceiling reason; the owner was notified',
-  // Round 11 host caps: provider-outage routing, store snapshot, per-task
-  // restart and the measured check envelope (D2/D6/D8).
-  'provider/outage': 'Provider outage classified (quota, rate limit or unavailable); the route is quiescent and no recovery credit is spent',
-  'provider/recovered': 'A quiescent provider route answered successfully again; the outage marker is cleared',
-  'task/restart-repended': 'Host restart re-pended a running task without spending recovery credit; the task and epoch are named',
-  'task/check-envelope': 'Measured declared-check envelope after a verification: limit, active, queued, wait and run times',
-  'store/snapshot': 'Periodic VACUUM INTO snapshot written beside the owner state file',
-  'store/restore-requested': 'Owner staged one validated snapshot restore for the next host start',
-  'store/restored': 'Plugin composition applied a staged snapshot restore before opening the store',
-  // R11-15: the shared temp roots are a cross-member channel; this row records
-  // two members naming the same temp path inside the rendezvous window.
-  'isolation/temp-rendezvous': 'Two members named the same shared temp path inside the rendezvous window; the path and both members are recorded',
-}
+export { EVENT_VOCABULARY, type EventKind }
 export interface EventVocabularyReport {
   recognized: string[]
   unrecognized: string[]
@@ -960,7 +545,8 @@ export function readEventHistory(store: TraceStore, missionId: string, options: 
   const limit = Math.min(HISTORY_PAGE_MAX, Math.max(1, Math.trunc(options.limit ?? HISTORY_PAGE_DEFAULT)))
   const before = options.before
   if (before !== undefined && (!Number.isSafeInteger(before) || before < 0)) throw new Error('before must be a nonnegative integer')
-  const all = store.events(missionId, HISTORY_SCAN_LIMIT, 0)
+  const scanned = store.events(missionId, HISTORY_SCAN_LIMIT + 1, 0)
+  const all = scanned.slice(-HISTORY_SCAN_LIMIT)
   const window = before === undefined ? all : all.filter(event => event.seq < before)
   const events = window.slice(-limit)
   const hasOlder = window.length > events.length
@@ -968,7 +554,7 @@ export function readEventHistory(store: TraceStore, missionId: string, options: 
     events, total: all.length, pageSize: limit,
     ...(events.length ? { firstSeq: events[0]!.seq, lastSeq: events.at(-1)!.seq } : {}),
     ...(hasOlder && events.length ? { nextBefore: events[0]!.seq } : {}),
-    hasOlder, truncated: all.length >= HISTORY_SCAN_LIMIT,
+    hasOlder, truncated: scanned.length > HISTORY_SCAN_LIMIT,
   }
 }
 
@@ -1053,7 +639,7 @@ const required = (data: Record<string, unknown>, key: string, seq: number): stri
 }
 /** Events that close a dispatched attempt; anything else leaves the attempt unresolved. */
 /** The one declared set (`src/types.ts`): every event that fences a running attempt. */
-const ATTEMPT_CLOSERS = new Set(ATTEMPT_FENCING_EVENTS)
+const ATTEMPT_CLOSERS: ReadonlySet<string> = new Set(ATTEMPT_FENCING_EVENTS)
 export interface ReplayResult {
   commands: ReplayCommand[]
   keys: string[]
@@ -1076,13 +662,25 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
   // replayed into a sequence that no legal mission could have produced.
   const graph: TaskGraphNode[] = []
   for (const event of events) {
-    if (event.type !== 'task/proposed') continue
-    const data = asObject(event.data, event.seq, event.type)
-    graph.push({
-      id: required(data, 'id', event.seq),
-      dependencies: Array.isArray(data.dependencies) ? data.dependencies.filter((id): id is string => typeof id === 'string') : [],
-      ...(typeof data.reviewOf === 'string' && data.reviewOf ? { reviewOf: data.reviewOf } : {}),
-    })
+    if (event.type === 'task/proposed') {
+      const data = asObject(event.data, event.seq, event.type)
+      graph.push({
+        id: required(data, 'id', event.seq),
+        dependencies: Array.isArray(data.dependencies) ? data.dependencies.filter((id): id is string => typeof id === 'string') : [],
+        ...(typeof data.reviewOf === 'string' && data.reviewOf ? { reviewOf: data.reviewOf } : {}),
+      })
+    } else if (event.type === 'task/amended' || event.type === 'task/plan-repaired') {
+      const data = asObject(event.data, event.seq, event.type)
+      const taskId = required(data, 'taskId', event.seq)
+      const node = graph.find(task => task.id === taskId)
+      if (!node) throw new ReplayTruncationError(`durable log lacks the admission for amended task ${taskId}`, [taskId])
+      const changes = asObject(event.type === 'task/amended' ? data.changes : data.task, event.seq, `${event.type} changes`)
+      if (Array.isArray(changes.dependencies)) node.dependencies = [...new Set(changes.dependencies.filter((id): id is string => typeof id === 'string' && id !== node.reviewOf))]
+      if (event.type === 'task/plan-repaired') {
+        if (typeof changes.reviewOf === 'string' && changes.reviewOf) node.reviewOf = changes.reviewOf
+        else delete node.reviewOf
+      }
+    }
   }
   const graphDefects = taskGraphDefects(graph)
   if (graphDefects.length > 0) {
@@ -1098,6 +696,11 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       if (reason) throw new TraceContractError(`trace span at seq ${event.seq} violates the D6 contract: ${reason}`, event.seq, (event.data as Partial<TraceSpan>).step)
       continue
     }
+    if (event.type === 'task/amended') {
+      const data = asObject(event.data, event.seq, event.type)
+      if (typeof data.fencedAttemptId === 'string' && open.get(data.fencedAttemptId)?.taskId === data.taskId) open.delete(data.fencedAttemptId)
+      continue
+    }
     if (event.type !== 'task/claimed' && !ATTEMPT_CLOSERS.has(event.type)) continue
     const data = asObject(event.data, event.seq, event.type)
     if (event.type === 'task/claimed') {
@@ -1105,6 +708,9 @@ export function orchestratorCommands(events: readonly SwarmEvent[]): ReplayResul
       const attempt = asObject(data.attempt, event.seq, 'task/claimed attempt')
       const attemptId = required(attempt, 'id', event.seq)
       const memberId = required(attempt, 'ownerId', event.seq)
+      const earlier = [...open.entries()].find(([, record]) => record.taskId === taskId)
+      if (earlier) throw new ReplayTruncationError(`durable log is truncated: ${taskId} was dispatched again at seq ${event.seq} before attempt ${earlier[0]} reached a closing event`, [`${taskId}#${earlier[0]}`])
+      if (open.has(attemptId)) throw new ReplayCorruptionError(`attempt ${attemptId} was claimed for another task at seq ${event.seq}`, event.seq)
       commands.push({ kind: 'dispatch', seq: event.seq, taskId, memberId, attemptId })
       open.set(attemptId, { taskId, memberId })
       continue

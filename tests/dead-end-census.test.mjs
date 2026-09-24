@@ -4,11 +4,11 @@
  * The owner's prototype censuses every live task as RECOVERABLE, OWNER-GATED or
  * DEAD END. This file makes that census checkable from the state machines
  * instead of running it by hand, over the *same* generated board space and the
- * *same* guard vocabulary the dispatch path uses (`guardActions`,
- * `guardMissionTerminal`, `terminalEscalation` in `src/scheduling.ts`,
- * `guardTerminal` in `src/refusals.ts`; the generator lives in
- * tests/guard-states.mjs, shared with tests/guard-terminals.test.mjs). No second
- * model of the board is grown here.
+ * *same* guard vocabulary the property test uses (`guardActions`,
+ * `guardMissionTerminal`, `terminalEscalation` in tests/guard-model.mjs, whose
+ * terminal is production's `guardTerminal` in `src/refusals.ts`; the generator
+ * lives in tests/guard-states.mjs, shared with tests/guard-terminals.test.mjs).
+ * No second model of the board is grown here.
  *
  * Classification, per live task (a task is live while it is neither accepted nor
  * cancelled): the census projects the board to that one task and asks the
@@ -39,11 +39,15 @@
  * **0 dead ends and 4 owner-gated**, the four being the blocked reviews whose
  * sources were rejected, each naming a real exit pair. That board is
  * reconstructed here from durable rows through the production projection
- * (`SwarmRuntime.scheduling.guardBoard`) and must classify as 0 dead ends and
+ * (`guardBoard` in tests/guard-model.mjs) and must classify as 0 dead ends and
  * exactly 4 owner-gated. Over the whole reachable closure the corrected
- * (task-scoped) census reports **60 recoverable / 12740 owner-gated / 0 dead
- * ends**; before the D1 fix it reported 86/12714/0, the difference being the
- * states whose only "action" was an unrelated member's `working` status. The
+ * (task-scoped) census reports **52 recoverable / 11148 owner-gated / 0 dead
+ * ends** over six board chains (60/12740/0 while the R12-F9 dependency guard
+ * was a seventh, dispatch-time `admission` chain with its own `assumed-content`
+ * seed; that guard now refuses at the call that writes a dependency set, so the
+ * seed and its states are gone); before the D1 fix it reported 86/12714/0, the
+ * difference being the states whose only "action" was an unrelated member's
+ * `working` status. The
  * *discriminating* number is the owner-gated count (0 dead ends is structural:
  * the terminal element of every chain is unconditional).
  *
@@ -61,7 +65,7 @@
  * the classification and the counts, the reachability of the DEAD END branch
  * (by mutation), and the well-formedness of every escalation's exits. What stays
  * a lint property: whether the named tools and parameters resolve in the real
- * tool schema — that is `assessRefusal` over `toolSchemaIndex`
+ * tool schema — that is `assessText` over `toolSchemaIndex`
  * (tests/refusal-inventory.mjs), which this file runs over the census's own
  * terminals so a drifted exit fails here too.
  *
@@ -71,10 +75,10 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { guardActions, guardMissionTerminal } from '../lib/scheduling.js'
+import { guardActions, guardBoard, guardMissionTerminal } from './guard-model.mjs'
 import { reconcileTaskAdmission } from '../lib/admission.js'
 import { ReplayGraphError, orchestratorCommands } from '../lib/trace.js'
-import { assessRefusal, refusalSites, toolSchemaIndex } from './refusal-inventory.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup } from './faults/harness.mjs'
 import { CHAINS, generatedBoards, generatorLimits, keyOf, reachableClosure } from './guard-states.mjs'
 
@@ -122,7 +126,7 @@ export function census(board, actions = guardActions) {
     // to this task — the same reason the member-scoped progress action is
     // dropped below. A `stopped` member cannot act at all. What remains is the
     // set the production dispatch predicate itself considers (`idle`/`waiting`),
-    // so no second model of the board is grown: the production `guardActions`
+    // so no second model of the board is grown: the shared `guardActions`
     // still answers every question.
     const projected = {
       ...board,
@@ -141,11 +145,7 @@ export function census(board, actions = guardActions) {
 
 /** The production message text goes through the real refusal lint, as in tests/guard-terminals.test.mjs. */
 const schemaIndex = await toolSchemaIndex()
-function exitViolations(message) {
-  const sites = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(message)})\n}\n`, 'src/probe.ts')
-  assert.equal(sites.length, 1, 'the lint fixture has exactly one refusal site')
-  return assessRefusal(sites[0], { ...schemaIndex, diagnosticProducers: new Set() })
-}
+const exitViolations = message => assessText(message, schemaIndex)
 
 test('DEAD census: every reachable non-terminal board state is RECOVERABLE or OWNER-GATED, and the reachable set is the generator\'s closure', () => {
   const reachable = reachableClosure()
@@ -225,7 +225,7 @@ test('DEAD census reference: this round\'s board shape reports 0 dead ends and 4
   const f = await setup({ config: { tickMs: 10_000 } })
   try {
     const reviews = putReferenceBoard(f)
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     const result = census(board)
     assert.equal(result.totals[DEAD_END], 0, 'this round\'s board has no dead ends')
     const ownerGated = result.perTask.filter(entry => entry.outcome === OWNER_GATED)
@@ -256,7 +256,7 @@ test('DEAD non-vacuity: the classifier returns DEAD END under the documented mut
         kind: 'implementation', dependencies: [], scope: ['**'], acceptance: ['works'], checks: [], status: 'blocked', priority: 0, experiment: false, epoch: 1, evidenceIds: [],
       })
     })
-    board = f.runtime.scheduling.guardBoard(f.mission.id)
+    board = guardBoard(f.runtime, f.mission.id)
     // The production model on the real board: no dead ends.
     assert.equal(census(board).totals[DEAD_END], 0, 'the production model never reports a dead end on a real board')
     // Mutant A: no terminal, no actions at all.
@@ -285,17 +285,16 @@ test('DEAD non-vacuity: the classifier returns DEAD END under the documented mut
 })
 
 test('DEAD pair: the same graph validator refuses an illegal graph at admission and on replay', () => {
-  const workspace = '/tmp/dead-census-workspace'
   const location = 'task'
   const source = { objective: 'Implement the scoped change in src/admission.ts.', scope: ['src/'], acceptance: ['the graph is validated'] }
   // Admission: the same defect the replay path refuses.
-  const dangling = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, workspace, location, { dependencies: ['task_never_admitted'], knownContents: new Set(['task_real']) })
+  const dangling = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, location, { dependencies: ['task_never_admitted'], knownContents: new Set(['task_real']) })
   const danglingDefects = dangling.filter(diagnostic => diagnostic.code.startsWith('task_graph'))
   assert.equal(danglingDefects.length, 1, `admission must refuse the dangling edge, saw ${JSON.stringify(dangling)}`)
   assert.equal(danglingDefects[0].code, 'task_graph_unknown_edge')
   assert.match(danglingDefects[0].message, /swarm_propose/, 'the admission diagnostic names an executable exit')
   // A known dependency is graph-legal: the validator does not double-refuse.
-  const legal = reconcileTaskAdmission({ ...source, dependencies: ['task_real'] }, workspace, location, { dependencies: ['task_real'], knownContents: new Set(['task_real']) })
+  const legal = reconcileTaskAdmission({ ...source, dependencies: ['task_real'] }, location, { dependencies: ['task_real'], knownContents: new Set(['task_real']) })
   assert.deepEqual(legal.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'a known edge is admitted')
   // Co-firing guards, named and shown disjoint rather than double-refusing:
   //  - the R12-F9 admission guard (a task whose text assumes prior work while it
@@ -306,15 +305,15 @@ test('DEAD pair: the same graph validator refuses an illegal graph at admission 
   //  - cancellation and replacement lineage are the runtime's own guards: a
   //    `replaces` id is not a graph edge, and a cancelled dependency is a known
   //    identity, so the graph validator stays silent for both.
-  const assumed = reconcileTaskAdmission({ objective: 'Resume from your own artifact `09883f3` and finish it.', scope: ['src/'], acceptance: ['works'], dependencies: [] }, workspace, location,
+  const assumed = reconcileTaskAdmission({ objective: 'Resume from your own artifact `09883f3` and finish it.', scope: ['src/'], acceptance: ['works'], dependencies: [] }, location,
     { dependencies: [], replaces: [], knownContents: new Set(['task_real']) })
   assert.ok(assumed.some(diagnostic => diagnostic.code === 'dependency_assumption_missing'), 'the R12-F9 guard fires on an empty edge set')
   assert.deepEqual(assumed.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'and the graph validator stays silent there')
   assert.deepEqual(dangling.filter(diagnostic => diagnostic.code === 'dependency_assumption_missing'), [], 'the R12-F9 guard stays silent on a dangling edge')
-  const repair = reconcileTaskAdmission({ ...source, dependencies: [], replaces: ['task_blocked'] }, workspace, location, { dependencies: [], replaces: ['task_blocked'], knownContents: new Set(['task_blocked']) })
+  const repair = reconcileTaskAdmission({ ...source, dependencies: [], replaces: ['task_blocked'] }, location, { dependencies: [], replaces: ['task_blocked'], knownContents: new Set(['task_blocked']) })
   assert.deepEqual(repair.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'a `replaces` lineage is not a graph edge')
   // A call site that does not know the mission's identities must never guess.
-  const blind = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, workspace, location, { dependencies: ['task_never_admitted'] })
+  const blind = reconcileTaskAdmission({ ...source, dependencies: ['task_never_admitted'] }, location, { dependencies: ['task_never_admitted'] })
   assert.deepEqual(blind.filter(diagnostic => diagnostic.code.startsWith('task_graph')), [], 'without known identities the graph guard cannot judge an edge and stays silent')
 
   // Replay: the same defects, from a durable log, refused before any command.
@@ -352,7 +351,7 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
   const f = await setup({ config: { tickMs: 10_000 } })
   try {
     const reviews = putReferenceBoard(f)
-    const idleBoard = f.runtime.scheduling.guardBoard(f.mission.id)
+    const idleBoard = guardBoard(f.runtime, f.mission.id)
     const baseline = census(idleBoard)
     assert.equal(baseline.totals[OWNER_GATED], 4, 'the four blocked reviews are owner-gated while every member is idle')
     assert.equal(baseline.totals[RECOVERABLE], 0)
@@ -366,7 +365,7 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     // reviews, so the same four subjects are classified before and after.
     const unrelated = f.propose({ title: 'Unrelated work', assigneeId: f.reviewer.id })
     await f.runtime.claim(f.actor(f.reviewer), f.mission.id, unrelated.id)
-    const driven = f.runtime.scheduling.guardBoard(f.mission.id)
+    const driven = guardBoard(f.runtime, f.mission.id)
     assert.equal(driven.members.find(member => member.id === f.reviewer.id).status, 'working', 'the driven board really reports a working member')
     const workingBoard = { ...driven, tasks: driven.tasks.filter(task => reviews.includes(task.id)) }
     const after = census(workingBoard)
@@ -401,7 +400,8 @@ test('DEADr D1 pair: an unrelated working member is not this task\'s recovery', 
     // member-scoped liveness and adds dispatch eligibility for a pending task;
     // the fixed census may therefore move OWNER-GATED -> RECOVERABLE for a
     // pending task, but it must NEVER move RECOVERABLE -> OWNER-GATED — which is
-    // exactly what the pre-D1 census does, 24 times (the verifier's 24 of 86).
+    // exactly what the pre-D1 census does, 21 times (the verifier's 24 of 86,
+    // measured while the `assumed-content` seed was still part of the closure).
     const reachable = reachableClosure()
     const forceIdle = board => ({ ...board, members: board.members.map(member => member.status === 'stopped' ? member : { ...member, status: 'idle' }) })
     const outcomes = (board, fn) => fn(board).perTask.map(entry => entry.outcome).join(',')

@@ -19,7 +19,10 @@ const npmCache = join(temporary, 'npm-cache')
 /** Materialize the tracked working tree (no ignored build output, no dependencies) into a clean checkout. */
 async function materializeTrackedTree(source, destination) {
   const { stdout } = await execute('git', ['ls-files', '-z'], { cwd: source, maxBuffer: 16 * 1024 * 1024 })
-  const tracked = stdout.split('\0').filter(Boolean)
+  // A tracked working tree also includes intentional, unstaged deletions.
+  // Preserve them without staging user changes or copying obsolete sources.
+  const deleted = new Set((await execute('git', ['ls-files', '--deleted', '-z'], { cwd: source, maxBuffer: 16 * 1024 * 1024 })).stdout.split('\0'))
+  const tracked = stdout.split('\0').filter(relative => relative && !deleted.has(relative))
   assert(tracked.length > 0, 'clean-checkout pack requires a tracked source tree')
   for (const relative of tracked) {
     const target = join(destination, relative)
@@ -88,6 +91,12 @@ try {
   ], { cwd: temporary, timeout: 90_000, maxBuffer: 4 * 1024 * 1024 })
   process.stdout.write(result.stdout)
   process.stderr.write(result.stderr)
+  const compaction = await execute(process.execPath, [
+    '--expose-internals', join(project, 'tests/harness-boundary-compaction.mjs'),
+    '--artifact', artifactRoot, '--harness', harnessRoot,
+  ], { cwd: temporary, timeout: 90_000, maxBuffer: 4 * 1024 * 1024 })
+  process.stdout.write(compaction.stdout)
+  process.stderr.write(compaction.stderr)
   process.stdout.write(`Packed artifact smoke passed (${files.length} published files).\n`)
 } finally {
   await rm(temporary, { recursive: true, force: true })

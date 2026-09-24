@@ -11,7 +11,7 @@ const RUNTIME_EMITTED = ['automatic/requested', 'automatic/failed', 'member/fail
 test('F-12: the verdict event names the evidence, the verdict and the retired reviews', async t => {
   const f = await traceFixture(t)
   const events = f.events()
-  // Normalized client contract from the tool layer: { evidenceId, verdict, retired }.
+  // Normalized client contract from the runtime verdict transaction.
   const verdicts = events.filter(event => event.type === 'evidence/verdict')
   assert.equal(verdicts.length, 1, 'one normalized verdict row per evidence id')
   const verdict = verdicts[0].data
@@ -77,11 +77,13 @@ test('F-13: the read path pages older events with a before cursor instead of tai
   assert(Array.isArray(verdict.data.retired), 'history returns the complete event data, not an excerpt')
 
   // The model tool exposes the same older-event read and vocabulary report.
+  const expectedToolPage = readEventHistory(f.runtime.store, f.missionId, { before: newest.nextBefore, limit: 3 })
   const tool = (await f.raw('swarm_observe', { missionId: f.missionId, before: newest.nextBefore, eventLimit: 3, vocabulary: true }, f.owner)).result
   assert.equal(tool.events.length, 3)
   assert.equal(tool.events.at(-1).seq, newest.nextBefore - 1)
   assert(tool.historyWindow.total === total && tool.historyWindow.hasOlder === true)
-  assert(tool.eventVocabulary.recognized.includes('task/claimed'))
+  assert.deepEqual(tool.events.map(event => event.seq), expectedToolPage.events.map(event => event.seq), 'the tool returns exactly the requested older window')
+  assert.deepEqual(tool.eventVocabulary, eventVocabularyReport(expectedToolPage.events), 'the vocabulary describes this page, independently of later event additions')
 })
 
 test('F-14: every previously unsurfaced event type is recognized by the read path', () => {

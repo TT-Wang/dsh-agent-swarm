@@ -7,30 +7,17 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 1000, maxSteps: 10, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
-
-async function eventually(read, message) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
+const budget = { ...sharedBudget, maxTokens: 1000, maxSteps: 10, maxWorkers: 4, maxTasks: 12, maxExperiments: 2 }
 
 /** A provider whose supported efforts are declared by `unsupported` and `rejectAll`. */
-class GovernanceWorkers {
-  callbacks; deliveries = []; stopped = []; prepared = []
+class GovernanceWorkers extends FakeWorkers {
   unsupported = new Set()
   rejectAll = false
   captureStarted = false
-  captureGate
   artifact = { commit: 'abc123', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] }
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/isolated/${memberId}` }
   async start(spec) {
     const effort = spec.member.reasoningEffort
     if (effort !== undefined && this.unsupported.has(effort)) {
@@ -40,27 +27,18 @@ class GovernanceWorkers {
     }
     if (this.rejectAll) throw new Error(`provider "${spec.member.provider ?? 'inherited'}" model "${spec.member.model ?? 'inherited'}" is unavailable`)
   }
-  async deliver(member, delivery) { this.deliveries.push(delivery) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
   async captureArtifact() { this.captureStarted = true; if (this.captureGate) await this.captureGate; return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async prepareTask(member, task) { this.prepared.push(task.epoch) }
-  async dispose() {}
 }
 
 async function setup(t, options = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'swarm-governance-'))
-  const workers = new GovernanceWorkers()
-  const config = { statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 1000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, ...options.config }
-  const runtime = new SwarmRuntime(config, workers)
-  t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
+  const { runtime, workers } = await makeRuntime(t, { workers: new GovernanceWorkers(),
+    config: { tickMs: 1000, maxEvents: 200, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId: 'owner-session' }
   const mission = runtime.create(owner, { title: 'Govern', objective: 'Fix governance', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget, ...options.budget } })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix governance' })
   const addMember = (input, admittedId) => runtime.addMember(owner, mission.id, { maxOutputTokens: 1000, ...input }, admittedId)
   const propose = (actor, extra = {}, admittedId) => runtime.propose(actor, mission.id, {
-    workstreamId: stream.id, title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra }, admittedId)
+    outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix governance', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra }, admittedId)
   const events = type => runtime.snapshot(owner, mission.id).events.filter(event => event.type === type)
   return { runtime, workers, mission, stream, owner, addMember, propose, events }
 }
@@ -100,6 +78,19 @@ test('W8: a route that still rejects the cleared effort refuses admission with a
   assert.equal(stored.status, 'stopped', 'a member that cannot start is not left live')
 })
 
+test('a mission duration beyond the clock range is one validation_error at create and at budget update', async t => {
+  const f = await setup(t)
+  const duration = error => {
+    assert.equal(error.code, 'mission_duration_invalid')
+    assert.equal(error.category, 'validation_error')
+    assert.equal(error.message, 'Mission duration exceeds the supported clock range')
+    return true
+  }
+  assert.throws(() => f.runtime.create(f.owner, { title: 'Long', objective: 'Too long', workspace: '/source', scope: ['src/'], acceptance: ['works'],
+    budget: { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER } }), duration)
+  assert.throws(() => f.runtime.updateBudget(f.owner, f.mission.id, { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER }), duration)
+})
+
 test('D9: the owner withdraws a submitted task, records the previous status and retires its review', async t => {
   const f = await setup(t)
   const builder = await f.addMember({ name: 'Builder', role: 'implementation' })
@@ -126,7 +117,7 @@ test('F6: cancelling during artifact capture tells the worker the task is termin
   let release
   f.workers.captureGate = new Promise(resolve => { release = resolve })
   const submitting = f.runtime.submit({ sessionId: builder.sessionId }, f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'done' })
-  await eventually(() => f.workers.captureStarted, 'artifact capture did not start')
+  await eventually(() => f.workers.captureStarted, 'artifact capture did not start', 2500)
   f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'captured by mistake' })
   release()
   await assert.rejects(submitting, /cancelled this task while the artifact was captured\. It is terminal: stop working on it and do not resubmit/)
@@ -148,18 +139,18 @@ test('F7: propose(admittedId) refuses to re-admit a cancelled record', async t =
   assert.equal(f.runtime.snapshot(f.owner, f.mission.id).tasks.find(item => item.id === admittedId).status, 'cancelled')
 })
 
-test('F11: suggestedLimit is the exact ceiling, not one above it', async t => {
+test('F11/R06: warning suggestions increase the limit and restore planning headroom', async t => {
   const f = await setup(t, { budget: { maxTokens: 1000 } })
   const builder = await f.addMember({ name: 'Builder', role: 'implementation' })
   await f.workers.callbacks.usageSnapshot(builder.id, 700)
   const warnings = () => f.events('mission/budget-warning')
   assert.equal(warnings().length, 1)
   assert.equal(warnings()[0].data.threshold, 0.7)
-  assert.equal(warnings()[0].data.suggestedLimit, 1000, '700 / 0.7 is exactly 1000, not 1001')
+  assert.equal(warnings()[0].data.suggestedLimit, 1001, 'a suggested adjustment must increase the current ceiling')
   await f.workers.callbacks.usageSnapshot(builder.id, 700)
   assert.equal(warnings().length, 1, 'the threshold warns once')
   await f.workers.callbacks.usageSnapshot(builder.id, 950)
   const last = warnings().at(-1)
   assert.equal(last.data.threshold, 0.9)
-  assert.equal(last.data.suggestedLimit, 1056, 'a non-integer ratio still rounds up')
+  assert.equal(last.data.suggestedLimit, 1358, 'a recommendation restores headroom below the first review threshold')
 })

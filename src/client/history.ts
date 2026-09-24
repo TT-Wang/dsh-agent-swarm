@@ -60,7 +60,8 @@ export function transcriptEntry(entry: HistoryEntry): { role: string; text: stri
   if (type === 'user/message') return { role: 'Input', text: contentText(data.content) }
   if (type === 'assistant/message') return { role: 'Assistant', text: object(data.message) ? contentText(data.message.content) : '' }
   if (type === 'tool/call') return { role: `Tool · ${String(data.name ?? '')}`, text: typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {}, null, 2) }
-  if (type === 'tool/result') return { role: data.error || (object(data.message) && toolError(data.message.content)) ? 'Tool error' : 'Tool result', text: object(data.message) ? contentText(data.message.content) : JSON.stringify(data.error ?? data, null, 2) }
+  // 0.1.7 flags the tool-role message itself; 0.1.5 flags its nested tool-result block.
+  if (type === 'tool/result') return { role: data.error || (object(data.message) && (data.message.isError === true || toolError(data.message.content))) ? 'Tool error' : 'Tool result', text: object(data.message) ? contentText(data.message.content) : JSON.stringify(data.error ?? data, null, 2) }
   if (type === 'compaction/summary') return { role: 'Context summary', text: contentText(data.content) || JSON.stringify(data, null, 2) }
   return undefined
 }

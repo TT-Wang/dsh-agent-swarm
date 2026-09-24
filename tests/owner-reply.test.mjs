@@ -17,37 +17,19 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class SilentWorkers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ to: member.id, ...delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [{ command: 'test', exitCode: 0, output: 'ok' }] }
-  async dispose() {}
-}
+import { FakeClock, FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
 
-async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-owner-reply-'))
-  const workers = new SilentWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+async function fixture(t, config = {}) {
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -147,7 +129,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 1: the owner reads the question and ends the turn without the call.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const missing = f.events('owner/reply-missing')
   assert.equal(missing.length, 1)
   assert.equal(missing[0].data.deliveryId, ask.id)
@@ -164,7 +146,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 2: still unanswered — the second nudge is the last one.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
   const secondNudge = f.deliveries().find(item => item.to === 'owner'
@@ -176,7 +158,7 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
 
   // Turn 3: the bound is spent, so the guard terminal reports the decision once.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const terminal = f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal')
   assert.equal(terminal.length, 1, 'the guard terminal is the durable exit once nudging is spent')
   assert.equal(terminal[0].data.chain, 'owner_reply')
@@ -185,14 +167,14 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.equal(f.events('owner/reply-missing').length, 2, 'the durable miss record is bounded with the nudges')
   // Turn 4 with the same open receipt stays quiet: no further event, no duplicate terminal.
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2)
   assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
 
   // The owner answers after the escalation: the receipt settles and the next turn is quiet.
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'target v2', replyTo: ask.id })
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 4000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 2, 'a settled receipt is never reported again')
   assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
 
@@ -202,6 +184,27 @@ test('L2/L3: an owner turn that leaves a question open is recorded, nudged with 
   assert.match(view.openAsks.note, /replyTo/)
 })
 
+test('L2: the turn boundary and the consumption stamp are on the runtime clock, so a clock ahead of the host still nudges', async t => {
+  // The guard booked a question only when its runtime-clock deliveredAt was at or
+  // before the host's user/message createdAt, and stamped consumedAt with that
+  // host time. With the runtime clock ten minutes ahead of the host, an
+  // unanswered owner question was never booked, so it was never nudged.
+  const clock = new FakeClock(Date.now() + 600_000)
+  const f = await fixture(t, { now: clock.now })
+  const ask = await f.ask()
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
+  t.after(() => guard.dispose())
+  clock.advance(1_000)
+  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  assert.deepEqual(f.events('owner/reply-missing').map(event => event.data.deliveryId), [ask.id], 'the unanswered question is booked and recorded')
+  f.runtime.pumpOutbox = () => {}
+  f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'And the schema version?' })
+  const consumed = f.deliveries().filter(row => row.replyExpected && row.id !== ask.id).at(-1)
+  guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now(), source: { kind: 'swarm', deliveryId: consumed.id } })
+  assert.equal(f.runtime.store.get('deliveries', consumed.id).consumedAt, clock.now(), 'consumption is stamped on the runtime clock')
+})
+
 test('L2: an answered turn is never nudged, and a repeated turn end is a no-op', async t => {
   const f = await fixture(t)
   const ask = await f.ask()
@@ -209,9 +212,9 @@ test('L2: an answered turn is never nudged, and a repeated turn end is a no-op',
   t.after(() => guard.dispose())
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() })
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'answered in-turn', replyTo: ask.id })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 0, 'the turn settled the receipt, so nothing is missing')
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('owner/reply-missing').length, 0, 'an end without a booked turn reports nothing')
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
 })
@@ -221,20 +224,20 @@ test('L2: replacing the guard resumes the durable nudge ordinal and reaches esca
   const ask = await f.ask()
   const first = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
   first.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-  first.observe(f.owner.sessionId, 'turn/end')
+  first.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   await f.runtime.flushOutbox(f.mission.id)
   first.dispose()
   const replacement = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 2 })
   t.after(() => replacement.dispose())
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  replacement.observe(f.owner.sessionId, 'turn/end')
-  replacement.observe(f.owner.sessionId, 'turn/end')
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   const nudges = f.deliveries().filter(row => row.notice?.dedupKey?.startsWith(`owner-reply-missing:${ask.id}`))
   assert.equal(nudges.length, 2, 'guard state loss does not repeat or swallow a recovery ordinal')
   assert.equal(new Set(nudges.map(row => row.notice.dedupKey)).size, 2)
   await f.runtime.flushOutbox(f.mission.id)
   replacement.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 3000 })
-  replacement.observe(f.owner.sessionId, 'turn/end')
+  replacement.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.events('mission/stalled').filter(event => event.data.cause === 'guard-terminal').length, 1)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 2)
 })
@@ -255,13 +258,13 @@ test('L2: an outbox write failure does not spend a nudge without retaining its w
   }
   try {
     guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
-    assert.throws(() => guard.observe(f.owner.sessionId, 'turn/end'), /injected outbox write failure/)
+    assert.throws(() => guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } }), /injected outbox write failure/)
   } finally { f.runtime.store.put = original }
   assert.ok(injected)
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, undefined)
   assert.equal(f.events('owner/reply-missing').length, 0)
   guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 2000 })
-  guard.observe(f.owner.sessionId, 'turn/end')
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
   assert.equal(f.runtime.store.get('deliveries', ask.id).replyNudges, 1)
   assert.equal(f.deliveries().filter(row => row.notice?.dedupKey?.startsWith('owner-reply-missing:')).length, 1)
 })
@@ -279,4 +282,59 @@ test('L2/L3: a stopped asker does not hide the open receipt the owner still owes
   assert.equal(view.openAsks.count, 1)
   assert.equal(view.openAsks.asks[0].deliveryId, ask.id)
   assert.equal(view.openAsks.asks[0].from, f.member.id)
+})
+
+
+test('owner receipt books actual consumption before transport acknowledgement and survives context messages', async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  f.runtime.message(f.asker, f.mission.id, { to: 'owner', kind: 'question', content: 'Which version?' })
+  const question = f.deliveries().find(row => row.replyExpected)
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  t.after(() => guard.dispose())
+  assert.equal(question.deliveredAt, undefined)
+  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'swarm', deliveryId: question.id } })
+  guard.observe(f.owner.sessionId, 'user/message', { source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' } })
+  guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  assert.equal(f.events('owner/reply-missing').length, 1)
+  assert.equal(f.events('owner/reply-missing')[0].data.deliveredAt, null)
+  assert.ok(f.events('owner/reply-missing')[0].data.consumedAt)
+  assert.ok(f.runtime.store.get('deliveries', question.id).consumedAt)
+  assert.equal(f.runtime.store.get('deliveries', question.id).deliveredAt, undefined, 'consumption never forges a transport acknowledgement')
+})
+
+for (const summarized of [false, true]) test(`answered receipts invalidate queued nudges and terminal escalation${summarized ? ' within a wake summary' : ''}`, async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  const question = await f.ask()
+  if (summarized) {
+    f.runtime.notices.wakeBudget = 1
+    f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'first fact', [`mission:${f.mission.id}`]))
+  }
+  const guard = new OwnerReplyGuard(fakeContext(), f.runtime, { guard: 'nudge', maxNudges: 1 })
+  t.after(() => guard.dispose())
+  for (let i = 0; i < 2; i++) {
+    guard.observe(f.owner.sessionId, 'user/message', { createdAt: Date.now() + 1000 })
+    guard.observe(f.owner.sessionId, 'turn/end', { reason: { kind: 'completed' } })
+  }
+  const reminders = f.deliveries().filter(row => row.notice?.questionId === question.id || row.notice?.aggregatedFacts?.some(fact => fact.questionId === question.id))
+  assert.ok(reminders.length)
+  assert.ok(reminders.every(row => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
+  assert.ok(reminders.every(row => !f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), row)))
+  await f.runtime.flushOutbox(f.mission.id)
+  assert.ok(reminders.every(row => !f.workers.deliveries.some(sent => sent.id === row.id)), 'no answered reminder reaches transport')
+})
+
+
+test('pre-upgrade receipt nudges expire by their existing structured question key', async t => {
+  const f = await fixture(t)
+  f.runtime.pumpOutbox = () => {}
+  const question = await f.ask()
+  f.runtime.commit(f.mission.id, () => f.runtime.notify(f.mission.id, 'legacy nudge', [`mission:${f.mission.id}`], { dedupKey: `owner-reply-missing:${question.id}:1` }))
+  const nudge = f.deliveries().find(row => row.notice?.dedupKey === `owner-reply-missing:${question.id}:1`)
+  assert.equal(nudge.notice.questionId, undefined)
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), true)
+  f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', content: 'v2', replyTo: question.id })
+  assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), nudge), false)
 })

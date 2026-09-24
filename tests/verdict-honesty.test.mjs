@@ -19,40 +19,25 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { durableVerdicts, shortId } from '../lib/types/client/projection.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const MAX_MESSAGE_CHARS = 10000
 
-class ReviewWorkers {
-  stopped = []
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
-
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-verdict-'))
-  const workers = new ReviewWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: MAX_MESSAGE_CHARS, maxEvents: 500, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: MAX_MESSAGE_CHARS, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'verdict-owner' }
   const mission = runtime.create(owner, { title: 'Verdict', objective: 'Honest verdicts', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -64,9 +49,9 @@ async function fixture(t) {
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   const refutations = evidenceId => events('evidence/refuted').filter(event => event.data.evidenceId === evidenceId)
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
-  const proposeSource = (title = 'Implement', extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
+  const proposeSource = (title = 'Implement', extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
-  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: 'Independent review',
+  const proposeReview = (source, title = 'Review') => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
   async function publishEvidence(claimed, claim, outcome = 'supported', supersedes) {
     const runId = await workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })
@@ -99,8 +84,10 @@ function assertBoardIsConsistent(f, label) {
   const cards = markup.split('<article class="sw-evidence">').slice(1)
   for (const evidence of snapshot.evidence) {
     const latest = verdicts.get(evidence.id)
-    assert.equal(latest?.type, VERDICT_FOR_STATUS[evidence.status],
-      `${label}: evidence ${evidence.id} is ${evidence.status} but its latest durable verdict is ${latest?.type ?? 'none'}`)
+    const latestRow = snapshot.events.find(event => event.seq === latest?.seq)
+    const verdictType = latest?.type === 'evidence/verdict' ? `evidence/${latestRow.data.verdict}` : latest?.type
+    assert.equal(verdictType, VERDICT_FOR_STATUS[evidence.status],
+      `${label}: evidence ${evidence.id} is ${evidence.status} but its latest durable verdict is ${verdictType ?? 'none'}`)
     const card = cards.find(segment => segment.includes(evidence.claim))
     assert.ok(card, `${label}: the board renders the card for evidence ${evidence.id} (${shortId(evidence.id)})`)
     assert.match(card, new RegExp(`>${evidence.status}</span>`), `${label}: the card badge shows the stored status`)
@@ -113,7 +100,7 @@ function assertBoardIsConsistent(f, label) {
   return snapshot
 }
 
-test('a rejected verification names the failing check in the durable reason and the owner notice', async t => {
+test('an infrastructure-deferred verification names the actual failed check and same-task owner recovery', async t => {
   const f = await fixture(t)
   const { source } = await f.submittedSourceWithEvidence()
   const verdict = f.proposeReview(source, 'Verdict review')
@@ -121,22 +108,23 @@ test('a rejected verification names the failing check in the durable reason and 
   f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: verdict.id, attemptId: claimed.attempt.id,
     verdict: 'accept', reason: 'passed every acceptance criterion' })
-  assert.equal(f.current(source.id).status, 'blocked')
+  assert.equal(f.current(source.id).status, 'submitted')
 
-  const [rejected] = f.events('task/rejected')
-  assert.ok(rejected, 'the rejection is durable')
+  const [rejected] = f.events('task/verification-deferred')
+  assert.ok(rejected, 'the deferred verdict is durable')
+  assert.equal(f.events('task/rejected').length, 0)
   const reason = rejected.data.reason
   assert.match(reason, /passed every acceptance criterion/, 'the reviewer reason is retained')
   assert.match(reason, /npm run typecheck && npm run build/, 'the failing command is named')
   assert.match(reason, /exited 127/, 'the exit code is named')
   assert.match(reason, /npm: command not found/, 'an output excerpt is carried')
   assert.equal(rejected.data.checks.length, 1, 'the host run id is still recorded')
-  assert.ok(Array.isArray(rejected.data.checkFailures), 'the durable event carries structured failing checks')
-  assert.deepEqual(rejected.data.checkFailures.map(check => [check.command, check.exitCode]),
-    [['npm run typecheck && npm run build', 127]], 'the structured failure names the command and exit code')
-  assert.match(rejected.data.checkFailures[0].output, /npm: command not found/, 'the structured failure carries the excerpt')
-  const [notice] = f.ownerNotices().filter(delivery => /blocked by independent verification/.test(delivery.content))
-  assert.ok(notice, 'the owner is woken by the rejection')
+  const recorded = f.runtime.store.get('tool_runs', rejected.data.checks[0])
+  assert.equal(recorded.result.exitCode, 127)
+  assert.match(recorded.result.output, /npm: command not found/)
+  const [notice] = f.ownerNotices().filter(delivery => /Verification could not establish a verdict/.test(delivery.content))
+  assert.ok(notice, 'the owner is woken for repair of the host environment')
+  assert.match(notice.content, /swarm_control/)
   assert.match(notice.content, /passed every acceptance criterion/, 'the notice keeps the reviewer reason')
   assert.match(notice.content, /npm run typecheck && npm run build/, 'the notice names the failing command')
   assert.match(notice.content, /exited 127/, 'the notice names the exit code')
@@ -240,4 +228,38 @@ test('evidence verified then challenged and rejected shows one refuted status on
     'the earlier acceptance stays historical and is not repeated')
   assert.equal(f.refutations(evidence.id).length, 1, 'the refutation is recorded exactly once')
   assertBoardIsConsistent(f, 'after the challenged claim was refuted')
+})
+
+test('a claim already refuted is neither verified again nor refuted twice when its source is re-reviewed', async t => {
+  const f = await fixture(t)
+  const source = f.proposeSource('Implement with a revised claim')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const first = await f.publishEvidence(claimed, 'The first attempt satisfies the claim')
+  const revised = await f.publishEvidence(claimed, 'The revised attempt satisfies the claim', 'supported', [first.id])
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const accept = async title => {
+    const review = f.proposeReview(source, title)
+    const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    f.workers.checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
+    await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
+    return review
+  }
+  await accept('First review')
+  assert.equal(f.runtime.store.get('evidence', first.id).status, 'refuted', 'the superseding claim refuted its predecessor')
+  const verifiedOf = id => f.events('evidence/verified').filter(event => event.data.evidenceId === id).length
+  const verdictsOf = id => f.events('evidence/verdict').filter(event => event.data.evidenceId === id).length
+  const before = { verified: verifiedOf(first.id), refuted: f.refutations(first.id).length, verdicts: verdictsOf(first.id) }
+
+  // Dissent on the surviving claim returns the source for a second verdict.
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: revised.id, reason: 'A counterexample questions the revised claim', toolRunIds: [] })
+  assert.equal(f.current(source.id).status, 'submitted')
+  const second = await accept('Second review')
+
+  const predecessor = f.runtime.store.get('evidence', first.id)
+  assert.equal(predecessor.status, 'refuted', 'the refuted predecessor stays refuted')
+  assert.equal(predecessor.refutedBy, revised.id)
+  assert.equal(verifiedOf(first.id), before.verified, 'the second verdict does not verify the refuted claim again')
+  assert.equal(f.refutations(first.id).length, before.refuted, 'nor refute it a second time')
+  assert.equal(verdictsOf(first.id), before.verdicts, 'nor record a verdict row for it')
+  assert.ok(f.events('evidence/verified').some(event => event.data.evidenceId === revised.id && event.data.verificationTaskId === second.id), 'the live claim is verified by the second verdict')
 })

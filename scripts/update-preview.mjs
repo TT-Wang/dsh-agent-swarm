@@ -8,9 +8,12 @@
  *   - the worker is spawned detached (POSIX setsid), so it is not in the
  *     process group of the host it stops — launching this script from inside
  *     that host no longer kills the restart half-way;
- *   - bookkeeping is written *before* anything is stopped, so a crashed worker
- *     leaves a recoverable `status: "restarting"` record instead of stale
- *     `pid`/`launch.url` values that point at a dead process.
+ *   - the host is the preview's own dsh host listening on the port
+ *     (scripts/host.mjs), never a recorded pid: a host restarted by hand is
+ *     still the one stopped, and the new host starts only once the port is
+ *     free. Any other listener (another program, another root's host) is
+ *     refused by pid and command line, here before the build and again in the
+ *     worker right before it signals, and is never stopped.
  *
  * Usage:
  *   node scripts/update-preview.mjs [options]
@@ -19,8 +22,18 @@
  *   --preview <dir>   preview root (default: ~/.dsh/agent-swarm-v41)
  *   --plugin <dir>    linked plugin snapshot (default: realpath of <preview>/plugin)
  *   --port <n>        host port (default: port from <preview>/server.json)
- *   --harness <dir>   Harness checkout to boot (default: infer from the running
- *                     host, else resolveHarnessRoot())
+ *   --harness <dir>   Harness checkout to boot, recorded in server.json
+ *                     (default: the one the preview's running host was
+ *                     launched from, else the one recorded in
+ *                     <preview>/server.json; required when neither exists).
+ *                     A checkout whose release is not in compatibility.json is
+ *                     refused with harness-target's message
+ *   --allow-unsupported-harness
+ *                     update a preview pinned to an unsupported Harness anyway,
+ *                     with a warning on stderr and in restart.log. A preview
+ *                     whose snapshot links an unsupported release's SDK
+ *                     packages would otherwise be stranded; the flag makes
+ *                     that choice explicit
  *   --patch <file>    patch overlay (default: <preview>/preview.patch.yml)
  *   --home <dir>      DSH_HOME (default: <preview>/home)
  *   --workspace <dir> host working directory (default: <preview>/workspace)
@@ -42,10 +55,11 @@
 import { cpSync, copyFileSync, existsSync, mkdirSync, openSync, closeSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { execFileSync, spawn } from 'node:child_process'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveHarnessRoot } from './harness-target.mjs'
-import { changedPaths, selectLaunchUrl, summarizePaths } from './preview-log.mjs'
+import { awaitLaunchUrl, findHost, hostEnv, readServer, startHost, stopHost, writeServer } from './host.mjs'
+import { assertSupportedHarness } from './harness-target.mjs'
+import { changedPaths, summarizePaths } from './preview-log.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const self = fileURLToPath(import.meta.url)
@@ -67,46 +81,33 @@ const skipBuild = flag('--skip-build')
 const noSync = flag('--no-sync')
 const noRestart = flag('--no-restart') || dryRun
 if (!existsSync(preview)) fail(`preview root does not exist: ${preview}`)
-const serverPath = join(preview, 'server.json')
-const server = existsSync(serverPath) ? JSON.parse(readFileSync(serverPath, 'utf8')) : {}
-// A crashed or interrupted restart leaves status "restarting" with pid null while
-// the old host may still be alive and serving. Recover it from previousPid plus
-// the store lock, otherwise a retry would start a second host on the same port.
-if (server.pid === null || server.pid === undefined) {
-  const lockPath = join(preview, 'swarm.sqlite.lock')
-  const lock = existsSync(lockPath) ? JSON.parse(readFileSync(lockPath, 'utf8')) : undefined
-  const candidate = Number(server.previousPid)
-  if (Number.isInteger(candidate) && candidate > 0 && lock?.pid === candidate) {
-    try { process.kill(candidate, 0); server.pid = candidate; server.status = 'running' } catch { /* previous host is gone */ }
-  }
-}
+const server = readServer(preview) ?? {}
 const pluginDir = noSync ? (args.includes('--plugin') ? resolve(value('--plugin')) : undefined) : resolve(value('--plugin', realpathSync(join(preview, 'plugin'))))
 if (pluginDir !== undefined && !existsSync(join(pluginDir, 'package.json'))) fail(`plugin snapshot has no package.json: ${pluginDir}`)
 const port = Number(value('--port', server.url ? new URL(server.url).port : '0'))
 if (!Number.isInteger(port) || port < 1024 || port > 65535) fail('choose a port from 1024 through 65535 with --port')
+// The host this update replaces must be this preview's own before anything is built or synced.
+let oldHost
+try { oldHost = findHost(port, preview) } catch (error) { if (!noRestart) fail(error.message) }
 const patch = resolve(value('--patch', join(preview, 'preview.patch.yml')))
 const home = resolve(value('--home', join(preview, 'home')))
 const workspace = resolve(value('--workspace', join(preview, 'workspace')))
 const logPath = join(preview, 'restart.log')
 const log = message => { const line = `[${now()}] ${message}`; if (dryRun) process.stdout.write(line + '\n'); else appendFileSync(logPath, line + '\n') }
-const harnessRoot = resolve(args.includes('--harness') ? value('--harness') : (inferHarness(server.pid) ?? resolveHarnessRoot()))
+// What is live beats the record, which a hand restart never updates.
+const harnessChoice = args.includes('--harness') ? value('--harness') : oldHost?.harness ?? server.harness
+if (!harnessChoice) fail(`no host of ${preview} is running and ${join(preview, 'server.json')} does not record the Harness it boots; pass --harness <checkout> once (it is recorded from then on)`)
+const harnessRoot = resolve(harnessChoice)
+if (server.harness && resolve(server.harness) !== harnessRoot) log(`booting Harness ${harnessRoot}, not the recorded ${server.harness}`)
 const cli = join(harnessRoot, 'apps/cli/lib/bin.js')
 if (!existsSync(cli)) fail(`harness CLI not found: ${cli} (pass --harness <checkout>)`)
-
-/** Prefer the harness the running host was actually booted from. */
-function inferHarness(pid) {
-  if (!Number.isInteger(pid) || pid < 1) return undefined
-  const candidates = []
-  try {
-    const cwd = execFileSync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8' }).split('\n').find(line => line.startsWith('n'))
-    if (cwd) candidates.push(cwd.slice(1))
-  } catch { /* lsof unavailable or the process is gone */ }
-  try {
-    const open = execFileSync('lsof', ['-p', String(pid)], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
-    for (const line of open.split('\n')) { const match = line.match(/(\/[^\s]*?\/deepseek-harness[^/\s]*)\//); if (match) candidates.push(match[1]) }
-  } catch { /* the host may already be gone */ }
-  for (const candidate of candidates) if (existsSync(join(candidate, 'apps/cli/lib/bin.js'))) return candidate
-  return undefined
+// Only the releases in compatibility.json are supported; anything else is
+// refused before the build, unless the operator names the override.
+try { assertSupportedHarness(harnessRoot) } catch (error) {
+  if (!flag('--allow-unsupported-harness')) fail(`${error.message} (${harnessRoot}); pass --allow-unsupported-harness to update this preview on it anyway`)
+  const warning = `WARNING: ${error.message} (${harnessRoot}); continuing only because --allow-unsupported-harness was passed. This plugin is neither supported nor tested on that Harness.`
+  process.stderr.write(`update-preview: ${warning}\n`)
+  log(warning)
 }
 
 /** Exactly the paths the published tarball carries, so the snapshot mirrors a release. */
@@ -156,12 +157,9 @@ const after = noSync ? {} : summarizePaths(pluginDir, entries)
 const changed = noSync ? [] : changedPaths(before, built)
 
 // ---------------------------------------------------------------- preflight
-const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }
-for (const [key, dir] of [['DSH_AGENTS_HOME', join(preview, 'agents-home')], ['DSH_BUNDLED_SKILL_DIR', join(preview, 'bundled-skills')]]) if (existsSync(dir)) env[key] = dir
-delete env.DEEPSEEK_API_KEY
 log('preflighting composed profile')
 try {
-  if (!dryRun) execFileSync(process.execPath, [cli, '--profile', 'web', '--patch', patch, '--dump-config'], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 })
+  if (!dryRun) execFileSync(process.execPath, [cli, '--profile', 'web', '--patch', patch, '--dump-config'], { cwd: workspace, env: hostEnv(preview, home), stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 })
 } catch (error) {
   if (!dryRun && existsSync(backup)) { copyEntries(backup, pluginDir, entries); log('preflight failed; snapshot restored from ' + backup) }
   fail(`profile preflight failed: ${String(error.stderr ?? error.message).slice(0, 400)}`)
@@ -171,13 +169,12 @@ const summary = { preview, plugin: pluginDir, port, harness: harnessRoot, backup
 if (noRestart) { process.stdout.write(JSON.stringify(summary, null, 2) + '\n'); process.exit(0) }
 
 // ---------------------------------------------------------------- restart
-// Bookkeeping first: a worker that dies before the new host is up must leave a
-// recoverable record, never a stale pid or launch url.
-const previousPid = server.pid
+// The worker looks the host up again when it runs, so nothing here records a
+// pid; the lookup above only names that host in the log.
 if (!dryRun) {
-  writeFileSync(serverPath, JSON.stringify({ status: 'restarting', pid: null, previousPid, url: `http://127.0.0.1:${port}`, home, plugin: pluginDir, model: server.model, port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 })
+  writeServer(preview, { status: 'restarting', url: `http://127.0.0.1:${port}`, port, home, plugin: pluginDir, harness: harnessRoot, model: server.model, startedAt: now() })
   const statePath = join(preview, `.update-preview-${stamp()}.json`)
-  writeFileSync(statePath, JSON.stringify({ preview, pluginDir, backup, entries, port, harnessRoot, cli, patch, home, workspace, previousPid, model: server.model, delayMs: Number(value('--delay', '2000')), launchTimeoutMs: Number(value('--launch-timeout-ms', '300000')) }, null, 2) + '\n', { mode: 0o600 })
+  writeFileSync(statePath, JSON.stringify({ preview, pluginDir, backup, entries, port, harnessRoot, cli, patch, home, workspace, model: server.model, delayMs: Number(value('--delay', '2000')), launchTimeoutMs: Number(value('--launch-timeout-ms', '300000')) }, null, 2) + '\n', { mode: 0o600 })
   const out = openSync(logPath, 'a', 0o600)
   const worker = spawn(process.execPath, [self, '--restart-worker', '--state', statePath], { detached: true, stdio: ['ignore', out, out] })
   worker.unref()
@@ -185,92 +182,49 @@ if (!dryRun) {
   summary.restarted = true
   summary.workerPid = worker.pid
   summary.state = statePath
-  log(`restart worker ${worker.pid} scheduled; old host ${previousPid} will stop in ${Number(value('--delay', '2000'))}ms`)
+  log(`restart worker ${worker.pid} scheduled; old host ${oldHost?.pid ?? 'none'} will stop in ${Number(value('--delay', '2000'))}ms`)
 }
 process.stdout.write(JSON.stringify(summary, null, 2) + '\n')
 
 /**
  * Detached half. Runs in its own session so it survives the host it stops.
- * Order: wait, record intent, stop, start, wait for the launch URL, bookkeep.
+ * Order: wait, stop this preview's host on the port, start, wait for the launch
+ * URL, bookkeep.
  * On failure it restores the previous snapshot and tries exactly once more.
  */
 async function runWorker(statePath) {
   const state = JSON.parse(readFileSync(statePath, 'utf8'))
   const log = message => appendFileSync(join(state.preview, 'restart.log'), `[${now()}] ${message}\n`)
-  const env = { ...process.env, DSH_HOME: state.home, DSH_TELEMETRY_DISABLED: '1' }
-  for (const [key, dir] of [['DSH_AGENTS_HOME', join(state.preview, 'agents-home')], ['DSH_BUNDLED_SKILL_DIR', join(state.preview, 'bundled-skills')]]) if (existsSync(dir)) env[key] = dir
-  delete env.DEEPSEEK_API_KEY
-  const serverPath = join(state.preview, 'server.json')
-  const launchPath = join(state.preview, 'launch.url')
-  const serverLogPath = join(state.preview, 'server.log')
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
-  // Read as text so the offset is a string offset: it stays stable across
-  // appends even when previous log lines contain multibyte characters.
-  const logLength = () => { try { return readFileSync(serverLogPath, 'utf8').length } catch { return 0 } }
-
-  const stop = async pid => {
-    if (!Number.isInteger(pid) || pid < 1) return
-    log(`stopping host ${pid}`)
-    try { process.kill(pid, 'SIGTERM') } catch (error) { log(`SIGTERM ${pid}: ${String(error)}`) }
-    for (let attempt = 0; attempt < 60; attempt++) { try { process.kill(pid, 0) } catch { return } await sleep(200) }
-    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
-    await sleep(1500)
-  }
-  const start = async () => {
-    // Append-only server.log: its length captured before this host is spawned is
-    // the only trustworthy boundary between this host's token and every
-    // previous host's. Without it, awaitLaunchUrl would immediately return the
-    // old token that the log still carries and the link would 401.
-    const sinceOffset = logLength()
-    const out = openSync(serverLogPath, 'a', 0o600)
-    const child = spawn(process.execPath, ['--expose-internals', state.cli, '--profile', 'web', '--patch', state.patch, '--port', String(state.port), '--no-open'], { cwd: state.workspace, env, detached: true, stdio: ['ignore', out, out] })
-    child.unref(); closeSync(out)
+  const record = fields => writeServer(state.preview, { url: `http://127.0.0.1:${state.port}`, port: state.port, home: state.home, plugin: state.pluginDir, harness: state.harnessRoot, model: state.model, startedAt: now(), ...fields })
+  const host = { root: state.preview, port: state.port, cli: state.cli, patch: state.patch, cwd: state.workspace, env: hostEnv(state.preview, state.home) }
+  const stop = () => stopHost(state.port, state.preview, { onStop: pids => log(`stopping host ${pids}`) })
+  // A loaded host (this machine runs the preview AND the agent session that
+  // deploys it) can take minutes to print its launch URL. Waiting too little is
+  // worse than waiting long: the old 90s window declared a healthy boot a
+  // failure and rolled a working snapshot back.
+  const boot = async () => {
+    const child = startHost(host)
     log(`started host ${child.pid}`)
-    writeFileSync(serverPath, JSON.stringify({ status: 'starting', pid: child.pid, url: `http://127.0.0.1:${state.port}`, home: state.home, plugin: state.pluginDir, model: state.model, port: state.port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 })
-    return { child, sinceOffset }
+    return { child, url: await awaitLaunchUrl({ ...host, child, timeoutMs: state.launchTimeoutMs }) }
   }
-  const awaitLaunchUrl = async (child, sinceOffset) => {
-    // A loaded host (this machine runs the preview AND the agent session that
-    // deploys it) can take minutes to print its launch URL. Waiting too little is
-    // worse than waiting long: the old 90s window declared a healthy boot a
-    // failure and rolled a working snapshot back.
-    const attempts = Math.max(1, Math.ceil(Number(state.launchTimeoutMs ?? 300000) / 200))
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      await sleep(200)
-      try {
-        const found = selectLaunchUrl(readFileSync(serverLogPath, 'utf8'), sinceOffset, state.port)
-        if (found) { writeFileSync(launchPath, found + '\n', { mode: 0o600 }); return found }
-      } catch { /* the log may not exist yet */ }
-      try { process.kill(child.pid, 0) } catch { return undefined }
-    }
-    return undefined
-  }
-  const commit = (child, launchUrl) => writeFileSync(serverPath, JSON.stringify({ status: 'running', pid: child.pid, url: `http://127.0.0.1:${state.port}`, home: state.home, plugin: state.pluginDir, model: state.model, port: state.port, startedAt: now(), launchUrl }, null, 2) + '\n', { mode: 0o600 })
 
   try {
     await sleep(state.delayMs)
-    await stop(state.previousPid)
-    let { child, sinceOffset } = await start()
-    let url = await awaitLaunchUrl(child, sinceOffset)
+    await stop()
+    let { child, url } = await boot()
     if (!url) {
-      log(`new host did not publish a launch url within ${Number(state.launchTimeoutMs ?? 300000)}ms; rolling back the plugin snapshot`)
-      await stop(child.pid)
-      if (state.backup && existsSync(state.backup)) {
-        for (const relative of state.entries) {
-          const source = join(state.backup, relative), target = join(state.pluginDir, relative)
-          if (!existsSync(source)) continue
-          rmSync(target, { recursive: true, force: true }); mkdirSync(dirname(target), { recursive: true })
-          if (statSync(source).isDirectory()) cpSync(source, target, { recursive: true }); else copyFileSync(source, target)
-        }
-      }
-      // A fresh offset for the retry: the first host's token, if it ever
-      // printed one, must not be mistaken for the retried host's.
-      ;({ child, sinceOffset } = await start())
-      url = await awaitLaunchUrl(child, sinceOffset)
+      log(`new host did not publish a launch url within ${state.launchTimeoutMs}ms; rolling back the plugin snapshot`)
+      await stop()
+      // A boot that hung before listening is not on the port; it is still ours to end.
+      child.kill('SIGKILL')
+      while (child.exitCode === null && child.signalCode === null) await sleep(200)
+      if (state.backup && existsSync(state.backup)) copyEntries(state.backup, state.pluginDir, state.entries)
+      ;({ child, url } = await boot())
     }
-    if (url) { commit(child, url); log(`restart complete: ${url}`) }
-    else { writeFileSync(serverPath, JSON.stringify({ status: 'failed', pid: null, previousPid: state.previousPid, url: `http://127.0.0.1:${state.port}`, home: state.home, plugin: state.pluginDir, port: state.port, startedAt: now() }, null, 2) + '\n', { mode: 0o600 }); log('restart failed: inspect server.log; snapshot backup at ' + state.backup) }
+    if (url) { record({ status: 'running', pid: child.pid, launchUrl: url }); log(`restart complete: ${url}`) }
+    else { record({ status: 'failed' }); log('restart failed: inspect server.log; snapshot backup at ' + state.backup) }
   } catch (error) {
+    record({ status: 'failed', error: String(error?.message ?? error) })
     log(`restart worker error: ${String(error && error.stack ? error.stack : error)}`)
   } finally {
     rmSync(statePath, { force: true })

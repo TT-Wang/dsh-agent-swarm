@@ -31,11 +31,12 @@ import assert from 'node:assert/strict'
 import { homedir, tmpdir } from 'node:os'
 import { lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
 import { resolveHarnessRoot, assertSupportedHarness } from '../scripts/harness-target.mjs'
 import { importHarness } from './fixtures/built-harness.mjs'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { git, makeWorkspaces } from './faults/harness.mjs'
 
 const harnessRoot = resolveHarnessRoot(undefined)
 assertSupportedHarness(harnessRoot)
@@ -49,11 +50,6 @@ assert.ok(sandbox, 'the Harness sandbox provider did not register')
 const confineCheck = (argv, cwd) => confinedCheckArgv(sandbox, argv, cwd)
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 const exists = async file => await lstat(file).then(() => true, () => false)
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Isolation', '-c', 'user.email=isolation@localhost', '-c', 'commit.gpgsign=false', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
 async function fixture(t, options = {}) {
   const scratch = await realpath(await mkdtemp(path.join(homedir(), '.dsh-swarm-isolation-')))
   const tempRoot = await realpath(tmpdir())
@@ -69,7 +65,7 @@ async function fixture(t, options = {}) {
   // An installed, ignored toolchain the check reads through the dependency link.
   await mkdir(path.join(source, 'node_modules', 'dep'), { recursive: true })
   await writeFile(path.join(source, 'node_modules', 'dep', 'tool.txt'), 'toolchain\n')
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(scratch, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck, ...options })
+  const workspaces = makeWorkspaces(scratch, { confineCheck, ...options })
   const mission = { id: 'mission-isolation', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Isolation proof', kind: 'implementation', scope: ['**'], checks: [], status: 'running' }
@@ -82,6 +78,9 @@ async function fixture(t, options = {}) {
 const runCheck = async (workspaces, member, task, artifact, command) => {
   const results = await workspaces.verifyArtifact(member, { ...task, checks: [command] }, artifact)
   assert.equal(results.length, 1, JSON.stringify(results))
+  // A refused confinement is now an infrastructure row rather than a throw; a
+  // non-zero row must be the sandbox's denial of a check that ran, never that.
+  assert.doesNotMatch(results[0].output, /^Host verification could not execute: /, `the check did not run: ${JSON.stringify(results[0])}`)
   return results[0]
 }
 
@@ -90,7 +89,7 @@ test('host prerequisite: the real provider fully enforces workspace-write', asyn
   t.after(async () => { await rm(scratch, { recursive: true, force: true }) })
   // confinedCheckArgv is the production path: it throws unless the host
   // reports full enforcement, so reaching runProcess proves enforcement.
-  const argv = confinedCheckArgv(sandbox, ['/bin/sh', '-c', 'true'], scratch)
+  const argv = await confinedCheckArgv(sandbox, ['/bin/sh', '-c', 'true'], scratch)
   const probe = await runProcess(argv, { subprocess: subprocessSeam, cwd: scratch, timeoutMs: 30000, maxBytes: 32000 })
   assert.equal(probe.exitCode, 0, `the host cannot apply the real sandbox (nested-sandbox worker hosts are excluded by design): ${probe.output}`)
 })

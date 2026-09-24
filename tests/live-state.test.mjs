@@ -164,8 +164,8 @@ test('delivery consumes the runtime target instead of the first accepted integra
   assert.equal(deliverableCommit(snapshot), '3'.repeat(40))
   const legacy = { ...snapshot }
   delete legacy.deliveryTarget
-  assert.equal(deliverableTask(legacy).id, 'integ-1', 'a legacy snapshot keeps the historical local rule')
-  assert.equal(deliverableCommit(legacy), '2'.repeat(40))
+  assert.equal(deliverableTask(legacy).id, 'integ-2', 'legacy snapshots use the same unique maximal artifact selector')
+  assert.equal(deliverableCommit(legacy), '3'.repeat(40))
   assert.equal(deliveryApplied(snapshot, deliverableCommit(snapshot)), false, 'no receipt means the result is not applied')
   const applied = { ...snapshot, appliedDelivery: { resultCommit: '3'.repeat(40), appliedAt: base.mission.updatedAt } }
   assert.equal(deliveryApplied(applied, deliverableCommit(applied)), true)

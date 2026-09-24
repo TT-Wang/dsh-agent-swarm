@@ -40,6 +40,17 @@ export async function harnessEntry(root, name) {
   return pathToFileURL(target).href
 }
 
+/**
+ * Tool results of a message list as tool-result blocks: 0.1.5 nests one in a
+ * user message, 0.1.7 sends a tool-role message that carries the call id and
+ * the error flag itself.
+ */
+export function toolResultBlocks(messages) {
+  return messages.flatMap(message => message.role === 'tool'
+    ? [{ type: 'tool-result', toolCallId: message.toolCallId, content: message.content, isError: message.isError === true }]
+    : message.content.filter(block => block.type === 'tool-result'))
+}
+
 export async function importHarness(root, name) {
   return import(await harnessEntry(root, name))
 }
@@ -60,10 +71,16 @@ export async function linkHarnessPeers(packageRoot, harnessRoot) {
   }
 }
 
-export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspace, swarmConfig, bundleProfile, deepseekConfig, shellConfig }) {
+/**
+ * `extraRows` are appended after the fixed plugins: `[id, package, config?]`
+ * resolves a built Harness entry, and an object is a literal Loader row (a
+ * `cordis:group` realm, whose children name built entries themselves).
+ */
+export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspace, swarmConfig, bundleProfile, deepseekConfig, shellConfig, extraRows = [] }) {
   const { Context } = await importHarness(harnessRoot, '@deepseek-ai/cordis')
   const { default: Loader } = await importHarness(harnessRoot, '@deepseek-ai/cordis-plugin-loader')
   const { default: Include } = await importHarness(harnessRoot, '@deepseek-ai/cordis-plugin-include')
+  const { default: Group } = await importHarness(harnessRoot, '@deepseek-ai/cordis-plugin-group')
   const manifest = JSON.parse(await readFile(join(artifactRoot, 'package.json'), 'utf8'))
   const builtEntry = manifest.exports?.['.']?.default ?? manifest.exports?.['.']?.import ?? manifest.main
   assert.equal(typeof builtEntry, 'string', 'Swarm package must publish an ESM entry')
@@ -85,10 +102,11 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
     ['shell-env', '@deepseek-ai/dsh-shell-env', { dshHome: join(runRoot, 'dsh-home') }],
     ['tool-bash', '@deepseek-ai/dsh-tool-bash', { enableRunInBackground: false }],
     ['agent-loop', '@deepseek-ai/dsh-agent-loop', { agents: [] }],
+    ...extraRows,
   ]
-  const entries = await Promise.all(plugins.map(async ([id, name, config]) => ({
-    id, name: await harnessEntry(harnessRoot, name), ...(config ? { config } : {}),
-  })))
+  const entries = await Promise.all(plugins.map(async row => Array.isArray(row) ? {
+    id: row[0], name: await harnessEntry(harnessRoot, row[1]), ...(row[2] ? { config: row[2] } : {}),
+  } : row))
   entries.push(deepseekConfig ? {
     id: 'deepseek-llm', name: await harnessEntry(harnessRoot, '@deepseek-ai/dsh-llm-deepseek'),
     config: deepseekConfig,
@@ -118,6 +136,8 @@ export async function bootHarness({ harnessRoot, artifactRoot, runRoot, workspac
   try {
     await ctx.plugin(Loader)
     ctx.loader.builtins.include = Include
+    // As the host's app-boot does: `cordis:group` rows give a provider its isolated realm.
+    ctx.loader.builtins.group = Group
     await ctx.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href, ...(patches ? { patches } : {}) } })
     await ctx.loader.await()
     const pending = [...ctx.loader.entries()]

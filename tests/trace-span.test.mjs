@@ -1,8 +1,8 @@
-/** D6 span contract: closed vocabulary, digest-addressed payloads, causal closure and metrics. */
+/** D6 span contract: closed vocabulary, digest-only payload references, causal closure and metrics. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { SWARM_TOOLS } from '../lib/tools.js'
-import { TRACE_OPERATIONS, TRACE_STEPS, TRACE_ERROR_TYPES, isTraceOperation, isTraceStep, spanContractViolation, traceIdFor, traceMetrics, digestText } from '../lib/trace.js'
+import { TRACE_OPERATIONS, TRACE_STEPS, TRACE_ERROR_TYPES, canonicalJson, digestText, payloadRef, isTraceOperation, isTraceStep, spanContractViolation, traceIdFor, traceMetrics } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 test('the span vocabulary is closed and covers every orchestration step', () => {
@@ -51,25 +51,31 @@ test('every orchestration step emits a contract-valid span with digests outside 
   const ids = new Set(spans.map(span => span.spanId))
   for (const span of spans) if (span.parentSpanId !== undefined) assert(ids.has(span.parentSpanId), `orphan parent ${span.parentSpanId}`)
 
-  // Payloads are content-addressed outside the log: the log holds only digests.
-  assert.equal(await f.payloads.verify(publish.input), true)
-  assert.equal(await f.payloads.verify(publish.output), true)
-  const input = await f.payloads.read(publish.input.digest)
-  assert.match(input, /swarm_publish/)
-  assert(input.includes(f.bigClaim), 'the input payload file carries the claim bytes')
+  // The log holds only digests: the bytes are never copied into it, and the
+  // digest still names the exact payload the step was called with.
   const spanLog = JSON.stringify(f.events().filter(event => event.type === 'trace/span'))
   assert(!spanLog.includes(f.bigClaim), 'payload bytes must never enter the event log')
-  assert.equal(digestText(input), publish.input.digest)
+  assert.match(publish.input.digest, /^sha256:[0-9a-f]{64}$/)
+  assert.equal(publish.input.stored, false, 'no payload bytes are retained anywhere')
+  assert(publish.input.bytes > f.bigClaim.length, 'the reference still measures the payload it names')
+  assert.notEqual(publish.input.digest, publish.output.digest, 'input and output are digested separately')
+  const called = payloadRef({ tool: 'swarm_publish', arguments: { missionId: f.missionId, taskId: f.source.id, attemptId: f.claim.attempt.id, claim: f.bigClaim, outcome: 'supported', toolRunIds: [f.runId] } })
+  assert.equal(publish.input.digest, called.digest, 'the input digest names exactly the payload swarm_publish was called with')
+  assert.equal(publish.input.bytes, called.bytes)
+  // The digest is still the canonical digest of the payload it names: the same
+  // bytes hash to the same reference, and a different payload to a different one.
+  assert.equal(digestText(canonicalJson({ ok: 1 })), digestText(canonicalJson({ ok: 1 })))
+  assert.notEqual(digestText(canonicalJson({ ok: 1 })), digestText(canonicalJson({ ok: 2 })))
 
   // Trace-level metrics (F-44).
-  const metrics = await traceMetrics(spans, { payloads: f.payloads })
+  const metrics = await traceMetrics(spans)
   assert.equal(metrics.contractCompliance, 1)
   assert.equal(metrics.firstViolatingStep, undefined)
   assert.equal(metrics.causalClosure, 1)
   assert.equal(metrics.orphanParents, 0)
-  assert(metrics.payloads.stored > 0)
-  assert.equal(metrics.payloads.verified, metrics.payloads.stored)
-  assert.equal(metrics.payloads.missing, 0)
+  assert.equal(metrics.payloads.referenced, spans.length * 2)
+  assert.equal(metrics.payloads.stored, 0)
+  assert.equal(metrics.payloads.omitted, metrics.payloads.referenced)
   assert.equal(metrics.operations.agent > 0 && metrics.operations.review > 0, true)
 })
 
@@ -84,7 +90,7 @@ test('a failed orchestration step records an error span with a closed error.type
   assert.equal(spanContractViolation(spans[0]), undefined)
   // Compliance is measured over the whole window; the error row is well-formed.
   const all = f.events().filter(event => event.type === 'trace/span').map(event => event.data)
-  const metrics = await traceMetrics(all, { payloads: f.payloads })
+  const metrics = await traceMetrics(all)
   assert.equal(metrics.contractCompliance, 1, 'a well-formed error span still satisfies the contract')
   assert.equal(metrics.operations.agent > 0, true)
 })

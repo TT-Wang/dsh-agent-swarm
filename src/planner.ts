@@ -12,7 +12,7 @@ import type { AutoStart } from './types.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'swarm-start': { kind: 'swarm-start'; form: 'notice'; summary: string; requestId: string; commandId: string; planningEpoch?: number; phase?: 'planning' | 'failure' }
+    'swarm-start': { kind: 'swarm-start'; form: 'notice'; summary: string; requestId: string; commandId: string; planningEpoch?: number; phase?: 'planning' | 'failure' | 'warning' }
   }
 }
 
@@ -51,6 +51,17 @@ The saved request, project snapshot and recorded usage are retained. Read swarm_
   })
 }
 
+/** Same request and epoch: the warning offers extension before planning expires. */
+export function planningWarningMessage(request: AutoStart): UserMessage {
+  const epoch = request.planningEpoch ?? 1
+  const deadline = request.planningWarning!.deadline
+  return freezeMessage({
+    id: MessageId(`swarm-start:${request.id}:${epoch}:warning:${deadline}`), role: 'user',
+    source: { kind: 'swarm-start', form: 'notice', summary: 'Agent Swarm: review planning time', requestId: request.id, commandId: request.commandId, planningEpoch: epoch, phase: 'warning' },
+    content: [{ type: 'text', text: `Planning for saved request ${request.id} (epoch ${epoch}) is approaching its current deadline ${new Date(deadline).toISOString()}. The request and saved snapshot remain active. Review progress now: launch the current plan with swarm_launch when ready, or extend this same request with swarm_control({ requestId: "${request.id}", action: "extend", timeoutMs: <needed milliseconds>, reason: "<progress and remaining work>" }). If planning cannot proceed, use action "stop" with this requestId and explain the blocker.` }],
+  })
+}
+
 /** Register under the optional native commands service; no custom provider loop. */
 export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): void {
   let disposed = false
@@ -70,15 +81,16 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     void agent.whenIdle().then(() => fail('规划已结束，但尚未启动协作。请查看对话中的原因，或重试已保存的请求。'),
       () => fail('规划未完成，请查看当前对话并重试已保存的请求。'))
   }
-  const pending = (id: string, epoch: number, kind: 'planning' | 'failure') => {
+  const pending = (id: string, epoch: number, kind: 'planning' | 'failure' | 'warning') => {
     if (disposed || runtime.shuttingDown || runtime.closed) return undefined
     const row = runtime.store.get('starts', id)
     if (row === undefined || (row.planningEpoch ?? 1) !== epoch) return undefined
     return kind === 'planning'
       ? row.status === 'planning' && !row.planningFenced && row.planningDispatchPending ? row : undefined
-      : row.status === 'failed' && row.recoveryNoticePending ? row : undefined
+      : kind === 'failure' ? row.status === 'failed' && row.recoveryNoticePending ? row : undefined
+        : ['planning', 'launching'].includes(row.status) && !row.planningFenced && row.planningWarning !== undefined && row.planningWarning.deadline === row.planningDeadlineAt && row.planningWarning.deliveredAt === undefined ? row : undefined
   }
-  const deliver = async (request: AutoStart, kind: 'planning' | 'failure', signal: AbortSignal) => {
+  const deliver = async (request: AutoStart, kind: 'planning' | 'failure' | 'warning', signal: AbortSignal) => {
     const epoch = request.planningEpoch ?? 1
     const actor = { sessionId: request.ownerSessionId, signal }
     const agent = ctx.agents.get(SessionId(request.ownerSessionId))
@@ -87,17 +99,25 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     signal.throwIfAborted()
     const current = pending(request.id, epoch, kind)
     if (current === undefined || ctx.agents.get(agent.id) !== agent) return
-    const message = kind === 'planning' ? planningMessage(current) : recoveryMessage(current)
+    if (kind === 'warning' && current.planningWarning?.deadline !== request.planningWarning?.deadline) return
+    const message = kind === 'planning' ? planningMessage(current) : kind === 'warning' ? planningWarningMessage(current) : recoveryMessage(current)
     const seen = agent.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
       || (event.type === 'agent/inbox/spliced' && event.data.inserted.some(item => item.id === message.id)))
     if (!seen) agent.send(message, 'next-step', true)
     await ctx.sessions.flush(agent.session)
     signal.throwIfAborted()
     if (pending(request.id, epoch, kind) === undefined) return
-    runtime.ackStartMessage(actor, request.id, epoch, kind)
+    if (kind === 'warning') {
+      runtime.commit(request.missionId ?? request.id, () => {
+        const latest = pending(request.id, epoch, kind)
+        if (latest?.planningWarning === undefined || latest.planningWarning.deadline !== current.planningWarning?.deadline) return
+        latest.planningWarning.deliveredAt = runtime.now()
+        runtime.store.put('starts', latest)
+      })
+    } else runtime.ackStartMessage(actor, request.id, epoch, kind)
     if (kind === 'planning') watchIdle(agent, current)
   }
-  const dispatch = async (request: AutoStart, kind: 'planning' | 'failure', key: string) => {
+  const dispatch = async (request: AutoStart, kind: 'planning' | 'failure' | 'warning', key: string) => {
     const timeout = new AbortController()
     const signal = AbortSignal.any([lifetime.signal, timeout.signal])
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -108,7 +128,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
         // to an already running preparation as well as its next retry.
         const current = kind === 'planning' ? pending(request.id, request.planningEpoch ?? 1, kind) : undefined
         const remaining = current === undefined ? 0
-          : (current.planningDeadlineAt ?? current.updatedAt + (runtime.config.planningTimeoutMs ?? 600000)) - Date.now()
+          : (current.planningDeadlineAt ?? current.updatedAt + (runtime.config.planningTimeoutMs ?? 600000)) - runtime.now()
         if (remaining > 0) {
           timer = setTimeout(expire, Math.min(remaining, 2147483647))
           timer.unref()
@@ -139,9 +159,10 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     try {
       for (const request of runtime.store.list('starts')) {
         const kind = request.status === 'planning' && request.planningDispatchPending ? 'planning'
-          : request.status === 'failed' && request.recoveryNoticePending ? 'failure' : undefined
+          : request.status === 'failed' && request.recoveryNoticePending ? 'failure'
+            : ['planning', 'launching'].includes(request.status) && request.planningWarning !== undefined && request.planningWarning.deadline === request.planningDeadlineAt && request.planningWarning?.deliveredAt === undefined ? 'warning' : undefined
         if (kind === undefined || ctx.agents.get(SessionId(request.ownerSessionId)) === undefined) continue
-        const key = `${request.id}:${request.planningEpoch ?? 1}:${kind}`
+        const key = `${request.id}:${request.planningEpoch ?? 1}:${kind}${kind === 'warning' ? `:${request.planningWarning?.deadline}` : ''}`
         if (inFlight.has(key)) continue
         inFlight.add(key)
         void dispatch(request, kind, key)
@@ -149,7 +170,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     } catch { /* A transient read/service failure must not veto agent creation; the timer retries durable pending work. */ }
   }
   const unsubscribe = runtime.subscribe(pump)
-  const removeCreated = ctx.on('agent/created', pump, { global: true })
+  const removeCreated = ctx.on('agent/created', (): undefined => { pump(); return undefined }, { global: true })
   const timer = setInterval(pump, Math.max(25, Math.min(runtime.config.tickMs, 1000)))
   timer.unref()
   ctx.effect(() => () => {

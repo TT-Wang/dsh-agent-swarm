@@ -6,30 +6,74 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import type {} from '@deepseek-ai/dsh-agent-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type {} from '@deepseek-ai/dsh-user-approval'
-import { readFile, mkdir, lstat, open, readdir, realpath } from 'node:fs/promises'
+import { readFile, mkdir, lstat, open, readdir, realpath, rm } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { Workspaces, writePrivateJson } from './workspaces.js'
+import { SWARM_SCRATCH_DIRNAME, Workspaces, writePrivateJson } from './workspaces.js'
 import { isContained, type WorkspaceGrantSnapshot } from './authorization.js'
 import { inspectDelivery, applyDelivery } from './delivery.js'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
-import { recordAppendRefusal } from './invariant.ts'
-import { noticeFamily } from './notices.ts'
 import { persistedSessionHeader } from './session-metadata.js'
 import { hiddenToolsFor, WORKER_PROMPT } from './tools.js'
 import { classifyProviderOutage } from './scheduler.js'
-import type { Artifact, CheckEnvelope, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
+import type { Artifact, CheckEnvelope, CheckSyntaxIssue, Delivery, Member, Mission, Task, UsageBuckets, WorkerAdapter, WorkerCallbacks, WorkerSpec, WorkerActivity } from './types.js'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     swarm: { kind: 'swarm'; form: 'relay'; missionId: string; senderMemberId: string; deliveryId: string; deliveryKind: Delivery['kind'] }
   }
+}
+
+/**
+ * The `agentPresets` service, declared structurally: 0.1.5 provides it from
+ * `@deepseek-ai/dsh-agent-presets`, 0.1.7 from `@deepseek-ai/dsh-agent-preset-registry`
+ * with the same two methods this adapter uses.
+ */
+interface AgentPresets {
+  composedPreset(agentCtx: Context): string | undefined
+  mount(agentCtx: Context, id?: string): Promise<unknown>
+}
+
+/** The host's regenerated runtime context: `runtime-context` on 0.1.7, a system-prompt `plugin` source on 0.1.5. */
+export function isRuntimeContext(source: { kind: string; plugin?: unknown }): boolean {
+  return source.kind === 'runtime-context' || (source.kind === 'plugin' && source.plugin === '@deepseek-ai/dsh-system-prompt')
+}
+
+/**
+ * Keep lifecycle policy in the runtime, but apply it at the native consumer
+ * boundary too: transport acknowledgement can precede consumption by a turn.
+ * Returning an empty admitted batch lets Harness finish a completed turn while
+ * still continuing unrelated tool-result work; cancelling the owner would not.
+ */
+export function installOwnerDeliveryFilter(ctx: Context, project: (sessionId: string, deliveryId: string) => string | false | undefined): (agent: Agent) => void {
+  const stale = (agent: Agent, message: UserMessage): boolean => message.source.kind === 'swarm'
+    && project(String(agent.id), message.source.deliveryId) === false
+  const prune = (agent: Agent): void => {
+    for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) if (stale(agent, message)) agent.inbox.remove(message.id)
+  }
+  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+    prune(agent)
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    const onlyStale = messages.length > 0 && messages.every(message => stale(agent, message))
+    const admitted = decision.messages.filter(message => !stale(agent, message)
+      // A changed generated context is not an independent user request. Let it
+      // be regenerated for the next genuine turn instead of reviving this one.
+      && !(onlyStale && isRuntimeContext(message.source)))
+    return { ...decision, messages: admitted.map(message => {
+      if (message.source.kind !== 'swarm') return message
+      const content = project(String(agent.id), message.source.deliveryId)
+      if (typeof content !== 'string') return message
+      const source = message.source
+      return freezeMessage({ ...message, content: [{ type: 'text', text: `[Swarm ${source.deliveryKind}; missionId ${source.missionId}; from ${source.senderMemberId}; delivery ${source.deliveryId}]\n${content}` }] })
+    }) }
+  })
+  return prune
 }
 
 export interface HarnessWorkerOptions {
@@ -79,17 +123,21 @@ export interface HarnessWorkerOptions {
 }
 /** The confinement surface a declared verification check must pass through. */
 export interface VerificationSandbox {
-  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): { argv: string[]; enforcement: 'full' | 'partial' }
+  /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
+  confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
 }
+export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
 /**
  * F-29: run a declared check only under FULL host enforcement. A partial
  * backend (Windows ACL, an older Landlock ABI) does not govern every promised
  * file effect, so it cannot establish the D7 boundary that a verification
  * check cannot write into the source checkout. Refusing here is fail-closed:
- * the check never runs unconfined and the caller records a check failure.
+ * the check never runs unconfined. `Workspaces.verifyArtifact` records the
+ * refusal as that command's infrastructure row (exit 125), so the review is
+ * deferred for the host to repair, never rejected as an assertion failure.
  */
-export function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): string[] {
-  const confined = sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
+export async function confinedCheckArgv(sandbox: VerificationSandbox, argv: string[], cwd: string): Promise<string[]> {
+  const confined = await sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: cwd })
   if (confined.enforcement !== 'full') throw new Error(`Artifact verification requires full sandbox enforcement: the host provider reports ${JSON.stringify(confined.enforcement)} enforcement for workspace-write, so a declared check could write outside the verification checkout. Refusing to run it.`)
   return confined.argv
 }
@@ -120,6 +168,8 @@ interface Composition {
   missionId: string
   memberId: string
   workspace: string
+  /** Durable accounting generation for the current native session log. */
+  usageGeneration?: number
   preset?: string
   options: AgentOptions
   selection?: ModelSelection
@@ -132,6 +182,10 @@ interface Composition {
    */
   environment: SessionEnvironment
 }
+// Teardown has a host-operation bound, separate from any model/task budget.
+// A timeout reports incomplete cleanup; stop() itself never claims success early.
+const DISPOSAL_TIMEOUT_MS = 5000
+
 interface Resident {
   spec: WorkerSpec
   abort: AbortController
@@ -158,6 +212,13 @@ interface Resident {
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error) }
 const DEFAULT_CACHE_READ_WEIGHT = 0.1
 const DEFAULT_ACTIVITY_HEARTBEAT_MS = 1000
+/**
+ * F3: the scratch directory name inside a member worktree (`SWARM_SCRATCH_DIRNAME`
+ * in src/workspaces.ts). It is declared once there and reused here, so the
+ * adapter that points `TMPDIR` at the root and the manager that must treat that
+ * root as toolchain state cannot drift apart.
+ */
+const SCRATCH_DIRNAME = SWARM_SCRATCH_DIRNAME
 /** Invalid configuration never silently reverts to 1:1 cache charging. */
 function cacheReadWeight(value: number | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : DEFAULT_CACHE_READ_WEIGHT
@@ -181,15 +242,29 @@ function accumulateUsage(target: UsageBuckets, usage: { inputTokens: number; out
   return Math.ceil(usage.inputTokens + usage.outputTokens + (usage.cacheReadTokens ?? 0) * cacheRead + (usage.cacheWriteTokens ?? 0))
 }
 const emptyBuckets = (): UsageBuckets => ({ uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0, requests: 0 })
+type ProviderUsage = Parameters<typeof accumulateUsage>[1]
+/**
+ * Provider usage a session event charges to its worker: every model response,
+ * and the summary request of a compaction (the boundary one or the host's own
+ * pressure path), which runs outside the agent loop and so logs no assistant
+ * message. Compaction events belong to an optional host package, hence the
+ * structural read.
+ */
+function chargedUsage(event: { type: string; data: unknown }): ProviderUsage | undefined {
+  if (event.type !== 'assistant/message' && event.type !== 'compaction/summary') return undefined
+  const usage = isRecord(event.data) ? event.data.usage : undefined
+  return isRecord(usage) && typeof usage.inputTokens === 'number' && typeof usage.outputTokens === 'number' ? usage as ProviderUsage : undefined
+}
 /** The durable run keeps the model-visible content; the execution-local canonical value is deliberately not persisted. */
 function durableResult(result: { isError: boolean; content: unknown; error?: unknown; meta?: unknown }): Record<string, unknown> {
   return { isError: result.isError, content: result.content, ...(result.error === undefined ? {} : { error: result.error }), ...(result.meta === undefined ? {} : { meta: result.meta }) }
 }
 function isRecord(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
-function parseComposition(value: unknown, spec: WorkerSpec, environment: SessionEnvironment): Composition {
+function parseComposition(value: unknown, spec: WorkerSpec, environment: SessionEnvironment, legacyTmpdir?: string): Composition {
   if (!isRecord(value) || value.version !== 1 || value.sessionId !== spec.member.sessionId || value.missionId !== spec.mission.id || value.memberId !== spec.member.id || value.workspace !== spec.member.workspace || typeof value.persona !== 'string' || (value.preset !== undefined && typeof value.preset !== 'string') || !isRecord(value.options)) throw new Error('Worker composition metadata is invalid or belongs to a different worker')
   const raw = value.options
   if ((raw.provider !== undefined && typeof raw.provider !== 'string') || (raw.model !== undefined && typeof raw.model !== 'string') || (raw.reasoningEffort !== undefined && (typeof raw.reasoningEffort !== 'string' || raw.reasoningEffort.length === 0)) || (raw.maxTokens !== undefined && (!Number.isSafeInteger(raw.maxTokens) || Number(raw.maxTokens) < 1))) throw new Error('Invalid persisted worker model options')
+  if (value.usageGeneration !== undefined && (!Number.isSafeInteger(value.usageGeneration) || Number(value.usageGeneration) < 0)) throw new Error('Invalid persisted worker usage generation')
   const options: AgentOptions = {}
   if (typeof raw.provider === 'string') options.provider = raw.provider
   if (typeof raw.model === 'string') options.model = raw.model
@@ -210,8 +285,8 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
   // from another member (or one whose root moved) is refused rather than
   // silently handing one member another's scratch tree; compositions written
   // before this field existed are completed from the freshly computed value.
-  assertCompositionScratch(value, environment.TMPDIR)
-  return { version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace, options, ...(selection === undefined ? {} : { selection }), persona: value.persona, environment, ...(typeof value.preset === 'string' ? { preset: value.preset } : {}) }
+  assertCompositionScratch(value, environment.TMPDIR, legacyTmpdir)
+  return { version: 1, sessionId: spec.member.sessionId, missionId: spec.mission.id, memberId: spec.member.id, workspace: spec.member.workspace, options, ...(selection === undefined ? {} : { selection }), persona: value.persona, environment, ...(typeof value.preset === 'string' ? { preset: value.preset } : {}), ...(typeof value.usageGeneration === 'number' ? { usageGeneration: value.usageGeneration } : {}) }
 }
 
 /**
@@ -219,10 +294,25 @@ function parseComposition(value: unknown, spec: WorkerSpec, environment: Session
  * An older composition without the field is completed from the freshly computed
  * environment by the caller, so this is the resume-time fence against a copied
  * or stale composition handing one member another member's scratch tree.
+ *
+ * Round 18: the round-16 layout put that root at `<missionDir>/scratch/<member>`,
+ * a sibling of the worktrees that the member's own `workspace-write` sandbox
+ * refuses. A composition persisted by that build is recognized by its own shape
+ * (it must still name THIS member inside the same mission directory) and
+ * accepted, so upgrading the plugin does not refuse every in-flight member; the
+ * caller re-composes with the current root.
  */
-export function assertCompositionScratch(value: unknown, expectedTmpdir: string): void {
+export function assertCompositionScratch(value: unknown, expectedTmpdir: string, legacyTmpdir?: string): void {
   const composed = isRecord(value) ? value.environment : undefined
-  if (composed !== undefined && (!isRecord(composed) || composed.TMPDIR !== expectedTmpdir)) throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+  if (composed === undefined) return
+  if (!isRecord(composed) || typeof composed.TMPDIR !== 'string') throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+  if (composed.TMPDIR === expectedTmpdir) return
+  if (legacyTmpdir !== undefined && composed.TMPDIR === legacyTmpdir) return
+  throw new Error('Worker composition scratch root is invalid or belongs to a different member')
+}
+/** The round-16 scratch root of one (mission, member) pair, tolerated on resume only. */
+export function legacyScratchRoot(workspaces: Workspaces, missionId: string, memberId: string): string {
+  return path.join(path.dirname(workspaces.metadataPath(missionId, memberId)), 'scratch', memberId)
 }
 
 /**
@@ -300,6 +390,7 @@ export class HarnessWorkers implements WorkerAdapter {
   private readonly activityHeartbeatMs: number
   private readonly activityPublishIntervalMs: number
   private closing = false
+  private compactionUnavailableWarned = false
   private disposal: Promise<void> | undefined
   private readonly removeStreamObserver: () => void
 
@@ -320,6 +411,12 @@ export class HarnessWorkers implements WorkerAdapter {
       // start so the provider's mount order never decides whether a mission can run.
       subprocess: () => ctx.get('subprocess'),
       ...(options.grants === undefined ? {} : { grants: options.grants }),
+      // H-3: a recovery fallback is an owner-visible durable fact, not a host
+      // log line; the bound runtime records it (read at call time: the callbacks
+      // are bound after construction).
+      onRecoveryFallback: info => this.callbacks?.recoveryFallback?.(info),
+      // Same channel for a verification checkout the host could not remove.
+      onCleanupFailure: info => this.callbacks?.verificationCleanupFailure?.(info),
       confineCheck: (argv, cwd) => {
         const sandbox = this.ctx.get('sandbox')
         if (sandbox === undefined) throw new Error('Artifact verification requires a Harness sandbox provider')
@@ -329,11 +426,13 @@ export class HarnessWorkers implements WorkerAdapter {
     const owner = this
     const removeStream = ctx.on('llm/stream', async function* (options, next) {
       const resident = [...owner.residents.values()].find(item => item.spec.member.sessionId === options.sessionId)
-      if (resident === undefined || owner.closing || resident.abort.signal.aborted) { yield* next(); return }
+      if (resident === undefined) { yield* next(); return }
+      resident.abort.signal.throwIfAborted()
+      if (owner.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
       resident.requestSignal = options.signal
       const activity = owner.beginActivity(resident, { kind: 'model' }, options.signal)
       try {
-        for await (const chunk of next()) { activity.touch(); yield chunk }
+        for await (const chunk of next()) { resident.abort.signal.throwIfAborted(); activity.touch(); yield chunk }
       } finally { activity.end() }
     })
     // Owner sessions are ordinary Harness agents: attribute their usage to their swarm without charging the worker pool.
@@ -358,6 +457,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return value === undefined ? undefined : { ...value }
   }
   private publishActivity(resident: Resident): void {
+    if (this.closing) return
     try { this.callbacks?.activity?.(resident.spec.member.id, this.currentActivity(resident.spec.member.id)) }
     catch (error) { this.ctx.logger.error(`Swarm activity observer failed: ${errorText(error)}`) }
   }
@@ -409,6 +509,7 @@ export class HarnessWorkers implements WorkerAdapter {
     return this.callbacks
   }
   private failure(memberId: string, error: unknown): void {
+    if (this.closing) return
     // R11-01: classify at the boundary where the provider error is still
     // structured, then report both the raw failure (existing contract) and the
     // typed outage. A callback failure must never mask the other report.
@@ -421,6 +522,7 @@ export class HarnessWorkers implements WorkerAdapter {
     catch (callbackError) { this.ctx.logger.error(`Swarm failure observer failed: ${errorText(callbackError)}`) }
   }
   private observe(resident: Resident, operation: () => Promise<void>): void {
+    if (this.closing) return
     let promise: Promise<void>
     try { promise = operation() } catch (error) { this.failure(resident.spec.member.id, error); return }
     resident.observations.add(promise)
@@ -474,14 +576,21 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   /**
-   * F3: the deterministic scratch root of one (mission, member) pair. It sits
-   * under the owned mission directory, a sibling of the member worktrees, so
-   * scratch state can never dirty a deliverable, and the identity is validated
-   * by the owned `Workspaces` path helper, so the root can never escape the
-   * owned root or collide with another member's.
+   * F3: the deterministic scratch root of one (mission, member) pair.
+   *
+   * It lives INSIDE the member's own worktree (under `.swarm-scratch/`, a path
+   * component the owned `Workspaces` recognizes as toolchain state and keeps out
+   * of `status`, checkpoints and artifacts). It used to be a sibling of the
+   * worktrees, which no `workspace-write` sandbox rule covers: the member's
+   * session grants writes under its workspace root, `/tmp` and `os.tmpdir()`
+   * only, so the persona's private scratch root was refused with EPERM and the
+   * member was pushed back onto the shared temp roots this root exists to
+   * replace. The identity is still derived from the owned path helpers, so the
+   * root can never escape the owned mission directory or collide with another
+   * member's.
    */
   scratchRoot(missionId: string, memberId: string): string {
-    return path.join(path.dirname(this.workspaces.metadataPath(missionId, memberId)), 'scratch', memberId)
+    return path.join(this.workspaces.workspacePath(missionId, memberId), SCRATCH_DIRNAME)
   }
   /**
    * F3: the environment the adapter composes for one member's session. The root
@@ -563,32 +672,54 @@ export class HarnessWorkers implements WorkerAdapter {
     return applyDelivery({ source: mission.workspace, baselineCommit: mission.baseline.snapshotCommit, resultCommit }, signal)
   }
 
-  async start(spec: WorkerSpec): Promise<void> {
+  async start(spec: WorkerSpec, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     if (this.closing) throw new Error('Worker adapter is disposed')
     this.observer()
     const existing = this.residents.get(spec.member.id)
     if (existing !== undefined) {
       if (existing.spec.member.sessionId !== spec.member.sessionId) throw new Error('Worker identity changed')
-      if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec) }
-      return await existing.opening
+      if (existing.stopping !== undefined) { await existing.stopping; return await this.start(spec, signal) }
+      existing.abort.signal.throwIfAborted()
+      return await this.awaitOpening(existing, signal)
     }
     const resident: Resident = { spec, abort: new AbortController(), opening: Promise.resolve(), observations: new Set(), delivered: new Set(), recoveryInbox: new Map(), journalWrites: Promise.resolve(), totalTokens: 0, usage: emptyBuckets(), lastPromptTokens: 0, compactionRequested: false, recordedExecutions: new WeakSet(), rejectedPendingStep: false, activities: new Map() }
     this.residents.set(spec.member.id, resident)
     resident.opening = this.open(resident)
-    try { await resident.opening }
+    try { await this.awaitOpening(resident, signal) }
     catch (error) { if (this.residents.get(spec.member.id) === resident) this.residents.delete(spec.member.id); throw error }
+  }
+
+  private async awaitOpening(resident: Resident, signal?: AbortSignal): Promise<void> {
+    const cancel = () => {
+      resident.abort.abort(signal?.reason)
+      this.workspaces.cancel(resident.spec.member.id)
+      this.clearActivities(resident)
+      try { resident.handle?.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true }) }
+      catch (error) {
+        try { this.ctx.logger.warn(`Swarm startup cancellation could not cancel its native handle: ${errorText(error)}`) } catch { /* The original startup cancellation remains primary. */ }
+      }
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
+    try { await resident.opening; resident.abort.signal.throwIfAborted() }
+    finally { signal?.removeEventListener('abort', cancel) }
   }
 
   private async composition(spec: WorkerSpec, signal: AbortSignal): Promise<Composition> {
     const metadataPath = this.workspaces.metadataPath(spec.mission.id, spec.member.id)
     const environment = await this.sessionEnvironment(spec.mission.id, spec.member.id)
-    try { return parseComposition(JSON.parse(await readFile(metadataPath, 'utf8')) as unknown, spec, environment) }
+    // A composition persisted by the round-16 layout names the old sibling
+    // scratch root; it is accepted (this member, this mission) and rewritten with
+    // the current root, so upgrading never refuses an in-flight member.
+    const legacyTmpdir = legacyScratchRoot(this.workspaces, spec.mission.id, spec.member.id)
+    try { return parseComposition(JSON.parse(await readFile(metadataPath, 'utf8')) as unknown, spec, environment, legacyTmpdir) }
     catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
     }
     const owner = this.ctx.agents.get(SessionId(spec.ownerSessionId))
     if (owner === undefined) throw new Error('First worker creation requires its owner session to seed a durable composition')
-    const preset = this.ctx.get('agentPresets')?.composedPreset(owner.ctx)
+    const preset = (this.ctx.get('agentPresets') as AgentPresets | undefined)?.composedPreset(owner.ctx)
     const inherited = await ownerModelSelection(this.ctx, owner, signal)
     const selection = inherited === undefined && spec.member.provider === undefined && spec.member.model === undefined && spec.member.reasoningEffort === undefined
       ? undefined : workerModelSelection(inherited, spec.member)
@@ -618,43 +749,48 @@ export class HarnessWorkers implements WorkerAdapter {
     if (persistence === undefined) throw new Error('Swarm workers require Harness session persistence')
     if (this.ctx.get('sandboxPolicy') === undefined || this.ctx.get('approval') === undefined) throw new Error('Swarm workers require Harness sandbox-policy and user-approval services')
     const expectedWorkspace = await this.workspaces.prepareWorkspace(spec.mission, spec.member.id)
+    abort.signal.throwIfAborted()
     if (spec.member.workspace !== expectedWorkspace) throw new Error('Worker workspace does not match its owned worktree')
     const composition = await this.composition(spec, abort.signal)
     abort.signal.throwIfAborted()
     const persisted = await persistedSessionHeader(persistence, SessionId(spec.member.sessionId), abort.signal) !== undefined
-    // The setup hook's shape moved in the 0.1.5 line: through 0.1.3-alpha.2 the
-    // agent was reached through `agentCtx.agent` (removed at 0.1.5), and from
-    // 0.1.5 the callback receives it as its second parameter. An OPTIONAL second
-    // parameter satisfies both `AgentSetup` signatures, and the value is taken
-    // from whichever host supplies it, so one callback serves every supported
-    // release instead of forking the adapter by host version.
-    const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
-      const presets = this.ctx.get('agentPresets')
+    if (!persisted || composition.usageGeneration === undefined) {
+      // Write the generation before the native factory can materialize a new
+      // log. A crash before creation may skip an empty generation; a crash
+      // after creation resumes this same one without resetting its watermark.
+      composition.usageGeneration = persisted ? spec.member.usageSession?.generation ?? Date.now()
+        : Math.max(Date.now(), (composition.usageGeneration ?? -1) + 1, (spec.member.usageSession?.generation ?? -1) + 1)
+      await writePrivateJson(this.workspaces.metadataPath(spec.mission.id, spec.member.id), composition)
+      abort.signal.throwIfAborted()
+    }
+    const usageSource = { generation: composition.usageGeneration, restored: persisted }
+    const setup = async (agentCtx: Context, agent: Agent): Promise<void> => {
+      abort.signal.throwIfAborted()
+      const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
       if (composition.preset !== undefined) {
         if (presets === undefined) throw new Error('Saved worker composition requires agent-presets')
         await presets.mount(agentCtx, composition.preset)
       } else if (presets !== undefined) throw new Error('A rosterless worker cannot silently resume under a new default preset')
-      const agent = setupAgent ?? (agentCtx as Context & { agent?: Agent }).agent
-      if (agent === undefined) throw new Error('Worker setup received no agent from the Harness')
+      abort.signal.throwIfAborted()
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
+      abort.signal.throwIfAborted()
       this.removeRevokedPending(resident, agent)
       resident.usage = emptyBuckets()
       resident.totalTokens = agent.session.snapshotEvents().reduce((total, event) => {
-        if (event.type !== 'assistant/message' || event.data.usage === undefined) return total
-        return total + accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
+        const usage = chargedUsage(event)
+        return usage === undefined ? total : total + accumulateUsage(resident.usage, usage, this.cacheReadWeight)
       }, 0)
       // Reconcile a session-log commit whose runtime budget transaction was
       // interrupted, before publication can release pending model requests.
       // `totalTokens` is the weighted charge; `usage` keeps the raw buckets.
-      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage })
+      await this.observer().usageSnapshot?.(spec.member.id, resident.totalTokens, { ...resident.usage }, usageSource)
+      abort.signal.throwIfAborted()
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
-      // rc.1 uses one persona; alpha.2 split it into prefix/suffix. Shadow the
-      // deployment persona on both public section contracts so workers retain
-      // only their own role, including after resuming an older composition.
-      agentCtx.systemPrompt.section({ name: 'deployment:persona', order: 0, text: '' })
+      // Shadow the deployment persona's prefix and suffix so workers retain only
+      // their own role, including after resuming an older composition.
       agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
       agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
       // Source metadata is preserved in the host log, but provider serializers
@@ -671,11 +807,12 @@ export class HarnessWorkers implements WorkerAdapter {
       const visible = new Set(agentCtx.tools.schemas(agent).map(schema => schema.name))
       const hidden = hiddenToolsFor('worker').filter(name => visible.has(name))
       if (hidden.length) agentCtx.tools.restrict({ deny: hidden })
-      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
+      agentCtx.tools.guard(exec => resident.stopping !== undefined || this.closing || abort.signal.aborted ? 'Swarm worker is stopping' : this.observer().guard(spec.member.id, exec.name))
       agentCtx.on('agent/pre-step', async ({ signal, messages }, next) => {
+        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
         await this.drainObservations(resident)
         signal.throwIfAborted()
-        if (this.closing || resident.stopping !== undefined) return { kind: 'reject' }
+        if (this.closing || resident.stopping !== undefined || abort.signal.aborted) return { kind: 'reject' }
         this.removeRevokedPending(resident, agent)
         // Claims are already removed from Inbox before this hook. Reject a
         // wholly stale batch and filter mixed batches through the admitted view.
@@ -683,7 +820,9 @@ export class HarnessWorkers implements WorkerAdapter {
           resident.rejectedPendingStep = true
           return { kind: 'reject' }
         }
+        abort.signal.throwIfAborted()
         const decision = await next()
+        abort.signal.throwIfAborted()
         if (decision.kind === 'reject') return decision
         const admitted = decision.messages.filter(message => !this.revokedAssignment(resident, message))
         const claimedIds = new Set(messages.map(message => message.id))
@@ -692,10 +831,13 @@ export class HarnessWorkers implements WorkerAdapter {
           resident.rejectedPendingStep = true
           return { kind: 'reject' }
         }
+        abort.signal.throwIfAborted()
         signal.throwIfAborted()
         return { kind: 'enter', messages: admitted.filter(message => !this.revokedAssignment(resident, message)) }
       })
       agentCtx.on('tools/execute', async (exec, next) => {
+        abort.signal.throwIfAborted()
+        if (this.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
         const activity = this.beginActivity(resident, { kind: 'tool', tool: exec.name }, exec.signal)
         try { return await next() } finally { activity.end() }
       })
@@ -703,6 +845,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // durable run id, so evidence can be cited without an observe round trip.
       agentCtx.on('tools/post-execute', async (exec, result, next) => {
         const decision = await next()
+        if (this.closing) return decision
         if (exec.name.startsWith('swarm_') || resident.recordedExecutions.has(exec)) return decision
         resident.recordedExecutions.add(exec)
         const content = decision.kind === 'accept' && decision.content !== undefined ? decision.content : result.content
@@ -736,7 +879,10 @@ export class HarnessWorkers implements WorkerAdapter {
         if (event.type === 'user/message') resident.recoveryInbox.delete(event.data.id)
         if (event.type === 'assistant/message' && event.data.usage !== undefined) {
           resident.lastPromptTokens = event.data.usage.inputTokens + (event.data.usage.cacheReadTokens ?? 0) + (event.data.usage.cacheWriteTokens ?? 0)
-          const tokens = accumulateUsage(resident.usage, event.data.usage, this.cacheReadWeight)
+        }
+        const charged = chargedUsage(event)
+        if (charged !== undefined) {
+          const tokens = accumulateUsage(resident.usage, charged, this.cacheReadWeight)
           resident.totalTokens += tokens
           const total = resident.totalTokens, buckets = { ...resident.usage }
           this.observe(resident, async () => {
@@ -745,7 +891,8 @@ export class HarnessWorkers implements WorkerAdapter {
               // The source total must survive a crash before SQLite accounts it.
               // The weighted charge is the accounted total; buckets stay raw.
               await this.ctx.sessions.flush(session)
-              await observer.usageSnapshot(spec.member.id, total, buckets)
+              if (this.closing) return
+              await observer.usageSnapshot(spec.member.id, total, buckets, usageSource)
             } else await observer.usage(spec.member.id, tokens)
           })
         }
@@ -754,10 +901,12 @@ export class HarnessWorkers implements WorkerAdapter {
       agentCtx.on('agent/status', ({ status }) => {
         if (status !== 'idle') return
         this.clearActivities(resident)
-        if (this.continueAfterRejectedStep(resident, agent)) return
+        // The unit closed before this idle: compact first. A tail re-woken below
+        // then waits behind the compaction, so the next unit starts on the summary.
         this.compactIfRequested(resident)
+        if (this.continueAfterRejectedStep(resident, agent)) return
         void this.drainObservations(resident).then(() => {
-          if (resident.stopping === undefined && !this.closing && agent.status === 'idle') this.observer().idle(spec.member.id)
+          if (resident.stopping === undefined && !this.closing && !abort.signal.aborted && agent.status === 'idle') this.observer().idle(spec.member.id)
         }).catch(error => { this.failure(spec.member.id, error) })
       })
     }
@@ -765,8 +914,11 @@ export class HarnessWorkers implements WorkerAdapter {
     const handle = await this.ctx.agents.withoutInitiator(async () => persisted
       ? await this.ctx.agents.resume({ resumeSessionId: SessionId(spec.member.sessionId), agentOptions: composition.options, setup, signal: abort.signal })
       : await this.ctx.agents.create({ sessionId: SessionId(spec.member.sessionId), meta: { cwd: composition.workspace, ...(composition.preset === undefined ? {} : { agentPreset: composition.preset }) }, agentOptions: composition.options, setup, signal: abort.signal }))
-    resident.handle = handle
     try {
+      // Do not publish even a transient usable adapter handle after cancellation.
+      abort.signal.throwIfAborted()
+      if (this.closing || resident.stopping !== undefined) throw new Error('Swarm worker is stopping')
+      resident.handle = handle
       for (const event of handle.agent.session.snapshotEvents()) {
         if (event.type === 'agent/inbox/spliced') for (const message of event.data.inserted) resident.delivered.add(message.id)
         if (event.type === 'user/message') resident.delivered.add(event.data.id)
@@ -774,7 +926,16 @@ export class HarnessWorkers implements WorkerAdapter {
       abort.signal.throwIfAborted()
       await this.ctx.sessions.flush(handle.agent.session)
       await this.preserveInbox(resident, handle.agent)
-    } catch (error) { await handle.dispose(); resident.handle = undefined; throw error }
+      abort.signal.throwIfAborted()
+    } catch (error) {
+      if (resident.handle === handle) resident.handle = undefined
+      try { handle.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true }) }
+      catch (cancelError) {
+        try { this.ctx.logger.warn(`Swarm failed startup could not cancel its native handle: ${errorText(cancelError)}`) } catch { /* Still dispose the handle. */ }
+      }
+      await handle.dispose()
+      throw error
+    }
   }
 
   /**
@@ -782,27 +943,84 @@ export class HarnessWorkers implements WorkerAdapter {
    * no longer needs. Only the native compaction engine is used, only while the
    * worker is idle, and only when its last request's prompt pressure exceeds
    * the configured threshold; the summary request is accounted like any other.
+   * A worker still in its turn keeps the request until its next idle, which
+   * compacts before any queued input starts the next unit.
    */
   compactAtBoundary(memberId: string): void {
     const resident = this.residents.get(memberId)
-    if (resident === undefined || this.closing || resident.stopping !== undefined) return
+    if (resident === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     resident.compactionRequested = true
     this.compactIfRequested(resident)
+  }
+  /**
+   * WS-1: the durable member identity changed (a staged-plan repair rotated its
+   * sessionId), so the persisted composition for this member belongs to the
+   * replaced identity. `parseComposition` refuses a sessionId mismatch and only
+   * an absent file is composed afresh, so without this the member can never
+   * start again — not even after the owner reverts the edit, because the
+   * rotation already happened. The caller has stopped and aborted the old handle
+   * first; this only removes the stale metadata, and the next start composes a
+   * fresh session for the new identity exactly as a first admission does.
+   */
+  /** Parse-only preflight over the plan's declared checks; no worker or worktree exists yet. */
+  async checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]> {
+    return await this.workspaces.checkSyntaxPreflight(checks, cwd, signal)
+  }
+  async invalidateComposition(missionId: string, memberId: string): Promise<void> {
+    const resident = this.residents.get(memberId)
+    if (resident !== undefined && resident.stopping === undefined && !resident.abort.signal.aborted) {
+      // The caller stopped this member first, so a live entry here is an
+      // already-fenced one. Cancel it and drop the entry rather than refusing
+      // the repair: the identity it was built for no longer exists, and leaving
+      // the stale metadata in place would brick the member permanently.
+      resident.abort.abort(new Error('Worker identity replaced by a saved-plan repair'))
+      this.residents.delete(memberId)
+    }
+    await rm(this.workspaces.metadataPath(missionId, memberId), { force: true })
   }
   private compactIfRequested(resident: Resident): void {
     const threshold = this.options.boundaryCompactionTokens ?? 250000
     const agent = resident.handle?.agent
-    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined) return
+    if (!resident.compactionRequested || threshold <= 0 || agent === undefined || agent.status !== 'idle' || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return
     if (resident.lastPromptTokens < threshold) { resident.compactionRequested = false; return }
-    // The compaction engine is an optional host service; structural access avoids a hard package dependency.
-    const compaction = (this.ctx.get as (name: string) => unknown)('compaction') as { compactNow(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
-    if (compaction === undefined || typeof compaction.compactNow !== 'function') { resident.compactionRequested = false; return }
     resident.compactionRequested = false
+    const compact = this.compactionFor(agent)
+    if (compact === undefined) {
+      if (!this.compactionUnavailableWarned) this.ctx.logger.warn(`Swarm boundary compaction is unavailable: ${resident.spec.member.id}'s composition has no /compact command and the host has no compaction service`)
+      this.compactionUnavailableWarned = true
+      return
+    }
     resident.lastPromptTokens = 0
     this.observe(resident, async () => {
-      try { await compaction.compactNow(agent, resident.abort.signal) }
-      catch (error) { if (!resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${errorText(error)}`) }
+      // Maintenance starts synchronously inside `compact`, so input woken after this returns waits behind it.
+      try {
+        const refusal = await compact(resident.abort.signal)
+        if (refusal !== undefined && !resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${refusal}`)
+      } catch (error) { if (!resident.abort.signal.aborted) this.ctx.logger.warn(`Swarm boundary compaction skipped for ${resident.spec.member.id}: ${errorText(error)}`) }
     })
+  }
+  /**
+   * The compaction engine this member's own composition uses. Both supported
+   * web profiles disable the host-plane `compaction-basic` row and mount it in
+   * each agent preset's isolated `compaction` realm, where `ctx.get` from this
+   * plugin cannot see it; the realm's public handle is the `/compact` command it
+   * registers for the agents on that preset. That command runs the engine's
+   * idle-only `compactNow` and reports an expected failure as an error result.
+   * A composition that mounts the engine on the host plane without the command
+   * is reached through the service. Resolves to a refusal text, or undefined.
+   */
+  private compactionFor(agent: Agent): ((signal: AbortSignal) => Promise<string | undefined>) | undefined {
+    const get = this.ctx.get as (name: string) => unknown
+    const commands = get('commands') as { find?(agent: Agent, name: string): { handler(invocation: object): unknown } | undefined } | undefined
+    const command = typeof commands?.find === 'function' ? commands.find(agent, 'compact') : undefined
+    if (command !== undefined) return async signal => {
+      // No command id: nobody typed this, so the host records an uncommanded compaction.
+      const result: unknown = await command.handler(Object.freeze({ agent, rawInput: '', attachments: [], signal }))
+      return isRecord(result) && result.kind === 'error' ? String(result.text) : undefined
+    }
+    const compaction = get('compaction') as { compactNow?(agent: Agent, signal: AbortSignal): Promise<unknown> } | undefined
+    if (typeof compaction?.compactNow !== 'function') return undefined
+    return async signal => { await compaction.compactNow!(agent, signal); return undefined }
   }
 
   async deliver(member: Member, delivery: Delivery): Promise<void> {
@@ -814,25 +1032,16 @@ export class HarnessWorkers implements WorkerAdapter {
       const message = this.deliveryMessage(delivery)
       const seen = owner.session.snapshotEvents().some(event => (event.type === 'user/message' && event.data.id === message.id)
         || (event.type === 'agent/inbox/spliced' && event.data.inserted.some(item => item.id === message.id)))
-      if (!seen) {
-        try {
-          owner.send(message, 'next-step', true)
-        } catch (error) {
-          // R17-G9: the host pre-append invariant refused this owner-facing
-          // decision. Record the refusal (a measurement) and ACKNOWLEDGE the
-          // delivery by returning, so the durable outbox does not retry forever a
-          // decision the invariant will refuse again; any other failure still
-          // propagates to the outbox's retry path.
-          if (recordAppendRefusal(error, { id: delivery.id, missionId: delivery.missionId, family: noticeFamily(delivery), subjects: delivery.subjects ?? [] })) return
-          throw error
-        }
-      }
+      // A host append failure is not a delivery: it stays a durable outbox obligation.
+      if (!seen) owner.send(message, 'next-step', true)
       await this.ctx.sessions.flush(owner.session)
       return
     }
     const resident = this.residents.get(member.id)
     if (resident === undefined) throw new Error('Worker must be started before delivery')
+    resident.abort.signal.throwIfAborted()
     await resident.opening
+    resident.abort.signal.throwIfAborted()
     if (this.closing || resident.stopping !== undefined || resident.handle === undefined) throw new Error('Worker is stopping')
     const id = MessageId(`swarm:${delivery.id}`)
     if (!resident.delivered.has(id)) {
@@ -842,6 +1051,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // Journal the accepted identity before publication and outbox acknowledgement.
       resident.recoveryInbox.set(message.id, { target, message })
       await this.preserveInbox(resident, resident.handle.agent)
+      resident.abort.signal.throwIfAborted()
       if (this.closing || resident.stopping !== undefined) throw new Error('Worker is stopping')
       // Claims and findings are visible at the next step; a new assignment owns a turn.
       resident.handle.agent.send(message, target, true)
@@ -860,6 +1070,9 @@ export class HarnessWorkers implements WorkerAdapter {
   }
 
   private revokedAssignment(resident: Resident, message: UserMessage): boolean {
+    // Shutdown can finish before a deferred journal write. Preserve the item;
+    // the next activation checks its durable assignment before consumption.
+    if (this.closing) return false
     return message.source.kind === 'swarm' && message.source.deliveryKind === 'assignment'
       && this.observer().admitDelivery?.(resident.spec.member.id, message.source.deliveryId) === false
   }
@@ -946,7 +1159,7 @@ export class HarnessWorkers implements WorkerAdapter {
    */
   isIdle(memberId: string): boolean {
     const resident = this.residents.get(memberId)
-    if (resident?.handle === undefined) return false
+    if (resident?.handle === undefined || this.closing || resident.stopping !== undefined || resident.abort.signal.aborted) return false
     const agent = resident.handle.agent
     const decision = strandedInboxDecision({
       stopping: resident.stopping !== undefined, observations: resident.observations.size,
@@ -972,29 +1185,48 @@ export class HarnessWorkers implements WorkerAdapter {
       }
     }
   }
-  captureArtifact(member: Member, task: Task): Promise<Artifact> { return this.workspaces.captureArtifact(member, task) }
+  captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact> { return this.workspaces.captureArtifact(member, task, deliverables, options) }
+  inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact> { return this.workspaces.inspectArtifact(member, artifact, signal) }
   /** R11-19: the owned Workspaces' measured declared-check envelope. */
   checkEnvelope(): CheckEnvelope { return this.workspaces.checkEnvelope() }
   async verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): ReturnType<WorkerAdapter['verifyArtifact']> {
     const resident = this.residents.get(member.id)
+    if (resident) {
+      resident.abort.signal.throwIfAborted()
+      signal = signal === undefined ? resident.abort.signal : AbortSignal.any([signal, resident.abort.signal])
+    }
     const activity = resident === undefined ? undefined : this.beginActivity(resident, { kind: 'verification' }, signal)
     try {
       // F3: the declared check runs under this member's own scratch root, so two
       // members' verification temp files cannot collide.
       const environment = await this.sessionEnvironment(member.missionId, member.id)
+      signal?.throwIfAborted()
       return await this.checkEnvironment.run(environment, () => this.workspaces.verifyArtifact(member, task, artifact, signal))
     }
     finally { activity?.end() }
   }
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void> { return this.workspaces.prepareTask(member, task, dependencies, reviewSource) }
+  checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void> { return this.workspaces.checkpointTask(member, task, options) }
   dispose(): Promise<void> {
     return this.disposal ??= (async () => {
       this.closing = true
       this.removeStreamObserver()
-      const results = await Promise.allSettled([...this.residents.keys()].map(async id => { await this.stop(id) }))
-      await this.workspaces.dispose()
-      const errors = results.filter((item): item is PromiseRejectedResult => item.status === 'rejected').map(item => item.reason as unknown)
-      if (errors.length > 0) throw new AggregateError(errors, 'Worker disposal failed')
+      // All residents are fenced synchronously by stop() before this wait. Keep
+      // cleanup attached for late handles, but report an uncooperative host await
+      // instead of blocking plugin unload indefinitely or reporting a false stop.
+      const cleanup = Promise.allSettled([
+        ...[...this.residents.keys()].map(async id => { await this.stop(id) }),
+        this.workspaces.dispose(),
+      ]).then(results => {
+        const errors = results.filter((item): item is PromiseRejectedResult => item.status === 'rejected').map(item => item.reason as unknown)
+        if (errors.length > 0) throw new AggregateError(errors, 'Worker disposal failed')
+      })
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([cleanup, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Worker disposal timed out; native startup or cleanup is still pending and all workers remain fenced')), DISPOSAL_TIMEOUT_MS)
+        })])
+      } finally { clearTimeout(timer) }
     })()
   }
 }

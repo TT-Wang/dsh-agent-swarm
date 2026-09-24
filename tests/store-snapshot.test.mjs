@@ -9,60 +9,38 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, sep } from 'node:path'
 import { SwarmStore, StoreRecoveryError, applyPendingRestore, isSqliteNotADatabase, pendingRestore } from '../lib/store.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { MANAGEMENT_TOOLS, SWARM_TOOLS } from '../lib/tools.js'
+import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, budget as defaultBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class RunWorkers {
-  artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
-}
-
-async function eventually(read, message, timeoutMs = 4000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const value = await read()
-    if (value) return value
-    await new Promise(resolve => setTimeout(resolve, 10))
-  }
-  assert.fail(`Timed out after ${timeoutMs}ms: ${message}`)
-}
+const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 }
 
 async function fixture(t, { storeOptions = {}, workspace } = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-store-snapshot-'))
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 10 }, new RunWorkers(), storeOptions)
+  const workers = new FakeWorkers({
+    artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+    checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+    async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+  })
+  const { dir: directory, config, runtime } = await makeRuntime(t, { workers, storeOptions,
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 10, checkTimeoutMs: undefined } })
   await runtime.start()
   const owner = { sessionId: 'snapshot-owner' }
   const mission = runtime.create(owner, { title: 'Snapshot', objective: 'Prove snapshot and restore', workspace: workspace ?? directory,
     scope: ['**'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test'] })
-  t.after(async () => { await runtime.dispose().catch(() => undefined); await rm(directory, { recursive: true, force: true }) })
-  return { directory, statePath: join(directory, 'state.sqlite'), runtime, owner, mission }
+  return { directory, statePath: config.statePath, runtime, owner, mission }
 }
 
 test('R11-02: the periodic snapshot is written outside the mission source and contains the board', async t => {
-  const source = await mkdtemp(join(tmpdir(), 'swarm-store-source-'))
+  const source = await tempDirectory('swarm-store-source-')
   t.after(async () => rm(source, { recursive: true, force: true }))
   const f = await fixture(t, { workspace: source, storeOptions: { snapshotIntervalMs: 20, snapshotKeep: 3 } })
-  const snapshot = await eventually(async () => (await f.runtime.store.snapshots())[0], 'the periodic timer writes a snapshot')
+  const snapshot = await eventually(async () => (await f.runtime.store.snapshots())[0], 'the periodic timer writes a snapshot', 4000)
   assert.ok(snapshot.path.startsWith(`${f.statePath}.snapshots${sep}`), `snapshot ${snapshot.path} is derived from the owner state path, not the mission source`)
   assert.ok(!snapshot.path.startsWith(`${source}${sep}`), 'the snapshot is never written inside the mission source checkout')
   assert.ok(snapshot.bytes > 0)

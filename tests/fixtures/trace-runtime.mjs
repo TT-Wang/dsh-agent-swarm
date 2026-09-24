@@ -10,26 +10,19 @@
  * root is outside the sandbox. The assertions are unchanged.
  */
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
-import { TracePayloadStore } from '../../lib/trace.js'
 import { tempDirectory } from '../temp-root.mjs'
+import { FakeWorkers } from '../faults/harness.mjs'
 
 export const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 
-export class TraceWorkers {
-  constructor() { this.commands = []; this.stopped = []; this.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]; this.artifacts = 0 }
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, memberId) { return `/isolated/${memberId}` }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
+/** The shared FakeWorkers (never idle, `/isolated/` workspaces) with one new commit per capture. */
+export class TraceWorkers extends FakeWorkers {
+  checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  artifacts = 0
   async captureArtifact() { this.artifacts++; return { commit: `commit-${this.artifacts}`, baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return this.checks }
-  async prepareTask() {}
-  async dispose() {}
 }
 
 /**
@@ -59,22 +52,22 @@ export async function traceFixture(t, options = {}) {
   const builder = await call('swarm_add_member', { missionId, name: 'Builder', role: 'implementation' }, owner)
   const reviewer = await call('swarm_add_member', { missionId, name: 'Reviewer', role: 'verification' }, owner)
   const reviewer2 = await call('swarm_add_member', { missionId, name: 'Second reviewer', role: 'verification' }, owner)
-  const source = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Implement', objective: 'Deliver the module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id }, owner)
+  const source = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Implement', objective: 'Deliver the module', kind: 'implementation', scope: ['src/'], acceptance: ['works'], outputs: [], checks: ['test'], assigneeId: builder.id }, owner)
   const claim = await call('swarm_claim', { missionId, taskId: source.id }, builder.sessionId)
   const runId = await workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'true' }, result: { output: 'ok' }, isError: false })
   const bigClaim = `evidence-${'x'.repeat(4000)}`
-  await call('swarm_publish', { missionId, taskId: source.id, attemptId: claim.attempt.id, claim: bigClaim, outcome: 'supported', toolRunIds: [runId] }, builder.sessionId)
+  await call('swarm_publish', { missionId, taskId: source.id, attemptId: claim.attempt.id, claim: bigClaim, outcome: options.outcome ?? 'supported', toolRunIds: [runId] }, builder.sessionId)
   await call('swarm_submit', { missionId, taskId: source.id, attemptId: claim.attempt.id, output: 'candidate' }, builder.sessionId)
-  const review = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, assigneeId: reviewer.id }, owner)
+  const review = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], outputs: [], checks: [], reviewOf: source.id, assigneeId: reviewer.id }, owner)
   const reviewClaim = await call('swarm_claim', { missionId, taskId: review.id }, reviewer.sessionId)
-  const review2 = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Second review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, assigneeId: reviewer2.id }, owner)
+  const review2 = await call('swarm_propose', { missionId, workstreamId: stream.id, title: 'Second review', objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], outputs: [], checks: [], reviewOf: source.id, assigneeId: reviewer2.id }, owner)
   const review2Claim = await call('swarm_claim', { missionId, taskId: review2.id }, reviewer2.sessionId)
+  await options.beforeVerify?.({ runtime, workers, missionId, owner, source, review, reviewClaim, review2, reviewer, reviewer2 })
   const verdict = await call('swarm_verify', { missionId, taskId: review.id, attemptId: reviewClaim.attempt.id, verdict: options.verdict ?? 'accept', reason: options.reason ?? 'Independent accept' }, reviewer.sessionId)
   const events = () => runtime.store.events(missionId, 1000, 0)
   return {
     root, workspace, statePath, runtime, workers, definitions, raw, call, exec, owner, missionId, stream, builder, reviewer, reviewer2,
     source, claim, review, reviewClaim, review2, review2Claim, verdict, runId, bigClaim, events,
     task: id => runtime.store.get('tasks', id),
-    payloads: new TracePayloadStore(join(dirname(statePath), 'trace-payloads')),
   }
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { access, appendFile } from 'node:fs/promises'
-import { importHarness } from './built-harness.mjs'
+import { importHarness, toolResultBlocks } from './built-harness.mjs'
 
 export const name = 'swarm-web-scripted-llm'
 export const inject = ['llm']
@@ -32,71 +32,150 @@ function mergeObservationWindows(observations) {
   return merged
 }
 
-/** Only model output is controlled: the web product, transport, tools and workers are real. */
+const acceptance = ['value.cjs exports two and node check.cjs passes']
+/** The two-member delivery both owner scripts propose. */
+const stagedPlan = {
+  title: 'Browser staged delivery', objective: 'Deliver an independently checked value of two.',
+  scope: ['value.cjs'], acceptance,
+  budget: { maxTokens: 50_000, maxSteps: 60, maxWorkers: 2, maxDurationMs: 180_000, maxTasks: 6, maxExperiments: 1 },
+  members: [
+    { key: 'builder', name: 'builder', role: 'implementation and integration', provider: 'deepseek-official', model: 'swarm-web-primary' },
+    { key: 'reviewer', name: 'reviewer', role: 'independent verifier', provider: 'deepseek-official', model: 'swarm-web-review' },
+  ],
+  workstreams: [{ key: 'delivery', title: 'Value delivery', objective: 'Change and independently verify the exported value.' }],
+  tasks: [
+    { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', outputs: [], scope: ['value.cjs'], acceptance, checks: ['node check.cjs'], assigneeKey: 'builder' },
+    { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', outputs: [], reviewOf: 'implement', scope: ['value.cjs'], acceptance, assigneeKey: 'reviewer' },
+  ],
+}
+
+/**
+ * Only model output is controlled: the web product, transport, tools and workers are real.
+ * `config.owner` picks the owner script: 'stage' stages a draft for the browser to edit and
+ * launch (scripts/smoke-web.mjs); 'command' plans the /agent-swarm request and launches it
+ * (scripts/smoke-command-web.mjs), first submitting an invalid plan and repairing it after
+ * inspecting the repository when `config.validationRepair` is set. Workers share one script.
+ */
 export async function apply(ctx, config) {
   const { LlmAdapter, ToolCallId } = await importHarness(config.harnessRoot, '@deepseek-ai/dsh-llm')
   const owners = new Set()
   const confirmations = new Set()
+  const repairs = new Map()
   const scripts = new Map()
   let nextCall = 0
   const trace = entry => appendFile(config.tracePath, JSON.stringify(entry) + '\n')
   const texts = message => message.content.filter(block => block.type === 'text').map(block => block.text)
-  const blocks = messages => messages.flatMap(message => message.content.filter(block => block.type === 'tool-result'))
+  const blocks = toolResultBlocks
   const resultBody = block => JSON.parse(texts(block).join('\n'))
   const tool = (name, args) => ({ kind: 'tool', name, args })
   const answer = text => ({ kind: 'text', text })
-  async function released(signal) {
+  async function released(signal, path = config.releasePath) {
     while (true) {
       signal?.throwIfAborted()
-      try { await access(config.releasePath); return } catch (error) { if (error.code !== 'ENOENT') throw error }
+      try { await access(path); return } catch (error) { if (error.code !== 'ENOENT') throw error }
       await new Promise(resolve => setTimeout(resolve, 50))
     }
   }
+  async function toolFailure(options, result) {
+    await trace({ type: 'fixture/error', sessionId: options.sessionId, message: texts(result).join('\n') })
+    return answer('Fixture observed a tool failure; stopping this turn.')
+  }
   ctx.on('session/event', (session, event) => {
     if (event.type === 'tool/call') void trace({ type: event.type, sessionId: session.header.id, name: event.data.name })
+    if (event.type === 'command/run' || event.type === 'command/done') void trace({ type: event.type, sessionId: session.header.id, data: event.data })
+    if (event.type === 'user/message') void trace({ type: event.type, sessionId: session.header.id, sourceKind: event.data.source?.kind })
   })
-  async function action(options) {
+
+  /** The user asks in the composer; the owner stages the draft once, then acknowledges. */
+  async function stagingOwner(options) {
     const lastResult = blocks(options.messages).at(-1)
-    if (lastResult?.isError) {
-      await trace({ type: 'fixture/error', sessionId: options.sessionId, message: texts(lastResult).join('\n') })
-      return answer('Fixture observed a tool failure; stopping this turn.')
-    }
-    const assignmentMessage = options.messages.findLast(message => texts(message).some(text => text.startsWith('[Swarm assignment;')))
+    if (lastResult?.isError) return toolFailure(options, lastResult)
     const ownerPrompt = options.messages.flatMap(texts).findLast(text => text.startsWith('Prepare a staged swarm for browser validation.'))
-    if (!assignmentMessage) {
-      if (!ownerPrompt) return answer('The real web model loop is connected.')
-      const ownerTurn = `${options.sessionId}:${ownerPrompt}`
-      if (owners.has(ownerTurn)) {
-        if (confirmations.has(ownerTurn)) return answer('Mission update received.')
-        confirmations.add(ownerTurn)
-        return answer('Draft ready for review. Edit the workers and launch when ready.')
-      }
-      owners.add(ownerTurn)
-      await trace({ type: 'owner/session', sessionId: options.sessionId })
-      return tool('swarm_stage', {
-        title: 'Browser staged delivery', objective: 'Deliver an independently checked value of two.', workspace: config.workspace,
-        scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'],
-        budget: { maxTokens: 50_000, maxSteps: 60, maxWorkers: 2, maxDurationMs: 180_000, maxTasks: 6, maxExperiments: 1 },
-        members: [
-          { key: 'builder', name: 'builder', role: 'implementation and integration', provider: 'deepseek-official', model: 'swarm-web-primary' },
-          { key: 'reviewer', name: 'reviewer', role: 'independent verifier', provider: 'deepseek-official', model: 'swarm-web-review' },
-        ],
-        workstreams: [{ key: 'delivery', title: 'Value delivery', objective: 'Change and independently verify the exported value.' }],
-        tasks: [
-          { key: 'implement', workstreamKey: 'delivery', title: 'Deliver value two', objective: 'Change value.cjs to export two and record host evidence.', kind: 'integration', scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], checks: ['node check.cjs'], assigneeKey: 'builder' },
-          { key: 'review', workstreamKey: 'delivery', title: 'Independent review', objective: 'Verify the exact submitted artifact using swarm_verify.', kind: 'verification', reviewOf: 'implement', scope: ['value.cjs'], acceptance: ['value.cjs exports two and node check.cjs passes'], assigneeKey: 'reviewer' },
-        ],
-      })
+    if (!ownerPrompt) return answer('The real web model loop is connected.')
+    const ownerTurn = `${options.sessionId}:${ownerPrompt}`
+    if (owners.has(ownerTurn)) {
+      if (confirmations.has(ownerTurn)) return answer('Mission update received.')
+      confirmations.add(ownerTurn)
+      return answer('Draft ready for review. Edit the workers and launch when ready.')
     }
+    owners.add(ownerTurn)
+    await trace({ type: 'owner/session', sessionId: options.sessionId })
+    return tool('swarm_stage', { ...stagedPlan, workspace: config.workspace })
+  }
+
+  /** /agent-swarm delivers a durable start; the owner plans it once and launches it. */
+  async function commandOwner(options) {
+    const lastResult = blocks(options.messages).at(-1)
+    const startMessage = options.messages.findLast(message => message.source?.kind === 'swarm-start')
+    if (!startMessage) return answer('The actual web model loop is connected.')
+    const requestId = startMessage.source.requestId
+    assert.equal(typeof requestId, 'string', 'automatic start must carry durable request identity')
+    assert(texts(startMessage).some(text => text.includes(requestId)), 'planning context must preserve request identity for swarm_launch')
+    const repair = repairs.get(requestId)
+    if (config.validationRepair && repair?.stage === 'rejected') {
+      assert(lastResult?.isError, 'the first invalid plan must return a normal model-visible tool error')
+      const message = texts(lastResult).join('\n')
+      assert.match(message, /scope\[0\]/, 'the error must locate the invalid mission selector')
+      assert.match(message, /tasks\[0\]\.checks/, 'the same error must locate the missing code verification command')
+      await trace({ type: 'owner/validation-error', sessionId: options.sessionId, requestId, message })
+      // Only the fixture model pauses here. The real command, owner inbox and
+      // browser continue normally while the test verifies no partial launch.
+      await released(options.signal, config.releaseRepairPath)
+      repair.stage = 'inspect'
+      return tool('bash', { command: 'git ls-files -- value.cjs check.cjs && cat check.cjs', description: 'Inspect the actual scoped filename and existing verification script before repairing the plan.' })
+    }
+    if (lastResult?.isError) return toolFailure(options, lastResult)
+    if (config.validationRepair && repair?.stage === 'inspect') {
+      const inspected = texts(lastResult).join('\n')
+      assert.match(inspected, /value\.cjs/)
+      assert.match(inspected, /check\.cjs/)
+      assert.match(inspected, /VERIFIED_TWO/)
+      const corrected = structuredClone(repair.plan)
+      corrected.scope = ['value.cjs']
+      corrected.tasks[0].scope = ['value.cjs']
+      corrected.tasks[0].checks = ['node check.cjs']
+      repair.stage = 'launched'
+      await trace({ type: 'owner/repair', sessionId: options.sessionId, requestId, inspected, plan: corrected })
+      return tool('swarm_launch', corrected)
+    }
+    if (owners.has(requestId)) {
+      if (confirmations.has(requestId)) return answer('收到协作进度更新，具体状态和验收结果见侧边栏。')
+      confirmations.add(requestId)
+      return answer('协作任务已自动启动，侧边栏会持续显示进展。')
+    }
+    await released(options.signal, config.releasePlanningPath)
+    owners.add(requestId)
+    await trace({ type: 'owner/session', sessionId: options.sessionId, requestId })
+    // The staged delivery, with every allowance, recovery limit and check deadline
+    // chosen by the owner; members name no model, so workers inherit the conversation's.
+    const plan = {
+      ...stagedPlan, requestId, title: 'Automatic browser delivery',
+      budget: { maxTokens: 120_000, maxSteps: 60, maxWorkers: 2, maxDurationMs: 180_000, maxTasks: 8, maxExperiments: 2 },
+      members: stagedPlan.members.map(({ key, name, role }) => ({ key, name, role, maxOutputTokens: 4096 })),
+      tasks: stagedPlan.tasks.map(task => ({ ...task, checkTimeoutMs: 30_000, maxRecoveryAttempts: 3 })),
+    }
+    if (config.validationRepair) {
+      plan.scope = ['*.cjs']
+      plan.tasks[0].scope = ['*.cjs']
+      delete plan.tasks[0].checks
+      // This redundant review edge is harmless and is intentionally retained
+      // on retry to exercise canonicalization at the real launch boundary.
+      plan.tasks[1].dependencies = ['implement']
+      repairs.set(requestId, { stage: 'rejected', plan: structuredClone(plan) })
+      await trace({ type: 'owner/invalid-plan', sessionId: options.sessionId, requestId, plan })
+    }
+    return tool('swarm_launch', plan)
+  }
+
+  async function action(options) {
+    const assignmentMessage = options.messages.findLast(message => texts(message).some(text => text.startsWith('[Swarm assignment;')))
+    if (!assignmentMessage) return config.owner === 'command' ? commandOwner(options) : stagingOwner(options)
     await released(options.signal)
     const text = texts(assignmentMessage).join('\n')
     const assignment = JSON.parse(text.slice(text.indexOf('\n') + 1))
     const key = `${options.sessionId}:${assignment.task.attempt.id}`
     const previous = blocks(options.messages).at(-1)
-    if (previous?.isError) {
-      await trace({ type: 'fixture/error', sessionId: options.sessionId, message: texts(previous).join('\n') })
-      return answer('Fixture observed a tool failure; stopping this turn.')
-    }
+    if (previous?.isError) return toolFailure(options, previous)
     let script = scripts.get(key)
     if (!script) { script = { stage: 'work' }; scripts.set(key, script); return tool('swarm_observe', { missionId: assignment.missionId }) }
     if (script.stage === 'done') return answer('Assignment finished; awaiting further work.')
@@ -128,7 +207,7 @@ export async function apply(ctx, config) {
     async listModels(provider) { return ['swarm-web-primary', 'swarm-web-review'].map(model => modelInfo(provider, model)) }
     async resolveModel(provider, model) { return modelInfo(provider, model) }
     async *stream(options) {
-      await trace({ type: 'model/request', sessionId: options.sessionId, model: options.model, reasoningEffort: options.reasoningEffort })
+      await trace({ type: 'model/request', sessionId: options.sessionId, model: options.model, reasoningEffort: options.reasoningEffort, maxTokens: options.maxTokens })
       const response = await action(options)
       if (response.kind === 'tool') {
         const id = ToolCallId(`swarm-web-${++nextCall}`)

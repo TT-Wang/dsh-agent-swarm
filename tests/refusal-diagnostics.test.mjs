@@ -20,13 +20,16 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
+import ts from 'typescript'
 import {
-  refusalSites, assessRefusal, diagnosticProducers, toolSchemaIndex, applyAllowlist,
+  refusalSites, assessRefusal, assessText, diagnosticProducers, toolSchemaIndex, applyAllowlist,
   uncoveredCodeLiterals, formatSite, DELEGATED_MESSAGES,
 } from './refusal-inventory.mjs'
 import { formatDiagnostic } from '../lib/admission.js'
 import { workspaceAuthorizationDiagnostic } from '../lib/authorization.js'
+import { guardTerminal } from '../lib/refusals.js'
+import { constructorArguments, sourceErrorClasses, sourceTree } from './source-semantics.mjs'
 
 const IN_SCOPE_SOURCES = ['src/tools.ts', 'src/admission.ts']
 /**
@@ -63,6 +66,10 @@ test('the inventory walks every refusal in the tool and admission surface, not a
     const rawThrows = [...source.matchAll(/throw new Error\(/g)].length
     const found = sitesByFile[index].filter(site => site.kind === 'throw').length
     assert.equal(found, rawThrows, `${file}: every throw call site is inventoried (${found}/${rawThrows})`)
+    // Typed admission refusals carry their own token and stay in the walk.
+    const rawAdmission = [...source.matchAll(/throw new AdmissionError\(/g)].length
+    assert.equal(sitesByFile[index].filter(site => site.kind === 'coded-throw' && site.errorClass === 'AdmissionError').length, rawAdmission,
+      `${file}: every AdmissionError call site is inventoried`)
     const uncovered = uncoveredCodeLiterals(source, sitesByFile[index])
     for (const entry of uncovered) {
       const classificationMarker = entry.keys.includes('runnable') || entry.keys.includes('requirement')
@@ -72,6 +79,7 @@ test('the inventory walks every refusal in the tool and admission surface, not a
   }
   // The durable ceiling reason is the motivating refusal; it must be in the walk.
   assert.ok(sites.some(site => site.code === 'task_ceiling_exhausted'), 'the durable ceiling refusal is inventoried')
+  assert.ok(sites.filter(site => site.errorClass === 'AdmissionError').length >= 10, 'the typed admission refusals are inventoried')
 })
 
 test('every in-scope refusal is coded and its next step names a parameter that resolves in the tool schema', async () => {
@@ -87,14 +95,14 @@ test('every in-scope refusal is coded and its next step names a parameter that r
   assert.equal(applied.checked.length, sites.length, 'nothing is exempted: the allowlist is empty')
 })
 
-test('the motivating refusal names maxSteps and maxFindings, which resolve on swarm_propose', async () => {
+test('the task ceiling refusal names a real same-task allocation repair through swarm_budget', async () => {
   const { index, sites } = await inventory()
   const ceiling = sites.find(site => site.code === 'task_ceiling_exhausted')
   assert.ok(ceiling, 'the ceiling refusal is inventoried')
-  assert.deepEqual(ceiling.tools, ['swarm_propose'])
-  for (const parameter of ['replaces', 'maxSteps', 'maxFindings']) {
+  assert.deepEqual(ceiling.tools, ['swarm_budget'])
+  for (const parameter of ['taskId', 'taskBudget', 'reason']) {
     assert.ok(ceiling.params.includes(parameter), `the ceiling exit names ${parameter}`)
-    assert.ok(index.ownProperties.get('swarm_propose').has(parameter), `swarm_propose declares ${parameter}`)
+    assert.ok(index.ownProperties.get('swarm_budget').has(parameter), `swarm_budget declares ${parameter}`)
   }
   // Both plan entry points expose the same per-task ceilings.
   for (const name of ['swarm_propose', 'swarm_stage', 'swarm_launch']) {
@@ -151,6 +159,99 @@ test('the lint fails the pre-fix ceiling advice and other non-executable exits',
   assert.ok(uncoded.some(violation => /no \[diagnostic_code\]/.test(violation)), uncoded.join('; '))
 })
 
+test('a coded refusal that names a parameter but gives no imperative next step fails the lint', async () => {
+  const { index } = await inventory()
+  const NO_VERB = 'no imperative next step (action verb)'
+  // The seven texts the batch-2 verifier found compliant once the verb check was
+  // dropped: each is coded and names a resolvable parameter, and none says what to do.
+  const statements = [
+    '[task_ceiling_exhausted] Task ceiling exhausted: `maxSteps` 150/150.',
+    '[mission_not_active] Mission is paused; `missionId` cannot accept work.',
+    '[task_not_in_mission] `taskId` is not in this mission.',
+    '[task_attempt_stale] The attempt for `taskId` is stale.',
+    '[guard_terminal] The budget chain has no progress for `missionId`; the owner must decide.',
+    '[output_missing] `swarm_submit` did not capture `deliverables`.',
+    '[review_path_missing] No live reviewer exists for `reviewOf`.',
+  ]
+  for (const text of statements) assert.deepEqual(assessText(text, index), [NO_VERB], text)
+  // The same text found at a source site fails the same way.
+  const [site] = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(statements[1])})\n}\n`, 'src/probe.ts')
+  assert.deepEqual(assess(site, { ...index, diagnosticProducers: new Set() }), [NO_VERB])
+  // A verb that is only a code token or a backticked name is not an instruction.
+  assert.deepEqual(assessText('[retry_pending] `name` is missing for `taskId`.', index), [NO_VERB])
+  // Each verb current refusals lead with is recognised, and the owner-reply
+  // terminal, which says only "Answer it … or close it", satisfies the lint.
+  for (const verb of ['Answer', 'Close', 'Inspect', 'Admit', 'Amend', 'Reassign', 'Extend', 'Observe', 'Restart', 'Resolve', 'Re-check', 'Leave', 'Send', 'Relaunch']) {
+    assert.deepEqual(assessText(`[probe_code] ${verb} it with \`swarm_control\` and its \`taskId\`.`, index), [], verb)
+  }
+  assert.deepEqual(assessText(guardTerminal('owner_reply').message, index), [])
+})
+
+test('a class throw\'s message is the argument at its constructor\'s declared message parameter', () => {
+  // src/plans.ts's aggregate refusal: a conditional code, a category binding, a `.join` message
+  // and a code-like location literal. No argument is shaped like a message, and position took the code.
+  const [aggregate] = refusalSites("export function probe() {\n  throw new AdmissionError(diagnostics.length === 1 ? diagnostics[0]!.code : 'plan_invalid', category, admissionIssues.map(issue => issue.message).join('\\n'), 'plan', diagnostics)\n}\n", 'src/probe.ts')
+  assert.equal(aggregate.expression, "admissionIssues.map(issue => issue.message).join('\\n')")
+  // The named parameter wins over an earlier argument shaped like a message, a subclass without a
+  // constructor inherits it, and a class that takes no message parameter falls back to shape.
+  const declared = refusalSites([
+    'class DetailedError extends Error { constructor(readonly detail: string, message: string) { super(message) } }',
+    'class InheritedError extends DetailedError {}',
+    'class RenderedError extends Error { constructor(code: string, detail: string) { super(`[${code}] ${detail}`) } }',
+    'export function probe() {',
+    '  if (a) throw new DetailedError(`detail ${a}`, reason)',
+    '  if (b) throw new InheritedError(`detail ${b}`, reason)',
+    "  throw new RenderedError('rendered_code', `detail ${c}`)",
+    '}',
+  ].join('\n'), 'src/probe.ts')
+  assert.deepEqual(declared.map(site => [site.errorClass, site.expression]), [['DetailedError', 'reason'], ['InheritedError', 'reason'], ['RenderedError', '`detail ${c}`']])
+  // Every class throw in src/ whose class declares a message parameter reads that argument.
+  const classes = sourceErrorClasses()
+  const files = readdirSync(new URL('../src/', import.meta.url), { recursive: true }).filter(file => file.endsWith('.ts')).map(file => `src/${file}`)
+  const mismatches = []
+  let checked = 0
+  for (const file of files) {
+    const text = read(file), tree = sourceTree(text, file), sites = refusalSites(text, file)
+    const visit = node => {
+      const created = ts.isThrowStatement(node) && node.expression ? node.expression : undefined
+      if (created && ts.isNewExpression(created) && ts.isIdentifier(created.expression)) {
+        const slot = constructorArguments(classes, created.expression.text)?.get('message')
+        if (slot?.index !== undefined) {
+          checked++
+          const line = tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1
+          const argument = created.arguments?.[slot.index]?.getText(tree) ?? ''
+          const site = sites.find(item => item.line === line && item.errorClass === created.expression.text)
+          if (site?.expression !== argument) mismatches.push(`${file}:${line} ${created.expression.text}: walker read ${JSON.stringify(site?.expression)}, the declared message is ${JSON.stringify(argument)}`)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(tree)
+  }
+  assert.ok(checked >= 200, `the class throws of src/ are checked (${checked})`)
+  assert.deepEqual(mismatches, [])
+})
+
+test('a message with dynamic segments is marked partially checked: only its literal parts are assessed', () => {
+  const sites = refusalSites([
+    'export function probe() {',
+    "  if (a) throw new Error('[probe_code] Retry with `taskId`.')",
+    '  if (b) throw new Error(`[probe_code] ${detail} Retry with \\`taskId\\`.`)',
+    "  if (c) throw new PolicyError('check_syntax_invalid', 'validation_error', '[check_syntax_invalid] ' + checkSyntaxDetail(checks, issues) + '\\nRepair every command in the `checks` array.')",
+    "  throw new Error('[probe_code] Retry ' + 'with `taskId`.')",
+    '}',
+  ].join('\n'), 'src/probe.ts')
+  assert.deepEqual(sites.map(site => [site.expressionKind, site.partial]), [['literal', false], ['template', true], ['concat', true], ['concat', false]])
+  // The behaviour is unchanged: the text is the literal parts, so a token or verb the
+  // dynamic segment renders (the command and shell output checkSyntaxDetail quotes) is never seen.
+  assert.equal(sites[2].text, '[check_syntax_invalid]  \nRepair every command in the `checks` array.')
+  assert.deepEqual(sites[2].substitutions, ['checkSyntaxDetail(checks, issues)'])
+  // The verifier's example is one such site.
+  const [syntax] = refusalSites(read('src/runtime.ts'), 'src/runtime.ts').filter(site => site.code === 'check_syntax_invalid')
+  assert.equal(syntax.partial, true)
+  assert.ok(syntax.substitutions.some(substitution => substitution.startsWith('checkSyntaxDetail(')), syntax.expression)
+})
+
 test('the code the throw renderer prefixes is the diagnostic code itself', () => {
   const rendered = formatDiagnostic({ code: 'probe_code', location: 'task "t"', message: 'message body' })
   assert.match(rendered, /^\[probe_code\] task "t": message body$/)
@@ -183,4 +284,15 @@ test('refusals outside this branch are inventoried through the same helper and r
   // drives the deferred count to zero, and this test must stay green on the
   // assembled artifact. The count is reported for that task's inventory.
   t.diagnostic(`deferred refusal inventory: ${total} refusal sites in ${deferredSources.length} out-of-scope files, ${uncoded} not yet coded`)
+})
+
+
+test('advisory diagnostics stay visible without becoming imperative refusal rules', async () => {
+  const { index } = await inventory()
+  const diagnostic = "const note = { code: 'scope_hint', severity: 'advisory', message: 'This may be a read-only input reference.' }"
+  const [advisory] = refusalSites(diagnostic, 'src/probe.ts')
+  assert.equal(advisory.advisory, true)
+  assert.deepEqual(assess(advisory, index), [])
+  const [hard] = refusalSites(diagnostic.replace("severity: 'advisory', ", ''), 'src/probe.ts')
+  assert.ok(assess(hard, index).length > 0, 'real refusal diagnostics still require executable guidance')
 })

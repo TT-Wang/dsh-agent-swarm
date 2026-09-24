@@ -8,6 +8,7 @@
  */
 import { admissionRowId, decideAdmission, defaultLimitRules, scopeKeysOverlap, type AdmissionCandidate, type AdmissionDecision, type AdmissionRecord, type AdmissionUsage, type LimitRule } from './scheduler.ts'
 import { WriterBusyError } from './store.ts'
+import { PolicyError } from './policy-error.ts'
 import { hasNotice } from './arena.ts'
 import { missionSubject } from './notices.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -29,8 +30,12 @@ export function validatedBudget(input: Budget): Budget {
   const budget = {} as Budget
   for (const key of ['maxTokens', 'maxSteps', 'maxWorkers', 'maxDurationMs', 'maxTasks', 'maxExperiments'] as const) {
     const value = input?.[key]
-    if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new Error(`Invalid budget ${key}`)
+    if (!Number.isSafeInteger(value) || value < (key === 'maxExperiments' ? 0 : 1)) throw new PolicyError('budget_invalid', 'budget_error', `Invalid budget ${key}`)
     budget[key] = value
+  }
+  if (input.deadlineAt !== undefined) {
+    if (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 1) throw new PolicyError('budget_invalid', 'budget_error', 'Invalid budget deadlineAt')
+    budget.deadlineAt = input.deadlineAt
   }
   return budget
 }
@@ -47,6 +52,22 @@ export function unsupportedEffort(error: unknown): { requested?: string; message
   if (code !== 'UNSUPPORTED_REASONING_EFFORT' && !/does not support reasoning effort/i.test(message)) return undefined
   const requested = /reasoning effort "([^"]+)"/i.exec(message)?.[1]
   return { ...(requested === undefined ? {} : { requested }), message }
+}
+
+type WriterBusyRecovery = { at: number; attempts: number; detail: string } & (
+  { candidate: AdmissionCandidate }
+  | { missionId: string; chain: GuardChainId; context: GuardTerminalContext }
+)
+const writerRecoveries = new WeakMap<SwarmRuntime, Map<string, WriterBusyRecovery & { count: number }>>()
+
+/** Coalesce one failed origin, retaining distinct admissions and guard failures. */
+export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery): void {
+  const pending = writerRecoveries.get(rt) ?? new Map<string, WriterBusyRecovery & { count: number }>()
+  writerRecoveries.set(rt, pending)
+  const key = 'candidate' in recovery ? `admission:${recovery.candidate.missionId}:${admissionRowId(recovery.candidate, 'writer_busy')}`
+    : `guard:${JSON.stringify([recovery.missionId, recovery.chain, recovery.context.taskId, recovery.context.memberId])}`
+  const previous = pending.get(key)
+  pending.set(key, { ...recovery, at: previous?.at ?? recovery.at, count: (previous?.count ?? 0) + 1 })
 }
 
 export class RefusalRegistry {
@@ -76,7 +97,7 @@ export class RefusalRegistry {
 
   /** Budget dimensions that must refuse a new lease; undefined when the mission can admit. */
   budgetBlocked(mission: Mission): string | undefined {
-    if (Date.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
+    if (this.rt.now() >= mission.deadline) return `mission duration budget exhausted (deadline ${new Date(mission.deadline).toISOString()})`
     if (mission.usedTokens >= mission.budget.maxTokens) return `token budget exhausted (${mission.usedTokens}/${mission.budget.maxTokens})`
     if (mission.usedSteps >= mission.budget.maxSteps) return `step budget exhausted (${mission.usedSteps}/${mission.budget.maxSteps})`
     return undefined
@@ -97,7 +118,7 @@ export class RefusalRegistry {
   }
 
   admissionRecord(candidate: AdmissionCandidate, decision: AdmissionDecision, latencyMs: number): AdmissionRecord {
-    const at = Date.now()
+    const at = this.rt.now()
     return {
       id: admissionRowId(candidate, decision.reason), missionId: candidate.missionId, memberId: candidate.memberId, taskId: candidate.taskId, epoch: candidate.epoch,
       reason: decision.reason, admitted: decision.admitted, taskClass: candidate.taskClass, scope: candidate.scope,
@@ -132,7 +153,7 @@ export class RefusalRegistry {
       this.rt.commit(candidate.missionId, () => this.upsertAdmission(record))
     } catch (error) {
       if (error instanceof WriterBusyError) {
-        this.rt.writerBusy = { at: Date.now(), attempts: error.attempts, candidate, detail: error.message }
+        queueWriterBusy(this.rt, { at: this.rt.now(), attempts: error.attempts, candidate, detail: error.message })
         return
       }
       throw error
@@ -154,15 +175,33 @@ export class RefusalRegistry {
    * Flush the classified writer conflict as a durable `writer_busy` admission row
    * once the writer is free again. The flag survives while the store stays busy.
    */
-  recordWriterBusyRecovery(mission: Mission): void {
-    const busy = this.rt.writerBusy
-    if (busy === undefined) return
-    const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, Date.now() - busy.at))
-    try {
-      this.rt.commit(mission.id, () => this.upsertAdmission(record))
-      this.rt.writerBusy = undefined
-    } catch (error) {
-      if (!(error instanceof WriterBusyError)) { this.rt.writerBusy = undefined; throw error }
+  recordWriterBusyRecovery(mission?: Mission): void {
+    const pending = writerRecoveries.get(this.rt)
+    if (pending === undefined) return
+    for (const [key, busy] of pending) {
+      const missionId = 'candidate' in busy ? busy.candidate.missionId : busy.missionId
+      if (mission !== undefined && mission.id !== missionId) continue
+      try {
+        this.rt.commit(missionId, () => {
+          if ('candidate' in busy) {
+            const record = this.admissionRecord(busy.candidate, { reason: 'writer_busy', admitted: false, detail: busy.detail }, Math.max(0, this.rt.now() - busy.at))
+            record.count = busy.count; record.firstAt = busy.at
+            this.upsertAdmission(record)
+          } else {
+            // This was a failed escalation write, never an admission decision.
+            // Record the historical failure; normal guards re-evaluate today's state.
+            this.rt.store.event(missionId, 'mission/stalled', 'runtime', {
+              cause: 'guard-terminal-write-failed', chain: busy.chain,
+              taskId: busy.context.taskId ?? null, memberId: busy.context.memberId ?? null,
+              detail: busy.detail, attempts: busy.attempts, count: busy.count, firstAt: busy.at, ownerNotified: false,
+            })
+          }
+        })
+        if (pending.get(key) === busy) pending.delete(key)
+      } catch (error) {
+        if (error instanceof WriterBusyError) return
+        throw error
+      }
     }
   }
 
@@ -204,8 +243,8 @@ export class RefusalRegistry {
  * structurally impossible". A *guard chain* is the ordered set of predicates a
  * control path evaluates before it can act: budget, workspace state, the
  * attempt/lease lifecycle, per-task ceilings, review admission, dispatch
- * preconditions and admission itself (the seventh chain in the same family,
- * R12-F9). The *terminal element* is what happens when every predicate
+ * preconditions and the owner's reply to a delivered question. The *terminal
+ * element* is what happens when every predicate
  * before it answers "no": it must be an unconditional escalation that emits a
  * durable decision request naming the executable exits. It has no conditions of
  * its own — it cannot be skipped, deduplicated away into silence, or left
@@ -213,17 +252,22 @@ export class RefusalRegistry {
  * the fact that the *same* decision request is already durable for the same
  * board fingerprint.
  *
- * `guardTerminal` is the single builder of those requests, so the pure board
- * model in `src/scheduling.ts`, the dispatch path that emits them, the
- * admission guard in `src/admission.ts` and the property test in
- * `tests/guard-terminals.test.mjs` all speak one vocabulary.
+ * `guardTerminal` is the single builder of those requests, so the dispatch path
+ * that emits them, the test-side board model in `tests/guard-model.mjs` and the
+ * property test in `tests/guard-terminals.test.mjs` all speak one vocabulary.
+ * The R12-F9 dependency-assumption guard is not a chain: it refuses at the call
+ * that writes a dependency set (plan validation, propose, the owner amendment),
+ * so no task admitted by this build reaches dispatch in that state. A row whose
+ * dependencies an owner amended to [] under d81a3fb or earlier can: the restart
+ * hold that caught it is deleted, and dispatch takes it from the bare mission
+ * baseline (docs/known-limitations.md).
  * Every message carries a stable `[diagnostic_code]`, an imperative next step
  * and backticked parameters that resolve in the real tool schema — the refusal
  * lint (`tests/refusal-inventory.mjs`) is run over every one of them.
  * ------------------------------------------------------------------------- */
 
 /** The seven control-path chains whose terminal element must escalate. */
-export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'admission' | 'owner_reply'
+export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
 export interface DecisionExit {
@@ -238,13 +282,6 @@ export interface GuardTerminal {
   code: string
   message: string
   exits: DecisionExit[]
-  /**
-   * The other guard chains this terminal can co-fire with on the same board.
-   * Every severe defect of 2026-09-10 was two individually-correct rules
-   * multiplying into a trap, so the pair is named here and the pair test in
-   * `tests/guard-terminals.test.mjs` exercises at least two of them.
-   */
-  coFires: GuardChainId[]
 }
 
 /** Free text a caller knows at emission time; never a condition on the escalation. */
@@ -252,6 +289,9 @@ export interface GuardTerminalContext {
   taskId?: string
   memberId?: string
   detail?: string
+  /** A receipt or local fault identity must not churn with unrelated board work. */
+  questionId?: string
+  localKey?: string
 }
 
 const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
@@ -261,32 +301,9 @@ const GUARD_TERMINAL_CODES: Record<GuardChainId, string> = {
   task_ceiling: 'task_ceiling_terminal',
   review_admission: 'review_admission_terminal',
   dispatch_preconditions: 'dispatch_terminal',
-  // One vocabulary entry for the admission guard, which is the terminal element
-  // of the seventh chain in the same family (R12-F9): the code is authored in
-  // src/admission.ts and tests/guard-terminals.test.mjs asserts the two match.
-  admission: 'dependency_assumption_missing',
   // L2: the owner was asked a question and closed the turn in prose, so the
   // answer never reached the asker. The chain names the receipt, not the model.
   owner_reply: 'owner_reply_missing',
-}
-
-/**
- * The co-firing guards of each chain, as observed on the 2026-09-10 host: a
- * clean-tree workspace guard fired together with the review-capture guard and
- * bricked a member, and "Member has uncommitted commits" fired together with
- * the attempt-preservation guard with no exit at all.
- */
-const GUARD_TERMINAL_CO_FIRES: Record<GuardChainId, GuardChainId[]> = {
-  budget: ['dispatch_preconditions', 'workspace'],
-  workspace: ['attempt_lease', 'review_admission', 'dispatch_preconditions'],
-  attempt_lease: ['workspace', 'task_ceiling', 'dispatch_preconditions'],
-  task_ceiling: ['dispatch_preconditions', 'budget'],
-  review_admission: ['workspace', 'dispatch_preconditions'],
-  dispatch_preconditions: ['workspace', 'attempt_lease', 'task_ceiling', 'budget', 'review_admission'],
-  admission: ['workspace', 'dispatch_preconditions'],
-  // A missing owner reply co-fires with nothing: the board is untouched, and the
-  // ask's own delivery row is the witness.
-  owner_reply: [],
 }
 
 const described = (context: GuardTerminalContext, fallback: string): string => context.detail ?? fallback
@@ -301,36 +318,33 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
   const task = context.taskId ?? 'the held work'
   const member = context.memberId ?? 'the member'
   const messages: Record<GuardChainId, string> = {
-    budget: `[budget_terminal] The mission budget is exhausted or paused (${described(context, 'no lease can be admitted')}), so ${member} cannot be given work and no attempt can renew. Raise the mission ceiling with \`swarm_budget\` by passing the raised \`budget\` and a \`reason\`, or withdraw the work holding the slot with \`swarm_cancel\` by naming the \`taskId\` and a \`reason\`, then decide with \`swarm_control\` and an \`action\`.`,
-    workspace: `[workspace_terminal] The mission workspace cannot produce an artifact (${described(context, 'workspace state is unresolved')}), so ${task} would loop without an exit. Repair the member workspace, then re-propose the blocked work with \`swarm_propose\` by passing the \`objective\`, \`dependencies\` and \`replaces\`, or withdraw it with \`swarm_cancel\` by naming the \`taskId\` and a \`reason\`.`,
-    attempt_lease: `[attempt_terminal] The attempt on ${task} cannot advance (${described(context, 'the lease or the workspace guard refused it')}). Release the attempt with \`swarm_handoff\` by passing the \`attemptId\` and a \`summary\` and let the next owner resume, or withdraw the task with \`swarm_cancel\` and its \`taskId\` and then re-propose the work with \`swarm_propose\` and its \`objective\`.`,
-    task_ceiling: `[task_ceiling_terminal] ${task} exhausted its own ceiling (${described(context, 'step or finding limit')}) and cannot be dispatched again. Propose its replacement with \`swarm_propose\`: name it in \`replaces\` and pass a raised \`maxSteps\` or \`maxFindings\` inside the mission budget, keeping the acceptance criteria verbatim; or withdraw it with \`swarm_cancel\` and its \`taskId\`.`,
-    admission: `[dependency_assumption_missing] ${task} declares no dependency while its text assumes prior work is already available (${described(context, 'the worktree would be prepared from the bare mission baseline')}), so the work starts without the content it needs. Add the dependency that carries that content with \`swarm_propose\` by passing \`dependencies\`, or state in the \`objective\` how you will obtain it and retry the same task with the same acceptance criteria and budget; a repair may name the blocked task in \`replaces\` instead.`,
+    budget: `[budget_terminal] The mission budget is exhausted or paused (${described(context, 'no lease can be admitted')}), so ${member} cannot be given work and no attempt can renew. Raise the finite mission ceiling with \`swarm_budget\` using \`budget\` and \`reason\`; a sufficient extension resumes budget-paused work after stop confirmation. Explicit user pause remains until \`swarm_control\` with \`action: resume\`. Use \`swarm_cancel\` with \`taskId\` and \`reason\` to withdraw mistaken work; cancellation never resets consumed budget.`,
+    workspace: `[workspace_terminal] ${task} cannot prepare its workspace (${described(context, 'workspace state is unresolved')}). Repair the condition, then use \`swarm_control\` with \`taskId\`, \`action: resume\` and \`reason\`; or amend the same task's scope/dependencies/assignee with \`action: amend\` and \`changes\`.`,
+    attempt_lease: `[attempt_terminal] ${task} cannot advance (${described(context, 'the lease or workspace guard refused it')}). The owner can use \`swarm_control\` with \`taskId\`, \`action: amend\`, \`changes.assigneeId\` and \`reason\` to fence and reassign it, or \`action: resume\` after repair. No member attemptId is required.`,
+    task_ceiling: context.taskId === undefined ? `[task_ceiling_terminal] Mission admission reached its allocation (${described(context, 'admission budget')}). Review the need and use \`swarm_budget\` with a finite raised \`budget\` and \`reason\`, then retry the original admission.` : `[task_ceiling_terminal] ${task} reached its execution estimate (${described(context, 'step limit')}). Review progress, then raise its finite allocation with \`swarm_budget\` using \`taskId\`, \`taskBudget\` and \`reason\`. Raise the mission budget first if needed. Preserve this task, its consumption, dependencies and evidence; no replacement is needed.`,
     review_admission: `[review_admission_terminal] Submitted work ${task} has no live independent review path, so no verdict can ever land. Admit a review with \`swarm_propose\` by passing \`kind\`, \`reviewOf\`, \`scope\` and \`acceptance\`, or withdraw the source with \`swarm_cancel\` and its \`taskId\`.`,
     owner_reply: `[owner_reply_missing] An owner-facing question was delivered and the owner's turn ended without binding an answer to it (${described(context, 'the receipt is still open')}). Answer it with \`swarm_message\` by passing \`to\`, \`kind: 'question'\`, the answer in \`content\` and the asked question's id in \`replyTo\`, or close it deliberately with \`dismiss: true\` and a \`replyTo\`; prose in the conversation is never delivered to the asker.`,
-    dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`, free a slot or raise a limit with \`swarm_budget\` and its \`budget\`, repair the work with \`swarm_propose\` and its \`replaces\`, withdraw the stuck work with \`swarm_cancel\` and its \`taskId\`, or decide with \`swarm_control\` and its \`action\`.`,
+    dispatch_preconditions: `[dispatch_terminal] No executable action remains (${described(context, 'no task is ready for a live member and no attempt is in flight')}). Inspect the blocker with \`swarm_observe\` and its \`taskId\`. Extend resource allocations with \`swarm_budget\`; amend an unsubmitted task, or resume it with \`swarm_control\` and its \`taskId\` after environment repair, which reworks a rejected task in place. Only when resume cannot rework it, propose a repair with \`swarm_propose\` and \`replaces\`; the repair inherits its acceptance. Withdraw mistaken work with \`swarm_cancel\`, or decide to complete or stop with \`swarm_control\` and its \`action\`.`,
   }
   const exits: Record<GuardChainId, DecisionExit[]> = {
     budget: [
       { tool: 'swarm_budget', parameter: 'budget', instruction: 'raise the mission ceiling with a reason' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the work holding the slot' },
-      { tool: 'swarm_control', parameter: 'action', instruction: 'resume, complete or stop the mission' },
+      { tool: 'swarm_control', parameter: 'action', instruction: 'resume an explicit user pause, or complete or stop the mission' },
     ],
     workspace: [
-      { tool: 'swarm_propose', parameter: 'dependencies', instruction: 're-propose the work with the dependency that carries missing content' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'resume or amend the same task after workspace repair' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the work the workspace cannot produce' },
     ],
     attempt_lease: [
-      { tool: 'swarm_handoff', parameter: 'attemptId', instruction: 'release the attempt to another owner' },
-      { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the task and re-propose it' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend assignee or resume the same task after repair' },
+      { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw mistaken work' },
     ],
-    task_ceiling: [
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'propose the replacement with a raised ceiling' },
+    task_ceiling: context.taskId === undefined ? [
+      { tool: 'swarm_budget', parameter: 'budget', instruction: 'raise the finite mission admission allocation, then retry admission' },
+    ] : [
+      { tool: 'swarm_budget', parameter: 'taskBudget', instruction: 'raise the finite allocation of this taskId' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the exhausted task' },
-    ],
-    admission: [
-      { tool: 'swarm_propose', parameter: 'dependencies', instruction: 'add the dependency that carries the assumed content' },
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair the task that carried the content, or state in the objective how it will be obtained' },
     ],
     review_admission: [
       { tool: 'swarm_propose', parameter: 'reviewOf', instruction: 'admit an independent verification task' },
@@ -342,12 +356,14 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
     ],
     dispatch_preconditions: [
       { tool: 'swarm_observe', parameter: 'taskId', instruction: 'read the exact blocker before deciding' },
-      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair or extend the board' },
+      { tool: 'swarm_budget', parameter: 'budget', instruction: 'extend the required allocation; use taskId and taskBudget for task allocations' },
+      { tool: 'swarm_control', parameter: 'taskId', instruction: 'amend unsubmitted policy, or resume the same task after environment repair or to rework a rejected task in place' },
+      { tool: 'swarm_propose', parameter: 'replaces', instruction: 'repair rejected work that resume cannot rework, preserving its acceptance' },
       { tool: 'swarm_cancel', parameter: 'taskId', instruction: 'withdraw the stuck work' },
       { tool: 'swarm_control', parameter: 'action', instruction: 'complete or stop the mission' },
     ],
   }
-  return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain], coFires: [...GUARD_TERMINAL_CO_FIRES[chain]] }
+  return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain] }
 }
 
 /** The durable dedup key of one terminal decision request: one per chain and board state. */
@@ -386,7 +402,7 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   // the executable exit most — still emits the terminal.
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
-  const fingerprint = rt.fingerprint(missionId)
+  const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
   const key = guardTerminalKey(chain, terminal.code, fingerprint)
   if (hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return terminal
   try {
@@ -397,21 +413,21 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
       rt.store.event(missionId, 'mission/stalled', 'runtime', {
         cause: 'guard-terminal', chain: terminal.chain, code: terminal.code,
         taskId: context.taskId ?? null, memberId: context.memberId ?? null, detail: context.detail ?? null,
-        coFires: terminal.coFires, fingerprint, ownerNotified: true,
+        fingerprint, ownerNotified: true,
       })
       // R15-A1: the guard chain names the subject it terminated for: the task it
       // was asked about, else the member's own unfinished work, else the mission
       // root. Guard pair: guard-terminal x writer-busy, x the board-level witness
       // (both are recorded for the same fingerprint; the subject is what tells the
       // two apart without reparsing prose).
-      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key })
+      rt.notify(missionId, terminal.message, rt.noticeSubjectsFor(missionId, { taskId: context.taskId, memberId: context.memberId }), { dedupe: true, dedupKey: key, questionId: context.questionId })
     })
   } catch (error) {
     // A busy writer must not turn an escalation into an unhandled rejection.
     // The state is re-derived on the next pass, and the board-level witness path
     // still speaks for a stalled board, so no silence follows.
     if (error instanceof WriterBusyError) {
-      rt.writerBusy = { at: Date.now(), attempts: error.attempts, candidate: { missionId, memberId: 'runtime', taskId: context.taskId ?? 'unknown', taskClass: 'research', scope: '**', epoch: 0 }, detail: error.message }
+      queueWriterBusy(rt, { at: rt.now(), attempts: error.attempts, missionId, chain, context, detail: error.message })
       return terminal
     }
     throw error

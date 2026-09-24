@@ -8,46 +8,23 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { AdmissionRefusedError, decideAdmission, defaultLimitRules, effectiveLimit, scopeKeysOverlap } from '../lib/scheduler.js'
 import { SwarmStore } from '../lib/store.js'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 32, maxExperiments: 0 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 32 }
 const owner = { sessionId: 'd8-owner' }
 const actorFor = member => ({ sessionId: member.sessionId })
 
-class InertWorkers {
-  callbacks; prepared = []; stopped = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return `/inert/${memberId}` }
-  async start() {}
-  async deliver() {}
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(task.id) }
-  async captureArtifact() { return { commit: 'inert', baseCommit: 'inert', workspace: '/inert', changes: [] } }
-  async verifyArtifact() { return [] }
-  async dispose() {}
-}
-
-async function eventually(read, message, timeoutMs = 4000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-
 async function fixture(t, options = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'swarm-d8-admission-'))
-  const workers = new InertWorkers()
-  const config = { statePath: join(root, 'state.sqlite'), leaseMs: 60000, tickMs: options.tickMs ?? 3600000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100 }
-  const runtime = new SwarmRuntime(config, workers, options.storeOptions ?? {})
+  const workers = new FakeWorkers({ artifact: { commit: 'inert', baseCommit: 'inert', workspace: '/inert', changes: [] }, checks: [],
+    async prepareWorkspace(mission, memberId) { return `/inert/${memberId}` } })
+  const config = { tickMs: options.tickMs ?? 3600000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined }
+  const { dir: root, runtime, config: settings } = await makeRuntime(t, { workers, config, storeOptions: options.storeOptions })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
-  return { root, runtime, workers, config }
+  return { root, runtime, workers, config: settings }
 }
 
 async function mission(runtime, overrides = {}) {
@@ -60,7 +37,7 @@ async function addWorker(runtime, m, name) {
 
 function propose(runtime, m, stream, member, scope) {
   return runtime.propose(owner, m.id, {
-    workstreamId: stream.id, title: `task ${scope}`, objective: `do ${scope}`, kind: 'implementation', scope: [scope],
+    outputs: [], workstreamId: stream.id, title: `task ${scope}`, objective: `do ${scope}`, kind: 'implementation', scope: [scope],
     acceptance: ['done'], checks: ['node -e "process.exit(0)"'], assigneeId: member.id,
   })
 }
@@ -143,8 +120,8 @@ test('budget exhaustion records durable budget_exceeded rows for waiting tasks',
   const stream = runtime.workstream(owner, m.id, { title: 'w', objective: 'o' })
   const alice = await addWorker(runtime, m, 'alice')
   const task = propose(runtime, m, stream, alice, 'src/a/')
-  runtime.updateBudget(owner, m.id, { ...budget, maxDurationMs: Date.now() - m.createdAt + 40 }, 'load-test squeeze')
-  await eventually(() => runtime.admissionLedger(owner, m.id, { reason: 'budget_exceeded' }).length > 0, 'budget refusal was not recorded')
+  runtime.updateBudget(owner, m.id, { ...budget, deadlineAt: Date.now() + 40 }, 'explicit wall-clock deadline')
+  await eventually(() => runtime.admissionLedger(owner, m.id, { reason: 'budget_exceeded' }).length > 0, 'budget refusal was not recorded', 4000)
   const rows = runtime.admissionLedger(owner, m.id, { reason: 'budget_exceeded' })
   assert.ok(rows.some(row => row.taskId === task.id && /maxDurationMs/.test(row.detail)))
   assert.equal(rows[0].admitted, false)
@@ -180,12 +157,12 @@ test('recordAdmission merges counts in place for a repeated decision identity', 
 })
 
 test('a classified writer conflict becomes a durable writer_busy row before the retried admission', async t => {
-  const { runtime, root } = await fixture(t, { storeOptions: { busyTimeoutMs: 1, writerAttempts: 2, writerDelayMs: 1 } })
+  const { runtime, config } = await fixture(t, { storeOptions: { busyTimeoutMs: 1, writerAttempts: 2, writerDelayMs: 1 } })
   const m = await mission(runtime)
   const stream = runtime.workstream(owner, m.id, { title: 'w', objective: 'o' })
   const alice = await addWorker(runtime, m, 'alice')
   const task = propose(runtime, m, stream, alice, 'src/a/')
-  const blocker = new DatabaseSync(join(root, 'state.sqlite'))
+  const blocker = new DatabaseSync(config.statePath)
   blocker.exec('PRAGMA busy_timeout=0; BEGIN IMMEDIATE')
   try {
     await assert.rejects(runtime.claim(actorFor(alice), m.id, task.id), error => error instanceof AdmissionRefusedError && error.reason === 'writer_busy')

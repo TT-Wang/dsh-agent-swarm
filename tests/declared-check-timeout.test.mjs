@@ -3,14 +3,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { rm, writeFile } from 'node:fs/promises'
-import { makeRepo, setup, Workspaces, WorkspaceWorkers, MISSION_ACCEPTANCE } from './faults/harness.mjs'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeRepo, setup, WorkspaceWorkers, MISSION_ACCEPTANCE, makeWorkspaces } from './faults/harness.mjs'
 
 async function fixture(t, checks, options = {}) {
   const repo = await makeRepo('check-timeout')
-  const workspaces = new Workspaces({
-    subprocess: subprocessSeam, workspacesRoot: join(repo.root, 'worktrees'),
-    checkTimeoutMs: 500, maxCheckOutputBytes: 32000, confineCheck: argv => argv,
+  const workspaces = makeWorkspaces(repo.root, {
+    checkTimeoutMs: 500,
     // A fixture-owned marker injects a deadline on only the first pass when requested.
     checkEnv: { SWARM_TEST_MARKER: join(repo.root, 'first-pass') }, ...options,
   })
@@ -22,7 +20,7 @@ async function fixture(t, checks, options = {}) {
   await writeFile(join(f.author.workspace, 'src/answer.txt'), 'candidate\n')
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
+    outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -34,7 +32,7 @@ async function fixture(t, checks, options = {}) {
   }
 }
 
-for (const recovers of [false, true]) test(`real check deadline ${recovers ? 'recovers on retry' : 'blocks after retry'} with both passes durable`, async t => {
+for (const recovers of [false, true]) test(`real check deadline ${recovers ? 'recovers on retry' : 'defers same-artifact verification after retry'} with both passes durable`, async t => {
   const slow = 'printf "before-timeout\\nnot ok 1 - slow check\\n%02000d\\n" 0; sleep 60'
   const deadline = recovers
     ? `if test -f "$SWARM_TEST_MARKER"; then echo recovered; else : > "$SWARM_TEST_MARKER"; ${slow}; fi`
@@ -44,7 +42,8 @@ for (const recovers of [false, true]) test(`real check deadline ${recovers ? 're
   assert.equal(f.workers.verified.length, 2, 'a real timeout retries the same immutable artifact once')
   assert.equal(new Set(f.workers.verified.map(run => run.commit)).size, 1)
   assert.equal(verdict.status, recovers ? 'accepted' : 'blocked')
-  assert.equal(f.runtime.store.get('tasks', f.source.id).status, verdict.status)
+  assert.equal(f.runtime.store.get('tasks', f.source.id).status, recovers ? 'accepted' : 'submitted')
+  if (!recovers) assert.equal(verdict.verificationRecovery.commit, f.runtime.store.get('tasks', f.source.id).artifact.commit)
   const runs = f.runs()
   assert.deepEqual(runs.map(run => run.arguments.attempt), [1, 1, 2, 2])
   assert.deepEqual(runs.map(run => run.result.exitCode), [0, 124, 0, recovers ? 0 : 124])

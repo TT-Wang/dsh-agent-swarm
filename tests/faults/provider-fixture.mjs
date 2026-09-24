@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import { mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { bootFaultHarness, importHarness, resolveHarnessRoot, FAULT_OWNER } from './loader.mjs'
+import { toolResultBlocks } from '../fixtures/built-harness.mjs'
 import { makeRepo, eventually, events, budget as defaultBudget, runScenario } from './harness.mjs'
 import { requests, faults, setScript } from './scripted-provider.mjs'
 
@@ -52,7 +53,7 @@ export async function providerFixture({ leaseMs = 60_000, fault }) {
     if (session.header.id !== author.sessionId) return
     if (event.type === 'tool/call') sessionEvents.push({ type: 'call', name: event.data.name, arguments: event.data.arguments })
     if (event.type === 'tool/result') {
-      const results = (event.data.message?.content ?? []).filter(block => block.type === 'tool-result')
+      const results = event.data.message === undefined ? [] : toolResultBlocks([event.data.message])
       sessionEvents.push({
         type: 'result', isError: results.some(block => block.isError),
         text: results.flatMap(block => (block.content ?? []).filter(part => part.type === 'text').map(part => part.text)).join('\n'),
@@ -60,8 +61,8 @@ export async function providerFixture({ leaseMs = 60_000, fault }) {
     }
   })
   const task = runtime.propose(FAULT_OWNER, mission.id, {
-    workstreamId: stream.id, title: 'Provider fault target', objective: 'Carry the injected provider fault',
-    kind: 'implementation', scope: ['**'], acceptance: ['provider fault recovery holds'], checks: ['true'], assigneeId: author.id,
+    outputs: [], workstreamId: stream.id, title: 'Provider fault target', objective: 'Carry the injected provider fault',
+    kind: 'implementation', scope: ['**'], acceptance: ['provider fault recovery holds'], checks: ['test -s src/answer.txt'], assigneeId: author.id,
   })
   state.taskId = task.id
   const claimed = await eventually(() => {

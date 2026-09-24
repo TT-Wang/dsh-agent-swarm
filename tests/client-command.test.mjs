@@ -53,7 +53,12 @@ async function commandBench(t, start = async () => ({ kind: 'success', text: 'æ­
   }
   ctx.provide('locale', { bind: () => text => text })
   ctx.provide('inputTriggers', { registerSource(source) { sources.set(source.name, source); return () => sources.delete(source.name) } })
-  ctx.provide('sessions', { subagentAddress: () => undefined, list: { getSnapshot: () => ({ current }) } })
+  // 0.1.7's command catalog reads through a retained, open session binding; 0.1.5 ignores these two.
+  const binding = { session: { getSnapshot: () => ({ openState: 'open' }) } }
+  ctx.provide('sessions', {
+    subagentAddress: () => undefined, list: { getSnapshot: () => ({ current }) },
+    binding: () => binding, using: async (_sessionId, _retain, use) => await use({ binding }),
+  })
   ctx.provide('remote', { commands, $on() { return () => {} } })
   ctx.provide('remote.commands', commands)
   const slots = ctx.plugin(SlotRegistry)

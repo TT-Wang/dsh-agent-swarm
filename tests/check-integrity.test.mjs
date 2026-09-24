@@ -18,33 +18,20 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { chmod, lstat, mkdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
 import { validatePlan } from '../lib/plans.js'
-import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, budget as sharedBudget, git, makeRepo, makeRuntime, makeWorkspaces } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 200, maxTasks: 20 }
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
-const git = async (cwd, ...args) => {
-  const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
-  assert.equal(result.exitCode, 0, result.output)
-  return result.output.trim()
-}
 
 /** A Python-shaped source project whose toolchain lives in a gitignored `.venv`. */
 async function pythonFixture(t, options = {}) {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), 'swarm-check-python-')))
-  const source = path.join(temp, 'source')
-  await mkdir(path.join(source, 'tests'), { recursive: true })
-  await git(source, 'init', '-b', 'main')
-  await writeFile(path.join(source, '.gitignore'), '.venv/\nvenv/\nvendor/\n.tox/\n__pycache__/\n')
-  await writeFile(path.join(source, 'tests', 'test_answer.py'), 'def test_answer():\n    assert 42 == 42\n')
-  await git(source, 'add', '.')
-  await git(source, 'commit', '-m', 'initial')
+  const { root: temp, source } = await makeRepo('swarm-check-python', {
+    '.gitignore': '.venv/\nvenv/\nvendor/\n.tox/\n__pycache__/\n',
+    'tests/test_answer.py': 'def test_answer():\n    assert 42 == 42\n',
+  })
   // The interpreter is a deterministic stand-in: it records the directory it
   // ran in and asserts the `-m pytest` argv, so the test proves that the
   // gitignored toolchain directory was materialised and invoked from the clean
@@ -59,8 +46,7 @@ async function pythonFixture(t, options = {}) {
   await writeFile(path.join(source, '.tox', 'py', 'bin', 'python'), '#!/bin/sh\necho "tox-python"\n')
   await chmod(path.join(source, '.tox', 'py', 'bin', 'python'), 0o755)
   const seen = []
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000,
-    confineCheck: (argv, cwd) => { seen.push(cwd); return argv }, ...options })
+  const workspaces = makeWorkspaces(temp, { confineCheck: (argv, cwd) => { seen.push(cwd); return argv }, ...options })
   const mission = { id: 'mission-one', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Fix the answer', kind: 'implementation', scope: ['src/'], checks: [], status: 'running' }
@@ -104,8 +90,10 @@ function plan(workspace, overrides = {}) {
 }
 
 test('admission refuses a declared check that names a host-absolute path outside the system allowlist', async t => {
-  const directory = await mkdtemp(path.join(tmpdir(), 'swarm-check-paths-'))
-  t.after(async () => { await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, id) { return path.join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, checkTimeoutMs: undefined },
+  })
   const benchmark = `/Users/tongtao/code/memem-publish/.venv/bin/python -m pytest -q || /Users/tongtao/.local/bin/uv run pytest -q`
   const reject = checks => {
     const input = plan('/workspace')
@@ -188,18 +176,10 @@ test('admission refuses a declared check that names a host-absolute path outside
   }
 
   // The runtime.propose admission point applies the same rule.
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(mission, id) { return path.join(mission.workspace, id) },
-    async start() {}, async prepareTask() {}, async deliver() {}, async stop() {},
-    isIdle() { return false }, async dispose() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: path.join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose() })
   const owner = { sessionId: 'check-integrity-owner' }
   const mission = runtime.create(owner, { title: 'Checks', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const propose = extra => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
+  const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], ...extra })
   assert.throws(() => propose({ checks: [benchmark] }), /\[check_absolute_path\]/)
   assert.throws(() => propose({ checks: [`${path.join(directory, '.venv', 'bin', 'python')} -m pytest`] }), /\[check_absolute_path\]/)

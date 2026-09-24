@@ -5,8 +5,8 @@
  * element escalates unconditionally, so a dead end is structurally impossible.
  * The chain is the ordered set of predicates a control path evaluates before it
  * can act — budget, workspace state, the attempt/lease lifecycle, per-task
- * ceilings, review admission, dispatch preconditions and (the seventh chain in
- * the same family) admission itself. When every earlier element answers "no",
+ * ceilings, review admission and dispatch preconditions (the owner-reply receipt
+ * chain is tests/owner-reply.test.mjs's). When every earlier element answers "no",
  * `terminalEscalation` names the chain and `guardTerminal` renders the coded
  * decision request that `Scheduling.escalateGuardTerminal` records durably.
  *
@@ -28,43 +28,41 @@
  *     generator does NOT reach are stated in `generatorLimits` below rather than
  *     implied away.
  *
- *  2. Every guard this round adds or alters names the other guards it can
- *     co-fire with (`coFires`), and the pair tests exercise the two real pairs
- *     of 2026-09-10: a workspace guard firing together with the review-capture
- *     guard (bricked a member, cost two missions extra members and budget), and
- *     "Member has uncommitted commits" firing during an attempt close-out with
- *     no exit at all.
+ *  2. The pair tests exercise the two real guard pairs of 2026-09-10: a workspace
+ *     guard firing together with the review-capture guard (bricked a member, cost
+ *     two missions extra members and budget), and "Member has uncommitted commits"
+ *     firing during an attempt close-out with no exit at all. Each pair is proven
+ *     by the board the two guards really produce and by the terminal that board
+ *     classifies to, not by a hand-written table of which guards pair up.
  *
  *  3. R12-F9: a task proposed with an empty dependency set while its objective
  *     or a `replaces` reference names existing artifact content is refused with
  *     a coded diagnostic and an executable exit, reproduced from the two real
  *     precedents (`T3b`: "resume from your own artifact `09883f3`"; `INT2`: the
  *     assembly was already in its worktree), while a legitimately self-contained
- *     task with no dependencies is not refused.
+ *     task with no dependencies is not refused. The guard refuses where a
+ *     dependency set is written (plan validation, propose, the owner's
+ *     dependency amendment); it is not a dispatch-time chain.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { guardActions, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from '../lib/scheduling.js'
+import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
 import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
-import { refusalSites, assessRefusal, toolSchemaIndex } from './refusal-inventory.mjs'
-import { setup, eventually, events } from './faults/harness.mjs'
+import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
+import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
 /**
  * Run one message through the *real* refusal lint: the production message text
- * is embedded in a throw fixture and assessed against the schema the production
- * registration path installs, so a terminal that names a tool or parameter the
- * model cannot call fails here.
+ * is assessed as rendered against the schema the production registration path
+ * installs, so a terminal that names a tool or parameter the model cannot call
+ * fails here.
  */
 const schemaIndex = await toolSchemaIndex()
-function lintRefusal(message) {
-  const sites = refusalSites(`export function probe() {\n  throw new Error(${JSON.stringify(message)})\n}\n`, 'src/probe.ts')
-  assert.equal(sites.length, 1, 'the lint fixture has exactly one refusal site')
-  return assessRefusal(sites[0], { ...schemaIndex, diagnosticProducers: new Set() })
-}
+const lintRefusal = message => assessText(message, schemaIndex)
 
 /* ------------------------------------------------------------------------- *
  * 1. The property test over generated board states.
@@ -122,8 +120,6 @@ test('R14 property: every reachable non-terminal board state has an executable a
       const chain = guardTerminalChain(board)
       if (terminal.chain !== chain) failures.push(`terminal chain ${terminal.chain} != classified ${chain} for ${keyOf(board)}`)
       if (terminal.kind !== 'escalate') failures.push(`terminal is not an escalation for ${keyOf(board)}`)
-      if (terminal.coFires.length === 0) failures.push(`terminal ${terminal.chain} names no co-firing guard for ${keyOf(board)}`)
-      if (terminal.coFires.some(peer => !CHAINS.includes(peer))) failures.push(`terminal ${terminal.chain} names an unknown co-firing guard`)
       const violations = lintRefusal(terminal.message)
       if (violations.length > 0) failures.push(`terminal ${terminal.chain} does not resolve through the refusal lint: ${violations.join('; ')}`)
       terminalsSeen.add(terminal.chain)
@@ -164,12 +160,10 @@ test('R14 pair: the workspace guard and the review-capture guard co-fire and the
   assert.deepEqual(guardProgressActions(board), [],
     'the attempt is live, but its workspace chain cannot let it land: the pair is what makes it a trap, not liveness')
   const terminal = terminalEscalation(board)
-  assert.equal(terminal.chain, 'workspace')
-  assert.ok(terminal.coFires.includes('review_admission'), 'the pair names the review-admission guard it co-fires with')
-  assert.ok(terminal.coFires.includes('attempt_lease'), 'the pair names the attempt/lease guard it co-fires with')
+  assert.equal(terminal.chain, 'workspace', 'the workspace guard is the first chain that cannot progress on the pair board')
   assert.deepEqual(lintRefusal(terminal.message), [])
-  assert.match(terminal.message, /swarm_propose/)
-  assert.match(terminal.message, /swarm_cancel/)
+  assert.match(terminal.message, /swarm_control/)
+  assert.match(terminal.message, /taskId/)
 })
 
 test('R14 pair: the workspace guard and "Member has uncommitted commits" co-fire with no exit before this round', () => {
@@ -184,30 +178,23 @@ test('R14 pair: the workspace guard and "Member has uncommitted commits" co-fire
   }
   const terminal = terminalEscalation(board)
   assert.equal(terminal.chain, 'workspace', 'the workspace state is the first chain that cannot progress')
-  assert.ok(terminal.coFires.includes('attempt_lease'))
   assert.deepEqual(lintRefusal(terminal.message), [])
   // With the workspace repaired, the same blocked task is the attempt chain's dead
   // end, and that terminal names its own exits (release the attempt, withdraw it).
   const repaired = { ...board, mission: { status: 'active', workspace: 'authorized' } }
   const attempt = terminalEscalation(repaired)
   assert.equal(attempt.chain, 'dispatch_preconditions', 'a blocked task with no dispatchable work falls through to the dispatch terminal')
-  assert.ok(attempt.coFires.includes('workspace'), 'the dispatch terminal names the workspace guard it co-fires with')
   assert.deepEqual(lintRefusal(attempt.message), [])
 })
 
-test('R14: each chain terminal is total, coded and names the guards it can co-fire with', () => {
+test('R14: each chain terminal is total and coded', () => {
   for (const chain of CHAINS) {
     const terminal = guardTerminal(chain)
     assert.equal(terminal.chain, chain)
     assert.ok(terminal.code.length > 0, `${chain} carries a stable code`)
     assert.ok(terminal.exits.length > 0, `${chain} names at least one executable exit`)
-    assert.ok(terminal.coFires.length > 0, `${chain} names the guards it can co-fire with`)
-    assert.ok(terminal.coFires.every(peer => CHAINS.includes(peer)), `${chain} co-fires only with known chains`)
-    assert.ok(!terminal.coFires.includes(chain), `${chain} does not name itself as a co-firing guard`)
     assert.deepEqual(lintRefusal(terminal.message), [], `${chain} must resolve through the refusal lint`)
   }
-  assert.equal(guardTerminal('admission').code, DEPENDENCY_ASSUMPTION_CODE,
-    'the admission chain code and the admission diagnostic code are one vocabulary')
 })
 
 test('R14: the terminal classification names the first chain that cannot progress', () => {
@@ -216,7 +203,6 @@ test('R14: the terminal classification names the first chain that cannot progres
     [{ mission: { status: 'active', workspace: 'revoked' }, tasks: [{ id: 't', status: 'pending' }], members: [{ id: 'm', status: 'idle' }] }, 'workspace'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'running', attempt: { leaseLive: false } }], members: [{ id: 'm', status: 'idle' }] }, 'attempt_lease'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', ceilingExhausted: true }], members: [{ id: 'm', status: 'idle' }] }, 'task_ceiling'],
-    [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', assumedContent: true }], members: [{ id: 'm', status: 'idle' }] }, 'admission'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'submitted', reviewSourceLive: false }], members: [{ id: 'm', status: 'idle' }] }, 'review_admission'],
     [{ mission: { status: 'active', workspace: 'authorized' }, tasks: [{ id: 't', status: 'pending', dependenciesDead: true }], members: [{ id: 'm', status: 'idle' }] }, 'dispatch_preconditions'],
   ]
@@ -231,39 +217,30 @@ test('R14: the terminal classification names the first chain that cannot progres
  * 3. The runtime-level pairs: the terminal is durable, contained and deduped.
  * ------------------------------------------------------------------------- */
 
-test('R14 runtime pair (dirty workspace x preparation): an exhausted preparation chain escalates with a coded decision request', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+test('R17 runtime pair (dirty workspace x preparation): deterministic failure preserves work and requests same-task owner recovery', async () => {
+  const f = await setup()
   try {
     f.workers.autoIdle = true
-    // The exact field condition: preparation meets a workspace guard and throws.
-    f.workers.prepareTask = async () => { throw new Error('workspace_uncommitted: the member workspace has uncommitted changes') }
+    let calls = 0
+    f.workers.prepareTask = async () => { calls++; throw new Error('workspace_uncommitted: the member workspace has uncommitted changes') }
     const task = f.propose({ title: 'Prepare under a dirty workspace', maxRecoveryAttempts: 1 })
     const blocked = await eventually(() => {
       const row = f.runtime.store.get('tasks', task.id)
       return row.status === 'blocked' ? row : undefined
-    }, 'the task must exhaust its preparation recovery limit', 8_000)
+    }, 'the task must wait for preparation repair', 8_000)
     assert.match(blocked.output, /Workspace or worker preparation failed/)
-    const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
-      .filter(item => item.data.cause === 'guard-terminal').at(-1), 'the terminal escalation must be durable', 8_000)
-    assert.equal(event.data.chain, 'dispatch_preconditions')
-    assert.equal(event.data.code, 'dispatch_terminal')
-    assert.ok(event.data.coFires.includes('workspace'), 'the terminal names the workspace guard it co-fired with')
-    assert.equal(event.data.ownerNotified, true)
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dispatch_terminal\]/.test(delivery.content)),
-      'the owner must receive the coded decision request', 8_000)
-    assert.match(notice.content, /swarm_propose/)
-    assert.match(notice.content, /swarm_cancel/)
-    assert.deepEqual(lintRefusal(notice.content), [], 'the delivered message resolves through the refusal lint')
-    // One durable decision request per unchanged board: the repeat is the same
-    // request, never a second differently-worded one.
+    assert.equal(blocked.preparationFailure.transient, false)
+    assert.equal(blocked.recoveryCount ?? 0, 0)
+    const notice = await eventually(() => f.workers.deliveries.find(delivery => delivery.memberId === 'owner'
+      && delivery.content.includes(task.id) && /swarm_control/.test(delivery.content)), 'owner gets executable same-task recovery', 8_000)
+    assert.match(notice.content, /resume/)
     await sleep(80)
-    assert.equal(f.workers.deliveries.filter(delivery => /\[dispatch_terminal\]/.test(delivery.content)).length, 1)
+    assert.equal(calls, 1, 'unchanged workspace failure is never retried each tick')
   } finally { await f.cleanup() }
 })
 
 test('R14 runtime pair (attempt close-out x "Member has uncommitted commits"): the throw is contained and escalated', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     const held = f.propose({ title: 'Held work', assigneeId: f.author.id })
@@ -278,7 +255,6 @@ test('R14 runtime pair (attempt close-out x "Member has uncommitted commits"): t
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'attempt_lease').at(-1),
       'the thrown guard must be escalated, not swallowed', 8_000)
     assert.equal(event.data.code, 'attempt_terminal')
-    assert.ok(event.data.coFires.includes('workspace'))
     // Containment: one member's dead end never aborts the sweep for the others.
     await eventually(() => f.runtime.store.get('tasks', other.id).status === 'running' ? true : undefined,
       'the sweep must continue past the throw and dispatch another member', 8_000)
@@ -305,7 +281,7 @@ test('R12-F9: the admissibility guard fires on the two real precedents', () => {
   const t3b = reconcileTaskAdmission({
     objective: 'Resume from your own artifact `09883f3` and finish the guard chain.',
     scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
-  }, '/workspace', 'task')
+  }, 'task')
   assert.equal(t3b.length, 1, 'the T3b precedent must be refused')
   assert.equal(t3b[0].code, DEPENDENCY_ASSUMPTION_CODE)
   assert.ok(t3b[0].message.includes('09883f3'), 'the diagnostic names the artifact it objects to')
@@ -333,7 +309,7 @@ test('R12-F9: a legitimately self-contained task is not refused, and a declared 
   const selfContained = reconcileTaskAdmission({
     objective: 'Implement the guard in src/admission.ts and cover it in tests/guard-terminals.test.mjs.',
     scope: SCOPE, acceptance: ACCEPTANCE, dependencies: [], replaces: [],
-  }, '/workspace', 'task')
+  }, 'task')
   assert.deepEqual(selfContained, [], 'a self-contained task with no dependencies is admitted')
 
   // A factual sentence about the baseline is not a claim about prepared content.
@@ -368,32 +344,51 @@ test('R12-F9: the diagnostic distinguishes "add the dependency" from "state how 
   assert.match(known[0].message, /exists in this mission/)
   const unknown = dependencyAssumptions(task, 'task', { knownContents: new Set() })
   assert.equal(unknown.length, 1)
-  assert.match(unknown[0].message, /not in the mission baseline/)
-  for (const diagnostic of [...known, ...unknown]) {
+  assert.match(unknown[0].message, /not a task id of this mission/)
+  // A hex commit may be an ancestor of the mission baseline: the guard checks
+  // only the mission's task ids, so the text must not assert the commit's
+  // absence from the baseline, which nothing verified.
+  const hex = dependencyAssumptions({ objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [] }, 'task', { knownContents: new Set(['task_source']) })
+  assert.equal(hex.length, 1)
+  assert.equal(hex[0].path, '09883f3')
+  assert.doesNotMatch(hex[0].message, /not in the mission baseline|worktree will not contain it/, 'no unverified provenance claim')
+  assert.match(hex[0].message, /whether the mission baseline or a task artifact already contains it was not checked/)
+  for (const diagnostic of [...known, ...unknown, ...hex]) {
     assert.deepEqual(lintRefusal(`[${diagnostic.code}] ${diagnostic.location}: ${diagnostic.message}`), [])
   }
 })
 
-test('R12-F9: the dispatch path is a backstop — a row admitted before the guard is refused before preparation', async () => {
-  // Admission now refuses this text at propose() (S4r-D3). The dispatch check
-  // remains as defence in depth for a row that reached the store another way
-  // (admitted before the guard existed, or written by an older process), so the
-  // member is never prepared from the bare baseline.
-  const f = await setup({ config: { tickMs: 10 } })
+test('R12-F9: an owner amendment that strips the content-carrying edge is refused at the call and leaves the row unchanged', async () => {
+  // The one live path that bypasses admission: propose() admitted this task
+  // because its dependency carries the artifact its objective resumes from, and
+  // `swarm_control` `changes.dependencies` could replace that list with [].
+  const f = await setup({ config: { tickMs: 10_000 } })
   try {
-    f.workers.autoIdle = true
-    const task = injectLegacyTask(f, { id: 'task_legacy_assumed', title: 'Legacy assumed work', objective: 'Resume from your own artifact `09883f3` and finish the guard.', createdAt: 1 })
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dependency_assumption_missing\]/.test(delivery.content)),
-      'the admission decision request must reach the owner', 8_000)
-    assert.deepEqual(lintRefusal(notice.content), [])
-    assert.equal(f.workers.prepared.filter(item => item.taskId === task.id).length, 0, 'no preparation ran on the bare baseline')
-    assert.equal(f.runtime.store.get('tasks', task.id).status, 'pending', 'the task stays admitted and repairable, never dispatched')
+    const source = f.propose({ title: 'Source work', objective: 'Implement the scoped change in src/answer.txt.' })
+    const resumed = f.propose({ title: 'Resume prior work', objective: 'Resume from your own artifact `09883f3` and finish the guard.', dependencies: [source.id] })
+    const before = structuredClone(f.runtime.store.get('tasks', resumed.id))
+    const amendedBefore = events(f.runtime, f.mission.id, 'task/amended').length
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, resumed.id, 'amend', { dependencies: [] }, 'drop the edge'), error => {
+      assert.equal(error.name, 'AdmissionError')
+      assert.equal(error.code, DEPENDENCY_ASSUMPTION_CODE)
+      assert.equal(error.category, 'tool_error', 'the category plan validation gives the same code')
+      assert.match(error.message, /^\[dependency_assumption_missing\] task "task_[^"]+": /)
+      assert.ok(error.message.includes('09883f3'), 'the diagnostic names the content it objects to')
+      assert.match(error.message, /`swarm_control`/, 'the exit is the amendment itself')
+      assert.deepEqual(lintRefusal(error.message), [], 'the refusal resolves through the refusal lint')
+      return true
+    })
+    assert.deepEqual(f.runtime.store.get('tasks', resumed.id), before, 'the refused amendment writes nothing')
+    assert.equal(events(f.runtime, f.mission.id, 'task/amended').length, amendedBefore, 'no amendment is recorded')
+    // An amendment that keeps a content-carrying edge is still admitted.
+    const other = f.propose({ title: 'Other source', objective: 'Implement the other scoped change in src/answer.txt.' })
+    const kept = f.runtime.controlTask(f.owner, f.mission.id, resumed.id, 'amend', { dependencies: [other.id] }, 'retarget the edge')
+    assert.deepEqual(kept.dependencies, [other.id])
   } finally { await f.cleanup() }
 })
 
 test('R14 runtime (workspace chain): a revoked workspace escalates with the coded workspace terminal', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     const { WorkspaceRevokedError } = await import('../lib/workspace-admission.js')
@@ -403,24 +398,22 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'workspace').at(-1),
       'the revoked workspace must escalate', 8_000)
     assert.equal(event.data.code, 'workspace_terminal')
-    assert.ok(event.data.coFires.includes('attempt_lease') && event.data.coFires.includes('review_admission'),
-      'the workspace terminal names the guards it co-fires with')
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[workspace_terminal\]/.test(delivery.content)),
       'the owner must receive the workspace terminal', 8_000)
     assert.deepEqual(lintRefusal(notice.content), [])
-    assert.match(notice.content, /swarm_propose/)
-    assert.match(notice.content, /swarm_cancel/)
+    assert.match(notice.content, /swarm_control/)
+    assert.match(notice.content, /taskId/)
   } finally { await f.cleanup() }
 })
 
 test('R14 runtime (budget chain): a refused worker proposal escalates as a coded owner decision', async () => {
-  const f = await setup({ config: { tickMs: 10 }, budget: { maxTasks: 1 } })
+  const f = await setup({ budget: { maxTasks: 1 } })
   try {
     f.propose({ title: 'Owner fills the only slot' })
     const stream = f.runtime.store.list('workstreams', f.mission.id)[0]
     assert.throws(() => f.runtime.propose(f.actor(f.author), f.mission.id, {
-      workstreamId: stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research',
+      outputs: [], workstreamId: stream.id, title: 'Worker overflow', objective: 'Overflow the ceiling', kind: 'research',
       scope: ['**'], acceptance: f.mission.acceptance,
     }), /task budget exhausted/)
     const notice = await eventually(() => f.workers.deliveries
@@ -439,7 +432,7 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
   // passes the context it already has. The test proves the path end to end from
   // inside this branch, so the integration task can wire a site without guessing
   // what the mechanism returns or how a repeat is suppressed.
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Held work' })
     const context = { taskId: task.id, memberId: f.author.id, detail: 'the workspace guard refused the close-out (Member has uncommitted commits)' }
@@ -454,7 +447,8 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[attempt_terminal\]/.test(delivery.content)),
       'the opt-in call delivers the owner notice', 8_000)
-    assert.match(notice.content, /swarm_handoff/)
+    assert.match(notice.content, /swarm_control/)
+    assert.doesNotMatch(notice.content, /swarm_handoff/)
     // The same call for the same board is the same decision request: the repeat
     // is suppressed because the request is durable, not because the caller chose
     // to stay silent.
@@ -471,48 +465,29 @@ test('R14 hand-off mechanism: emitGuardTerminal lets any call site opt in mechan
  * S4r — the four defects the independent verification reproduced.
  * ------------------------------------------------------------------------- */
 
-/**
- * Put a task row straight into the store, the way a legacy row admitted before
- * the R12-F9 guard existed reaches the dispatch sweep. Admission refuses the
- * text at propose() now, so this is the only way to exercise the dispatch
- * backstop and the non-starvation guarantee it owes.
- */
-function injectLegacyTask(f, overrides) {
-  const seed = f.propose({ title: 'Seed row', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.reviewer.id })
-  const row = { ...f.runtime.store.get('tasks', seed.id), ...overrides, status: 'pending', attempt: undefined, epoch: 0 }
-  f.runtime.store.transaction(() => f.runtime.store.put('tasks', row))
-  return row
-}
-
-test('S4r-D1 pair (admission guard x dispatch sweep): an assumed-content task must not starve its member', async () => {
-  // The verifier's reproduction: `continue` skipped the member's whole iteration
-  // and only `tasks[0]` was ever considered, so an ineligible head task starved
-  // every later ready task on that member forever. The pair is the point: the
-  // admission guard is individually correct and the sweep is individually
-  // correct; together they were a trap.
-  const f = await setup({ config: { tickMs: 10 } })
+test('R12-F9 has no dispatch half: the sweep dispatches the first ready task as admitted and escalates nothing about its text', async () => {
+  // The dispatch-time re-check of objective prose existed only for rows admitted
+  // before the guard, and its co-firing with the sweep was the S4r-D1 wedge.
+  // Every write of a dependency set is refused at its own call now, so dispatch
+  // reads no prose: a stored row whose text resumes from prior work is prepared
+  // and dispatched like any other ready task, and no guard terminal names it.
+  const f = await setup()
   try {
     f.workers.autoIdle = true
-    // The ineligible head is injected directly: propose() now refuses this text
-    // (S4r-D3), so the sweep's non-starvation guarantee is proven against the
-    // legacy-row backstop, which is exactly the row the verifier reproduced with.
-    const head = injectLegacyTask(f, { id: 'task_assumed_head', title: 'Assumed head', objective: 'Resume from your own artifact `09883f3` and finish the guard.', assigneeId: f.author.id, createdAt: 1 })
-    const second = f.propose({ title: 'Self-contained second', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.author.id })
-    await eventually(() => f.runtime.store.get('tasks', second.id).status === 'running' ? true : undefined,
-      'the self-contained task must be dispatched even though an assumed-content task is ahead of it', 8_000)
-    assert.equal(f.runtime.store.get('tasks', head.id).status, 'pending', 'the ineligible head stays admitted and repairable')
-    assert.equal(f.runtime.store.get('tasks', head.id).attempt, undefined, 'the ineligible head is never given an attempt')
-    assert.equal(f.workers.prepared.filter(item => item.taskId === head.id).length, 0, 'the ineligible head is never prepared')
-    assert.ok(f.workers.prepared.some(item => item.taskId === second.id), 'the later task really was prepared and dispatched')
-    const notice = await eventually(() => f.workers.deliveries
-      .find(delivery => delivery.memberId === 'owner' && /\[dependency_assumption_missing\]/.test(delivery.content)),
-      'the ineligible head still escalates once', 8_000)
-    assert.deepEqual(lintRefusal(notice.content), [])
+    const seed = f.propose({ title: 'Seed row', objective: 'Implement the scoped change in src/answer.txt.', assigneeId: f.author.id })
+    const stored = { ...f.runtime.store.get('tasks', seed.id), objective: 'Resume from your own artifact `09883f3` and finish the guard.' }
+    f.runtime.store.transaction(() => f.runtime.store.put('tasks', stored))
+    await eventually(() => f.runtime.store.get('tasks', seed.id).status === 'running' ? true : undefined,
+      'the stored row is dispatched as admitted', 8_000)
+    assert.ok(f.workers.prepared.some(item => item.taskId === seed.id), 'the row was prepared')
+    assert.equal(events(f.runtime, f.mission.id, 'mission/stalled').filter(item => item.data.code === DEPENDENCY_ASSUMPTION_CODE).length, 0,
+      'no dispatch-time escalation reads the objective')
+    assert.equal(f.workers.deliveries.filter(delivery => /\[dependency_assumption_missing\]/.test(delivery.content)).length, 0)
   } finally { await f.cleanup() }
 })
 
-test('S4r-D3: the admission guard refuses at propose() and at plan validation, not only at dispatch', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+test('S4r-D3: the admission guard refuses at propose() and at plan validation', async () => {
+  const f = await setup()
   try {
     // T3b precedent, at the production call shape: propose() must refuse it.
     assert.throws(() => f.propose({ title: 'Resume prior work', objective: 'Resume from your own artifact `09883f3` and finish the guard.' }),
@@ -531,21 +506,20 @@ test('S4r-D3: the admission guard refuses at propose() and at plan validation, n
     // The same guard fires at plan validation (plans.ts), where the task never
     // reaches propose() at all.
     const { validatePlan } = await import('../lib/plans.js')
-    const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 60000, maxTasks: 12, maxExperiments: 2 }
     const base = {
       title: 'Plan', objective: 'Deliver verified code', workspace: f.dir, scope: ['src/'], acceptance: ['works'], budget,
       members: [{ key: 'builder', name: 'Builder', role: 'implementation' }],
       workstreams: [{ key: 'main', title: 'Main', objective: 'Main' }],
     }
-    assert.throws(() => validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Resume from your own artifact `09883f3`.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['true'] }] }),
+    assert.throws(() => validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Resume from your own artifact `09883f3`.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }] }),
       /dependency_assumption_missing/, 'plan admission refuses the same prejudged content')
-    const valid = validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['true'] }] })
+    const valid = validatePlan({ ...base, tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change in src/answer.txt.', kind: 'implementation', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'] }] })
     assert.equal(valid.tasks.length, 1, 'a self-contained plan task is still admitted')
   } finally { await f.cleanup() }
 })
 
 test('S4r-D4: guardBoard reports review liveness from the same predicate the scheduler uses', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Submitted source' })
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -553,7 +527,7 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
     const review = await eventually(() => f.runtime.store.list('tasks', f.mission.id).find(item => item.kind === 'verification' && item.reviewOf === task.id),
       'the automatic review is admitted', 8_000)
     f.runtime.cancel(f.owner, f.mission.id, { taskId: review.id, reason: 'S4r: withdraw the review' })
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     const source = board.tasks.find(candidate => candidate.id === task.id)
     const schedulerSays = f.runtime.scheduling.reviewable(f.runtime.store.get('tasks', task.id), f.runtime.store.list('tasks', f.mission.id))
     assert.equal(schedulerSays, false, 'the scheduler sees no live review')
@@ -566,11 +540,11 @@ test('S4r-D4: guardBoard reports review liveness from the same predicate the sch
 })
 
 test('S4r-D5: a budget-blocked mission still escalates, and the terminal emission is unconditional', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); mission.usedTokens = mission.budget.maxTokens; f.runtime.store.put('missions', mission) })
     await eventually(() => f.runtime.mission(f.mission.id).status === 'blocked', 'the exhausted budget blocks the mission', 8_000)
-    const board = f.runtime.scheduling.guardBoard(f.mission.id)
+    const board = guardBoard(f.runtime, f.mission.id)
     assert.equal(guardMissionTerminal(board), false, 'a blocked mission is not terminal')
     const escalation = guardActions(board).find(action => action.kind === 'escalate')
     assert.ok(escalation, 'a blocked mission still has an executable action')
@@ -599,7 +573,7 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
  * ------------------------------------------------------------------------- */
 
 test('S4b pair (workspace capture x close-out): a failed close-out checkpoint escalates the attempt terminal', async () => {
-  const f = await setup({ config: { tickMs: 10, maxIdleCloseouts: 0 } })
+  const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Held attempt', maxRecoveryAttempts: 3 })
@@ -627,7 +601,7 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
   // Measured on the owner's instrument: task/closeout-abandoned 7 of 8 silent,
   // task/closeout-exhausted 2 of 2 silent. Both are terminals of the
   // attempt/lease chain now.
-  const f = await setup({ config: { tickMs: 10, maxIdleCloseouts: 0 } })
+  const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Close-out exhaustion', maxRecoveryAttempts: 1 })
@@ -653,7 +627,7 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
 })
 
 test('S4b pair (lease expiry x workspace capture): the checkpoint failure and the exhausted recovery both escalate', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Expiring attempt', maxRecoveryAttempts: 1 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -679,7 +653,7 @@ test('S4b pair (lease expiry x workspace capture): the checkpoint failure and th
 })
 
 test('S4b (task ceiling): the blocked task escalates with the coded ceiling terminal', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Ceiling bound', maxSteps: 1 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -693,27 +667,41 @@ test('S4b (task ceiling): the blocked task escalates with the coded ceiling term
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[task_ceiling_terminal\]/.test(delivery.content)),
       'the owner decision request replaces the prose-only ceiling notice', 8_000)
-    assert.match(notice.content, /swarm_propose/)
+    assert.match(notice.content, /swarm_budget/)
     assert.deepEqual(lintRefusal(notice.content), [])
   } finally { await f.cleanup() }
 })
 
+test('S4b (task ceiling): the ceiling block is stamped on the runtime clock', async () => {
+  // taskCeilingBlock defaulted its instant to Date.now(), and the runtime called
+  // it without the clock, so task.ceiling.at was host time on a runtime-clock row.
+  const clock = new FakeClock(Date.now() + 600_000)
+  const f = await setup({ clock })
+  try {
+    const task = f.propose({ title: 'Ceiling bound', maxSteps: 1 })
+    await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
+    await f.workers.callbacks.beforeStep(f.author.id, true)
+    assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), false, 'the ceiling refuses the next step')
+    assert.equal(f.runtime.store.get('tasks', task.id).ceiling.at, clock.now())
+  } finally { await f.cleanup() }
+})
+
 test('S4b (owner-side ceiling): the refusal is a recorded coded decision, not only a thrown error', async () => {
-  const f = await setup({ config: { tickMs: 10 }, budget: { maxTasks: 1 } })
+  const f = await setup({ budget: { maxTasks: 1 } })
   try {
     f.propose({ title: 'Only slot' })
     assert.throws(() => f.propose({ title: 'Overflow' }), /task budget exhausted/)
     const notice = await eventually(() => f.workers.deliveries
       .find(delivery => delivery.memberId === 'owner' && /\[task_ceiling_terminal\]/.test(delivery.content)),
       'the owner faces a recorded decision on the next read', 8_000)
-    assert.match(notice.content, /swarm_propose/)
+    assert.match(notice.content, /swarm_budget/)
     assert.match(notice.content, /\[task_ceiling_terminal\]/)
     assert.deepEqual(lintRefusal(notice.content), [])
   } finally { await f.cleanup() }
 })
 
 test('S4b pair (isolation x workspace): a refused dispatch escalates with the violation as the detail', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     f.workers.autoIdle = true
     // The isolation guard is the workspace chain's predicate; force the violation
@@ -733,7 +721,7 @@ test('S4b pair (isolation x workspace): a refused dispatch escalates with the vi
 })
 
 test('S4b (workspace fence): fenceWorkspace itself emits the coded terminal for every caller', async () => {
-  const f = await setup({ config: { tickMs: 10 } })
+  const f = await setup()
   try {
     const task = f.propose({ title: 'Fenced work' })
     f.runtime.fenceWorkspace(f.mission.id, 'workspace_revoked: the authorized grant root was removed')

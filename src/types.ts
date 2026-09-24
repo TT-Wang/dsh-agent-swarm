@@ -1,4 +1,5 @@
 /** Durable swarm records and the execution adapter shared by runtime and Harness. */
+import type { EventKind } from './events.ts'
 export type MissionStatus = 'staged' | 'active' | 'paused' | 'blocked' | 'completed' | 'stopped'
 export type TaskKind = 'research' | 'implementation' | 'verification' | 'integration'
 export type TaskStatus = 'pending' | 'running' | 'submitted' | 'accepted' | 'blocked' | 'cancelled'
@@ -45,6 +46,8 @@ export interface Budget {
   maxDurationMs: number
   maxTasks: number
   maxExperiments: number
+  /** Optional absolute user deadline, distinct from the execution-time estimate. */
+  deadlineAt?: number
 }
 /**
  * Provider-reported usage split into billing buckets. `outputTokens` already
@@ -58,6 +61,12 @@ export interface UsageBuckets {
   outputTokens: number
   reasoningTokens: number
   requests: number
+}
+/** Host session generation, persisted before creating a replacement native log. */
+export interface UsageSnapshotSource {
+  generation: number
+  /** Only used to migrate a member written before session-specific watermarks existed. */
+  restored: boolean
 }
 /** Host-created immutable starting point; never supplied by a model plan. */
 export interface WorkspaceBaseline {
@@ -109,6 +118,69 @@ export interface CheckEnvelope {
   totalRunMs: number
   maxRunMs: number
 }
+/** One declared check's outcome, as the host recorded it or, with `failureKind`, as the host failed to execute it. */
+export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
+  failureKind?: 'timeout' | 'infrastructure'
+  /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
+  attribution?: CheckAttribution
+  /** ENV: the environment this check actually ran under. */
+  environment?: CheckEnvironment }
+/**
+ * ENV: the environment a declared check runs under, stated as facts instead of
+ * folklore, so the assignee knows which environment the host check will use and
+ * a verification can tell when the executed check did not reproduce it.
+ *
+ * `home`, the two user cache roots, the sandbox policy and the dependency links
+ * are what an execution must reproduce. `checkCacheRoot`/`checkCacheRoots` are the
+ * scoped roots the envelope itself provides inside the disposable checkout: they
+ * differ by design on every run and are excluded from the reproduction
+ * comparison. Existence flags are recorded and reported but never refuse an
+ * acceptance: a check must not depend on the ambient cache staying warm.
+ *
+ * Declared beside `CheckEnvelope` for the same reason: the adapter interface
+ * and the runtime read it without importing the Node-only workspace module,
+ * which re-exports it.
+ */
+export interface CheckEnvironment {
+  /** HOME the check process receives; null when it inherits none. */
+  home: string | null
+  /** User-level cache directory the check's HOME resolves (`<home>/.cache`); null without a HOME. */
+  userCacheDir: string | null
+  /** `<userCacheDir>/huggingface`, where a user-level model cache lives; null without a HOME. */
+  huggingfaceCacheDir: string | null
+  /** Whether the two user cache roots existed when these facts were recorded. */
+  userCacheDirExists: boolean
+  huggingfaceCacheDirExists: boolean
+  /** XDG_CACHE_HOME in force for this environment (the scoped root for a check). */
+  xdgCacheHome: string | null
+  /** The confinement the host applies: workspace-write rooted at the checkout, full enforcement. */
+  sandboxPolicy: { mode: string; enforcement: string; workspaceRoot: string | null }
+  /** Dependency materialisation policy. dirs is the configured set of directory names. */
+  dependencyLinks: { mode: 'link' | 'copy'; dirs: string[];
+    /** Actual relative paths found and materialised in this execution; absent before execution. */
+    materializedPaths?: string[] }
+  /** Scoped cache root the envelope provides inside the checkout; null for a self-run. */
+  checkCacheRoot: string | null
+  /** Package-manager cache roots the check sets below `checkCacheRoot`. */
+  checkCacheRoots: Record<string, string>
+}
+/** ENV: one check's failure attribution, captured before the output bound can cut it off. */
+export interface CheckAttribution {
+  /** 1-based position of the failing check in the declared sequence. */
+  index: number
+  command: string
+  /** The last stage banner (`> script`, `$ command`, `# stage: name`) before the first failure. */
+  stage: string | null
+  /** The last `# Subtest:` heading before the first failure (the suite that failed). */
+  subtest: string | null
+  /** TAP `not ok` names seen in the stream, bounded; the count is every name seen. */
+  failingTests: string[]
+  failingTestCount: number
+  /** TAP summary lines (`1..N`, `# tests/# pass/# fail/...`), latest value per key. */
+  tapSummary: string[]
+  /** True when the stored output was cut at the host's output bound. */
+  outputTruncated: boolean
+}
 export interface Mission {
   id: string
   ownerSessionId: string
@@ -142,6 +214,8 @@ export interface Mission {
   createdAt: number
   updatedAt: number
   deadline: number
+  /** Active execution time; paused, idle and resource-waiting time is excluded. */
+  executionTime?: { usedMs: number; since?: number }
   coordinatorId?: string
   reason?: string
   baseline?: WorkspaceBaseline
@@ -168,6 +242,8 @@ export interface Mission {
    * one unchanged board. Cleared when a pass advances durable state.
    */
   schedulingStallNotice?: string
+  /** Separate timeout witness: an earlier no-progress notice cannot suppress a wedge. */
+  schedulingWedgeNotice?: string
   /**
    * No-silent-state witness (docs/no-silent-state-spec.md §2): the fingerprint
    * `F(S)` of the board state at the moment the last owner-decision notice was
@@ -179,6 +255,7 @@ export interface Mission {
   /** R10-14: fingerprint of the coverage-complete state the owner was told about. */
   coverageNotice?: string
   /** Highest approaching-limit threshold already warned per budget dimension. */
+  budgetReviewedAt?: number
   budgetWarned?: Record<string, number>
   /** Last successful delivery application; projected for the client after the event window scrolls. */
   appliedDelivery?: { resultCommit: string; appliedAt: number }
@@ -235,10 +312,12 @@ export interface Member {
   reasoningEffort?: string
   /** Primary-agent-selected output allowance for each model request. */
   maxOutputTokens?: number
-  /** Last authoritative cumulative token total applied to the mission budget. */
+  /** Lifetime authoritative token charge applied to the mission budget, across native sessions. */
   accountedTokens?: number
-  /** Cumulative bucketed usage from this worker's persisted session log. */
+  /** Lifetime bucketed usage across this worker's native sessions. */
   usage?: UsageBuckets
+  /** Current native session's cumulative watermarks, separate from lifetime usage. */
+  usageSession?: { generation: number; accountedTokens: number; usage?: UsageBuckets }
   /**
    * R11-01: the last provider outage classified for this member. Present means
    * the member's route is quiescent (capacity/quota/availability), so a start
@@ -283,12 +362,49 @@ export interface Attempt {
   epoch: number
   ownerId: string
   leaseUntil: number
+  /** Immutable source selected when a verification attempt was assigned. */
+  sourceCommit?: string
 }
 export interface Artifact {
   commit: string
   baseCommit: string
   workspace: string
   changedPaths: string[]
+  /** The declared outputs and listed deliverables, read back from this commit (never the mutable worktree). */
+  files?: Array<{ path: string; blob: string; bytes: number }>
+  /** Changed executable files, symlinks or submodules in either tree, including deletions. */
+  executablePaths?: string[]
+}
+/** Owner revisions keep the obligation and history; submitted artifacts stay immutable. */
+export interface TaskAmendment {
+  scope?: string[]
+  outputs?: string[]
+  dependencies?: string[]
+  checks?: string[]
+  assigneeId?: string | null
+  maxSteps?: number
+  maxFindings?: number
+  maxRecoveryAttempts?: number
+  checkTimeoutMs?: number
+  maxRework?: number
+}
+/**
+ * One independent rejection a task was re-opened from: the rejected artifact
+ * commit, the task epoch it was submitted at, the review that rejected it and
+ * that review's reason, and the claims the rejection refuted (history, not a
+ * block cause, once the task is reworked). On the review row a rework re-opens,
+ * the same record archives its own verdict: the commit it rejected, its epoch,
+ * itself, its reason, the claims its reviewer published in that round, the
+ * review artifact it captured, and what that round consumed (`spent`).
+ */
+export interface TaskRejection {
+  commit: string; epoch: number; reviewTaskId: string; reason: string; evidenceIds: string[]; reviewArtifact?: Artifact
+  /**
+   * On a review's own entry: what the rejecting round consumed. The re-opened
+   * review starts the next round with a fresh review's allowance, so this is
+   * history only; no ceiling or recovery limit reads it.
+   */
+  spent?: { usedSteps: number; recoveryCount: number; ceiling?: TaskCeiling }
 }
 export interface Task {
   id: string
@@ -300,6 +416,15 @@ export interface Task {
   dependencies: string[]
   scope: string[]
   acceptance: string[]
+  /**
+   * The repository-relative files this task must produce, declared by whoever
+   * planned it instead of inferred from the objective prose. An empty array is
+   * a declaration ("this task writes no file"); absent means the row predates
+   * the field or came from a manual assembly that omitted it, and it reads as
+   * `[]`. Capture force-adds and preservation carries exactly these files, and
+   * submit and verify refuse one that was never written (`[output_missing]`).
+   */
+  outputs?: string[]
   checks: string[]
   status: TaskStatus
   priority: number
@@ -320,7 +445,9 @@ export interface Task {
    */
   revision?: number
   assigneeId?: string
-  /** Plan-intended owner; restored when a lease expiry re-pends the task and the member is still live. */
+  /** Only preferred tasks that have never started may be borrowed. Absent preserves legacy binding. */
+  assignmentMode?: 'preferred' | 'pinned'
+  /** Initial plan owner; a preferred task fixes this to its first actual owner for recovery. */
   plannedAssigneeId?: string
   attempt?: Attempt
   /** Lease value already warned about, so a lease-expiring event is emitted once per lease. */
@@ -330,6 +457,11 @@ export interface Task {
   recoveryCount?: number
   /** Primary-agent choice; absent only on legacy/manual tasks. */
   maxRecoveryAttempts?: number
+  /** Owner re-opens of this task after an independent rejection, bounded by `maxRework` (default 2). */
+  reworkCount?: number
+  maxRework?: number
+  /** Rejections this task was re-opened from, oldest first; on a review, the verdicts a rework of its source archived. */
+  rejections?: TaskRejection[]
   /** Per-task model-step ceiling admitted with the task; the runtime blocks the task at this limit. */
   maxSteps?: number
   /** Per-task finding (published evidence) ceiling admitted with the task. */
@@ -340,12 +472,16 @@ export interface Task {
   usedSteps?: number
   /** Durable block reason when the task exhausted one of its own ceilings. */
   ceiling?: TaskCeiling
+  /** Highest warning per dimension and allocation; runtime estimates never refill themselves. */
+  budgetWarned?: Record<string, number>
+  preparationFailure?: { reason: string; transient: boolean; attempts: number; retryAt?: number }
+  verificationRecovery?: { sourceTaskId: string; commit: string; reason: string; at: number }
   /** Per-command host verification timeout chosen for this task. */
   checkTimeoutMs?: number
   /** Same-owner resume preserves attempt provenance after budget quiescence. */
   budgetResume?: { pauseId: string; attemptId: string; epoch: number }
   /** Durable quiescence transition; epoch matching prevents reopening invalidated work. */
-  resumeAfterStop?: { epoch: number; reason: 'handoff' | 'lease-expired' | 'worker-closeout'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number }
+  resumeAfterStop?: { epoch: number; memberId?: string; reason: 'handoff' | 'lease-expired' | 'worker-closeout' | 'resource' | 'invalidated'; /** R14-F2(d): when the stop began, so a waited-on stop has a durable bound. */ at?: number; /** Deterministic preservation failures retain the fence until an explicit resume retries them. */ failure?: { message: string; deterministic: boolean } }
   /** Idle close-out nudges already delivered for this attempt; cleared when a new attempt starts. */
   closeout?: { nudges: number; at: number }
   /**
@@ -358,9 +494,21 @@ export interface Task {
   idleSignal?: { attemptId: string; at: number }
   /** Durable workspace checkpoint captured before an abandoned attempt was reassigned. */
   checkpoint?: { commit: string; at: number }
+  /**
+   * H-3: the last cross-owner recovery that could not capture the previous
+   * owner's workspace as an artifact. `preserved` means the replacement attempt
+   * inherited that worktree's WIP (in-scope and out-of-scope alike) from the
+   * preservation snapshot `commit`; otherwise it started from the last durable
+   * checkpoint or the task base and the WIP is still only in the previous
+   * owner's worktree. Written together with the `task/recovery-fallback` event
+   * and the owner notice, and projected by `swarm_observe`.
+   */
+  recovery?: { epoch: number; previousOwnerId: string; commit: string; preserved: boolean; reason: string; at: number }
   /** Sandbox denial of a worker-side git write on this attempt; cleared when a new attempt starts. */
   gitWriteDenied?: { command: string; runId?: string; at: number }
   artifact?: Artifact
+  /** Captured reviewer-authored record; never a dependency deliverable or independent verdict on its own contents. */
+  reviewArtifact?: Artifact
   /**
    * Authenticated proposer key (`owner` or a member id). Set at admission so
    * the per-member proposal allowance is counted from durable records and can
@@ -372,6 +520,12 @@ export interface Task {
   reviewedCommit?: string
   /** Blocked tasks whose acceptance obligations this replacement covers. */
   replaces?: string[]
+  /**
+   * Set on an accepted replacement once its replaced lineage was retired, in
+   * the verdict's transaction (or once by host recovery for a store accepted
+   * before that rule). Recovery replays the retirement only without it.
+   */
+  lineageRetired?: true
   /**
    * X1 (P0): every member that ever owned an attempt on this task. Independence
    * is decided from the union of the current attempt owner and this list, so a
@@ -500,8 +654,21 @@ export interface NoticeEnvelope {
   sentAt: number
   queuedAt: number
   claimedAt?: number
+  /** Receipt or failed delivery whose current state decides whether this notice still applies. */
+  questionId?: string
+  deliveryFailureId?: string
   /** Original notice identities carried by a wake summary, independent of its transport identity. */
   aggregatedIdentities?: Array<{ class: NoticeClass; dedupKey: string; from: string; contentDigest: string }>
+  /** Structured constituents let a queued wake summary recheck each original obligation. */
+  aggregatedFacts?: Array<{
+    class: NoticeClass; dedupKey: string; from: string; factStart: number; factCount: number
+    subjects: string[]; trigger: string; reason: string; createdAt: number
+    questionId?: string; deliveryFailureId?: string
+    /** Reminders spent on this constituent: each summarized fact has its own allowance. */
+    followupCount?: number
+  }>
+  /** First transport handoff freezes the rendered summary across uncertain retries. */
+  handoffAt?: number
 }
 /**
  * Typed durable owner escalation raised by a mission member. A board post is
@@ -534,6 +701,9 @@ export interface Delivery {
   topic?: string
   createdAt: number
   deliveredAt?: number
+  /** Actual host message consumption, independent of transport acknowledgement timing. */
+  consumedAt?: number
+  deliveryFailure?: { reason: string; at: number }
   taskId?: string
   attemptId?: string
   /**
@@ -596,8 +766,8 @@ export interface Delivery {
  *
  * Every supported release mounts the connection plugin's `/api` route and offers
  * `ctx.connection.rpc.intercept('/api', …)` for plugin endpoints. A plugin-owned
- * channel (`rpc.handle('/agent-swarm', …)`) is only usable through 0.1.3: from
- * 0.1.5 the connection service resolves `webServer` on its own context, which
+ * channel (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: the connection
+ * service resolves `webServer` on its own context, which
  * injects `credentials` alone, and Cordis refuses that property access
  * (`cannot get property "webServer" without inject`), so the channel route is
  * never registered. The client posts to `<channel>/<endpoint>`, so both halves
@@ -622,8 +792,14 @@ export const OWNER_ONLY_TOOLS: readonly string[] = [
   'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
 ]
 
-export const ATTEMPT_FENCING_EVENTS: readonly string[] = [
-  'task/submitted', 'task/blocked', 'task/cancelled', 'task/cancelled-at-completion',
+export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
+  // `attempt/fenced` is the uniform closer every control path now writes through
+  // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
+  // with only their own domain event, so a log this runtime wrote was refused as
+  // truncated by its own replay; `task/start-failed` drops the attempt too and
+  // had the same gap.
+  'attempt/fenced', 'task/start-failed',
+  'task/submitted', 'task/blocked', 'task/verification-deferred', 'task/cancelled', 'task/cancelled-at-completion',
   'task/lease-expired', 'task/restart-repended', 'task/ceiling-exhausted',
   'task/handoff-started', 'task/invalidated', 'task/review-retired',
   'task/closeout-abandoned', 'task/closeout-failed', 'task/accepted', 'task/rejected',
@@ -636,35 +812,6 @@ export interface SwarmEvent {
   actor: string
   data: unknown
   createdAt: number
-}
-/**
- * R17-G9: one owner-facing decision candidate, judged before it is written. The
- * candidate is what the emission site knows: the mission, the notice family (from
- * the explicit option or the dedup key) and the subjects the decision names as
- * `taskId@epoch` (or the mission root).
- */
-export interface DecisionCandidate {
-  missionId: string
-  /** The notice family; only the families whose claim is "no live path will advance this subject" are judged. */
-  family?: string
-  /** The named subjects, at their current epoch. */
-  subjects: readonly string[]
-}
-/**
- * R17-G9: one refused decision, recorded as a measurement. A refusal is never a
- * silent no-op: the emission-time refusal records `emission` (nothing durable was
- * written), the host pre-append invariant records `append` (the host session
- * append was refused before publication).
- */
-export interface DecisionRefusal {
-  at: number
-  missionId: string
-  family: string
-  subjects: string[]
-  reason: string
-  stage: 'emission' | 'append'
-  /** The durable delivery the append-stage refusal named, when one exists. */
-  deliveryId?: string
 }
 /**
  * S6: critical-path accounting for one mission, projected next to its total
@@ -737,6 +884,8 @@ export interface PlanTask {
   kind: TaskKind
   scope: string[]
   acceptance: string[]
+  /** Declared deliverable files; see `Task.outputs`. */
+  outputs?: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
   /** Per-task step ceiling; admission derives a bounded default when the plan omits it. */
@@ -748,8 +897,23 @@ export interface PlanTask {
   priority?: number
   experiment?: boolean
   assigneeKey?: string
+  assignmentMode?: 'preferred' | 'pinned'
   dependencies?: string[]
   reviewOf?: string
+  /**
+   * On a deliverable no verification task names in `reviewOf`: fields of the
+   * one independent review the host adds for it. Consumed when that review is
+   * added, so a saved or launched plan carries the review row instead.
+   */
+  review?: PlanReviewOverride
+}
+/** The planner's choices for a host-added review; every other field derives from its source. */
+export interface PlanReviewOverride {
+  assigneeKey?: string
+  objective?: string
+  acceptance?: string[]
+  maxSteps?: number
+  maxRecoveryAttempts?: number
 }
 export interface PlanInput extends CreateMissionInput {
   members: PlanMember[]
@@ -763,6 +927,8 @@ export interface DraftPlan {
   status: 'draft' | 'launching' | 'launched' | 'failed' | 'discarded'
   /** Validated plan exactly as supplied; the authorization anchor lives beside it, never inside. */
   input: PlanInput
+  /** Bounded advisory preflight notes; they never change launch eligibility. */
+  advisories?: string[]
   /** Human-authorization anchor captured at staging; carried into the launched mission. */
   workspaceGrantRoot?: string
   /** Host-derived authorization origin captured with the anchor; never inside `input`. */
@@ -791,6 +957,8 @@ export interface AutoStart extends RequestStartInput {
   /** Durable generation fences late planners after a retry or stop. Legacy rows are epoch 1. */
   planningEpoch?: number
   planningDeadlineAt?: number
+  /** A durable deadline-review notice; transport acknowledgement keeps the request active. */
+  planningWarning?: { deadline: number; threshold: number; deliveredAt?: number }
   planningFenced?: boolean
   /** Durable inbox work, replayed by the native planner when the owner is available. */
   planningDispatchPending?: boolean
@@ -806,6 +974,10 @@ export interface AutoStart extends RequestStartInput {
 }
 /** Bounded, focused reads for the model; the complete board stays in the UI projection. */
 export interface ObserveQuery {
+  /** Owner compact board baseline from nextCursor; missing/stale cursors return a full compact reset. */
+  cursor?: string
+  /** Owner-only exact read of a durable notification or question and its facts. */
+  deliveryId?: string
   /** Return only events after this sequence number. */
   after?: number
   /** Return only this participant's visible tool runs after this per-mission position. */
@@ -827,7 +999,10 @@ export interface ProposeTaskInput {
   kind: TaskKind
   dependencies?: string[]
   scope: string[]
-  acceptance: string[]
+  /** Required unless `replaces` names a task: a repair inherits every replaced task's acceptance, and entries here are added after it. */
+  acceptance?: string[]
+  /** Declared deliverable files; see `Task.outputs`. Required, except that a repair omitting them inherits every replaced task's declaration (in order, de-duplicated); explicit outputs replace that list. */
+  outputs?: string[]
   checks?: string[]
   maxRecoveryAttempts?: number
   /** Per-task step ceiling; admission derives a bounded default when the proposal omits it. */
@@ -839,6 +1014,7 @@ export interface ProposeTaskInput {
   priority?: number
   experiment?: boolean
   assigneeId?: string
+  assignmentMode?: 'preferred' | 'pinned'
   reviewOf?: string
   replaces?: string[]
 }
@@ -858,6 +1034,22 @@ export interface WorkerSpec {
   /** Exact owner session used only to seed initial composition; resume must be owner-independent. */
   ownerSessionId: string
 }
+/**
+ * H-3: one cross-owner recovery whose `captureArtifact` refused the previous
+ * owner's worktree. `preserved` says whether the replacement (`memberId`)
+ * inherited that worktree's WIP through a preservation snapshot (`commit` is
+ * then the snapshot) or started from the last durable checkpoint or the task
+ * base with the WIP left behind.
+ */
+export interface RecoveryFallback { missionId: string; taskId: string; epoch: number; memberId: string; previousOwnerId: string; commit: string; preserved: boolean; reason: string }
+/**
+ * H-3 follow-up: a disposable verification checkout the host could not remove
+ * after `taskId`'s declared checks ran under `memberId`. `reason` is the
+ * removal failure; the tree may still sit under the mission's `verification/`
+ * directory or as a stale worktree registration in the source repository. The
+ * check results were already returned; this never changes the verdict.
+ */
+export interface VerificationCleanupFailure { missionId: string; taskId: string; memberId: string; checkout: string; reason: string }
 export interface WorkerCallbacks {
   /** Optional for adapters without live execution observation. */
   activity?(memberId: string, activity?: WorkerActivity): void
@@ -866,7 +1058,7 @@ export interface WorkerCallbacks {
   beforeStep(memberId: string, hasFreshInput?: boolean): Promise<void | false>
   usage(memberId: string, tokens: number): Promise<void>
   /** Optional idempotent accounting path; cumulative persisted session total, never a delta. */
-  usageSnapshot?(memberId: string, totalTokens: number, usage?: UsageBuckets): Promise<void>
+  usageSnapshot?(memberId: string, totalTokens: number, usage?: UsageBuckets, source?: UsageSnapshotSource): Promise<void>
   /** Optional owner-session usage report, attributed by the runtime to that owner's live missions or planning requests. */
   ownerUsage?(sessionId: string, usage: UsageBuckets): void
   /** Reject a revoked assignment by its durable delivery id; other peer messages retain their context. */
@@ -877,84 +1069,101 @@ export interface WorkerCallbacks {
   guard(memberId: string, toolName: string): string | undefined
   failure(memberId: string, error: string): void
   /**
+   * H-3: a cross-owner recovery could not capture the previous owner's
+   * workspace as an artifact. The adapter's `Workspaces` reports it; the
+   * runtime records the durable event, the owner notice and the task summary.
+   */
+  recoveryFallback?(info: RecoveryFallback): void
+  /**
+   * H-3 follow-up: a verification checkout could not be removed after its
+   * checks ran. The adapter's `Workspaces` reports it; the runtime records the
+   * durable event and the owner notice. The verdict is never affected.
+   */
+  verificationCleanupFailure?(info: VerificationCleanupFailure): void
+  /**
    * R11-01: a classified provider outage (quota, rate limit, provider
    * unavailable). The adapter classifies; the runtime emits the durable event,
    * keeps the attempt alive and never spends recovery credit on the pause.
    */
   providerOutage?(memberId: string, outage: ProviderOutage): void
 }
+/** One declared check `/bin/sh` could not parse: its position in the probed list and the parser's own diagnostic. */
+export interface CheckSyntaxIssue { index: number; message: string }
 /** Worker handles and all effectful execution remain owned by the adapter. */
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
   /** Freeze once before planning; optional only for adapters without Git execution. */
   prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
-  inspectDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
-  applyDelivery?(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
+  inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
+  applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
-  start(spec: WorkerSpec): Promise<void>
+  start(spec: WorkerSpec, signal?: AbortSignal): Promise<void>
   deliver(member: Member, delivery: Delivery): Promise<void>
   stop(memberId: string): Promise<void>
   /** Only returns operations still owned by a live, uncancelled adapter execution. */
-  currentActivity?(memberId: string): WorkerActivity | undefined
+  currentActivity(memberId: string): WorkerActivity | undefined
   /** A unit of work closed for this member; the adapter may compact its history when idle and over its pressure threshold. */
-  compactAtBoundary?(memberId: string): void
+  compactAtBoundary(memberId: string): void
+  /**
+   * The durable worker identity changed (a staged-plan repair rotated the
+   * member's sessionId), so the adapter's persisted composition for that member
+   * must not be reused. Called after the previous handle has stopped; the next
+   * start composes a fresh session for the new identity instead of refusing a
+   * composition that belongs to the replaced one.
+   */
+  invalidateComposition(missionId: string, memberId: string): Promise<void>
+  /**
+   * Parse every declared check without executing it, so a plan whose check is a
+   * shell syntax error is refused before any worker, worktree or model step
+   * exists. The result is located, not input-aligned: one entry per unparsable
+   * command, in plan order, whose `index` is that command's position in
+   * `checks`; a command that parses has no entry, so callers pair by `index`.
+   */
+  checkSyntaxPreflight(checks: readonly string[], cwd: string, signal?: AbortSignal): Promise<CheckSyntaxIssue[]>
   isIdle(memberId: string): boolean
-  captureArtifact(member: Member, task: Task): Promise<Artifact>
+  /**
+   * Capture the member worktree plus `deliverables` and the task's declared
+   * `outputs`; with `requireOutputs` (submit and verify) a declared output that
+   * is not a regular file is refused with `[output_missing]`.
+   */
+  captureArtifact(member: Member, task: Task, deliverables?: string[], options?: { requireOutputs?: boolean }): Promise<Artifact>
+  /** Preserve any owned WIP after stop without treating it as an accepted artifact. */
+  checkpointTask(member: Member, task: Task, options?: { ifOwned?: boolean }): Promise<void>
+  /** Read authoritative immutable Git facts, including fields absent from older stored records. */
+  inspectArtifact(member: Member, artifact: Artifact, signal?: AbortSignal): Promise<Artifact>
   /** Verify in an isolated checkout of the exact artifact; records are host-produced. */
-  verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<Array<{ command: string; exitCode: number; output: string }>>
+  verifyArtifact(member: Member, task: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]>
   /** R11-19: the host's measured declared-check envelope, when the adapter runs checks. */
   checkEnvelope?(): CheckEnvelope
   /** Materialize accepted dependencies or a prior task checkpoint. Stop/fence the old owner before preparing a later epoch. */
   prepareTask(member: Member, task: Task, dependencies: Task[], reviewSource?: Task): Promise<void>
   dispose(): Promise<void>
 }
-/**
- * S1: one durable scheduling-pass record per mission (`pass_<missionId>`, the
- * row is overwritten by each pass). The scheduling guard is this row, re-read
- * from the store; the in-memory `scheduled` Set it replaces could swallow the
- * tick timer's only liveness action and leave a mission invisible for 120
- * minutes. A row whose status is `running` older than the configured bound is
- * *not* a guard: the watchdog releases it, commits the stall event and lets
- * later ticks proceed.
- */
-export interface SchedulingPass {
-  /** Stable row key (`pass_<missionId>`): the guard, re-read from the store. */
-  id: string
-  /** Identity of this pass execution; a released body is fenced by it, never by the stable key. */
-  runId: string
-  /** Runtime process that opened the pass. A row from another instance never gates. */
-  instanceId: string
-  missionId: string
-  status: 'running' | 'finished'
-  startedAt: number
-  finishedAt?: number
-  /** Store revisions around the pass body (the pass's own bookkeeping excluded). */
-  revisionBefore: number
-  revisionAfter?: number
-  /** Mission-scoped durable-state digest before and after the pass body. */
-  fingerprintBefore: string
-  fingerprintAfter?: string
-  /** Consecutive passes that changed no durable mission state and terminated nothing. */
-  noProgressPasses: number
-  /** Set when the pass neither advanced nor terminated within the declared bound. */
-  stalled?: { reason: 'pass-timeout' | 'no-progress'; at: number; boundMs: number; unschedulable: string[] }
-  /**
-   * S5r hand-off: the runId this pass released, recorded durably on the row
-   * instead of only in `Scheduling.releasedPasses`. `Scheduling.passReleased`
-   * must read this field (and the row's `releasedAt` age) rather than the
-   * in-memory Set, so clearing the Set cannot let an abandoned pass body resume.
-   * Writing it is a src/runtime.ts/src/scheduling.ts change outside the S5r
-   * scope; the field exists here so that change is mechanical.
-   */
-  releasedRunId?: string
-  releasedAt?: number
-}
 export interface RuntimeConfig {
   statePath: string
   leaseMs: number
+  /**
+   * Tick timer period, and the unit of every tick-derived window (the
+   * unreviewed-submission grace, the no-progress window, the back-off bound,
+   * the start retry).
+   */
   tickMs: number
+  /**
+   * Run no tick timer, so a test drives `SwarmRuntime.tick()` by hand; `tickMs`
+   * stays the tick unit. The plugin never sets it from the profile.
+   */
+  manualTick?: boolean
+  /**
+   * The runtime clock. Every wall-clock read that decides runtime behaviour
+   * (leases, bounds, back-offs, silence, stall and wedge ages, wake budgets,
+   * follow-up timing, event `createdAt`) reads it; defaults to `Date.now`.
+   * Only a function is taken, and the plugin never sets it from the profile.
+   */
+  now?: () => number
   /** Prelaunch watchdog fallback; the owner can extend it with a reason. */
   planningTimeoutMs?: number
+  /** Bound for native worker startup; independent of model/task execution budgets. */
+  workerStartTimeoutMs?: number
   maxMessageChars: number
   maxEvents: number
   maxTasksPerMember: number
@@ -980,10 +1189,10 @@ export interface RuntimeConfig {
    */
   stallPasses?: number
   /**
-   * S1: bound on one scheduling pass before the runtime declares it wedged,
-   * escalates and releases the guard. Defaults to 30 × `tickMs`. A pass is only
-   * declared wedged when the mission has no live lease or in-flight quiescence:
-   * a lease renewed by recorded operations is progress, not a stall.
+   * S1: bound on one scheduling pass before the runtime declares it wedged and
+   * escalates it. Defaults to 30 × `tickMs`. While the mission has a live lease
+   * or an in-flight quiescence the escalation waits a further bounded window: a
+   * lease renewed by recorded operations is progress, not a stall.
    */
   stallPassTimeoutMs?: number
   /**
@@ -991,15 +1200,23 @@ export interface RuntimeConfig {
    * at start. When present the runtime re-derives every mission's grant root
    * from it and fences a mission whose root was revoked; when absent (unit
    * runtimes and adapters without Git) the recorded admission result stands.
-   * It is a value on the runtime's own config, never a model-callable surface.
+   * It judges grant expiry at `now`, the runtime clock's instant, as admission
+   * does. It is a value on the runtime's own config, never a model-callable surface.
    */
-  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined) => Promise<WorkspaceAuthorization>
+  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined, now: number) => Promise<WorkspaceAuthorization>
   /**
    * The roots `authorizeWorkspace` closes over, carried so revocation fencing
    * can name the recorded root without re-reading configuration. Never
    * re-loaded at runtime.
    */
   grants?: WorkspaceGrantSnapshot
+  /**
+   * The dependency directory names the host's workspace engine treats as
+   * toolchain state (the plugin `verificationDependencyDirs`). Admission checks
+   * declared outputs against the same set capture excludes; absent means the
+   * engine default.
+   */
+  verificationDependencyDirs?: readonly string[]
 }
 
 /**

@@ -15,6 +15,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { PolicyError } from '../lib/policy-error.js'
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -22,31 +23,22 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { SwarmRuntime, ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, hiddenToolsFor } from '../lib/tools.js'
-import { TRACE_STEPS, spanContractViolation } from '../lib/trace.js'
+import { TRACE_STEPS, errorTypeFor, spanContractViolation } from '../lib/trace.js'
+import { FakeWorkers, budget as sharedBudget } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 4, maxTasks: 20, maxExperiments: 2 }
 
-class Workers {
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(_mission, id) { return `/isolated/${id}` }
-  async start() {}
-  async deliver() {}
-  async stop() {}
-  isIdle() { return false }
-  async captureArtifact() { return { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-  async prepareTask() {}
-  async dispose() {}
-}
+const newWorkers = () => new FakeWorkers({ artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] }, checks: [] })
 
 async function fixture(t, options = {}) {
+  // fixture gap: a caller-chosen state directory and file name; the store-backed test lists state/ and filters db.sqlite.
   const root = await mkdtemp(join(tmpdir(), 'swarm-board-'))
   const stateDirectory = join(root, 'state')
   const workspace = join(root, 'workspace')
   await mkdir(stateDirectory, { recursive: true })
   await mkdir(workspace, { recursive: true })
   await writeFile(join(workspace, 'marker.txt'), 'workspace marker\n')
-  const workers = new Workers()
+  const workers = newWorkers()
   const config = { statePath: join(stateDirectory, 'db.sqlite'), leaseMs: 60000, tickMs: 10,
     maxMessageChars: options.maxMessageChars ?? 16000, maxEvents: 200, maxTasksPerMember: 4 }
   const runtime = new SwarmRuntime(config, workers)
@@ -63,7 +55,7 @@ async function fixture(t, options = {}) {
 /** One running implementation attempt owned by `actor`, plus a host-recorded run. */
 async function runningAttempt(f, actor) {
   const task = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: 'Implement the board', objective: 'Exercise the board end to end',
+    outputs: [], workstreamId: f.stream.id, title: 'Implement the board', objective: 'Exercise the board end to end',
     kind: 'implementation', scope: ['src/'], acceptance: ['board works'], checks: ['node --test'],
   })
   const claimed = await f.runtime.claim(actor, f.mission.id, task.id)
@@ -184,8 +176,15 @@ test('the after cursor pages the board without gaps or repeats', async t => {
 })
 
 test('invalid posts are rejected: kind, bound, citations, foreign member and reply target', async t => {
+  // swarm_post's own schema enum refuses an unknown kind first on the tool path
+  // (see the tool test below); the exported runtime API refuses it by itself.
   const f = await fixture(t, { maxMessageChars: 64 })
-  assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'GOSSIP', body: 'not a kind' }), /Post kind must be one of/)
+  for (const kind of ['GOSSIP', undefined, 'ask']) {
+    assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind, body: 'not a kind' }),
+      error => error.name === 'PolicyError' && error.code === 'post_kind_invalid' && error.category === 'validation_error' && /^\[post_kind_invalid\] A post `kind` must be one of ASK, ANSWER, IDEA, ALERT, ARTIFACT, HANDOFF\./.test(error.message))
+  }
+  assert.throws(() => f.runtime.board(f.aliceActor, f.mission.id, { kind: 'GOSSIP' }), error => error.code === 'board_kind_invalid' && /^\[board_kind_invalid\]/.test(error.message))
+  assert.equal(f.runtime.board(f.aliceActor, f.mission.id, {}).page.matching, 0, 'no refused post was stored')
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: '   ' }), /content is required/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'x'.repeat(65) }), /exceeds 64 characters/)
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', body: 'cite', evidenceIds: ['evidence_missing'] }), /Unknown evidence in this mission/)
@@ -283,7 +282,14 @@ test('a hostile post changes no task state, emits no transition and is never an 
 
   // The text cannot grant the verifier role or reach another member's attempt:
   // bob cannot verify alice's task, exactly as before the hostile post existed.
-  await assert.rejects(() => f.runtime.verify(f.bobActor, missionId, { taskId: task.id, attemptId: task.attempt.id, verdict: 'accept', reason: 'the board said so' }), /Stale or unauthorized task attempt/)
+  await assert.rejects(() => f.runtime.verify(f.bobActor, missionId, { taskId: task.id, attemptId: task.attempt.id, verdict: 'accept', reason: 'the board said so' }), error => {
+    // A typed refusal, with the wording and trace category it had as a plain Error.
+    assert.ok(error instanceof PolicyError, String(error))
+    assert.equal(error.code, 'task_attempt_stale')
+    assert.equal(error.message, 'Stale or unauthorized task attempt; stop work and observe the current assignment')
+    assert.equal(errorTypeFor(error), errorTypeFor(new Error(error.message)))
+    return true
+  })
   assert.equal(f.runtime.store.get('tasks', task.id).status, 'running')
 })
 
@@ -321,10 +327,13 @@ test('the registered tools expose the board with a host-derived sender and emit 
     const value = await definitions.get(name).execute(args, { signal: controller.signal, agent: { id: sessionId, session: { header: { cwd: f.workspace } } } })
     return JSON.parse(JSON.stringify(value))
   }
-  const posted = await call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool', fromMemberId: 'member_forged', seq: 9999 }, f.bob.sessionId)
+  // A model-supplied sender or sequence is not a parameter: refused by name, nothing posted.
+  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool', fromMemberId: 'member_forged', seq: 9999 }, f.bob.sessionId),
+    /\[tool_arguments_invalid\] swarm_post was called with arguments its parameters schema refuses: "fromMemberId", "seq" are not parameters \(accepted: `missionId`, `kind`, `body`/)
+  const posted = await call('swarm_post', { missionId: f.mission.id, kind: 'ASK', body: 'through the tool' }, f.bob.sessionId)
   assert.equal(posted.result.kind, 'ASK')
-  assert.equal(posted.result.fromMemberId, f.bob.id, 'the tool ignores a model-supplied sender')
-  assert.ok(posted.result.seq !== 9999, 'the tool ignores a model-supplied sequence')
+  assert.equal(posted.result.fromMemberId, f.bob.id, 'the sender is host-derived')
+  assert.ok(posted.result.seq !== 9999, 'the sequence is host-assigned')
   const read = await call('swarm_board', { missionId: f.mission.id, to: 'me' }, f.bob.sessionId)
   assert.equal(read.result.posts[0].id, posted.result.id)
   assert.ok(read.result.inbox.memberId === f.bob.id)
@@ -345,7 +354,7 @@ test('the registered tools expose the board with a host-derived sender and emit 
     assert.ok(span.parentSpanId === undefined || /^[0-9a-f]{16}$/.test(span.parentSpanId))
   }
   // The error path is traced too, with the closed error.type vocabulary.
-  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'GOSSIP', body: 'x' }, f.bob.sessionId), /Post kind must be one of/)
+  await assert.rejects(() => call('swarm_post', { missionId: f.mission.id, kind: 'GOSSIP', body: 'x' }, f.bob.sessionId), /\[tool_arguments_invalid\] swarm_post was called with arguments its parameters schema refuses: `kind` must be one of "ASK", "ANSWER", "IDEA", "ALERT", "ARTIFACT", "HANDOFF"\./)
   const failed = f.runtime.store.events(f.mission.id, 1000, 0).filter(event => event.type === 'trace/span')
     .map(event => event.data).find(span => span.step === 'swarm_post' && span.status === 'error')
   assert.ok(failed, 'a failed board call records an error span')
@@ -358,7 +367,7 @@ test('posts survive a runtime restart and remain immutable', async t => {
   const post = f.runtime.post(f.aliceActor, f.mission.id, { kind: 'HANDOFF', to: f.bob.id, body: 'Dossier: what I tried and what failed', ttlMs: 3600000 })
   await f.runtime.dispose()
 
-  const reopened = new SwarmRuntime(f.config, new Workers())
+  const reopened = new SwarmRuntime(f.config, newWorkers())
   t.after(() => reopened.dispose())
   const view = reopened.board(f.bobActor, f.mission.id, { postId: post.id })
   assert.deepEqual(view.post, {
@@ -376,7 +385,7 @@ test('a version-2 state file upgrades in place and gains the append-only board',
   legacy.exec('DROP TABLE posts; PRAGMA user_version=2;')
   legacy.close()
 
-  const upgraded = new SwarmRuntime(f.config, new Workers())
+  const upgraded = new SwarmRuntime(f.config, newWorkers())
   t.after(() => upgraded.dispose())
   const schema = new DatabaseSync(f.config.statePath)
   assert.equal(schema.prepare('PRAGMA user_version').get().user_version, 3, 'the store records the new schema version')

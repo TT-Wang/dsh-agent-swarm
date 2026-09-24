@@ -6,17 +6,17 @@ import { join, isAbsolute } from 'node:path'
 import { authorizeWorkspace, loadWorkspaceGrants, type WorkspaceGrant } from './authorization.ts'
 import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
-import { HarnessWorkers } from './harness-workers.ts'
+import { HarnessWorkers, installOwnerDeliveryFilter } from './harness-workers.ts'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import { DEFAULT_VERIFICATION_DEPENDENCY_DIRS } from './workspaces.ts'
 import { registerTools, SWARM_PROMPT } from './tools.ts'
 import { RoleScoper } from './roles.ts'
 import { OwnerReplyGuard } from './owner-reply.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
-import { liveLineageSubject, noticeFamily } from './notices.ts'
-import { installSwarmInvariant } from './invariant.ts'
-import { bindHostTelemetry, DEFAULT_TRACE_SPILL_LIMITS, TRACE_SPILL_RETENTION_DAYS, type HostTelemetrySink } from './trace.ts'
+import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
 import type { Budget } from './types.ts'
+import { reportHarnessSupport } from './host-version.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
 
@@ -28,6 +28,7 @@ export interface Config {
   leaseMs: number
   tickMs: number
   planningTimeoutMs: number
+  workerStartTimeoutMs: number
   maxMessageChars: number
   maxEvents: number
   maxAttempts: number
@@ -66,19 +67,9 @@ export interface Config {
   authorizedWorkspaces: WorkspaceGrant[]
   defaultBudget: Budget
   /**
-   * R17-G10: hard bound, in bytes, on the content-addressed span-payload spill
-   * beside the state file. Oldest payloads are evicted first, and an evicted
-   * payload is reported as `missing` by `traceMetrics`, never silently.
-   */
-  traceSpillMaxBytes: number
-  /** R17-G10: hard bound on the number of payload files held by the spill. */
-  traceSpillMaxFiles: number
-  /** R17-G10: days a payload file is retained; `0` disables age retention and keeps the size bound only. */
-  traceSpillRetentionDays: number
-  /**
    * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
-   * left unanswered and instructs with the exact call; `block` additionally
-   * refuses the owner's next step while the receipt stays open.
+   * left unanswered and instructs with the exact call. Legacy `block` is an
+   * alias: the owner's control channel always remains available to answer.
    */
   ownerReplyGuard: 'nudge' | 'block'
   /** Nudges spent on one unanswered owner question before the guard terminal; default 2. */
@@ -89,6 +80,7 @@ export const Config: z<Config> = z.object({
   workspacesRoot: z.string().default(join(homedir(), '.dsh/agent-swarm/workspaces')),
   leaseMs: z.natural().min(100).default(120000),
   tickMs: z.natural().min(10).default(1000),
+  workerStartTimeoutMs: z.natural().min(100).default(60000),
   planningTimeoutMs: z.natural().min(100).default(600000),
   maxMessageChars: z.natural().min(1000).default(16000),
   maxEvents: z.natural().min(1).default(100),
@@ -125,11 +117,6 @@ export const Config: z<Config> = z.object({
     maxTasks: z.natural().min(1).default(40),
     maxExperiments: z.natural().min(0).default(8),
   }),
-  // The spill bound defaults come from the trace module's declared limits, so
-  // the schema and the sweep cannot disagree about what the bound is.
-  traceSpillMaxBytes: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxBytes),
-  traceSpillMaxFiles: z.natural().min(1).default(DEFAULT_TRACE_SPILL_LIMITS.maxFiles),
-  traceSpillRetentionDays: z.natural().min(0).default(TRACE_SPILL_RETENTION_DAYS),
 })
 
 /**
@@ -158,6 +145,8 @@ export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
 
 /** Register the host service and all consumers under one disposable plugin fiber. */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  // An unsupported host is logged, not refused: 0.1.5-rc.3 enforces no peer range.
+  reportHarnessSupport(ctx.logger)
   if (!isAbsolute(config.statePath) || !isAbsolute(config.workspacesRoot)) throw new Error('Swarm statePath and workspacesRoot must be absolute')
   // Human authorization is read exactly once here, from plugin configuration.
   // Nothing below re-reads the profile and no model tool can reach this value.
@@ -168,30 +157,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // swap outside any live runtime's ownership.
   const restored = applyPendingRestore(config.statePath)
   const workers = new HarnessWorkers(ctx, { ...config, grants })
-  const runtime = new SwarmRuntime({ ...config, maxTasksPerMember: config.maxAttempts, grants,
-    authorizeWorkspace: (workspace, sessionCwd) => authorizeWorkspace(workspace, sessionCwd, grants) }, workers)
+  // The profile passes unknown keys through; the runtime clock and the manual
+  // tick are never among them.
+  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants,
+    authorizeWorkspace: (workspace, sessionCwd, now) => authorizeWorkspace(workspace, sessionCwd, grants, now) }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
   ctx.provide('swarm', runtime)
-  // R17-G9: the pre-append invariant pilot. The companion registers through the
-  // host's `ctx.invariants` facility (the same one twelve host packages use), so
-  // an owner-facing decision naming a subject whose lineage still has a live path
-  // is refused BEFORE its host session event is published. The judge maps one
-  // relayed swarm message to the shared lineage predicate (`liveLineageSubject`,
-  // the emission-time counterpart of the wake-precision classifier); a deployment
-  // that mounts no invariant registry keeps working and reports the pilot as not
-  // landed through `swarmInvariantStatus`.
-  installSwarmInvariant(ctx, message => {
-    const source = message.source
-    if (source?.kind !== 'swarm' || typeof source.deliveryId !== 'string') return undefined
-    const delivery = runtime.store.get('deliveries', source.deliveryId)
+  const pruneOwnerInbox = installOwnerDeliveryFilter(ctx, (sessionId, deliveryId) => {
+    const delivery = runtime.store.get('deliveries', deliveryId)
     if (delivery === undefined || delivery.to !== 'owner') return undefined
-    const family = noticeFamily(delivery)
-    const reason = liveLineageSubject(runtime, { missionId: delivery.missionId, family, subjects: delivery.subjects ?? [] })
-    if (reason === undefined) return undefined
-    return { missionId: delivery.missionId, family, subjects: [...(delivery.subjects ?? [])], reason, deliveryId: delivery.id }
+    const mission = runtime.store.get('missions', delivery.missionId)
+    if (mission?.ownerSessionId !== sessionId) return undefined
+    return runtime.ownerDeliveryRelevant(mission, delivery) ? runtime.ownerDeliveryContent(mission, delivery) : false
   })
+  ctx.effect(() => runtime.subscribe(missionId => {
+    const mission = runtime.store.get('missions', missionId)
+    const owner = mission === undefined ? undefined : ctx.agents.get(SessionId(mission.ownerSessionId))
+    if (owner !== undefined) pruneOwnerInbox(owner)
+  }), 'swarm.owner-inbox-relevance')
   // R17-G10: the host sink link exists before the recorder does; `registerTools`
   // builds the recorder from the runtime identity this binding is keyed on.
   installHostTelemetry(ctx, runtime)
@@ -199,7 +184,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
   new RoleScoper(ctx, runtime)
-  await runtime.start(grants)
   // L2: the owner side of the reply protocol. The guard observes owner turns and
   // reports questions the turn did not settle; it never answers on the owner's
   // behalf and never edits a message.
@@ -207,4 +191,5 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
   ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
+  await runtime.start(grants)
 }

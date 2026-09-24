@@ -6,7 +6,7 @@ import { readFile, rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import {
-  ReplayCorruptionError, ReplayDivergenceError, ReplayTruncationError, TraceContractError, TracePayloadStore,
+  ReplayCorruptionError, ReplayDivergenceError, ReplayTruncationError, TraceContractError,
   assertReplayParity, decodeDurableLog, orchestratorCommands, replayDigest, replayLabels, stableCommandKey, traceMetrics,
 } from '../lib/trace.js'
 import { runScenario } from '../scripts/replay/scenario.mjs'
@@ -113,9 +113,10 @@ test('the durable log replays the live recorded command sequence with zero provi
   assert.equal(events.some(event => event.type === 'trace/span'), true, 'the durable log carries span rows')
 
   const spans = events.filter(event => event.type === 'trace/span').map(event => event.data)
-  const metrics = await traceMetrics(spans, { payloads: new TracePayloadStore(scenario.payloadDir) })
+  const metrics = await traceMetrics(spans)
   assert.equal(metrics.contractCompliance, 1)
   assert.equal(metrics.firstViolatingStep, undefined)
   assert.equal(metrics.orphanParents, 0)
-  assert(metrics.payloads.stored > 0 && metrics.payloads.verified === metrics.payloads.stored)
+  assert.equal(metrics.payloads.referenced, spans.length * 2)
+  assert.equal(metrics.payloads.stored, 0, 'no recorded span spills payload bytes')
 })

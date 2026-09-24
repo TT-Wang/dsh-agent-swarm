@@ -14,11 +14,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { absoluteCheckPaths, classifyCheck, isCheckPattern, isSystemCheckPath, normalizeAbsolutePath, reconcileCheckPaths, shellSegments, shellTokens } from '../lib/admission.js'
 import { validatePlan } from '../lib/plans.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { runProcess } from '../lib/workspaces.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 200, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 200, maxTasks: 20 }
+// fixture gap: a bare temp directory cleaned up by t.after (makeRuntime also opens a runtime).
+async function tempDir(t, prefix) {
+  const directory = await mkdtemp(join(tmpdir(), prefix))
+  t.after(async () => rm(directory, { recursive: true, force: true }))
+  return directory
+}
 
 function plan(workspace, checks) {
   return {
@@ -35,8 +41,7 @@ function plan(workspace, checks) {
 }
 
 test('A2-01: the shell really resolves \\/ and // to the same host path the scanner must refuse', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-a2-01-'))
-  t.after(async () => rm(directory, { recursive: true, force: true }))
+  const directory = await tempDir(t, 'swarm-a2-01-')
   const target = join(directory, 'host-secret.txt')
   await writeFile(target, 'host state\n')
   for (const spelling of [target, `\\${target}`, `/${target}`, `//${target}`]) {
@@ -104,8 +109,7 @@ test('R11-04: the POSIX-ish tokenizer resolves quoting and escapes the way the s
 })
 
 test('A2-01: both spellings are refused at validatePlan', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-a2-01-plan-'))
-  t.after(async () => rm(directory, { recursive: true, force: true }))
+  const directory = await tempDir(t, 'swarm-a2-01-plan-')
   for (const check of ['cat \\/Users/tongtao/secret', 'cat //Users/tongtao/secret', 'test -f \\/Users/tongtao/secret']) {
     assert.throws(() => validatePlan(plan(directory, [check])), error => {
       assert.match(error.message, /\[check_absolute_path\]/, error.message)
@@ -117,8 +121,7 @@ test('A2-01: both spellings are refused at validatePlan', async t => {
 })
 
 test('R11-12 follow-up: quoted, backtick, eval and nested-quote host paths are refused; URL values and prose stay admitted', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-a2-01-quoted-'))
-  t.after(async () => rm(directory, { recursive: true, force: true }))
+  const directory = await tempDir(t, 'swarm-a2-01-quoted-')
   const host = '/Users/tongtao/secret'
   const refused = [
     `sh -c "cat ${host}"`,
@@ -151,20 +154,14 @@ test('R11-12 follow-up: quoted, backtick, eval and nested-quote host paths are r
 })
 
 test('A2-01: both spellings are refused at runtime.propose', async t => {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-a2-01-runtime-'))
-  t.after(async () => rm(directory, { recursive: true, force: true }))
-  const workers = {
-    bind(callbacks) { this.callbacks = callbacks },
-    async prepareWorkspace(mission, id) { return join(mission.workspace, id) },
-    async start() {}, async prepareTask() {}, async deliver() {}, async stop() {},
-    isIdle() { return false }, async dispose() {},
-  }
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
-  t.after(async () => { await runtime.dispose() })
+  const { dir: directory, runtime } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, id) { return join(mission.workspace, id) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, checkTimeoutMs: undefined },
+  })
   const owner = { sessionId: 'a2-01-owner' }
   const mission = runtime.create(owner, { title: 'Bypass', objective: 'Refuse host paths', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const propose = checks => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
+  const propose = checks => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks })
   for (const check of ['cat \\/Users/tongtao/secret', 'cat //Users/tongtao/secret']) {
     assert.throws(() => propose([check]), /\[check_absolute_path\]/, check)
@@ -172,23 +169,10 @@ test('A2-01: both spellings are refused at runtime.propose', async t => {
   assert.equal(propose(['node check.cjs']).checks[0], 'node check.cjs')
 })
 
-test('R11-06: the classifier judges an npm script by its resolved body, not its name', () => {
-  const scripts = {
-    'test:deepseek': 'node --expose-internals scripts/smoke-deepseek.mjs',
-    'test:sidebar-service': 'node scripts/smoke-better-sidebar.mjs',
-    'test:command-deepseek': 'node --expose-internals scripts/smoke-command-deepseek.mjs',
-    'test:validation-repair-web': 'node scripts/smoke-command-web.mjs --validation-repair',
-    disguised: 'npm run test:deepseek',
-    worker: 'node --test tests/*.test.mjs',
-  }
-  for (const name of ['test:deepseek', 'test:sidebar-service', 'test:command-deepseek', 'test:validation-repair-web']) {
-    const classification = classifyCheck(`npm run ${name}`, scripts)
-    assert.equal(classification.runnable, 'host-only', name)
-    assert.equal(classification.code, 'check_requires_host')
-    assert.ok(classification.requirement.length > 0)
-  }
-  assert.match(classifyCheck('npm run disguised', scripts).requirement, /resolves to/, 'a neutral name is refused by its resolved body')
-  assert.equal(classifyCheck('npm run disguised', scripts).runnable, 'host-only', 'a neutral name cannot launder a host-only body')
-  assert.equal(classifyCheck('npm run worker', scripts).runnable, 'worker')
-  assert.equal(classifyCheck('npm run test:webhook', scripts).runnable, 'worker', 'an unknown script is not refused by name')
+test('resolved confinement requirements are independent of npm script names', () => {
+  const scripts = { verify: 'node --test', smoke: 'sandbox-exec -p rule node --test', disguised: 'npm run smoke' }
+  assert.equal(classifyCheck('npm run verify', scripts).runnable, 'worker')
+  assert.match(classifyCheck('npm run disguised', scripts).requirement, /resolves to/)
+  assert.equal(classifyCheck('npm run disguised', scripts).runnable, 'host-only')
+  assert.equal(classifyCheck('npm run test:webhook', scripts).runnable, 'worker')
 })

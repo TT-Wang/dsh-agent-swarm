@@ -1,0 +1,188 @@
+/**
+ * A repair inherits the acceptance of the task it replaces. The host already
+ * holds the replaced task's criteria, so `swarm_propose { replaces }` stores
+ * them itself: each replaced task's list in order, then any criteria the
+ * proposal adds, without duplicates. Pre-fix the proposal had to copy them
+ * verbatim or be refused, and a repair that omitted acceptance was refused.
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { join } from 'node:path'
+import { registerTools } from '../lib/tools.js'
+import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
+
+async function fixture(t) {
+  const { dir: directory, runtime, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({
+      checks: [{ command: 'test', exitCode: 0, output: 'ok' }],
+      artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] },
+      async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) },
+    }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
+  const owner = { sessionId: 'inherit-owner' }
+  const mission = runtime.create(owner, { title: 'Inherit', objective: 'Repair rejected work', workspace: directory,
+    scope: ['src/'], acceptance: ['works', 'is documented'], budget })
+  const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
+  const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
+  const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  const actor = member => ({ sessionId: member.sessionId })
+  const stored = task => runtime.store.get('tasks', task.id)
+  // Built without an `acceptance` key unless one is passed, so omission is real.
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+    kind: 'implementation', scope: ['src/'], checks: ['test'], ...extra })
+  async function verdict(task, value) {
+    const claimed = await runtime.claim(actor(author), mission.id, task.id)
+    await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+      kind: 'verification', scope: ['src/'], acceptance: ['independent review'], checks: [], reviewOf: task.id })
+    const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
+    await runtime.verify(actor(reviewer), mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: value, reason: `Independent host checks ${value}` })
+    return stored(task)
+  }
+  return { runtime, budget, owner, mission, stream, propose, stored, verdict }
+}
+
+test('a repair proposed with no acceptance inherits exactly the replaced task\'s list', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'] })
+  assert.equal((await f.verdict(original, 'reject')).status, 'blocked')
+  const repair = f.propose({ title: 'Repair', replaces: [original.id] })
+  assert.deepEqual(repair.acceptance, ['works', 'is documented'])
+  assert.deepEqual(f.stored(repair).acceptance, ['works', 'is documented'], 'the durable row carries the inherited obligations')
+  const admitted = f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'task/proposed' && event.data.id === repair.id)
+  assert.deepEqual(admitted.data.inheritedAcceptance, ['works', 'is documented'], 'the admission event names every inherited criterion')
+  assert.deepEqual(f.stored(original).acceptance, ['works', 'is documented'], 'the replaced record is unchanged')
+})
+
+test('a repair adding one criterion stores the replaced list first, then the addition, without duplicates', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'] })
+  await f.verdict(original, 'reject')
+  const repair = f.propose({ title: 'Repair', replaces: [original.id], acceptance: ['handles empty input', 'works'] })
+  assert.deepEqual(f.stored(repair).acceptance, ['works', 'is documented', 'handles empty input'])
+})
+
+test('a repair of several withdrawn tasks inherits each list in order, de-duplicated across them', async t => {
+  const f = await fixture(t)
+  const first = f.propose({ title: 'First', acceptance: ['works', 'shared'] })
+  const second = f.propose({ title: 'Second', acceptance: ['shared', 'is documented'] })
+  for (const task of [first, second]) f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Merged into one repair' })
+  const repair = f.propose({ title: 'Merged repair', replaces: [first.id, second.id], acceptance: ['is documented', 'new'] })
+  assert.deepEqual(f.stored(repair).acceptance, ['works', 'shared', 'is documented', 'new'])
+})
+
+test('mission completion coverage sees the criteria a repair inherited', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original', acceptance: ['works', 'is documented'] })
+  await f.verdict(original, 'reject')
+  const current = () => f.runtime.store.get('missions', f.mission.id)
+  assert.match(f.runtime.completionError(current()), /unfinished or blocked/)
+  const repair = f.propose({ title: 'Repair', replaces: [original.id] })
+  assert.equal((await f.verdict(repair, 'accept')).status, 'accepted')
+  assert.equal(f.stored(original).status, 'cancelled', 'the accepted repair retires the blocked original')
+  assert.equal(f.runtime.completionError(current()), undefined, 'the inherited criteria cover the mission acceptance')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'Accepted inherited repair').status, 'completed')
+})
+
+test('a new task that replaces nothing is still refused without acceptance', async t => {
+  const f = await fixture(t)
+  assert.throws(() => f.propose({ title: 'No criteria' }), error => error.code === 'task_acceptance_required' && /^\[task_acceptance_required\] .*`acceptance`.*`swarm_propose`.*`replaces`/.test(error.message))
+  assert.throws(() => f.propose({ title: 'Empty replaces', replaces: [] }), /\[task_acceptance_required\]/, 'an empty replaces list is not a repair')
+  assert.throws(() => f.propose({ title: 'Empty criteria', acceptance: [] }), /acceptance must contain nonempty strings/, 'a malformed list keeps its existing refusal')
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 0, 'nothing was admitted')
+})
+
+test('a repair that leaves out a replaced criterion keeps it and names it on the admission event and in the swarm_propose result', async t => {
+  const f = await fixture(t)
+  // The owner withdrew the original because one criterion was a mistake, then
+  // proposed its repair without that criterion.
+  const original = f.propose({ title: 'Original', acceptance: ['works', 'supports IE11'] })
+  f.propose({ title: 'Dependent', acceptance: ['is documented'], dependencies: [original.id] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'IE11 criterion was a mistake' })
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.budget)
+  const tool = definitions.get('swarm_propose')
+  const exec = { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }
+  const call = async extra => {
+    const args = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Repair', objective: 'Implement', kind: 'implementation', scope: ['src/'], checks: ['test'], ...extra }
+    const value = await tool.execute(args, exec)
+    return { task: value.result, rendered: JSON.parse(tool.output.render(args, value)[0].text).result }
+  }
+  const proposed = id => f.runtime.store.events(f.mission.id, 500).find(event => event.type === 'task/proposed' && event.data.id === id)
+  const { task: repair, rendered } = await call({ title: 'Repair without IE11', replaces: [original.id], acceptance: ['works'], outputs: [] })
+  assert.deepEqual(f.stored(repair).acceptance, ['works', 'supports IE11'], 'the inheritance is kept')
+  assert.deepEqual(proposed(repair.id).data.inheritedAcceptance, ['supports IE11'], 'the admission event records what the host added')
+  assert.equal(f.stored(repair).inheritedAcceptance, undefined, 'the task row keeps its shape')
+  assert.equal(rendered.note, `Acceptance inherited from ${original.id} beyond the supplied list: "supports IE11".`)
+  assert.equal(rendered.note.split('\n').length, 1, 'one short line')
+  // Nothing added, nothing said: a repair restating every criterion, and a new task.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: repair.id, reason: 'Restate the criteria' })
+  const restated = await call({ title: 'Repair restating', replaces: [repair.id], acceptance: ['supports IE11', 'works'], outputs: [] })
+  assert.equal(proposed(restated.task.id).data.inheritedAcceptance, undefined)
+  assert.equal(restated.rendered.note, undefined)
+  const fresh = await call({ title: 'Fresh', acceptance: ['works'], outputs: [] })
+  assert.equal(proposed(fresh.task.id).data.inheritedAcceptance, undefined)
+  assert.equal(fresh.rendered.note, undefined)
+})
+
+test('a repair that omits outputs inherits every replaced task\'s declaration in order, and the swarm_propose result names them', async t => {
+  const f = await fixture(t)
+  const first = f.propose({ title: 'Report', acceptance: ['works'], outputs: ['src/report.md', 'src/shared.md'] })
+  const second = f.propose({ title: 'Appendix', acceptance: ['works'], outputs: ['src/shared.md', 'src/appendix.md'] })
+  const analysis = f.propose({ title: 'Analysis', acceptance: ['works'], outputs: [] })
+  for (const task of [first, second, analysis]) f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Merged into one repair' })
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.budget)
+  const tool = definitions.get('swarm_propose')
+  const exec = { agent: { id: f.owner.sessionId }, signal: new AbortController().signal }
+  const call = async extra => {
+    const args = { missionId: f.mission.id, workstreamId: f.stream.id, title: 'Repair', objective: 'Implement', kind: 'implementation', scope: ['src/'], checks: ['test'], ...extra }
+    const value = await tool.execute(args, exec)
+    return { task: value.result, rendered: JSON.parse(tool.output.render(args, value)[0].text).result }
+  }
+  // Omitted: the union of every declaration, in `replaces` order, de-duplicated like acceptance.
+  const merged = await call({ title: 'Merged repair', replaces: [first.id, second.id, analysis.id], acceptance: ['works'] })
+  assert.deepEqual(f.stored(merged.task).outputs, ['src/report.md', 'src/shared.md', 'src/appendix.md'], 'no replaced task\'s deliverable is dropped')
+  assert.equal(merged.rendered.note, `Outputs inherited from ${first.id}, ${second.id}, ${analysis.id}: ["src/report.md","src/shared.md","src/appendix.md"]; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
+  assert.equal(merged.rendered.note.split('\n').length, 1, 'one short line')
+  // Explicit: the proposal's own list replaces the inherited one, and nothing is said.
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: merged.task.id, reason: 'The repair moves the report' })
+  const moved = await call({ title: 'Moved repair', replaces: [merged.task.id], acceptance: ['works'], outputs: ['src/notes/report.md'] })
+  assert.deepEqual(f.stored(moved.task).outputs, ['src/notes/report.md'])
+  assert.equal(moved.rendered.note, undefined)
+  // Both inheritances in one line.
+  const lost = f.propose({ title: 'Lost', acceptance: ['works', 'is documented'], outputs: ['src/lost.md'] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: lost.id, reason: 'Repair it' })
+  const both = await call({ title: 'Both', replaces: [lost.id], acceptance: ['works'] })
+  assert.equal(both.rendered.note, `Acceptance inherited from ${lost.id} beyond the supplied list: "is documented". Outputs inherited from ${lost.id}: ["src/lost.md"]; explicit outputs on a repair replace this list, and the owner can amend it with swarm_control changes.outputs.`)
+  // The schema text says an explicit list replaces the inherited one.
+  assert.match(tool.description, /repair inherits their acceptance and declared outputs, and explicit outputs replace the inherited ones/)
+  assert.match(tool.parameters.properties.outputs.description, /On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
+})
+
+test('a malformed replaces is a typed refusal before any replaced task is read', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original', acceptance: ['works'] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: original.id, reason: 'Repair it' })
+  const refusedAs = error => error.code === 'task_replaces_invalid' && error.category === 'validation_error'
+    && /^\[task_replaces_invalid\] .*Pass `replaces`.*`swarm_propose`/.test(error.message)
+  for (const replaces of [original.id, { 0: original.id, length: 1 }, 7, [''], [original.id, 42]]) {
+    assert.throws(() => f.propose({ title: 'Repair', replaces }), refusedAs, `replaces ${JSON.stringify(replaces)} without acceptance`)
+    assert.throws(() => f.propose({ title: 'Repair', replaces, acceptance: ['works'] }), refusedAs, `replaces ${JSON.stringify(replaces)} with acceptance`)
+  }
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 1, 'nothing was admitted')
+})
+
+test('an unknown replaces id never hides an earlier field error, and is itself a typed refusal', async t => {
+  const f = await fixture(t)
+  const replaces = ['task_unknown']
+  assert.throws(() => f.propose({ title: '', replaces }), /title is required/)
+  assert.throws(() => f.propose({ objective: ' ', replaces }), /objective is required/)
+  assert.throws(() => f.propose({ replaces, acceptance: ['works', ''] }), /acceptance must contain nonempty strings/)
+  assert.throws(() => f.propose({ kind: 'bogus', replaces }), error => error.code === 'task_kind_invalid')
+  assert.throws(() => f.propose({ scope: [], replaces }), /task\.scope must contain nonempty strings/)
+  assert.throws(() => f.propose({ replaces }), error => error.code === 'task_not_in_mission', 'with every field valid the unknown id is refused, typed')
+  assert.equal(f.runtime.store.list('tasks', f.mission.id).length, 0, 'nothing was admitted')
+})

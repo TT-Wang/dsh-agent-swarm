@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ReactNode } from 'react'
+import { currentSessionId } from './navigation.ts'
 
 /** Public Better Sidebar 0.18 service subset. Kept structural so an optional
  * client integration does not pull its newer Harness peers into this plugin.
@@ -43,8 +44,9 @@ interface BetterSidebar {
 
 export interface SidebarAdapter {
   subscribe(listener: () => void): () => void
+  /** Whether this provider owns the registered tab surface, independent of visibility. */
   getSnapshot(): boolean
-  /** Focus and reveal the registered tab through the host's public descriptor. */
+  /** Claim an explicit reveal request; a native surface may still be mounting. */
   open(): boolean
   dispose(): void
 }
@@ -72,8 +74,7 @@ function revealedDescriptor(descriptor: SidebarTabDescriptor, service: BetterSid
 }
 
 /** Contribute a tab only while the optional sidebar service is present.
- * Registration follows Cordis service replacement and unload; subscribers can
- * hand layout ownership back to the standalone dock when the service leaves.
+ * Registration follows Cordis service replacement and unload.
  * The descriptor receives the sidebar's exact scope, including pinned tabs.
  */
 export function createSidebarAdapter(ctx: Context, descriptor: () => SidebarTabDescriptor): SidebarAdapter {
@@ -129,15 +130,15 @@ export function createSidebarAdapter(ctx: Context, descriptor: () => SidebarTabD
 }
 
 /* ------------------------------------------------------------------------- *
- * The host's right sidebar (the 0.1.5 line).
+ * The host's right sidebar.
  *
  * The Files pane and this panel are the same mechanism: a tab TYPE registered
  * with the `sidebarRightTabs` registry (id, kind, and the title its chip shows),
  * the panel BODY in the keyed `sidebar.right.pane.tab` seat under that id, and
  * navigation through the `sidebarRight` controller (`openTab(kind)`). Nothing
- * here imports the sidebar package: the ids, keys and slot names are structural,
- * so 0.1.2/0.1.3 — which have no right sidebar — simply never fire these injects
- * and the standalone dock keeps carrying the surface.
+ * here imports the sidebar package, which is not a declared peer: the ids, keys
+ * and slot names are structural, and a profile without the right sidebar never
+ * fires these injects.
  * ------------------------------------------------------------------------- */
 
 /** The slot service, restricted to what this adapter uses. */
@@ -152,6 +153,8 @@ interface SlotRegistrar {
  * user reaches a page type that recognizes no resource address.
  */
 export interface RightSidebarGuideEntry {
+  /** Stable within the tab type; the registry requires it and rejects duplicates. */
+  id: string
   order: number
   title: () => string
   description?: () => string
@@ -178,20 +181,9 @@ interface RightSidebarController {
   openTab(kind: string, options?: Record<string, unknown>): void
 }
 
-/** The session list, restricted to the signal that a session surface can mount. */
-interface SessionList {
-  subscribe?(listener: () => void): () => void
-  getSnapshot?(): { current?: string }
-}
-
 /** How long a tab that could not open yet keeps trying (60 x 500ms). */
 const REVEAL_ATTEMPTS = 60
 const REVEAL_INTERVAL_MS = 500
-
-/** The layout service, restricted to revealing the right pane. */
-interface LayoutReveal {
-  openRightbar?(track: boolean, fullscreen: boolean): void
-}
 
 export interface RightSidebarDescriptor {
   /** Registry id: also the key both seats register under. */
@@ -204,32 +196,28 @@ export interface RightSidebarDescriptor {
   /** Ascending order on the guide page. */
   order?: number
   component: (props: SidebarTabProps) => ReactNode
+  /** Persistent native navigation action, including the sessionless home. */
+  launcher?: (props: { wide: boolean; onOpen(): void }) => ReactNode
 }
 
 /** The host binds these standard session props and the tab hook at the body seat.
- * Kept structural so earlier supported releases need no sidebar-right import. */
+ * Kept structural so the plugin needs no sidebar-right import. */
 interface RightSidebarBodyProps {
   sessionId: string
   useTabInfo(): { tab: { visible: boolean } }
 }
 
 /**
- * Contribute one right-sidebar tab. Integration requires a successful reveal
- * through the current provider; until then the caller retains its fallback.
+ * Register without revealing: the native controller owns both tab navigation
+ * and layout. Only an explicit open request may wait for a mounting surface.
  * The body projects the host tab's session and visibility into the monitor.
  */
 export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightSidebarDescriptor): SidebarAdapter {
   const listeners = new Set<() => void>()
+  const sessions = (ctx as { sessions?: Context['sessions'] }).sessions
   let disposed = false
-  let current: {
-    opened: boolean
-    scheduleReveal(reset?: boolean): void
-    open(): boolean
-    release(): void
-  } | undefined
+  let current: { retry(): void; open(): boolean; release(): void } | undefined
   const notify = () => { for (const listener of [...listeners]) listener() }
-  // A navigation success belongs to this registry AND controller lifetime.
-  // Replacing either service must release the previous reveal and retry state.
   const dependency = ctx.inject(['slots', 'sidebarRightTabs', 'sidebarRight'], ready => ready.effect(() => {
     if (disposed) return () => {}
     const slots = ready.get('slots') as unknown as SlotRegistrar | undefined
@@ -240,77 +228,80 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
     const tab = descriptor()
     const releaseType = registry.register({
       id: tab.id, kind: tab.kind, title: () => tab.label(),
-      guide: [{ order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
+      guide: [{ id: 'open', order: tab.order ?? 80, title: () => tab.label(), ...(tab.description === undefined ? {} : { description: tab.description }) }],
     })
-    let releaseBody: () => void
+    let releaseBody: (() => void) | undefined
+    let releaseLauncher: (() => void) | undefined
     try {
       releaseBody = slots.inject('sidebar.right.pane.tab', () => slots.register({ name: 'sidebar.right.pane.tab', key: tab.id },
         function SwarmTabBody({ sessionId, useTabInfo }: RightSidebarBodyProps) {
           const { tab: info } = useTabInfo()
           return tab.component({ scope: { sessionId }, visible: info.visible })
         }))
-    } catch (error) { releaseType(); throw error }
+      if (tab.launcher) releaseLauncher = slots.inject('sidebar.footer.action', () => slots.register({
+        name: 'sidebar.footer.action', id: `${tab.id}-launcher`, order: tab.order ?? 80,
+      }, function SwarmLauncher({ wide }: { wide: boolean }) {
+        return tab.launcher!({ wide, onOpen: () => { entry.open() } })
+      }))
+    } catch (error) { releaseLauncher?.(); releaseBody?.(); releaseType(); throw error }
     let timer: ReturnType<typeof setInterval> | undefined
+    let request: { sessionId?: string } | undefined
     let attempts = 0
     let released = false
-    const stopRetry = () => { if (timer !== undefined) { clearInterval(timer); timer = undefined } }
-    const live = () => !disposed && !released && current === entry
-    const reveal = (): boolean => {
-      if (!live()) return false
-      try {
-        const layout = ready.get('layout') as unknown as LayoutReveal | undefined
-        layout?.openRightbar?.(true, false)
-      } catch { /* Layout optional; the tab still opens below. */ }
-      try { controller.openTab(tab.kind, { revealIfOpened: true }); return true }
-      catch { return false }
+    const stopRetry = () => {
+      if (timer !== undefined) { clearInterval(timer); timer = undefined }
+      request = undefined
     }
+    const live = () => !disposed && !released && current === entry
     const attempt = (): boolean => {
-      if (!live() || entry.opened) return true
-      if (!reveal()) return false
-      entry.opened = true
-      stopRetry()
-      notify()
-      return true
+      if (!live() || request === undefined) return true
+      // A late mount for a different conversation cannot inherit this reveal.
+      if (request.sessionId !== undefined && request.sessionId !== currentSessionId(sessions)) {
+        stopRetry()
+        return true
+      }
+      try {
+        // Public navigation throws until a seat mounts. openTabIn is an internal
+        // tab action that silently no-ops before adoption, so it cannot acknowledge a reveal.
+        controller.openTab(tab.kind, { revealIfOpened: true })
+        stopRetry()
+        return true
+      } catch { return false }
     }
     const entry: NonNullable<typeof current> = {
-      opened: false,
-      scheduleReveal(reset = false) {
-        if (!live() || entry.opened) return
-        if (reset) attempts = 0
-        if (attempt() || timer !== undefined) return
-        timer = setInterval(() => {
+      retry() { if (request !== undefined) attempt() },
+      open() {
+        if (!live()) return false
+        stopRetry()
+        // Global pages unmount the session surface. An explicit launch returns
+        // to the current conversation; native sidebar state still owns geometry.
+        const layout = ready.get('layout') as { selectPanel?(panel: null): void } | undefined
+        layout?.selectPanel?.(null)
+        request = { sessionId: currentSessionId(sessions) }
+        attempts = 0
+        if (!attempt()) timer = setInterval(() => {
           attempts += 1
           if (attempt() || attempts >= REVEAL_ATTEMPTS) stopRetry()
         }, REVEAL_INTERVAL_MS)
-      },
-      open() {
-        if (!live()) return false
-        if (entry.opened) {
-          entry.opened = reveal()
-          if (!entry.opened) notify()
-        }
-        entry.scheduleReveal(true)
-        return entry.opened
+        // Native ownership includes this bounded pending intent. Opening a
+        // fallback at the same time would create two competing side panels.
+        return true
       },
       release() {
         if (released) return
         released = true
         stopRetry()
-        entry.opened = false
         if (current === entry) { current = undefined; notify() }
-        try { releaseBody() } finally { releaseType() }
+        try { releaseLauncher?.() } finally { try { releaseBody?.() } finally { releaseType() } }
       },
     }
     current = entry
-    entry.scheduleReveal()
+    notify()
     return entry.release
   }, 'agent-swarm: right sidebar tab'))
-  // Only a live provider owns a retry budget. Session notifications on older
-  // hosts or during provider removal cannot start orphan reveal loops.
-  const sessions = (ctx as { sessions?: { list?: SessionList } }).sessions?.list
   let stopWatchingSessions: (() => void) | undefined
-  if (typeof sessions?.subscribe === 'function') {
-    try { stopWatchingSessions = sessions.subscribe(() => current?.scheduleReveal(true)) }
+  if (typeof sessions?.list?.subscribe === 'function') {
+    try { stopWatchingSessions = sessions.list.subscribe(() => current?.retry()) }
     catch { stopWatchingSessions = undefined }
   }
   const dispose = () => {
@@ -325,7 +316,7 @@ export function createRightSidebarAdapter(ctx: Context, descriptor: () => RightS
   ctx.effect(() => dispose, 'agent-swarm: right sidebar adapter')
   return {
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
-    getSnapshot: () => current?.opened ?? false,
+    getSnapshot: () => current !== undefined,
     open: () => current?.open() ?? false,
     dispose,
   }

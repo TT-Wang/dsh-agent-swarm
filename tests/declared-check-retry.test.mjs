@@ -23,7 +23,6 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
 import { setup, taskOf, events, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers } from './faults/harness.mjs'
 
 const CHECK = 'node --test tests/first.test.mjs'
@@ -35,7 +34,7 @@ async function verifySource(f, task) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+    outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
     reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
   })
   const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -120,7 +119,7 @@ test('S15 pair: the repeated-failure block does not admit a second review or re-
       .filter(delivery => delivery.to === 'owner' && typeof delivery.content === 'string')
       .find(delivery => delivery.content.includes(task.id))
     assert.ok(notice, 'the block wakes the owner with the task named')
-    assert.match(notice.content, /Repair it with a replacement task or adjust the plan/)
+    assert.match(notice.content, new RegExp(`Rework it in place with swarm_control\\(action: "resume", taskId: "${task.id}", reason\\)[^]*replaces: \\["${task.id}"\\]`), 'the rework is offered before a replacement')
     assert.match(notice.content, /blocked by independent verification/, 'the notice names the cause, not only the symptom')
     assert.equal(reviewsFor().length, 1, 'one review, admitted once')
 
@@ -154,7 +153,7 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
     const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
     const review = f.runtime.propose(f.owner, f.mission.id, {
-      workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
+      outputs: [], workstreamId: f.stream.id, title: `Review ${task.title}`, objective: 'Independent review', kind: 'verification',
       reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
     })
     const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -175,7 +174,7 @@ test('R16-G5a: the failed first pass survives a lost process and the retry compl
 
     // Phase 2: a fresh runtime on the same store, as after a host restart. The
     // retry pass completes the pair without rewriting the durable first pass.
-    revived = new SwarmRuntime({ statePath: join(f.dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000, maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000 }, new FakeWorkers())
+    revived = new SwarmRuntime(f.runtime.config, new FakeWorkers())
     const recorded = revived.declaredChecks.recordRuns(f.mission.id, { memberId: f.reviewer.id, taskId: review.id, attemptId, commit }, [passing()])
     assert.equal(recorded.length, 1, 'the deciding pass is the returned run')
     const after = revived.store.list('tool_runs', f.mission.id).filter(run => run.taskId === review.id)

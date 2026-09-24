@@ -4,7 +4,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
 import { currentProgress, recentProgress, acceptanceSummary, activityDuration } from '../lib/types/client/progress.js'
-import { MissionProgress } from '../lib/types/client/MissionProgress.js'
+import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { activityGroups } from '../lib/types/client/projection.js'
 import { ActivityPanel } from '../lib/types/client/ActivityPanel.js'
@@ -18,6 +18,7 @@ function render(component, props, chinese = false) {
 }
 function withActivity(kind = 'model') {
   const snapshot = uiSnapshot()
+  snapshot.tasks[1].epoch = snapshot.tasks[1].attempt.epoch
   snapshot.members[1].activity = { id: 'native-operation', kind, startedAt: snapshot.mission.updatedAt - 5000, updatedAt: snapshot.mission.updatedAt - 2000, attemptId: snapshot.tasks[1].attempt.id }
   return snapshot
 }
@@ -57,7 +58,7 @@ test('retry, verification and transport state are separate from task lifecycle',
   const offline = currentProgress(snapshot, 'reconnecting')
   assert.equal(offline.stale, true)
   assert.equal(offline.label, 'Waiting to retry', 'transport failure must not declare task failure')
-  const markup = render(MissionProgress, { snapshot, live: true, connection: 'reconnecting' })
+  const markup = render(MissionOverview, { snapshot, live: true, connection: 'reconnecting' })
   assert.match(markup, /Last observed state/)
   assert.match(markup, /Current execution is unconfirmed/)
   assert.match(markup, /Retry scheduled for/)
@@ -84,10 +85,10 @@ test('historical duration uses the recorded native interval and formatting clamp
   assert.deepEqual(activityDuration(1000, 66_900), { minutes: 1, seconds: 5 })
   assert.deepEqual(activityDuration(5000, 2000), { minutes: 0, seconds: 0 })
   const snapshot = withActivity()
-  const historical = render(MissionProgress, { snapshot, live: false })
+  const historical = render(MissionOverview, { snapshot, live: false })
   assert.match(historical, /Elapsed <!-- -->3sec|Elapsed 3sec/)
   assert.match(historical, /Recorded state/)
-  const offline = render(MissionProgress, { snapshot, live: true, connection: 'reconnecting' })
+  const offline = render(MissionOverview, { snapshot, live: true, connection: 'reconnecting' })
   assert.match(offline, /Elapsed <!-- -->3sec|Elapsed 3sec/)
 })
 
@@ -350,15 +351,14 @@ test('OWNER PASS 2026-09-11 #2: Pause and Stop share one horizontal control row'
 
 test('compact member rows lead with the portrait and expose the assignment and conversation action', () => {
   const markup = render(SwarmBoard, { snapshot: uiSnapshot(), onOpenWorker() {} })
-  const start = markup.indexOf('<button class="sw-live-member"')
-  assert.ok(start > 0, 'the current assignment stays visible and clickable')
-  const card = markup.slice(start, markup.indexOf('</button>', start))
+  const card = markup.match(/<button\b[^>]*class="sw-live-member"[^>]*>[\s\S]*?<\/button>/)?.[0]
+  assert.ok(card, 'the current assignment stays visible and clickable')
   assert.match(card, /data-swarm-member="b"/)
   assert.match(card, /aria-label="Open conversation: Nova"/, 'opening the actual member conversation is accessible')
   assert.match(card, /class="sw-agent-avatar" data-agent-identity="b"[^>]*width:40px;height:40px/, 'the geometric portrait stays readable in a compact row')
   assert.ok(card.indexOf('sw-agent-avatar') < card.indexOf('sw-live-member-heading'), 'the avatar anchors the identity')
-  assert.match(card, /<strong>Nova<\/strong><small>Runtime implementation<\/small>/)
-  assert.match(card, /class="sw-live-task">Implement lease renewal and fencing</)
+  assert.match(card, /<strong\b[^>]*>Nova<\/strong><small\b[^>]*>Runtime implementation<\/small>/)
+  assert.match(card, /class="sw-live-task"[^>]*>Implement lease renewal and fencing</)
   assert.match(card, /data-state="stale"/, 'a recorded snapshot labels execution as unconfirmed')
   assert.doesNotMatch(card, /data-moving="true"|sw-agent-avatar-ring|class="sw-bar"/, 'a historical row has neither busy animation nor a budget bar')
   assert.doesNotMatch(card, /initials/, 'and no initials block returns')

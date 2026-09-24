@@ -10,10 +10,11 @@ import assert from 'node:assert/strict'
 import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { Workspaces, runProcess } from '../lib/workspaces.js'
+import { runProcess } from '../lib/workspaces.js'
 import { applyDelivery } from '../lib/delivery.js'
 import { confinedCheckArgv } from '../lib/harness-workers.js'
 import { subprocessSeam } from './subprocess-seam.mjs'
+import { makeWorkspaces } from './faults/harness.mjs'
 
 const git = async (cwd, ...args) => {
   const result = await runProcess(['git', '-c', 'user.name=Swarm Test', '-c', 'user.email=swarm-test@localhost', '-c', 'commit.gpgsign=false', ...args], { subprocess: subprocessSeam, cwd, timeoutMs: 30000, maxBytes: 100000 })
@@ -44,7 +45,7 @@ async function workspaceFixture(t, { links = {}, options = {} } = {}) {
     await git(source, 'add', '-A')
     await git(source, 'commit', '-m', 'baseline links')
   }
-  const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot: path.join(temp, 'worktrees'), checkTimeoutMs: 30000, maxCheckOutputBytes: 32000, confineCheck: argv => argv, ...options })
+  const workspaces = makeWorkspaces(temp, options)
   const mission = { id: 'mission-isolation', workspace: source }
   const member = { id: 'member-one', missionId: mission.id, workspace: await workspaces.prepareWorkspace(mission, 'member-one') }
   const task = { id: 'task-one', missionId: mission.id, epoch: 1, title: 'Isolation guard', kind: 'implementation', scope: ['**'], checks: [], status: 'running' }
@@ -133,15 +134,15 @@ test('F-C1: delivery materializes a chain that stays inside the repository', asy
   assert.equal(await readlink(path.join(source, 'src', 'chain')), '../a')
 })
 
-test('F-29: a declared check runs only when the host reports full enforcement', () => {
+test('F-29: a declared check runs only when the host reports full enforcement', async () => {
   const calls = []
   const full = { confine: (argv, policy) => { calls.push({ argv, policy }); return { argv: ['wrapped', ...argv], enforcement: 'full' } } }
-  assert.deepEqual(confinedCheckArgv(full, ['/bin/sh', '-c', 'true'], '/checkout'), ['wrapped', '/bin/sh', '-c', 'true'])
+  assert.deepEqual(await confinedCheckArgv(full, ['/bin/sh', '-c', 'true'], '/checkout'), ['wrapped', '/bin/sh', '-c', 'true'])
   assert.deepEqual(calls[0].policy, { mode: 'workspace-write', workspaceRoot: '/checkout' }, 'the check is confined to the verification checkout, not the source')
   for (const enforcement of ['partial', 'none', undefined]) {
     let ran = false
     const refusing = { confine: argv => { ran = true; return { argv, enforcement } } }
-    assert.throws(() => confinedCheckArgv(refusing, ['/bin/sh', '-c', 'true'], '/checkout'), /full sandbox enforcement/, String(enforcement))
+    await assert.rejects(() => confinedCheckArgv(refusing, ['/bin/sh', '-c', 'true'], '/checkout'), /full sandbox enforcement/, String(enforcement))
     assert.equal(ran, true, 'the provider is consulted, never bypassed')
   }
 })

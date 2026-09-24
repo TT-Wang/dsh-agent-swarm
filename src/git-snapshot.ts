@@ -15,6 +15,8 @@ interface SourceState {
   head: string
   fingerprint: string
   stagedOnly: string[]
+  removedFromIndex: string[]
+  explicitPresent: string[]
 }
 class ChangedDuringSnapshot extends Error {}
 const paths = (value: string): string[] => value.split('\0').filter(Boolean)
@@ -25,7 +27,7 @@ async function digestFile(file: string, signal?: AbortSignal): Promise<string> {
   return digest.digest('hex')
 }
 
-async function sourceState(source: string, git: SnapshotGit, signal?: AbortSignal): Promise<SourceState> {
+async function sourceState(source: string, git: SnapshotGit, signal?: AbortSignal, includePaths: readonly string[] = []): Promise<SourceState> {
   const head = await git(['rev-parse', 'HEAD^{commit}'])
   if (await git(['ls-files', '--unmerged', '-z'])) throw new Error('Resolve Git merge conflicts before creating a swarm snapshot')
   const sparse = await git(['config', '--bool', '--get', 'core.sparseCheckout']).catch(() => '')
@@ -46,7 +48,9 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
   }))
   const digest = createHash('sha256').update(head).update('\0').update(index)
   const stagedOnly: string[] = []
-  for (const filename of [...new Set([...headPaths, ...tracked, ...untracked])].sort()) {
+  const explicitPresent: string[] = []
+  const explicit = new Set(includePaths)
+  for (const filename of [...new Set([...tracked, ...untracked, ...includePaths])].sort()) {
     signal?.throwIfAborted()
     if (filename.endsWith('/')) throw new Error(`Nested repositories cannot be captured as swarm snapshots: ${filename}`)
     const absolute = path.join(source, filename)
@@ -61,6 +65,12 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
     })
     digest.update(JSON.stringify([filename, stat?.mode ?? null]))
     if (stat === undefined) continue
+    // Explicit recovery hints name files only. Never follow an ignored directory
+    // (dependencies or credentials can live inside it) or a symlink ancestor.
+    if (explicit.has(filename) && !trackedSet.has(filename) && !untracked.includes(filename)) {
+      if (!stat.isFile() && !stat.isSymbolicLink()) continue
+      explicitPresent.push(filename)
+    }
     if (submodules.has(filename)) {
       // A clean gitlink is preserved; dirty or moved submodule state has no
       // faithful single-repository snapshot representation. An uninitialized
@@ -102,11 +112,13 @@ async function sourceState(source: string, git: SnapshotGit, signal?: AbortSigna
     if ((stat.isFile() || stat.isSymbolicLink()) && trackedSet.has(filename) && !headPaths.has(filename)) stagedOnly.push(filename)
     digest.update('\0')
   }
-  return { head, fingerprint: digest.digest('hex'), stagedOnly }
+  return { head, fingerprint: digest.digest('hex'), stagedOnly, explicitPresent, removedFromIndex: [...headPaths].filter(filename => !trackedSet.has(filename)) }
 }
 
-/** Capture stable tracked and nonignored untracked content without touching the real index. */
-export async function captureGitSnapshot(source: string, directory: string, git: SnapshotGit, signal?: AbortSignal): Promise<GitSnapshot> {
+/** Capture stable working content without touching the real index. Explicit file
+ * hints are used only for private task recovery; baseline callers omit them. */
+export async function captureGitSnapshot(source: string, directory: string, git: SnapshotGit, signal?: AbortSignal, includePaths: readonly string[] = []): Promise<GitSnapshot> {
+  if (includePaths.some(name => !name || path.isAbsolute(name) || /[\u0000-\u001f]/.test(name) || name.split('/').some(part => !part || part === '.' || part === '..' || part.toLowerCase() === '.git'))) throw new Error('Snapshot recovery paths must be literal relative files outside Git metadata')
   await mkdir(directory, { recursive: true, mode: 0o700 })
   for (let attempt = 0; attempt < 3; attempt++) {
     signal?.throwIfAborted()
@@ -114,19 +126,40 @@ export async function captureGitSnapshot(source: string, directory: string, git:
     const forcedPaths = `${index}.paths`
     let before: SourceState | undefined
     try {
-      before = await sourceState(source, git, signal)
+      before = await sourceState(source, git, signal, includePaths)
       const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: '1' }
       await git(['read-tree', before.head], env)
+      // Seed trackedness from the current index, not historical HEAD. A file
+      // intentionally untracked and ignored must not re-enter the snapshot.
+      for (let offset = 0; offset < before.removedFromIndex.length; offset += 64) {
+        await git(['update-index', '--force-remove', '--', ...before.removedFromIndex.slice(offset, offset + 64)], env)
+      }
       await git(['add', '--all', '--', '.'], env)
       // Already-tracked additions may match ignore rules. They remain part of
       // the user's working state even though a fresh private index lacks them.
-      if (before.stagedOnly.length) {
-        await writeFile(forcedPaths, before.stagedOnly.join('\0') + '\0', { mode: 0o600, flag: 'wx' })
+      const included = [...new Set([...before.stagedOnly, ...before.explicitPresent])]
+      if (included.length) {
+        await writeFile(forcedPaths, included.join('\0') + '\0', { mode: 0o600, flag: 'wx' })
         await git(['add', '--force', `--pathspec-from-file=${forcedPaths}`, '--pathspec-file-nul'], env)
       }
+      // `git add` exits 0 when a literal pathspec matches nothing, which is what
+      // a hint spelled in a different letter case than the file on a
+      // case-folding filesystem does: `lstat` finds the file, the pathspec does
+      // not. A present hint missing from the private index would be a silent
+      // loss of the file it names, so it fails the snapshot instead.
+      for (let offset = 0; offset < before.explicitPresent.length; offset += 64) {
+        const batch = before.explicitPresent.slice(offset, offset + 64)
+        const recorded = paths(await git(['ls-files', '--cached', '-z', '--', ...batch], env))
+        const lost = batch.find(name => !recorded.includes(name))
+        if (lost !== undefined) throw new Error(`Snapshot recovery path ${JSON.stringify(lost)} is present in the worktree but was not recorded in the snapshot; name it in the spelling the filesystem stores`)
+      }
       const tree = await git(['write-tree'], env)
-      const after = await sourceState(source, git, signal)
+      const after = await sourceState(source, git, signal, includePaths)
       if (before.fingerprint !== after.fingerprint) continue
+      // A transient v1→v2→v1 edit during `add` can evade both source digests.
+      // Compare the captured index with the current worktree as a third check.
+      // This is bounded race detection, not an atomic multi-file filesystem snapshot.
+      if (await git(['diff', '--name-only', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '-z', '--'], env)) continue
       const originalTree = await git(['rev-parse', `${before.head}^{tree}`])
       const snapshotCommit = tree === originalTree ? before.head : await git(['commit-tree', tree, '-p', before.head, '-m', 'Agent Swarm private workspace baseline'])
       const changedPaths = paths(await git(['diff', '--name-only', '--no-renames', '-z', before.head, snapshotCommit, '--']))
@@ -136,7 +169,7 @@ export async function captureGitSnapshot(source: string, directory: string, git:
       if (error instanceof ChangedDuringSnapshot) continue
       // A disappearing path may make Git itself reject the add. Retry only
       // when the observed source actually changed; preserve genuine failures.
-      if (before !== undefined && await sourceState(source, git, signal).then(after => after.fingerprint !== before!.fingerprint, () => false)) continue
+      if (before !== undefined && await sourceState(source, git, signal, includePaths).then(after => after.fingerprint !== before!.fingerprint, () => false)) continue
       throw error
     } finally {
       await rm(index, { force: true })

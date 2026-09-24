@@ -1,57 +1,42 @@
 /** W5 regressions: owner-only withdrawal of admitted-but-mistaken work. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools, SWARM_TOOLS, MANAGEMENT_TOOLS, OWNER_SESSION_TOOLS } from '../lib/tools.js'
+import { FakeWorkers, eventually, makeRuntime, makeRuntimeStub } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
 
-class CancelWorkers {
-  prepared = []; stopped = []; stopGate
+/** A stop can be held open by `stopGate`; it is recorded only once it returns. */
+class CancelWorkers extends FakeWorkers {
+  stopGate
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   artifact = { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver() {}
   async stop(memberId) { if (this.stopGate) await this.stopGate; this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(structuredClone({ member: member.id, task })) }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
 }
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-cancel-'))
-  const workers = new CancelWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new CancelWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'cancel-owner' }
   const mission = runtime.create(owner, { title: 'Cancel', objective: 'Withdraw mistaken work', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const current = task => runtime.store.get('tasks', typeof task === 'string' ? task : task.id)
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   async function block(task) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     workers.checks = [{ command: 'test', exitCode: 1, output: 'host check failed' }]
@@ -62,13 +47,13 @@ async function fixture(t) {
   async function accept(task) {
     const claimed = await runtime.claim(actor(author), mission.id, task.id)
     await runtime.submit(actor(author), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const review = runtime.propose(owner, mission.id, { workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
+    const review = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${task.title}`, objective: 'Independent review',
       kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: task.id })
     const claimedReview = await runtime.claim(actor(reviewer), mission.id, review.id)
     await runtime.verify(actor(reviewer), mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
     return current(task)
   }
-  return { runtime, workers, owner, mission, stream, author, reviewer, actor, propose, block, accept, current, events }
+  return { runtime, workers, budget, owner, mission, stream, author, reviewer, actor, propose, block, accept, current, events }
 }
 
 test('owner cancel withdraws a pending duplicate and lineage falls back to the surviving replacement', async t => {
@@ -128,7 +113,7 @@ test('owner cancel terminates a running attempt, releases the lease, frees the m
   assert.equal(event.data.previousStatus, 'running')
   assert.equal(event.data.attemptId, claimed.attempt.id)
   assert.equal(event.data.ownerId, f.author.id)
-  await eventually(() => f.workers.stopped.includes(f.author.id), 'the released worker handle is stopped')
+  await eventually(() => f.workers.stopped.includes(f.author.id), 'the released worker handle is stopped', 2500)
   await assert.rejects(f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'late' }), /Stale|unauthorized|terminal/i)
   assert.throws(() => f.runtime.publish(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, claim: 'late', outcome: 'supported', toolRunIds: [] }), /Stale|unauthorized|terminal/i)
   assert.equal(f.current(task.id).status, 'cancelled', 'late calls never revive terminal work')
@@ -153,8 +138,12 @@ test('owner cancel wins a handoff race: the blocked task never re-opens after th
   f.workers.stopGate = gate.promise
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'Reassign' })
   assert.equal(f.current(task.id).status, 'blocked')
+  const beforeCancel = f.current(task.id)
   const cancelled = f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'No longer needed' })
   assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.epoch, beforeCancel.epoch)
+  assert.deepEqual(cancelled.resumeAfterStop, beforeCancel.resumeAfterStop, 'cancellation keeps the existing stop owner and checkpoint obligation')
+  assert.deepEqual(f.runtime.cancel(f.owner, f.mission.id, { taskId: task.id, reason: 'Replay' }), cancelled)
   gate.resolve()
   await new Promise(resolve => setTimeout(resolve, 30))
   assert.equal(f.current(task.id).status, 'cancelled', 'the deferred handoff cannot reopen cancelled work')
@@ -169,7 +158,7 @@ test('swarm_cancel is registered as an owner-only tool with a schema and a worke
   const calls = []
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } },
-    { cancel: (...args) => { calls.push(args); return { status: 'cancelled' } }, snapshot: () => undefined }, budget)
+    makeRuntimeStub({ cancel: (...args) => { calls.push(args); return { status: 'cancelled' } }, snapshot: () => undefined }), f.budget)
   const definition = definitions.get('swarm_cancel')
   assert.ok(definition, 'swarm_cancel is registered')
   assert.deepEqual(definition.parameters.required, ['missionId', 'taskId', 'reason'])
@@ -189,27 +178,29 @@ test('cancelling a source retires a running review so it cannot re-pend after le
   const source = f.propose()
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
-  const review = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Review source', objective: 'Independent review',
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review source', objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
   await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   assert.equal(f.current(review.id).status, 'running')
   // A review parked by lease expiry or handoff would re-pend after restart even
   // though its source can never be reviewed again; model that durable state.
-  const parked = f.runtime.propose(f.owner, f.mission.id, { workstreamId: f.stream.id, title: 'Parked review', objective: 'Independent review',
+  const parked = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Parked review', objective: 'Independent review',
     kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id })
+  const parkedOwner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Parked reviewer', role: 'verification' })
   const parkedRecord = f.current(parked.id)
-  parkedRecord.status = 'blocked'; parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, reason: 'lease-expired' }
+  parkedRecord.status = 'blocked'; parkedRecord.resumeAfterStop = { epoch: parkedRecord.epoch, memberId: parkedOwner.id, reason: 'lease-expired', at: Date.now() }
   f.runtime.store.transaction(() => f.runtime.store.put('tasks', parkedRecord))
   f.runtime.cancel(f.owner, f.mission.id, { taskId: source.id, reason: 'Source withdrawn' })
   const retired = f.current(review.id)
   assert.equal(retired.status, 'cancelled', 'a running review of withdrawn work is retired with its source')
   assert.equal(retired.attempt, undefined, 'the review attempt is fenced')
-  assert.equal(retired.resumeAfterStop, undefined, 'a retired review cannot re-pend')
+  assert.equal(retired.resumeAfterStop.memberId, f.reviewer.id, 'retirement fences the old owner until it stops')
   assert.match(retired.output, /Superseded/)
   const parkedAfter = f.current(parked.id)
   assert.equal(parkedAfter.status, 'cancelled', 'a quiescence-parked review of withdrawn work is retired too')
-  assert.equal(parkedAfter.resumeAfterStop, undefined)
-  await eventually(() => f.workers.stopped.includes(f.reviewer.id), 'the retired reviewer is stopped')
+  assert.equal(parkedAfter.resumeAfterStop.memberId, parkedOwner.id)
+  await eventually(() => f.workers.stopped.includes(f.reviewer.id), 'the retired reviewer is stopped', 2500)
+  await eventually(() => [review, parked].every(task => f.current(task).resumeAfterStop === undefined), 'confirmed stops clear the markers without reopening the cancelled reviews', 2500)
   // Even a later scheduling pass must not re-pend or reassign the review.
   f.workers.callbacks.idle(f.reviewer.id)
   await new Promise(resolve => setTimeout(resolve, 30))

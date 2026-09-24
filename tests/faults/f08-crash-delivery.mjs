@@ -2,20 +2,19 @@
 import assert from 'node:assert/strict'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { makeRepo, Workspaces, WorkspaceWorkers, setup, runNode, runScenario, MISSION_ACCEPTANCE } from './harness.mjs'
-import { subprocessSeam } from '../subprocess-seam.mjs'
+import { makeRepo, WorkspaceWorkers, setup, runNode, runScenario, MISSION_ACCEPTANCE, makeWorkspaces } from './harness.mjs'
 
 await runScenario({
   id: 'F8', title: 'A SIGKILL after the delivery effect but before the receipt replays idempotently', invariants: ['I4'],
   body: async () => {
     const { root, source } = await makeRepo('swarm-faults-f8', { 'value.cjs': 'module.exports = 1\n' })
     const workspacesRoot = join(root, 'worktrees')
-    const workspaces = new Workspaces({ subprocess: subprocessSeam, workspacesRoot, checkTimeoutMs: 30_000, maxCheckOutputBytes: 32_000, confineCheck: argv => argv })
+    const workspaces = makeWorkspaces(root)
     const workers = new WorkspaceWorkers(workspaces)
     const stateDir = join(root, 'state')
     await mkdir(stateDir, { recursive: true })
     const marker = join(root, 'apply-marker.json')
-    const f = await setup({ workspace: source, workers, config: { statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000 }, acceptance: ['value is two'], checks: ['true'] })
+    const f = await setup({ workspace: source, workers, config: { statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000 }, acceptance: ['value is two'], checks: [`node -e "require('node:assert/strict').equal(require('./value.cjs'), 2)"`] })
     let missionId
     let artifact
     try {
@@ -27,7 +26,7 @@ await runScenario({
       const submitted = await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'value is two' })
       artifact = submitted.artifact.commit
       const review = f.runtime.propose(f.owner, f.mission.id, {
-        workstreamId: f.stream.id, title: 'Review value two', objective: 'Independent review', kind: 'verification',
+        outputs: [], workstreamId: f.stream.id, title: 'Review value two', objective: 'Independent review', kind: 'verification',
         reviewOf: task.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
       })
       const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)

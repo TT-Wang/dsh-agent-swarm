@@ -7,16 +7,16 @@ import test from 'node:test'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { uiSnapshot } from './fixtures/ui-snapshot.mjs'
-import { taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
+import { boardIndex, taskLane, remainingPercent, snapshotFromResult, readSnapshot, deliverableCommit, completionBlocker } from '../lib/types/client/projection.js'
 import { leaseExpired } from '../lib/types/client/clock.js'
 import { swarmCardDefinition } from '../lib/types/client/card-definition.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityPanel.js'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
-import { openWorker } from '../lib/types/client/navigation.js'
-import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
+import { currentSessionId, openWorker } from '../lib/types/client/navigation.js'
 import { createRightSidebarAdapter } from '../lib/types/client/sidebar.js'
-import { WorkerAvatar } from '../lib/types/client/MissionProgress.js'
+import { AgentAvatar, AGENT_AVATAR_CSS } from '../lib/types/client/AgentAvatar.js'
+import { LIVE_WORK_CSS } from '../lib/types/client/LiveWorkPanel.js'
 import { DisposalRegistry } from '../lib/types/client/lifecycle.js'
 import { DraftEditor, cleanPlan, newPlan } from '../lib/types/client/DraftEditor.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
@@ -74,6 +74,20 @@ test('UI reads native private metadata and rejects incompatible historical paylo
   assert.equal(snapshotFromResult(undefined, [{ type: 'tool-result', isError: true, content: [{ type: 'text', text: JSON.stringify(snapshot) }] }]), undefined)
 })
 
+test('board keeps borrowable work ready when its preference stops and validates assignment policy', () => {
+  const snapshot = uiSnapshot()
+  const task = { ...snapshot.tasks[4], epoch: 0, assigneeId: 'a', assignmentMode: 'preferred' }
+  const members = snapshot.members.map(member => member.id === 'a' ? { ...member, status: 'stopped' } : member)
+  const tasks = [task]
+  assert.equal(boardIndex(tasks).lane(task, members), 'ready')
+  assert.equal(boardIndex(tasks).lane({ ...task, assignmentMode: 'pinned' }, members), 'blocked')
+  assert.equal(boardIndex(tasks).lane({ ...task, assignmentMode: undefined }, members), 'blocked')
+  assert.equal(boardIndex(tasks).lane({ ...task, epoch: 1 }, members), 'blocked', 'started work follows recovery instead of borrowing')
+  assert.equal(boardIndex(tasks).lane(task, members.map(member => ({ ...member, status: 'stopped' }))), 'blocked')
+  assert.ok(readSnapshot({ ...snapshot, tasks }))
+  assert.equal(readSnapshot({ ...snapshot, tasks: [{ ...task, assignmentMode: 'unexpected' }] }), undefined)
+})
+
 test('native conversation fold presents only successful explicit swarm observations', () => {
   const snapshot = uiSnapshot()
   const start = { event: { type: 'tool/call', seq: 4, data: { name: 'swarm_observe', callId: 'call-1' } }, location: { kind: 'unresolved' } }
@@ -84,6 +98,10 @@ test('native conversation fold presents only successful explicit swarm observati
   context.state = swarmCardDefinition.update(context, result)
   assert.equal(swarmCardDefinition.buildViewNode(context).data.mission.id, snapshot.mission.id)
   assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, { event: { ...result.event, data: { ...result.event.data, error: { name: 'Error' } } } }), {})
+  // A failed tool result: 0.1.7 flags the tool-role message, 0.1.5 its nested tool-result block.
+  const failedResult = message => ({ event: { ...result.event, data: { ...result.event.data, message: { ...result.event.data.message, ...message } } } })
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ role: 'tool', toolCallId: 'call-1', isError: true })), {})
+  assert.deepEqual(swarmCardDefinition.update({ ...context, state: {} }, failedResult({ content: [{ type: 'tool-result', toolCallId: 'call-1', isError: true, content: [] }] })), {})
 })
 
 test('current native Conversation assembler rebuilds swarm cards from durable tool events', async () => {
@@ -140,7 +158,7 @@ test('built client closure loads in Harness module protocol and owns reversible 
   assert.equal(definitions[0].kind, 'agent-swarm')
   assert(slots.some(slot => slot.options.name === 'conversation.chat.node' && slot.options.key === 'agent-swarm'))
   assert(slots.some(slot => slot.options.name === 'conversation.chat.commandview' && slot.options.key === 'agent-swarm'))
-  assert(slots.some(slot => slot.options.name === 'shell.overlay' && slot.options.id === 'agent-swarm-sidebar'))
+  assert(!slots.some(slot => slot.options.name === 'shell.overlay'), 'the host right sidebar carries the panel; no plugin-owned overlay is registered')
   for (const dispose of effects.reverse()) dispose?.()
   assert.equal(styleRemoved, true)
   assert.equal(slots.length, 0)
@@ -175,7 +193,7 @@ test('built client mounts and unloads with the actual Harness Cordis and browser
     assert.equal(ctx.uiConversation.events.entries().some(item => item.kind === 'agent-swarm'), true)
     assert.equal(ctx.slots.entries('conversation.chat.node').some(item => item.options.key === 'agent-swarm'), true)
     assert.equal(ctx.slots.entries('conversation.chat.commandview').some(item => item.options.key === 'agent-swarm'), true)
-    assert.equal(ctx.slots.entries('shell.overlay').some(item => item.options.id === 'agent-swarm-sidebar'), true)
+    assert.equal(ctx.slots.entries('shell.overlay').length, 0, 'no plugin-owned overlay beside the host right sidebar')
     await feature.dispose()
     assert.equal(ctx.uiConversation.events.entries().some(item => item.kind === 'agent-swarm'), false)
     assert.equal(ctx.slots.entries('conversation.chat.node').length, 0)
@@ -214,14 +232,33 @@ test('live monitor fences switched-session responses and aborts all work on disp
 
 test('worker navigation opens its independent native session and rejects missing list entries', async () => {
   const opened = []
-  const sessions = { list: { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }, open: sessionId => opened.push(sessionId) }
-  assert.equal(openWorker(sessions, 'worker'), true)
+  const list = { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }
+  // 0.1.5: the sessions face navigates.
+  const legacy = { sessions: { list, open: sessionId => opened.push(sessionId) }, get: () => undefined }
+  assert.equal(openWorker(legacy, 'worker'), true)
   assert.deepEqual(opened, ['worker'])
-  assert.equal(openWorker(sessions, 'missing'), false, 'missing live row delegates to read-only native history')
+  assert.equal(openWorker(legacy, 'missing'), false, 'missing live row delegates to read-only native history')
   assert.equal(opened.length, 1)
+  // 0.1.7: no sessions.open; navigation belongs to the workspace UI service.
+  const navigated = []
+  const modern = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
+  assert.equal(openWorker(modern, 'worker'), true)
+  assert.deepEqual(navigated, ['worker'])
+  assert.equal(openWorker({ sessions: { list }, get: () => undefined }, 'worker'), false, 'no navigation service: fall back to persisted history')
 })
 
-test('draft defaults preserve independent verification and line editing; sidebar leaves room for conversation', () => {
+test('session selection supports 0.1.5 current and the retained 0.1.7 main view', () => {
+  const background = { retainedBy: { worker: 1, mainView: 0 } }
+  const displayed = { retainedBy: { mainView: 1 } }
+  const sessions = snapshot => ({ list: { getSnapshot: () => snapshot } })
+  assert.equal(currentSessionId(sessions({ current: 'legacy', byId: { displayed } })), 'legacy')
+  assert.equal(currentSessionId(sessions({ ids: ['background', 'displayed'], byId: { background, displayed } })), 'displayed')
+  assert.equal(currentSessionId(sessions({ byId: { background, displayed } })), 'displayed')
+  assert.equal(currentSessionId(sessions({ ids: ['background'], byId: { background } })), undefined)
+  assert.equal(currentSessionId(undefined), undefined)
+})
+
+test('draft defaults preserve independent verification and line editing', () => {
   const input = newPlan('/repo', uiSnapshot().mission.budget)
   assert.equal(input.tasks[1].reviewOf, input.tasks[0].key)
   assert.notEqual(input.tasks[0].assigneeKey, input.tasks[1].assigneeKey)
@@ -232,11 +269,17 @@ test('draft defaults preserve independent verification and line editing; sidebar
   input.scope = ['src/', '', ' tests/ ']
   assert.deepEqual(cleanPlan(input).scope, ['src/', 'tests/'])
   assert.deepEqual(input.scope, ['src/', '', ' tests/ '], 'normalization does not change an in-progress field')
-  assert.equal(fitSidebar(480, 1440), 480)
-  assert.equal(fitSidebar(900, 1440), 760)
-  assert.equal(fitSidebar(900, 1000), 600)
-  assert.equal(fitSidebar(Number.NaN, 1440), 480)
-
+  // Saving never declares outputs on the owner's behalf: an Outputs field the
+  // owner never touched stays absent, so launch still refuses that task with
+  // [outputs_required] instead of admitting it as analysis-only work. A field
+  // the owner edited and cleared is an explicit empty declaration.
+  input.tasks[0].outputs = [' src/value.cjs ', '']
+  assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], undefined])
+  assert.throws(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), error => error.code === 'outputs_required'
+    && error.diagnostics.map(diagnostic => diagnostic.location).join() === 'tasks[1] (review).outputs', 'the untouched task is refused at launch, and only that one')
+  input.tasks[1].outputs = ['']
+  assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], []])
+  assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan whose every Outputs field was set launches')
 })
 
 test('graph and Chinese card render real task/evidence projections and worker links', () => {
@@ -247,7 +290,7 @@ test('graph and Chinese card render real task/evidence projections and worker li
   assert.match(graph, /stroke-dasharray="4 4"/)
   const chinese = renderToStaticMarkup(React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, React.createElement(SwarmBoard, { snapshot, initialView: 'board', onOpenWorker() {} })))
   assert.match(chinese, /任务看板/)
-  assert.match(chinese, /data-worker-session=/)
+  assert.match(chinese, /data-swarm-member="b"[^>]*aria-label="打开对话: Nova"/)
   assert.match(chinese, /打开对话/)
 })
 
@@ -302,6 +345,9 @@ test('cold worker history paginates native events, renders inert tool results, a
   await older
   assert.deepEqual(history.getSnapshot().entries.map(entry => entry.event.seq), [2, 8])
   assert.equal(transcriptEntry(history.getSnapshot().entries[0]).text, 'Assignment')
+  const toolMessage = isError => ({ event: { seq: 9, type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'call-9', isError, content: [{ type: 'text', text: 'output' }] } } } })
+  assert.deepEqual(transcriptEntry(toolMessage(true)), { role: 'Tool error', text: 'output' }, 'a 0.1.7 tool-role failure is labelled correctly')
+  assert.deepEqual(transcriptEntry(toolMessage(false)), { role: 'Tool result', text: 'output' })
   history.open('worker-b', 'Reviewer')
   history.close()
   pending[2]({ events: [{ event: { seq: 1, type: 'user/message', data: { content: 'late' } } }], hasMore: false })
@@ -428,35 +474,14 @@ test('snapshot reader validates every budget key and the runtime-projected deliv
   assert.equal(completionBlocker(projected), 'still blocked')
 })
 
-test('OWNER PASS 2026-09-11 (C3): the dock shifts a discovered host root by inline style, not by an id rule', async () => {
-  // The reservation must follow the dock, so it is computed for the same four
-  // geometries the dock itself uses.
-  assert.deepEqual(dockShift(true, 480, 1440), { width: 'calc(100% - 480px)' })
-  assert.deepEqual(dockShift(false, 480, 1440), { width: 'calc(100% - 28px)' }, 'the collapsed launcher keeps its 28px strip')
-  assert.deepEqual(dockShift(true, 480, 600), { width: '100%', height: '55dvh' }, 'a narrow viewport stacks the dock under the app')
-  assert.deepEqual(dockShift(false, 480, 600), { width: '100%', height: 'calc(100dvh - 40px)' }, 'a collapsed narrow dock is only its 40px bar')
-  // The target is discovered structurally: the child of the body above the dock.
-  const body = { style: {}, parentElement: null }
-  const root = { style: {}, parentElement: body }
-  const shell = { style: {}, parentElement: root }
-  const dock = { style: {}, parentElement: shell }
-  assert.equal(hostShiftTarget(dock, node => node === body), root, 'the app root is whatever sits directly under the body')
-  assert.equal(hostShiftTarget({ style: {}, parentElement: body }, node => node === body), undefined,
-    'a dock that is itself a body child has no host root to move')
-  assert.equal(hostShiftTarget({ style: {}, parentElement: null }, node => node === body), undefined, 'a detached dock moves nothing')
-  assert.equal(hostShiftTarget(undefined, node => node === body), undefined)
-  // C3 is only closed if the sheet no longer names the host's id or forces the
-  // layout with !important; the dock's own geometry stays in CSS.
+test('OWNER PASS 2026-09-11 (C3): the sheet names no host root id', async () => {
   const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
-  assert.doesNotMatch(styles, /#root/, 'the dock no longer depends on the host root id')
-  assert.doesNotMatch(styles, /\[data-swarm-docked\][^{}]*\{[^}]*!important/, 'and no dock rule has to outrank the host with !important')
+  assert.doesNotMatch(styles, /#root/, 'the panel does not depend on the host root id')
   for (const rule of ['.sw-lane-count', '.sw-lane[data-empty]', '.sw-activity-group', '.sw-why']) {
     assert.ok(styles.includes(rule), `the second-pass styles ship ${rule}`)
   }
   assert.match(styles, /\.sw-lane\[data-empty\]\{opacity:\.55;align-self:start\}/,
     'an empty lane stops stretching to its row height, so it is one header tall instead of a full-height empty column')
-  const dockSource = await readFile(new URL('../src/client/SidebarDock.tsx', import.meta.url), 'utf8')
-  assert.match(dockSource, /style\.width = previous\.width/, 'the host inline style is restored on unload')
 })
 
 test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly once, even after the drain', async () => {
@@ -486,24 +511,23 @@ test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly 
   assert.match(index, /ctx\.effect\(\(\) => \(\) => disposals\.dispose\(\), 'agent-swarm: pane resources'\)/, 'plugin unload drains the registry')
 })
 
-test('OWNER PASS 2026-09-11 #2: the avatar scales in half steps and the controls row never wraps', async () => {
-  const render = props => renderToStaticMarkup(React.createElement(WorkerAvatar, props))
-  assert.match(render({ name: 'Nova' }), /width="32" height="32" viewBox="0 0 32 32"/, 'the default renders the sprite grid exactly')
-  assert.match(render({ name: 'Nova', size: 48 }), /width="48" height="48" viewBox="0 0 32 32"/, '48px is 1.5x the grid, so the cells stay integer')
-  assert.match(render({ name: 'Nova', size: 28 }), /width="32" height="32"/, 'a smaller request never shrinks below the grid; the stylesheet sizes the header')
-  assert.equal(render({ name: 'Nova' }), render({ name: 'Nova', size: 32 }))
+test('current robot avatars remain readable at their actual sizes and controls remain one row', async () => {
+  const render = props => renderToStaticMarkup(React.createElement(AgentAvatar, { id: 'nova-id', name: 'Nova', ...props }))
+  assert.match(render({}), /width:40px;height:40px/, 'the current member portrait defaults to 40px')
+  assert.match(render({ size: 26 }), /width:26px;height:26px/, 'the compact roster uses its actual requested size')
+  assert.match(render({ size: 28 }), /width:28px;height:28px/, 'the activity header uses its actual requested size')
+  assert.match(render({ state: 'active' }), /class="sw-agent-avatar-ring"/, 'observed native activity keeps the robot ring')
+  assert.match(AGENT_AVATAR_CSS, /prefers-reduced-motion:reduce/, 'the current ring supports reduced motion')
+  assert.match(LIVE_WORK_CSS, /prefers-reduced-motion:reduce/, 'live waves and event arrivals support reduced motion')
   const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
   assert.match(styles, /\.sw-actions\{display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;overflow-x:auto/,
     'the mission control row is one horizontal row that scrolls instead of wrapping')
   assert.match(styles, /\.sw-actions>\.sw-mission-controls\{padding:0;flex:0 0 auto;flex-wrap:nowrap;align-items:flex-start\}/)
-  assert.match(styles, /\.sw-member-head\{display:grid;grid-template-columns:auto minmax\(0,1fr\);gap:12px/, 'the member head is avatar + identity')
   assert.match(styles, /\.sw-complete-control\{display:flex;flex-direction:column/, 'the completion blocker is the button caption, not an inline sentence that displaces Stop')
   assert.match(styles, /\.sw-complete-control>\[data-swarm-completion\]\{max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis/, 'and it is bounded with an ellipsis')
-  assert.match(styles, /\.sw-member \.sw-worker-avatar\{width:48px;height:48px;border-radius:11px/, 'the member avatar is 48px')
-  assert.match(styles, /\.sw-team \.sw-workers\{margin-top:10px;grid-template-columns:repeat\(auto-fit,minmax\(240px,1fr\)\)\}/, 'the roster widens for the larger card')
 })
 
-test('right sidebar adapter: one tab type, its body seat, and host navigation', async () => {
+test('right sidebar adapter: passive tab registration, its body seat, and explicit host navigation', async t => {
   // A fake host modelled on the real right-sidebar kit: the registry takes the
   // tab type, the slot service takes the body under the same id, and the
   // controller opens the pane by kind.
@@ -533,21 +557,18 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   }
   const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80, label: () => 'Agent Swarm', description: () => 'Missions, workers and evidence for this conversation', component: () => null })
   const adapter = createRightSidebarAdapter(ctx, describe)
-  assert.equal(adapter.getSnapshot(), true, 'a registered tab reports integrated, so the dock stays hidden')
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'a registered tab and controller own the surface, so the dock stays hidden')
   assert.deepEqual(types.map(type => [type.id, type.kind, type.title()]), [['dsh-external-agent-swarm', 'agent-swarm', 'Agent Swarm']],
     'the tab type carries the implementation id, the kind navigation names, and its chip title')
   assert.deepEqual(types[0].guide.map(entry => [entry.order, entry.title(), entry.description()]),
     [[80, 'Agent Swarm', 'Missions, workers and evidence for this conversation']],
-    'and one guide capsule, which is the only route to a page type from the UI')
+    'and one guide capsule, which lets the host offer the page type from its UI')
   assert.deepEqual(seats.map(seat => [seat.slot, seat.key, typeof seat.component]), [['sidebar.right.pane.tab', 'dsh-external-agent-swarm', 'function']],
     'the body sits in the keyed seat under that same id')
-  // The host starts with an empty right pane, so the adapter opens its tab once
-  // when it registers: a registered tab nobody opens is invisible.
-  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'],
-    'registering reveals the pane and selects the tab once')
-  opened.length = 0
+  assert.deepEqual(opened, [], 'registration preserves the host pane state without selecting a tab')
   assert.equal(adapter.open(), true)
-  assert.deepEqual(opened, ['pane:true:false', 'agent-swarm:{"revealIfOpened":true}'], 'open() reveals the pane and the tab through the host services')
+  assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'an explicit open delegates reveal to the controller without writing layout')
   adapter.dispose()
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal releases the type and the seat')
@@ -555,9 +576,9 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   assert.deepEqual(seats, [])
   assert.equal(adapter.open(), false, 'a disposed adapter never reveals anything')
 
-  // Hosts without a right sidebar (0.1.2/0.1.3) must fall back, not throw — and
-  // a host that has the slot service but no sidebar registry must not claim a
-  // seat in a pane that does not exist (that bug hid the dock on 0.1.3).
+  // A profile without the right sidebar must not throw — and a host that has the
+  // slot service but no sidebar registry must not claim a seat in a pane that
+  // does not exist.
   const slotOnly = {
     inject(names, factory) {
       if (names.includes('sidebarRightTabs')) return { dispose: async () => {} }
@@ -569,36 +590,34 @@ test('right sidebar adapter: one tab type, its body seat, and host navigation', 
   }
   opened.length = 0
   const noRegistry = createRightSidebarAdapter(slotOnly, describe)
-  assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing and the dock renders')
+  assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing')
+  assert.equal(noRegistry.open(), false, 'an explicit request is left to Better Sidebar when no native registry exists')
   assert.deepEqual(opened, [], 'and it never reveals a pane that does not exist')
   assert.deepEqual(seats, [], 'and the body seat is never registered into an undeclared slot')
   noRegistry.dispose()
   const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }
   const fallback = createRightSidebarAdapter(bare, describe)
   assert.equal(fallback.getSnapshot(), false)
-  assert.equal(fallback.open(), false, 'without the registry the adapter reports not-integrated and the dock renders')
+  assert.equal(fallback.open(), false, 'without the registry the adapter reports not-integrated')
   fallback.dispose()
-  // The adapter must stay structural: importing the sidebar package would pull a
-  // 0.1.5-only peer into a plugin that also loads on 0.1.2/0.1.3.
+  // The adapter must stay structural: the right-sidebar package is not a declared peer.
   const source = await readFile(new URL('../src/client/sidebar.tsx', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar-right/, 'no static import of the right-sidebar package')
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
   assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs', 'sidebarRight'\]/, 'and only while the slot service, registry and controller are present')
-  assert.match(source, /guide: \[\{ order: tab\.order \?\? 80/, 'and names itself on the guide page, the only route to a page type from the UI')
+  assert.match(source, /guide: \[\{ id: 'open', order: tab\.order \?\? 80/, 'and names itself on the guide page with the stable entry id the registry requires')
   assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
-  assert.match(source, /getSnapshot: \(\) => current\?\.opened \?\? false/, 'and integration means the pane really shows the tab, not merely that a type was registered')
 })
 
-test('right sidebar adapter: a refused reveal keeps the dock and retries until a session surface exists', async () => {
+test('right sidebar adapter: an explicit refused reveal stays native until its session surface exists', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   // The 0.1.5 host answers a write with no mounted session surface by throwing
-  // (`sidebarRight: no session surface is mounted`). The adapter used to set its
-  // one-shot flag BEFORE that call, so the throw ended the only attempt while the
-  // successful registration hid the dock: the owner saw an empty right pane on
-  // 5196. The attempt is now contained, retried on a bounded schedule, resumed by
-  // the session the surface belongs to, and the dock stays until the tab is open.
+  // (`sidebarRight: no session surface is mounted`). Only explicit intent creates
+  // a retry request; registration and ordinary session signals remain passive.
+  // Native ownership covers a pending request so it cannot open a second surface.
   const types = [], opened = []
-  let mounted = false
+  let mounted = false, attempts = 0
   const registry = { register(definition) { types.push(definition); return () => { types.splice(types.indexOf(definition), 1) } } }
   const slots = {
     inject(name, factory) { const release = factory(); return () => release?.() },
@@ -618,6 +637,7 @@ test('right sidebar adapter: a refused reveal keeps the dock and retries until a
     get: name => name === 'sidebarRight'
       ? {
         openTab: (kind, options) => {
+          attempts++
           if (!mounted) throw new Error('sidebarRight: no session surface is mounted')
           opened.push(`${kind}:${JSON.stringify(options)}`)
         },
@@ -627,20 +647,31 @@ test('right sidebar adapter: a refused reveal keeps the dock and retries until a
   }
   const describe = () => ({ id: 'dsh-external-agent-swarm', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null })
   const adapter = createRightSidebarAdapter(ctx, describe)
-  assert.equal(adapter.getSnapshot(), false, 'a refused reveal is not integration: the dock keeps carrying the panel')
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'registry/controller readiness owns the surface before any reveal')
+  for (const listener of sessions.listeners) listener()
+  assert.equal(attempts, 0, 'registration and session signals make no navigation attempt')
+  assert.equal(adapter.open(), true, 'the native integration owns the request while the surface is unmounted')
+  assert.equal(attempts, 1)
+  assert.equal(adapter.getSnapshot(), true)
   assert.deepEqual(opened, [], 'the host refused the write, so no tab was opened')
-  // A conversation reaches the screen: the session signal re-arms the attempt.
+  // A conversation reaches the screen: its signal retries the pending request.
   mounted = true
   for (const listener of sessions.listeners) listener()
-  assert.equal(adapter.getSnapshot(), true, 'the adapter opens the tab as soon as the host can accept the write')
+  assert.equal(attempts, 2)
   assert.deepEqual(opened, ['agent-swarm:{"revealIfOpened":true}'], 'and it opens exactly once')
+  for (const listener of sessions.listeners) listener()
+  t.mock.timers.tick(120_000)
+  assert.equal(attempts, 2, 'a completed request cannot reveal again through signals or old timers')
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal releases the retry schedule with the registration')
 })
 
-test('right sidebar adapter: a host that never mounts a session surface is left quietly retrying, then disposed', async () => {
+test('right sidebar adapter: an explicit request retries without session signals and stops on disposal', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const registry = { register() { return () => {} } }
   const slots = { inject(name, factory) { const release = factory(); return () => release?.() }, register() { return () => {} } }
+  let attempts = 0
   const ctx = {
     inject(names, factory) {
       const available = { slots, sidebarRightTabs: registry, sidebarRight: ctx.get('sidebarRight'), layout: ctx.get('layout') }
@@ -649,13 +680,20 @@ test('right sidebar adapter: a host that never mounts a session surface is left 
       const release = factory(scope)
       return { dispose: async () => { await release?.dispose?.() } }
     },
-    get: name => name === 'sidebarRight' ? { openTab: () => { throw new Error('sidebarRight: no session surface is mounted') } } : undefined,
+    get: name => name === 'sidebarRight' ? { openTab: () => { attempts++; throw new Error('sidebarRight: no session surface is mounted') } } : undefined,
     effect: fn => { fn() },
   }
   const adapter = createRightSidebarAdapter(ctx, () => ({ id: 'x', kind: 'agent-swarm', label: () => 'Agent Swarm', component: () => null }))
-  assert.equal(adapter.getSnapshot(), false, 'nothing integrates while the write keeps being refused')
-  assert.equal(adapter.open(), false, 'and open() reports the truth instead of claiming a pane that is not there')
-  await new Promise(resolve => setTimeout(resolve, 60))
+  t.after(() => adapter.dispose())
+  assert.equal(adapter.getSnapshot(), true, 'readiness does not require the host surface to be mounted')
+  assert.equal(attempts, 0, 'idle registration never requests navigation')
+  assert.equal(adapter.open(), true, 'the native controller owns a refused request')
+  assert.equal(attempts, 1)
+  t.mock.timers.tick(500)
+  assert.equal(attempts, 2, 'the request can retry on hosts without session notifications')
   adapter.dispose()
   assert.equal(adapter.getSnapshot(), false, 'disposal stops the bounded retry schedule')
+  t.mock.timers.tick(120_000)
+  assert.equal(attempts, 2)
+  assert.equal(adapter.open(), false)
 })

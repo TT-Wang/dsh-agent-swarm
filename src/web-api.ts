@@ -1,20 +1,21 @@
 /** Optional native browser RPC consumers of the durable swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import { RpcId } from '@deepseek-ai/dsh-client-connection'
-import type { ConnectionRpcHandler, ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionRpcResult, ServerResponse } from '@deepseek-ai/dsh-client-connection'
 import { isAppendSurfaceEvent, SessionId, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
 import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceGrantSnapshot } from './authorization.ts'
-import { TaskGraphAdmissionError } from './admission.ts'
+import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
+import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, Mission, PlanInput, PlanMember } from './types.ts'
+import type { Actor, Budget, Mission, PlanInput, PlanMember, TaskAmendment } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -50,112 +51,71 @@ function revision(body: Record<string, unknown>): number {
   return Number(value)
 }
 /** A user-actionable request failure whose message is safe to return to the browser. */
-class RequestError extends Error {}
-/**
- * Authored policy/validation refusals the browser may see. Every other
- * collaborator failure is unexpected: the host logs its full detail and the
- * browser receives a stable `internal-error` message, so absolute paths,
- * SQLite text and internal route codes never leave the process
- * (SURFACE-R3-01 / F-08). Unknown messages fail closed (sanitized); a new
- * owner-actionable runtime refusal must be added here to become visible.
- */
-const actionableMessages: readonly RegExp[] = [
-  // Plan admission and scope diagnostics.
-  /^Plan entries must be objects$/,
-  /^Plan exceeds (?:1 MiB|task\/workstream budget|experiment budget)$/,
-  /^(?:Title|Objective|Workspace|Mission scope|Mission acceptance) must be nonempty text of at most 16000 characters$/,
-  /^Workspace must be absolute$/,
-  /^Invalid budget (?:maxTokens|maxSteps|maxWorkers|maxDurationMs|maxTasks|maxExperiments)$/,
-  /^Roster exceeds worker budget$/,
-  /^members\[/,
-  /^workstreams\[/,
-  /^tasks\[/,
-  /^scope\[/,
-  /^scope exceeds mission scope:/,
-  // Runtime authority, lifecycle and budget refusals.
-  /^Unknown (?:mission|workstream|assignee|coordinator|task kind|model provider)$/,
-  /^Session is not a participant in this mission$/,
-  /^Only (?:the mission owner|the user session|members|independent verification)/,
-  /^Mission is (?:active|paused|blocked|stopped|completed|staged)$/,
-  /^Mission is waiting for budget-pause quiescence and a fresh resume assignment$/,
-  /^Mission is (?:inactive or out of budget|terminal; create a new mission to continue|terminal; its budget cannot be changed)$/,
-  /^Mission (?:duration|worker|task|experiment) budget exhausted$/,
-  /^Mission budget exhausted; it cannot be resumed with a fresh allowance$/,
-  /^Mission (?:already exists|duration exceeds the supported clock range)$/,
-  /^Member admission identity conflict$/,
-  /^Workstream (?:identity conflict|admission budget exhausted)$/,
-  /^Worker (?:name already exists|already owns an open task|membership is inactive)$/,
-  /^Workers cannot create independent missions or budgets$/,
-  /^Swarm runtime is (?:closed|shutting down)$/,
-  /^Draft is not owned by this session$/,
-  /^Draft changed; reload before (?:saving|discarding|launching)$/,
-  /^Draft admission identity already exists$/,
-  /^Draft cannot be launched in its current state$/,
-  /^Discard unused drafts before creating more$/,
-  /^Only unlaunched drafts can be edited/,
-  /^A launching or launched plan cannot be discarded/,
-  /^The partially assembled mission cannot be launched$/,
-  /^Plan assembly was interrupted$/,
-  /^Task (?:is not in this mission|is not ready for this member|changed while preparing its workspace|has no active attempt|identity conflict)$/,
-  /^Task .* is accepted; accepted work is immutable/,
-  /^A task prerequisite is no longer accepted/,
-  /^Stale or unauthorized task attempt/,
-  /^Attempt lease exceeds the supported clock range$/,
-  /^Content exceeds \d+ characters$/,
-  /^A prerequisite was invalidated/,
-  /^Automatic (?:workers require maxOutputTokens|tasks require a recovery limit|task checks require a timeout) chosen by the primary agent$/,
-  /^Verification (?:requires reviewOf|cannot review another verification task)$/,
-  /^Only verification tasks may set reviewOf$/,
-  /^(?:reviewOf|replaces|Dependency|assigneeId) /,
-  /^priority must be an integer from 0 to 100$/,
-  /^(?:maxRecoveryAttempts|maxOutputTokens) must be a positive safe integer$/,
-  /^checkTimeoutMs must be a positive integer within the platform timer range$/,
-  /^subscriptions must be a string array$/,
-  /^workspace must be an absolute path$/,
-  /^A selected provider requires a selected model$/,
-  /^Choose an explicit provider and model/,
-  // T2 W8/F7 refusals (messages confirmed byte-for-byte with the governance task).
-  /^Member .+ cannot start: provider .+ does not support reasoning effort/,
-  /^Task .+ was cancelled by the owner; a cancelled record cannot be re-admitted/,
-  /^(?:maxTokens|maxSteps|maxWorkers|maxTasks|maxExperiments) cannot be below existing consumption or admitted work/,
-  /^An active mission needs a duration deadline in the future$/,
-  /^Use the saved plan (?:launch action to activate staged work|to set the budget before launch)$/,
-  // Completion and delivery preconditions.
-  /^Mission still has unfinished or blocked required work/,
-  /^Accepted tasks do not cover every mission acceptance criterion:/,
-  /^Coding missions require an independently accepted integration artifact/,
-  /^Unresolved evidence challenges prevent completion:/,
-  /^Complete independent acceptance before applying results$/,
-  /^This historical mission has no saved delivery baseline/,
-  /^This worker adapter does not support /,
-]
-/** Host-derived detail must never travel through the actionable allowlist. */
-const unsafeDetail = /(?:\bSQLITE\b|\/Users\/|\/private\/|\/var\/|\/tmp\/|\/home\/|\/etc\/|\/opt\/|\/usr\/|\0)/i
-function actionableMessage(message: string): boolean {
-  if (message.length === 0 || message.length > 4000 || unsafeDetail.test(message)) return false
-  return actionableMessages.some(pattern => pattern.test(message))
+class RequestError extends Error {
+  constructor(message: string, readonly policy?: { code: string; category: string }) { super(message) }
 }
+/**
+ * Host-derived detail never reaches the browser, whatever the failure's type:
+ * absolute host paths, SQLite text and NUL bytes (SURFACE-R3-01 / F-08). The
+ * roots of the second group are also common repository directory names, so
+ * they count only where an absolute path starts (`/data/x`, `"/mnt/x"`), not
+ * inside a relative one (`tests/data/x`); `~/` and a drive root count likewise.
+ */
+const unsafeDetail = /(?:\bSQLITE\b|\/Users\/|\/private\/|\/var\/|\/tmp\/|\/home\/|\/etc\/|\/opt\/|\/usr\/|\0|(?<![\w.-])(?:\/(?:Volumes|srv|mnt|data|root|Library|System|Applications|proc|run|media|snap|nix|dev|sys|boot|bin|sbin|lib|lib64|workspace|workspaces)\/|~\/|[a-z]:\\))/i
+/** A stable public policy code. */
+const POLICY_CODE = /^[a-z][a-z0-9_]{0,79}$/
 class InternalFailure extends Error {
   constructor(readonly cause: unknown) { super('Swarm request failed unexpectedly') }
 }
 /**
- * Run a collaborator operation and decide what the browser may see. `true`
- * marks an operation whose every failure is authored validation text;
- * a predicate marks operations that can also fail internally.
+ * Run a collaborator operation and decide what the browser may see. An
+ * authored refusal is a PolicyError: the browser sees its message and code
+ * when the text is bounded and names no host detail. Every other failure is
+ * unexpected: the host logs its full detail and the browser receives a stable
+ * `internal-error` message, so no wording makes a failure visible. `true`
+ * marks a validator whose every failure echoes the caller's own input; its
+ * failures stay visible even when that input names a host path. Elsewhere an
+ * admission refusal whose text names host detail is answered with a fixed
+ * repair text naming only its diagnostics' codes and locations.
  */
-async function exposed<T>(operation: () => Promise<T> | T, userActionable: boolean | ((message: string) => boolean) = false): Promise<T> {
+async function exposed<T>(operation: () => Promise<T> | T, userActionable = false): Promise<T> {
   try { return await operation() } catch (error) {
     if (error instanceof MissingSession || error instanceof RequestError) throw error
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
-    if (error instanceof TaskGraphAdmissionError) {
-      // Only the runtime's typed, authored diagnostic crosses this boundary;
-      // matching prose in an arbitrary internal Error grants no visibility.
-      throw new RequestError(message.length <= 4000 && !unsafeDetail.test(message) ? message
-        : '[task_graph_invalid] Task dependencies or review sources form an invalid graph. Inspect the tasks with swarm_observe, remove the cyclic dependencies or reviewOf edge, and retry with swarm_propose.')
+    if (error instanceof PolicyError) {
+      // A type is not permission to expose host paths or unbounded details.
+      if (message.length > 0 && message.length <= 4000 && !unsafeDetail.test(message) && POLICY_CODE.test(error.code)) {
+        throw new RequestError(message, { code: error.code, category: error.category })
+      }
+      // A graph refusal whose task identities carry host detail has a fixed repair text.
+      if (error instanceof TaskGraphAdmissionError) {
+        throw new RequestError('[task_graph_invalid] Task dependencies or review sources form an invalid graph. Inspect the tasks with swarm_observe, remove the cyclic dependencies or reviewOf edge, and retry with swarm_propose.')
+      }
+      // A validator's own-input echo stays scrub-exempt whatever its type.
+      if (userActionable && message !== '') throw new RequestError(message)
+      // An admission refusal that echoes the caller's own absolute-looking
+      // value keeps a fixed repair text built from its diagnostics' codes and
+      // locations alone, so the caller can still correct the named field.
+      if (error instanceof AdmissionError && unsafeDetail.test(message)) {
+        const repair = hostFreeRepair(error.diagnostics)
+        if (repair !== undefined) throw new RequestError(repair, POLICY_CODE.test(error.code) ? { code: error.code, category: error.category } : undefined)
+      }
+      throw new InternalFailure(error)
     }
-    if (message !== '' && (userActionable === true || (typeof userActionable === 'function' && userActionable(message)))) throw new RequestError(message)
+    if (userActionable && message !== '') throw new RequestError(message)
     throw new InternalFailure(error)
   }
+}
+/** One repair line per diagnostic, naming its code and a host-free location; undefined when none qualifies. */
+function hostFreeRepair(diagnostics: readonly AdmissionDiagnostic[]): string | undefined {
+  const lines = new Set<string>()
+  for (const { code, location } of diagnostics) {
+    if (!POLICY_CODE.test(code)) continue
+    const at = location.length > 0 && location.length <= 200 && !unsafeDetail.test(location) ? `${location}: the` : 'The'
+    lines.add(`[${code}] ${at} value names an absolute path and is not repeated here. Use a repository-relative path and retry.`)
+  }
+  const text = [...lines].join('\n')
+  return text.length > 0 && text.length <= 4000 ? text : undefined
 }
 class MissingSession extends Error {
   constructor(readonly sessionId: SessionId) { super(`Session ${sessionId} is not an available workspace session`) }
@@ -171,13 +131,13 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
   return header
 }
 
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, launching = false): Promise<PlanInput> {
+async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined, launching = false): Promise<PlanInput> {
   const input = object(body.input)
   const authorization = await canonicalWorkspace(text(input, 'workspace'), header, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
   // The host-derived root always overrides any client-supplied value, so a
   // browser payload cannot widen its own authorization anchor.
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }), true)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching, dependencyDirs }), true)
   await validateModels(ctx, header.id, plan.members, signal, launching)
   return plan
 }
@@ -247,7 +207,8 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       writable, ownerLive: writable && ctx.agents.get(SessionId(actor.sessionId)) !== undefined, revision: runtime.store.revision(),
     } }
   }
-  const handler: ConnectionRpcHandler = async (endpoint, payload, signal) => {
+  // The routes below call this directly; 0.1.7's ConnectionRpcHandler adds a peer argument no route needs.
+  const handler = async (endpoint: string, payload: unknown, signal: AbortSignal): Promise<ConnectionRpcResult<unknown>> => {
     try {
       signal.throwIfAborted()
       if (Buffer.byteLength(JSON.stringify(payload) ?? '', 'utf8') > options.maxPayloadBytes) throw new RequestError('Swarm request exceeds the payload limit')
@@ -261,10 +222,18 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       switch (endpoint) {
         case 'models': {
           const providers = ctx.llm.listProviders().map(provider => ({ id: provider.id, name: provider.name }))
-          const models = (await Promise.all(providers.map(async provider => await ctx.llm.listModels(provider.id)))).flat()
+          const catalogs = await Promise.allSettled(providers.map(async provider => await ctx.llm.listModels(provider.id)))
+          signal.throwIfAborted()
+          const models = catalogs.flatMap(result => result.status === 'fulfilled' ? result.value : [])
             .map(model => ({ provider: model.provider, id: model.id, name: model.name,
               ...(model.description === undefined ? {} : { description: model.description }) }))
-          return { ok: true, value: { providers, models } }
+          const providerErrors = catalogs.flatMap((result, index) => {
+            if (result.status === 'fulfilled') return []
+            const provider = providers[index]!.id
+            try { ctx.logger.warn('agent-swarm: model catalog %s failed: %s', provider, String(result.reason)) } catch { /* Preserve the healthy catalogs. */ }
+            return [{ provider, code: 'catalog-unavailable', message: 'Model catalog is temporarily unavailable' }]
+          })
+          return { ok: true, value: { providers, models, ...(providerErrors.length ? { providerErrors } : {}) } }
         }
         case 'delivery':
         case 'apply-delivery': {
@@ -272,8 +241,8 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           const mission = runtime.store.get('missions', missionId)
           if (!mission || mission.ownerSessionId !== sessionId) throw new RequestError('Only the mission owner can access deliverables')
           await missionWorkspace(mission, grants)
-          if (endpoint === 'delivery') return { ok: true, value: { delivery: await exposed(() => runtime.inspectDelivery(actor, missionId), actionableMessage) } }
-          return { ok: true, value: { result: await exposed(() => runtime.applyDelivery(actor, missionId), actionableMessage), snapshot: runtime.snapshot(actor, missionId) } }
+          if (endpoint === 'delivery') return { ok: true, value: { delivery: await exposed(() => runtime.inspectDelivery(actor, missionId)) } }
+          return { ok: true, value: { result: await exposed(() => runtime.applyDelivery(actor, missionId)), snapshot: runtime.snapshot(actor, missionId) } }
         }
         case 'worker-history': {
           const workerSessionId = SessionId(text(body, 'workerSessionId'))
@@ -314,7 +283,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           if (!Number.isSafeInteger(waitMs) || Number(waitMs) < 0 || Number(waitMs) > 20_000) throw new RequestError('waitMs must be an integer from 0 through 20000')
           const visibleScopes = () => new Set([sessionId, ...runtime.visibleMissions(actor).map(mission => mission.id)])
           if (after !== undefined) await waitForStateChange(runtime.store, Number(after), visibleScopes, AbortSignal.any([signal, lifetime.signal]), Number(waitMs), wake => {
-            const observe = ({ agent }: { agent: { id: string } }) => { if (agent.id === sessionId) wake() }
+            const observe = ({ agent }: { agent: { id: string } }): undefined => { if (agent.id === sessionId) wake(); return undefined }
             const created = ctx.on('agent/created', observe, { global: true })
             const disposed = ctx.on('agent/disposed', observe, { global: true })
             return () => { created(); disposed() }
@@ -338,11 +307,11 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants)), actionableMessage) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants)), actionableMessage) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'discard-draft': {
-          const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)), actionableMessage)
+          const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }
         }
         case 'launch-draft': {
@@ -351,11 +320,11 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
             const mission = draft.missionId === undefined ? undefined : runtime.store.get('missions', draft.missionId)
             if (mission !== undefined) await missionWorkspace(mission, grants)
             else await canonicalWorkspace(draft.input.workspace, header, grants)
-            return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, draft.id, revision(body)), actionableMessage) } }
+            return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, draft.id, revision(body))) } }
           }
           if (ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
-          if (draft !== undefined) await planInput(ctx, { input: draft.input }, header, signal, grants, true)
-          return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body)), actionableMessage) } }
+          if (draft !== undefined) await planInput(ctx, { input: draft.input }, header, signal, grants, runtime.config.verificationDependencyDirs, true)
+          return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body))) } }
         }
         case 'control': {
           if (body.requestId !== undefined) {
@@ -363,14 +332,29 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
             const action = text(body, 'action')
             if (!['retry', 'stop', 'extend'].includes(action)) throw new RequestError('Unknown automatic request control action')
             if (body.timeoutMs !== undefined && (!Number.isSafeInteger(body.timeoutMs) || Number(body.timeoutMs) <= 0)) throw new RequestError('timeoutMs must be a positive safe integer')
-            const request = await exposed(() => runtime.controlStart(actor, text(body, 'requestId'), action as 'retry' | 'stop' | 'extend', text(body, 'reason'), body.timeoutMs as number | undefined), actionableMessage)
+            const request = await exposed(() => runtime.controlStart(actor, text(body, 'requestId'), action as 'retry' | 'stop' | 'extend', text(body, 'reason'), body.timeoutMs as number | undefined))
             return { ok: true, value: { request } }
           }
           const missionId = text(body, 'missionId')
           const action = text(body, 'action')
+          if (body.taskId !== undefined) {
+            await exposed(() => runtime.controlTask(actor, missionId, text(body, 'taskId'), action as 'resume' | 'amend', body.changes === undefined ? {} : object(body.changes) as TaskAmendment, text(body, 'reason')))
+            return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
+          }
+          if (action === 'amend') {
+            // Only `changes.scope` is valid without a taskId (see the tool
+            // surface). Name the required shape instead of surfacing a generic
+            // "Expected a JSON object" or an unhandled TypeError.
+            const changes = body.changes === undefined ? undefined : object(body.changes)
+            if (changes !== undefined && Object.keys(changes).some(key => key !== 'scope')) throw new RequestError('Mission-scope amend accepts only changes.scope: remove the other changes fields, or pass taskId to amend one task')
+            if (changes === undefined || changes.scope === undefined) throw new RequestError('Amend without taskId revises mission scope: pass changes.scope as a nonempty string array, or pass taskId to amend one task')
+            const scope = stringArray(changes, 'scope')
+            await exposed(() => runtime.amendScope(actor, missionId, scope, text(body, 'reason')))
+            return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
+          }
           if (!['pause', 'resume', 'stop', 'complete', 'coordinator'].includes(action)) throw new RequestError('Unknown mission control action')
           const coordinatorId = body.coordinatorId === undefined ? undefined : text(body, 'coordinatorId')
-          await exposed(() => runtime.control(actor, missionId, action as Parameters<SwarmRuntime['control']>[2], text(body, 'reason'), coordinatorId), actionableMessage)
+          await exposed(() => runtime.control(actor, missionId, action as Parameters<SwarmRuntime['control']>[2], text(body, 'reason'), coordinatorId))
           return { ok: true, value: { snapshot: runtime.snapshot(actor, missionId) } }
         }
         case 'add-member': {
@@ -382,12 +366,12 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           // M9(c): a bare string would turn topic matching into substring semantics.
           if (input.subscriptions !== undefined) stringArray(input, 'subscriptions')
           await validateModels(ctx, sessionId, [input as Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>], signal, true)
-          const member = await exposed(() => runtime.addMember(actor, missionId, input as Parameters<SwarmRuntime['addMember']>[2]), actionableMessage)
+          const member = await exposed(() => runtime.addMember(actor, missionId, input as Parameters<SwarmRuntime['addMember']>[2]))
           return { ok: true, value: { member, snapshot: runtime.snapshot(actor, missionId) } }
         }
         case 'propose': {
           const missionId = text(body, 'missionId')
-          const task = await exposed(() => runtime.propose(actor, missionId, object(body.input) as unknown as Parameters<SwarmRuntime['propose']>[2]), actionableMessage)
+          const task = await exposed(() => runtime.propose(actor, missionId, object(body.input) as unknown as Parameters<SwarmRuntime['propose']>[2]))
           return { ok: true, value: { task, snapshot: runtime.snapshot(actor, missionId) } }
         }
         case 'cancel': {
@@ -395,7 +379,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           const missionId = text(body, 'missionId')
           const taskId = text(body, 'taskId')
           const reason = text(body, 'reason')
-          const task = await exposed(() => runtime.cancel(actor, missionId, { taskId, reason }), actionableMessage)
+          const task = await exposed(() => runtime.cancel(actor, missionId, { taskId, reason }))
           return { ok: true, value: { task, snapshot: runtime.snapshot(actor, missionId) } }
         }
         default: throw new RequestError(`Unknown swarm endpoint: ${endpoint}`)
@@ -403,20 +387,21 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
     } catch (error) {
       if (signal.aborted || lifetime.signal.aborted) return { ok: false, error: { code: 'cancelled', message: 'Swarm request was cancelled', details: {} } }
       if (error instanceof MissingSession) return { ok: false, error: { code: 'session-not-found', message: error.message, details: { sessionId: error.sessionId } } }
-      if (error instanceof RequestError) return { ok: false, error: { code: 'bad-request', message: error.message, details: { issues: [] } } }
+      if (error instanceof RequestError) return { ok: false, error: { code: 'bad-request', message: error.message, details: { issues: [], ...(error.policy ? { policyCode: error.policy.code, category: error.policy.category } : {}) } } }
       // L3: an unexpected failure can carry absolute paths, store schema text or
       // internal route codes. Log the original host-side and return a stable
-      // public message; only authored policy text passes the allowlist above.
+      // public message; only an authored PolicyError passes exposed() above.
       const original = error instanceof InternalFailure ? error.cause : error
       const detail = original instanceof Error ? `${original.name}: ${original.message}` : String(original)
       try { ctx.logger.warn('agent-swarm: unexpected %s failure: %s', endpoint, detail) } catch { /* Logging must never mask the response. */ }
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // Three host generations, one route shape. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5: the connection
-  // service resolves `webServer` on a context that injects `credentials` alone,
-  // and Cordis refuses that property access, so the route is never registered.
+  // One route shape on both supported hosts. A plugin-owned channel
+  // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
+  // registers the route under the CONNECTION plugin's own fiber, which injects
+  // `credentials` alone, so Cordis refuses its `webServer` access and the route
+  // is never registered — silently, because the failure lands in a child fiber.
   // The shared `/api` interceptor is not an option either — that channel admits
   // exactly one interceptor and another plugin holds it. What is left is what the
   // host itself documents for plugin endpoints: one exact route per endpoint on
@@ -424,10 +409,23 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
   // Origin and browser-authentication fence. The client posts the standard
   // envelope to `/api/agent-swarm/<endpoint>`.
   const releases: Array<() => Promise<void>> = []
-  ctx.effect(() => () => { for (const release of releases.splice(0)) void release() }, 'agent-swarm: web routes')
+  ctx.effect(() => async () => {
+    const results = await Promise.allSettled(releases.splice(0).map(async release => await release()))
+    for (const result of results) if (result.status === 'rejected') {
+      try { ctx.logger.warn('agent-swarm: web route release failed: %s', String(result.reason)) } catch { /* Teardown must still settle. */ }
+    }
+  }, 'agent-swarm: web routes')
   const reply = (rpcId: string, result: ConnectionRpcResult<unknown>): Response => new Response(
     JSON.stringify({ type: 'server-response', rpcId: RpcId(rpcId), result } satisfies ServerResponse),
     { status: 200, headers: { 'content-type': 'application/json' } })
+  // A throw here fails only this inject child and Cordis reports it through the logger alone, so the
+  // outcome is written down either way: it is the line to look for when the panel answers 404 or 405.
+  try { mountRoutes() } catch (error) {
+    try { ctx.logger.error('agent-swarm: web routes failed to mount on %s: %s', SWARM_RPC_CHANNEL, String(error)) } catch { /* The throw below still reports it. */ }
+    throw error
+  }
+  try { ctx.logger.info('agent-swarm: web routes mounted on %s (%d endpoints)', SWARM_RPC_CHANNEL, SWARM_WEB_ENDPOINTS.length) } catch { /* Logging must never veto the mount. */ }
+  function mountRoutes(): void {
   for (const endpoint of SWARM_WEB_ENDPOINTS) {
     const method = `${SWARM_RPC_PREFIX}${endpoint}`
     releases.push(ctx.connection.fetch.register({
@@ -454,5 +452,6 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
         return reply(rpcId, await handler(endpoint, envelope.payload, request.signal))
       },
     }))
+  }
   }
 }

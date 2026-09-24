@@ -1,32 +1,15 @@
 /** W7 regressions: a denied worker git write is typed, actionable and never blocks submission. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 3, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-async function eventually(read, message) {
-  const deadline = Date.now() + 2500
-  while (Date.now() < deadline) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail(message)
-}
-
-class GitWorkers {
-  prepared = []; stopped = []; deliveries = []
+class GitWorkers extends FakeWorkers {
   checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   artifact = { commit: 'e'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] }
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ memberId: member.id, delivery }) }
-  async stop(memberId) { this.stopped.push(memberId) }
-  isIdle() { return false }
-  async prepareTask(member, task) { this.prepared.push(structuredClone({ member: member.id, task })) }
-  async captureArtifact() { return this.artifact }
-  async verifyArtifact() { return this.checks }
-  async dispose() {}
+  // Asynchronous like the adapter's inbox write, so ordering is observable.
+  async deliver(member, delivery) { await new Promise(resolve => setImmediate(resolve)); this.deliveries.push({ memberId: member.id, delivery }) }
 }
 
 const deniedCommit = {
@@ -37,11 +20,11 @@ const deniedCommit = {
 }
 
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-gitwrite-'))
-  const workers = new GitWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100 }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new GitWorkers(),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 300, maxTasksPerMember: 100, checkTimeoutMs: undefined },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'git-owner' }
   const mission = runtime.create(owner, { title: 'Git write', objective: 'Surface the sandbox boundary', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
@@ -49,7 +32,7 @@ async function fixture(t) {
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const actor = member => ({ sessionId: member.sessionId })
-  const propose = (extra = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Implement', objective: 'Implement',
+  const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
   const events = type => runtime.store.events(mission.id, 500).filter(event => event.type === type)
   return { runtime, workers, owner, mission, author, reviewer, actor, propose, events }
@@ -64,15 +47,16 @@ test('a denied worker git write returns a typed error naming swarm_submit and le
   assert.equal(denied.data.taskId, task.id)
   assert.equal(denied.data.attemptId, task.attempt.id)
   assert.match(denied.data.command, /git commit/)
-  // Pre-fix the guard returned undefined and the worker saw only the raw EPERM.
+  // The precise denial is delivered without disabling unrelated tools.
   const guard = f.workers.callbacks.guard(f.author.id, 'bash')
-  assert.match(guard, /swarm_submit/, 'the typed error names the supported artifact path')
-  assert.match(guard, /git metadata|index\.lock|EPERM/)
-  assert.doesNotMatch(guard, /^fatal:/, 'the raw sandbox error is not surfaced as the whole message')
+  assert.equal(guard, undefined, 'workspace tools remain available after the sandbox refused a Git write')
   assert.equal(f.workers.callbacks.guard(f.author.id, 'swarm_submit'), undefined, 'submission stays available')
-  const notice = await eventually(() => f.workers.deliveries.find(item => item.memberId === f.author.id
-    && /swarm_submit/.test(item.delivery.content)), 'the worker receives the actionable notice')
-  assert.match(notice.delivery.content, /cannot write git metadata/)
+  // The adapter awaits toolRun before the model sees the failed result, so the
+  // notice must already be in the worker's inbox: its next model step sees it.
+  // (The assignment's instructions also name swarm_submit; match the typed control row.)
+  const notice = f.workers.deliveries.find(item => item.memberId === f.author.id && item.delivery.kind === 'control' && /swarm_submit/.test(item.delivery.content))
+  assert.ok(notice, 'the worker receives the actionable notice before the failed run returns')
+  assert.match(notice.delivery.content, /git commit -m "integrate branches" could not write git metadata/)
   const submitted = await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, output: 'workspace captured host-side' })
   assert.equal(submitted.status, 'submitted', 'artifact publication never depends on a worker-side commit')
   assert.equal(submitted.artifact.commit, f.workers.artifact.commit)
@@ -82,7 +66,7 @@ test('the assignment instructions state the git-write constraint before the work
   const f = await fixture(t)
   await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose().id)
   const assignment = await eventually(() => f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.memberId === f.author.id),
-    'the worker received its assignment')
+    'the worker received its assignment', 2500)
   const { instructions } = JSON.parse(assignment.delivery.content)
   assert.match(instructions, /cannot write git metadata/)
   assert.match(instructions, /index\.lock EPERM/)
@@ -104,12 +88,12 @@ test('a new attempt starts without the previous attempt git-write denial', async
   const f = await fixture(t)
   const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose().id)
   await f.workers.callbacks.toolRun(f.author.id, deniedCommit)
-  assert.match(f.workers.callbacks.guard(f.author.id, 'bash'), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, 'bash'), undefined)
   f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: task.attempt.id, to: f.reviewer.id, summary: 'Reassign after the sandbox denial' })
   await eventually(() => {
     const current = f.runtime.store.get('tasks', task.id)
     return current.status === 'pending' ? current : undefined
-  }, 'the handoff re-pends the task')
+  }, 'the handoff re-pends the task', 2500)
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, task.id)
   assert.equal(claimed.gitWriteDenied, undefined, 'the marker is cleared when the new attempt is admitted')
   assert.equal(f.workers.callbacks.guard(f.reviewer.id, 'bash'), undefined, 'the new owner is not denied for the old attempt')
@@ -176,7 +160,7 @@ test('F14: only the executed shell command decides; a quoting side argument or a
     isError: true,
   })
   assert.equal(f.events('task/git-write-denied').length, 1, 'a real shell write is still denied exactly once')
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   assert.equal(f.workers.callbacks.guard(f.author.id, 'swarm_submit'), undefined)
 })
 
@@ -208,7 +192,7 @@ test('F14: a quoted pattern is data while a compound command still denies', asyn
     isError: true,
   })
   assert.equal(f.events('task/git-write-denied').length, 1, 'a compound command still denies')
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
 // R6-01: the denial must not depend on text in the command's OUTPUT. A failing
@@ -251,26 +235,19 @@ test('R6-01: a real git add through bash is still denied once with the typed dur
   assert.equal(denied[0].data.taskId, task.id)
   assert.match(denied[0].data.command, /git add/)
   assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, realAddCommand)
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
-test('R6-01: the denial no longer depends on the failure output text', async t => {
+test('R15: a non-permission Git failure is not reported as a sandbox refusal', async t => {
   const f = await fixture(t)
   const task = await f.runtime.claim(f.actor(f.author), f.mission.id, f.propose().id)
-  // A real commit that fails without any sandbox refusal vocabulary in its
-  // output is still a denied git write; pre-fix it was not, because the guard
-  // required the refusal text, so this test fails on the pre-fix head.
   await f.workers.callbacks.toolRun(f.author.id, {
-    tool: SHELL,
-    arguments: { command: realCommitCommand },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
-    isError: true,
+    tool: SHELL, arguments: { command: realCommitCommand },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] }, isError: true,
   })
-  const [denied] = f.events('task/git-write-denied')
-  assert.ok(denied, 'a failed metadata write denies without output-borne refusal text')
-  assert.equal(denied.data.taskId, task.id)
-  assert.match(denied.data.command, /git commit/)
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.events('task/git-write-denied').length, 0)
+  assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied, undefined)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
 // R6-02: only the git SUBCOMMAND at command position counts. A read-only
@@ -309,7 +286,7 @@ test('R6-02: a metadata write at subcommand position still denies once after glo
   await f.workers.callbacks.toolRun(f.author.id, {
     tool: SHELL,
     arguments: { command: positionedWriteCommand },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
     isError: true,
   })
   const denied = f.events('task/git-write-denied')
@@ -317,7 +294,7 @@ test('R6-02: a metadata write at subcommand position still denies once after glo
   assert.equal(denied[0].data.taskId, task.id)
   assert.match(denied[0].data.command, /commit/)
   assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, positionedWriteCommand)
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
 // R6-I2c: the git token must be the COMMAND. A segment whose preceding tokens
@@ -366,7 +343,7 @@ test('R6-I2c: wrapper forms still deny exactly once at command position', async 
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
@@ -429,14 +406,14 @@ test('R7-01: a real write after the heredoc terminator still denies exactly once
   await f.workers.callbacks.toolRun(f.author.id, {
     tool: SHELL,
     arguments: { command },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
     isError: true,
   })
   const denied = f.events('task/git-write-denied')
   assert.equal(denied.length, 1, 'the executed write after the terminator is durably recorded exactly once')
   assert.equal(denied[0].data.taskId, task.id)
   assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command)
-  assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+  assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
 })
 
 test('R7-01: a real git write whose stdin is a heredoc still denies exactly once', async t => {
@@ -446,7 +423,7 @@ test('R7-01: a real git write whose stdin is a heredoc still denies exactly once
   await f.workers.callbacks.toolRun(f.author.id, {
     tool: SHELL,
     arguments: { command },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
     isError: true,
   })
   const denied = f.events('task/git-write-denied')
@@ -494,7 +471,7 @@ test('R7-01: a here-string or arithmetic shift never hides a later real write', 
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
@@ -527,14 +504,14 @@ test('R7-01b: a here-string or arithmetic operator never swallows a later real w
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the later write exactly once`)
     assert.equal(denied[0].data.taskId, task.id)
     assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command, 'the executed command is latched')
-    assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+    assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
 
@@ -579,7 +556,7 @@ test('R7-01b: a real write after a legal heredoc terminator still denies exactly
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
@@ -598,7 +575,7 @@ test('R7-01b: an unterminated heredoc never swallows a later real write', async 
   await f.workers.callbacks.toolRun(f.author.id, {
     tool: SHELL,
     arguments: { command },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
     isError: true,
   })
   const denied = f.events('task/git-write-denied')
@@ -637,7 +614,7 @@ test('R7-01b: a here-string without a space never hides a later real write', asy
   await f.workers.callbacks.toolRun(f.author.id, {
     tool: SHELL,
     arguments: { command },
-    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+    result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
     isError: true,
   })
   const denied = f.events('task/git-write-denied')
@@ -666,14 +643,14 @@ test('R7-01c: $[...] and unquoted ${...} are literal spans, not heredoc operator
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
     assert.equal(denied.length, 1, `${command.split('\n')[0]} still denies the later write exactly once`)
     assert.equal(denied[0].data.taskId, task.id)
     assert.equal(f.runtime.store.get('tasks', task.id).gitWriteDenied.command, command, 'the executed command is latched')
-    assert.match(f.workers.callbacks.guard(f.author.id, SHELL), /swarm_submit/)
+    assert.equal(f.workers.callbacks.guard(f.author.id, SHELL), undefined)
   }
 })
 
@@ -691,7 +668,7 @@ test('R7-01c: arithmetic $((...)) controls still deny exactly once', async t => 
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')
@@ -735,7 +712,7 @@ test('R7-01c: a real write after a literal span and a heredoc terminator still d
     await f.workers.callbacks.toolRun(f.author.id, {
       tool: SHELL,
       arguments: { command },
-      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref, repository is busy' }] },
+      result: { isError: true, content: [{ type: 'text', text: 'fatal: cannot lock ref: Operation not permitted' }] },
       isError: true,
     })
     const denied = f.events('task/git-write-denied')

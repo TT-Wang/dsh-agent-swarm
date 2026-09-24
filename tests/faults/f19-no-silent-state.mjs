@@ -15,10 +15,7 @@
  * owner-assembled mission returned silently.
  */
 import assert from 'node:assert/strict'
-import { realpath, rm } from 'node:fs/promises'
-import { join } from 'node:path'
-import { FakeWorkers, SwarmRuntime, acceptThroughReview, blockThroughReview, clone, eventually, events, runScenario, setup, taskOf } from './harness.mjs'
-import { tempDirectory } from '../temp-root.mjs'
+import { acceptThroughReview, blockThroughReview, clone, eventually, events, makeRuntime, runScenario, setup, taskOf } from './harness.mjs'
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const ownerNotices = f => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.kind === 'control')
@@ -249,24 +246,120 @@ await runScenario({
     }
 
     // Row 7b — T1av2 (evidence_978a4694): running work plus a pending dependent
-    // whose prerequisite is not accepted. The documented row-3 exemption covers
-    // only an all-running board, so this state must still leave a W2 notice.
+    // that no live path advances. The documented row-3 exemption covers only an
+    // all-running board, so row 7's condition (deps blocked/cancelled) must still
+    // leave a W2 notice while unrelated work runs. A dependent whose prerequisite
+    // is merely queued behind its assignee's live lease is NOT that condition: the
+    // lease bounds the wait exactly as in row 3, so waking the owner there would be
+    // a false wake. Both halves are asserted. Research kind keeps the board free of
+    // the second-implementation integration-gap diagnostic (as rows 5b/5c do).
     {
       const f = await setup({ config: { leaseMs: 60_000 } })
       try {
-        const first = f.propose({ title: 'Running work' })
+        const research = { kind: 'research', checks: undefined }
+        const first = f.propose({ title: 'Running work', ...research })
         await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
         assert.equal(taskOf(f.runtime, first.id).status, 'running')
-        const prerequisite = f.propose({ title: 'Pending prerequisite' })
-        const dependent = { ...taskOf(f.runtime, prerequisite.id), id: 'task_f19_running_dependent', title: 'Pending dependent',
-          dependencies: [prerequisite.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
-          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
+        const dependentOf = (id, prerequisiteId) => ({ ...taskOf(f.runtime, first.id), id, title: `Dependent of ${prerequisiteId}`,
+          dependencies: [prerequisiteId], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
+          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined })
+        const fallthroughs = () => ownerNotices(f).filter(delivery => /made no progress|Mission stalled/.test(delivery.content))
+        // (a) The prerequisite is ready for its assignee, who holds a live lease on
+        // `first`: a bounded live wait, so no fall-through may name either task.
+        const prerequisite = f.propose({ title: 'Queued prerequisite', ...research })
+        const waiting = dependentOf('task_f19_waiting_dependent', prerequisite.id)
+        f.runtime.store.transaction(() => f.runtime.store.put('tasks', waiting))
+        await sleep(200)
+        assert.deepEqual(fallthroughs(), [], 'row 7b: work queued behind a live lease is a bounded wait, not a stall')
+        // (b) A dependent admitted before its prerequisite was withdrawn: its
+        // lineage is dead (spec row 7), and the running work must not hide it.
+        const withdrawn = f.propose({ title: 'Withdrawn prerequisite', ...research })
+        f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'withdrawn by the owner' })
+        const dependent = dependentOf('task_f19_running_dependent', withdrawn.id)
         f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
-        const notice = await eventually(() => ownerNotices(f).find(delivery => /made no progress|Mission stalled/.test(delivery.content)),
+        const notice = await eventually(() => fallthroughs()[0],
           'row 7b: running work plus a not-ready dependent must still leave a witness')
         assertWitness(f, 'W2', 'row 7b')
         assert.match(notice.content, /swarm_propose|swarm_control/, 'the notice names a decision the owner can take')
+        assert.deepEqual(notice.subjects, [`${dependent.id}@0`], 'the notice names only the subject no live path advances')
         rows.row7b = { witness: 'W2', taskId: dependent.id }
+      } finally { await f.cleanup() }
+    }
+
+    // Row 7c — a BLOCKED prerequisite under running work. The prerequisite hits
+    // its own step ceiling (no verify-site rejection decision covers it), so its
+    // stall-root decision is the owner's wake: it must be DELIVERED, not only
+    // written to the ledger, and name the dependent it strands. The dependent
+    // waits on the root, so no fall-through re-names either task.
+    {
+      const f = await setup({ config: { leaseMs: 60_000 } })
+      try {
+        const research = { kind: 'research', checks: undefined }
+        const runner = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Runner', role: 'implementation', maxOutputTokens: 5_000 })
+        const first = f.propose({ title: 'Running work', ...research, assigneeId: runner.id })
+        await f.runtime.claim(f.actor(runner), f.mission.id, first.id)
+        const prerequisite = f.propose({ title: 'Ceilinged prerequisite', ...research, maxSteps: 1 })
+        await f.runtime.claim(f.actor(f.author), f.mission.id, prerequisite.id)
+        const dependent = { ...taskOf(f.runtime, first.id), id: 'task_f19_blocked_dependent', title: 'Dependent of a blocked prerequisite',
+          dependencies: [prerequisite.id], status: 'pending', assigneeId: undefined, attempt: undefined, epoch: 0,
+          artifact: undefined, evidenceIds: [], reviewOf: undefined, replaces: undefined, output: undefined, recoveryCount: undefined }
+        f.runtime.store.transaction(() => f.runtime.store.put('tasks', dependent))
+        await f.workers.callbacks.beforeStep(f.author.id)
+        assert.equal(await f.workers.callbacks.beforeStep(f.author.id), false)
+        const blocked = taskOf(f.runtime, prerequisite.id)
+        assert.equal(blocked.status, 'blocked', 'row 7c: the prerequisite is blocked by its ceiling')
+        assert.equal(taskOf(f.runtime, first.id).status, 'running', 'row 7c: unrelated work keeps running')
+        const key = `stall-root:${f.mission.id}:${prerequisite.id}@${blocked.epoch}`
+        const root = await eventually(() => ownerNotices(f).find(delivery => delivery.notice?.dedupKey === key && delivery.deliveredAt !== undefined),
+          'row 7c: the stall-root decision for a blocked prerequisite under running work must be delivered')
+        assert.equal(root.notice.coveredBy, undefined, 'row 7c: no rejection decision carries this root; it is its own wake')
+        assert.ok(root.subjects.includes(`${dependent.id}@0`), `row 7c: the stranded dependent is named: ${JSON.stringify(root.subjects)}`)
+        assert.deepEqual(ownerNotices(f).filter(delivery => delivery.notice?.dedupKey?.startsWith('fallthrough:')), [], 'row 7c: the root speaks for its dependent')
+        assertWitness(f, 'W2', 'row 7c')
+        rows.row7c = { witness: 'W2', taskId: prerequisite.id, delivered: true }
+      } finally { await f.cleanup() }
+    }
+
+    // Row 7d — a pending task in preparation back-off is a bounded wait until one
+    // tick past retryAt. A W2 stamped inside that window (here the row-7b stamp
+    // after an unrelated stall root) must not hide the back-off once the bound
+    // passes with nothing left to retry it: its expiry changes nothing in F(S).
+    {
+      const f = await setup({ config: { leaseMs: 60_000 } })
+      try {
+        const research = { kind: 'research', checks: undefined }
+        const tickMs = f.runtime.config.tickMs
+        const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation', maxOutputTokens: 5_000 })
+        const first = f.propose({ title: 'Running work', ...research })
+        await f.runtime.claim(f.actor(f.author), f.mission.id, first.id)
+        const other = f.propose({ title: 'Unrelated dead end', ...research })
+        const backoff = f.propose({ title: 'Backing off', ...research, assigneeId: second.id })
+        const retryAt = Date.now() + 400
+        f.runtime.commit(f.mission.id, () => {
+          const row = taskOf(f.runtime, backoff.id)
+          row.epoch++
+          row.preparationFailure = { reason: 'Workspace or worker preparation failed: EBUSY', transient: true, attempts: 1, retryAt }
+          f.runtime.store.put('tasks', row)
+          const dead = taskOf(f.runtime, other.id)
+          dead.status = 'blocked'; dead.epoch++; dead.output = 'blocked by the injected fault'
+          f.runtime.store.put('tasks', dead)
+          const member = f.runtime.store.get('members', second.id)
+          member.phase = 'stopped'
+          f.runtime.store.put('members', member)
+        })
+        const subject = `${backoff.id}@${taskOf(f.runtime, backoff.id).epoch}`
+        const naming = () => ownerNotices(f).filter(delivery => delivery.notice?.dedupKey?.startsWith('fallthrough:') && delivery.subjects?.includes(subject))
+        const stamped = await eventually(() => {
+          const witness = witnessOf(f)
+          return witness?.kind === 'W2' && witness.at <= retryAt && witness.fingerprint === f.runtime.fingerprint(f.mission.id) ? witness : undefined
+        }, 'row 7d: a W2 is stamped for this F(S) inside the back-off window')
+        assert.deepEqual(naming(), [], 'row 7d: the live back-off is not named')
+        const notice = await eventually(() => naming()[0], 'row 7d: the expired back-off must be named despite the earlier W2 for the same F(S)', 3_000)
+        assert.ok(notice.createdAt > retryAt + tickMs, 'row 7d: named only once the bound has passed')
+        assert.deepEqual(notice.subjects, [subject], 'row 7d: only the expired back-off is named')
+        assertWitness(f, 'W2', 'row 7d')
+        assert.ok(witnessOf(f).at > stamped.at, 'row 7d: the fall-through is the new witness for F(S)')
+        rows.row7d = { witness: 'W2', taskId: backoff.id }
       } finally { await f.cleanup() }
     }
 
@@ -316,7 +409,10 @@ await runScenario({
         await acceptThroughReview(f, second)
         const stall = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled').at(-1),
           'row 9b: two implementation artifacts without an integration must stall')
-        assert.match(stall.data.reason, /Coding missions require an independently accepted integration artifact/)
+        // The delivery predicate's wording since 69211b9; the row's claim is that
+        // the stall carries exactly what completion reports.
+        assert.match(stall.data.reason, /A unique independently accepted implementation artifact is required/)
+        assert.equal(stall.data.reason, f.runtime.completionError(f.runtime.store.get('missions', f.mission.id)))
         assertWitness(f, 'W3', 'row 9b')
         rows.row9b = { witness: 'W3', reason: stall.data.reason }
       } finally { await f.cleanup() }
@@ -369,7 +465,7 @@ await runScenario({
         const evidence = publishEvidence(f, task, claimed.attempt.id)
         await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate with evidence' })
         const review = f.runtime.propose(f.owner, f.mission.id, {
-          workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
+          outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review', kind: 'verification',
           reviewOf: task.id, scope: ['**'], acceptance: ['fault recovery is proven from durable state'], assigneeId: f.reviewer.id,
         })
         const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
@@ -434,22 +530,22 @@ await runScenario({
     // Row 17 — zero-task, zero-member active mission: documented exemption; the
     // test asserts no notice and a fingerprint stable across ticks.
     {
-      const directory = await realpath(await tempDirectory('swarm-f19-empty-'))
-      const workers = new FakeWorkers()
-      const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 10,
-        maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+      // fixture gap: makeRuntime takes a node:test context and a scenario has none, so its cleanup is collected here and run in finally.
+      let cleanup
+      const { dir: directory, runtime, budget } = await makeRuntime({ after: fn => { cleanup = fn } }, { config: { maxEvents: 500, checkTimeoutMs: undefined },
+        budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20 } })
       try {
         await runtime.start()
         const owner = { sessionId: 'f19-empty-owner' }
         const mission = runtime.create(owner, { title: 'Empty', objective: 'Owner still planning', workspace: directory, scope: ['**'],
-          acceptance: ['x'], budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 0 } })
+          acceptance: ['x'], budget })
         const first = runtime.fingerprint(mission.id)
         await sleep(120)
         assert.equal(runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').length, 0, 'row 17: the documented exemption is not spammed')
         assert.equal(runtime.store.get('missions', mission.id).witness, undefined, 'row 17: no witness is fabricated for the exemption')
         assert.equal(runtime.fingerprint(mission.id), first, 'row 17: wall-clock ticks never change F(S)')
         rows.row17 = { witness: 'exempt' }
-      } finally { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) }
+      } finally { await cleanup() }
     }
 
     // The board is stable under task/member order and sensitive to real change.

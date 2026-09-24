@@ -1,6 +1,6 @@
 /**
- * Arena protocols: the mission-state fingerprint, the bounded per-member
- * proposal allowance, and the read-only notice/escalation projections.
+ * Arena protocols: the mission-state fingerprint, the aggregate proposal
+ * safety limit, and the read-only notice/escalation projections.
  *
  * Everything here is a pure function over durable records so the runtime, the
  * tests and the UI projection derive the same answer without a second policy
@@ -15,6 +15,10 @@
  * `missionFingerprint(board)` (T1a's 32-hex F(S)).
  */
 import { createHash } from 'node:crypto'
+import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
+import { assignmentAllows, canOwnReview } from './assignment.ts'
+import { liveReviewFor } from './admission.ts'
+import { memberPhaseOf } from './projection.ts'
 import type { Delivery, Escalation, Evidence, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /** Owner-observable board, as durable records; no wall-clock value participates. */
@@ -34,17 +38,8 @@ const byId = <T extends { id: string }>(left: T, right: T): number => (left.id <
  * replacement, deterministically (oldest live replacement, id tie-break).
  */
 export function liveCarrier(tasks: readonly Task[], dependencyId: string, seen: Set<string> = new Set()): Task | undefined {
-  const task = tasks.find(candidate => candidate.id === dependencyId)
-  if (task === undefined || seen.has(task.id)) return undefined
-  seen.add(task.id)
-  if (task.status !== 'blocked' && task.status !== 'cancelled') return task
-  const replacements = tasks.filter(candidate => candidate.replaces?.includes(task.id) && !seen.has(candidate.id))
-  const oldest = (candidates: readonly Task[]) => [...candidates]
-    .sort((left, right) => left.createdAt - right.createdAt || byId(left, right))[0]
-  const next = oldest(replacements.filter(candidate => candidate.status === 'accepted'))
-    ?? oldest(replacements.filter(candidate => ['pending', 'running', 'submitted'].includes(candidate.status)))
-    ?? oldest(replacements.filter(candidate => candidate.status === 'blocked' || candidate.status === 'cancelled'))
-  return next === undefined ? task : liveCarrier(tasks, next.id, seen)
+  if (seen.has(dependencyId)) return undefined
+  return taskGraphIndex(tasks).effective(dependencyId)
 }
 
 /** Whether one dependency reference is satisfied by an accepted live carrier. */
@@ -52,16 +47,9 @@ export function dependencyAccepted(tasks: readonly Task[], dependencyId: string)
   return liveCarrier(tasks, dependencyId)?.status === 'accepted'
 }
 
-/** A submitted task's live review path: a non-terminal verification task reviewing it. */
-function hasReviewPath(tasks: readonly Task[], taskId: string): boolean {
-  return tasks.some(candidate => candidate.reviewOf === taskId && ['pending', 'running', 'submitted'].includes(candidate.status))
-}
-
-/** The author of the reviewed source; a reviewer must differ from it. */
-function reviewedAuthor(tasks: readonly Task[], reviewOf: string | undefined): string | undefined {
-  if (reviewOf === undefined) return undefined
-  const source = tasks.find(candidate => candidate.id === reviewOf)
-  return source?.attempt?.ownerId ?? source?.assigneeId
+/** A submitted task's live review path: the scheduler's one live-review rule (`liveReviewFor`). */
+function hasReviewPath(tasks: readonly Task[], members: readonly Member[], source: Task): boolean {
+  return liveReviewFor(tasks, source, new Set(members.filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))) !== undefined
 }
 
 /**
@@ -70,17 +58,15 @@ function reviewedAuthor(tasks: readonly Task[], reviewOf: string | undefined): s
  * independence. `waiting` counts as live: dispatch to a waiting member is
  * fresh input (R10-09/S3), so the fingerprint must not call it not-ready.
  */
-export function pendingReadiness(tasks: readonly Task[], members: readonly Member[]): { ready: number; notReady: number } {
-  const live = members.filter(member => member.status !== 'stopped')
+export function pendingReadiness(tasks: readonly Task[], members: readonly Member[], graph: TaskGraphIndex = taskGraphIndex(tasks)): { ready: number; notReady: number } {
+  const live = members.filter(member => member.status === 'idle' || member.status === 'waiting')
   let ready = 0, notReady = 0
   for (const task of tasks) {
     if (task.status !== 'pending') continue
-    const assignee = task.assigneeId === undefined ? undefined : live.find(member => member.id === task.assigneeId)
-    const pinnedToStopped = task.assigneeId !== undefined && assignee === undefined
-    const author = reviewedAuthor(tasks, task.reviewOf)
-    const independent = assignee === undefined || author === undefined || assignee.id !== author
-    const runnable = !pinnedToStopped && independent && task.dependencies.every(dependency => dependencyAccepted(tasks, dependency))
-      && (task.assigneeId === undefined ? live.length > 0 : assignee !== undefined)
+    const source = graph.reviewSource(task)
+    const runnable = task.dependencies.every(graph.dependencyMet)
+      && (task.reviewOf === undefined || source?.status === 'submitted')
+      && live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
     if (runnable) ready++
     else notReady++
   }
@@ -111,17 +97,24 @@ export function noticeFingerprint(input: FingerprintInput): string {
   return digest(input, true)
 }
 
-function digest(input: FingerprintInput, excludeNotices: boolean): string {
+/** A covered owner fact (`coveredBy`, src/notices.ts) is never sent: the delivery covering it carried the obligation. */
+const covered = (delivery: Pick<Delivery, 'notice'>): boolean => (delivery.notice as { coveredBy?: string } | undefined)?.coveredBy !== undefined
+
+/** Whether a delivery is still owed to its recipient; a covered fact never is. */
+export function awaitsDelivery(delivery: Pick<Delivery, 'deliveredAt' | 'notice'>): boolean {
+  return delivery.deliveredAt === undefined && !covered(delivery)
+}
+
+function digest(input: FingerprintInput, excludeNotices: boolean, readiness = pendingReadiness(input.tasks, input.members)): string {
   const { mission, tasks, members, evidence, deliveries } = input
-  const readiness = pendingReadiness(tasks, members)
   const canonical = {
     status: mission.status,
     tasks: [...tasks].sort(byId).map(task => [task.id, task.status, task.attempt?.ownerId ?? null]),
     ready: readiness.ready,
     notReady: readiness.notReady,
-    submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, task.id)).map(task => task.id).sort(),
+    submittedUnreviewed: tasks.filter(task => task.status === 'submitted' && !hasReviewPath(tasks, members, task)).map(task => task.id).sort(),
     members: [...members].sort(byId).map(member => [member.id, member.status]),
-    pendingDeliveries: deliveries.filter(delivery => delivery.deliveredAt === undefined && !(excludeNotices && delivery.notice !== undefined)).length,
+    pendingDeliveries: deliveries.filter(delivery => awaitsDelivery(delivery) && !(excludeNotices && delivery.notice !== undefined)).length,
     challenged: evidence.filter(item => item.status === 'challenged').map(item => item.id).sort(),
     ceilings: tasks.filter(task => task.ceiling !== undefined)
       .map(task => [task.id, task.ceiling!.dimension, task.ceiling!.limit, task.ceiling!.used]).sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
@@ -129,29 +122,21 @@ function digest(input: FingerprintInput, excludeNotices: boolean): string {
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
-/** The owner-set bound on how much board one member may add, and its usage. */
+/** Compatibility projection of the aggregate mission task safety limit. */
 export interface ProposalAllowance {
-  /** Effective per-member limit: inside the mission task ceiling, never below 1. */
   limit: number
-  /** The mission task ceiling the allowance sits inside. */
   ceiling: number
-  /** Planned worker capacity used to derive the default share. */
+  /** Informational capacity; increasing workers never reduces proposal room. */
   plannedMembers: number
-  /** Non-cancelled tasks this proposer already added to the board. */
+  /** All admitted rows, matching the aggregate runtime safety limit. */
   admitted: number
 }
 
-/**
- * R11-17: derive the allowance from the owner-set mission ceiling. It is a pure
- * function of durable state, so a member cannot raise it: the only input that
- * changes it is `maxTasks`, and `swarm_budget` is owner-only. A cancelled task
- * does not consume the allowance (it no longer occupies the board).
- */
-export function proposalAllowance(mission: Pick<Mission, 'budget'>, _members: readonly Member[], tasks: readonly Task[], proposer: string): ProposalAllowance {
+export function proposalAllowance(mission: Pick<Mission, 'budget'>, _members: readonly Member[], tasks: readonly Task[], _proposer: string): ProposalAllowance {
   const ceiling = Math.max(1, mission.budget.maxTasks)
   const plannedMembers = Math.max(1, mission.budget.maxWorkers)
-  const limit = Math.max(1, Math.min(ceiling, Math.ceil(ceiling / plannedMembers)))
-  const admitted = tasks.filter(task => task.proposedBy === proposer && task.status !== 'cancelled').length
+  const limit = ceiling
+  const admitted = tasks.length
   return { limit, ceiling, plannedMembers, admitted }
 }
 
@@ -194,10 +179,14 @@ export function noticeEntry(delivery: Delivery): NoticeLedgerEntry | undefined {
   }
 }
 
-/** Newest-first bounded ledger page. Read-only: the caller receives copies. */
+/**
+ * Newest-first bounded ledger page. Read-only: the caller receives copies. A
+ * covered fact is no notice the owner was sent, so it is not a ledger entry
+ * (never `queued`, never the last notice); `hasNotice` still dedups on it.
+ */
 export function noticeLedger(deliveries: readonly Delivery[], limit = 20): NoticeLedgerEntry[] {
   const bounded = Math.max(1, Math.trunc(limit))
-  return deliveries.map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
+  return deliveries.filter(delivery => !covered(delivery)).map(noticeEntry).filter((entry): entry is NoticeLedgerEntry => entry !== undefined).slice(-bounded).reverse()
 }
 
 /**
@@ -237,11 +226,11 @@ export interface ArenaMemberView {
    * same ownership across renewals.
    */
   attemptAgeMs?: number
-  /** The member's next pending task, when it holds no live attempt. */
+  /** A representative pending task when no attempt is live; not a dispatch prediction. */
   pendingTaskId?: string
   /**
    * Ids of the dependencies still blocking this member: the running attempt's
-   * dependencies, or the next pending task's when there is no live attempt.
+   * dependencies, or the representative pending task's when there is no live attempt.
    */
   pendingDependencies: string[]
   subscriptions: string[]
@@ -266,27 +255,31 @@ export function arenaView(input: FingerprintInput & { missionId: string; now: nu
   const { missionId, now, leaseMs, limit = 20 } = input
   const notices = noticeLedger(input.deliveries, limit)
   const running = input.tasks.filter(task => task.status === 'running' && task.attempt !== undefined)
+  const graph = taskGraphIndex(input.tasks)
+  const readiness = pendingReadiness(input.tasks, input.members, graph)
   return {
     missionId,
     status: input.mission.status,
-    fingerprint: arenaLedgerDigest(input),
-    pendingDispatchable: pendingReadiness(input.tasks, input.members).ready,
+    fingerprint: digest(input, false, readiness),
+    pendingDispatchable: readiness.ready,
     members: [...input.members].sort(byId).map(member => {
       const current = running.find(task => task.attempt!.ownerId === member.id)
       const attemptStart = current === undefined ? undefined : Math.max(0, current.attempt!.leaseUntil - leaseMs)
-      // Without a live attempt, the member's next pending task names what it is
-      // waiting on, so the owner can see a blocked member, not just a busy one.
+      // A pending task illustrates a member's outstanding work. This diagnostic
+      // is not a dispatch prediction: host readiness remains runtime-owned.
       const next = current === undefined
-        ? input.tasks.filter(task => task.status === 'pending' && (task.assigneeId === undefined || task.assigneeId === member.id))
-          .sort((left, right) => Number(right.assigneeId === member.id) - Number(left.assigneeId === member.id)
-            || right.priority - left.priority || left.createdAt - right.createdAt || byId(left, right))[0]
+        ? input.tasks.filter(task => {
+          if (task.status !== 'pending' || !assignmentAllows(task, member.id, input.tasks)) return false
+          return canOwnReview(graph.reviewSource(task), member.id)
+        })
+          .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt || byId(left, right))[0]
         : undefined
       return {
         id: member.id, name: member.name, role: member.role, status: member.status,
         ...(member.activity === undefined ? {} : { activity: member.activity }),
         ...(current === undefined ? {} : { currentTaskId: current.id, attemptId: current.attempt!.id, attemptAgeMs: Math.max(0, now - attemptStart!) }),
         ...(next === undefined ? {} : { pendingTaskId: next.id }),
-        pendingDependencies: (current?.dependencies ?? next?.dependencies ?? []).filter(dependency => !dependencyAccepted(input.tasks, dependency)),
+        pendingDependencies: (current?.dependencies ?? next?.dependencies ?? []).filter(dependency => !graph.dependencyMet(dependency)),
         subscriptions: [...member.subscriptions],
       }
     }),

@@ -1,48 +1,36 @@
 /** Automatic admission uses the real durable runtime; only external workers are controlled. */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 12, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
-async function eventually(read) {
-  const until = Date.now() + 2500
-  while (Date.now() < until) { const value = read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)) }
-  assert.fail('Expected automatic runtime transition did not occur')
-}
-class Workers {
-  prepared = []; starts = []; stopped = []; delivered = []
+/** `prepared` holds prepared workspace ids, `starts` the start specs and `delivered` the raw deliveries; a verification may call through with no arguments. */
+class Workers extends FakeWorkers {
+  starts = []; delivered = []
   checks = [{ command: 'node check.cjs', exitCode: 0, output: 'ok' }]
   onStart = async () => {}
-  bind(callbacks) { this.callbacks = callbacks }
   async prepareWorkspace(mission, id) { this.prepared.push(id); return join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec); await this.onStart(spec) }
   async stop(id) { if (this.stopGate) await this.stopGate; this.stopped.push(id) }
   async prepareTask() {}
   async deliver(member, delivery) { this.delivered.push({ member, delivery }) }
-  isIdle() { return false }
   async captureArtifact(member) { return { commit: 'verified-commit', baseCommit: 'base', workspace: member.workspace, changedPaths: ['src/value.cjs'] } }
   async verifyArtifact() { return this.checks }
-  async dispose() {}
 }
 function plan(workspace) {
   return { title: 'Automatic delivery', objective: 'Deliver verified code', workspace, scope: ['src/'], acceptance: ['works'], budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
     tasks: [
-      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
-      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
+      { key: 'deliver', workstreamKey: 'main', title: 'Deliver', objective: 'Implement final change', kind: 'integration', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 5, checkTimeoutMs: 45000 },
+      { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ] }
 }
 async function fixture(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-automatic-'))
-  const config = { statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 10, maxMessageChars: 10000, maxEvents: 100, maxTasksPerMember: 3 }
-  const workers = new Workers(), runtime = new SwarmRuntime(config, workers)
+  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(), config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'automatic-owner' }
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const requestInput = { commandId: 'command-1', goal: 'Make the requested change and verify it.', workspace: directory }
   return { directory, config, workers, runtime, owner, requestInput, input: plan(directory) }
 }
@@ -51,6 +39,43 @@ async function launch(f, input = f.input) {
   const snapshot = await f.runtime.startPlan(f.owner, request.id, input)
   return { request, snapshot }
 }
+
+test('automatic default names persist in the plan and roster through a failed launch and retry', async t => {
+  const f = await fixture(t)
+  delete f.input.members[0].name
+  delete f.input.members[1].name
+  let fail = true
+  f.workers.onStart = async spec => { if (spec.member.name === 'Alan' && fail) throw new Error('Temporary named worker failure') }
+  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Temporary named worker failure/)
+  const failed = f.runtime.starts(f.owner)[0]
+  const draft = f.runtime.store.get('drafts', failed.draftId)
+  assert.deepEqual(draft.input.members.map(member => member.name), ['Ada', 'Alan'])
+  const originalRoster = f.runtime.store.list('members', failed.missionId).map(member => ({ id: member.id, name: member.name, role: member.role }))
+  assert.deepEqual(originalRoster.map(member => member.name), ['Ada', 'Alan'])
+  assert.deepEqual(originalRoster.map(member => member.role), ['implementation', 'verification'])
+  fail = false
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.deepEqual(snapshot.members.map(member => ({ id: member.id, name: member.name, role: member.role })), originalRoster)
+  assert.equal(f.runtime.starts(f.owner)[0].draftId, draft.id)
+  assert.equal(f.workers.prepared.length, 2, 'retry reuses the durable workers')
+  const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.deepEqual(replay.members.map(member => ({ id: member.id, name: member.name, role: member.role })), originalRoster)
+  assert.deepEqual(f.input.members.map(member => member.name), [undefined, undefined], 'the caller may retry its original nameless input')
+})
+
+test('automatic launch persists assignment preferences and preserves an explicit pinned reviewer', async t => {
+  const f = await fixture(t)
+  f.input.tasks.find(task => task.kind === 'verification').assignmentMode = 'pinned'
+  const { request, snapshot } = await launch(f)
+  assert.equal(snapshot.tasks.find(task => task.kind !== 'verification').assignmentMode, 'preferred')
+  assert.equal(snapshot.tasks.find(task => task.kind === 'verification').assignmentMode, 'pinned')
+  const saved = f.runtime.store.get('drafts', f.runtime.store.get('starts', request.id).draftId)
+  assert.equal(saved.input.tasks.find(task => task.kind !== 'verification').assignmentMode, 'preferred')
+  const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
+  assert.equal(replay.tasks.find(task => task.kind === 'verification').assignmentMode, 'pinned')
+  assert.equal(f.input.tasks.find(task => task.kind !== 'verification').assignmentMode, undefined, 'admission does not mutate the caller plan')
+})
 async function accept(f, snapshot, { evidence = false } = {}) {
   const missionId = snapshot.mission.id
   const builder = snapshot.members.find(member => member.name === 'Builder')
@@ -113,9 +138,10 @@ test('concurrent plan delivery launches once with the saved workspace and primar
 test('automatic admission rejects incomplete topology before creating workers or a draft', async t => {
   for (const mutate of [
     input => { input.members.pop(); input.tasks.pop() },
-    input => { input.tasks.pop() },
+    // A deliverable without a review, or with an unassigned one, is no longer
+    // incomplete: the host adds or keeps its independent review
+    // (tests/review-pairing.test.mjs). Its own assignee is still required.
     input => { input.tasks[0].assigneeKey = undefined },
-    input => { input.tasks[1].assigneeKey = undefined },
     // One reviewed implementation is deliverable alone; several implementation branches still need a final integration.
     input => { input.tasks[0].kind = 'implementation'; input.tasks.push({ ...input.tasks[0], key: 'second', title: 'Second' }, { ...input.tasks[1], key: 'second-review', title: 'Second review', reviewOf: 'second' }) },
     input => { input.acceptance = ['uncovered obligation'] },
@@ -174,8 +200,8 @@ test('failed assembly and retries retain one deterministic plan and worker roste
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
   fail = false
-  const snapshot = await f.runtime.startPlan(f.owner, request.id, { ...f.input, title: 'Ignore retry mutation' })
-  assert.equal(snapshot.mission.title, f.input.title)
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, { ...f.input, title: 'Corrected saved plan' })
+  assert.equal(snapshot.mission.title, 'Corrected saved plan')
   assert.equal(f.runtime.starts(f.owner)[0].draftId, failed.draftId)
   assert.equal(f.workers.prepared.length, 2)
 })
@@ -220,9 +246,9 @@ test('independent host verification automatically completes the mission and jour
   const f = await fixture(t)
   const { request, snapshot } = await launch(f)
   await accept(f, snapshot)
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status === 'completed')
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status === 'completed', 'the mission completes', 2500)
   assert.equal(f.runtime.starts(f.owner)[0].status, 'completed')
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).events.some(event => event.type === 'automatic/completed'))
   const replay = await f.runtime.startPlan(f.owner, request.id, f.input)
   assert.equal(replay.mission.status, 'completed')
@@ -245,11 +271,15 @@ test('primary-agent budget adjustments preserve consumption, admitted counts and
   f.runtime.control(f.owner, snapshot.mission.id, 'pause', 'Primary agent inspecting remaining work')
   const chosen = { ...budget, maxTokens: 765432, maxSteps: 321, maxWorkers: 4, maxTasks: 19, maxDurationMs: 900000 }
   assert.deepEqual(f.runtime.updateBudget(f.owner, snapshot.mission.id, chosen, 'More integration checks are required'), chosen)
+  const observedBefore = Date.now()
   const updated = f.runtime.snapshot(f.owner, snapshot.mission.id)
+  const observedAfter = Date.now()
   assert.equal(updated.mission.usedTokens, 17)
   assert.equal(updated.mission.usedSteps, 3)
   assert.equal(updated.mission.status, 'paused')
-  assert.equal(updated.mission.deadline, updated.mission.createdAt + chosen.maxDurationMs)
+  const remainingExecutionMs = chosen.maxDurationMs - updated.mission.executionTime.usedMs
+  assert.ok(updated.mission.deadline >= observedBefore + remainingExecutionMs && updated.mission.deadline <= observedAfter + remainingExecutionMs, 'paused deadline projection uses remaining execution allowance')
+  assert.equal(updated.mission.executionTime.since, undefined, 'pause does not accrue execution time')
   assert.equal(updated.members.length, 2); assert.equal(updated.tasks.length, 2)
   assert.deepEqual(f.runtime.starts(f.owner)[0].budget, chosen)
   assert.equal(updated.events.findLast(event => event.type === 'mission/budget-updated').data.reason, 'More integration checks are required')
@@ -257,7 +287,7 @@ test('primary-agent budget adjustments preserve consumption, admitted counts and
   assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status, 'active')
 })
 
-test('a budget-blocked mission needs explicit resume after adjustment and keeps recorded usage', async t => {
+test('a resource-blocked mission continues after an owner extension without resetting usage', async t => {
   const f = await fixture(t)
   const { snapshot } = await launch(f)
   const builder = snapshot.members.find(member => member.name === 'Builder')
@@ -265,8 +295,7 @@ test('a budget-blocked mission needs explicit resume after adjustment and keeps 
   const chosen = { ...budget, maxTokens: budget.maxTokens * 2, maxDurationMs: 900000 }
   f.runtime.updateBudget(f.owner, snapshot.mission.id, chosen)
   let current = f.runtime.snapshot(f.owner, snapshot.mission.id).mission
-  assert.equal(current.status, 'blocked'); assert.equal(current.usedTokens, budget.maxTokens + 123)
-  f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Continue the remaining work')
+  assert.equal(current.status, 'active'); assert.equal(current.usedTokens, budget.maxTokens + 123)
   current = f.runtime.snapshot(f.owner, snapshot.mission.id).mission
   assert.equal(current.status, 'active'); assert.equal(current.usedTokens, budget.maxTokens + 123)
 })
@@ -280,7 +309,7 @@ test('budget resume waits for quiescence then promptly wakes the same long-lived
     const actor = { sessionId: builder.sessionId }
     const source = snapshot.tasks.find(task => task.kind === 'integration')
     const claimed = await f.runtime.claim(actor, snapshot.mission.id, source.id)
-    await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id))
+    await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered', 2500)
     await f.workers.callbacks.toolRun(builder.id, { tool: 'bash', arguments: { command: 'inspect working tree' }, result: 'existing evidence', isError: false })
     const run = f.runtime.observe(actor, snapshot.mission.id).toolRuns[0]
     const gate = deferred(), entered = deferred()
@@ -306,7 +335,7 @@ test('budget resume waits for quiescence then promptly wakes the same long-lived
     assert.throws(() => f.runtime.publish(actor, snapshot.mission.id, { taskId: claimed.id, attemptId: claimed.attempt.id, claim: 'too early', outcome: 'supported', toolRunIds: [run.id] }), /quiescence/)
     assert.equal(await f.workers.callbacks.beforeStep(builder.id, true), false)
     gate.resolve()
-    const resumed = await eventually(() => f.workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id && !oldAssignments.has(delivery.id)))
+    const resumed = await eventually(() => f.workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id && !oldAssignments.has(delivery.id)), 'the resumed assignment is delivered', 2500)
     assert.equal(resumed.delivery.attemptId, claimed.attempt.id)
     assert.match(JSON.parse(resumed.delivery.content).instructions, /same task and attempt/)
     const current = f.runtime.snapshot(f.owner, snapshot.mission.id).tasks.find(task => task.id === source.id)
@@ -328,7 +357,7 @@ test('an explicit stop during budget quiescence prevents a queued resume assignm
   const builder = snapshot.members.find(member => member.name === 'Builder')
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   await f.runtime.claim({ sessionId: builder.sessionId }, snapshot.mission.id, source.id)
-  await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id))
+  await eventually(() => f.workers.delivered.some(({ delivery }) => delivery.taskId === source.id), 'the source assignment is delivered', 2500)
   const assignments = f.workers.delivered.filter(({ delivery }) => delivery.kind === 'assignment').length
   const gate = deferred(); f.workers.stopGate = gate.promise
   await f.workers.callbacks.usage(builder.id, budget.maxTokens + 1)
@@ -336,7 +365,7 @@ test('an explicit stop during budget quiescence prevents a queued resume assignm
   f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Resume requested')
   f.runtime.control(f.owner, snapshot.mission.id, 'stop', 'User stopped before quiescence')
   gate.resolve()
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   assert.equal(f.runtime.snapshot(f.owner, snapshot.mission.id).mission.status, 'stopped')
   assert.equal(f.workers.delivered.filter(({ delivery }) => delivery.kind === 'assignment').length, assignments)
 })
@@ -349,7 +378,7 @@ test('a restarted budget pause promptly assigns a recovered epoch instead of wai
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const claimed = await f.runtime.claim({ sessionId: builder.sessionId }, snapshot.mission.id, source.id)
   await f.workers.callbacks.usage(builder.id, budget.maxTokens + 1)
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.budgetPause?.quiesced)
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).mission.budgetPause?.quiesced, 'the budget pause quiesces', 2500)
   await f.runtime.dispose()
   const workers = new Workers(), recovered = new SwarmRuntime(f.config, workers)
   try {
@@ -361,7 +390,7 @@ test('a restarted budget pause promptly assigns a recovered epoch instead of wai
     recovered.updateBudget(f.owner, snapshot.mission.id, { ...budget, maxTokens: budget.maxTokens * 2 })
     workers.isIdle = () => true
     recovered.control(f.owner, snapshot.mission.id, 'resume', 'Continue after host restart')
-    const delivered = await eventually(() => workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id))
+    const delivered = await eventually(() => workers.delivered.find(({ delivery }) => delivery.kind === 'assignment' && delivery.taskId === source.id), 'the recovered epoch is assigned', 2500)
     assert.notEqual(delivered.delivery.attemptId, claimed.attempt.id)
     assert.equal(recovered.snapshot(f.owner, snapshot.mission.id).mission.budgetPause, undefined)
   } finally { await recovered.dispose() }
@@ -375,7 +404,7 @@ test('terminal worker status waits for actual quiescence and late idle events ca
   await new Promise(resolve => setImmediate(resolve))
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status !== 'stopped'))
   gate.resolve()
-  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
+  await eventually(() => f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'), 'every worker stops', 2500)
   for (const member of snapshot.members) f.workers.callbacks.idle(member.id)
   assert.ok(f.runtime.snapshot(f.owner, snapshot.mission.id).members.every(member => member.status === 'stopped'))
 })
@@ -432,7 +461,7 @@ test('workers inherit primary-admitted execution policy when extending an automa
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const actor = { sessionId: snapshot.members[0].sessionId }
   const input = { workstreamId: snapshot.workstreams[0].id, title: 'Additional review', objective: 'Check the proposed result', kind: 'verification',
-    scope: ['src/'], acceptance: ['works'], reviewOf: source.id, maxRecoveryAttempts: 999, checkTimeoutMs: 999999 }
+    scope: ['src/'], acceptance: ['works'], outputs: [], reviewOf: source.id, maxRecoveryAttempts: 999, checkTimeoutMs: 999999 }
   const workerTask = f.runtime.propose(actor, snapshot.mission.id, input)
   assert.equal(workerTask.maxRecoveryAttempts, source.maxRecoveryAttempts)
   assert.equal(workerTask.checkTimeoutMs, source.checkTimeoutMs)
@@ -450,7 +479,7 @@ test('zero experiment allowance is valid and updates cannot erase admitted exper
   assert.equal(snapshot.mission.budget.maxExperiments, 0)
   const source = snapshot.tasks.find(task => task.kind === 'integration')
   const input = { workstreamId: snapshot.workstreams[0].id, title: 'Experiment', objective: 'Try a variant', kind: 'integration', scope: ['src/'],
-    acceptance: ['works'], checks: ['node check.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1234, experiment: true }
+    acceptance: ['works'], outputs: [], checks: ['node check.cjs'], maxRecoveryAttempts: 2, checkTimeoutMs: 1234, experiment: true }
   assert.throws(() => f.runtime.propose(f.owner, snapshot.mission.id, input), /experiment budget exhausted/)
   f.runtime.updateBudget(f.owner, snapshot.mission.id, { ...budget, maxExperiments: 1 })
   f.runtime.propose(f.owner, snapshot.mission.id, input)
@@ -483,7 +512,7 @@ test('paused and budget-blocked automatic missions do not silently complete', as
     assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
     if (state === 'paused') {
       f.runtime.control(f.owner, snapshot.mission.id, 'resume', 'Continue')
-      await eventually(() => f.runtime.starts(f.owner)[0].status === 'completed')
+      await eventually(() => f.runtime.starts(f.owner)[0].status === 'completed', 'the start completes', 2500)
     }
   }
 })
@@ -554,7 +583,7 @@ test('prelaunch deadline releases the session without a mission and queues durab
   const request = f.runtime.requestStart(f.owner, f.requestInput)
   request.planningDeadlineAt = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('starts', request))
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails', 2500)
   const failed = f.runtime.starts(f.owner)[0]
   assert.equal(failed.planningFenced, true)
   assert.equal(failed.recoveryNoticePending, true)
@@ -631,7 +660,7 @@ test('an expired launch settles before an uncooperative adapter and cannot resur
   const launching = f.runtime.starts(f.owner)[0]
   launching.planningDeadlineAt = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('starts', launching))
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails', 2500)
   await rejected
   const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Resume retained assembly')
   gate.resolve(); await new Promise(resolve => setImmediate(resolve))
@@ -668,7 +697,7 @@ test('retry can activate the saved draft while its cancelled adapter call is sti
   const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover without waiting for old adapter')
   f.workers.onStart = async () => {}
   const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
-  await eventually(() => f.runtime.starts(f.owner)[0].status === 'running')
+  await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs', 2500)
   const snapshot = await launch
   assert.equal(snapshot.mission.id, saved.missionId)
   gate.resolve(); await new Promise(resolve => setImmediate(resolve))
@@ -702,8 +731,17 @@ test('late failure from a superseded startup cannot stop the successfully retrie
     f.runtime.failStart(f.owner, request.id, 'cancel old startup')
     const retry = f.runtime.controlStart(f.owner, request.id, 'retry', 'Recover saved plan')
     f.workers.onStart = async () => {}
-    const launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
-    await eventually(() => f.runtime.starts(f.owner)[0].status === 'running')
+    let launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    if (loseAbortHandle) {
+      // Losing the native cancellation handle does not prove the old startup
+      // stopped. The retry is bounded and refused until that physical call
+      // settles, rather than overlapping another startup in the same workspace.
+      await assert.rejects(launch, /mission_operation_pending/)
+      gate.reject(new Error('old provider startup eventually failed'))
+      await rejected
+      launch = f.runtime.startPlan(f.owner, request.id, f.input, retry.planningEpoch)
+    }
+    await eventually(() => f.runtime.starts(f.owner)[0].status === 'running', 'the start runs', 2500)
     const snapshot = await launch
     const reviewer = snapshot.members.find(member => member.name === 'Reviewer')
     gate.reject(new Error('old provider startup eventually failed'))

@@ -31,33 +31,21 @@ import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { authorizeWorkspace, loadWorkspaceGrants } from '../lib/authorization.js'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { recentProgress } from '../lib/types/client/progress.js'
-import { RecentProgress } from '../lib/types/client/MissionProgress.js'
+import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { eventSummary } from '../lib/types/client/projection.js'
 import { CopyContext, zh } from '../lib/types/client/locale.js'
+import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 const renderChinese = (component, props) => renderToStaticMarkup(
   React.createElement(CopyContext.Provider, { value: text => zh[text] ?? text }, React.createElement(component, props)))
-class Workers {
-  bind() {}
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
-}
-class TickingWorkers extends Workers {
-  prepared = 0
-  async deliver() {}
-  async prepareTask() { this.prepared++ }
-  async captureArtifact() { return { commit: 'artifact', baseCommit: 'base', workspace: '/isolated', changedPaths: [] } }
-  async verifyArtifact() { return [] }
-}
+const projectionWorkers = () => new FakeWorkers({ autoIdle: true, artifact: { commit: 'artifact', baseCommit: 'base', workspace: '/isolated', changedPaths: [] }, checks: [],
+  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
 async function fixture(t) {
+  // fixture gap: a temp tree that exists before the runtime, whose grants name paths inside it.
   const temp = await realpath(await tempDirectory('swarm-client-projection-'))
   t.after(() => rm(temp, { recursive: true, force: true }))
   const session = join(temp, 'session'), granted = join(temp, 'granted')
@@ -65,19 +53,13 @@ async function fixture(t) {
   const project = join(granted, 'project'); await mkdir(project)
   return { temp, session, granted, project }
 }
-async function eventually(read, message, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 10)) }
-  assert.fail(message)
-}
-const runtimeConfig = directory => ({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 })
+const runtimeConfig = { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined }
+const granting = grants => ({ ...runtimeConfig, grants, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants) })
 
 test('the real runtime snapshot projects the workspace binding into the compact panel with its payload', async t => {
-  const { temp, granted, project } = await fixture(t)
+  const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
-  const runtime = new SwarmRuntime({ ...runtimeConfig(temp), grants,
-    authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants) }, new Workers())
-  t.after(async () => { await runtime.dispose() })
+  const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: granting(grants) })
   await runtime.start(grants)
   const owner = { sessionId: 'owner-bound' }
   const mission = runtime.create(owner, { title: 'Bound mission', objective: 'Work inside a human-authorized root',
@@ -94,34 +76,31 @@ test('the real runtime snapshot projects the workspace binding into the compact 
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /source: grant/)
   // The panel translates the label through the real zh table.
-  const chinese = renderChinese(RecentProgress, { snapshot })
+  const chinese = renderChinese(LiveWorkOverview, { snapshot })
   assert.match(chinese, /任务已绑定到授权工作目录/)
   assert.doesNotMatch(chinese, />Mission bound to an authorized workspace</)
 })
 
 test('a real restart with the human root removed projects the revocation with its reason', async t => {
-  const { temp, granted, project } = await fixture(t)
+  const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
-  const workers = new TickingWorkers()
-  const before = new SwarmRuntime({ ...runtimeConfig(temp), grants,
-    authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants) }, workers)
+  const { config, runtime: before, workers } = await makeRuntime(t, { workers: projectionWorkers(), config: granting(grants) })
   const owner = { sessionId: 'owner-revoked' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = before.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath,
     workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = before.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  before.propose(owner, mission.id, { workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
+  before.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   await before.start(grants)
-  await eventually(() => workers.prepared > 0, 'the mission never started working')
+  await eventually(() => workers.prepared.length > 0, 'the mission never started working', 15000)
   await before.dispose()
   // A human removes the root and restarts the host: the same durable state, no grant.
   const after = await loadWorkspaceGrants([])
-  const restarted = new SwarmRuntime({ ...runtimeConfig(temp), grants: after,
-    authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, after) }, new TickingWorkers())
+  const restarted = new SwarmRuntime({ ...config, ...granting(after) }, projectionWorkers())
   t.after(async () => { await restarted.dispose() })
   await restarted.start(after)
-  await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced')
+  await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced', 15000)
   const snapshot = restarted.snapshot(owner, mission.id)
   const revoked = recentProgress(snapshot, 20).find(event => event.label === 'Mission workspace authorization revoked')
   assert.ok(revoked, 'the compact panel labels the revocation')
@@ -131,13 +110,12 @@ test('a real restart with the human root removed projects the revocation with it
   const summary = eventSummary(event.data)
   assert.match(summary, /grantRoot: /)
   assert.match(summary, /blockedTasks: /)
-  assert.match(renderChinese(RecentProgress, { snapshot }), /任务工作目录授权已撤销/)
+  assert.match(renderChinese(LiveWorkOverview, { snapshot }), /任务工作目录授权已撤销/)
 })
 
 test('the sanctioned board stays model-tool-only in the client and the declared gap is documented', async t => {
-  const { temp, session } = await fixture(t)
-  const runtime = new SwarmRuntime({ ...runtimeConfig(temp) }, new Workers())
-  t.after(async () => { await runtime.dispose() })
+  const { session } = await fixture(t)
+  const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: runtimeConfig })
   const owner = { sessionId: 'owner-board' }
   const mission = runtime.create(owner, { title: 'Board mission', objective: 'Post a durable note', workspace: session,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
