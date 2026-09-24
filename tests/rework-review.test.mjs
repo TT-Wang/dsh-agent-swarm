@@ -49,9 +49,16 @@ async function fixture(t, { members = ['Author', 'Reviewer'], maxTasks = 100 } =
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: m[0].id, ...extra })
   const proposeReview = (source, extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: `Review ${source.title}`,
     objective: 'Independent review', kind: 'verification', scope: ['src/'], acceptance: ['works'], checks: [], reviewOf: source.id, ...extra })
-  async function submit(member, task) {
+  /** Claim and submit `task` as `member`, publishing one host-backed claim first when `claim` is given. */
+  async function submit(member, task, claim) {
     const claimed = await runtime.claim(actor(member), mission.id, task.id)
+    let published
+    if (claim !== undefined) {
+      const runId = await workers.callbacks.toolRun(member.id, { tool: 'bash', arguments: { command: 'node --test' }, result: { exitCode: 0, output: 'ok' }, isError: false })
+      published = runtime.publish(actor(member), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, claim, outcome: 'supported', toolRunIds: [runId] })
+    }
     await runtime.submit(actor(member), mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
+    return published
   }
   async function verify(member, review, verdict, reason = 'The artifact misses the acceptance criterion') {
     const claimed = await runtime.claim(actor(member), mission.id, review.id)
@@ -240,7 +247,8 @@ test('an automatic review of the rejected submission is never read as withdrawn 
   assert.equal(f.current(automatic).status, 'cancelled')
   f.resume(source)
   assert.equal(f.current(manual).status, 'pending', 'the rejecting review re-opens')
-  await f.submit(author, source)
+  // An evidence-only rework: the commit is unchanged, its new claim is not.
+  await f.submit(author, source, 'The unchanged artifact meets the criterion; see this run')
   assert.equal(f.current(source).artifact.commit, 'c'.repeat(40), 'the resubmission is the rejected commit, unchanged')
   await f.pastReviewGrace(3)
   assert.deepEqual(f.live(source).map(task => task.id), [manual.id], 'the paired review reviews the resubmission; none is admitted')
@@ -282,7 +290,20 @@ test('a real unchanged resubmission is re-reviewed by the automatic review that 
   assert.match(automatic.id, /^task_auto_review_/)
   await verdict(automatic, 'reject', 'Reviewer judged it wrong')
   f.runtime.controlTask(f.owner, f.mission.id, source.id, 'resume', {}, 'The author disputes the rejection; resubmit as is')
-  const second = await submit(false)
+  // A no-edit capture reproduces the rejected commit: with nothing new for the
+  // review to judge, the resubmission is refused and the attempt stays running.
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await assert.rejects(f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'as is' }), error => {
+    assert.equal(error.code, 'rework_unchanged')
+    assert.ok(error.message.startsWith(`[rework_unchanged] The captured commit ${first} is the commit review ${automatic.id} rejected (rejections[0])`), error.message)
+    return true
+  })
+  assert.deepEqual([f.runtime.store.get('tasks', source.id).status, f.runtime.store.get('tasks', source.id).attempt?.id], ['running', claimed.attempt.id])
+  // The author's dispute is new host-backed evidence: the same commit is then re-reviewed, marked as a repeat.
+  const run = await f.workers.callbacks.toolRun(f.author.id, { tool: 'bash', arguments: { command: 'test -f src/answer.txt' }, result: { exitCode: 0, output: '' }, isError: false })
+  f.runtime.publish(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, claim: 'The draft is present and meets the criterion', outcome: 'supported', toolRunIds: [run] })
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'as is, with the evidence' })
+  const second = f.runtime.store.get('tasks', source.id).artifact.commit
   assert.equal(second, first, 'no edit captures the rejected commit again')
   await settle(8)
   assert.deepEqual(reviews().map(task => [task.id, task.status]), [[automatic.id, 'pending']], 'the same review, re-opened, is the only review')
@@ -350,6 +371,38 @@ test('the rejecting reviewer\'s claims are archived with its verdict: disputing 
   assert.deepEqual([f.current(source).status, f.current(review).status], ['accepted', 'accepted'], 'the accepting review is not reverted')
   assert.equal(f.runtime.store.get('evidence', finding.id).challenges.length, 0, 'no dispute was recorded')
   assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+})
+
+test('a resubmission of a rejected commit with no new claim is refused; with new claims it is re-reviewed and marked as a repeat', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const index = await toolSchemaIndex()
+  f.workers.fixedCommit = 'c'.repeat(40)
+  const source = f.propose('Implement')
+  await f.submit(author, source, 'The first attempt works')
+  const review = f.proposeReview(source)
+  await f.verify(reviewer, review, 'reject', 'Misses the criterion')
+  f.resume(source)
+  const claimed = await f.runtime.claim(f.actor(author), f.mission.id, source.id)
+  await assert.rejects(f.runtime.submit(f.actor(author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'unchanged' }), error => {
+    assert.equal(error.code, 'rework_unchanged')
+    assert.equal(error.category, 'conflict_error')
+    assert.ok(error.message.startsWith(`[rework_unchanged] The captured commit ${'c'.repeat(40)} is the commit review ${review.id} rejected (rejections[0])`), error.message)
+    assert.deepEqual(assessText(error.message, index), [], 'the exits resolve in the published tool schema')
+    return true
+  })
+  assert.deepEqual([f.current(source).status, f.current(source).attempt?.id, f.current(source).artifact], ['running', claimed.attempt.id, undefined], 'nothing was submitted; the attempt stays running')
+  assert.equal(f.events('task/submitted').length, 1)
+  // New host-backed claims change what the review judges, so the same commit is submitted, visibly as a repeat.
+  const run = await f.workers.callbacks.toolRun(author.id, { tool: 'bash', arguments: { command: 'node --test' }, result: { exitCode: 0, output: 'ok' }, isError: false })
+  f.runtime.publish(f.actor(author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, claim: 'The criterion holds; see this run', outcome: 'supported', toolRunIds: [run] })
+  await f.runtime.submit(f.actor(author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'unchanged, with new evidence' })
+  assert.deepEqual(f.events('task/submitted').at(-1).data.repeatsRejection, { commit: 'c'.repeat(40), reviewTaskId: review.id, rejection: 0 })
+  await f.verify(reviewer, review, 'accept', 'The evidence shows the criterion holds')
+  assert.equal(f.current(source).status, 'accepted')
+  const registry = f.runtime.artifacts(f.owner, { missionId: f.mission.id }).artifacts.filter(row => row.taskId === source.id)
+  assert.deepEqual(registry.map(row => [row.artifact.commit, row.archived ?? false, row.review.verdict, row.repeatsRejectedCommit ?? false]),
+    [['c'.repeat(40), true, 'refuted', false], ['c'.repeat(40), false, 'verified', true]], 'the registry marks the verified row as a repeat of the refuted one')
 })
 
 test('a released rework is never taken by the reviewer its re-opened review is bound to', async t => {

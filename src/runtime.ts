@@ -1690,7 +1690,8 @@ export class SwarmRuntime {
       if (task.kind === 'verification') throw new Error('[verification_requires_verify] Verification tasks must use swarm_verify Call `swarm_verify` with `taskId` and `verdict`, then retry.')
       this.bounded(input.output)
       // A refuted claim, or one a rework archived, supports nothing.
-      if (task.kind === 'research' && currentEvidenceIds(task).every(evidenceId => this.store.get('evidence', evidenceId)?.status === 'refuted')) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
+      const liveClaim = currentEvidenceIds(task).some(evidenceId => this.store.get('evidence', evidenceId)?.status !== 'refuted')
+      if (task.kind === 'research' && !liveClaim) throw new Error('[research_evidence_required] Research submission requires host-backed evidence. Supply host-backed evidence with `swarm_publish` and its `toolRunIds`, then retry with `swarm_submit` and its `taskId`.')
       this.fenceAttempt(this.mission(missionId), task, this.config.leaseMs)
       // A declared output that is not written is refused at capture with
       // [output_missing] before any commit, while the attempt is still running.
@@ -1708,6 +1709,14 @@ export class SwarmRuntime {
         if (current !== undefined && current.status === 'blocked' && stopPending(current)) throw new Error(`${stale}; the task is being reassigned after a stop. Observe the current assignment and submit again after reassignment. (${detail})`)
         throw new Error(`${stale}; observe the task and submit again after reassignment (${detail})`)
       }
+      // A resubmission must change what its review judged: the commit, or the
+      // claims. A no-edit capture reproduces a rejected commit, so one with no
+      // live claim of this round is refused. One that brings new claims (an
+      // evidence-only rework, as every research rework is: its commit may
+      // never change) is submitted, and marked as a repeat of that rejected
+      // commit on its durable submission and in the artifact registry.
+      const repeated = task.rejections?.find(rejection => rejection.commit === artifact.commit)
+      if (repeated !== undefined && !liveClaim) throw new PolicyError('rework_unchanged', 'conflict_error', `[rework_unchanged] The captured commit ${artifact.commit} is the commit review ${repeated.reviewTaskId} rejected (rejections[${task.rejections!.indexOf(repeated)}]), and this rework has published no new claim, so nothing that review judged has changed. Nothing was submitted and your attempt stays running. Change the work inside the task scope and retry \`swarm_submit\` with the same \`taskId\`, or publish the host-backed evidence the rejection asked for with \`swarm_publish\` and its \`toolRunIds\` first; if you hold the rejection to be wrong, call \`swarm_escalate\` with this \`taskId\` instead.`)
       requireArtifactChecks(task, artifact)
       task.artifact = artifact; task.output = input.output; task.status = 'submitted'
       // F2: decide the review path before committing, so the missing-review
@@ -1721,6 +1730,7 @@ export class SwarmRuntime {
         for (const evidenceId of currentEvidenceIds(task)) { const e = this.store.get('evidence', evidenceId)!; if (e.status === 'refuted') continue; e.artifact = artifact; this.store.put('evidence', e) }
         // Submission is routine progress: the durable event reaches the UI; the reviewer receives its assignment.
         this.store.event(missionId, 'task/submitted', member.id, { taskId: task.id, artifact,
+          ...(repeated === undefined ? {} : { repeatsRejection: { commit: repeated.commit, reviewTaskId: repeated.reviewTaskId, rejection: task.rejections!.indexOf(repeated) } }),
           ...(missingReview === undefined ? {} : { reviewPath: { missing: true, reason: missingReview } }) })
       })
       this.kick(missionId)
@@ -3039,6 +3049,8 @@ export class SwarmRuntime {
           ...identity,
           artifact: { commit: captured.commit, baseCommit: captured.baseCommit, changedPaths: captured.changedPaths },
           ...(task.kind === 'verification' ? { artifactRole: 'review-record', reviewedCommit: task.reviewedCommit } : {}),
+          // An evidence-only rework resubmits the rejected commit; its archived row above names that verdict.
+          ...(task.kind !== 'verification' && task.rejections?.some(rejection => rejection.commit === captured.commit) ? { repeatsRejectedCommit: true } : {}),
           ...(review === undefined ? {} : { review: { taskId: review.id, status: review.status,
             verdict: review.status === 'accepted' ? 'verified' : refuted ? 'refuted' : 'pending',
             ...(review.output === undefined ? {} : { reason: excerpt(review.output, 400) }) } }),
