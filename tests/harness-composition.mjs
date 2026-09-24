@@ -15,6 +15,7 @@ const args = process.argv.slice(2)
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback
 const artifactRoot = resolve(argument('--artifact', project))
 const harnessRoot = resolveHarnessRoot(argument('--harness', undefined))
+assertSupportedHarness(harnessRoot)
 const bundleProfile = argument('--bundle-profile', undefined)
 const temporary = await realpath(await mkdtemp(join(tmpdir(), 'dsh-swarm-loader-')))
 const workspace = join(temporary, 'workspace')

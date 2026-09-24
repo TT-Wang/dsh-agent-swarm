@@ -14,6 +14,7 @@ const project = fileURLToPath(new URL('../', import.meta.url))
 const args = process.argv.slice(2)
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback
 const harnessRoot = resolveHarnessRoot(argument('--harness', undefined))
+assertSupportedHarness(harnessRoot)
 const artifactRoot = resolve(argument('--artifact', project))
 const envPath = argument('--env', undefined)
 const reportPath = resolve(argument('--report', join(project, 'artifacts/deepseek-smoke.json')))

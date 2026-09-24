@@ -22,7 +22,9 @@
  * promote: --commit <sha> --dry-run; requires a recorded green gate for that
  *          exact commit and a clean tree in its paths; never commits by itself
  * mount:   --harness <dir> (default: the running lab host's, else the one
- *          recorded in the lab's server.json)
+ *          recorded in the lab's server.json); update-preview refuses a
+ *          Harness outside compatibility.json unless --allow-unsupported-harness
+ *          is passed, which mount forwards
  * soak:    verifies the lab is alive, loaded the plugin and started after the build
  * The lab host is the lab's own dsh host on its port, not a recorded pid.
  * new:     --scope "one-line round scope"
@@ -102,6 +104,7 @@ if (command === 'mount') {
   const update = join(project, 'scripts/update-preview.mjs')
   const argv = [update, '--preview', lab, '--no-sync', '--patch', patch, '--port', String(server.port), '--delay', value('--delay', '1500')]
   if (harness) argv.push('--harness', harness)
+  if (args.includes('--allow-unsupported-harness')) argv.push('--allow-unsupported-harness')
   const result = spawnSync(process.execPath, argv, { stdio: 'inherit' })
   process.exit(result.status ?? 1)
 }

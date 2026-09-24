@@ -12,15 +12,22 @@ import { access, mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { PROJECT } from './harness.mjs'
-import { resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
+import { assertSupportedHarness, resolveHarnessRoot as resolveTarget } from '../../scripts/harness-target.mjs'
 
 const catalogs = new Map()
 
-/** The release gates' own selection (scripts/harness-target.mjs), with the fault suite's message. */
+/**
+ * The release gates' own selection (scripts/harness-target.mjs), with the fault
+ * suite's message, and their support check: an explicitly supplied checkout of
+ * a release outside compatibility.json is refused, never booted.
+ */
 export function resolveHarnessRoot(explicit) {
-  try { return resolveTarget(explicit) } catch {
+  let root
+  try { root = resolveTarget(explicit) } catch {
     throw new Error('The fault suite needs a built Harness checkout; set DSH_HARNESS_ROOT (see compatibility.json)')
   }
+  assertSupportedHarness(root)
+  return root
 }
 
 export async function harnessCatalog(root) {

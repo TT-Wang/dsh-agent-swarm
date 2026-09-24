@@ -21,6 +21,7 @@ import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseFaultOk } from './record.mjs'
+import { resolveHarnessRoot } from '../../tests/faults/loader.mjs'
 
 const PROJECT = fileURLToPath(new URL('../../', import.meta.url))
 const FAULTS_DIR = join(PROJECT, 'tests/faults')
@@ -30,6 +31,8 @@ const asJson = args.includes('--json')
 const only = (value('--only') ?? '').split(',').map(item => item.trim().toUpperCase()).filter(Boolean)
 const timeoutMs = Number(value('--timeout') ?? 300_000)
 const EXPECTED = ['F1', 'F2', 'F3', 'F3A', 'F3B', 'F3C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', 'F13', 'F14', 'F15', 'F16', 'F17', 'F18', 'F19', 'F20', 'F21']
+/** Tier B: the scenarios that boot the real Harness Loader (tests/faults/loader.mjs). */
+const HARNESS_TIER = ['F3A', 'F3B', 'F3C']
 
 const scenarioId = file => file.replace(/\.mjs$/, '').replace(/^f(\d+)([a-z]?)-.*$/, (_match, number, suffix) => `F${Number(number)}${suffix.toUpperCase()}`)
 
@@ -56,6 +59,14 @@ const selected = files.filter(file => !only.length || only.includes(scenarioId(f
 if (!selected.length) {
   process.stderr.write(`faults: no scenario matched ${JSON.stringify(only)}\n`)
   process.exit(1)
+}
+// Refuse an unusable or unsupported Harness once, before any scenario runs,
+// instead of letting each Tier B scenario fail on it after the others ran.
+if (selected.some(file => HARNESS_TIER.includes(scenarioId(file)))) {
+  try { resolveHarnessRoot() } catch (error) {
+    process.stderr.write(`faults: ${error.message}\n`)
+    process.exit(1)
+  }
 }
 
 function runOne(file) {

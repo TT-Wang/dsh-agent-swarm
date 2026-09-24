@@ -14,7 +14,8 @@
  *   --root <dir>       lab root (default: ~/.dsh/agent-swarm-lab)
  *   --port <n>         host port (default: 5292)
  *   --plugin <dir>     plugin checkout to link (default: this repository)
- *   --harness <dir>    Harness checkout to boot (default: resolveHarnessRoot())
+ *   --harness <dir>    Harness checkout to boot (default: resolveHarnessRoot()); it
+ *                      must be a release listed in compatibility.json
  *   --no-start         provision only; never launch the host
  *   --dry-run          print the plan; write nothing
  */
@@ -24,7 +25,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseEnv } from 'node:util'
-import { resolveHarnessRoot } from './harness-target.mjs'
+import { assertSupportedHarness, resolveHarnessRoot } from './harness-target.mjs'
 import { importHarness } from '../tests/fixtures/built-harness.mjs'
 import { awaitLaunchUrl, hostEnv, startHost, stopHost, writeServer } from './host.mjs'
 
@@ -45,6 +46,7 @@ if (!existsSync(join(plugin, 'package.json'))) fail(`plugin checkout has no pack
 const harnessRoot = resolve(args.includes('--harness') ? value('--harness') : resolveHarnessRoot())
 const cli = join(harnessRoot, 'apps/cli/lib/bin.js')
 if (!existsSync(cli)) fail(`harness CLI not found: ${cli}`)
+try { assertSupportedHarness(harnessRoot) } catch (error) { fail(error.message) }
 
 const home = join(root, 'home')
 const workspace = join(root, 'workspace')

@@ -4,7 +4,10 @@
  * Harness CLI on a throwaway port >= 6100 with a temporary root and HOME: never
  * dsh, ~/.dsh or the live hosts. A hand-started host runs the fake Harness's
  * apps/cli/lib/bin.js with the root's patch, the command line the scripts
- * launch.
+ * launch. The scripts run from a scratch copy whose compatibility.json declares
+ * each fake Harness (a throwaway git checkout) as a supported release, so the
+ * release check they apply to every Harness passes for exactly these
+ * (tests/harness-support.test.mjs covers the refusal).
  *
  * The first two tests replay the 2026-09-18 incident: the host was restarted by
  * hand, so server.json records a pid that some other process (the decoy) now
@@ -17,12 +20,13 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFile, spawn, spawnSync } from 'node:child_process'
-import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process'
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { withLocalImports } from './fixtures/local-imports.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 const fakeHost = fileURLToPath(new URL('./fixtures/fake-host.mjs', import.meta.url))
@@ -48,13 +52,29 @@ const freePort = () => new Promise((resolve, reject) => {
   })
 })
 
-/** A temporary root and port, a fake Harness checkout, and cleanup of every process the test caused. */
+/** A temporary root and port, a fake Harness checkout, the scripts' scratch copy, and cleanup of every process the test caused. */
 async function scene(t) {
   const root = mkdtempSync(join(tmpdir(), 'host-scripts-'))
   const port = await freePort()
-  const harness = join(root, 'harness')
-  mkdirSync(join(harness, 'apps/cli/lib'), { recursive: true })
-  copyFileSync(fakeHost, join(harness, 'apps/cli/lib/bin.js'))
+  const copy = join(root, 'project')
+  for (const entry of ['scripts/update-preview.mjs', 'scripts/start-lab.mjs', 'scripts/round.mjs']) {
+    for (const [path, source] of Object.entries(await withLocalImports(project, entry))) { mkdirSync(dirname(join(copy, path)), { recursive: true }); writeFileSync(join(copy, path), source) }
+  }
+  for (const entry of ['package.json', 'lib']) symlinkSync(join(project, entry), join(copy, entry))
+  const supportedHosts = []
+  /** A fake Harness checkout at `dir`, declared supported by the copy's compatibility.json. */
+  const fakeHarness = dir => {
+    mkdirSync(join(dir, 'apps/cli/lib'), { recursive: true })
+    copyFileSync(fakeHost, join(dir, 'apps/cli/lib/bin.js'))
+    const version = `0.0.${supportedHosts.length}-fake`
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ version }))
+    const git = (...args) => execFileSync('git', ['-c', 'user.name=Fake', '-c', 'user.email=fake@example.invalid', ...args], { cwd: dir, encoding: 'utf8' }).trim()
+    git('init', '--quiet'); git('add', '.'); git('commit', '--quiet', '-m', 'fake harness')
+    supportedHosts.push({ version, commit: git('rev-parse', 'HEAD') })
+    writeFileSync(join(copy, 'compatibility.json'), JSON.stringify({ supportedHosts }))
+    return dir
+  }
+  const harness = fakeHarness(join(root, 'harness'))
   const children = []
   t.after(() => {
     for (const child of children) child.kill('SIGKILL')
@@ -65,11 +85,7 @@ async function scene(t) {
   return {
     root, port, harness,
     /** Another Harness checkout next to the first. */
-    harnessCopy(name) {
-      mkdirSync(join(root, name, 'apps/cli/lib'), { recursive: true })
-      copyFileSync(fakeHost, join(root, name, 'apps/cli/lib/bin.js'))
-      return join(root, name)
-    },
+    harnessCopy(name) { return fakeHarness(join(root, name)) },
     patch(name) {
       const path = join(root, name)
       writeFileSync(path, JSON.stringify([{ id: 'dsh-external-agent-swarm', config: { statePath: join(root, 'swarm.sqlite'), workspacesRoot: join(root, 'worktrees') } }]) + '\n')
@@ -98,7 +114,7 @@ async function scene(t) {
       return child
     },
     run(script, args) {
-      return new Promise(resolve => execFile(process.execPath, [join(project, 'scripts', script), ...args], { cwd: project, env }, (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr })))
+      return new Promise(resolve => execFile(process.execPath, [join(copy, 'scripts', script), ...args], { cwd: copy, env }, (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr })))
     },
   }
 }
