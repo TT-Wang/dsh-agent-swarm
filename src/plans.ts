@@ -305,7 +305,9 @@ function reviewKey(sourceKey: string, taken: Set<string>): string {
  * acceptance, priority, check timeout and recovery limit, and `outputs: []`.
  * Like an authored review it names no checks: verification runs the source's.
  * The source's `review` override supplies assigneeKey, objective, acceptance,
- * maxSteps and maxRecoveryAttempts, and is consumed. An authored review
+ * maxSteps and maxRecoveryAttempts, and is consumed. Like an authored review,
+ * its step ceiling and finding estimate are the task defaults, not the
+ * source's. An authored review
  * suppresses the synthesis, so a plan that pairs every deliverable is returned
  * unchanged. The added rows count against `maxTasks`. Takes and returns a
  * validated plan: the added rows are canonical admitted rows, so validating

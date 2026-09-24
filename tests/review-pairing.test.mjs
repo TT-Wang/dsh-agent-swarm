@@ -177,6 +177,22 @@ test('a staged draft shows the synthesized review in the editor before launch, a
   assert.equal(reviewsOf(launched.tasks, source).length, 1)
 })
 
+test('the review override schema states the defaults the added review really takes', () => {
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, makeRuntimeStub({ config: {} }), plan('/workspace').budget)
+  const source = deliverable({ maxSteps: 20, maxFindings: 3 })
+  const review = pairReviews(validatePlan(plan('/workspace', { tasks: [source] }), { launch: true })).tasks.find(task => task.kind === 'verification')
+  assert.equal(review.maxRecoveryAttempts, source.maxRecoveryAttempts, 'the recovery limit is the source\'s')
+  assert.deepEqual(review.acceptance, source.acceptance, 'so is the acceptance')
+  assert.equal(review.ceilingProvenance.maxSteps.source, 'default', 'the step ceiling is the task default')
+  assert.notEqual(review.maxSteps, source.maxSteps)
+  for (const name of ['swarm_stage', 'swarm_launch']) {
+    const { description } = definitions.get(name).parameters.properties.tasks.items.properties.review
+    assert.doesNotMatch(description, /acceptance and limits/, `${name}: the step ceiling is not this task's`)
+    assert.match(description, /this task's acceptance and maxRecoveryAttempts, and the default maxSteps/, name)
+  }
+})
+
 test('swarm_stage and swarm_launch declare the review override, and the registered launch forwards it', async () => {
   const definitions = new Map(), launched = []
   const runtime = makeRuntimeStub({

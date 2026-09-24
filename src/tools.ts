@@ -380,7 +380,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       maxSteps: taskCeilingSchema.maxSteps, maxFindings: taskCeilingSchema.maxFindings,
       checkTimeoutMs: { ...integer, description: 'Per-check timeout in milliseconds. Required when an automatic mission declares checks, because the runtime extends the verifier lease by it; reviews inherit their source\'s checks and timeout.' },
       experiment: { type: 'boolean' },
-      review: { type: 'object', additionalProperties: false, description: 'Deliverables only: overrides for the independent review the host adds for this task when no verification task names it in reviewOf. Omitted fields default to unassigned and this task\'s acceptance and limits.',
+      review: { type: 'object', additionalProperties: false, description: 'Deliverables only: overrides for the independent review the host adds for this task when no verification task names it in reviewOf. Omitted fields default to unassigned, the host\'s review objective, this task\'s acceptance and maxRecoveryAttempts, and the default maxSteps.',
         properties: { assigneeKey: string, objective: string, acceptance: strings, maxSteps: positiveInteger, maxRecoveryAttempts: positiveInteger } },
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
