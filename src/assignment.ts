@@ -13,6 +13,34 @@ export interface AssignmentCandidate {
   checkpoint?: unknown
 }
 
+/** The ownership facts a review's independence is decided from. */
+export interface AuthoredTask {
+  assigneeId?: string
+  priorOwnerIds?: readonly string[]
+  attempt?: { ownerId?: string }
+}
+
+/**
+ * X1 (P0): the current assignee, the current attempt's owner and every
+ * recorded prior owner. An unused initial preference is not in the history
+ * once borrowed, so independence follows actual ownership.
+ */
+export function authorIdsOf(task: AuthoredTask): Set<string> {
+  const ids = new Set(task.priorOwnerIds ?? [])
+  if (task.attempt?.ownerId !== undefined) ids.add(task.attempt.ownerId)
+  if (task.assigneeId !== undefined) ids.add(task.assigneeId)
+  return ids
+}
+
+/**
+ * The one independence rule every assignment path applies: a member may own a
+ * review of `source` only if it never authored it. No source (a task that
+ * reviews nothing) excludes no one.
+ */
+export function canOwnReview(source: AuthoredTask | undefined, memberId: string): boolean {
+  return source === undefined || !authorIdsOf(source).has(memberId)
+}
+
 /** Recovery and handoff own their workspace; only untouched pending work may move. */
 export function canBorrowTask(task: AssignmentCandidate): boolean {
   // New admissions record an explicit empty ownership history. Epoch also

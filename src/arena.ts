@@ -16,7 +16,7 @@
  */
 import { createHash } from 'node:crypto'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
-import { assignmentAllows } from './assignment.ts'
+import { assignmentAllows, canOwnReview } from './assignment.ts'
 import type { Delivery, Escalation, Evidence, Member, Mission, NoticeClass, Task } from './types.ts'
 
 /** Owner-observable board, as durable records; no wall-clock value participates. */
@@ -62,10 +62,9 @@ export function pendingReadiness(tasks: readonly Task[], members: readonly Membe
   for (const task of tasks) {
     if (task.status !== 'pending') continue
     const source = graph.reviewSource(task)
-    const authors = new Set([...(source?.priorOwnerIds ?? []), source?.attempt?.ownerId, source?.assigneeId])
     const runnable = task.dependencies.every(graph.dependencyMet)
       && (task.reviewOf === undefined || source?.status === 'submitted')
-      && live.some(member => assignmentAllows(task, member.id, tasks) && !authors.has(member.id))
+      && live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
     if (runnable) ready++
     else notReady++
   }
@@ -269,8 +268,7 @@ export function arenaView(input: FingerprintInput & { missionId: string; now: nu
       const next = current === undefined
         ? input.tasks.filter(task => {
           if (task.status !== 'pending' || !assignmentAllows(task, member.id, input.tasks)) return false
-          const source = graph.reviewSource(task)
-          return source === undefined || ![...(source.priorOwnerIds ?? []), source.attempt?.ownerId, source.assigneeId].includes(member.id)
+          return canOwnReview(graph.reviewSource(task), member.id)
         })
           .sort((left, right) => right.priority - left.priority || left.createdAt - right.createdAt || byId(left, right))[0]
         : undefined

@@ -21,7 +21,7 @@ import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from '.
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, liveReviewFor, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { assignmentAllows, canBorrowTask } from './assignment.ts'
+import { canBorrowTask, canOwnReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, planAdvisories, validatePlan } from './plans.ts'
@@ -1409,8 +1409,7 @@ export class SwarmRuntime {
       const source = this.task(missionId, input.reviewOf)
       if (source.kind === 'verification') throw new PolicyError('verification_review_source_invalid', 'tool_error', 'Verification cannot review another verification task')
       if (source.status === 'cancelled' || source.status === 'accepted') throw new PolicyError('review_source_not_submitted', 'tool_error', `reviewOf ${source.id}: that task is already ${source.status}; a review can only start on submitted work`)
-      const authors = this.authorIds(source)
-      if (input.assigneeId !== undefined && authors.has(input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
+      if (input.assigneeId !== undefined && !canOwnReview(source, input.assigneeId)) throw new PolicyError('review_assignee_not_independent', 'validation_error', `assigneeId ${input.assigneeId} authored ${source.id}; an independent review must be assigned to a member who never owned it, or left unassigned`)
     } else if (input.reviewOf) throw new PolicyError('review_source_not_verification', 'tool_error', 'Only verification tasks may set reviewOf')
     // Round 9-C: a repair may keep the original acceptance while changing the
     // declared check. Acceptance is already inherited above; a check
@@ -1475,18 +1474,7 @@ export class SwarmRuntime {
     this.kick(missionId)
     return task
   }
-  
-  /**
-   * X1 (P0): current assignment and every actual prior owner cannot review this
-   * work. An unused initial preference is not added to history when borrowed;
-   * independence follows actual ownership, not a discarded planning preference.
-   */
-  authorIds(task: Task): Set<string> {
-    const ids = new Set(task.priorOwnerIds ?? [])
-    if (task.attempt?.ownerId !== undefined) ids.add(task.attempt.ownerId)
-    if (task.assigneeId !== undefined) ids.add(task.assigneeId)
-    return ids
-  }
+
 
   /** ENV: the adapter's measured envelope, widened to the environment facts it also reports. */
   private declaredCheckEnvelope(): DeclaredCheckEnvelope | undefined {
@@ -1730,7 +1718,7 @@ export class SwarmRuntime {
       const { task, member } = this.ownAttempt(actor, missionId, input.taskId, input.attemptId)
       if (task.kind !== 'verification' || !task.reviewOf) throw new Error('[not_a_verification_task] This is not a verification task. Call `swarm_verify` with `taskId` and `verdict`, then retry.')
       const source = this.task(missionId, task.reviewOf)
-      if (source.status !== 'submitted' || !source.artifact || this.authorIds(source).has(member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
+      if (source.status !== 'submitted' || !source.artifact || !canOwnReview(source, member.id)) throw new PolicyError('verification_not_independent', 'tool_error', 'Only independent verification of a submitted artifact by a member who never owned it is allowed')
       // The reviewer's own reason is required and bounded; the check-failure
       // report is appended to it, never substituted for it.
       this.bounded(input.reason)
@@ -2286,7 +2274,7 @@ export class SwarmRuntime {
     // author of the reviewed source, so a handoff that skipped the check left the
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
-    if (input.to !== undefined && task.reviewOf !== undefined && this.authorIds(this.task(missionId, task.reviewOf)).has(input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    if (input.to !== undefined && task.reviewOf !== undefined && !canOwnReview(this.task(missionId, task.reviewOf), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
@@ -2340,13 +2328,9 @@ export class SwarmRuntime {
    * scheduling and the owner notice agree on what "has a review" means.
    */
   private liveReview(missionId: string, source: Task): Task | undefined {
-    const author = source.attempt?.ownerId ?? source.assigneeId
-    const authors = this.authorIds(source)
     const live = new Set(this.store.list('members', missionId).filter(member => memberPhaseOf(member) !== 'stopped').map(member => member.id))
-    const tasks = this.store.list('tasks', missionId)
-    return liveReviewFor(tasks, source.id, author, live,
-      review => (review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
-        && [...live].some(memberId => !authors.has(memberId) && assignmentAllows(review, memberId, tasks)))
+    return liveReviewFor(this.store.list('tasks', missionId), source, live,
+      review => review.status === 'pending' || review.status === 'running' || this.quiescencePending(review))
   }
   /**
    * F2/R11-16: why a freshly submitted artifact has no review path, or
@@ -2438,9 +2422,8 @@ export class SwarmRuntime {
     if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
-    const authors = this.authorIds(source)
     const author = source.attempt?.ownerId ?? source.assigneeId
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && !authors.has(member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
+    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${author ?? 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable. */
@@ -3550,7 +3533,7 @@ export class SwarmRuntime {
       else {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
-        if (task.reviewOf && this.authorIds(this.task(missionId, task.reviewOf)).has(member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }

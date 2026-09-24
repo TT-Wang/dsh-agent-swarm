@@ -25,6 +25,7 @@
  */
 import { guardTerminal } from '../lib/refusals.js'
 import { taskCeilingExhaustion } from '../lib/admission.js'
+import { authorIdsOf } from '../lib/assignment.js'
 
 /**
  * The durable board as the guard-chain model sees it. Every field is derived
@@ -62,7 +63,7 @@ export function guardBoard(runtime, missionId, mission) {
         // a submitted source is live exactly while `reviewable` finds a live
         // independent review.
         ...(reviewSourceLive === undefined ? {} : { reviewSourceLive }),
-        ...(source === undefined ? {} : { authorMemberIds: [...runtime.authorIds(source)] }),
+        ...(source === undefined ? {} : { authorMemberIds: [...authorIdsOf(source)] }),
         // The recorded preparation failure, not the prose of `task.output`,
         // which a later transition rewrites or leaves stale.
         preparationExhausted: task.status === 'blocked' && runtime.taskBlockCauses(task).has('preparation-failed'),

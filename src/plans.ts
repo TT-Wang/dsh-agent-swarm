@@ -1,6 +1,7 @@
 /** Pure validation shared by staged browser plans and their launch boundary. */
 import { isAbsolute } from 'node:path'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, classifyCheck, loadPackageScripts, dependencyAssumptions, formatDiagnostic, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, requireHostChecks, type AdmissionDiagnostic, type TaskCeilingInput } from './admission.ts'
+import { canOwnReview } from './assignment.ts'
 import type { PolicyErrorCategory } from './policy-error.ts'
 import { nextWorkerName, type CheckSyntaxIssue, type PlanInput, type PlanTask } from './types.ts'
 
@@ -218,7 +219,8 @@ export function validatePlan(value: unknown, options: PlanValidationOptions = {}
         if (typeof task.reviewOf !== 'string' || !tasks.has(task.reviewOf)) throw new AdmissionError('plan_review_source_unknown', 'tool_error', `${at}.reviewOf must name the existing source task key this verification reviews`, `${at}.reviewOf`)
         const source = tasks.get(task.reviewOf)!
         if (source.kind === 'verification') throw new AdmissionError('plan_review_source_invalid', 'tool_error', `${at}.reviewOf cannot name another verification task`, `${at}.reviewOf`)
-        if (task.assigneeKey && task.assigneeKey === source.assigneeKey) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
+        // A planned source's only author is its assignee.
+        if (task.assigneeKey && !canOwnReview({ assigneeId: source.assigneeKey as string | undefined }, String(task.assigneeKey))) throw new AdmissionError('plan_review_independence_required', 'tool_error', `${at}.assigneeKey must differ from the reviewed source's assignee ${JSON.stringify(source.assigneeKey)}`, `${at}.assigneeKey`)
       } else if (task.reviewOf !== undefined) throw new AdmissionError('plan_review_not_verification', 'tool_error', `${at}.reviewOf is only valid on verification tasks`, `${at}.reviewOf`)
     })
   }

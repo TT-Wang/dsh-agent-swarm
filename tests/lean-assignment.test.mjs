@@ -2,7 +2,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { assignmentAllows, canBorrowTask } from '../lib/assignment.js'
+import { assignmentAllows, authorIdsOf, canBorrowTask } from '../lib/assignment.js'
 import { pendingReadiness } from '../lib/arena.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
@@ -66,7 +66,7 @@ test('an idle member borrows untouched work from a busy preference without inven
   assert.equal(claimed.assigneeId, f.spare.id)
   assert.equal(claimed.attempt.ownerId, f.spare.id)
   assert.equal(claimed.plannedAssigneeId, f.spare.id, 'recovery keeps the actual workspace owner')
-  assert.deepEqual([...f.runtime.authorIds(claimed)], [f.spare.id])
+  assert.deepEqual([...authorIdsOf(claimed)], [f.spare.id])
   assert.equal(f.runtime.store.events(f.mission.id, 100).find(event => event.type === 'task/proposed' && event.data.id === task.id).data.assigneeId, f.preferred.id)
 })
 
