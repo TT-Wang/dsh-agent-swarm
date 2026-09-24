@@ -714,6 +714,25 @@ test('A verification retry re-validates before its own checkout: a grant that ex
   assert.equal(revokedEvents(runtime, f.mission.id).length, 1, 'exactly one revocation event')
 })
 
+test('A revocation found at task preparation leaves the dispatch sweep to finish its pass', async t => {
+  const { granted, project } = await fixture(t)
+  const clock = new FakeClock()
+  const grants = await loadWorkspaceGrants([{ path: granted, expiresAt: clock.now() + 1_000 }])
+  const workers = claimingWorkers()
+  const { runtime } = await makeRuntime(t, { workers, config: wired(grants), clock })
+  const f = await grantedMission(runtime, project, granted, 'owner-sweep')
+  const task = f.propose({ assigneeId: f.author.id })
+  await runtime.settle(f.mission.id)
+  // The grant expires while the author's start runs, after the start's own check.
+  workers.autoIdle = true
+  workers.start = async spec => { workers.started.push(spec.member.id); clock.advance(2_000) }
+  const swept = await runtime.exclusive(f.mission.id, () => runtime.scheduling.dispatch(runtime.mission(f.mission.id), f.mission.id))
+  assert.equal(swept, true, 'the sweep reaches its pass-end steps instead of abandoning the pass')
+  assert.equal(runtime.store.get('tasks', task.id).status, 'blocked', 'the task preparation check fenced the work')
+  assert.equal(revokedEvents(runtime, f.mission.id).length, 1, 'exactly one revocation event')
+  assert.equal(workspaceNotices(runtime, f.mission.id).length, 1, 'the catch adds no second workspace decision')
+})
+
 test('A grant that expires while work runs fences that work at the next pass', async t => {
   const { granted, project } = await fixture(t)
   const clock = new FakeClock()
