@@ -72,7 +72,6 @@ export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery):
 
 export class RefusalRegistry {
 
-
   constructor(private readonly rt: SwarmRuntime) {}
 
   /**
