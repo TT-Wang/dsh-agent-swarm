@@ -75,10 +75,10 @@ test('a schema requires only what the runtime requires on every call, and says w
   const propose = definitions.get('swarm_propose').parameters
   assert.equal(propose.required.includes('outputs'), false)
   assert.match(propose.properties.outputs.description, /Required unless replaces is given\. On a repair, explicit outputs replace the outputs it would otherwise inherit from every task in replaces\./)
-  // swarm_launch: the automatic plan requires assigneeKey on deliverables and one review of each, not on every task.
+  // swarm_launch: the automatic plan requires assigneeKey on deliverables, never on a review (the host adds an unassigned one).
   const launchTask = definitions.get('swarm_launch').parameters.properties.tasks.items
   assert.equal(launchTask.required.includes('assigneeKey'), false)
-  assert.match(launchTask.properties.assigneeKey.description, /Required on every non-verification task and on at least one verification task reviewing it, with a different member; may be omitted on any further review\./)
+  assert.match(launchTask.properties.assigneeKey.description, /; required on every non-verification task\./)
   // The staged plan never required it.
   assert.equal(definitions.get('swarm_stage').parameters.properties.tasks.items.required.includes('assigneeKey'), false)
 })
