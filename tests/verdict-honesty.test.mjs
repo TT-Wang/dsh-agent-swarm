@@ -229,3 +229,37 @@ test('evidence verified then challenged and rejected shows one refuted status on
   assert.equal(f.refutations(evidence.id).length, 1, 'the refutation is recorded exactly once')
   assertBoardIsConsistent(f, 'after the challenged claim was refuted')
 })
+
+test('a claim already refuted is neither verified again nor refuted twice when its source is re-reviewed', async t => {
+  const f = await fixture(t)
+  const source = f.proposeSource('Implement with a revised claim')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  const first = await f.publishEvidence(claimed, 'The first attempt satisfies the claim')
+  const revised = await f.publishEvidence(claimed, 'The revised attempt satisfies the claim', 'supported', [first.id])
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  const accept = async title => {
+    const review = f.proposeReview(source, title)
+    const claimedReview = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+    f.workers.checks = [{ command: 'npm test', exitCode: 0, output: 'ok' }]
+    await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Checks pass' })
+    return review
+  }
+  await accept('First review')
+  assert.equal(f.runtime.store.get('evidence', first.id).status, 'refuted', 'the superseding claim refuted its predecessor')
+  const verifiedOf = id => f.events('evidence/verified').filter(event => event.data.evidenceId === id).length
+  const verdictsOf = id => f.events('evidence/verdict').filter(event => event.data.evidenceId === id).length
+  const before = { verified: verifiedOf(first.id), refuted: f.refutations(first.id).length, verdicts: verdictsOf(first.id) }
+
+  // Dissent on the surviving claim returns the source for a second verdict.
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: revised.id, reason: 'A counterexample questions the revised claim', toolRunIds: [] })
+  assert.equal(f.current(source.id).status, 'submitted')
+  const second = await accept('Second review')
+
+  const predecessor = f.runtime.store.get('evidence', first.id)
+  assert.equal(predecessor.status, 'refuted', 'the refuted predecessor stays refuted')
+  assert.equal(predecessor.refutedBy, revised.id)
+  assert.equal(verifiedOf(first.id), before.verified, 'the second verdict does not verify the refuted claim again')
+  assert.equal(f.refutations(first.id).length, before.refuted, 'nor refute it a second time')
+  assert.equal(verdictsOf(first.id), before.verdicts, 'nor record a verdict row for it')
+  assert.ok(f.events('evidence/verified').some(event => event.data.evidenceId === revised.id && event.data.verificationTaskId === second.id), 'the live claim is verified by the second verdict')
+})

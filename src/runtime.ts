@@ -1857,6 +1857,10 @@ export class SwarmRuntime {
         const verdictEvidence: Array<{ id: string; outcome: string }> = []
         for (const evidenceId of source.evidenceIds) {
           const evidence = this.store.get('evidence', evidenceId)!
+          // F3-B: a claim is never both refuted and verified. One refuted by an
+          // earlier verdict or a superseding claim stays refuted: this verdict
+          // neither verifies it again nor records a second refutation of it.
+          if (evidence.status === 'refuted') continue
           // F-12: the durable log must reconstruct which claim became verified or
           // refuted and which reviews the verdict retired; `task/accepted` alone
           // names neither the evidence nor the retired tasks.
@@ -1865,10 +1869,8 @@ export class SwarmRuntime {
             // the stored status matches the `evidence/refuted` event. Leaving
             // the record `challenged` made the board show an unresolved dispute
             // while the durable log already said the claim was refuted.
-            if (evidence.status !== 'refuted') {
-              evidence.status = 'refuted'
-              this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
-            }
+            evidence.status = 'refuted'
+            this.store.event(missionId, 'evidence/refuted', member.id, { evidenceId, outcome: evidence.outcome, taskId: source.id, verificationTaskId: task.id, reason: rejection, retired })
             this.store.put('evidence', evidence)
             verdictEvidence.push(evidence)
             continue
