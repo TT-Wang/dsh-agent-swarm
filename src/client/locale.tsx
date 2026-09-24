@@ -75,7 +75,7 @@ export const zh: Record<string, string> = {
   'budget-resumed': '预算已恢复', 'budget-resume-skipped': '已跳过预算恢复', 'added': '已加入', 'subscribed': '已订阅',
   'activity': '活动', 'resume-failed': '恢复失败', 'workstream': '工作流', 'requested': '已请求',
   'lease-expiring': '租约即将到期', 'closeout-ready': '可收尾', 'closeout-exhausted': '收尾次数已用尽',
-  'quiescence-recovered': '静止后已恢复', 'review-retired': '审查已退役', 'effort-downgraded': '推理强度已降级',
+  'quiescence-recovered': '静止后已恢复', 'review-retired': '审查已退役', 'superseded': '已被替代', 'effort-downgraded': '推理强度已降级',
   // R11-08: the review-path, check-change, restart-recovery and
   // workspace-authorization event tokens, plus the residual vocabulary tokens
   // the derived F-33 guard covers.
