@@ -21,7 +21,7 @@ import { awaitsDelivery, proposalAllowance as computeProposalAllowance } from '.
 import { AdmissionRefusedError, classifyProviderOutage, LIMIT_LEVELS, scopeKeysOverlap, TASK_CLASSES, type AdmissionCandidate, type AdmissionDecision, type AdmissionReason, type AdmissionRecord, type LimitLevel, type LimitRule } from './scheduler.ts'
 import { validScope, scopeSubset } from './scope.ts'
 import { AdmissionError, assertDeclaredOutputs, assertScopeSelectors, dependencyAssumptions, formatDiagnostic, inheritedAcceptance, isNoopCheck, loadPackageScripts, normalizeReviewDependencies, normalizeScopeSelectors, normalizeTaskCeilings, reconcileTaskAdmission, requireHostChecks, taskCeilingBlock, taskGraphDefects, TaskGraphAdmissionError, type TaskGraphNode } from './admission.ts'
-import { canBorrowTask, canOwnReview } from './assignment.ts'
+import { canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
@@ -2287,6 +2287,9 @@ export class SwarmRuntime {
     // review bound to a member who can never claim it: pending forever, blocking
     // completion, with no notice naming the cause.
     if (input.to !== undefined && task.reviewOf !== undefined && !canOwnReview(this.task(missionId, task.reviewOf), input.to)) throw new PolicyError('review_independence_required', 'authorization_error', '[review_independence_required] Review requires an independent assignee; that member authored the reviewed source. Hand this review to a member who never owned it, or hand off the source instead.')
+    // The source side of the same rule: the new owner must stay independent of this task's own reviews.
+    const stranded = input.to === undefined ? undefined : strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: input.to })
+    if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${input.to} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Hand off to another member with \`to\`, or omit \`to\` to release the task.`)
     task.status = 'blocked'; task.handoff = input.summary; task.epoch++; task.assigneeId = input.to; this.dropAttempt(task)
     if (input.to !== undefined) task.plannedAssigneeId = input.to
     task.resumeAfterStop = { epoch: task.epoch, reason: 'handoff', memberId: member.id, at: this.now() }
@@ -3630,6 +3633,8 @@ export class SwarmRuntime {
         const member = this.store.get('members', changes.assigneeId)
         if (member?.missionId !== missionId || memberPhaseOf(member) === 'stopped') throw new PolicyError('task_assignee_invalid', 'validation_error', 'Unknown live assignee')
         if (task.reviewOf && !canOwnReview(this.task(missionId, task.reviewOf), member.id)) throw new PolicyError('review_independence_required', 'authorization_error', 'Review requires an independent assignee')
+        const stranded = strandedReview(this.store.list('tasks', missionId), task.id, { ...task, assigneeId: member.id })
+        if (stranded !== undefined) throw new PolicyError('review_independence_required', 'authorization_error', `[review_independence_required] Member ${member.id} is the assignee of review ${stranded.id} of this task; owning this task would make it that review's author. Pass another member as \`assigneeId\` in \`changes\`, or first amend review ${stranded.id}'s \`assigneeId\` with \`swarm_control\`.`)
         next.assigneeId = member.id; next.plannedAssigneeId = member.id
       }
     }

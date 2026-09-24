@@ -58,7 +58,16 @@ export function canBorrowTask(task: AssignmentCandidate): boolean {
  */
 export function assignmentAllows(task: AssignmentCandidate, memberId: string, tasks: readonly AssignmentCandidate[] = []): boolean {
   if (task.assigneeId === undefined || task.assigneeId === memberId) return true
-  return canBorrowTask(task) && !tasks.some(review => review.reviewOf === task.id
-    && review.assigneeId === memberId && !canBorrowTask(review)
-    && (review.status === 'pending' || review.status === 'running' || review.status === 'submitted'))
+  return canBorrowTask(task) && strandedReview(tasks, task.id, { assigneeId: memberId }) === undefined
+}
+
+/**
+ * The source side of the one independence rule: a live review of `sourceId`
+ * bound to its assignee (pinned, or already started) that its assignee could
+ * no longer own (`canOwnReview`) once the source's authors are `author`.
+ * Borrowing, amending and handing off a source refuse to create one.
+ */
+export function strandedReview<T extends AssignmentCandidate>(tasks: readonly T[], sourceId: string | undefined, author: AuthoredTask): T | undefined {
+  return tasks.find(review => review.reviewOf !== undefined && review.reviewOf === sourceId && review.assigneeId !== undefined && !canBorrowTask(review)
+    && (review.status === 'pending' || review.status === 'running' || review.status === 'submitted') && !canOwnReview(author, review.assigneeId))
 }

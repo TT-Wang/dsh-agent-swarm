@@ -83,6 +83,27 @@ test('amend: the owner cannot reassign a review to a prior owner of its source',
   assert.equal(taskOf(f.runtime, review.id).assigneeId, f.reviewer.id)
 })
 
+test('amend and handoff of a SOURCE: it cannot move to the member its own pending review is assigned to', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const other = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation', maxOutputTokens: 5_000 })
+  const source = f.propose({ title: 'Source' })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: f.reviewer.id }, 'the reviewer knows this code'), error => {
+    assert.equal(error.code, 'review_independence_required'); assert.match(error.message, /^\[review_independence_required\] .*`assigneeId` in `changes`/); return true
+  })
+  assert.equal(taskOf(f.runtime, source.id).assigneeId, f.author.id, 'the refused amend changed nothing')
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  assert.throws(() => f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, to: f.reviewer.id, summary: 'over to the reviewer' }), error => {
+    assert.equal(error.code, 'review_independence_required'); assert.match(error.message, /another member with `to`/); return true
+  })
+  assert.equal(taskOf(f.runtime, source.id).status, 'running', 'the refused handoff changed nothing')
+  assert.equal(taskOf(f.runtime, review.id).assigneeId, f.reviewer.id, 'the review keeps its independent assignee')
+  f.runtime.handoff(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, to: other.id, summary: 'over to another member' })
+  assert.equal(taskOf(f.runtime, source.id).assigneeId, other.id, 'a member independent of the review may take the source')
+})
+
 test('verify: a prior owner holding a review attempt cannot record a verdict', async t => {
   const f = await coauthored(t)
   const review = f.review({ assigneeId: f.reviewer.id })
