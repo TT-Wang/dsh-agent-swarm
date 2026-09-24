@@ -53,19 +53,26 @@ export function canBorrowTask(task: AssignmentCandidate): boolean {
 
 /**
  * Assignment eligibility, before readiness/independence and member availability.
- * Borrowing must not turn an explicitly pinned future reviewer into its source's
- * author. Legacy tasks have no mode and keep their existing assignment contract.
+ * A member takes a task bound to someone else only by borrowing it, and a
+ * member takes a task it is not assigned to (borrowed or unassigned, a
+ * released rework included) only if that would strand none of the task's own
+ * reviews (`strandedReview`): claim and dispatch never turn the member a
+ * review is bound to into its source's author. Legacy tasks have no mode and
+ * keep their existing assignment contract.
  */
 export function assignmentAllows(task: AssignmentCandidate, memberId: string, tasks: readonly AssignmentCandidate[] = []): boolean {
-  if (task.assigneeId === undefined || task.assigneeId === memberId) return true
-  return canBorrowTask(task) && strandedReview(tasks, task.id, { assigneeId: memberId }) === undefined
+  if (task.assigneeId === memberId) return true
+  if (task.assigneeId !== undefined && !canBorrowTask(task)) return false
+  return strandedReview(tasks, task.id, { assigneeId: memberId }) === undefined
 }
 
 /**
  * The source side of the one independence rule: a live review of `sourceId`
  * bound to its assignee (pinned, or already started) that its assignee could
  * no longer own (`canOwnReview`) once the source's authors are `author`.
- * Borrowing, amending and handing off a source refuse to create one.
+ * Every path that picks a source's executor refuses to create one: claim and
+ * dispatch (`assignmentAllows`), borrowing, amending, handing off, and a
+ * start-failure reroute.
  */
 export function strandedReview<T extends AssignmentCandidate>(tasks: readonly T[], sourceId: string | undefined, author: AuthoredTask): T | undefined {
   return tasks.find(review => review.reviewOf !== undefined && review.reviewOf === sourceId && review.assigneeId !== undefined && !canBorrowTask(review)

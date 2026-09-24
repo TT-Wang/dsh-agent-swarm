@@ -487,8 +487,7 @@ export class SwarmRuntime {
   private rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
     const target = this.scheduling.rerouteTarget(missionId, task, failedId)
     if (target === undefined || this.providerQuiescent(target) === undefined) return target
-    return this.store.list('members', missionId).find(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
-      && this.providerQuiescent(member) === undefined && this.scheduling.capable(task, member)) ?? target
+    return this.scheduling.rerouteCandidates(missionId, task, failedId).find(member => this.providerQuiescent(member) === undefined) ?? target
   }
 
   /** M1a seam 5/7: the declared-check execution path. */

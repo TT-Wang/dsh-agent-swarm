@@ -104,6 +104,58 @@ test('amend and handoff of a SOURCE: it cannot move to the member its own pendin
   assert.equal(taskOf(f.runtime, source.id).assigneeId, other.id, 'a member independent of the review may take the source')
 })
 
+test('claim and dispatch of an unassigned SOURCE: never to the member its own bound review is assigned to', async t => {
+  const f = await setup({ clock: new FakeClock() })
+  t.after(f.cleanup)
+  const source = f.propose({ title: 'Source', assigneeId: undefined })
+  const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+    kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
+  assert.equal(taskOf(f.runtime, source.id).assigneeId, undefined)
+  // Only the bound reviewer is idle: the dispatcher does not hand it the source.
+  f.workers.idle.add(f.reviewer.id)
+  await f.runtime.scheduling.dispatch(f.runtime.mission(f.mission.id), f.mission.id)
+  const pending = taskOf(f.runtime, source.id)
+  assert.deepEqual([pending.status, pending.attempt, pending.priorOwnerIds], ['pending', undefined, []], 'the reviewer never became the source\'s author')
+  assert.equal(f.runtime.ready(pending, f.runtime.store.get('members', f.reviewer.id)), false)
+  await assert.rejects(f.runtime.claim(f.actor(f.reviewer), f.mission.id, source.id), error => {
+    assert.equal(error.code, 'task_not_ready')
+    assert.ok(error.message.includes(`is the assignee of review ${review.id} of this task`), error.message)
+    return true
+  })
+  const onlyReviewerIdle = f.runtime.store.list('members', f.mission.id).map(member => ({ ...member, status: member.id === f.reviewer.id ? 'idle' : 'working' }))
+  assert.deepEqual(pendingReadiness(f.runtime.store.list('tasks', f.mission.id), onlyReviewerIdle), { ready: 0, notReady: 2 }, 'the arena counts the source as not ready for the reviewer either')
+  // Any other member may take it, and the review stays independent of it.
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  assert.equal(claimed.attempt.ownerId, f.author.id)
+  assert.equal(taskOf(f.runtime, review.id).assigneeId, f.reviewer.id)
+  assert.equal(canOwnReview(taskOf(f.runtime, source.id), f.reviewer.id), true)
+})
+
+test('reroute of a SOURCE: a failed start never moves it to the member its own bound review is assigned to', async t => {
+  for (const shape of ['two members', 'an independent member named later']) {
+    await t.test(shape, async t => {
+      const f = await setup({ clock: new FakeClock() })
+      t.after(f.cleanup)
+      // Sorted by name, the bound reviewer would be the first reroute candidate.
+      const bound = shape === 'two members' ? f.reviewer : await f.runtime.addMember(f.owner, f.mission.id, { name: 'Aardvark', role: 'verification', maxOutputTokens: 5_000 })
+      const source = f.propose({ title: 'Source' })
+      const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review', objective: 'Independent review',
+        kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: bound.id })
+      const mission = f.runtime.mission(f.mission.id)
+      for (let i = 0; i < 3; i++) f.runtime.onStartFailure(mission, f.runtime.store.get('members', f.author.id), new Error('bootstrap failed'))
+      const moved = f.runtime.store.events(f.mission.id, 5000).filter(event => event.type === 'task/reassigned' && event.data.taskId === source.id).map(event => event.data.to)
+      assert.equal(moved.includes(bound.id), false, 'the source is never re-routed to the bound reviewer')
+      assert.notEqual(taskOf(f.runtime, source.id).assigneeId, bound.id)
+      assert.deepEqual(moved, shape === 'two members' ? [] : [f.reviewer.id], 'an independent capable member takes it when there is one')
+      // With none, the released source is named unschedulable: no live member may take it.
+      const unschedulable = f.runtime.unschedulable(f.runtime.mission(f.mission.id), f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)).map(task => task.id)
+      assert.equal(unschedulable.includes(source.id), shape === 'two members')
+      assert.equal(taskOf(f.runtime, review.id).assigneeId, bound.id)
+      assert.equal(canOwnReview(taskOf(f.runtime, source.id), bound.id), true, 'the review stays ownable by its assignee')
+    })
+  }
+})
+
 test('verify: a prior owner holding a review attempt cannot record a verdict', async t => {
   const f = await coauthored(t)
   const review = f.review({ assigneeId: f.reviewer.id })

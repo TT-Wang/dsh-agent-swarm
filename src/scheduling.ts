@@ -9,7 +9,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { selectAcceptedDelivery } from './task-graph.ts'
-import { assignmentAllows, canBorrowTask, canOwnReview } from './assignment.ts'
+import { assignmentAllows, canBorrowTask, canOwnReview, strandedReview } from './assignment.ts'
 import { liveReviewFor } from './admission.ts'
 import { pendingStopOwner, stopPending } from './attempts.ts'
 import { hasNotice } from './arena.ts'
@@ -472,12 +472,12 @@ export class Scheduling {
   readinessBlocker(task: Task, member: Member, tasks?: Task[]): string | undefined {
     if (task.status !== 'pending') return `task ${task.id} is ${task.status}; inspect its current attempt, artifact or recovery condition with swarm_observe(taskId)`
     if ((task.preparationFailure?.retryAt ?? 0) > this.rt.now()) return `preparation is backing off until ${task.preparationFailure!.retryAt}: ${task.preparationFailure!.reason}`
-    if (task.assigneeId === undefined || task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
-    if (!canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
+    if (task.assigneeId === member.id) return this.capabilityBlocker(task, member, tasks)
+    if (task.assigneeId !== undefined && !canBorrowTask(task)) return `task is bound to member ${task.assigneeId}; the owner can amend assigneeId when reassignment is appropriate`
     const all = tasks ?? this.rt.store.list('tasks', task.missionId)
-    if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is reserved as an independent reviewer and cannot borrow this source task`
+    if (!assignmentAllows(task, member.id, all)) return `member ${member.id} is the assignee of review ${strandedReview(all, task.id, { assigneeId: member.id })?.id} of this task, so owning this task would make it that review's author; another member can take it, or the owner can amend that review's assigneeId with swarm_control`
     const incapable = this.capabilityBlocker(task, member, all)
-    if (incapable !== undefined) return incapable
+    if (incapable !== undefined || task.assigneeId === undefined) return incapable
     // Keep useful context on the preferred member when it can take this work
     // now. A busy, stopping, retired or non-independent preference cannot reserve
     // an untouched task while another member is idle. This adds no reservation.
@@ -518,8 +518,10 @@ export class Scheduling {
 
   /**
    * Tasks that cannot be dispatched under the current plan: pending work whose dependency
-   * lineage or review source is dead, reviews assigned to their own author, and
-   * blocked work. This is a diagnostic for owner repair, not permission to
+   * lineage or review source is dead, reviews assigned to their own author,
+   * pending work no live member may take (`assignmentAllows`: a source only its
+   * own bound reviewer is left to take included), and blocked work. This is a
+   * diagnostic for owner repair, not permission to
    * cancel obligations or mark the mission complete.
    */
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] {
@@ -540,7 +542,7 @@ export class Scheduling {
             return source.status === 'cancelled' || source.status === 'accepted' || dead.has(source.id)
               || !live.some(member => assignmentAllows(task, member.id, tasks) && canOwnReview(source, member.id))
           })())
-          || (task.assigneeId !== undefined && !live.some(member => assignmentAllows(task, member.id, tasks)))
+          || !live.some(member => assignmentAllows(task, member.id, tasks))
         if (stuck) { dead.add(task.id); changed = true }
       }
     }
@@ -1176,10 +1178,20 @@ export class Scheduling {
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
   }
 
+  /**
+   * R5-02: the live members a failed attempt may be re-routed to, in store
+   * order: capable of the task, and never the member one of its own reviews is
+   * bound to (`strandedReview`), whom a reroute would make that review's author.
+   */
+  rerouteCandidates(missionId: string, task: Task, failedId: string): Member[] {
+    const tasks = this.rt.store.list('tasks', missionId)
+    return this.rt.store.list('members', missionId).filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped'
+      && this.capable(task, member, tasks) && strandedReview(tasks, task.id, { assigneeId: member.id }) === undefined)
+  }
+
   /** R5-02: deterministic next live member for re-routed work, preferring the planned assignee. */
   rerouteTarget(missionId: string, task: Task, failedId: string): Member | undefined {
-    const candidates = this.rt.store.list('members', missionId)
-      .filter(member => member.id !== failedId && memberPhaseOf(member) !== 'stopped' && this.capable(task, member))
+    const candidates = this.rerouteCandidates(missionId, task, failedId)
     const planned = task.plannedAssigneeId === undefined ? undefined : candidates.find(member => member.id === task.plannedAssigneeId)
     return planned ?? candidates.sort((a, b) => a.name.localeCompare(b.name) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))[0]
   }

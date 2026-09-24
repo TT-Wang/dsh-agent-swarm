@@ -322,6 +322,40 @@ test('a reworked task stays pinned to its author through a failed start, so the 
   f.workers.start = outage
 })
 
+test('a released rework is never taken by the reviewer its re-opened review is bound to', async t => {
+  for (const release of ['handoff without to', 'amend assigneeId to null']) {
+    await t.test(release, async t => {
+      const f = await fixture(t, { members: ['Author', 'Reviewer', 'Third'] })
+      const [author, reviewer, third] = f.m
+      const source = f.propose('Implement')
+      await f.submit(author, source)
+      const review = f.proposeReview(source)
+      await f.verify(reviewer, review, 'reject')
+      f.resume(source)
+      if (release === 'handoff without to') {
+        const claimed = await f.runtime.claim(f.actor(author), f.mission.id, source.id)
+        f.runtime.handoff(f.actor(author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, summary: 'Releasing the rework' })
+        for (let i = 0; i < 10 && f.current(source).status !== 'pending'; i++) { f.clock.advance(20); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+      } else f.runtime.controlTask(f.owner, f.mission.id, source.id, 'amend', { assigneeId: null }, 'Release the rework')
+      assert.deepEqual([f.current(source).status, f.current(source).assigneeId], ['pending', undefined], 'the rework is released')
+      assert.deepEqual([f.current(review).status, f.current(review).assigneeId], ['pending', reviewer.id])
+      await assert.rejects(f.runtime.claim(f.actor(reviewer), f.mission.id, source.id), error => {
+        assert.equal(error.code, 'task_not_ready')
+        assert.ok(error.message.includes(`is the assignee of review ${review.id} of this task`), error.message)
+        return true
+      })
+      // Another independent member reworks it, and the re-opened review stays the one review of it.
+      await f.submit(third, source)
+      await f.pastReviewGrace(4)
+      assert.deepEqual(f.live(source).map(task => [task.id, task.assigneeId]), [[review.id, reviewer.id]], 'no automatic review is admitted')
+      assert.deepEqual(f.events('task/review-admitted'), [])
+      await f.verify(reviewer, review, 'accept', 'The rework meets the criterion')
+      assert.equal(f.current(source).status, 'accepted')
+      assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
+    })
+  }
+})
+
 test('a missing review path names every author of a reworked artifact', async t => {
   const f = await fixture(t)
   const [author, reviewer] = f.m
