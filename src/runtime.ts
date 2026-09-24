@@ -624,6 +624,10 @@ export class SwarmRuntime {
             })
           }
         }
+        // A store written before an accepted replacement retired its whole
+        // lineage may still hold the chain blocked; retired rows are terminal,
+        // so this replay retires nothing twice.
+        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length) this.retireReplacedLineage(mission.id, task)
         // R17-G7: recovery used to rewrite every non-stopped member row to
         // `idle`, which is exactly how a member could read `idle` while the
         // attempt it owns was still live (R15-F2). There is nothing to write:

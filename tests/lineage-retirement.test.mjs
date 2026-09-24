@@ -141,3 +141,24 @@ test('restart in the middle of a chain: the retirement reads only durable rows',
     assert.deepEqual(f.superseded().map(data => data.taskId).sort(), [a.id, r1.id].sort())
   } finally { await f.runtime.dispose() }
 })
+
+test('a store left with an accepted repair and a blocked chain is retired at restart, and a second restart replays nothing', async t => {
+  const f = await fixture(t)
+  const { a, reviewA, r1, reviewR1, r2 } = await rejectedChain(f)
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, r2.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: r2.id, attemptId: claimed.attempt.id, output: 'accepted before this rule existed' })
+  // The durable state a build without whole-lineage retirement left behind.
+  f.write(r2.id, { status: 'accepted' })
+  await f.restart()
+  try {
+    for (const task of [a, reviewA, r1, reviewR1]) assert.equal(f.status(task.id), 'cancelled', `${task.title} is retired on recovery`)
+    assert.deepEqual(f.superseded().map(data => [data.taskId, data.supersededBy]).sort(), [[a.id, r2.id], [r1.id, r2.id]].sort())
+    const rows = () => f.runtime.store.list('tasks', f.mission.id)
+    const retirements = () => f.runtime.store.events(f.mission.id, 5_000).filter(event => ['task/superseded', 'task/review-retired'].includes(event.type)).length
+    const [board, written] = [rows(), retirements()]
+    await f.restart()
+    assert.deepEqual(rows(), board, 'a replay changes no row')
+    assert.equal(retirements(), written, 'a replay writes no second retirement')
+    assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The accepted repair covers the mission').status, 'completed')
+  } finally { await f.runtime.dispose() }
+})
