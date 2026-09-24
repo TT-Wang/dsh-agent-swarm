@@ -17,38 +17,19 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { OwnerReplyGuard } from '../lib/owner-reply.js'
-import { FakeClock } from './faults/harness.mjs'
-
-const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 0 }
-
-class SilentWorkers {
-  deliveries = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start() {}
-  async deliver(member, delivery) { this.deliveries.push({ to: member.id, ...delivery }) }
-  async stop() {}
-  isIdle() { return false }
-  async prepareTask() {}
-  async captureArtifact() { return { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a.ts'] } }
-  async verifyArtifact() { return [{ command: 'test', exitCode: 0, output: 'ok' }] }
-  async dispose() {}
-}
+import { FakeClock, FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 /** A context stub: the guard only reads `on` (events) and `agents` (block mode). */
 const fakeContext = () => ({ on: () => () => {}, agents: { get: () => undefined }, get: () => undefined })
 
 async function fixture(t, config = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'swarm-owner-reply-'))
-  const workers = new SilentWorkers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'state.sqlite'), leaseMs: 60000, tickMs: 60000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, ...config }, workers)
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
+  const { dir: directory, runtime, workers, budget } = await makeRuntime(t, {
+    workers: new FakeWorkers({ async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } }),
+    config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, checkTimeoutMs: undefined, ...config },
+    budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
+  })
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
     scope: ['src/'], acceptance: ['works'], budget: { ...budget } })

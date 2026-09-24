@@ -7,19 +7,18 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, rm } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
-import { SwarmRuntime } from '../lib/runtime.js'
 import { registerTools } from '../lib/tools.js'
 import { validatePlan } from '../lib/plans.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { WORKER_NAME_POOL, nextWorkerName } from '../lib/types.js'
 import { MissionOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
-import { tempDirectory } from './temp-root.mjs'
+import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 
 /** The pool as the specification fixes it, in assignment order. */
 const POOL = ['Ada', 'Alan', 'Anita', 'Barbara', 'Beatrice', 'Ben', 'Carol', 'Dennis', 'Dora', 'Ed',
@@ -32,25 +31,17 @@ const VENDORS = ['claude', 'anthropic', 'openai', 'chatgpt', 'gpt', 'gemini', 'b
   'vertex', 'nvidia', 'apple', 'cohere', 'perplexity', 'huggingface', 'replit', 'tabnine', 'codex',
   'dsh', 'harness', 'swarm', 'agent']
 
-const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 6, maxDurationMs: 600000, maxTasks: 10, maxExperiments: 2 }
+const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxWorkers: 6, maxTasks: 10, maxExperiments: 2 }
 
 /** The only external boundary the runtime talks to; every host operation is controlled by the test. */
-class Workers {
-  started = []
-  bind(callbacks) { this.callbacks = callbacks }
-  async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }
-  async start(spec) { this.started.push(spec.member.id); if (this.refuseStart) throw new Error('worker refused to start') }
-  async stop() {}
-  isIdle() { return true }
-  async dispose() {}
-}
+const newWorkers = (overrides = {}) => new FakeWorkers({ autoIdle: true, async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) }, ...overrides })
 
 async function scenario(t, options = {}) {
-  const directory = await tempDirectory('swarm-worker-names-')
-  const workers = options.workers ?? new Workers()
-  const runtime = new SwarmRuntime({ statePath: join(directory, 'swarm.sqlite'), leaseMs: 60000, tickMs: 20, maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  const { dir: directory, runtime, workers } = await makeRuntime(t, {
+    workers: options.workers ?? newWorkers(),
+    config: { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined },
+  })
   await runtime.start()
-  t.after(async () => { await runtime.dispose(); await rm(directory, { recursive: true, force: true }) })
   const owner = { sessionId: 'owner-worker-names' }
   const mission = runtime.create(owner, { title: 'Worker identity', objective: 'Name every worker from the fixed pool',
     workspace: directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: options.maxWorkers ?? budget.maxWorkers } })
@@ -146,7 +137,7 @@ test('assignment is unique, never reused while the mission is active, and needs 
 
   // The name is chosen by the runtime, before and independently of any worker
   // start: a worker that cannot start still leaves its pooled name durable.
-  const refusing = await scenario(t, { workers: Object.assign(new Workers(), { refuseStart: true }) })
+  const refusing = await scenario(t, { workers: newWorkers({ startError: new Error('worker refused to start') }) })
   await assert.rejects(refusing.add({ role: 'refused' }), /refused to start/)
   const stopped = refusing.rows().find(row => row.status === 'stopped')
   assert.ok(stopped, 'the failed admission is durable')
@@ -187,7 +178,7 @@ test('the sidebar renders name · role beside a stable accessible inline robot p
   const role = 'Replacement slot; implements exactly the acceptance strings it replaces'
   const member = await f.add({ role })
   // The real observation path the worker adapter uses, so the snapshot is durable state.
-  f.workers.callbacks.activity(member.id, { id: 'operation-1', kind: 'model', startedAt: Date.now() - 1000, updatedAt: Date.now() })
+  f.workers.reportActivity(member.id, { id: 'operation-1', kind: 'model', startedAt: Date.now() - 1000, updatedAt: Date.now() })
   const snapshot = f.runtime.snapshot(f.owner, f.mission.id)
   assert.equal(snapshot.members.find(row => row.id === member.id).activity.kind, 'model')
   const overview = renderToStaticMarkup(React.createElement(MissionOverview, { snapshot, live: true }))
