@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
 import { bootHarness, importHarness } from './fixtures/built-harness.mjs'
 import { requests, setResponder } from './fixtures/scripted-llm.mjs'
@@ -28,6 +28,8 @@ const userMessages = []
 const transcript = []
 const recentTools = []
 const fixtureStarted = Date.now()
+/** Fixture token standing for the runtime's exported ASSIGNMENT_INSTRUCTIONS. */
+const INSTRUCTIONS_PLACEHOLDER = '<ASSIGNMENT_INSTRUCTIONS>'
 let ctx
 let ownerHandle
 let commandCounter = 0
@@ -349,9 +351,19 @@ try {
     completion: completion.result.status,
     acceptedTasks: completed.tasks.map(task => ({ title: task.title, kind: task.kind, status: task.status })).sort((a, b) => a.title.localeCompare(b.title)),
   }
+  // The snapshot pins structure, not prose: tool-name sets, delivery sources and
+  // task keys are literal, while the fixture holds a placeholder wherever an
+  // assignment carries the runtime's exported ASSIGNMENT_INSTRUCTIONS. Rewording
+  // the instruction needs no fixture refresh; an assignment without exactly that
+  // text, or a changed tool name or task key, still fails. The constant is read
+  // from the artifact under test, after the Loader has resolved it.
+  const { ASSIGNMENT_INSTRUCTIONS } = await import(pathToFileURL(join(artifactRoot, 'lib', 'runtime.js')).href)
+  assert.equal(typeof ASSIGNMENT_INSTRUCTIONS, 'string', 'the artifact must export its assignment instructions')
+  const withInstructions = (snapshot, from, to) => ({ ...snapshot, assignments: snapshot.assignments.map(item => item.instructions === from ? { ...item, instructions: to } : item) })
   const snapshotPath = fileURLToPath(new URL('./fixtures/model-visible.expected.json', import.meta.url))
-  if (process.env.UPDATE_SMOKE_SNAPSHOT === '1') await writeFile(snapshotPath, JSON.stringify(boundarySnapshot, null, 2) + '\n')
-  assert.deepEqual(boundarySnapshot, JSON.parse(await readFile(snapshotPath, 'utf8')), 'the assembled Harness model-visible collaboration snapshot changed')
+  if (process.env.UPDATE_SMOKE_SNAPSHOT === '1') await writeFile(snapshotPath, JSON.stringify(withInstructions(boundarySnapshot, ASSIGNMENT_INSTRUCTIONS, INSTRUCTIONS_PLACEHOLDER), null, 2) + '\n')
+  const expectedSnapshot = withInstructions(JSON.parse(await readFile(snapshotPath, 'utf8')), INSTRUCTIONS_PLACEHOLDER, ASSIGNMENT_INSTRUCTIONS)
+  assert.deepEqual(boundarySnapshot, expectedSnapshot, 'the assembled Harness model-visible collaboration snapshot changed')
 
   // Abort during a live model step, then restore workers without recreating the owner.
   const recoveryMission = (await ownerCall('swarm_create', {
