@@ -119,7 +119,7 @@ test('S15 pair: the repeated-failure block does not admit a second review or re-
       .filter(delivery => delivery.to === 'owner' && typeof delivery.content === 'string')
       .find(delivery => delivery.content.includes(task.id))
     assert.ok(notice, 'the block wakes the owner with the task named')
-    assert.match(notice.content, /Repair it with a replacement task or adjust the plan/)
+    assert.match(notice.content, new RegExp(`Rework it in place with swarm_control\\(action: "resume", taskId: "${task.id}", reason\\)[^]*replaces: \\["${task.id}"\\]`), 'the rework is offered before a replacement')
     assert.match(notice.content, /blocked by independent verification/, 'the notice names the cause, not only the symptom')
     assert.equal(reviewsFor().length, 1, 'one review, admitted once')
 

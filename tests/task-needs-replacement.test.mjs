@@ -66,6 +66,8 @@ const needsReplacement = taskId => error => {
   assert.equal(error.category, 'conflict_error')
   assert.ok(error.message.startsWith('[task_needs_replacement] '), error.message)
   assert.match(error.message, /`swarm_propose`[^.]*`replaces`/)
+  const resumeAt = error.message.indexOf('`action` resume')
+  assert.ok(resumeAt >= 0 && resumeAt < error.message.indexOf('`swarm_propose`'), 'the in-place rework is named before the replacement')
   assert.ok(error.message.includes(`["${taskId}"]`), 'the exit names the task the replacement must cover')
   return true
 }
@@ -164,6 +166,23 @@ test('task_refuted: a rejected experiment whose evidence was refuted refuses res
   assert.equal(f.current(task).epoch, rejected.epoch)
   assert.equal(f.current(task).checkTimeoutMs, rejected.checkTimeoutMs)
   assert.equal(f.workers.stopped.includes(f.author.id), false)
+})
+
+test('a structural amendment of a rejected task names the resume before the replacement and meets the refusal contract', async t => {
+  const f = await fixture(t)
+  const task = f.propose()
+  await f.reject(task)
+  let message
+  assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, task.id, 'amend', { checks: ['test', 'test -d .'] }, 'Stronger checks before the rework'), error => {
+    assert.equal(error.code, 'artifact_policy_immutable')
+    assert.ok(error.message.startsWith('[artifact_policy_immutable] '), error.message)
+    const resumeAt = error.message.indexOf('`action` resume')
+    assert.ok(resumeAt >= 0 && resumeAt < error.message.indexOf('`swarm_propose`'), error.message)
+    message = error.message
+    return true
+  })
+  assert.deepEqual(assessText(message, await toolSchemaIndex()), [])
+  assert.deepEqual(f.current(task).checks, ['test'], 'nothing of the refused amendment is written')
 })
 
 test('the task_needs_replacement refusal meets the refusal contract against the real tool schema', async t => {

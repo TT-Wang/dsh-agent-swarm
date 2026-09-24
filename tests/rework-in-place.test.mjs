@@ -37,7 +37,7 @@ class ReworkWorkers extends FakeWorkers {
 async function fixture(t) {
   const clock = new FakeClock()
   const { dir, runtime, workers, budget } = await makeRuntime(t, { workers: new ReworkWorkers(), clock,
-    config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks: 100 } })
+    config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks: 100, maxExperiments: 2 } })
   await runtime.start()
   const owner = { sessionId: 'rework-owner' }
   const mission = runtime.create(owner, { title: 'Rework', objective: 'Repair rejected work in place', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
@@ -229,6 +229,40 @@ test('the rework bound refuses with its exit, and raising maxRework through swar
   assert.equal(raised.maxRework, 3)
   assert.equal(raised.reworkCount, 3)
   assert.equal(raised.rejections.length, 3)
+})
+
+test('the rejection decision names the rework first and a replacement second, to the owner and to the author', async t => {
+  const f = await fixture(t)
+  const deliveries = () => f.runtime.store.list('deliveries', f.mission.id)
+  const decisionFor = task => deliveries().filter(delivery => delivery.to === 'owner' && delivery.content.includes(`(${task.id}) was blocked by independent verification`)).at(-1)?.content
+  const authorNoticeFor = task => deliveries().filter(delivery => delivery.to === f.author.id && delivery.kind === 'control' && delivery.content.includes(`(${task.id}) was rejected by independent verification`)).at(-1)?.content
+  const resumeCall = task => `swarm_control(action: "resume", taskId: "${task.id}", reason)`
+  const replacement = task => `swarm_propose naming replaces: ["${task.id}"]`
+  const inOrder = (text, first, second) => { assert.ok(text.includes(first) && text.indexOf(first) < text.indexOf(second), `${first} before ${second} in: ${text}`) }
+  /** Each rejection in its own wake window, so the decision is its own row. */
+  const rejectOnce = async task => { f.clock.advance(6000); await f.submit(task); await f.reject(task) }
+
+  const source = f.propose('Implement')
+  await rejectOnce(source)
+  inOrder(decisionFor(source), resumeCall(source), replacement(source))
+  assert.match(decisionFor(source), /rework 1\/2/)
+  inOrder(authorNoticeFor(source), resumeCall(source), replacement(source))
+  assert.match(authorNoticeFor(source), /The artifact misses the acceptance criterion/, 'the author reads the reason')
+  f.resume(source)
+  await rejectOnce(source)
+  assert.match(decisionFor(source), /rework 2\/2/)
+  f.resume(source)
+  await rejectOnce(source)
+  // Past the bound the first exit is the raise.
+  inOrder(decisionFor(source), `reworked 2/2 times; raise changes.maxRework in ${resumeCall(source)}`, replacement(source))
+
+  // A rejected experiment stays blocked, so only the replacement is offered.
+  const experiment = f.propose('Try an idea', { experiment: true })
+  await rejectOnce(experiment)
+  assert.match(decisionFor(experiment), /Repair it with a replacement task or adjust the plan\./)
+  assert.ok(!decisionFor(experiment).includes('swarm_control'), decisionFor(experiment))
+  assert.ok(authorNoticeFor(experiment).includes(replacement(experiment)))
+  assert.ok(!authorNoticeFor(experiment).includes('swarm_control'))
 })
 
 test('a real rework attempt starts from the rejected commit, whether or not its author moved on', async t => {

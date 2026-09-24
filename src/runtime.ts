@@ -122,6 +122,25 @@ const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
  */
 export const DEFAULT_MAX_REWORK = 2
 /**
+ * The repair path the verify site's rejection decision names to the owner and
+ * to the author: rework in place first, a replacement second. A rejected
+ * experiment stays blocked, so it is offered the replacement alone; a task past
+ * its rework bound is offered the raise.
+ */
+function rejectionRepair(source: Task): { owner: string; author: string } {
+  const replaces = `swarm_propose naming replaces: ["${source.id}"]`
+  if (source.experiment) return { owner: 'Repair it with a replacement task or adjust the plan.',
+    author: `Repair path: propose a replacement with ${replaces} and the same kind (${source.kind}); the replacement inherits its acceptance. Do not resubmit this task; it stays blocked until its replacement is independently accepted.` }
+  const resume = `swarm_control(action: "resume", taskId: "${source.id}", reason)`
+  const used = source.reworkCount ?? 0
+  const max = source.maxRework ?? DEFAULT_MAX_REWORK
+  return {
+    owner: `${used < max ? `Rework it in place with ${resume} (rework ${used + 1}/${max}): its author resumes from the rejected commit and the resubmission is reviewed afresh`
+      : `It was reworked ${used}/${max} times; raise changes.maxRework in ${resume} to rework it again`}. Otherwise propose a replacement with ${replaces}, or adjust the plan.`,
+    author: `Repair path: the owner can re-open this task for you with ${resume}; then rework it from your rejected commit and resubmit. Otherwise a replacement repairs it: ${replaces} and the same kind (${source.kind}), inheriting its acceptance. Until then do not resubmit; it stays blocked.`,
+  }
+}
+/**
  * The instructions every assignment delivery carries to its worker, verbatim.
  * Exported so the model-visible snapshot (`tests/harness-composition.mjs`)
  * pins that each assignment carries exactly this text, not its wording.
@@ -1913,7 +1932,8 @@ export class SwarmRuntime {
         }
         // Acceptance is routine progress; a rejection blocks work and needs a repair decision.
         if (!passed) {
-          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. Repair it with a replacement task or adjust the plan.`, this.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
+          const repair = rejectionRepair(source)
+          this.notify(missionId, `${source.title} (${source.id}) was blocked by independent verification: ${rejection}. ${repair.owner}`, this.interpretation(missionId).subjectsOf([source]), { from: member.id, trigger: REJECTION_DECISION_TRIGGER, reason: rejection })
           // R11-18: the rejection reason and the repair path must reach the
           // source author, not only the owner. The author's re-claim is refused
           // (the task is blocked), so without this delivery the only exit is
@@ -1921,7 +1941,7 @@ export class SwarmRuntime {
           const authorId = source.attempt?.ownerId ?? source.assigneeId
           const author = authorId === undefined ? undefined : this.store.get('members', authorId)
           if (author !== undefined && memberPhaseOf(author) !== 'stopped') this.store.put('deliveries', { id: id('msg'), missionId, from: member.id, to: author.id, kind: 'control', createdAt: this.now(),
-            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\nRepair path: propose a replacement with swarm_propose naming replaces: ["${source.id}"] and the same kind (${source.kind}); the replacement inherits its acceptance. Do not resubmit this task; it stays blocked until its replacement is independently accepted.` })
+            content: `${source.title} (${source.id}) was rejected by independent verification: ${rejection}\n${repair.author}` })
         }
       })
       // Retired reviewers carry durable stop/checkpoint markers; retirement
@@ -3571,7 +3591,7 @@ export class SwarmRuntime {
     // the scope it must sit inside: a submitted artifact's obligations cannot be
     // rewritten after the fact.
     const structural = !strengthenSubmittedChecks && ['scope', 'outputs', 'dependencies', 'checks', 'assigneeId'].some(key => Object.hasOwn(changes, key))
-    if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', 'Submitted artifact policy is immutable; repair rejected work through a replacement')
+    if (structural && (task.artifact !== undefined || task.status === 'submitted')) throw new PolicyError('artifact_policy_immutable', 'conflict_error', `[artifact_policy_immutable] Task ${task.id} holds a submitted or rejected artifact, so its scope, outputs, dependencies, checks and assignee are fixed. Resume a rejected task with \`swarm_control\` and \`action\` resume first, then amend it; otherwise propose a replacement with \`swarm_propose\` naming \`replaces\`.`)
     const causes = this.taskBlockCauses(task)
     // An independently rejected source re-opens in place when it resumes (the
     // rework below). A rejected experiment stays blocked, and a pending stop
@@ -3642,7 +3662,7 @@ export class SwarmRuntime {
     // only fence the historical author and re-pend work that can never change.
     // A resume while a stop is still pending is the advertised cleanup retry,
     // which keeps the blocked outcome, so it stays allowed.
-    if (resumes && rework === undefined && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact (a rejected source, or submitted work invalidated after submission), so it cannot resume. Propose its repair with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
+    if (resumes && rework === undefined && !stopPending(task) && causes.has('needs-replacement')) throw new PolicyError('task_needs_replacement', 'conflict_error', `[task_needs_replacement] Task ${task.id} is blocked with an immutable artifact that resume cannot rework: ${task.experiment ? 'a rejected experiment stays blocked' : 'its submitted work was invalidated after submission'}. \`swarm_control\` with \`action\` resume re-opens in place only an independently rejected task that is not an experiment. Repair this one with \`swarm_propose\` naming \`replaces\`: ["${task.id}"] (the replacement inherits its acceptance), or withdraw it with \`swarm_cancel\` and \`taskId\`.`)
     if (resumes && task.status === 'submitted') throw new PolicyError('task_awaiting_verdict', 'conflict_error', 'Submitted work waits for an independent verdict')
     if (resumes && taskCeilingBlock(next, this.now()) !== undefined) throw new PolicyError('task_budget_exhausted', 'budget_error', 'Task budget exhausted; raise the same task allocation with swarm_budget before resuming')
     if (resumes && task.verificationRecovery) {
