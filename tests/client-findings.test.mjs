@@ -444,6 +444,29 @@ test('F-12/F-13 client surface: durable verdict naming, retired siblings, retain
   assert.doesNotMatch(activity, /Showing the latest 40/)
 })
 
+test('a retired lineage row names the accepted repair that retired it and the live fork, not its first withdrawn repair', () => {
+  const snapshot = uiSnapshot()
+  snapshot.mission.status = 'active'
+  const base = snapshot.tasks[4]
+  const original = { ...base, id: 't20', title: 'Original', status: 'cancelled' }
+  const withdrawn = { ...base, id: 't21', title: 'First repair', status: 'cancelled', replaces: [original.id] }
+  const accepted = { ...base, id: 't22', title: 'Repair of the withdrawn repair', status: 'accepted', replaces: [withdrawn.id] }
+  const fork = { ...base, id: 't23', title: 'Sibling repair', status: 'running', replaces: [original.id] }
+  const retirement = { taskId: original.id, supersededBy: accepted.id, previousStatus: 'blocked', liveReplacements: [fork.id] }
+  const at = snapshot.mission.updatedAt
+  const board = { ...snapshot, tasks: [...snapshot.tasks, original, withdrawn, accepted, fork], events: [...snapshot.events,
+    { seq: 90, missionId: snapshot.mission.id, type: 'task/cancelled', actor: 'owner', data: { taskId: withdrawn.id, reason: 'Wrong approach' }, createdAt: at },
+    { seq: 91, missionId: snapshot.mission.id, type: 'task/superseded', actor: 'runtime', data: retirement, createdAt: at }] }
+  assert.deepEqual(cancellationNotes(board).get(original.id), { kind: 'superseded', detail: accepted.title, live: [fork.title] }, 'the durable retirement names the accepting repair and the fork')
+  assert.deepEqual(cancellationNotes({ ...board, events: snapshot.events }).get(original.id), { kind: 'superseded', detail: fork.title },
+    'without the record in the window, a live repair is named before a withdrawn one')
+  const summary = eventSummary(retirement)
+  assert.match(summary, /supersededBy: t22/)
+  assert.match(summary, /liveReplacements: t23/)
+  assert.match(eventSummary({ taskId: fork.id, carriedBy: accepted.id, status: 'running', code: 'lineage_duplicate_carrier' }), /carriedBy: t22/)
+  assert.match(render(SwarmBoard, { snapshot: board, initialView: 'board' }), /superseded by a repair · Repair of the withdrawn repair · live replacement left alone: Sibling repair/)
+})
+
 test('OWNER PASS 2026-09-11: the cancelled lane names why each task was withdrawn', () => {
   const snapshot = uiSnapshot()
   const base = snapshot.tasks[4]

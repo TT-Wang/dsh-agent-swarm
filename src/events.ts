@@ -69,6 +69,7 @@ export const EVENTS = {
   'task/handoff-ready': { description: 'Previous worker stopped and the handed-off task is schedulable again', panel: { en: 'Task handoff completed', zh: '任务交接已完成' } },
   'task/review-retired': { description: 'Sibling review retired because its source can never reach a verdict', panel: { en: 'A redundant review was retired', zh: '已退役多余的审查' } },
   'task/superseded': { description: 'A blocked or pending task of an accepted replacement\'s lineage was retired; names the replacement and any live replacement left alone', panel: { en: 'Replaced work retired', zh: '被替代的工作已退役' } },
+  'task/duplicate-carrier': { description: 'A task of an accepted replacement\'s lineage was still live, so it was not retired; names the accepted replacement that already carries its obligation (code lineage_duplicate_carrier)', panel: { en: 'Duplicate work flagged', zh: '发现重复承担的工作' } },
   'task/invalidated': { description: 'Dependent work invalidated by a challenged prerequisite', panel: { en: 'Dependent work needs another review', zh: '依赖此结果的工作需要重新审查' } },
   'task/git-write-denied': { description: 'Sandbox refused a worker git write; the supported exit is named', panel: { en: 'Worker git write denied', zh: '成员的 Git 写入被拒绝' } },
   'task/budget-resume-skipped': { description: 'Budget-resume marker was stale and skipped', panel: { en: 'Task resume skipped', zh: '已跳过子任务恢复' } },

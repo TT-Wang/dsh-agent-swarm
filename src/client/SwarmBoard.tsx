@@ -96,7 +96,7 @@ function TaskCard({ task, snapshot, index, memberById, lane, reason, cancellatio
       : <p className="sw-small sw-focus-note" data-swarm-task-reason="">{reason}</p>)}
     {/* Item 4 of the 2026-09-11 UI pass: a cancelled card names which of the four
         causes it is, instead of sharing one "blocked / cancelled" label. */}
-    {cancellation && <p className="sw-small sw-cancel-note" data-swarm-cancel-kind={cancellation.kind}>{t(cancellationLabels[cancellation.kind])}{cancellation.detail ? ` · ${cancellation.detail.slice(0, REASON_INLINE)}${clipped(cancellation.detail) ? '…' : ''}` : ''}</p>}
+    {cancellation && <p className="sw-small sw-cancel-note" data-swarm-cancel-kind={cancellation.kind}>{t(cancellationLabels[cancellation.kind])}{cancellation.detail ? ` · ${cancellation.detail.slice(0, REASON_INLINE)}${clipped(cancellation.detail) ? '…' : ''}` : ''}{cancellation.live ? ` · ${t('live replacement left alone')}: ${cancellation.live.join(', ')}` : ''}</p>}
     {(task.dependencies.length > 0 || task.output || task.scope?.length > 0) && <details><summary>{t('Task details')}</summary>
       {task.objective && <p className="sw-small">{task.objective}</p>}
       {task.dependencies.length > 0 && <p className="sw-refs">{t('Prerequisites')}: {task.dependencies.map((id, i) => `${dependencies[i]?.title ?? shortId(id)} (${dependencies[i]?.status ?? 'missing'})`).join('; ')}</p>}

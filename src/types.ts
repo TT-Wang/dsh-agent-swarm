@@ -512,6 +512,12 @@ export interface Task {
   /** Blocked tasks whose acceptance obligations this replacement covers. */
   replaces?: string[]
   /**
+   * Set on an accepted replacement once its replaced lineage was retired, in
+   * the verdict's transaction (or once by host recovery for a store accepted
+   * before that rule). Recovery replays the retirement only without it.
+   */
+  lineageRetired?: true
+  /**
    * X1 (P0): every member that ever owned an attempt on this task. Independence
    * is decided from the union of the current attempt owner and this list, so a
    * handoff, lease expiry, idle close-out, start-failure reroute, cancellation

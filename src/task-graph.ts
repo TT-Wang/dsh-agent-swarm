@@ -23,6 +23,12 @@ export function taskGraphIndex(tasks: readonly Task[]) {
     return result
   }
   /**
+   * A replacement of `id`, direct or transitive, that is not cancelled. While
+   * one exists it carries `id`'s obligation, so `id` is admitted no second
+   * repair and is neither resumed, amended nor re-pended by a host restart.
+   */
+  const liveReplacement = (id: string): Task | undefined => replacementDescendants(id).find(task => task.status !== 'cancelled')
+  /**
    * `id` and every task it replaces, transitively: the one backward walk over
    * `replaces`, both parents of a `replaces: [a, b]` repair included, in
    * breadth-first order from `id`. Only indexed rows are returned, so an id
@@ -150,7 +156,7 @@ export function taskGraphIndex(tasks: readonly Task[]) {
       return identities(id).has(sourceId) || covers(endpoint, sourceId, seen)
     })
   }
-  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, replacedLineage }
+  return { byId, lineage, effective, identities, dependencyMet, reviewSource, covers, replacementDescendants, liveReplacement, replacedLineage }
 }
 
 /** Reuse only while the indexed task rows remain unchanged within one synchronous read. */

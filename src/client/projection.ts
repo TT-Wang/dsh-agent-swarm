@@ -320,8 +320,10 @@ export interface RetiredReview { id: string; title: string }
  * Why a task is sitting in the cancelled lane. Four causes were collapsed into
  * one label before this pass, and the board could not tell a healthy repair from
  * a real withdrawal:
- *  - `superseded`: another task names it in `replaces` (the repair lineage the
- *    runtime resolves through);
+ *  - `superseded`: the accepted repair its durable `task/superseded` record
+ *    names (not the first repair that named it, which may have been withdrawn),
+ *    with any live replacement that retirement left alone; without the record,
+ *    another task that names it in `replaces`, a non-withdrawn one first;
  *  - `retired-review`: a verification withdrawn because its source reached a
  *    verdict (the runtime retires sibling reviews);
  *  - `at-completion`: a mission completed with this task still queued;
@@ -330,20 +332,31 @@ export interface RetiredReview { id: string; title: string }
  *  - `unrecorded`: the snapshot carries no cause, stated rather than guessed.
  */
 export type CancellationKind = 'superseded' | 'retired-review' | 'at-completion' | 'withdrawn' | 'unrecorded'
-export interface CancellationNote { kind: CancellationKind; detail?: string }
+/** `live`: titles of the live replacements a lineage retirement left alone (a fork). */
+export interface CancellationNote { kind: CancellationKind; detail?: string; live?: string[] }
 export function cancellationNotes(snapshot: Snapshot): Map<string, CancellationNote> {
   const index = boardIndex(snapshot.tasks)
   const replacement = new Map<string, Task>()
-  for (const task of snapshot.tasks) for (const target of task.replaces ?? []) if (!replacement.has(target)) replacement.set(target, task)
-  const withdrawn = new Map<string, string>()
-  for (const event of snapshot.events) {
-    if (event.type !== 'task/cancelled' || event.actor !== 'owner') continue
-    const data = event.data as { taskId?: unknown; reason?: unknown } | undefined
-    if (typeof data?.taskId === 'string' && !withdrawn.has(data.taskId)) withdrawn.set(data.taskId, typeof data.reason === 'string' ? data.reason : '')
+  for (const task of snapshot.tasks) for (const target of task.replaces ?? []) {
+    const current = replacement.get(target)
+    if (current === undefined || (current.status === 'cancelled' && task.status !== 'cancelled')) replacement.set(target, task)
   }
+  const withdrawn = new Map<string, string>()
+  const retired = new Map<string, { by: string; live: string[] }>()
+  for (const event of snapshot.events) {
+    const data = event.data as { taskId?: unknown; reason?: unknown; supersededBy?: unknown; liveReplacements?: unknown } | undefined
+    if (typeof data?.taskId !== 'string') continue
+    if (event.type === 'task/superseded' && typeof data.supersededBy === 'string') {
+      retired.set(data.taskId, { by: data.supersededBy, live: Array.isArray(data.liveReplacements) ? data.liveReplacements.filter(id => typeof id === 'string') : [] })
+    }
+    if (event.type === 'task/cancelled' && event.actor === 'owner' && !withdrawn.has(data.taskId)) withdrawn.set(data.taskId, typeof data.reason === 'string' ? data.reason : '')
+  }
+  const title = (id: string) => index.byId.get(id)?.title ?? id
   const notes = new Map<string, CancellationNote>()
   for (const task of snapshot.tasks) {
     if (task.status !== 'cancelled') continue
+    const retirement = retired.get(task.id)
+    if (retirement !== undefined) { notes.set(task.id, { kind: 'superseded', detail: title(retirement.by), ...(retirement.live.length ? { live: retirement.live.map(title) } : {}) }); continue }
     const repair = replacement.get(task.id)
     if (repair !== undefined) { notes.set(task.id, { kind: 'superseded', detail: repair.title }); continue }
     if (task.kind === 'verification' && task.reviewOf !== undefined) {
@@ -410,13 +423,15 @@ export function activityGroups(snapshot: Snapshot): ActivityGroup[] {
  * a verdict, so the compact activity list can be reconstructed without the
  * raw event payload (F-14). `previousChecks`/`checks`/`reviewOf` carry the
  * R11-09 check-change and review-link payload; the workspace-audit keys carry
- * the authorization binding and revocation (grant root, resolved path, source).
+ * the authorization binding and revocation (grant root, resolved path, source);
+ * `supersededBy`/`liveReplacements`/`carriedBy` name the accepted repair that
+ * retired or duplicates a lineage row and the live fork it left.
  */
 export function eventSummary(data: unknown): string {
   if (!record(data)) return ''
   return Object.entries(data).filter(([key]) => ['taskId', 'memberId', 'reason', 'status', 'evidenceId', 'title', 'kind',
     'runId', 'command', 'outcome', 'verdict', 'commit', 'resultCommit', 'previousStatus',
     'previousChecks', 'checks', 'reviewOf', 'workspace', 'path', 'grantRoot', 'loaded', 'source', 'blockedTasks',
-    'escalationId', 'deliveryId', 'dedupKey', 'bodyChars', 'limit', 'class'].includes(key))
+    'escalationId', 'deliveryId', 'dedupKey', 'bodyChars', 'limit', 'class', 'supersededBy', 'liveReplacements', 'carriedBy'].includes(key))
     .map(([key, value]) => `${key}: ${String(value).slice(0, 160)}`).join(' · ')
 }

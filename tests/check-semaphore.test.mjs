@@ -41,18 +41,39 @@ async function semaphoreFixture(t, options = {}, members = 3, checkCommand = 'sl
  */
 
 test('R11-19: checkConcurrency 1 serializes declared checks and records the measured envelope', async t => {
-  const f = await semaphoreFixture(t, { checkConcurrency: 1 })
-  const results = await Promise.all(f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact)))
-  for (const result of results) assert.deepEqual(result.map(check => check.exitCode), [0])
+  // Order instead of a wall-clock threshold: each check holds its only slot
+  // until this test releases it (and consumes the release), so the queue and
+  // the serial order are observed by construction. The previous form asserted
+  // `maxWaitMs >= 100` against `sleep 0.15`, which a loaded host broke by
+  // staggering the verifications' Git preparation (saw maxWaitMs=76).
+  let sentinel
+  const f = await semaphoreFixture(t, { checkConcurrency: 1 }, 3, temp => {
+    sentinel = path.join(temp, 'serial-release')
+    return `node -e "const fs=require('fs');const d=Date.now()+30000;while(!fs.existsSync('${sentinel}')&&Date.now()<d){}fs.rmSync('${sentinel}',{force:true})"`
+  })
+  const results = f.prepared.map(entry => f.workspaces.verifyArtifact(entry.member, entry.task, entry.artifact))
+  await eventually(() => { const state = f.workspaces.checkEnvelope(); return state.active === 1 && state.queued === 2 }, 'two declared checks never queued behind the one holding the slot', 30000)
+  const queuedAt = Date.now()
+  const releasedAt = []
+  for (let completed = 1; completed <= 3; completed++) {
+    releasedAt.push(Date.now())
+    await writeFile(sentinel, 'release\n')
+    await eventually(() => f.workspaces.checkEnvelope().completed === completed, `release ${completed} never completed exactly one more check`, 30000)
+    const state = f.workspaces.checkEnvelope()
+    assert.equal(state.maxActive, 1, 'no two checks ran at once')
+    assert.equal(state.active + state.queued, 3 - completed, 'each release let exactly one check through, in turn')
+  }
+  for (const result of await Promise.all(results)) assert.deepEqual(result.map(check => check.exitCode), [0])
   const envelope = f.workspaces.checkEnvelope()
   assert.equal(envelope.limit, 1)
   assert.equal(envelope.maxActive, 1, 'no two checks ran at once')
   assert.equal(envelope.completed, 3)
-  assert.ok(envelope.maxWaitMs >= 100, `two checks had to wait, saw maxWaitMs=${envelope.maxWaitMs}`)
-  assert.ok(envelope.totalRunMs >= 400, 'the checks really ran serially')
-  // The measured envelope is the whole record: `maxActive === 1` is the per-check
-  // "never more than the limit was active", and `maxWaitMs >= 100` is the per-check
-  // "the queue wait is really measured", both maximised over the same three checks.
+  // The third check was queued before `queuedAt` and could only take the slot
+  // once the second check, released second, had finished, so its measured wait
+  // covers that whole interval: the queue wait is really measured, whatever the
+  // host's speed.
+  const queuedFor = releasedAt[1] - queuedAt
+  assert.ok(envelope.maxWaitMs >= queuedFor, `the third check waited for its turn, saw maxWaitMs=${envelope.maxWaitMs} over ${queuedFor} ms queued`)
   assert.ok(envelope.totalWaitMs >= envelope.maxWaitMs, 'the wait total accumulates every check, not only the longest')
   assert.equal(envelope.active, 0, 'every slot was released: a leak here would queue every later check forever')
   assert.equal(envelope.queued, 0, 'no check is left waiting for a slot')

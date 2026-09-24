@@ -6,16 +6,19 @@
  * rejecting review blocked, and completion was refused until the owner
  * cancelled them (docs/known-limitations.md, round 23).
  *
- * Guards: accepted, running and submitted rows are never retired; a live
- * sibling replacement (a fork) is left alone and named; a restart replays the
- * retirement without writing it twice.
+ * Guards: accepted, running, submitted and stopping rows are never retired; a
+ * live sibling replacement (a fork) is left alone and named; host recovery
+ * replays the retirement once, only for an acceptance recorded before the rule
+ * (no `lineageRetired` marker), and before it re-pends anything, so a restart
+ * never retires work the verdict left live.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FakeClock, MISSION_ACCEPTANCE, SwarmRuntime, FakeWorkers, acceptThroughReview, blockThroughReview, events, makeRuntime, taskOf } from './faults/harness.mjs'
+import { NOTICE_TEMPLATES } from '../lib/notices.js'
 
 async function fixture(t) {
-  const made = await makeRuntime(t, { clock: new FakeClock() })
+  const made = await makeRuntime(t, { clock: new FakeClock(), budget: { maxWorkers: 4 } })
   const owner = { sessionId: 'lineage-owner' }
   const f = { ...made, owner, actor: member => ({ sessionId: member.sessionId }) }
   await f.runtime.start()
@@ -161,4 +164,133 @@ test('a store left with an accepted repair and a blocked chain is retired at res
     assert.equal(retirements(), written, 'a replay writes no second retirement')
     assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The accepted repair covers the mission').status, 'completed')
   } finally { await f.runtime.dispose() }
+})
+
+/** Imported history admission no longer produces: `task` claimed by `member`, then left mid-handoff with its stop still owed. */
+async function stopping(f, task, member) {
+  const claimed = await f.runtime.claim(f.actor(member), f.mission.id, task.id)
+  const epoch = claimed.epoch + 1
+  f.write(task.id, { status: 'blocked', epoch, attempt: undefined, resumeAfterStop: { epoch, memberId: member.id, reason: 'handoff', at: f.clock.now() } })
+}
+
+test('work still running or stopping when its carrier is accepted stays live through the verdict and a restart', async t => {
+  const f = await fixture(t)
+  const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+  const helper = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Helper', role: 'implementation', maxOutputTokens: 5_000 })
+  const running = f.propose({ title: 'Running original', assigneeId: builder.id })
+  const claimed = await f.runtime.claim(f.actor(builder), f.mission.id, running.id)
+  const handingOff = f.propose({ title: 'Stopping original', assigneeId: helper.id })
+  await stopping(f, handingOff, helper)
+  const repair = f.propose({ title: 'Repair of both' })
+  f.write(repair.id, { replaces: [running.id, handingOff.id] })
+  await acceptThroughReview(f, repair)
+  assert.equal(taskOf(f.runtime, running.id).attempt?.id, claimed.attempt.id, 'the verdict leaves the running attempt alone')
+  assert.notEqual(f.status(handingOff.id), 'cancelled', 'the verdict never retires a row whose stop is still owed')
+  assert.equal(taskOf(f.runtime, repair.id).lineageRetired, true, 'the verdict marks the acceptance whose lineage it retired')
+  await f.restart()
+  try {
+    assert.equal(f.status(running.id), 'pending', 'recovery re-pends the running row like any other and does not retire it')
+    assert.notEqual(f.status(handingOff.id), 'cancelled', 'recovery finishes the owed stop and does not retire the row')
+    assert.deepEqual(f.superseded(), [], 'neither the verdict nor recovery retired live work')
+  } finally { await f.runtime.dispose() }
+})
+
+test('recovery replays the retirement once, only for an acceptance recorded before the rule, and spares work live at the crash', async t => {
+  const f = await fixture(t)
+  const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+  const helper = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Helper', role: 'implementation', maxOutputTokens: 5_000 })
+  const { a, r1, r2 } = await rejectedChain(f)
+  const running = f.propose({ title: 'Running original', assigneeId: builder.id })
+  await f.runtime.claim(f.actor(builder), f.mission.id, running.id)
+  const handingOff = f.propose({ title: 'Stopping original', assigneeId: helper.id })
+  await stopping(f, handingOff, helper)
+  const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, r2.id)
+  await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: r2.id, attemptId: claimed.attempt.id, output: 'accepted before this rule existed' })
+  // The durable state a build without whole-lineage retirement left: accepted, unmarked.
+  f.write(r2.id, { status: 'accepted', replaces: [r1.id, running.id, handingOff.id] })
+  await f.restart()
+  try {
+    for (const task of [a, r1]) assert.equal(f.status(task.id), 'cancelled', `${task.title}, blocked at the crash, is retired`)
+    assert.equal(f.status(running.id), 'pending', 'the row running at the crash is re-pended, not retired')
+    assert.notEqual(f.status(handingOff.id), 'cancelled', 'the row stopping at the crash is not retired')
+    assert.equal(taskOf(f.runtime, r2.id).lineageRetired, true, 'the replay marks the acceptance it repaired')
+    assert.deepEqual(f.superseded().map(data => data.taskId).sort(), [a.id, r1.id].sort())
+    assert.deepEqual(events(f.runtime, f.mission.id, 'task/duplicate-carrier').map(event => [event.data.taskId, event.data.carriedBy]).sort(),
+      [[running.id, r2.id], [handingOff.id, r2.id]].sort(), 'the replay names every live row it spared, as the verdict does')
+    await f.restart()
+    assert.equal(f.status(running.id), 'pending', 'a second restart replays nothing, so the re-pended row is still not retired')
+    assert.equal(events(f.runtime, f.mission.id, 'task/duplicate-carrier').length, 2, 'and names nothing twice')
+    assert.deepEqual(f.superseded().map(data => data.taskId).sort(), [a.id, r1.id].sort())
+  } finally { await f.runtime.dispose() }
+})
+
+// One obligation, one live carrier: the entry points that let a replaced task
+// run beside the repair that carries it are closed, and a live row older
+// history still holds is named, never skipped.
+
+test('a task carried by a repair of its withdrawn repair is neither resumed nor amended into a resume', async t => {
+  const f = await fixture(t)
+  const rejected = f.propose({ title: 'Rejected original' })
+  await blockThroughReview(f, rejected)
+  const stalled = f.propose({ title: 'Stalled original' })
+  f.write(stalled.id, { status: 'blocked' })
+  for (const original of [rejected, stalled]) {
+    const withdrawn = f.propose({ title: `Repair of ${original.title}`, replaces: [original.id] })
+    f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'Wrong approach' })
+    const restored = f.propose({ title: `Restored repair of ${original.title}`, replaces: [withdrawn.id] })
+    const refused = error => error.code === 'task_replaced' && error.message.startsWith('[task_replaced] ') && error.message.includes(restored.id)
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, original.id, 'resume', {}, 'Rework instead'), refused, `${original.title} is not resumed beside the repair that carries it`)
+    assert.throws(() => f.runtime.controlTask(f.owner, f.mission.id, original.id, 'amend', { maxRecoveryAttempts: 9 }, 'More credit'), refused, `${original.title} is not amended into an implied resume`)
+    assert.equal(f.status(original.id), 'blocked')
+  }
+})
+
+test('a repair of a withdrawn repair is refused while the task it repairs is live again or accepted', async t => {
+  const f = await fixture(t)
+  const original = f.propose({ title: 'Original' })
+  f.write(original.id, { status: 'blocked' })
+  const withdrawn = f.propose({ title: 'First repair', replaces: [original.id] })
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: withdrawn.id, reason: 'Wrong approach' })
+  assert.equal(f.runtime.controlTask(f.owner, f.mission.id, original.id, 'resume', {}, 'The environment is repaired').status, 'pending', 'the original resumes once its only repair is withdrawn')
+  const refused = status => error => error.code === 'replacement_already_live' && error.message.includes(`${original.id}, which it repairs, is ${status}`)
+  assert.throws(() => f.propose({ title: 'Second repair', replaces: [withdrawn.id] }), refused('pending'), 'no second carrier while the original is live')
+  await acceptThroughReview(f, original)
+  assert.throws(() => f.propose({ title: 'Second repair', replaces: [withdrawn.id] }), refused('accepted'), 'nor once the original fulfilled the obligation')
+  assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The original covers the mission').status, 'completed')
+})
+
+test('a restart keeps a task blocked only by the obsolete finding ceiling blocked while its repair is live', async t => {
+  const f = await fixture(t)
+  const parent = f.propose({ title: 'Parent' })
+  // A store from before findings became advisory: the finding ceiling is the only block.
+  f.write(parent.id, { status: 'blocked', ceiling: { dimension: 'maxFindings', limit: 1, used: 1, code: 'task_ceiling_exhausted', reason: 'legacy finding ceiling' } })
+  const repair = f.propose({ title: 'Repair', replaces: [parent.id] })
+  await f.restart()
+  try {
+    assert.equal(taskOf(f.runtime, parent.id).ceiling, undefined, 'the obsolete ceiling is still retired')
+    assert.equal(f.status(parent.id), 'blocked', 'but the task its live repair carries is not re-opened')
+    await acceptThroughReview(f, repair)
+    assert.equal(f.status(parent.id), 'cancelled', 'the accepted repair retires it')
+    assert.equal(f.runtime.control(f.owner, f.mission.id, 'complete', 'The repair covers the mission').status, 'completed')
+  } finally { await f.runtime.dispose() }
+})
+
+test('a replaced task still live when its repair is accepted is named in a coded event and an owner decision', async t => {
+  const f = await fixture(t)
+  const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
+  // Imported history the admission rules above no longer produce.
+  const live = f.propose({ title: 'Live original', assigneeId: builder.id })
+  const claimed = await f.runtime.claim(f.actor(builder), f.mission.id, live.id)
+  const repair = f.propose({ title: 'Repair' })
+  f.write(repair.id, { replaces: [live.id] })
+  await acceptThroughReview(f, repair)
+  const row = taskOf(f.runtime, live.id)
+  assert.equal(row.attempt?.id, claimed.attempt.id, 'the live attempt is untouched')
+  assert.deepEqual(events(f.runtime, f.mission.id, 'task/duplicate-carrier').map(event => event.data),
+    [{ taskId: live.id, carriedBy: repair.id, status: 'running', code: 'lineage_duplicate_carrier' }])
+  const decisions = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.statement?.family === 'duplicate-carrier')
+  assert.equal(decisions.length, 1, 'one owner decision names the duplicate')
+  assert.equal(decisions[0].content, NOTICE_TEMPLATES['duplicate-carrier'].build({ acceptedId: repair.id, duplicates: [row] }), 'the body is the template rebuilt from the rows')
+  assert.match(decisions[0].content, new RegExp(`${live.id} \\(Live original, running\\).*swarm_cancel`))
+  assert.deepEqual(decisions[0].notice.subjects, [`${live.id}@${row.epoch}`, `${repair.id}@${taskOf(f.runtime, repair.id).epoch}`])
 })

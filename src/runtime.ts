@@ -6,7 +6,7 @@ import { Attempts, blockCauses, currentEvidenceIds, pendingStopOwner, stopPendin
 import { PolicyError } from './policy-error.ts'
 import type { WorkspaceGrantSnapshot } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -602,15 +602,22 @@ export class SwarmRuntime {
           mission.executionTime = { usedMs: executionElapsed(mission, lastEvent) }; executionClock(mission, false, this.now()); this.store.put('missions', mission)
         }
         if (mission.budgetPause) { mission.budgetPause.quiesced = true; this.store.put('missions', mission) }
+        // Replay the lineage retirement only for a replacement accepted before
+        // the verdict ran it, and before anything below re-pends a row, so it
+        // judges each row as the crash left it: work that was running,
+        // submitted or stopping stays live exactly as on the verdict path.
+        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length && !task.lineageRetired) this.retireReplacedLineage(mission.id, task)
+        const graph = taskGraphIndex(this.store.list('tasks', mission.id))
         for (const task of this.store.list('tasks', mission.id)) {
           // Finding volume is advisory. Retire only this obsolete ceiling;
           // independent rejection or preparation failures still need repair.
           // A host restart never spends or checks recovery credit (R11-07), so
-          // the recovery limit alone does not keep the task blocked.
+          // the recovery limit alone does not keep the task blocked, and a
+          // live replacement that carries its obligation does.
           if (task.ceiling?.dimension === 'maxFindings') {
             delete task.ceiling
             const remaining = [...this.taskBlockCauses(task)].filter(cause => cause !== 'recovery-exhausted')
-            if (task.status === 'blocked' && task.resumeAfterStop === undefined && remaining.length === 0) task.status = 'pending'
+            if (task.status === 'blocked' && task.resumeAfterStop === undefined && remaining.length === 0 && graph.liveReplacement(task.id) === undefined) task.status = 'pending'
             this.store.put('tasks', task)
           }
           // A cold host confirms the old process is gone, but a durable stop
@@ -637,10 +644,6 @@ export class SwarmRuntime {
             })
           }
         }
-        // A store written before an accepted replacement retired its whole
-        // lineage may still hold the chain blocked; retired rows are terminal,
-        // so this replay retires nothing twice.
-        for (const task of this.store.list('tasks', mission.id)) if (task.status === 'accepted' && task.replaces?.length) this.retireReplacedLineage(mission.id, task)
         // R17-G7: recovery used to rewrite every non-stopped member row to
         // `idle`, which is exactly how a member could read `idle` while the
         // attempt it owns was still live (R15-F2). There is nothing to write:
@@ -1437,7 +1440,8 @@ export class SwarmRuntime {
       // must be reachable for exactly the blocked case it was written for: two
       // admitted replacements would make lineage ambiguous and stall every
       // dependent once both are accepted.
-      const replacement = taskGraphIndex(tasks).replacementDescendants(previousId).find(task => task.status !== 'cancelled')
+      const graph = taskGraphIndex(tasks)
+      const replacement = graph.liveReplacement(previousId)
       // W12: cancellation is terminal for the withdrawn record, not for the
       // obligation it carried. A cancelled task admits exactly one live repair,
       // exactly like blocked work, so a dependent's lineage can resolve again.
@@ -1447,6 +1451,11 @@ export class SwarmRuntime {
         throw new PolicyError('replacement_source_not_blocked', 'tool_error', `replaces ${previousId}: that task is ${previous.status}, and ${rule}${replacement ? `; it is already replaced by ${replacement.id} (${replacement.status})` : repairable ? '; wait for its verdict or use swarm_handoff/challenge' : ''}`)
       }
       if (replacement !== undefined) throw new PolicyError('replacement_already_live', 'tool_error', `replaces ${previousId}: that task is ${previous.status}, and is already replaced by ${replacement.id} (${replacement.status}); wait for its verdict, withdraw it with swarm_cancel, or repair that replacement instead of admitting a second one`)
+      // The same rule seen from the other end: a task this one repairs that is
+      // live again (resumed after its repair was withdrawn) or accepted carries
+      // the obligation itself, and a second carrier could be accepted beside it.
+      const carrier = graph.replacedLineage(previousId).slice(1).find(row => row.status !== 'cancelled' && (row.status !== 'blocked' || stopPending(row)))
+      if (carrier !== undefined) throw new PolicyError('replacement_already_live', 'tool_error', `[replacement_already_live] replaces ${previousId}: ${carrier.id}, which it repairs, is ${carrier.status} and carries the same obligation itself. Wait for its verdict, or withdraw it with \`swarm_cancel\` and its \`taskId\` before admitting another repair with \`swarm_propose\` and \`replaces\`; accepted work needs no repair.`)
       if (previous.status !== 'cancelled' && stopPending(previous)) throw new PolicyError('replacement_source_reassigning', 'lease_error', `replaces ${previousId}: that task is being reassigned after a handoff or lease expiry, not blocked for repair; observe again shortly`)
       if (previous.kind !== input.kind) throw new PolicyError('replacement_kind_mismatch', 'tool_error', `replaces ${previousId}: kind mismatch. The blocked task is ${previous.kind}; a replacement must also be ${previous.kind}`)
       if (dependencies.includes(previousId)) throw new PolicyError('replacement_depends_on_source', 'tool_error', `replaces ${previousId}: a repair cannot also depend on the blocked task it replaces`)
@@ -2408,31 +2417,43 @@ export class SwarmRuntime {
   /**
    * An accepted replacement carries every obligation of its replaced lineage
    * (`replacedLineage`: the `replaces` chain back to its roots, both parents of
-   * a multi-parent repair included). Each row of it still blocked or pending is
-   * cancelled with one `task/superseded` naming the replacement, and every
-   * cancelled row's open reviews are retired. Accepted, running and submitted
-   * rows are never retired; another live replacement of a retired row (a fork)
-   * is left alone and named. Terminal rows are skipped, so a replay retires
-   * nothing twice. Returns the retired reviews. Must be called inside a mission
-   * transaction.
+   * a multi-parent repair included). Each row of it still blocked or pending
+   * with no stop in flight is cancelled with one `task/superseded` naming the
+   * replacement, and every cancelled row's open reviews are retired. Accepted,
+   * running, submitted and stopping rows are never retired; another live
+   * replacement of a retired row (a fork) is left alone and named. Admission
+   * keeps a replaced task from running beside its repair, so a live row here
+   * is history from an older store: it is never skipped silently, but named in
+   * a coded `task/duplicate-carrier` and an owner decision. The accepted row is
+   * marked `lineageRetired`, so host recovery never runs this again for it.
+   * Returns the retired reviews. Must be called inside a mission transaction.
    */
   private retireReplacedLineage(missionId: string, accepted: Task): { retired: Task[]; released: Set<string> } {
     const graph = taskGraphIndex(this.store.list('tasks', missionId))
     const lineage = graph.replacedLineage(accepted.id)
     const carried = new Set(lineage.map(row => row.id))
-    const retired: Task[] = [], released = new Set<string>()
+    const retired: Task[] = [], released = new Set<string>(), duplicates: Task[] = []
+    if (lineage.length > 1) { accepted.lineageRetired = true; this.store.put('tasks', accepted) }
     for (const previous of lineage.slice(1)) {
       const previousStatus = previous.status
-      if (previousStatus === 'blocked' || previousStatus === 'pending') {
+      if ((previousStatus === 'blocked' || previousStatus === 'pending') && !stopPending(previous)) {
         const liveReplacements = graph.replacementDescendants(previous.id).filter(row => !carried.has(row.id) && !TERMINAL_STATES.has(row.status)).map(row => row.id)
         previous.status = 'cancelled'
         previous.output = `${previous.output ?? ''}\nSuperseded by independently accepted task ${accepted.id}${liveReplacements.length ? `; live replacement ${liveReplacements.join(', ')} left alone` : ''}`
         this.store.put('tasks', previous)
         this.store.event(missionId, 'task/superseded', 'runtime', { taskId: previous.id, supersededBy: accepted.id, previousStatus, ...(liveReplacements.length ? { liveReplacements } : {}) })
-      } else if (previousStatus !== 'cancelled') continue
+      } else if (previousStatus !== 'cancelled') {
+        if (previousStatus !== 'accepted') duplicates.push(previous)
+        continue
+      }
       const reviews = this.retireReviewSiblings(missionId, previous.id, { exclude: accepted.id, reason: `Superseded by review of replacement ${accepted.id}` })
       retired.push(...reviews.retired)
       for (const memberId of reviews.released) released.add(memberId)
+    }
+    if (duplicates.length > 0) {
+      for (const row of duplicates) this.store.event(missionId, 'task/duplicate-carrier', 'runtime', { taskId: row.id, carriedBy: accepted.id, status: row.status, code: 'lineage_duplicate_carrier' })
+      const { content, statement } = renderNotice('duplicate-carrier', { acceptedId: accepted.id, duplicates })
+      this.notify(missionId, content, this.interpretation(missionId).subjectsOf([...duplicates, accepted]), { trigger: NOTICE_TEMPLATES['duplicate-carrier'].trigger, reason: `${accepted.id} accepted`, statement })
     }
     return { retired, released }
   }
@@ -3603,7 +3624,10 @@ export class SwarmRuntime {
       return task
     }
     if (['accepted', 'cancelled'].includes(task.status)) throw new PolicyError('task_immutable', 'conflict_error', 'Accepted and cancelled tasks are immutable')
-    if (this.store.list('tasks', missionId).some(row => row.status !== 'cancelled' && row.replaces?.includes(task.id))) throw new PolicyError('task_replaced', 'conflict_error', 'Task has a live replacement; amend that task instead')
+    // A replacement carries this task's obligation while any row of its
+    // replacement chain is not cancelled, even behind a withdrawn repair.
+    const carrier = taskGraphIndex(this.store.list('tasks', missionId)).liveReplacement(task.id)
+    if (carrier !== undefined) throw new PolicyError('task_replaced', 'conflict_error', `[task_replaced] Task ${task.id} is carried by its replacement ${carrier.id} (${carrier.status}), so it is neither amended nor resumed. Amend or resume that replacement with \`swarm_control\` and its \`taskId\` while it is live; withdraw it with \`swarm_cancel\` and its \`taskId\` to re-open this task, or withdraw this task once the replacement is accepted.`)
     // A submitted artifact may acquire additional checks without changing its
     // content, authorship or obligations. The verdict fences this exact check list.
     const strengthenSubmittedChecks = task.status === 'submitted' && action === 'amend'
