@@ -361,11 +361,12 @@ function bulkSnapshot(size) {
 }
 
 test('F-34: the real board render scans the task array linearly, not per task or per event', () => {
-  // Structural check: index construction and graph layout never rescan.
-  const tasks = uiSnapshot().tasks
+  // Structural check: index construction, the board's lane resolution (with the
+  // roster, as the board calls it) and graph layout never rescan.
+  const { tasks, members } = uiSnapshot()
   const { proxy, counts } = countingTasks(tasks)
   const index = boardIndex(proxy)
-  for (const task of tasks) index.lane(task)
+  for (const task of tasks) index.lane(task, members)
   assert.deepEqual(counts, { find: 0, filter: 0 }, 'lane resolution never rescans the task array')
   graphLayout(proxy)
   assert.deepEqual(counts, { find: 0, filter: 0 }, 'graph layout never rescans the task array per edge')

@@ -147,7 +147,7 @@ test('R25 all projections reject ambiguity and cross-kind replacements, with exa
   repair.status = 'submitted'
   const rows = [source, repair, review]
   assert.equal(taskGraphIndex(rows).reviewSource(review).id, source.id)
-  assert.equal(boardIndex(rows).lane(review), 'blocked')
+  assert.equal(boardIndex(rows).lane(review, [{ id: 'reviewer', status: 'idle' }]), 'blocked')
 })
 
 test('R23/R24 completion and delivery share unique artifact coverage before terminal state', async t => {

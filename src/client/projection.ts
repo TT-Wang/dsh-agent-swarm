@@ -29,17 +29,19 @@ export interface BoardIndex {
   effective(id: string): Task | undefined
   dependencyMet(id: string): boolean
   blockedDependencies(task: Task): string[]
-  lane(task: Task, members?: readonly Member[]): BoardLane
+  lane(task: Task, members: readonly Member[]): BoardLane
 }
 
 /** One pure identity index supplies dependency and exact review-source facts. */
 export function boardIndex(tasks: readonly Task[]): BoardIndex {
   const { byId, effective, dependencyMet, reviewSource } = taskGraphIndex(tasks)
+  const reviews = new Map<string, Task[]>()
+  for (const task of tasks) if (task.reviewOf !== undefined) reviews.set(task.reviewOf, [...reviews.get(task.reviewOf) ?? [], task])
   const blockedDependencies = (task: Task): string[] => task.dependencies.filter(id => !dependencyMet(id))
   // A task is still alive while it can reach an acceptance or a verdict on its
   // own; only a dead one makes its dependents blocked rather than queued.
   const alive = (status: string): boolean => status === 'pending' || status === 'running' || status === 'submitted'
-  const lane = (task: Task, members?: readonly Member[]): BoardLane => {
+  const lane = (task: Task, members: readonly Member[]): BoardLane => {
     if (task.status === 'accepted') return 'done'
     if (task.status === 'running') return 'active'
     if (task.status === 'submitted') return 'review'
@@ -55,12 +57,9 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
     }
     const unmet = blockedDependencies(task)
     if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
-    if (members !== undefined) {
-      const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
-      if (!members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
-        && assignmentAllows(task, member.id, tasks))) return 'blocked'
-    }
-    return 'ready'
+    const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
+    return members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
+      && assignmentAllows(task, member.id, reviews.get(task.id) ?? [])) ? 'ready' : 'blocked'
   }
   return { byId, effective, dependencyMet, blockedDependencies, lane }
 }
