@@ -297,7 +297,7 @@ function declaredOutputFault(output: unknown, scope: readonly string[], dependen
   if (output.endsWith('/')) return 'ends in "/", so it names a directory rather than one file'
   if (/[*?[\]]/.test(output)) return 'contains a glob character, and only literal paths can be captured'
   if (isAbsolute(output) || output.startsWith('/') || output.includes('\\')) return 'is not a repository-relative path'
-  if (/[ -]/.test(output)) return 'contains a control character'
+  if (/[\u0000-\u001f]/.test(output)) return 'contains a control character'
   const parts = output.split('/')
   if (parts.some(part => part === '' || part === '.')) return 'has an empty or "." path segment'
   if (parts.includes('..')) return 'has a ".." segment, which could escape the repository'
