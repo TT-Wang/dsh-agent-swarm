@@ -28,18 +28,20 @@ export interface EventSpec {
    * tests/reader-census.test.mjs.
    */
   historical?: true
+  /** The kind is mission progress: the absence net measures silence from the newest such row (`SwarmStore.progressAt`). */
+  progress?: true
 }
 
 export const EVENTS = {
   'task/verification-deferred': { description: 'Check infrastructure needs repair; exact submitted source and verification evidence preserved', panel: { en: 'Verification needs environment repair', zh: '验证需要修复执行环境' } },
-  'task/amended': { description: 'Owner revised task execution policy while retaining task identity and acceptance', panel: { en: 'Task plan amended', zh: '任务计划已修订' } },
-  'mission/scope-amended': { description: 'Owner revised execution scope within the human workspace authorization', panel: { en: 'Mission scope amended', zh: '任务范围已修订' } },
+  'task/amended': { description: 'Owner revised task execution policy while retaining task identity and acceptance', panel: { en: 'Task plan amended', zh: '任务计划已修订' }, progress: true },
+  'mission/scope-amended': { description: 'Owner revised execution scope within the human workspace authorization', panel: { en: 'Mission scope amended', zh: '任务范围已修订' }, progress: true },
   'task/plan-repaired': { description: 'Unused staged task policy repaired with its previous revision preserved', panel: { en: 'Task plan amended', zh: '任务计划已修订' } },
   'member/plan-repaired': { description: 'Staged member configuration repaired after stop acknowledgement', panel: { en: 'Worker configuration repaired', zh: '成员配置已修复' } },
   'plan/admissions-repaired': { description: 'Saved plan reconciled with retained mission and resource identities', panel: { en: 'Saved plan repaired', zh: '已保存的计划已修复' } },
-  'mission/created': { description: 'Mission admitted with its initial scope and budget', panel: { omit: 'the mission header and status show creation' } },
+  'mission/created': { description: 'Mission admitted with its initial scope and budget', panel: { omit: 'the mission header and status show creation' }, progress: true },
   'mission/recovered': { description: 'Host restarted and recovered the mission from durable state', panel: { en: 'Mission recovered', zh: '任务已恢复' } },
-  'mission/budget-updated': { description: 'Owner changed the resource ceilings without resetting usage', panel: { omit: 'accounting; the metrics show the new ceilings' } },
+  'mission/budget-updated': { description: 'Owner changed the resource ceilings without resetting usage', panel: { omit: 'accounting; the metrics show the new ceilings' }, progress: true },
   'mission/stalled': { description: 'No schedulable work remains and every live worker is idle', panel: { en: 'Mission stalled', zh: '任务已停滞' } },
   'automatic/completed': { description: 'Runtime completed an automatic mission after independent acceptance', panel: { en: 'Collaboration completed', zh: '协作已完成' } },
   'workspace/snapshot': { description: 'Member workspace baseline snapshot recorded', panel: { en: 'Project snapshot saved', zh: '已保存项目快照' } },
@@ -49,14 +51,14 @@ export const EVENTS = {
   'member/stopped': { description: 'Worker handle stopped', panel: { omit: 'the team disclosure shows member status' } },
   'member/activity': { description: 'Worker activity heartbeat for lease liveness', panel: { omit: 'lease-liveness heartbeat; the activity projection already shows it' } },
   'workstream/created': { description: 'Workstream admitted', panel: { omit: 'board structure, not progress' } },
-  'task/proposed': { description: 'Task admitted under a workstream', panel: { omit: 'the pending task card appears on the board' } },
-  'task/claimed': { description: 'Attempt dispatched: ownership, attempt id and lease recorded', panel: { en: 'Task started', zh: '子任务开始执行' } },
-  'task/submitted': { description: 'Artifact captured and submitted for independent review', panel: { en: 'Work submitted for review', zh: '工作已提交审查' } },
-  'task/accepted': { description: 'Independent verification accepted the source artifact', panel: { en: 'Work accepted', zh: '工作已验收' } },
-  'task/rejected': { description: 'Independent verification rejected the source artifact', panel: { en: 'Review requested changes', zh: '审查要求修改' } },
+  'task/proposed': { description: 'Task admitted under a workstream', panel: { omit: 'the pending task card appears on the board' }, progress: true },
+  'task/claimed': { description: 'Attempt dispatched: ownership, attempt id and lease recorded', panel: { en: 'Task started', zh: '子任务开始执行' }, progress: true },
+  'task/submitted': { description: 'Artifact captured and submitted for independent review', panel: { en: 'Work submitted for review', zh: '工作已提交审查' }, progress: true },
+  'task/accepted': { description: 'Independent verification accepted the source artifact', panel: { en: 'Work accepted', zh: '工作已验收' }, progress: true },
+  'task/rejected': { description: 'Independent verification rejected the source artifact', panel: { en: 'Review requested changes', zh: '审查要求修改' }, progress: true },
   'task/blocked': { description: 'Task blocked with the reason that must be repaired', panel: { en: 'Task needs attention', zh: '子任务需要处理' } },
-  'task/cancelled': { description: 'Owner withdrew admitted work; dependents named as stranded', panel: { en: 'Task cancelled', zh: '子任务已取消' } },
-  'task/cancelled-at-completion': { description: 'Unschedulable leftover cancelled at mission completion', panel: { en: 'Task cancelled at completion', zh: '子任务在完成时被取消' }, historical: true },
+  'task/cancelled': { description: 'Owner withdrew admitted work; dependents named as stranded', panel: { en: 'Task cancelled', zh: '子任务已取消' }, progress: true },
+  'task/cancelled-at-completion': { description: 'Unschedulable leftover cancelled at mission completion', panel: { en: 'Task cancelled at completion', zh: '子任务在完成时被取消' }, historical: true, progress: true },
   'task/lease-expired': { description: 'Attempt lease expired and the owner was released', panel: { en: 'Task execution expired', zh: '任务执行已到期' } },
   'attempt/fenced': { description: 'A control decision fenced a running attempt: epoch bumped, outgoing owner recorded, stop obligation installed', panel: { en: 'Task work was stopped', zh: '子任务的工作已被停止' } },
   'task/ceiling-exhausted': { description: 'Task exhausted its step allocation and preserved work for owner-directed continuation', panel: { en: 'Task ceiling reached', zh: '子任务超出执行上限' } },
@@ -78,15 +80,15 @@ export const EVENTS = {
   // emission exactly like a literal, so this row is required, not optional.
   'task/stale-revision-refused': { description: 'A task write presented a revision another accepted write had moved past; the durable revision was named and the write refused', panel: { omit: 'store-internal lost-update record; the refused write is named to its caller synchronously and this row exists so an audit can reconstruct it' } },
   'task/quiescence-recovered': { description: 'Parked task recovered after host restart', panel: { en: 'Task recovered after quiescence', zh: '子任务在静止后已恢复' } },
-  'evidence/published': { description: 'Unverified claim published with host-recorded run ids', panel: { en: 'A finding was recorded', zh: '记录了一项发现' } },
+  'evidence/published': { description: 'Unverified claim published with host-recorded run ids', panel: { en: 'A finding was recorded', zh: '记录了一项发现' }, progress: true },
   'evidence/challenged': { description: 'Claim challenged with counterevidence', panel: { en: 'A finding was challenged', zh: '一项发现受到质疑' } },
-  'evidence/verified': { description: 'Verdict verified the claim and names the retired reviews', panel: { en: 'A finding was verified', zh: '一项发现已核实' } },
-  'evidence/refuted': { description: 'Verdict refuted the claim and names the retired reviews', panel: { en: 'A finding was refuted', zh: '一项发现已被推翻' } },
+  'evidence/verified': { description: 'Verdict verified the claim and names the retired reviews', panel: { en: 'A finding was verified', zh: '一项发现已核实' }, progress: true },
+  'evidence/refuted': { description: 'Verdict refuted the claim and names the retired reviews', panel: { en: 'A finding was refuted', zh: '一项发现已被推翻' }, progress: true },
   'evidence/verdict': { description: 'Normalized verdict row: evidence id, verdict and retired reviews', panel: { omit: 'normalized duplicate of evidence/verified|refuted' } },
   'trace/span': { description: 'One orchestration step span with digests of its input and output', panel: { omit: 'trace payload; the trace/replay surface owns it' } },
   'message/queued': { description: 'Directed message or topic broadcast queued durably', panel: { omit: 'transport; the delivery panel owns it' } },
-  'message/answered': { description: 'The addressed recipient bound an answer to a question delivery id (L1 receipt)', panel: { en: 'A question was answered', zh: '问题已获答复' } },
-  'message/dismissed': { description: 'The addressed recipient closed a question delivery without an answer, recording the reason (L1 receipt)', panel: { en: 'A question was closed without an answer', zh: '问题已标记为不答复' } },
+  'message/answered': { description: 'The addressed recipient bound an answer to a question delivery id (L1 receipt)', panel: { en: 'A question was answered', zh: '问题已获答复' }, progress: true },
+  'message/dismissed': { description: 'The addressed recipient closed a question delivery without an answer, recording the reason (L1 receipt)', panel: { en: 'A question was closed without an answer', zh: '问题已标记为不答复' }, progress: true },
   'owner/reply-missing': { description: 'An owner turn ended with a delivered question still unanswered: the receipt was not bound by any tool call in that turn (L2)', panel: { en: 'A question to the owner is still unanswered', zh: '主对话有一条问题尚未答复' } },
   // Every remaining type the runtime emits (F-14). The read path must name them
   // so an operator can reconstruct a decision instead of seeing an unknown row.
@@ -124,7 +126,7 @@ export const EVENTS = {
   'mission/pause': { description: 'Owner paused the mission', panel: { en: 'Mission paused', zh: '任务已暂停' } },
   'mission/stop': { description: 'Owner stopped the mission', panel: { en: 'Mission stopped', zh: '任务已停止' } },
   'mission/complete': { description: 'Owner completed the mission', panel: { en: 'Collaboration completed', zh: '协作已完成' } },
-  'mission/resume': { description: 'Owner resumed the mission', panel: { en: 'Mission resumed', zh: '任务已继续' } },
+  'mission/resume': { description: 'Owner resumed the mission', panel: { en: 'Mission resumed', zh: '任务已继续' }, progress: true },
   'mission/coordinator': { description: 'Owner set the mission coordinator', panel: { en: 'Mission coordinator set', zh: '已设置任务协调者' } },
   'delivery/applied': { description: 'Owner applied an accepted result to the source checkout', panel: { en: 'Result applied to project', zh: '成果已应用到项目' } },
   'delivery/conflicts': { description: 'Owner applied a result that conflicted; no source write was kept', panel: { en: 'Result needs conflict resolution', zh: '成果需要处理合并冲突' } },
@@ -166,6 +168,9 @@ const SPECS: Record<string, EventSpec> = EVENTS
 
 /** Description by kind: the read path's vocabulary, unchanged in shape and meaning. */
 export const EVENT_VOCABULARY: Record<string, string> = Object.fromEntries(Object.entries(SPECS).map(([kind, spec]) => [kind, spec.description]))
+
+/** The mission-progress kinds; telemetry, scheduling and transport are not among them. */
+export const PROGRESS_KINDS: string[] = Object.entries(SPECS).filter(([, spec]) => spec.progress).map(([kind]) => kind)
 
 /** Compact-panel labels by kind; a kind whose `panel` names an omit reason is absent. */
 export const EVENT_PANEL_LABELS: Record<string, { en: string; zh: string }> = Object.fromEntries(
