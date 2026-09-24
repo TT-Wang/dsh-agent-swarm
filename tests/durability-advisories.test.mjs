@@ -5,9 +5,11 @@
  * and capture. A checkpoint that read the record, decided it still owned it and
  * wrote after a newer attempt's write would clobber that write. Every writer of
  * a task record runs in this process (the store's runtime lock admits one per
- * store and a mission belongs to one store), so the writes of one record are
- * serialized in memory: this test holds an older checkpoint inside its write and
- * proves the newer attempt's write waits behind it instead of being lost.
+ * store and a mission belongs to one store), so each read-check-write of one
+ * record is serialized in memory. These tests hold one writer inside its write
+ * and prove, in both orders, that the other neither lands first nor decides on
+ * a record that is about to change: the running checkpoint (preservation) and
+ * the checkpoint a member writes when it leaves a task.
  *
  * A2: `git status --untracked-files=all` lists the files inside an untracked
  * dependency directory and never the directory name, so the `isDirectory`
@@ -51,9 +53,10 @@ const taskRecordPath = (temp, missionId, taskId) => path.join(temp, 'worktrees',
 const readJson = async file => JSON.parse(await readFile(file, 'utf8'))
 
 /**
- * Hold the first write of `file` in flight until released: a private JSON write
- * publishes by renaming its temporary over the record. `landed` lists the epoch
- * of each write of the record in the order the writes took effect.
+ * Hold the first write of `file` in flight: a private JSON write publishes by
+ * renaming its temporary over the record. `whileHeld(observe)` runs `observe`
+ * and then releases the write, even when `observe` fails. `landed` names the
+ * owner of each write of the record, `member@epoch`, in the order they took effect.
  */
 function holdFirstWrite(t, file) {
   const rename = filesystem.rename
@@ -63,17 +66,50 @@ function holdFirstWrite(t, file) {
   const landed = []
   filesystem.rename = async (from, to) => {
     if (to !== file) return await rename(from, to)
-    const epoch = JSON.parse(await readFile(from, 'utf8')).task.epoch
+    const { memberId, task } = JSON.parse(await readFile(from, 'utf8'))
     if (reach !== undefined) { const signal = reach; reach = undefined; signal(); await released }
     await rename(from, to)
-    landed.push(epoch)
+    landed.push(`${memberId}@${task.epoch}`)
   }
   syncBuiltinESMExports()
   t.after(() => { filesystem.rename = rename; syncBuiltinESMExports() })
-  return { reached, release, landed }
+  const whileHeld = async observe => { try { return await observe() } finally { release() } }
+  return { reached, whileHeld, landed }
 }
 
-test('A1: writes of one task record serialize in this process, so an older checkpoint never lands over a newer attempt', async t => {
+/** Count the reads of `file` from now on. */
+function countReads(t, file) {
+  const readFileOriginal = filesystem.readFile
+  const reads = { count: 0 }
+  filesystem.readFile = async (name, ...rest) => { if (name === file) reads.count++; return await readFileOriginal(name, ...rest) }
+  syncBuiltinESMExports()
+  t.after(() => { filesystem.readFile = readFileOriginal; syncBuiltinESMExports() })
+  return reads
+}
+
+/**
+ * The real subprocess seam, plus `passed(match)`: resolves once the next command
+ * matching `match` has exited and every step its caller takes without further
+ * I/O has run. A checkpoint's last git command is followed directly by its
+ * task-record step, so after `passed` a checkpoint is at that step.
+ */
+function commandSeam() {
+  let waiting
+  const seam = { spawn: spec => {
+    const handle = subprocessSeam().spawn(spec)
+    if (waiting?.match(spec.argv)) { const { resolve } = waiting; waiting = undefined; void handle.done.then(() => setImmediate(resolve), () => setImmediate(resolve)) }
+    return handle
+  } }
+  return { subprocess: () => seam, passed: match => new Promise(resolve => { waiting = { match, resolve } }) }
+}
+
+/** A newer owner of the task writes its record through the one task-record writer the runtime uses. */
+async function newerOwner(workspaces, mission, task, head) {
+  const workspace = await workspaces.prepareWorkspace(mission, 'member-two')
+  return () => workspaces.saveTaskWorkspace({ version: 1, missionId: mission.id, memberId: 'member-two', workspace, task: { taskId: task.id, epoch: 2, baseCommit: head } })
+}
+
+test("A1: a newer attempt's write waits behind a running checkpoint's write, so it is never lost", async t => {
   const { temp, workspaces, mission, member, task } = await fixture(t)
   await workspaces.prepareTask(member, task, [])
   const recordPath = taskRecordPath(temp, mission.id, task.id)
@@ -84,14 +120,75 @@ test('A1: writes of one task record serialize in this process, so an older check
   // Attempt 2 of the same task takes the record over while that write is in flight.
   const takeover = workspaces.prepareTask(member, { ...task, epoch: 2 }, [])
   const memberRecord = path.join(temp, 'worktrees', mission.id, `${member.id}.workspace.json`)
-  await eventually(async () => (await readJson(memberRecord)).task.epoch === 2, 'attempt 2 reaches its task record write')
-  assert.equal((await readJson(recordPath)).task.epoch, 1, 'the newer write waits behind the one in flight')
-  write.release()
+  const held = await write.whileHeld(async () => {
+    await eventually(async () => (await readJson(memberRecord)).task.epoch === 2, 'attempt 2 reaches its task record write')
+    return (await readJson(recordPath)).task.epoch
+  })
+  assert.equal(held, 1, 'the newer write waits behind the one in flight')
   await Promise.all([checkpoint, takeover])
-  assert.deepEqual(write.landed, [1, 2], 'the writes took effect one at a time, in the order they began')
+  assert.deepEqual(write.landed, ['member-one@1', 'member-one@2'], 'the writes took effect one at a time, in the order they began')
   const after = await readJson(recordPath)
   assert.equal(after.task.epoch, 2, 'the newer attempt keeps the record: no lost update')
   assert.match(after.task.preservedCommit, /^[a-f0-9]{40,64}$/, 'the checkpoint it waited behind is carried forward')
+})
+
+test("A1: a running checkpoint that starts while a newer owner's write is in flight decides on that write and declines", async t => {
+  const commands = commandSeam()
+  const { temp, head, workspaces, mission, member, task } = await fixture(t, { subprocess: commands.subprocess })
+  await workspaces.prepareTask(member, task, [])
+  const recordPath = taskRecordPath(temp, mission.id, task.id)
+  const writeNewer = await newerOwner(workspaces, mission, task, head)
+  const write = holdFirstWrite(t, recordPath)
+  const newer = writeNewer()
+  await write.reached
+  const reads = countReads(t, recordPath)
+  // The checkpoint's last git command drops the legacy preservation ref; its record step follows.
+  const passed = commands.passed(argv => argv.includes('update-ref') && argv.includes('-d'))
+  const checkpoint = workspaces.checkpointTask(member, task).then(() => 'saved', error => error.message)
+  assert.equal(await write.whileHeld(async () => { await passed; return reads.count }), 0, 'the checkpoint does not read the record while a newer write of it is in flight')
+  assert.match(await checkpoint, /ownership changed/, 'it reads the newer owner and refuses')
+  await newer
+  assert.deepEqual(write.landed, ['member-two@2'])
+  assert.equal((await readJson(recordPath)).memberId, 'member-two', 'the newer owner keeps the record')
+})
+
+test("A1: a newer owner's write waits behind the checkpoint of a member leaving the task, so it is never lost", async t => {
+  const { temp, head, workspaces, mission, member, task } = await fixture(t)
+  await workspaces.prepareTask(member, task, [])
+  const recordPath = taskRecordPath(temp, mission.id, task.id)
+  const writeNewer = await newerOwner(workspaces, mission, task, head)
+  const write = holdFirstWrite(t, recordPath)
+  // Member one moves on to another task: its checkpoint of task-one is the first write of that record.
+  const switching = workspaces.prepareTask(member, { ...task, id: 'task-next' }, [])
+  await write.reached
+  const newer = writeNewer()
+  const held = await write.whileHeld(async () => {
+    await eventually(async () => (await readJson(path.join(temp, 'worktrees', mission.id, 'member-two.workspace.json'))).task?.epoch === 2, 'the newer owner reaches its task record write')
+    return (await readJson(recordPath)).memberId
+  })
+  assert.equal(held, 'member-one', 'the newer write waits behind the one in flight')
+  await Promise.all([switching, newer])
+  assert.deepEqual(write.landed, ['member-one@1', 'member-two@2'])
+  assert.equal((await readJson(recordPath)).memberId, 'member-two', 'the newer owner keeps the record')
+})
+
+test("A1: a member leaving a task while a newer owner's write is in flight decides on that write and leaves it", async t => {
+  const commands = commandSeam()
+  const { temp, head, workspaces, mission, member, task } = await fixture(t, { subprocess: commands.subprocess })
+  await workspaces.prepareTask(member, task, [])
+  const recordPath = taskRecordPath(temp, mission.id, task.id)
+  const writeNewer = await newerOwner(workspaces, mission, task, head)
+  const write = holdFirstWrite(t, recordPath)
+  const newer = writeNewer()
+  await write.reached
+  const reads = countReads(t, recordPath)
+  // Leaving a clean task, the member's last git command reads its HEAD; the checkpoint follows.
+  const passed = commands.passed(argv => argv.includes('HEAD^{commit}'))
+  const switching = workspaces.prepareTask(member, { ...task, id: 'task-next' }, [])
+  assert.equal(await write.whileHeld(async () => { await passed; return reads.count }), 0, 'the checkpoint does not read the record while a newer write of it is in flight')
+  await Promise.all([switching, newer])
+  assert.deepEqual(write.landed, ['member-two@2'], 'the leaving member writes nothing over the newer owner')
+  assert.equal((await readJson(recordPath)).memberId, 'member-two')
 })
 
 test('A2: a real untracked dependency directory is excluded from preparation and capture', async t => {

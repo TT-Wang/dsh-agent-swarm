@@ -298,7 +298,7 @@ const RECOVERY_COLLECTIONS = {
     behavior: 'owner cursors are replayable, scoped, bounded and disposable',
     reason: 'At most64 immutable compact baselines belong to explicit owner/mission cursors; loss or eviction returns a complete compact view, never gates execution or settles an obligation.' },
   'src/workspaces.ts:pathQueues': { kind: 'Map', label: 'in-flight', proof: 'tests/durability-advisories.test.mjs',
-    behavior: 'writes of one task record serialize in this process',
+    behavior: 'waits behind the checkpoint of a member leaving the task, so it is never lost',
     reason: 'One promise chain per git common dir and per task record: every writer of either runs in this process, so the chain is the whole serialization; an entry is released when its last callback settles and holds nothing durable.' },
   'src/workspaces.ts:verificationCheckouts': { kind: 'Set', label: 'in-flight', proof: 'tests/workspaces.test.mjs',
     behavior: 'never reclaims the checkout of a concurrent in-flight verification',
