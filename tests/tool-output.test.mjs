@@ -130,6 +130,25 @@ test('repair guidance says a repair inherits acceptance instead of asking the mo
   }
 })
 
+test('every repair text names the in-place rework of a rejected task before a replacement', async () => {
+  const { OWNER_PROMPT } = await import('../lib/tools.js')
+  const { NOTICE_TEMPLATES } = await import('../lib/notices.js')
+  const { guardTerminal } = await import('../lib/refusals.js')
+  const dispatch = guardTerminal('dispatch_preconditions')
+  const surfaces = {
+    OWNER_PROMPT,
+    swarm_propose: tools().get('swarm_propose').description,
+    'stall-root notice': NOTICE_TEMPLATES['stall-root'].build({ rootId: 'task_root', title: 'Rejected work', epoch: 2, cause: 'no live replacement exists anywhere in its lineage', dependents: ['task_next'], recordedReason: 'rejected by review' }),
+    dispatch_terminal: dispatch.message,
+    'dispatch_terminal exits': dispatch.exits.map(exit => `${exit.tool} ${exit.parameter}: ${exit.instruction}`).join('\n'),
+  }
+  for (const [where, text] of Object.entries(surfaces)) {
+    const rework = text.search(/\brework/i), replaces = text.indexOf('replaces')
+    assert.ok(rework >= 0 && replaces > rework, `${where} names the rework before a replacement: ${text}`)
+    assert.doesNotMatch(text, /rejected implementations (?:need|require)/i, `${where} no longer makes a replacement the rule`)
+  }
+})
+
 test('tool schemas match the enforced runtime contract for observe cursors and member subscriptions', () => {
   const definitions = tools()
   // M9(b): optionalInteger rejects negatives, so every cursor declares minimum 0.

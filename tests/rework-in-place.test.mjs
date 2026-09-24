@@ -335,6 +335,21 @@ test('the rejection decision names the rework first and a replacement second, to
   assert.ok(!authorNoticeFor(experiment).includes('swarm_control'))
 })
 
+test('every owner notice about a rejected task with a waiting dependent offers the rework before a replacement', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement')
+  f.propose('Build on it', { dependencies: [source.id], assigneeId: f.reviewer.id })
+  await f.submit(source)
+  await f.reject(source)
+  for (let i = 0; i < 6; i++) { f.clock.advance(7000); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.content.includes(source.id) && delivery.content.includes('replaces'))
+  assert.ok(notices.length >= 2, 'the rejection decision and the stall root both reach the owner')
+  for (const { content } of notices) {
+    const rework = content.search(/\brework/i)
+    assert.ok(rework >= 0 && rework < content.indexOf('replaces'), `the rework comes first: ${content}`)
+  }
+})
+
 test('a real rework attempt starts from the rejected commit, whether or not its author moved on', async t => {
   const repo = await makeRepo('rework-worktree')
   const workspaces = makeWorkspaces(repo.root)
