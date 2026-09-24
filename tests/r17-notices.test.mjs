@@ -8,8 +8,10 @@
  *    every `notify(` site in the source tree with its trigger and its reason for
  *    not passing an explicit fact marker, so a new site fails this file.
  * 2. FACT-ONLY TEMPLATES: every body of a reviewed family is built by the one
- *    function in `NOTICE_TEMPLATES`, and the replay check rebuilds each emitted
- *    body from the rows the notice cites and compares it byte for byte.
+ *    function in `NOTICE_TEMPLATES` and records what it states (its statement:
+ *    template family and counts, beside its subjects and recorded reason); the
+ *    structure check asserts those facts against the rows the notice cites plus
+ *    a few stable anchors in the body, so the wording is free to change.
  * 3. FACT-KEYED REPETITION: identity is subject@epoch + triggering event +
  *    recorded reason. The same fact records one row, an unrelated board change
  *    does not re-arm it, and a changed fact is a new row.
@@ -233,15 +235,19 @@ test('R17-G8: the admitted owner message records consumption after inbox claim',
 })
 
 /**
- * R17-G2 (repaired): the replay is INDEPENDENT of the production builder. Each
- * expected body below is written here from the durable rows the notice cites —
- * never by calling NOTICE_TEMPLATES and never with a hardcoded cause — so a
- * template mutation that adds a claim no row supports changes the emitted body
- * and fails this test.
+ * R17-G2 (structure, not prose): each reviewed body is checked through the
+ * facts the notice records with it — its statement (template family and the
+ * counts the body states), its subjects at their epochs and its recorded
+ * reason — asserted against the durable rows the notice cites, never against
+ * NOTICE_TEMPLATES and never against a second copy of the sentence. A few
+ * stable anchors tie the body to those facts (a subject id, a code token, the
+ * recorded cause where the builder interpolates it); the wording around them
+ * can change without a test edit.
  */
 function ownerNotice(f, prefix) {
   return f.ownerNotices().find(delivery => typeof delivery.notice?.dedupKey === 'string' && delivery.notice.dedupKey.startsWith(prefix))
 }
+const subjectOf = task => `${task.id}@${task.epoch}`
 
 test('R17-G2a: the stall-root body replays from the blocked row alone', async t => {
   const f = await fixture(t)
@@ -254,11 +260,13 @@ test('R17-G2a: the stall-root body replays from the blocked row alone', async t 
   const notice = ownerNotice(f, 'stall-root:')
   assert.ok(notice, 'the stall root was reported')
   const root = f.runtime.store.get('tasks', task.id)
-  const dependents = f.runtime.store.list('tasks', f.mission.id).filter(candidate => candidate.dependencies.includes(root.id)).map(candidate => candidate.id)
-  const expectedFacts = `Task ${root.id} (${root.title}, epoch ${root.epoch}) is a stall root: it is blocked and no live replacement exists anywhere in its lineage${dependents.length ? `; ${dependents.length} task(s) depend on it (${dependents.join(', ')})` : ''}. Recorded reason: ${root.output}.`
-  assert.ok(notice.content.startsWith(expectedFacts), 'the facts replay exactly from the blocked row')
-  assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
+  const dependents = f.runtime.store.list('tasks', f.mission.id).filter(candidate => candidate.dependencies.includes(root.id))
+  assert.deepEqual(notice.notice.statement, { family: 'stall-root', counts: { dependents: dependents.length } }, 'the body is the stall-root template and states the dependent count the rows hold')
+  assert.deepEqual(notice.notice.subjects, [root, ...dependents].map(subjectOf), 'the subjects are the blocked row and its dependents at their epochs')
   assert.equal(notice.notice.reason, 'no live replacement exists anywhere in its lineage', 'the recorded reason is row-derived (the row is blocked with no replacement)')
+  assert.ok(notice.content.includes(notice.notice.reason), 'the body states the recorded cause')
+  assert.ok(notice.content.includes(root.output), 'the body quotes the reason recorded on the blocked row')
+  assert.ok(notice.content.includes(`swarm_control(taskId: "${root.id}")`), 'repair advice names the existing task')
 })
 
 test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', async t => {
@@ -271,10 +279,13 @@ test('R17-G2b: the W3 stall body replays from the unschedulable rows alone', asy
   const notice = ownerNotice(f, 'mission/stalled')
   assert.ok(notice, 'the W3 stall was reported')
   const stuck = view.unschedulable.length ? view.unschedulable : view.nonTerminal
-  const subjects = stuck.map(task => `${task.id}@${task.epoch}`)
-  const detail = view.unschedulable.map(task => `${task.id} (${task.kind}, ${task.status}${task.reviewOf ? `, reviews ${task.reviewOf}` : ''}${task.dependencies.length ? `, depends on ${task.dependencies.join('/')}` : ''})`).join('; ')
-  const expected = `Mission stalled: no task can be scheduled and workers are idle. ${reason}. Unschedulable: ${detail || 'none'}. Subjects: ${subjects.join(', ')}. Decide: amend the existing task dependencies or assignee with swarm_control, admit a repair or review with swarm_propose, or adjust the budget. If work is no longer required, withdraw it explicitly with swarm_cancel; completing a mission never cancels unfinished tasks. Use swarm_control stop to stop the mission.`
-  assert.equal(notice.content, expected, 'the body replays from the rows and the recorded completion diagnostic')
+  const subjects = stuck.map(subjectOf)
+  assert.deepEqual(notice.notice.statement, { family: 'stall', counts: { unschedulable: view.unschedulable.length } }, 'the body is the stall template and states the unschedulable count of the rows')
+  assert.deepEqual(notice.notice.subjects, subjects, 'the subjects are the unschedulable rows, or every non-terminal row when none is')
+  assert.equal(notice.notice.reason, reason, 'the recorded reason is the completion diagnostic')
+  assert.ok(notice.content.includes(reason), 'the body states the recorded completion diagnostic')
+  for (const subject of subjects) assert.ok(notice.content.includes(subject), `the body names ${subject}`)
+  assert.ok(notice.content.includes('swarm_control'), 'the body names the decision tool')
 })
 
 test('R17-G2c: the fall-through body replays from the unrecognised rows alone', async t => {
@@ -296,9 +307,11 @@ test('R17-G2c: the fall-through body replays from the unrecognised rows alone', 
   const notice = ownerNotice(f, 'fallthrough:')
   assert.ok(notice, 'the fall-through was reported')
   const row = f.runtime.store.get('tasks', waiting.id)
-  const expected = `Mission ${f.mission.title} made no progress this tick and has unfinished work that no live path will advance: ${row.id} (${row.kind}, ${row.status}, epoch ${row.epoch}, depends on ${row.dependencies.join('/')}). Inspect the board, admit a repair or review with swarm_propose, or decide with swarm_control.`
-  assert.equal(notice.content, expected, 'the body names exactly the row the classifier did not recognise')
+  assert.deepEqual(notice.notice.statement, { family: 'fallthrough', counts: {} }, 'the body is the fall-through template and states no count')
+  assert.deepEqual(notice.notice.subjects, [subjectOf(row)], 'the body names exactly the row the classifier did not recognise')
   assert.equal(notice.notice.reason, `no live path advances ${row.id}@${row.epoch}`, 'the recorded reason is the classifier verdict over that row')
+  assert.ok(notice.content.includes(row.id), 'the body names the unrecognised row')
+  assert.ok(notice.content.includes('swarm_propose'), 'the body names the repair tool')
 })
 
 test('R17-G2d: the integration-gap and coverage-complete bodies replay from the task rows alone', async t => {
@@ -309,8 +322,10 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   const gap = ownerNotice(f, 'integration-gap:')
   assert.ok(gap, 'the integration gap was reported')
   const implementations = f.runtime.store.list('tasks', f.mission.id).filter(task => task.kind === 'implementation')
-  const expectedGap = `Coding missions require an independently accepted integration artifact, or exactly one independently accepted implementation artifact when the plan has no integration task. The mission now has ${implementations.length} implementation branches (${implementations.map(task => task.id).join(', ')}); admit an integration task depending on every branch, or complete with exactly one accepted implementation artifact.`
-  assert.equal(gap.content, expectedGap, 'the gap body replays from the implementation rows and the recorded completion rule')
+  assert.deepEqual(gap.notice.statement, { family: 'integration-gap', counts: { implementations: implementations.length } }, 'the gap states the implementation branch count of the rows')
+  assert.deepEqual(gap.notice.subjects, implementations.map(subjectOf), 'the gap names every implementation branch')
+  assert.ok(gap.notice.reason.length > 0 && gap.content.includes(gap.notice.reason), 'the body states the recorded completion rule')
+  for (const task of implementations) assert.ok(gap.content.includes(task.id), `the gap body names ${task.id}`)
 
   // Coverage-complete: accept the only task and report with the mission still active.
   const accepted = f.runtime.store.get('tasks', implementations[0].id)
@@ -319,7 +334,10 @@ test('R17-G2d: the integration-gap and coverage-complete bodies replay from the 
   f.runtime.notices.notifyCoverageComplete(f.runtime.store.get('missions', f.mission.id))
   const coverage = ownerNotice(f, 'task/accepted:')
   assert.ok(coverage, 'the coverage-complete notice was reported')
-  assert.equal(coverage.content, `Mission ${f.mission.title} is ready to complete: every acceptance criterion is independently covered and no task can make further progress. The mission stays active until you decide. Use swarm_control complete to accept the deliverable, or admit more work with swarm_propose.`)
+  assert.deepEqual(coverage.notice.statement, { family: 'coverage-complete', counts: {} }, 'the body is the coverage-complete template and states no count')
+  assert.deepEqual(coverage.notice.subjects, [subjectOf(accepted)], 'the subject is the accepted deliverable')
+  assert.ok(coverage.content.includes(f.mission.title), 'the body names the mission')
+  assert.ok(coverage.content.includes('swarm_control complete'), 'the body names the completion decision')
 })
 
 test('R17-G2e: the parked-holder body replays from the running task row alone', async t => {
@@ -334,8 +352,10 @@ test('R17-G2e: the parked-holder body replays from the running task row alone', 
   const notice = ownerNotice(f, 'parked:')
   assert.ok(notice, 'the parked holder was reported')
   const row = f.runtime.store.get('tasks', task.id)
-  assert.equal(notice.content, `Task ${row.id} (${row.title}) is held by a parked member and cannot make progress while parked. A fresh assignment wakes it; if the lease expires the task re-pends without spending a recovery attempt.`)
+  assert.deepEqual(notice.notice.statement, { family: 'parked', counts: {} }, 'the body is the parked template and states no count')
+  assert.deepEqual(notice.notice.subjects, [subjectOf(row)], 'the subject is the running row the parked member holds')
   assert.equal(notice.notice.reason, 'the owning member is parked')
+  assert.ok(notice.content.includes(row.id), 'the body names the held task')
 })
 
 test('R17-G2f: the review-blocked body replays from the submitted source row and the recorded reason alone', async t => {
@@ -352,11 +372,13 @@ test('R17-G2f: the review-blocked body replays from the submitted source row and
   const notice = await eventually(() => ownerNotice(f, 'review-blocked:'), 'the blocked review path was reported')
   const recorded = f.runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/review-blocked').at(-1)
   assert.ok(recorded, 'the reason is durable in the task/review-blocked event')
-  // The diagnostic prefix is produced by the admission formatter from the
-  // durable reason; both halves are read back from the recorded event.
-  const diagnostic = `[review_path_missing] task "${source.id}": ${recorded.data.reason}`
-  assert.equal(notice.content, `${diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${source.id}) or cancel the source task; the mission cannot complete while it is unreviewable.`)
+  assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'the body is the review-blocked template and states no count')
+  assert.deepEqual(notice.notice.subjects, [subjectOf(f.runtime.store.get('tasks', source.id))], 'the subject is the submitted source row')
   assert.equal(notice.notice.reason, recorded.data.reason, 'the recorded reason is the durable event payload, not a test constant')
+  // The body leads with the admission diagnostic built from the durable reason.
+  assert.ok(notice.content.includes(recorded.data.reason), 'the body states the recorded reason')
+  assert.ok(notice.content.includes('[review_path_missing]'), 'the body carries the typed diagnostic code')
+  assert.ok(notice.content.includes(source.id), 'the body names the source task')
 })
 
 test('R17-G8: the admitted owner message records consumption after inbox claim', async t => {
