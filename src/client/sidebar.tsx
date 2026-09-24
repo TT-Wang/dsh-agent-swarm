@@ -74,8 +74,7 @@ function revealedDescriptor(descriptor: SidebarTabDescriptor, service: BetterSid
 }
 
 /** Contribute a tab only while the optional sidebar service is present.
- * Registration follows Cordis service replacement and unload; subscribers can
- * hand layout ownership back to the standalone dock when the service leaves.
+ * Registration follows Cordis service replacement and unload.
  * The descriptor receives the sidebar's exact scope, including pinned tabs.
  */
 export function createSidebarAdapter(ctx: Context, descriptor: () => SidebarTabDescriptor): SidebarAdapter {
@@ -131,15 +130,15 @@ export function createSidebarAdapter(ctx: Context, descriptor: () => SidebarTabD
 }
 
 /* ------------------------------------------------------------------------- *
- * The host's right sidebar (the 0.1.5 line).
+ * The host's right sidebar.
  *
  * The Files pane and this panel are the same mechanism: a tab TYPE registered
  * with the `sidebarRightTabs` registry (id, kind, and the title its chip shows),
  * the panel BODY in the keyed `sidebar.right.pane.tab` seat under that id, and
  * navigation through the `sidebarRight` controller (`openTab(kind)`). Nothing
- * here imports the sidebar package: the ids, keys and slot names are structural,
- * so 0.1.2/0.1.3 — which have no right sidebar — simply never fire these injects
- * and the standalone dock keeps carrying the surface.
+ * here imports the sidebar package, which is not a declared peer: the ids, keys
+ * and slot names are structural, and a profile without the right sidebar never
+ * fires these injects.
  * ------------------------------------------------------------------------- */
 
 /** The slot service, restricted to what this adapter uses. */
@@ -154,7 +153,7 @@ interface SlotRegistrar {
  * user reaches a page type that recognizes no resource address.
  */
 export interface RightSidebarGuideEntry {
-  /** Stable within the tab type; 0.1.6 requires it and rejects duplicates. */
+  /** Stable within the tab type; the registry requires it and rejects duplicates. */
   id: string
   order: number
   title: () => string
@@ -202,7 +201,7 @@ export interface RightSidebarDescriptor {
 }
 
 /** The host binds these standard session props and the tab hook at the body seat.
- * Kept structural so earlier supported releases need no sidebar-right import. */
+ * Kept structural so the plugin needs no sidebar-right import. */
 interface RightSidebarBodyProps {
   sessionId: string
   useTabInfo(): { tab: { visible: boolean } }

@@ -163,8 +163,8 @@ export interface TraceStore {
 /**
  * R17-G10: the host telemetry sink (`session-telemetry`), declared structurally.
  *
- * The host package `@deepseek-ai/dsh-session-telemetry` v0.1.3-alpha.2
- * (harness commit 82a5fd61) defines `SessionTelemetryRecord` and
+ * The host package `@deepseek-ai/dsh-session-telemetry` (the same contract on
+ * 0.1.5-rc.3 and 0.1.7-rc.1) defines `SessionTelemetryRecord` and
  * `SessionTelemetrySink` and registers the sink as the `sessionTelemetry`
  * service; the record shape below is that contract verbatim
  * (`channel`/`time`/`severity`/`attributes`/`body`, with `emit` a non-blocking

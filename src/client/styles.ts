@@ -21,22 +21,10 @@ export const SWARM_CSS = AGENT_AVATAR_CSS + LIVE_WORK_CSS + `
 [data-swarm-panel] .sw-panel-title{display:flex;align-items:center;justify-content:space-between;background:var(--sw-card);padding:12px 16px;flex:none;user-select:none;border-bottom:1px solid var(--sw-border)}
 [data-swarm-panel] .sw-panel-title>div:first-child{min-width:0;overflow:hidden}[data-swarm-panel] .sw-panel-title strong{font-size:13px;letter-spacing:.01em}[data-swarm-panel] .sw-panel-title small{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--sw-muted);max-width:48ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}
 .sw-live-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#65cfb0;flex:none}.sw-live-dot[data-error=true]{background:#d9ad69}
-/* C3: the host root is resized inline by SidebarDock.dockShift, so this sheet
-   names no host id and needs no !important; the dock's own geometry stays here. */
-[data-swarm-dock]{position:fixed;inset:0 0 0 auto;width:var(--swarm-dock-width);height:100dvh;pointer-events:auto;border-left:1px solid #90a79c55;background:#f6faf8;z-index:40}
-body[data-ds-dark-theme] [data-swarm-dock]{background:#101b22}
-.sw-dock-body{height:100%;min-height:0}.sw-dock-body[hidden],.sw-launcher[hidden]{display:none}
-.sw-launcher{width:100%;height:100%;display:flex;align-items:center;justify-content:flex-start;gap:12px;writing-mode:vertical-rl;background:transparent;color:inherit;border:0;padding:18px 3px;font:600 11px ui-sans-serif,system-ui,sans-serif;cursor:pointer}
-.sw-launcher:focus-visible{outline:2px solid #559b7c;outline-offset:-3px}
-.sw-sidebar-resize{position:absolute;inset:0 auto 0 -3px;width:7px;cursor:col-resize;touch-action:none;z-index:2}
-.sw-sidebar-resize:hover,.sw-sidebar-resize:focus-visible{background:#68bca66b;outline:none}
-@media(max-width:700px){
-[data-swarm-dock]{inset:auto 0 0;width:100%;height:45dvh;border-left:0;border-top:1px solid #90a79c55}[data-swarm-dock][data-expanded=false]{height:40px}.sw-launcher{writing-mode:horizontal-tb;justify-content:center;padding:8px}.sw-sidebar-resize{display:none}}
 
 [data-swarm-native-launcher]{display:flex;align-items:center;justify-content:center;gap:8px;box-sizing:border-box;width:100%;min-width:32px;min-height:36px;padding:6px 10px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;font-size:13px;cursor:pointer;text-align:left}
 [data-swarm-native-launcher][data-wide=true]{justify-content:flex-start}[data-swarm-native-launcher] svg{flex:none}[data-swarm-native-launcher]:hover{background:color-mix(in srgb,currentColor 8%,transparent)}[data-swarm-native-launcher]:focus-visible{outline:2px solid currentColor;outline-offset:2px}
 .sw-open-monitor{border:1px solid #507c70;border-radius:7px;background:transparent;color:inherit;font:12px ui-sans-serif,system-ui,sans-serif;padding:6px 10px;cursor:pointer}
-[data-swarm-panel] .sw-panel-buttons{display:flex;gap:5px}[data-swarm-panel] .sw-panel-buttons button{width:29px;height:29px;padding:0;font-size:20px;background:transparent;border-color:transparent}
 [data-swarm-panel] .sw-panel-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;flex:none;padding:10px 12px;border-bottom:1px solid var(--sw-border)}
 [data-swarm-panel] .sw-panel-toolbar select{flex:1 1 180px;min-width:0}[data-swarm-panel] .sw-panel-content{overflow:auto;flex:1;min-height:0;overscroll-behavior:contain;padding:0 12px 18px}[data-swarm-panel] .sw-panel-content>[data-swarm]{margin:8px 0 0;border:0;border-radius:10px}
 [data-swarm-panel] button,[data-swarm-panel] select,[data-swarm-panel] input,[data-swarm-panel] textarea{font:inherit;color:var(--sw-text);background:var(--sw-card);border:1px solid var(--sw-border);border-radius:6px;padding:7px 9px;max-width:100%}

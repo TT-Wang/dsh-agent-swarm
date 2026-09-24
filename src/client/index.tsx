@@ -14,8 +14,7 @@ import { registerSwarmCommandUi } from './command.tsx'
 import { swarmCardDefinition } from './card-definition.ts'
 import { SwarmBoard } from './SwarmBoard.tsx'
 import { SWARM_CSS } from './styles.ts'
-import { ActivityPanel, OPEN_MONITOR } from './ActivityPanel.tsx'
-import { SidebarDock } from './SidebarDock.tsx'
+import { ActivityPanel } from './ActivityPanel.tsx'
 import { createRightSidebarAdapter, createSidebarAdapter } from './sidebar.tsx'
 import { SwarmMonitor, type Request } from './monitor.ts'
 import { DisposalRegistry } from './lifecycle.ts'
@@ -38,7 +37,7 @@ function SidebarLauncher({ wide, onOpen }: { wide: boolean; onOpen(): void }) {
   </button>
 }
 
-/** Native history cards and a docked sidebar; the host owns transport trust. */
+/** Native history cards and a right-sidebar tab; the host owns transport trust. */
 export function apply(ctx: Context): void {
   ctx.effect(() => {
     const style = document.createElement('style')
@@ -73,7 +72,7 @@ export function apply(ctx: Context): void {
   // plugin scope drains the rest on unload.
   const disposals = new DisposalRegistry()
   ctx.effect(() => () => disposals.dispose(), 'agent-swarm: pane resources')
-  function Pane({ sessionId, active = true, onClose }: { sessionId?: string; active?: boolean; onClose?: () => void }) {
+  function Pane({ sessionId, active = true }: { sessionId?: string; active?: boolean }) {
     const monitor = useMemo(() => disposals.add(new SwarmMonitor(request)), [request])
     const history = useMemo(() => disposals.add(new WorkerHistory(async (workerSessionId, beforeSeq) => {
       const owner = sessionId ?? currentSessionId(ctx.sessions)
@@ -92,16 +91,16 @@ export function apply(ctx: Context): void {
         for (const listener of historyListeners) listener()
       }
     }, [active, pending, sessionId, current, history])
-    return <Localized><ActivityPanel sessions={ctx.sessions} modelDirectories={ctx.modelDirectories} monitor={monitor} history={history} sessionId={sessionId} active={active} onClose={onClose}
+    return <Localized><ActivityPanel sessions={ctx.sessions} modelDirectories={ctx.modelDirectories} monitor={monitor} history={history} sessionId={sessionId} active={active}
       onOpenWorker={member => {
         try { if (openWorker(ctx, member.sessionId)) return } catch { /* A completed row can leave the live list. */ }
         history.open(member.sessionId, member.name)
       }} /></Localized>
   }
-  // Surface preference: the host's own right sidebar first (0.1.5 line, the same
-  // pane Files uses), then Better Sidebar when a profile mounts it, then the
-  // standalone dock. Registration owns the surface without opening it; the
-  // native controller reveals it only for a command or explicit navigation.
+  // Surface preference: the host's own right sidebar first (the same pane Files
+  // uses), then Better Sidebar when a profile mounts it. Registration owns the
+  // surface without opening it; the native controller reveals it only for a
+  // command or explicit navigation.
   const native = createRightSidebarAdapter(ctx, () => ({
     id: 'dsh-external-agent-swarm', kind: 'agent-swarm', order: 80,
     label: () => copy('Agent Swarm'),
@@ -113,10 +112,7 @@ export function apply(ctx: Context): void {
     id: 'agent-swarm', title: () => copy('Agent Swarm'), single: true, order: 80,
     component: ({ scope, visible }) => <Pane sessionId={scope.sessionId} active={visible} />,
   }))
-  const openSidebar = () => {
-    if (native.open()) return
-    if (!sidebar.open()) window.dispatchEvent(new Event(OPEN_MONITOR))
-  }
+  const openSidebar = () => { if (!native.open()) sidebar.open() }
   registerSwarmCommandUi(ctx, { openSidebar, copy })
   const viewWorker = (member: Member) => {
     try { if (openWorker(ctx, member.sessionId)) return } catch { /* Fall back to persisted history. */ }
@@ -133,14 +129,8 @@ export function apply(ctx: Context): void {
       <SwarmBoard snapshot={node.data} onOpenWorker={member => { setError(''); try { viewWorker(member) } catch (failure) { setError(String(failure)) } }} />
     </div></Localized>
   }
-  function Panel() {
-    const hostIntegrated = useSyncExternalStore(native.subscribe, native.getSnapshot, native.getSnapshot)
-    const integrated = useSyncExternalStore(sidebar.subscribe, sidebar.getSnapshot, sidebar.getSnapshot)
-    return hostIntegrated || integrated ? null : <Localized><SidebarDock>{props => <Pane {...props} />}</SidebarDock></Localized>
-  }
   ctx.uiConversation.events.register(swarmCardDefinition)
   ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
     name: 'conversation.chat.node', key: 'agent-swarm',
   }, SwarmCard))
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'agent-swarm-sidebar', order: 80 }, Panel))
 }

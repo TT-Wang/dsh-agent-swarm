@@ -25,27 +25,22 @@ import { subprocessSeam, SubprocessLocal } from './subprocess-seam.mjs'
 import { eventually, makeRuntime } from './faults/harness.mjs'
 
 /**
- * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
- * passed it as `options.system`; from the 0.1.5 line the agent-loop invariant
- * requires `options.system === undefined` and carries the prompt inside
- * `messages` as surface node 0 (a `system`-role message). Reading both keeps one
- * assertion set valid on either host.
+ * The provider-visible system prompt. The agent loop requires
+ * `options.system === undefined` and carries the prompt inside `messages` as
+ * surface node 0 (a `system`-role message).
  */
-const systemTextOf = request => request.system ?? (request.messages ?? [])
+const systemTextOf = request => (request.messages ?? [])
   .filter(message => message.role === 'system')
   .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
   .join('\n')
 
-// Actual public storage APIs on each supported release. These helpers preserve
-// durability and release alpha.2's explicit handles, including after failures.
+// The public storage API: these helpers release the explicit handles, including after failures.
 async function readStoredSession(persistence, id) {
-  if (!('open' in persistence)) return await persistence.readFrom(id, 0)
   const handle = await persistence.open(id, 'read')
   try { return { meta: handle.header, inheritedEventCount: handle.inheritedEventCount, ...(await handle.read()) } }
   finally { await handle.close() }
 }
 async function appendStoredEvents(persistence, id, events) {
-  if (!('open' in persistence)) return await persistence.append(id, events)
   const handle = await persistence.open(id, 'write')
   try { await handle.append(events); await handle.flush() }
   finally { await handle.close() }
@@ -59,19 +54,16 @@ test('the owner filter recognizes regenerated runtime context on both supported 
   assert.equal(isRuntimeContext({ kind: 'swarm', deliveryId: 'd1' }), false)
 })
 
-test('session metadata supports both public persistence contracts without activating sessions', async () => {
+test('session metadata reads one persisted header through stat without activating sessions', async () => {
   const id = SessionId('metadata-owner')
   const header = { id, cwd: '/fixture' }
   const signal = new AbortController().signal
-  const legacy = { async list(received) { assert.equal(received, signal); return [{ id: 'other' }, header] } }
-  const modern = {
+  const persistence = {
     async stat(received, options) { assert.equal(received, id); assert.equal(options.signal, signal); return { header } },
-    async list() { assert.fail('modern metadata must use stat without listing every session') },
+    async list() { assert.fail('metadata must use stat without listing every session') },
   }
-  assert.equal(await persistedSessionHeader(legacy, id, signal), header)
-  assert.equal(await persistedSessionHeader(modern, id, signal), header)
+  assert.equal(await persistedSessionHeader(persistence, id, signal), header)
   assert.equal(await persistedSessionHeader({ async stat() { return undefined } }, id, signal), undefined)
-  assert.equal(await persistedSessionHeader({ async list() { return [] } }, id, signal), undefined)
   const stopped = new AbortController()
   stopped.abort(new Error('metadata request canceled'))
   await assert.rejects(persistedSessionHeader({ async stat() { assert.fail('pre-canceled read') } }, id, stopped.signal), /metadata request canceled/)

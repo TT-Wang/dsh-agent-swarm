@@ -123,7 +123,7 @@ export interface HarnessWorkerOptions {
 }
 /** The confinement surface a declared verification check must pass through. */
 export interface VerificationSandbox {
-  /** 0.1.5 returned the confinement synchronously; 0.1.6 resolves it (the backend probe became async). Both are accepted. */
+  /** 0.1.5 returns the confinement synchronously; 0.1.7 resolves it (the backend probe became async). Both are accepted. */
   confine(argv: readonly string[], policy: { mode: 'workspace-write'; workspaceRoot: string }): ConfinedCheck | Promise<ConfinedCheck>
 }
 export interface ConfinedCheck { argv: string[]; enforcement: 'full' | 'partial' }
@@ -750,13 +750,7 @@ export class HarnessWorkers implements WorkerAdapter {
       abort.signal.throwIfAborted()
     }
     const usageSource = { generation: composition.usageGeneration, restored: persisted }
-    // The setup hook's shape moved in the 0.1.5 line: through 0.1.3-alpha.2 the
-    // agent was reached through `agentCtx.agent` (removed at 0.1.5), and from
-    // 0.1.5 the callback receives it as its second parameter. An OPTIONAL second
-    // parameter satisfies both `AgentSetup` signatures, and the value is taken
-    // from whichever host supplies it, so one callback serves every supported
-    // release instead of forking the adapter by host version.
-    const setup = async (agentCtx: Context, setupAgent?: Agent): Promise<void> => {
+    const setup = async (agentCtx: Context, agent: Agent): Promise<void> => {
       abort.signal.throwIfAborted()
       const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
       if (composition.preset !== undefined) {
@@ -764,8 +758,6 @@ export class HarnessWorkers implements WorkerAdapter {
         await presets.mount(agentCtx, composition.preset)
       } else if (presets !== undefined) throw new Error('A rosterless worker cannot silently resume under a new default preset')
       abort.signal.throwIfAborted()
-      const agent = setupAgent ?? (agentCtx as Context & { agent?: Agent }).agent
-      if (agent === undefined) throw new Error('Worker setup received no agent from the Harness')
       installModelSelection(agentCtx, { current: composition.selection, assembled: undefined })
       await this.restoreInbox(resident, agent)
       abort.signal.throwIfAborted()
@@ -783,10 +775,8 @@ export class HarnessWorkers implements WorkerAdapter {
       // Force a fresh durable policy on each activation; peers cannot widen it.
       agent.session.append('sandbox/mode', { mode: 'workspace-write', source: 'delegation' })
       agent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
-      // rc.1 uses one persona; alpha.2 split it into prefix/suffix. Shadow the
-      // deployment persona on both public section contracts so workers retain
-      // only their own role, including after resuming an older composition.
-      agentCtx.systemPrompt.section({ name: 'deployment:persona', order: 0, text: '' })
+      // Shadow the deployment persona's prefix and suffix so workers retain only
+      // their own role, including after resuming an older composition.
       agentCtx.systemPrompt.section({ name: 'deployment:persona-prefix', order: 0, text: composition.persona })
       agentCtx.systemPrompt.section({ name: 'deployment:persona-suffix', order: 10200, text: '' })
       // Source metadata is preserved in the host log, but provider serializers

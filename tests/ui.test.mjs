@@ -14,7 +14,6 @@ import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
 import { ActivityPanel, CompletionControls } from '../lib/types/client/ActivityPanel.js'
 import { SwarmMonitor } from '../lib/types/client/monitor.js'
 import { currentSessionId, openWorker } from '../lib/types/client/navigation.js'
-import { fitSidebar, hostShiftTarget, dockShift } from '../lib/types/client/SidebarDock.js'
 import { createRightSidebarAdapter } from '../lib/types/client/sidebar.js'
 import { AgentAvatar, AGENT_AVATAR_CSS } from '../lib/types/client/AgentAvatar.js'
 import { LIVE_WORK_CSS } from '../lib/types/client/LiveWorkPanel.js'
@@ -159,7 +158,7 @@ test('built client closure loads in Harness module protocol and owns reversible 
   assert.equal(definitions[0].kind, 'agent-swarm')
   assert(slots.some(slot => slot.options.name === 'conversation.chat.node' && slot.options.key === 'agent-swarm'))
   assert(slots.some(slot => slot.options.name === 'conversation.chat.commandview' && slot.options.key === 'agent-swarm'))
-  assert(slots.some(slot => slot.options.name === 'shell.overlay' && slot.options.id === 'agent-swarm-sidebar'))
+  assert(!slots.some(slot => slot.options.name === 'shell.overlay'), 'the host right sidebar carries the panel; no plugin-owned overlay is registered')
   for (const dispose of effects.reverse()) dispose?.()
   assert.equal(styleRemoved, true)
   assert.equal(slots.length, 0)
@@ -194,7 +193,7 @@ test('built client mounts and unloads with the actual Harness Cordis and browser
     assert.equal(ctx.uiConversation.events.entries().some(item => item.kind === 'agent-swarm'), true)
     assert.equal(ctx.slots.entries('conversation.chat.node').some(item => item.options.key === 'agent-swarm'), true)
     assert.equal(ctx.slots.entries('conversation.chat.commandview').some(item => item.options.key === 'agent-swarm'), true)
-    assert.equal(ctx.slots.entries('shell.overlay').some(item => item.options.id === 'agent-swarm-sidebar'), true)
+    assert.equal(ctx.slots.entries('shell.overlay').length, 0, 'no plugin-owned overlay beside the host right sidebar')
     await feature.dispose()
     assert.equal(ctx.uiConversation.events.entries().some(item => item.kind === 'agent-swarm'), false)
     assert.equal(ctx.slots.entries('conversation.chat.node').length, 0)
@@ -234,13 +233,13 @@ test('live monitor fences switched-session responses and aborts all work on disp
 test('worker navigation opens its independent native session and rejects missing list entries', async () => {
   const opened = []
   const list = { getSnapshot: () => ({ byId: { worker: { id: 'worker' } } }) }
-  // 0.1.2-0.1.5: the sessions face navigates.
+  // 0.1.5: the sessions face navigates.
   const legacy = { sessions: { list, open: sessionId => opened.push(sessionId) }, get: () => undefined }
   assert.equal(openWorker(legacy, 'worker'), true)
   assert.deepEqual(opened, ['worker'])
   assert.equal(openWorker(legacy, 'missing'), false, 'missing live row delegates to read-only native history')
   assert.equal(opened.length, 1)
-  // 0.1.6: sessions.open is gone; navigation belongs to the workspace UI service.
+  // 0.1.7: no sessions.open; navigation belongs to the workspace UI service.
   const navigated = []
   const modern = { sessions: { list }, get: name => name === 'uiWorkspace' ? { openSession: target => navigated.push(target) } : undefined }
   assert.equal(openWorker(modern, 'worker'), true)
@@ -248,7 +247,7 @@ test('worker navigation opens its independent native session and rejects missing
   assert.equal(openWorker({ sessions: { list }, get: () => undefined }, 'worker'), false, 'no navigation service: fall back to persisted history')
 })
 
-test('session selection supports legacy current and the retained 0.1.6 main view', () => {
+test('session selection supports 0.1.5 current and the retained 0.1.7 main view', () => {
   const background = { retainedBy: { worker: 1, mainView: 0 } }
   const displayed = { retainedBy: { mainView: 1 } }
   const sessions = snapshot => ({ list: { getSnapshot: () => snapshot } })
@@ -259,7 +258,7 @@ test('session selection supports legacy current and the retained 0.1.6 main view
   assert.equal(currentSessionId(undefined), undefined)
 })
 
-test('draft defaults preserve independent verification and line editing; sidebar leaves room for conversation', () => {
+test('draft defaults preserve independent verification and line editing', () => {
   const input = newPlan('/repo', uiSnapshot().mission.budget)
   assert.equal(input.tasks[1].reviewOf, input.tasks[0].key)
   assert.notEqual(input.tasks[0].assigneeKey, input.tasks[1].assigneeKey)
@@ -281,11 +280,6 @@ test('draft defaults preserve independent verification and line editing; sidebar
   input.tasks[1].outputs = ['']
   assert.deepEqual(cleanPlan(input).tasks.map(task => task.outputs), [['src/value.cjs'], []])
   assert.doesNotThrow(() => validatePlan({ ...cleanPlan(input), scope: ['**'] }, { launch: true }), 'a plan whose every Outputs field was set launches')
-  assert.equal(fitSidebar(480, 1440), 480)
-  assert.equal(fitSidebar(900, 1440), 760)
-  assert.equal(fitSidebar(900, 1000), 600)
-  assert.equal(fitSidebar(Number.NaN, 1440), 480)
-
 })
 
 test('graph and Chinese card render real task/evidence projections and worker links', () => {
@@ -480,35 +474,14 @@ test('snapshot reader validates every budget key and the runtime-projected deliv
   assert.equal(completionBlocker(projected), 'still blocked')
 })
 
-test('OWNER PASS 2026-09-11 (C3): the dock shifts a discovered host root by inline style, not by an id rule', async () => {
-  // The reservation must follow the dock, so it is computed for the same four
-  // geometries the dock itself uses.
-  assert.deepEqual(dockShift(true, 480, 1440), { width: 'calc(100% - 480px)' })
-  assert.deepEqual(dockShift(false, 480, 1440), { width: 'calc(100% - 28px)' }, 'the collapsed launcher keeps its 28px strip')
-  assert.deepEqual(dockShift(true, 480, 600), { width: '100%', height: '55dvh' }, 'a narrow viewport stacks the dock under the app')
-  assert.deepEqual(dockShift(false, 480, 600), { width: '100%', height: 'calc(100dvh - 40px)' }, 'a collapsed narrow dock is only its 40px bar')
-  // The target is discovered structurally: the child of the body above the dock.
-  const body = { style: {}, parentElement: null }
-  const root = { style: {}, parentElement: body }
-  const shell = { style: {}, parentElement: root }
-  const dock = { style: {}, parentElement: shell }
-  assert.equal(hostShiftTarget(dock, node => node === body), root, 'the app root is whatever sits directly under the body')
-  assert.equal(hostShiftTarget({ style: {}, parentElement: body }, node => node === body), undefined,
-    'a dock that is itself a body child has no host root to move')
-  assert.equal(hostShiftTarget({ style: {}, parentElement: null }, node => node === body), undefined, 'a detached dock moves nothing')
-  assert.equal(hostShiftTarget(undefined, node => node === body), undefined)
-  // C3 is only closed if the sheet no longer names the host's id or forces the
-  // layout with !important; the dock's own geometry stays in CSS.
+test('OWNER PASS 2026-09-11 (C3): the sheet names no host root id', async () => {
   const styles = await readFile(new URL('../src/client/styles.ts', import.meta.url), 'utf8')
-  assert.doesNotMatch(styles, /#root/, 'the dock no longer depends on the host root id')
-  assert.doesNotMatch(styles, /\[data-swarm-docked\][^{}]*\{[^}]*!important/, 'and no dock rule has to outrank the host with !important')
+  assert.doesNotMatch(styles, /#root/, 'the panel does not depend on the host root id')
   for (const rule of ['.sw-lane-count', '.sw-lane[data-empty]', '.sw-activity-group', '.sw-why']) {
     assert.ok(styles.includes(rule), `the second-pass styles ship ${rule}`)
   }
   assert.match(styles, /\.sw-lane\[data-empty\]\{opacity:\.55;align-self:start\}/,
     'an empty lane stops stretching to its row height, so it is one header tall instead of a full-height empty column')
-  const dockSource = await readFile(new URL('../src/client/SidebarDock.tsx', import.meta.url), 'utf8')
-  assert.match(dockSource, /style\.width = previous\.width/, 'the host inline style is restored on unload')
 })
 
 test('OWNER PASS 2026-09-11 (C2): the pane registry disposes a resource exactly once, even after the drain', async () => {
@@ -603,9 +576,9 @@ test('right sidebar adapter: passive tab registration, its body seat, and explic
   assert.deepEqual(seats, [])
   assert.equal(adapter.open(), false, 'a disposed adapter never reveals anything')
 
-  // Hosts without a right sidebar (0.1.2/0.1.3) must fall back, not throw — and
-  // a host that has the slot service but no sidebar registry must not claim a
-  // seat in a pane that does not exist (that bug hid the dock on 0.1.3).
+  // A profile without the right sidebar must not throw — and a host that has the
+  // slot service but no sidebar registry must not claim a seat in a pane that
+  // does not exist.
   const slotOnly = {
     inject(names, factory) {
       if (names.includes('sidebarRightTabs')) return { dispose: async () => {} }
@@ -617,24 +590,23 @@ test('right sidebar adapter: passive tab registration, its body seat, and explic
   }
   opened.length = 0
   const noRegistry = createRightSidebarAdapter(slotOnly, describe)
-  assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing and the dock renders')
-  assert.equal(noRegistry.open(), false, 'an explicit request is left to the fallback when no native registry exists')
+  assert.equal(noRegistry.getSnapshot(), false, 'without the sidebar registry the adapter claims nothing')
+  assert.equal(noRegistry.open(), false, 'an explicit request is left to Better Sidebar when no native registry exists')
   assert.deepEqual(opened, [], 'and it never reveals a pane that does not exist')
   assert.deepEqual(seats, [], 'and the body seat is never registered into an undeclared slot')
   noRegistry.dispose()
   const bare = { inject: () => ({ dispose: async () => {} }), get: () => undefined, effect: () => {} }
   const fallback = createRightSidebarAdapter(bare, describe)
   assert.equal(fallback.getSnapshot(), false)
-  assert.equal(fallback.open(), false, 'without the registry the adapter reports not-integrated and the dock renders')
+  assert.equal(fallback.open(), false, 'without the registry the adapter reports not-integrated')
   fallback.dispose()
-  // The adapter must stay structural: importing the sidebar package would pull a
-  // 0.1.5-only peer into a plugin that also loads on 0.1.2/0.1.3.
+  // The adapter must stay structural: the right-sidebar package is not a declared peer.
   const source = await readFile(new URL('../src/client/sidebar.tsx', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /from '@deepseek-ai\/dsh-client-ui-sidebar-right/, 'no static import of the right-sidebar package')
   assert.match(source, /slots\.inject\('sidebar\.right\.pane\.tab'/, 'the body registers by slot name')
   assert.match(source, /registry\.register\(\{/, 'the type registers through the host registry')
   assert.match(source, /ctx\.inject\(\['slots', 'sidebarRightTabs', 'sidebarRight'\]/, 'and only while the slot service, registry and controller are present')
-  assert.match(source, /guide: \[\{ id: 'open', order: tab\.order \?\? 80/, 'and names itself on the guide page with the stable entry id 0.1.6 requires')
+  assert.match(source, /guide: \[\{ id: 'open', order: tab\.order \?\? 80/, 'and names itself on the guide page with the stable entry id the registry requires')
   assert.match(source, /catch \{ return false \}/, 'a refused write is contained in the attempt, never thrown out of the registration effect')
 })
 
@@ -643,7 +615,7 @@ test('right sidebar adapter: an explicit refused reveal stays native until its s
   // The 0.1.5 host answers a write with no mounted session surface by throwing
   // (`sidebarRight: no session surface is mounted`). Only explicit intent creates
   // a retry request; registration and ordinary session signals remain passive.
-  // Native ownership covers a pending request so it cannot open a second dock.
+  // Native ownership covers a pending request so it cannot open a second surface.
   const types = [], opened = []
   let mounted = false, attempts = 0
   const registry = { register(definition) { types.push(definition); return () => { types.splice(types.indexOf(definition), 1) } } }

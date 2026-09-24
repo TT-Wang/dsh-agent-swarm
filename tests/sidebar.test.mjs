@@ -38,7 +38,7 @@ test('optional Better Sidebar tab follows actual Cordis service arrival, removal
   const transitions = []
   const off = adapter.subscribe(() => transitions.push(adapter.getSnapshot()))
   assert.equal(adapter.getSnapshot(), false)
-  assert.equal(adapter.open(), false, 'absent service leaves the standalone dock in control')
+  assert.equal(adapter.open(), false, 'absent service claims no reveal')
 
   const service = sidebarService()
   const provider = ctx.plugin({ name: 'sidebar-service-test', apply(scope) { scope.provide('betterSidebar', service) } })

@@ -766,8 +766,8 @@ export interface Delivery {
  *
  * Every supported release mounts the connection plugin's `/api` route and offers
  * `ctx.connection.rpc.intercept('/api', …)` for plugin endpoints. A plugin-owned
- * channel (`rpc.handle('/agent-swarm', …)`) is only usable through 0.1.3: from
- * 0.1.5 the connection service resolves `webServer` on its own context, which
+ * channel (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: the connection
+ * service resolves `webServer` on its own context, which
  * injects `credentials` alone, and Cordis refuses that property access
  * (`cannot get property "webServer" without inject`), so the channel route is
  * never registered. The client posts to `<channel>/<endpoint>`, so both halves

@@ -107,7 +107,7 @@ export const zh: Record<string, string> = {
   'Start from the conversation input:': '在对话输入框中发送：', 'Describe what you want to accomplish': '描述你想完成的任务',
   'Roles, tasks and verification are set up automatically.': '成员、任务分工和验证会自动设置。',
   'Agent Swarm': '智能体协作', 'Mission control': '任务控制', 'New mission': '新建任务',
-  'Open swarm sidebar': '打开协作侧边栏', 'Collapse sidebar': '收起侧边栏', 'Resize sidebar': '调整侧边栏宽度',
+  'Open swarm sidebar': '打开协作侧边栏',
   'Live': '实时更新', 'Reconnecting': '重新连接中', 'Refresh': '刷新', 'Drafts': '草稿',
   'Missions': '任务', 'No missions yet': '还没有协作任务', 'Select a conversation to manage its missions.': '选择一个对话以管理协作任务。',
   'Pause': '暂停', 'Resume': '继续', 'Stop': '停止', 'Confirm stop': '确认停止', 'Cancel': '取消',

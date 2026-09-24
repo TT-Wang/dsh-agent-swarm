@@ -51,7 +51,7 @@ async function fixture(t) {
     modifyRecord: async (_key, mutate) => (credentialRecord = await mutate(credentialRecord)),
     deleteRecord: async () => { credentialRecord = undefined },
   })
-  // rc.1: connection registers its RPC route on the context the service was provided from,
+  // 0.1.5's connection registers its RPC route on the context the service was provided from,
   // and that context must itself inject webServer; compose it inside such a scope.
   await new Promise((resolve, reject) => ctx.inject(['webServer'], scope => {
     scope.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 }).then(() => resolve(), reject)

@@ -4,15 +4,15 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 
 /** The session list, restricted to what identifies the conversation on screen across supported hosts. */
 interface SessionListView {
-  /** 0.1.2-0.1.5: the persisted selection every session-scoped surface keys off. */
+  /** 0.1.5: the persisted selection every session-scoped surface keys off. */
   current?: string
-  /** 0.1.6: local reference counts; the main conversation view retains its session as 'mainView'. */
+  /** 0.1.7: local reference counts; the main conversation view retains its session as 'mainView'. */
   byId?: Record<string, { retainedBy?: Partial<Record<string, number>> } | undefined>
   ids?: readonly string[]
 }
 
 /**
- * The session whose conversation is on screen. 0.1.6 removed `list.current`
+ * The session whose conversation is on screen. 0.1.7 has no `list.current`
  * (client sessions can have several live instances) and the main view instead
  * retains its session under the 'mainView' source, so that count stands in.
  */
@@ -30,7 +30,7 @@ export function openWorker(ctx: Pick<Context, 'sessions' | 'get'>, workerSession
   const sessions = ctx.sessions as Context['sessions'] & { open?: (id: string) => void }
   const list = sessions.list.getSnapshot() as SessionListView
   if (!list.byId?.[workerSessionId]) return false
-  // 0.1.2-0.1.5 navigated through the sessions face; 0.1.6 moved navigation to the workspace UI service.
+  // 0.1.5 navigates through the sessions face; 0.1.7 through the workspace UI service.
   if (typeof sessions.open === 'function') { sessions.open(workerSessionId); return true }
   const workspace = ctx.get('uiWorkspace') as { openSession?: (target: string) => void } | undefined
   if (typeof workspace?.openSession !== 'function') return false

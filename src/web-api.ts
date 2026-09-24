@@ -397,12 +397,11 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
       return { ok: false, error: { code: 'internal-error', message: 'Swarm request failed unexpectedly; the original error was logged on the host.', details: { issues: [] } } }
     }
   }
-  // Three host generations, one route shape. A plugin-owned channel
-  // (`rpc.handle('/agent-swarm', …)`) is unusable from 0.1.5 onward, 0.1.6
-  // included: `rpc.handle` registers the route under the CONNECTION plugin's own
-  // fiber, and from 0.1.5 that fiber injects `credentials` alone (0.1.3 injected
-  // `webServer` too), so Cordis refuses its `webServer` access and the route is
-  // never registered — silently, because the failure lands in a child fiber.
+  // One route shape on both supported hosts. A plugin-owned channel
+  // (`rpc.handle('/agent-swarm', …)`) is unusable on 0.1.5: `rpc.handle`
+  // registers the route under the CONNECTION plugin's own fiber, which injects
+  // `credentials` alone, so Cordis refuses its `webServer` access and the route
+  // is never registered — silently, because the failure lands in a child fiber.
   // The shared `/api` interceptor is not an option either — that channel admits
   // exactly one interceptor and another plugin holds it. What is left is what the
   // host itself documents for plugin endpoints: one exact route per endpoint on

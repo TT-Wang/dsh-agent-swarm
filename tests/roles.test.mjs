@@ -24,13 +24,11 @@ import { budget as sharedBudget, makeRuntime } from './faults/harness.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
 /**
- * The provider-visible system prompt. On hosts through 0.1.3-alpha.2 the loop
- * passed it as `options.system`; from the 0.1.5 line the agent-loop invariant
- * requires `options.system === undefined` and carries the prompt inside
- * `messages` as surface node 0 (a `system`-role message). Reading both keeps one
- * assertion set valid on either host.
+ * The provider-visible system prompt. The agent loop requires
+ * `options.system === undefined` and carries the prompt inside `messages` as
+ * surface node 0 (a `system`-role message).
  */
-const systemTextOf = request => request.system ?? (request.messages ?? [])
+const systemTextOf = request => (request.messages ?? [])
   .filter(message => message.role === 'system')
   .flatMap(message => message.content.filter(block => block.type === 'text').map(block => block.text))
   .join('\n')

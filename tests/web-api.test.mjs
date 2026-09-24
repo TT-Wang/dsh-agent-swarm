@@ -52,7 +52,7 @@ async function fixture(t) {
     modifyRecord: async (_key, mutate) => (credentialRecord = await mutate(credentialRecord)),
     deleteRecord: async () => { credentialRecord = undefined },
   })
-  // rc.1: connection registers its RPC route on the context the service was provided from,
+  // 0.1.5's connection registers its RPC route on the context the service was provided from,
   // and that context must itself inject webServer; compose it inside such a scope.
   await new Promise((resolve, reject) => ctx.inject(['webServer'], scope => {
     scope.plugin(Connection, { trustedHosts: ['lan.example'], maxRequestBodyBytes: 1048576 }).then(() => resolve(), reject)
@@ -586,7 +586,7 @@ test('worker history pages retain message source groups and cold sessions withou
   const member = await f.runtime.addMember(owner, mission.id, { name: 'History worker', role: 'research' })
   let worker
   const workerScope = f.ctx.plugin({ name: 'history-worker-fixture', inject: ['agents'], async apply(scope) {
-    // Use the native factory so alpha.2 binds its persistence write handle.
+    // Use the native factory so the host binds its persistence write handle.
     // No wake is sent; history inspection after disposal must keep it cold.
     const handle = await scope.agents.create({ sessionId: SessionId(member.sessionId), meta: { cwd: f.workspace }, agentOptions: { provider: 'public-provider', model: 'model-one' } })
     worker = handle.agent.session
