@@ -150,6 +150,16 @@ test('the synthesized review counts against maxTasks at launch', async t => {
   assert.equal(snapshot.mission.budget.maxTasks, 2)
 })
 
+test('an automatic plan refusal lists the maxTasks shortfall of the added reviews with every other issue, in one repair round', async t => {
+  const f = await fixture(t)
+  await assert.rejects(f.launch(plan(f.dir, { tasks: [deliverable({ assigneeKey: undefined })], maxTasks: 1 })), error => {
+    assert.match(error.message, /^Automatic plan rejected; repair every item/)
+    assert.match(error.message, /tasks\[deliver\]\.assigneeKey is required/)
+    assert.match(error.message, /\[plan_tasks_exceed_budget\] The plan needs 2 tasks, including 1 independent review\(s\)/, 'the cap shortfall arrives in the same round')
+    return true
+  })
+})
+
 test('a staged draft shows the synthesized review in the editor before launch, and launches it', async t => {
   const f = await fixture(t)
   const { members: _members, ...rest } = plan(f.dir)

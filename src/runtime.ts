@@ -2844,8 +2844,14 @@ export class SwarmRuntime {
     } else if (implementations.length === 1 && integrations.length && !integrations.some(task => dependsOn(task.key, implementations[0]!.key))) {
       issues.push(`The integration task must depend on implementation ${implementations[0]!.key}, or be omitted so the reviewed implementation is delivered directly`)
     }
-    if (issues.length) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
-    const paired = pairReviews(plan)
+    // The host-added reviews and their maxTasks refusal belong to the same
+    // repair round; alone, that refusal keeps its own code.
+    let paired: PlanInput | undefined
+    try { paired = pairReviews(plan) } catch (error) {
+      if (!issues.length || !(error instanceof AdmissionError)) throw error
+      issues.push(error.message)
+    }
+    if (issues.length || paired === undefined) throw new Error(`Automatic plan rejected; repair every item and retry the same requestId:\n${issues.join('\n')}`)
     // New automatic plans use preferences; old/manual task rows keep their binding.
     for (const task of paired.tasks) if (task.assigneeKey !== undefined) task.assignmentMode ??= 'preferred'
     return paired
