@@ -49,6 +49,33 @@ async function selectWebWorkspace(page, workspace) {
   await composerFor(page).waitFor()
 }
 
+/**
+ * Readiness of the owner session, read from the page's own Harness RPC: the
+ * workspace the runner selected (workspace/create), the session created in it
+ * (session/create) and a loaded command catalog for that session
+ * (commands/list). A visible composer is not enough: 0.1.7-rc.1 first opens a
+ * session in its default workspace, and keystrokes typed while the selected
+ * workspace's session replaces it are lost (the leading "/" of a slash
+ * command among them).
+ * @returns whether the selected workspace's session has its command catalog.
+ */
+export function trackOwnerCatalog(page, workspace) {
+  const workspaces = new Set(), sessions = new Map(), catalogs = new Set()
+  page.on('response', async response => {
+    const endpoint = new URL(response.url()).pathname
+    if (!['/api/workspace/create', '/api/session/create', '/api/commands/list'].includes(endpoint)) return
+    try {
+      const { payload } = JSON.parse(response.request().postData() ?? '{}')
+      const { result } = await response.json()
+      if (!result?.ok) return
+      if (endpoint === '/api/workspace/create' && result.value?.workspace?.path === workspace) workspaces.add(result.value.workspace.workspaceId)
+      if (endpoint === '/api/session/create') sessions.set(result.value?.sessionId, payload?.args?.request?.workspaceId)
+      if (endpoint === '/api/commands/list') catalogs.add(payload?.args?.agentId)
+    } catch { /* A response cut off by navigation proves nothing. */ }
+  })
+  return () => [...sessions].some(([sessionId, workspaceId]) => workspaces.has(workspaceId) && catalogs.has(sessionId))
+}
+
 /** Isolate the scripted Host adapter from the real browser plugin's package identity. */
 async function isolateWebModelFixture(root) {
   const directory = join(root, 'scripted-model-fixture')
@@ -83,8 +110,9 @@ export async function writeComposerDraft(page, input, text) {
  * - `observe({ endpoint, value, state, response })`: optional hook on every successful
  *   /api/agent-swarm response, before `ctx.state` takes `state`.
  * - `report`: extra report.json fields; arrays in it are serialized when the report is written.
- * - `scenario(page, ctx)`: runs once the owner workspace is open. `ctx.state` is the
- *   latest state observed on the wire and `ctx.revision` counts its updates.
+ * - `scenario(page, ctx)`: runs once the owner workspace is open and its session's native
+ *   command catalog has loaded (trackOwnerCatalog). `ctx.state` is the latest state
+ *   observed on the wire and `ctx.revision` counts its updates.
  *
  * `--serve-only` stops after the host is ready; `--keep-alive` keeps a verified host
  * until SIGINT or SIGTERM.
@@ -203,6 +231,7 @@ export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, ob
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: 'en-US' })
     const pageErrors = []
     page.on('pageerror', error => pageErrors.push(error.message))
+    const ownerCatalogLoaded = trackOwnerCatalog(page, workspace)
     page.on('response', async response => {
       const endpoint = new URL(response.url()).pathname
       if (!endpoint.startsWith('/api/agent-swarm/')) return
@@ -218,6 +247,7 @@ export async function runWebSmoke({ name, scriptedLlm, pluginConfig, prepare, ob
     await openAuthenticatedWeb(page, launchUrl, checks)
     assert((await page.evaluate(() => JSON.stringify(window.__DSH_BOOT__))).includes('@dsh-external/dsh-agent-swarm'), 'actual server must publish the external browser bundle in its boot graph')
     await selectWebWorkspace(page, workspace)
+    await until(ownerCatalogLoaded, 'the selected workspace\'s session and its native command catalog', 60_000)
     await scenario(page, ctx)
     assert.deepEqual(pageErrors, [])
     validatedAt = Date.now()

@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { withLocalImports } from './fixtures/local-imports.mjs'
+import { trackOwnerCatalog } from '../scripts/web-smoke-browser.mjs'
 
 const project = fileURLToPath(new URL('../', import.meta.url))
 
@@ -84,4 +85,41 @@ test('the command smoke gives the host a manual default below the generated allo
   const clamped = Object.fromEntries(Object.entries(generated).map(([key, value]) => [key, Math.min(value, defaultBudget[key])]))
   assert.notDeepEqual(clamped, generated, 'a launch that clamps the generated allowance to the manual default must fail the smoke\'s deepEqual')
   assert.notEqual(defaultBudget.maxTokens, generated.maxTokens, 'and replacing it with the manual default must fail its notEqual')
+})
+
+/** A page that replays recorded native RPC responses to the runner's listeners. */
+function replayPage() {
+  const listeners = []
+  return {
+    on(event, listener) { if (event === 'response') listeners.push(listener) },
+    async respond(method, args, result) {
+      const response = {
+        url: () => `http://127.0.0.1:1/api/${method}`,
+        request: () => ({ postData: () => JSON.stringify({ type: 'client-request', method, payload: { args } }) }),
+        json: async () => ({ type: 'server-response', result }),
+      }
+      await Promise.all(listeners.map(listener => listener(response)))
+    },
+  }
+}
+
+test('the web scenarios start only once the selected workspace\'s session has its command catalog, not the default workspace\'s', async () => {
+  // The RPC order of a 0.1.7-rc.1 command-web run that failed under load: the runner
+  // typed "/agent-sw" after the default workspace's catalog loaded but before the
+  // selected workspace's session existed, and the "/" was lost in the switch.
+  const workspace = '/private/tmp/smoke/workspace'
+  const page = replayPage()
+  const ready = trackOwnerCatalog(page, workspace)
+  const catalog = { ok: true, value: [{ name: 'agent-swarm', description: 'Start an agent swarm' }] }
+  await page.respond('workspace/initializeDefault', {}, { ok: true, value: { workspace: { workspaceId: 'default', path: '/Users/someone/Documents' } } })
+  await page.respond('session/create', { request: { workspaceId: 'default' } }, { ok: true, value: { sessionId: 'session-default' } })
+  await page.respond('commands/list', { agentId: 'session-default' }, catalog)
+  await page.respond('workspace/create', { path: workspace }, { ok: true, value: { workspace: { workspaceId: 'selected', path: workspace } } })
+  assert.equal(ready(), false, 'the default workspace\'s catalog is not the owner\'s (the failed run typed here)')
+  await page.respond('session/create', { request: { workspaceId: 'selected' } }, { ok: true, value: { sessionId: 'session-selected' } })
+  assert.equal(ready(), false, 'a session without its catalog is not ready')
+  await page.respond('commands/list', { agentId: 'session-selected' }, { ok: false, error: { code: 'x', message: 'not open' } })
+  assert.equal(ready(), false, 'a failed catalog load is not ready')
+  await page.respond('commands/list', { agentId: 'session-selected' }, catalog)
+  assert.equal(ready(), true)
 })
