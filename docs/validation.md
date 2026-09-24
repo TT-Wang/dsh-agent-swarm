@@ -9,6 +9,42 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.3-alpha.2` | `82a5fd61a7cf5c293cec4bdff68f455398d685e9` |
 | `0.1.2-rc.1` | `a66e4702047846cdaa10c66c9d3df3951f5ea70d` |
 
+## Round-27 simplification batch 7: rework in place, whole-lineage retirement, host-added reviews (2026-09-24)
+
+- **Rework in place.** `swarm_control` `action: "resume"` on a task its own independent review rejected
+  re-opens it: the rejection (commit, epoch, review, reason, refuted claims) moves into `task.rejections[]`,
+  the artifact is released, the epoch bumps, the author stays pinned and resumes from the rejected commit,
+  and the review that rejected it is re-pended with the same reviewer and a fresh allowance, its own
+  verdict and claims archived; every other open review of the source is retired. `maxRework` (default 2)
+  bounds it (`[task_rework_exhausted]`). Archived claims are refused by `swarm_challenge`
+  (`[evidence_archived]`) and ignored by completion; a verdict never re-verifies or re-refutes a refuted
+  claim; a same-commit resubmission without a new claim is refused (`[rework_unchanged]`). A dependent
+  admitted before the rejection is prepared with the reworked artifact, with no replacement row.
+- **Whole-lineage retirement.** Accepting a replacement retires every blocked or pending task of its
+  `replaces` lineage and their reviews (`task/superseded`); `[task_replaced]` is transitive, re-pend
+  paths skip replaced rows, a live duplicate carrier from an older store is named
+  (`task/duplicate-carrier`), and host recovery replays the retirement once, before re-pending, only for
+  acceptances made before the rule.
+- **Host-added reviews and one independence rule.** `pairReviews` adds one unassigned independent review to
+  every unpaired deliverable at launch, draft save and legacy draft listing, with an optional nested
+  `review` override; `canOwnReview`, `authorIdsOf` and `strandedReview` decide independence on every
+  assignment path, including claim, dispatch and reroute of an unassigned source; a review counts as a live
+  review path only when a live member may own it. `OWNER_PROMPT` is 44 characters shorter.
+
+The first adversarial pass found two high-severity defects (a challenge of an archived claim blocked
+completion forever; the restart replay retired work the verdict had deliberately left running) and medium
+ones: resubmissions that got no review or a false "withdrawn" notice, a deferred review left blocked, a
+two-member rework rerouted to its only reviewer, a non-transitive `task_replaced` guard, a silent duplicate
+implementation, and review-path relevance blind to independence. The fix re-opens the rejecting review
+with the task instead of minting a new one. A narrower second pass confirmed every fix and found the
+re-opened review keeping its previous round's consumption, an owner withdrawal of it not honoured, and
+unassigned sources still reachable by their bound reviewer; all are fixed with regressions.
+
+- `npm run typecheck` and `npm run build`: passed.
+- Full behavioral suite: 1490 tests at cf86cb7, 1489 passed. The one failure, `F. a verification checkout that cannot be removed ...` in `tests/r19-recovery-fallback.test.mjs`, is an intermittent real-time test seen since round 21; it passed 4 of 4 runs in isolation.
+- `npm run test:replay` (digest unchanged), `test:bundle`, `test:harness` (smoke snapshot unchanged),
+  `test:pack`, `test:profile`, `test:faults` (24 of 24) and `test:web`: passed.
+
 ## Round-26 simplification batch 6, wave B: one test fixture, a required adapter, structural notice checks (2026-09-24)
 
 - **One shared runtime test fixture.** `tests/faults/harness.mjs` exports `FakeWorkers(overrides)` (every
