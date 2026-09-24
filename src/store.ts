@@ -498,9 +498,8 @@ export class SwarmStore {
     // accepted write.
     if (table === 'tasks') { this.putTask(value as Task); return }
     // R17-G7: the member funnel drops the derived live status and normalizes the
-    // durable phase. A caller that assigns `member.status` (there are legacy
-    // sites outside this round's write scope) changes nothing durable: the next
-    // read re-derives the status from the phase and the live attempts.
+    // durable phase. Status is never stored: every read re-derives it from the
+    // phase and the live attempts.
     if (table === 'members') {
       const member = value as Member
       const { status: _derivedStatus, ...durable } = member

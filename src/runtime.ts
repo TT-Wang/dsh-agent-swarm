@@ -321,13 +321,14 @@ export class SwarmRuntime {
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `idleSignals` (durable `Task.idleSignal`),
-   *     `startFailures`, `operations`, `startControllers`,
+   *     `startFailures`, `operations`, `startControllers`, `listeners`,
    *     `fingerprintCache` (keyed by store revision), `observeCursors`, `ownerObserveCursors`.
    *  physical ownership: `queues` retains in-flight operations until they settle.
    *  It is not a disposable cache while adapter I/O can still affect a checkout.
    *  The scheduling pass guard (`Scheduling.passes`) is the same kind of state:
    *  the one scheduling body queued or running on a mission's queue, removed
    *  when that body settles.
+   *  lifecycle: `workerStarts`, one cancellable native start per member, fenced by durable checks.
    *
    * There is deliberately no in-memory `scheduled` Set: the Row-13 incident was
    * that Set swallowing the tick timer's only liveness action while the pass it
