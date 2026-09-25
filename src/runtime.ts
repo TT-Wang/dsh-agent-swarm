@@ -4106,13 +4106,13 @@ export class SwarmRuntime {
    * The check results were already returned and the verdict is decided from
    * them; this records one durable event and one owner notice naming the
    * checkout and the removal failure. The owner has nothing to remove: the
-   * host reclaims the checkout (`Workspaces.cleanupVerification`).
+   * mission's next verification reclaims the leftover (`Workspaces.cleanupVerification`).
    */
   onVerificationCleanupFailure(info: VerificationCleanupFailure): void {
     if (this.closed) return
     const task = this.store.get('tasks', info.taskId)
     if (task === undefined || task.missionId !== info.missionId) return
-    const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand. The host removes the tree and its worktree registration itself, and the mission's next verification reclaims anything left, so no repository-wide prune is needed.`
+    const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand. The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed.`
     this.commit(info.missionId, () => {
       this.store.event(info.missionId, 'task/verification-cleanup-failed', 'runtime', { taskId: info.taskId, memberId: info.memberId, checkout: info.checkout, reason: info.reason })
       this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })
