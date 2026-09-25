@@ -250,6 +250,34 @@ test('browser drafts under the configured roots save, edit and launch with their
   await saveEditLaunch(f.input, { source: 'session', root: f.workspace })
 })
 
+/**
+ * The launch entry point used to authorize the draft afresh against the
+ * calling session's cwd and discard the result, while the runtime launched
+ * under the draft's recorded authorization: a row the two judged differently
+ * passed the browser check and failed inside the runtime as an internal error.
+ * The browser now re-validates the recorded row the runtime launches under.
+ */
+test('a browser launch re-validates the authorization its draft recorded, not the calling session', async t => {
+  const grants = { grants: [], loadedAt: Date.now(), unresolved: [] }
+  const f = await fixture(t, { grants })
+  grants.grants.push(...(await loadWorkspaceGrants([{ path: f.directory }])).grants)
+  const created = await f.rpc('create-draft', { sessionId: f.ownerId, input: f.input })
+  assert.equal(created.result.ok, true, created.text)
+  const { id, revision } = created.result.value.draft
+  // A row that predates recorded authorizations, under roots that no longer contain its workspace:
+  // the session cwd alone would authorize it, but a row without a source never reads as a session.
+  f.runtime.store.transaction(() => {
+    const { workspaceGrantRoot: _root, workspaceAuthorizationSource: _source, ...legacy } = f.runtime.store.get('drafts', id)
+    f.runtime.store.put('drafts', legacy)
+  })
+  grants.grants.length = 0
+  const launch = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: id, revision })
+  assert.equal(launch.result.error?.code, 'bad-request', launch.text)
+  assert.match(launch.result.error.message, /\[workspace_not_authorized\]$/)
+  assert.equal(f.runtime.drafts({ sessionId: f.ownerId }).find(draft => draft.id === id).status, 'draft', 'the refused launch leaves the draft editable')
+  assert.deepEqual(f.runtime.store.list('missions'), [], 'and assembles nothing')
+})
+
 test('member state is visible without granting owner controls, and unrelated sessions see no missions', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
