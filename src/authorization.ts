@@ -29,8 +29,6 @@ export interface WorkspaceAuthorized {
    * session cwd for a session workspace, the configured root otherwise.
    */
   grantRoot: string
-  /** The configured grant that matched, when the source is a grant. */
-  grant?: WorkspaceGrant
 }
 
 /** What an entry point hands the runtime beside a plan, and the runtime records; never a plan field. */
@@ -101,19 +99,24 @@ export async function loadWorkspaceGrants(configured: readonly WorkspaceGrant[] 
 }
 
 /**
- * The one matching rule: the most specific (longest) configured root that is
- * still active at `now` and contains `path`. Admission, the synchronous create
- * path and re-validation all select through it, so nested roots can never make
- * them disagree.
+ * The one authorization rule, over canonical paths: `workspace` is the
+ * session workspace when it is that session's own directory, which wins over a
+ * root that happens to contain it (the human authorized it directly, so
+ * removing a root never fences it); otherwise it is under the most specific
+ * (longest) configured root still active at `now` that contains it, the root
+ * recorded. Admission, the synchronous create path and re-validation all
+ * decide through it, so nested roots can never make them disagree.
  */
-export function grantFor(path: string, loaded: WorkspaceGrantSnapshot, now: number): WorkspaceGrant | undefined {
-  return loaded.grants
-    .filter(grant => (grant.expiresAt === undefined || grant.expiresAt > now) && isContained(grant.path, path))
+export function claimFor(workspace: string, session: string | undefined, loaded: WorkspaceGrantSnapshot, now: number): WorkspaceClaim | undefined {
+  if (workspace === session) return { grantRoot: workspace, source: 'session' }
+  const grant = loaded.grants
+    .filter(grant => (grant.expiresAt === undefined || grant.expiresAt > now) && isContained(grant.path, workspace))
     .sort((left, right) => right.path.length - left.path.length)[0]
+  return grant === undefined ? undefined : { grantRoot: grant.path, source: 'grant' }
 }
 
 /**
- * Admission: the requested path is realpath-resolved before `grantFor`, so a
+ * Admission: the requested path is realpath-resolved before `claimFor`, so a
  * symlinked root or workspace is judged by where it actually points; prefix
  * confusion and traversal cannot pass because containment is decided on
  * resolved path components, not string prefixes.
@@ -122,10 +125,8 @@ export async function authorizeWorkspace(requested: string, sessionCwd: string |
   const workspace = await realpath(requested).catch(() => undefined)
   if (workspace === undefined) return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded, 'the path does not exist or cannot be resolved') }
   const session = typeof sessionCwd === 'string' && sessionCwd.trim() !== '' ? await realpath(sessionCwd).catch(() => undefined) : undefined
-  if (session !== undefined && workspace === session) return { ok: true, workspace, source: 'session', grantRoot: session }
-  const grant = grantFor(workspace, loaded, now)
-  if (grant !== undefined) return { ok: true, workspace, source: 'grant', grantRoot: grant.path, grant }
-  return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded) }
+  const claim = claimFor(workspace, session, loaded, now)
+  return claim === undefined ? { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded) } : { ok: true, workspace, ...claim }
 }
 
 /**
@@ -141,11 +142,10 @@ export function recordedClaim(workspace: string, row: Pick<Mission, 'workspaceGr
 /**
  * Re-validate a workspace already recorded on a mission or planning request.
  * The resolved workspace must still sit inside its recorded claim's root; it
- * then stays authorized as the session workspace it was recorded as, or while
- * `grantFor` still finds an active configured root containing it: the
- * admission rule, so a root added or removed around it never fences a
- * workspace admission would accept, and removing the last root that contains
- * it fences the mission at its next preparation.
+ * then stays authorized by `claimFor`, the admission rule, with the recorded
+ * root as the session when it was recorded as one: a root added or removed
+ * around it never fences a workspace admission would accept, and removing the
+ * last root that contains it fences the mission at its next preparation.
  *
  * Residual TOCTOU: the check and the subsequent git operation are separate
  * syscalls, so a root replaced in that window is not caught here. This is
@@ -157,8 +157,6 @@ export async function reauthorizeWorkspace(record: Pick<Mission, 'workspace' | '
   if (workspace === undefined) return { ok: false, diagnostic: `Authorized workspace ${record.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]` }
   const anchor = await realpath(recorded).catch(() => undefined)
   if (anchor === undefined || !isContained(anchor, workspace)) return { ok: false, diagnostic: `Workspace ${record.workspace} escaped its recorded authorized root ${recorded} [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  if (source === 'session' && workspace === anchor) return { ok: true, workspace, source: 'session', grantRoot: anchor }
-  const grant = grantFor(workspace, loaded, now)
-  if (grant !== undefined) return { ok: true, workspace, source: 'grant', grantRoot: grant.path, grant }
-  return { ok: false, diagnostic: `Authorized root ${recorded} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }
+  const claim = claimFor(workspace, source === 'session' ? anchor : undefined, loaded, now)
+  return claim === undefined ? { ok: false, diagnostic: `Authorized root ${recorded} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` } : { ok: true, workspace, ...claim }
 }

@@ -9,7 +9,7 @@
  */
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
-import { grantFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
+import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
 import { emitGuardTerminal, guardTerminalHeld } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
@@ -372,26 +372,18 @@ export class WorkspaceAdmission {
   /**
    * The runtime-side half of the workspace authorization boundary. `create` is
    * synchronous, so the full realpath check happened at the entry point that
-   * computed `claim`; here the runtime proves the workspace really resolves
-   * inside the claimed root, so a caller that fabricates a wider root cannot
-   * widen its own authorization. When the plugin loaded `config.grants`, the
-   * root recorded is the one `grantFor` selects from them, the same rule
-   * admission and re-validation use.
+   * computed `claim` over canonical paths; here the runtime proves the
+   * workspace sits inside the claimed root, then decides by `claimFor`, the
+   * rule admission and re-validation use. The root recorded is therefore never
+   * the caller's claim: a fabricated wider root records the configured root
+   * that contains the workspace, and a narrower one that does not is refused.
    */
   assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim {
     if (!isContained(claim.grantRoot, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claim.grantRoot} [${WORKSPACE_AUTHORIZATION_CODE}]`)
     const grants = this.rt.config.grants
     if (grants === undefined) return { grantRoot: claim.grantRoot, source: claim.source }
-    // A session authorization wins over a root that happens to contain the
-    // session cwd: the human authorized that directory directly, so removing a
-    // root must not fence it.
-    if (claim.source === 'session' && claim.grantRoot === workspace) return { grantRoot: workspace, source: 'session' }
-    // The recorded root is the configured root that actually contains the
-    // workspace — never the caller's claim. A caller that fabricates a wider
-    // root therefore cannot record it, and a fabricated narrower root is
-    // refused by the containment check above.
-    const matched = grantFor(workspace, grants, this.rt.now())
-    if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
+    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, grants, this.rt.now())
+    if (authorized !== undefined) return authorized
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
   }
 
