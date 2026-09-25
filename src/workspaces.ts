@@ -8,6 +8,7 @@ import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } fr
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
+import { unexecutedCheck } from './declared-checks.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
 
 /** Full-repository path inventories are metadata, not user-visible check output. */
@@ -438,16 +439,6 @@ class ProcessTimeoutError extends Error {
     super(`Execution timed out after ${timeoutMs}ms`)
     this.name = 'ProcessTimeoutError'
   }
-}
-
-/**
- * The row for a declared check the host could not execute: exit 124 when the
- * host's own deadline stopped the preparation, otherwise 125, with the failure
- * kind the declared-check layer defers on instead of rejecting the artifact.
- */
-function unexecutedCheck(command: string, error: unknown): CheckResult {
-  const timeout = error instanceof ProcessTimeoutError
-  return { command, exitCode: timeout ? 124 : 125, failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }
 }
 
 /**
@@ -1896,7 +1887,7 @@ export class Workspaces {
       try { await this.validateArtifact(member, artifact, signal) }
       catch (error) {
         // Only the host's own git deadline (HOST_GIT_TIMEOUT_MS) proving the
-        // artifact is a timeout row: no command has run. Any other failure here
+        // artifact is an infrastructure row: no command has run. Any other failure here
         // (a non-ancestor, a missing commit) refuses the artifact by a throw,
         // and cancellation stays cancellation.
         if (!(error instanceof ProcessTimeoutError) || signal.aborted) throw error
@@ -1980,16 +1971,12 @@ export class Workspaces {
             result = { exitCode: 124, ...bounded, truncated,
               ...(error.captured.attribution === undefined ? {} : { attribution: { ...error.captured.attribution, outputTruncated: truncated } }) }
           }
-          // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
-          const output = result.exitCode === 127
-            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
-            : result.output
           // ENV: attribution and environment are written BEFORE the free-form
           // output, so a bound on the record removes detail rather than the
           // failing test names, the TAP summary and the stage that failed.
           const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
             : { index: results.length + 1, command, ...result.attribution }
-          results.push({ command, exitCode: result.exitCode, ...([124, 126, 127].includes(result.exitCode) ? { failureKind: result.exitCode === 124 ? 'timeout' as const : 'infrastructure' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
+          results.push({ command, exitCode: result.exitCode, ...(result.exitCode === 124 ? { failureKind: 'timeout' as const } : [126, 127].includes(result.exitCode) ? { failureKind: 'unrunnable' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output: result.output, truncated: result.truncated })
           if (result.exitCode !== 0) break
         }
         return results

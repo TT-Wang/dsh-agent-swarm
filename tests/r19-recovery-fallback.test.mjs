@@ -267,7 +267,8 @@ test('E. a second recovery of the same previous owner and commit records no seco
 })
 
 test('F. a verification checkout that cannot be removed is a durable event and an owner notice; the verdict stands', async t => {
-  const f = await fixture(t, { subprocess: refusingVerificationRemoval })
+  const removal = { refused: true }
+  const f = await fixture(t, { subprocess: () => (removal.refused ? refusingVerificationRemoval : subprocessSeam)() })
   const source = f.propose({ checks: ['test -f src/answer.txt && echo checked'] })
   const claim = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await writeFile(join(f.runtime.store.get('members', f.author.id).workspace, 'src', 'answer.txt'), 'answer\n')
@@ -290,10 +291,27 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   assert.equal(event.data.memberId, f.reviewer.id, 'and the verifying member')
   assert.ok(typeof event.data.checkout === 'string' && event.data.checkout.startsWith(`${verification}/`), `the event names the checkout: ${event.data.checkout}`)
   assert.match(event.data.reason, /worktree remove refused/, 'the event carries the removal failure')
-  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.from === 'runtime' && delivery.notice?.trigger === 'task/verification-cleanup-failed')
+  // The owner fact, delivered on its own or, when the guard notices racing the verdict have spent the
+  // owner wake budget, carried by the window's summary as one of its constituent facts.
+  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.from === 'runtime')
+    .flatMap(({ content, notice }) => notice?.aggregatedFacts === undefined ? [{ ...notice, content }]
+      : notice.aggregatedFacts.map(part => ({ ...part, content: notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n') })))
+    .filter(fact => fact.trigger === 'task/verification-cleanup-failed')
   assert.equal(notices.length, 1, 'one owner notice')
   assert.match(notices[0].content, /could not be removed/)
   assert.match(notices[0].content, /worktree remove refused/)
-  assert.ok(notices[0].content.includes(event.data.checkout), 'the notice names the checkout the owner has to look at')
-  assert.ok(notices[0].notice.subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
+  assert.ok(notices[0].content.includes(event.data.checkout), 'the notice names the checkout')
+  // The owner is told what the host guarantees, and never to run a repository-wide prune.
+  assert.doesNotMatch(notices[0].content, /git worktree prune/)
+  assert.match(notices[0].content, /The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed\./)
+  assert.ok(notices[0].subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
+  // What that promise covers: git refused the registration again after the tree was removed, and the next verification reclaims it.
+  const registered = async () => (await git(f.source, 'worktree', 'list', '--porcelain')).split('\n').filter(line => line.startsWith('worktree ') && line.includes(`/${f.mission.id}/verification/`))
+  assert.equal((await registered()).length, 1, 'the refused registration outlives this verification')
+  removal.refused = false
+  const accepted = f.current(f.runtime)(source.id)
+  assert.deepEqual((await f.workers.verifyArtifact(f.runtime.store.get('members', f.reviewer.id), accepted, accepted.artifact)).map(check => check.exitCode), [0])
+  assert.deepEqual(await registered(), [], 'the next verification reclaimed the leftover registration')
+  assert.deepEqual(await readdir(verification), [])
+  assert.equal(f.workers.reports.cleanups.length, 1, 'and reported no new failure')
 })

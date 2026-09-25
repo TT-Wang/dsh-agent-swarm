@@ -26,7 +26,7 @@ import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assi
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName, type WorkspaceGrantSnapshot } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
@@ -1746,7 +1746,8 @@ export class SwarmRuntime {
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       if (this.declaredChecks.recoveryRequired(checks)) {
-        const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - 750))}\nVerification could not establish a verdict. The immutable source ${source.id} at ${artifact.commit} remains submitted. Fix the reported environment or amend checkTimeoutMs with swarm_budget, then resume review ${task.id} using swarm_control(action: "resume", taskId: "${task.id}", reason: "condition repaired").`
+        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks)}.`
+        const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
           task.status = 'blocked'; task.output = this.bounded(reason)
@@ -2496,7 +2497,7 @@ export class SwarmRuntime {
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
+    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
     const authors = [...authorIdsOf(source)]
@@ -4099,16 +4100,14 @@ export class SwarmRuntime {
    * repository reached nobody.
    * The check results were already returned and the verdict is decided from
    * them; this records one durable event and one owner notice naming the
-   * checkout and the removal failure, so the leftover is something the owner
-   * can find and remove.
+   * checkout and the removal failure. The owner has nothing to remove: the
+   * mission's next verification reclaims the leftover (`Workspaces.cleanupVerification`).
    */
   onVerificationCleanupFailure(info: VerificationCleanupFailure): void {
     if (this.closed) return
     const task = this.store.get('tasks', info.taskId)
     if (task === undefined || task.missionId !== info.missionId) return
-    // The fallback removal may already have reclaimed the tree; only the owner
-    // can tell, so the notice names what to look for rather than asserting it.
-    const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand; if that directory or its worktree registration in the source repository is still present, delete it and run \`git worktree prune\` there.`
+    const content = `Verification checkout ${info.checkout} for ${info.taskId} could not be removed cleanly after its checks ran (${info.reason}). The check results and the verdict stand. The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed.`
     this.commit(info.missionId, () => {
       this.store.event(info.missionId, 'task/verification-cleanup-failed', 'runtime', { taskId: info.taskId, memberId: info.memberId, checkout: info.checkout, reason: info.reason })
       this.notify(info.missionId, content, this.noticeSubjectsFor(info.missionId, { taskId: info.taskId }), { noticeClass: 'progress', trigger: 'task/verification-cleanup-failed', reason: info.reason })

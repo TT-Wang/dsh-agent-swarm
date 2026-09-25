@@ -122,7 +122,7 @@ test('an infrastructure-deferred verification names the actual failed check and 
   const recorded = f.runtime.store.get('tool_runs', rejected.data.checks[0])
   assert.equal(recorded.result.exitCode, 127)
   assert.match(recorded.result.output, /npm: command not found/)
-  const [notice] = f.ownerNotices().filter(delivery => /Verification could not establish a verdict/.test(delivery.content))
+  const [notice] = f.ownerNotices().filter(delivery => /deferred its verdict on the immutable source/.test(delivery.content))
   assert.ok(notice, 'the owner is woken for repair of the host environment')
   assert.match(notice.content, /swarm_control/)
   assert.match(notice.content, /passed every acceptance criterion/, 'the notice keeps the reviewer reason')
