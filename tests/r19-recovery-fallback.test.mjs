@@ -294,6 +294,10 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   assert.equal(notices.length, 1, 'one owner notice')
   assert.match(notices[0].content, /could not be removed/)
   assert.match(notices[0].content, /worktree remove refused/)
-  assert.ok(notices[0].content.includes(event.data.checkout), 'the notice names the checkout the owner has to look at')
+  assert.ok(notices[0].content.includes(event.data.checkout), 'the notice names the checkout')
+  // The host reclaims the tree and its registration, and the next verification reclaims a leftover:
+  // the owner is told no repository-wide prune is needed, never to run one.
+  assert.doesNotMatch(notices[0].content, /git worktree prune/)
+  assert.match(notices[0].content, /The host removes the tree and its worktree registration itself, and the mission's next verification reclaims anything left, so no repository-wide prune is needed\./)
   assert.ok(notices[0].notice.subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
 })
