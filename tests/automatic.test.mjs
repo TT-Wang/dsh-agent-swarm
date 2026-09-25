@@ -28,8 +28,9 @@ function plan(workspace) {
       { key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 },
     ] }
 }
-async function fixture(t) {
-  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(), config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
+/** `extra` extends the runtime configuration, e.g. with the loaded `grants` the plugin always wires. */
+async function fixture(t, extra = {}) {
+  const { dir: directory, config, workers, runtime } = await makeRuntime(t, { workers: new Workers(), config: { maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined, ...extra } })
   const owner = { sessionId: 'automatic-owner' }
   const requestInput = { commandId: 'command-1', goal: 'Make the requested change and verify it.', workspace: directory }
   return { directory, config, workers, runtime, owner, requestInput, input: plan(directory) }
@@ -204,6 +205,28 @@ test('failed assembly and retries retain one deterministic plan and worker roste
   assert.equal(snapshot.mission.title, 'Corrected saved plan')
   assert.equal(f.runtime.starts(f.owner)[0].draftId, failed.draftId)
   assert.equal(f.workers.prepared.length, 2)
+})
+
+/**
+ * A retry whose plan differs from the saved draft edits that draft under the
+ * request's own authorization. With the configured roots loaded and none
+ * containing the session workspace, any other claim is refused, so the edit,
+ * the draft and the relaunched mission all carry the session authorization.
+ */
+test('a retried automatic plan edits its saved draft under the session authorization of its request', async t => {
+  const f = await fixture(t, { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } })
+  let fail = true
+  f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer' && fail) throw new Error('Temporary launch failure') }
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
+  await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Temporary launch failure/)
+  fail = false
+  const snapshot = await f.runtime.startPlan(f.owner, request.id, { ...f.input, title: 'Corrected saved plan' })
+  const draft = f.runtime.store.get('drafts', f.runtime.starts(f.owner)[0].draftId)
+  assert.equal(draft.input.title, 'Corrected saved plan', 'the retry took the edit branch')
+  const session = ['session', f.directory]
+  assert.deepEqual([draft.workspaceAuthorizationSource, draft.workspaceGrantRoot], session)
+  assert.deepEqual([snapshot.mission.workspaceAuthorizationSource, snapshot.mission.workspaceGrantRoot], session)
+  assert.equal(snapshot.mission.status, 'active')
 })
 
 test('a reentrant failure while assembly waits fences activation and permits saved-plan retry', async t => {

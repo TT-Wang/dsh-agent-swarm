@@ -219,9 +219,10 @@ test('draft API persists editable plans, enforces revision ownership and canonic
  * With the configured roots loaded, as the plugin always loads them, the
  * browser's authorization used to ride inside the plan, which validation
  * rebuilt without it: every save of a session-workspace draft failed with an
- * internal error, and a session cwd inside a root was relabelled a grant. The
- * authorization now travels beside the plan, and the launch records the one
- * the draft was saved with.
+ * internal error, an edit could not record the authorization of the workspace
+ * it moved the draft to, and a session cwd inside a root was relabelled a
+ * grant. The authorization now travels beside the plan, each save records the
+ * one computed for it, and the launch records the one the draft was saved with.
  */
 test('browser drafts under the configured roots save, edit and launch with their own authorization', async t => {
   // One snapshot, filled once the fixture's directories exist; the runtime and the API read it live.
@@ -230,11 +231,13 @@ test('browser drafts under the configured roots save, edit and launch with their
   const granted = path.join(f.directory, 'granted'), project = path.join(granted, 'project')
   await mkdir(project, { recursive: true })
   grants.grants.push(...(await loadWorkspaceGrants([{ path: granted }])).grants)
-  const saveEditLaunch = async (input, expected) => {
-    const created = await f.rpc('create-draft', { sessionId: f.ownerId, input })
+  const session = { source: 'session', root: f.workspace }, grant = { source: 'grant', root: granted }
+  /** Save in `saved`, edit into `edited`, launch: the draft and the mission record the edited workspace's authorization. */
+  const saveEditLaunch = async (saved, edited, expected) => {
+    const created = await f.rpc('create-draft', { sessionId: f.ownerId, input: { ...f.input, workspace: saved } })
     assert.equal(created.result.ok, true, created.text)
     const { id, revision } = created.result.value.draft
-    const updated = await f.rpc('update-draft', { sessionId: f.ownerId, draftId: id, revision, input: { ...input, title: 'Edited under the roots' } })
+    const updated = await f.rpc('update-draft', { sessionId: f.ownerId, draftId: id, revision, input: { ...f.input, workspace: edited, title: 'Edited under the roots' } })
     assert.equal(updated.result.ok, true, updated.text)
     const draft = updated.result.value.draft
     assert.deepEqual({ source: draft.workspaceAuthorizationSource, root: draft.workspaceGrantRoot }, expected, 'the draft records its authorization beside the plan')
@@ -243,11 +246,15 @@ test('browser drafts under the configured roots save, edit and launch with their
     const { mission } = launched.result.value.snapshot
     assert.deepEqual({ source: mission.workspaceAuthorizationSource, root: mission.workspaceGrantRoot }, expected, 'the launch records the authorization the draft was saved with')
   }
-  await saveEditLaunch(f.input, { source: 'session', root: f.workspace })
-  await saveEditLaunch({ ...f.input, workspace: project }, { source: 'grant', root: granted })
+  await saveEditLaunch(f.workspace, f.workspace, session)
+  // A guard, not a regression: a grant-authorized draft kept its root while the authorization rode in the plan too.
+  await saveEditLaunch(project, project, grant)
+  // An edit that moves the draft records the authorization of the workspace it moved to.
+  await saveEditLaunch(f.workspace, project, grant)
+  await saveEditLaunch(project, f.workspace, session)
   // A root that also contains the session cwd never turns the session's own workspace into a grant.
   grants.grants.push(...(await loadWorkspaceGrants([{ path: f.directory }])).grants)
-  await saveEditLaunch(f.input, { source: 'session', root: f.workspace })
+  await saveEditLaunch(f.workspace, f.workspace, session)
 })
 
 /**
