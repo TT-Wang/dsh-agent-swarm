@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { runProcess } from '../lib/workspaces.js'
@@ -99,4 +99,30 @@ test('W4: two missions and many members prepare worktrees on one repository with
       assert.equal(await commondir(source, `${prefix}${names[index]}`), '../..', `${prefix}${names[index]} metadata is complete`)
     }
   }
+})
+
+/**
+ * The retry after a cross-process metadata race used to remove its target and
+ * then run a repository-wide `git worktree prune`, which also dropped the
+ * user's own linked worktrees whose directory was missing at that moment. It
+ * reclaims its own target by path and nothing else.
+ */
+test('W4: the metadata-race retry reclaims only its own target and leaves the user\'s worktrees registered', async t => {
+  const { temp, source, workspaces, mission, member } = await fixture(t)
+  // A worktree the user registered whose directory is away right now (moved, an unmounted disk).
+  const user = path.join(temp, 'user-worktree')
+  await git(source, 'worktree', 'add', '--detach', user)
+  await rename(user, path.join(temp, 'user-worktree-away'))
+  const nativeGit = workspaces.git.bind(workspaces)
+  const mutations = []
+  workspaces.git = async (cwd, args, ...rest) => {
+    if (isMutation(args)) mutations.push(args[1])
+    if (mutations.length === 1 && args[1] === 'add') throw new Error(`fatal: failed to read ${path.join(source, '.git', 'worktrees', 'publishing', 'commondir')}: Success`)
+    return await nativeGit(cwd, args, ...rest)
+  }
+  const workspace = await workspaces.prepareWorkspace(mission, 'raced')
+  assert.equal(mutations[0], 'add', 'the first add met the race')
+  assert.equal(mutations.at(-1), 'add', 'and was retried')
+  assert.equal(await git(workspace, 'rev-parse', 'HEAD'), await git(member.workspace, 'rev-parse', 'HEAD'), 'the retried checkout starts at the mission snapshot')
+  assert.match(await git(source, 'worktree', 'list', '--porcelain'), new RegExp(`^worktree ${user}$`, 'm'), 'the user\'s worktree stays registered')
 })

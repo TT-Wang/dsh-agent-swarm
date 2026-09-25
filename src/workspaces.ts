@@ -889,9 +889,9 @@ export class Workspaces {
       catch (error) {
         if (!(error instanceof Error) || !WORKTREE_METADATA_RACE.test(error.message)) throw error
         // Another process outside this manager can still publish the metadata
-        // non-atomically. Drop the partial registration and retry exactly once.
-        await rm(target, { recursive: true, force: true }).catch(() => undefined)
-        await this.git(cwd, ['worktree', 'prune'], signal).catch(() => undefined)
+        // non-atomically. Reclaim this target by path and retry exactly once.
+        await this.forceRemove(target).catch(() => undefined)
+        await this.git(cwd, ['worktree', 'remove', '--force', '--force', target], signal).catch(() => undefined)
         await this.git(cwd, ['worktree', 'add', '--detach', target, commit], signal)
       }
     })
