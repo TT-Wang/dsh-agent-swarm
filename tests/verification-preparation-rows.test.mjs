@@ -111,6 +111,22 @@ test('a verification checkout whose git worktree add exits 128 defers the review
   assert.equal(f.workspaces.checkEnvelope().completed, 0, 'no check slot was taken by a checkout that was never created')
 })
 
+/**
+ * Review M-9: the host's own git deadline creating the checkout is the host's, like the ancestry
+ * proof's below; checkTimeoutMs does not govern it, so its row is an infrastructure row with the host
+ * repair as its exit. a65f837 stored it as an exit-124 `timeout` row whose exit raised checkTimeoutMs.
+ */
+test('a host git deadline while creating the verification checkout defers the review with infrastructure rows', async t => {
+  let substituted = 0
+  const f = await reviewFixture(t, { options: { subprocess: substitutingSeam(verificationWorktreeAdd, ['/bin/sh', '-c', 'sleep 20'], () => { substituted++ }) } })
+  f.workspaces.gitTimeout = () => 1_500
+  const verdict = await assertDeferred(f, PREPARATION, /^Host verification could not execute: ProcessTimeoutError: Execution timed out after 1500ms$/)
+  assert.equal(substituted, 2, 'the worktree add really ran and outlasted the deadline on both passes')
+  assert.match(verdict.output, /the host could not execute a check: repair the host condition its output reports/)
+  assert.doesNotMatch(verdict.output, /checkTimeoutMs/, 'a host deadline is not the check\'s own deadline')
+  assert.equal(f.workspaces.checkEnvelope().completed, 0, 'no check slot was taken by a checkout that was never created')
+})
+
 test('a sandbox provider reporting partial enforcement defers the review and never runs the check', async t => {
   const partial = { confine: argv => ({ argv, enforcement: 'partial' }) }
   // Were the check ever run, it would leave a sentinel outside the verification checkout.
