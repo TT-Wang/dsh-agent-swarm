@@ -25,7 +25,7 @@ import { authorIdsOf, canBorrowTask, canOwnReview, strandedReview } from './assi
 import { executionClock, executionElapsed } from './resource-time.ts'
 import { completionExempt, taskGraphIndex, type TaskGraphIndex } from './task-graph.ts'
 import { checkSyntaxDetail, declaredPlanChecks, orderedTasks, pairReviews, planAdvisories, validatePlan } from './plans.ts'
-import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
+import { OWNER_ONLY_TOOLS, type Actor, type AutoStart, BoardQuery, Budget, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CreateMissionInput, CriticalPath, Delivery, DraftPlan, Escalation, Evidence, EvidenceStatus, Member, MemberStatus, Mission, NoticeClass, ObserveQuery, MessageInput, PlanInput, Post, PostInput, PostKind, ProposeTaskInput, ProviderOutage, PublishInput, RecoveryFallback, RequestStartInput, RuntimeConfig, Snapshot, Task, TaskAmendment, TaskRejection, TaskCeiling, ToolRun, UsageBuckets, UsageSnapshotSource, VerificationCleanupFailure, WorkerAdapter, WorkerActivity, Workstream } from './types.ts'
 import { nextWorkerName, type WorkspaceGrantSnapshot } from './types.ts'
 import { requireArtifactChecks } from './artifact-policy.ts'
 
@@ -1745,7 +1745,7 @@ export class SwarmRuntime {
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       if (this.declaredChecks.recoveryRequired(checks)) {
-        const deferral = `\nVerification could not establish a verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks, source.id, task.id)}.`
+        const deferral = `\nReview ${task.id} deferred its verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExit(checks)}.`
         const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
@@ -2496,7 +2496,7 @@ export class SwarmRuntime {
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.declaredChecks.deferredChecks(mission.id, deferred.id), source.id, deferred.id)}`
+    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
     const authors = [...authorIdsOf(source)]

@@ -15,16 +15,19 @@
  * the host repair, and `unrunnable` names the dependency directories the
  * checkout received (from the row's own environment record) and the
  * cancel-plus-replacement exit with its real tool parameters. The deferral
- * reason and the review-path blocker compose from the failure that ended the
- * deciding pass (the host stops a pass at its first failing check), so the
- * reason has a fixed maximum whatever the row carries. Each exit is performed
- * here through the registered tools, so a named parameter that the published
- * schema does not declare is refused.
+ * reason and the review-path blocker compose from the last classified failure
+ * of the review's rows, the one that ended its deciding pass (the host stops a
+ * pass at its first failing check). An exit names no id: the text around it
+ * names the source and the review once, so the reason has a fixed maximum
+ * whatever the ids and the row carry. Each exit is performed here through the
+ * registered tools, so a named parameter that the published schema does not
+ * declare is refused.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { registerTools } from '../lib/tools.js'
 import { toolSchemaIndex } from './refusal-inventory.mjs'
 import { FakeWorkers, MISSION_ACCEPTANCE, WorkspaceWorkers, events, makeRepo, makeWorkspaces, setup, taskOf } from './faults/harness.mjs'
@@ -50,15 +53,15 @@ async function assertNamedCalls(text, expected) {
 const deferredReason = f => events(f.runtime, f.mission.id, 'task/verification-deferred').at(-1)?.data.reason
 const hostRuns = f => f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.tool === 'swarm.host_verification')
 
-/** Submit `source` as the author, then claim an independent review of it as the reviewer. */
-async function submitForReview(f, source, write = async () => {}) {
+/** Submit `source` as the author, then claim an independent review of it (admitted as `reviewId` when given) as the reviewer. */
+async function submitForReview(f, source, write = async () => {}, reviewId = undefined) {
   const claimed = await f.runtime.claim(f.actor(f.author), f.mission.id, source.id)
   await write(claimed)
   await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, {
-    outputs: [], workstreamId: f.stream.id, title: `Review ${source.id}`, objective: 'Independently review the scoped change',
+    outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id,
-  })
+  }, reviewId)
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
   return { review, verify: (reason = 'Review against acceptance') => f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason }) }
 }
@@ -102,8 +105,9 @@ test('exit 127: the row is unrunnable with the command\'s own output, and the en
   const reason = deferredReason(f)
   assert.equal(deferred.output, reason)
   assert.ok(reason.includes('a command could not run in the clean verification checkout (dependency directories copied from the source: node_modules)'), reason)
-  assert.ok(reason.includes(`swarm_control(action: "resume", taskId: "${review.id}", reason: "condition repaired")`), 'the environment exit resumes the same review')
-  assert.ok(reason.includes(`swarm_cancel(taskId: "${source.id}", reason)`) && reason.includes(`swarm_propose(replaces: ["${source.id}"], checks)`), 'the replacement exit is named')
+  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${taskOf(f.runtime, source.id).artifact.commit}, which remains submitted: `), reason)
+  assert.ok(reason.includes('then resume the review with swarm_control(action: "resume", taskId, reason)'), 'the environment exit resumes the same review')
+  assert.ok(reason.includes('cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks)'), 'the replacement exit is named')
   assert.doesNotMatch(reason, /checkTimeoutMs/, 'a deadline is not this failure\'s exit')
   await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
 
@@ -124,7 +128,7 @@ test('exit 126: the replacement exit named in the reason really works end to end
   assert.deepEqual(hostRuns(f).map(run => [run.result.exitCode, run.result.failureKind]), [[126, 'unrunnable'], [126, 'unrunnable']])
   const reason = deferredReason(f)
   assert.ok(reason.includes('dependency directories copied from the source: node_modules'), reason)
-  assert.ok(reason.includes(`or, if the command itself is wrong, cancel the source with swarm_cancel(taskId: "${source.id}", reason) and repair it with swarm_propose(replaces: ["${source.id}"], checks) holding corrected commands`), reason)
+  assert.ok(reason.includes('or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands'), reason)
   await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
 
   // The command itself is wrong (the script is not executable): withdraw, then repair with corrected checks.
@@ -147,9 +151,10 @@ async function fakeFixture(t, config = {}) {
   return { ...f, tool: ownerTools(f) }
 }
 
-async function deferOn(f, rows, reason) {
-  const source = f.propose()
-  const { review, verify } = await submitForReview(f, source)
+async function deferOn(f, rows, reason, ids = {}) {
+  const source = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Implement', objective: 'Implement the scoped change',
+    kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'], assigneeId: f.author.id }, ids.source)
+  const { review, verify } = await submitForReview(f, source, undefined, ids.review)
   f.workers.checks = rows
   const verdict = await verify(reason)
   f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok' }]
@@ -163,7 +168,7 @@ test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that e
   const { source, review, verdict } = await deferOn(f, [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }])
   assert.equal(verdict.status, 'blocked')
   const reason = deferredReason(f)
-  assert.ok(reason.includes(`a check reached its deadline: raise it with swarm_budget(taskId: "${source.id}", taskBudget: { checkTimeoutMs }, reason), then resume review ${review.id}`), reason)
+  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${'a'.repeat(40)}, which remains submitted: a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason)`), reason)
   assert.doesNotMatch(reason, /swarm_cancel/)
   await assertNamedCalls(reason, ['swarm_budget', 'swarm_control'])
   await f.tool('swarm_budget', { taskId: source.id, taskBudget: { checkTimeoutMs: 90_000 }, reason: 'The suite needs a longer deadline' })
@@ -176,7 +181,7 @@ test('a host that could not execute the check names the host repair, never check
   const f = await fakeFixture(t)
   const { source, review } = await deferOn(f, [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: git worktree failed (128)' }])
   const reason = deferredReason(f)
-  assert.ok(reason.includes(`the host could not execute a check: repair the host condition its output reports, then resume review ${review.id}`), reason)
+  assert.ok(reason.includes('the host could not execute a check: repair the host condition its output reports, then resume the review with swarm_control(action: "resume", taskId, reason)'), reason)
   assert.doesNotMatch(reason, /checkTimeoutMs|swarm_cancel/)
   assert.equal(blocker(f, source), `review ${review.id} deferred its verdict on this artifact: ${reason.slice(reason.indexOf('the host could not'), -1)}`, 'the blocker composes from the same table')
 })
@@ -202,47 +207,74 @@ test('a 127 row a 75b765a host stored as infrastructure still defers, with the i
 
 const unrunnable = environment => ({ command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: tool: command not found', environment })
 
-test('the review-path blocker composes the unrunnable exits from the stored row, and the reason fits the smallest message bound whatever the row carries', async t => {
+/** The longest task id a launch admits: `task_<draft>_<key>`, an automatic request's draft and a 100-character plan key. */
+const planTaskId = key => `task_draft_start_${randomUUID()}_${key}${'k'.repeat(100 - key.length)}`
+
+test('the reason fits the smallest message bound with the longest ids, and the blocker composes the same exit from the stored rows', async t => {
   const f = await fakeFixture(t, { maxMessageChars: 1_000 })
   f.workers.artifact = { ...f.workers.artifact, commit: 'a'.repeat(64) }
-  const materializedPaths = Array.from({ length: 40 }, (_, index) => `packages/p${index}/node_modules`)
-  const { source, review } = await deferOn(f, [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } })], 'r'.repeat(990))
+  const ids = { source: planTaskId('implement-'), review: planTaskId('implement-review-') }
+  assert.deepEqual([ids.source.length, ids.review.length], [154, 154])
+  // Enough materialized paths that the bounded list's own marker carries a seven-digit count.
+  const materializedPaths = Array.from({ length: 50_000 }, (_, index) => `packages/p${index}/node_modules`)
+  const { source, review, verdict } = await deferOn(f, [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } })], 'r'.repeat(990), ids)
+  assert.equal(verdict.status, 'blocked', 'the review defers instead of throwing content_too_long')
+  assert.equal(taskOf(f.runtime, source.id).status, 'submitted')
   const reason = deferredReason(f)
+  assert.equal(verdict.output, reason)
   assert.ok(reason.length <= 1_000, `the composed reason stays within maxMessageChars: ${reason.length}`)
   assert.ok(reason.includes('dependency directories copied from the source: packages/p0/node_modules, '), reason)
-  assert.ok(reason.includes(`swarm_propose(replaces: ["${source.id}"], checks)`), reason)
-  const path = blocker(f, source)
-  assert.ok(path.startsWith(`review ${review.id} deferred its verdict on this artifact: a command could not run`), path)
-  assert.ok(path.includes(`swarm_cancel(taskId: "${source.id}", reason)`) && path.includes(`swarm_control(action: "resume", taskId: "${review.id}"`), path)
+  assert.match(reason, /… \[\d{7} more chars\]\): provide what it needs/)
+  const deferral = reason.slice(reason.lastIndexOf('\nReview '))
+  assert.deepEqual([deferral.split(source.id).length - 1, deferral.split(review.id).length - 1], [1, 1], `each id is named once: ${deferral}`)
+  await assertNamedCalls(reason, ['swarm_control', 'swarm_cancel', 'swarm_propose'])
+  assert.equal(blocker(f, source), `review ${review.id} deferred its verdict on this artifact: ${reason.slice(reason.indexOf('a command could not run'), -1)}`)
 
   const empty = await fakeFixture(t)
   await deferOn(empty, [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules', '.venv'], materializedPaths: [] } })])
   assert.ok(deferredReason(empty).includes('(dependency directories copied from the source: none of verificationDependencyDirs ["node_modules",".venv"])'), deferredReason(empty))
 
-  // Nothing materialized and a long configured list: the list is rendered through the same bound
-  // (unbounded, it made the deferral itself longer than maxMessageChars and swarm_verify threw).
+  // Nothing materialized and a long configured list: the list is rendered through the same bound.
   const configured = await fakeFixture(t, { maxMessageChars: 1_000 })
+  configured.workers.artifact = { ...configured.workers.artifact, commit: 'a'.repeat(64) }
   const dirs = Array.from({ length: 30 }, (_, index) => `vendor-bundle-${index}`)
-  const listed = await deferOn(configured, [unrunnable({ dependencyLinks: { mode: 'copy', dirs, materializedPaths: [] } })], 'r'.repeat(990))
+  const listed = await deferOn(configured, [unrunnable({ dependencyLinks: { mode: 'copy', dirs, materializedPaths: [] } })], 'r'.repeat(990),
+    { source: planTaskId('build-'), review: planTaskId('build-review-') })
   assert.equal(listed.verdict.status, 'blocked', 'the review defers')
   assert.equal(taskOf(configured.runtime, listed.source.id).status, 'submitted')
   const bounded = deferredReason(configured)
   assert.ok(bounded.length <= 1_000, `${bounded.length}: ${bounded}`)
   assert.match(bounded, /\(dependency directories copied from the source: none of verificationDependencyDirs \["vendor-bundle-0",[^)]*… \[\d+ more chars\]\): provide what it needs/)
 
-  // One adapter pass holding a failure of every kind: the failure that ended the pass gives the one exit.
+  // One adapter pass holding a failure of every kind: the last failure is the one that ended the pass.
   const mixed = await fakeFixture(t, { maxMessageChars: 1_000 })
   const every = await deferOn(mixed, [
     { command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' },
     { command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' },
-    unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } }),
+    unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths: ['node_modules'] } }),
   ], 'r'.repeat(990))
   assert.equal(every.verdict.status, 'blocked', 'the review defers')
-  const first = deferredReason(mixed)
-  assert.ok(first.length <= 1_000, `${first.length}: ${first}`)
-  assert.ok(first.includes(`a check reached its deadline: raise it with swarm_budget(taskId: "${every.source.id}", taskBudget: { checkTimeoutMs }, reason)`), first)
-  assert.doesNotMatch(first, /could not execute a check|could not run in the clean/, 'one exit, the first failure\'s')
-  assert.equal(blocker(mixed, every.source), `review ${every.review.id} deferred its verdict on this artifact: ${first.slice(first.indexOf('a check reached'), -1)}`)
+  const last = deferredReason(mixed)
+  assert.ok(last.length <= 1_000, `${last.length}: ${last}`)
+  assert.ok(last.includes('a command could not run in the clean verification checkout (dependency directories copied from the source: node_modules)'), last)
+  assert.doesNotMatch(last, /could not execute a check|reached its deadline/, 'one exit, the last failure\'s')
+  assert.equal(blocker(mixed, every.source), `review ${every.review.id} deferred its verdict on this artifact: ${last.slice(last.indexOf('a command could not run'), -1)}`)
+})
+
+/**
+ * 75b765a deferred on a bare exit code 124/126/127 (`DeclaredChecks.recoveryRequired`), so a
+ * WorkerAdapter that returned such rows without a kind left a stored deferral whose rows carry
+ * none. That review still decided to defer, so its blocker still names its resume exit.
+ */
+test('a stored deferral whose rows carry no kind still names the review\'s resume exit', async t => {
+  const f = await fakeFixture(t)
+  const { source, review } = await deferOn(f, [{ command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: npm: command not found' }])
+  f.runtime.store.transaction(() => { for (const run of hostRuns(f)) f.runtime.store.put('tool_runs', { ...run, result: { command: run.result.command, exitCode: 127, output: run.result.output } }) })
+  assert.ok(hostRuns(f).every(run => run.result.failureKind === undefined), 'the rows are what 75b765a stored')
+  const path = blocker(f, source)
+  assert.match(path, /swarm_control\(action: "resume"/, path)
+  assert.equal(path, `review ${review.id} deferred its verdict on this artifact: resume the review with swarm_control(action: "resume", taskId, reason)`)
+  await assertNamedCalls(path, ['swarm_control'])
 })
 
 test('the reason and the blocker take the exit from the deciding pass: the retry, and after a resume the latest deferral', async t => {
