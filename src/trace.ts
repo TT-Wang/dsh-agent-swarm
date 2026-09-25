@@ -229,8 +229,7 @@ export function hostTelemetryRecord(span: TraceSpan): HostTelemetryRecord {
  * One runtime's binding to the host sink. The service may be mounted before or
  * after this plugin (`ctx.inject` fires whenever it appears), so recorded spans
  * read a mutable link instead of a value captured at construction. The link
- * also holds the one failure policy of every span sink, the durable row
- * included (`contain`).
+ * also holds the one failure policy of span recording (`contain`).
  */
 export class HostTelemetryLink {
   private sink?: HostTelemetrySink
@@ -239,16 +238,16 @@ export class HostTelemetryLink {
   attach(sink: HostTelemetrySink | undefined): void { this.sink = sink }
   detach(): void { this.sink = undefined }
   bound(): boolean { return this.sink !== undefined }
-  /** The host contract's backend-failure policy, for every span sink: a throwing write is counted, never rethrown. */
-  contain<T>(write: () => T): T | undefined {
-    try { return write() } catch { this.failed++; return undefined }
+  /** Recording a span is best effort: a failure resolving, building or writing it (log or host sink) is counted, never rethrown. */
+  contain<T>(record: () => T): T | undefined {
+    try { return record() } catch { this.failed++; return undefined }
   }
   /** Hand one span to the host sink, when a backend is mounted. */
   emit(span: TraceSpan): void {
     const sink = this.sink
     if (sink !== undefined) this.contain(() => { sink.emit(hostTelemetryRecord(span)); this.emitted++ })
   }
-  /** Records enqueued and sink failures contained, for the round's instrument. */
+  /** Host records enqueued and recordings `contain` stopped, for the round's instrument. */
   counts(): { emitted: number; failed: number } { return { emitted: this.emitted, failed: this.failed } }
 }
 const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()
@@ -402,9 +401,9 @@ export class TraceRecorder {
    * Nothing is validated here, because every D6 clause holds where its value is
    * made: the mission row exists, the actor is the id the session guard
    * requires, `durationMs` is a monotonic whole count so the span cannot end
-   * before it starts, a failure names its closed `error.type`, and a parent is a
-   * valid stored span id. The whole recording follows the link's one failure
-   * policy, and (R17-G10) the host sink is fed only after the durable row.
+   * before it starts, a failure names its closed `error.type`, and a stored
+   * parent is kept only when its id is valid. The whole recording, `resolve`
+   * included, is best effort (`contain`); (R17-G10) the host sink is fed last.
    */
   record(step: TraceStep, resolve: () => SpanCall | undefined): TraceSpan | undefined {
     const span = this.telemetry.contain(() => {
