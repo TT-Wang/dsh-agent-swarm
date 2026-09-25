@@ -13,8 +13,9 @@
  *
  * Now `timeout` names swarm_budget's checkTimeoutMs, `infrastructure` names
  * the host repair, and `unrunnable` names the dependency directories the
- * checkout received (from the row's own environment record) and the
- * cancel-plus-replacement exit with its real tool parameters. The deferral
+ * checkout received (from the row's own environment record); `timeout` and
+ * `unrunnable` also name the cancel-plus-replacement exit with its real tool
+ * parameters, for a command that is itself wrong. The deferral
  * reason and the review-path blocker compose from the last classified failure
  * of the review's rows, the one that ended its deciding pass (the host stops a
  * pass at its first failing check). An exit names no id: the text around it
@@ -168,13 +169,38 @@ test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that e
   const { source, review, verdict } = await deferOn(f, [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }])
   assert.equal(verdict.status, 'blocked')
   const reason = deferredReason(f)
-  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${'a'.repeat(40)}, which remains submitted: a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason)`), reason)
-  assert.doesNotMatch(reason, /swarm_cancel/)
-  await assertNamedCalls(reason, ['swarm_budget', 'swarm_control'])
+  assert.ok(reason.includes(`\nReview ${review.id} deferred its verdict on the immutable source ${source.id} at ${'a'.repeat(40)}, which remains submitted: a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then resume the review with swarm_control(action: "resume", taskId, reason); or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands.`), reason)
+  await assertNamedCalls(reason, ['swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_propose'])
   await f.tool('swarm_budget', { taskId: source.id, taskBudget: { checkTimeoutMs: 90_000 }, reason: 'The suite needs a longer deadline' })
   assert.equal(taskOf(f.runtime, source.id).checkTimeoutMs, 90_000)
   assert.equal(taskOf(f.runtime, source.id).status, 'submitted')
   assert.equal((await resumeAndAccept(f, f.tool, review)).status, 'accepted')
+})
+
+/**
+ * A command that exits 124 itself (an inner `timeout`, or `exit 124`) is stored as `timeout` today,
+ * like the host's own check deadline; whether it should be is an open owner decision. While it defers,
+ * raising checkTimeoutMs cannot help it, so the exit that does (the command itself is wrong: withdraw
+ * the source and repair it with corrected checks) is named, and performed here end to end.
+ */
+test('a command\'s own exit 124 names the replacement exit, and that exit really works', async t => {
+  const f = await realFixture(t)
+  const source = f.propose({ checks: ['exit 124'] })
+  const { review, verify } = await submitForReview(f, source, answer(f))
+  assert.equal((await verify()).status, 'blocked', 'the review defers')
+  assert.equal(taskOf(f.runtime, source.id).status, 'submitted')
+  assert.deepEqual(hostRuns(f).map(run => [run.result.exitCode, /\[swarm\] Execution timed out/.test(run.result.output)]), [[124, false], [124, false]], 'no host deadline fired')
+  const reason = deferredReason(f)
+  assert.ok(reason.includes('; or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands.'), reason)
+  await assertNamedCalls(reason, ['swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_propose'])
+
+  await f.tool('swarm_cancel', { taskId: source.id, reason: 'the declared check exits 124 by itself' })
+  assert.equal(taskOf(f.runtime, review.id).status, 'cancelled', 'the deferred review is retired with its source')
+  const repair = await f.tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Implement the scoped change',
+    kind: 'implementation', scope: ['**'], replaces: [source.id], checks: ['test -f src/answer.txt'], assigneeId: f.author.id })
+  const next = await submitForReview(f, taskOf(f.runtime, repair.id), answer(f))
+  assert.equal((await next.verify()).status, 'accepted')
+  assert.equal(taskOf(f.runtime, repair.id).status, 'accepted', 'the repair carries the obligation to acceptance')
 })
 
 test('a host that could not execute the check names the host repair, never checkTimeoutMs or a replacement', async t => {

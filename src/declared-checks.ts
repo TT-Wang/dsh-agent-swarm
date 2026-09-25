@@ -32,14 +32,15 @@ export function unexecutedCheck(command: string, error: unknown): CheckResult {
 }
 
 const RESUME = 'resume the review with swarm_control(action: "resume", taskId, reason)'
+const REPLACE = 'or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands'
 /** The one exit per failure kind classified on the row, an older host's rows included; it names no id and bounds row data, so a deferral has a fixed maximum. */
 const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult) => string> = {
-  timeout: () => `a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then ${RESUME}`,
+  timeout: () => `a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then ${RESUME}; ${REPLACE}`,
   infrastructure: () => `the host could not execute a check: repair the host condition its output reports, then ${RESUME}`,
   unrunnable: ({ environment }) => {
     const links = environment?.dependencyLinks
     const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${excerpt(links.materializedPaths?.length ? links.materializedPaths.join(', ') : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`, 60)})`
-    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${RESUME}; or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands`
+    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${RESUME}; ${REPLACE}`
   },
 }
 

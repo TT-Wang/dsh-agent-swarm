@@ -118,7 +118,7 @@ export interface CheckEnvelope {
   totalRunMs: number
   maxRunMs: number
 }
-/** One declared check's outcome as the host recorded it; `failureKind`, classified where the row is produced, marks one that decides no verdict: its own deadline, a host that could not execute it, or exit 126/127 (it could not run in the checkout). */
+/** One declared check's outcome as the host recorded it; `failureKind`, classified where the row is produced, marks one that decides no verdict: exit 124 (the host's check deadline, or a command's own 124), a host that could not execute it, or exit 126/127 (it could not run in the checkout). */
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
   failureKind?: 'timeout' | 'infrastructure' | 'unrunnable'
   /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
