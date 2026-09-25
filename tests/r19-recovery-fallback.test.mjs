@@ -291,7 +291,12 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   assert.equal(event.data.memberId, f.reviewer.id, 'and the verifying member')
   assert.ok(typeof event.data.checkout === 'string' && event.data.checkout.startsWith(`${verification}/`), `the event names the checkout: ${event.data.checkout}`)
   assert.match(event.data.reason, /worktree remove refused/, 'the event carries the removal failure')
-  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.from === 'runtime' && delivery.notice?.trigger === 'task/verification-cleanup-failed')
+  // The owner fact, delivered on its own or, when the guard notices racing the verdict have spent the
+  // owner wake budget, carried by the window's summary as one of its constituent facts.
+  const notices = f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.from === 'runtime')
+    .flatMap(({ content, notice }) => notice?.aggregatedFacts === undefined ? [{ ...notice, content }]
+      : notice.aggregatedFacts.map(part => ({ ...part, content: notice.facts.slice(part.factStart, part.factStart + part.factCount).join('\n') })))
+    .filter(fact => fact.trigger === 'task/verification-cleanup-failed')
   assert.equal(notices.length, 1, 'one owner notice')
   assert.match(notices[0].content, /could not be removed/)
   assert.match(notices[0].content, /worktree remove refused/)
@@ -299,7 +304,7 @@ test('F. a verification checkout that cannot be removed is a durable event and a
   // The owner is told what the host guarantees, and never to run a repository-wide prune.
   assert.doesNotMatch(notices[0].content, /git worktree prune/)
   assert.match(notices[0].content, /The mission's next verification reclaims what is left of the checkout and its worktree registration, so no repository-wide prune is needed\./)
-  assert.ok(notices[0].notice.subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
+  assert.ok(notices[0].subjects.some(subject => subject.startsWith(`${source.id}@`)), 'the notice is attributed to the verified task')
   // What that promise covers: git refused the registration again after the tree was removed, and the next verification reclaims it.
   const registered = async () => (await git(f.source, 'worktree', 'list', '--porcelain')).split('\n').filter(line => line.startsWith('worktree ') && line.includes(`/${f.mission.id}/verification/`))
   assert.equal((await registered()).length, 1, 'the refused registration outlives this verification')
