@@ -253,10 +253,9 @@ export class HostTelemetryLink {
 const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()
 /**
  * The telemetry link belongs to the runtime object, not to the recorder: the
- * recorder is built by `src/tools.ts` (outside this change's scope) while the
- * cordis context that owns the sink is only available in `src/index.ts`, so the
- * two meet on the runtime identity they already share. Binding first or
- * attaching later both yield one shared link.
+ * recorder is built by `src/tools.ts` while the cordis context that owns the
+ * sink is only available in `src/index.ts`, so the two meet on the runtime
+ * identity they already share, and whichever binds first creates the one link.
  */
 export function bindHostTelemetry(runtime: object): HostTelemetryLink {
   const existing = hostTelemetryLinks.get(runtime)

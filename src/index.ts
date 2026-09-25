@@ -120,13 +120,9 @@ export const Config: z<Config> = z.object({
  * registry instead of importing the host package: `ctx.inject` fires whether the
  * backend is mounted before or after this plugin, and a composition with no
  * backend mounted records exactly as before (durable span rows, no sink) — the
- * host's own "no backend" behaviour, not this plugin's silence. The link is
- * created before `registerTools` builds the recorder and shared through the
- * runtime identity, because the recorder's construction site (`src/tools.ts`) is
- * outside this change's scope while the context is only available here. The
- * disposer detaches the sink with the plugin fiber, so no backend keeps a
- * reporter after unload; the fiber is returned so a caller (and the pair test)
- * can reach it.
+ * host's own "no backend" behaviour, not this plugin's silence. The disposer
+ * detaches the sink with the plugin fiber, so no backend keeps a reporter after
+ * unload; the fiber is returned so a caller (and the pair test) can reach it.
  */
 export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
   const link = bindHostTelemetry(runtime as object)
@@ -169,8 +165,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const owner = mission === undefined ? undefined : ctx.agents.get(SessionId(mission.ownerSessionId))
     if (owner !== undefined) pruneOwnerInbox(owner)
   }), 'swarm.owner-inbox-relevance')
-  // R17-G10: the host sink link exists before the recorder does; `registerTools`
-  // builds the recorder from the runtime identity this binding is keyed on.
   installHostTelemetry(ctx, runtime)
   registerTools(ctx, runtime, config.defaultBudget, grants)
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.

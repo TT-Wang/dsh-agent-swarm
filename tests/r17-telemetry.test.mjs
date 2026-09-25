@@ -101,6 +101,7 @@ test('no backend mounted: the span still records and no transport is invented', 
   const runtime = runtimeFor(root)
   const recorder = TraceRecorder.forRuntime(runtime)
   assert.equal(recorder.telemetry.bound(), false, 'a runtime nobody bound has no sink attached')
+  assert.equal(bindHostTelemetry(runtime), recorder.telemetry, 'a binding made after the recorder is built is the link the recorder holds')
   const span = recorder.record('swarm_publish', spanCall('mission-2'))
   assert.equal(runtime.store.rows.length, 1)
   assert.equal(runtime.store.rows[0].data.spanId, span.spanId)
