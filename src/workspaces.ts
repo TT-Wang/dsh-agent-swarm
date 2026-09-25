@@ -890,8 +890,7 @@ export class Workspaces {
         if (!(error instanceof Error) || !WORKTREE_METADATA_RACE.test(error.message)) throw error
         // Another process outside this manager can still publish the metadata
         // non-atomically. Reclaim this target by path and retry exactly once.
-        await this.forceRemove(target).catch(() => undefined)
-        await this.git(cwd, ['worktree', 'remove', '--force', '--force', target], signal).catch(() => undefined)
+        await this.reclaim(cwd, target, signal)
         await this.git(cwd, ['worktree', 'add', '--detach', target, commit], signal)
       }
     })
@@ -2008,24 +2007,27 @@ export class Workspaces {
   /**
    * Remove this verification's checkout, then every checkout of its mission no verification in this
    * process owns (a crash left it): the entries of its canonical `verification/` and the registrations
-   * naming a path there. Git removes the own checkout; a refusal is reported and the checkout reclaimed.
-   * Reclaiming removes the tree as what it is (a link is never followed), then the registration of the
-   * now missing path, which git cannot resolve to another worktree. Nothing else is touched or pruned.
+   * naming a path there. Git removes the own checkout; a refusal is reported and the checkout reclaimed
+   * (`reclaim`), as every leftover is. Nothing else is touched or pruned.
    * Best effort by contract: what resists stays for the mission's next verification; nothing is thrown.
    */
   private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
-    const remove = async (candidate: string): Promise<string> => await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', candidate])
-    const reclaim = async (candidate: string): Promise<void> => { await this.forceRemove(candidate); await remove(candidate).catch(() => undefined) }
-    await remove(checkout).catch(async (removal: unknown) => {
+    await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', checkout]).catch(async (removal: unknown) => {
       if (!(await lstat(checkout).then(() => true, () => false))) return
-      const failure = await reclaim(checkout).then(() => removal, (error: unknown) => error)
+      const failure = await this.queueWorktree(source, async () => await this.reclaim(source, checkout)).then(() => removal, (error: unknown) => error)
       try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
     })
     const directory = path.dirname(checkout)
     if (await realpath(directory).catch(() => undefined) !== directory) return
     const registered = (await this.worktreeGit(source, ['worktree', 'list', '--porcelain', '-z']).catch(() => '')).split('\0').flatMap(line => line.startsWith('worktree ') ? [line.slice('worktree '.length)] : [])
     const leftovers = new Set([...(await readdir(directory).catch(() => [])).map(name => path.join(directory, name)), ...registered.filter(candidate => path.dirname(candidate) === directory)])
-    for (const candidate of leftovers) if (!verificationCheckouts.has(candidate)) await reclaim(candidate).catch(() => undefined)
+    for (const candidate of leftovers) if (!verificationCheckouts.has(candidate)) await this.queueWorktree(source, async () => await this.reclaim(source, candidate)).catch(() => undefined)
+  }
+
+  /** Reclaim a checkout by path in the caller's worktree queue: the tree as what it is, then the registration (even locked) of the now missing path; a tree that resists is thrown before git sees its path. */
+  private async reclaim(cwd: string, target: string, signal?: AbortSignal): Promise<void> {
+    await this.forceRemove(target)
+    await this.git(cwd, ['worktree', 'remove', '--force', '--force', target], signal).catch(() => undefined)
   }
 
   /** Remove `target` after restoring owner access to each directory in it (unlink needs no more); a link is never followed. */

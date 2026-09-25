@@ -126,3 +126,31 @@ test('W4: the metadata-race retry reclaims only its own target and leaves the us
   assert.equal(await git(workspace, 'rev-parse', 'HEAD'), await git(member.workspace, 'rev-parse', 'HEAD'), 'the retried checkout starts at the mission snapshot')
   assert.match(await git(source, 'worktree', 'list', '--porcelain'), new RegExp(`^worktree ${user}$`, 'm'), 'the user\'s worktree stays registered')
 })
+
+/**
+ * The retry reclaims its target through the one reclaim step, the tree and
+ * then the registration of that path. A tree that resists is the retry's
+ * failure: git never sees a path whose tree is still there, so it cannot
+ * resolve that path to another worktree.
+ */
+test('W4: a raced target whose tree resists the reclaim fails the add and is never handed to git', async t => {
+  const { source, workspaces, mission } = await fixture(t)
+  const nativeGit = workspaces.git.bind(workspaces)
+  const mutations = []
+  let target
+  workspaces.git = async (cwd, args, ...rest) => {
+    if (isMutation(args)) mutations.push(args[1])
+    if (mutations.length === 1 && args[1] === 'add') {
+      target = args[3]
+      await mkdir(target, { recursive: true })
+      await writeFile(path.join(target, 'left.txt'), 'partial\n')
+      throw new Error(`fatal: failed to read ${path.join(source, '.git', 'worktrees', 'publishing', 'commondir')}: Success`)
+    }
+    return await nativeGit(cwd, args, ...rest)
+  }
+  const nativeForceRemove = workspaces.forceRemove.bind(workspaces)
+  workspaces.forceRemove = async candidate => { if (candidate === target) throw new Error(`EPERM: the tree at ${candidate} resists`); return await nativeForceRemove(candidate) }
+  await assert.rejects(workspaces.prepareWorkspace(mission, 'raced'), /EPERM: the tree at .* resists/, 'the reclaim failure is the add\'s failure')
+  assert.deepEqual(mutations, ['add'], 'no registration removal and no second add reached git')
+  assert.equal(await readFile(path.join(target, 'left.txt'), 'utf8'), 'partial\n', 'the resisting tree is left as it was')
+})
