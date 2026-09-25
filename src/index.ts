@@ -166,7 +166,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     if (owner !== undefined) pruneOwnerInbox(owner)
   }), 'swarm.owner-inbox-relevance')
   installHostTelemetry(ctx, runtime)
-  registerTools(ctx, runtime, config.defaultBudget, grants)
+  registerTools(ctx, runtime, config.defaultBudget)
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
   new RoleScoper(ctx, runtime)
@@ -176,6 +176,6 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
-  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
-  await runtime.start(grants)
+  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
+  await runtime.start()
 }

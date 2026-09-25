@@ -28,14 +28,14 @@ const plan = workspace => ({
 })
 /** swarm_create takes the mission fields only; members, workstreams and tasks are not its parameters. */
 const missionFields = workspace => { const { members: _m, workstreams: _w, tasks: _t, ...fields } = plan(workspace); return fields }
-function definitions(runtime, grants) {
+function definitions(runtime) {
   const registered = new Map()
-  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget, grants)
+  registerTools({ tools: { register: definition => registered.set(definition.name, definition) } }, runtime, budget)
   return registered
 }
-function fakeRuntime() {
+function fakeRuntime(grants) {
   const calls = { created: [], staged: [] }
-  return makeRuntimeStub({ calls,
+  return makeRuntimeStub({ calls, config: { grants },
     create: (_actor, input) => { calls.created.push(input); return { id: 'mission-1', ...input } },
     createDraft: (_actor, input) => { calls.staged.push(input); return { id: 'draft-1', revision: 1, status: 'draft', input } },
     snapshot: () => undefined,
@@ -87,7 +87,7 @@ test('AC1: a path outside the session cwd and every configured root is refused w
   // The session workspace itself is still accepted, and a sibling is not.
   assert.equal((await authorizeWorkspace(session, session, grants)).ok, true)
   assert.equal((await authorizeWorkspace(project, session, grants)).ok, true)
-  const tools = definitions(fakeRuntime(), grants)
+  const tools = definitions(fakeRuntime(grants))
   const runtime = tools.get('swarm_create')
   const calls = []
   const exec = execution(session)
@@ -102,12 +102,12 @@ test('AC2: a granted repository is accepted and the mission records the matched 
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
   const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
-  await runtime.start(grants)
+  await runtime.start()
   const loaded = runtime.store.events('swarm/install', 50).filter(event => event.type === 'workspace/grant-loaded')
   assert.equal(loaded.length, 1, 'one grant-loaded audit event per configured root')
   assert.equal(loaded[0].data.path, await realpath(granted))
   assert.equal(loaded[0].data.note, 'human-approved tree')
-  const tools = definitions(runtime, grants)
+  const tools = definitions(runtime)
   const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
   const recorded = runtime.store.get('missions', created.result.id)
   assert.equal(recorded.workspace, await realpath(project), 'the resolved path is recorded')
@@ -123,7 +123,7 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
   const { session, granted, project, outside } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
   const { runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(grants) })
-  const tools = definitions(runtime, grants)
+  const tools = definitions(runtime)
   // No workspace-bound tool exposes a grant field in its model-visible schema.
   for (const name of ['swarm_create', 'swarm_stage', 'swarm_propose']) {
     const properties = Object.keys(tools.get(name).parameters.properties)
@@ -179,12 +179,12 @@ test('The planning tools hand the runtime their binding\'s authorization beside 
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
   const received = []
-  const runtime = makeRuntimeStub({
+  const runtime = makeRuntimeStub({ config: { grants },
     create: (_actor, input, claim) => { received.push({ input, claim }); return { id: 'mission-1', ...input } },
     createDraft: (_actor, input, claim) => { received.push({ input, claim }); return { id: 'draft-1', revision: 1, status: 'draft', input } },
     snapshot: () => undefined,
   })
-  const tools = definitions(runtime, grants)
+  const tools = definitions(runtime)
   for (const [name, args] of [['swarm_create', missionFields], ['swarm_stage', plan]]) {
     await tools.get(name).execute(args(session), execution(session))
     await tools.get(name).execute(args(project), execution(session))
@@ -325,7 +325,7 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
   const workerSession = member.sessionId
   assert.throws(() => runtime.create({ sessionId: workerSession }, { title: 'Worker mission', objective: 'Escape', workspace: projectPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, grant), /Workers cannot/)
   assert.throws(() => runtime.createDraft({ sessionId: workerSession }, plan(projectPath), grant), /Workers cannot/)
-  const tools = definitions(runtime, grants)
+  const tools = definitions(runtime)
   await assert.rejects(tools.get('swarm_create').execute(missionFields(projectPath), execution(session, workerSession)), /Workers cannot/)
   // Another owner session of this install cannot re-point the mission, and
   // cannot launch the owner's draft.
@@ -366,7 +366,7 @@ test('AC6: a removed root refuses new missions and fences a running mission with
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
-  await runtime.start(before)
+  await runtime.start()
   await eventually(() => workers.prepared.length > 0, 'the mission never started working', 15000)
   await runtime.dispose()
   // Human removes the root and restarts: the same durable state, no grant.
@@ -374,7 +374,7 @@ test('AC6: a removed root refuses new missions and fences a running mission with
   const restarted = new SwarmRuntime(wired(after, config), workspaceWorkers())
   t.after(async () => { await restarted.dispose() })
   assert.throws(() => restarted.create(owner, { title: 'New', objective: 'New mission in a revoked root', workspace: projectPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: grantedPath, source: 'grant' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await restarted.start(after)
+  await restarted.start()
   const blocked = await eventually(() => restarted.store.list('tasks', mission.id).find(task => task.status === 'blocked'), 'the running mission was not fenced', 15000)
   assert.match(blocked.output, new RegExp(WORKSPACE_AUTHORIZATION_CODE))
   const revoked = restarted.store.events(mission.id, 200).filter(event => event.type === 'mission/workspace-revoked')
@@ -718,7 +718,7 @@ test('A worker start is preceded by the runtime check: a revoked root fences onc
   const workers = opening()
   const restarted = new SwarmRuntime(wired(removed, config), workers)
   t.after(async () => { await restarted.dispose() })
-  await restarted.start(removed)
+  await restarted.start()
   for (let pass = 0; pass < 3; pass++) { await restarted.tick(); await restarted.settle(mission.id) }
   assert.equal(restarted.store.get('tasks', task.id).status, 'blocked', 'the start path fenced the mission')
   assert.match(restarted.store.get('tasks', task.id).output, new RegExp(WORKSPACE_AUTHORIZATION_CODE))

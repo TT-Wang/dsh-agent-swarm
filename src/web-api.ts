@@ -15,7 +15,7 @@ import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, PlanInput, PlanMember, TaskAmendment, WorkspaceGrantSnapshot } from './types.ts'
+import type { Actor, Budget, PlanInput, PlanMember, RuntimeConfig, TaskAmendment } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -23,12 +23,6 @@ import { waitForStateChange } from './watch.ts'
 interface WebApiOptions {
   defaultBudget: Budget
   maxPayloadBytes: number
-  /**
-   * The human-authorized roots loaded once at plugin start. The browser path
-   * enforces the same containment check as the model tool path; absent in unit
-   * fixtures, where the session cwd alone remains the authorization.
-   */
-  grants?: WorkspaceGrantSnapshot
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -140,11 +134,11 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
  * resolve inside a configured authorized root. The refusal is a field-level
  * diagnostic naming the authorization requirement, never a bare cwd-equality error.
  */
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
+async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, config: Pick<RuntimeConfig, 'grants' | 'verificationDependencyDirs'>): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
   const input = object(body.input)
-  const authorization = await authorizeWorkspace(text(input, 'workspace'), header.cwd, grants)
+  const authorization = await authorizeWorkspace(text(input, 'workspace'), header.cwd, config.grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs }), true)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs: config.verificationDependencyDirs }), true)
   await validateModels(ctx, header.id, plan.members, signal, false)
   return [plan, authorization]
 }
@@ -182,7 +176,6 @@ async function validateModels(ctx: Context, ownerId: SessionId, members: Pick<Pl
  */
 export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: WebApiOptions): void {
   if (!Number.isSafeInteger(options.maxPayloadBytes) || options.maxPayloadBytes < 1) throw new Error('maxPayloadBytes must be a positive integer')
-  const grants: WorkspaceGrantSnapshot = options.grants ?? { grants: [], loadedAt: Date.now(), unresolved: [] }
   const lifetime = new AbortController()
   ctx.effect(() => () => lifetime.abort(new Error('Swarm web API was unloaded')), 'agent-swarm: watches')
   const stateFor = (actor: Actor, header: SessionHeader, changed?: ReadonlySet<string>): { state: LiveState; missionIds: string[] } => {
@@ -294,9 +287,9 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(ctx, body, header, signal, runtime.config))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(ctx, body, header, signal, runtime.config))) } }
         case 'discard-draft': {
           const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }

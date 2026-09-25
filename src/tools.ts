@@ -207,7 +207,7 @@ function assertToolArguments(name: string, schema: JsonSchemaNode, args: Args): 
  * no cwd, and return the canonical workspace plus the matched root so the
  * mission records both durably.
  */
-async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot): Promise<WorkspaceAuthorized> {
+async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot | undefined): Promise<WorkspaceAuthorized> {
   const cwd = exec.agent?.session?.header?.cwd
   if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('[session_workspace_missing] Swarm planning tools require an agent session workspace; call `swarm_stage` or `swarm_create` from a session whose cwd is inside the authorized `workspace` and retry the same request.')
   const authorization = await authorizeWorkspace(requested, cwd, grants)
@@ -266,10 +266,7 @@ function spanContext(runtime: SwarmRuntime, step: string, sessionId: string, arg
 }
 
 /** Install tools with host-derived identity and durable UI metadata. */
-export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget, grants?: WorkspaceGrantSnapshot): void {
-  // No grants supplied (unit fixtures) means the only authorization is the
-  // calling session's own cwd — the pre-feature H4 boundary, never wider.
-  const authorized: WorkspaceGrantSnapshot = grants ?? { grants: [], loadedAt: Date.now(), unresolved: [] }
+export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget): void {
   // One recorder per runtime: every mission-scoped orchestration step emits a
   // durable `trace/span` row carrying the digest and size of its input and
   // output; the bytes themselves are not retained.
@@ -312,7 +309,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         const command = async (): Promise<unknown> => {
           assertToolArguments(name, definition.parameters, args)
           if (typeof run === 'function') return await run(args, actor, called)
-          const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
+          const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), runtime.config.grants)
           args = { ...args, workspace: authorization.workspace }
           return await run.bound(args, actor, authorization)
         }

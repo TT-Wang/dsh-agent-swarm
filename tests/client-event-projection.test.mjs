@@ -60,7 +60,7 @@ test('the real runtime snapshot projects the workspace binding into the compact 
   const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
   const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: granting(grants) })
-  await runtime.start(grants)
+  await runtime.start()
   const owner = { sessionId: 'owner-bound' }
   const mission = runtime.create(owner, { title: 'Bound mission', objective: 'Work inside a human-authorized root',
     workspace: await realpath(project), scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: await realpath(granted), source: 'grant' })
@@ -92,7 +92,7 @@ test('a real restart with the human root removed projects the revocation with it
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = before.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   before.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
-  await before.start(grants)
+  await before.start()
   await eventually(() => workers.prepared.length > 0, 'the mission never started working', 15000)
   await before.dispose()
   // A human removes the root and restarts the host: the same durable state, no grant.

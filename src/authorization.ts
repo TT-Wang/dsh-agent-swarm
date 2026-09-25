@@ -115,13 +115,16 @@ export function claimFor(workspace: string, session: string | undefined, loaded:
   return grant === undefined ? undefined : { grantRoot: grant.path, source: 'grant' }
 }
 
+/** A runtime with no loaded roots (unit runtimes): the calling session's own directory is the only authorization. */
+const NO_GRANTS: WorkspaceGrantSnapshot = { grants: [], loadedAt: 0, unresolved: [] }
+
 /**
  * Admission: the requested path is realpath-resolved before `claimFor`, so a
  * symlinked root or workspace is judged by where it actually points; prefix
  * confusion and traversal cannot pass because containment is decided on
  * resolved path components, not string prefixes.
  */
-export async function authorizeWorkspace(requested: string, sessionCwd: string | undefined, loaded: WorkspaceGrantSnapshot, now = Date.now()): Promise<WorkspaceAuthorization> {
+export async function authorizeWorkspace(requested: string, sessionCwd: string | undefined, loaded: WorkspaceGrantSnapshot = NO_GRANTS, now = Date.now()): Promise<WorkspaceAuthorization> {
   const workspace = await realpath(requested).catch(() => undefined)
   if (workspace === undefined) return { ok: false, diagnostic: workspaceAuthorizationDiagnostic(requested, loaded, 'the path does not exist or cannot be resolved') }
   const session = typeof sessionCwd === 'string' && sessionCwd.trim() !== '' ? await realpath(sessionCwd).catch(() => undefined) : undefined

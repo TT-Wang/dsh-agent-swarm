@@ -263,7 +263,7 @@ export const makeWorkspaces = (dir, overrides) => new Workspaces(workspaceOption
  * dependency every component reads is added here once; `overrides` supplies
  * the rest and wins.
  */
-export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), ...overrides })
+export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: {}, ...overrides })
 
 /**
  * Runtime + mission + two members + a propose helper. The runtime, store,

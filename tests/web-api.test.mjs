@@ -34,7 +34,7 @@ class Workers extends FakeWorkers {
   async prepareWorkspace(mission, id) { this.workspaces.push(id); return path.join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec.member.id) }
 }
-/** `grants` wires the runtime and the web API to one loaded snapshot, as src/index.ts does. */
+/** `grants` is the runtime's one loaded snapshot, which the web API reads from it, as src/index.ts wires the plugin. */
 async function fixture(t, { grants } = {}) {
   // Registered before makeRuntime's cleanup, so the runtime and then the host
   // composition are disposed before the temp dir goes.
@@ -100,7 +100,7 @@ async function fixture(t, { grants } = {}) {
   } })
   await ownerFiber
   ctx.sessions.create(SessionId('other-owner'), { meta: { cwd: workspace } })
-  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192, grants }) } })
+  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
   await bridge
   const port = ctx.webServer.port
   const authority = `127.0.0.1:${port}`
