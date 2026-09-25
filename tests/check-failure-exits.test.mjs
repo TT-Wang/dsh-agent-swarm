@@ -15,9 +15,11 @@
  * the host repair, and `unrunnable` names the dependency directories the
  * checkout received (from the row's own environment record) and the
  * cancel-plus-replacement exit with its real tool parameters. The deferral
- * reason and the review-path blocker compose from the kinds present. Each
- * exit is performed here through the registered tools, so a named parameter
- * that the published schema does not declare is refused.
+ * reason and the review-path blocker compose from the failure that ended the
+ * deciding pass (the host stops a pass at its first failing check), so the
+ * reason has a fixed maximum whatever the row carries. Each exit is performed
+ * here through the registered tools, so a named parameter that the published
+ * schema does not declare is refused.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -198,11 +200,13 @@ test('a 127 row a 75b765a host stored as infrastructure still defers, with the i
   assert.match(blocker(f, source), new RegExp(`^review ${review.id} deferred its verdict on this artifact: the host could not execute a check`))
 })
 
-test('the review-path blocker composes the unrunnable exits from the stored row, and the reason fits the message bound', async t => {
+const unrunnable = environment => ({ command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: tool: command not found', environment })
+
+test('the review-path blocker composes the unrunnable exits from the stored row, and the reason fits the smallest message bound whatever the row carries', async t => {
   const f = await fakeFixture(t, { maxMessageChars: 1_000 })
+  f.workers.artifact = { ...f.workers.artifact, commit: 'a'.repeat(64) }
   const materializedPaths = Array.from({ length: 40 }, (_, index) => `packages/p${index}/node_modules`)
-  const { source, review } = await deferOn(f, [{ command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: tool: command not found',
-    environment: { dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } } }], 'r'.repeat(990))
+  const { source, review } = await deferOn(f, [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } })], 'r'.repeat(990))
   const reason = deferredReason(f)
   assert.ok(reason.length <= 1_000, `the composed reason stays within maxMessageChars: ${reason.length}`)
   assert.ok(reason.includes('dependency directories copied from the source: packages/p0/node_modules, '), reason)
@@ -212,7 +216,31 @@ test('the review-path blocker composes the unrunnable exits from the stored row,
   assert.ok(path.includes(`swarm_cancel(taskId: "${source.id}", reason)`) && path.includes(`swarm_control(action: "resume", taskId: "${review.id}"`), path)
 
   const empty = await fakeFixture(t)
-  await deferOn(empty, [{ command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: tool: command not found',
-    environment: { dependencyLinks: { mode: 'copy', dirs: ['node_modules', '.venv'], materializedPaths: [] } } }])
+  await deferOn(empty, [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules', '.venv'], materializedPaths: [] } })])
   assert.ok(deferredReason(empty).includes('(dependency directories copied from the source: none of verificationDependencyDirs ["node_modules",".venv"])'), deferredReason(empty))
+
+  // Nothing materialized and a long configured list: the list is rendered through the same bound
+  // (unbounded, it made the deferral itself longer than maxMessageChars and swarm_verify threw).
+  const configured = await fakeFixture(t, { maxMessageChars: 1_000 })
+  const dirs = Array.from({ length: 30 }, (_, index) => `vendor-bundle-${index}`)
+  const listed = await deferOn(configured, [unrunnable({ dependencyLinks: { mode: 'copy', dirs, materializedPaths: [] } })], 'r'.repeat(990))
+  assert.equal(listed.verdict.status, 'blocked', 'the review defers')
+  assert.equal(taskOf(configured.runtime, listed.source.id).status, 'submitted')
+  const bounded = deferredReason(configured)
+  assert.ok(bounded.length <= 1_000, `${bounded.length}: ${bounded}`)
+  assert.match(bounded, /\(dependency directories copied from the source: none of verificationDependencyDirs \["vendor-bundle-0",[^)]*… \[\d+ more chars\]\): provide what it needs/)
+
+  // One adapter pass holding a failure of every kind: the failure that ended the pass gives the one exit.
+  const mixed = await fakeFixture(t, { maxMessageChars: 1_000 })
+  const every = await deferOn(mixed, [
+    { command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' },
+    { command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' },
+    unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths } }),
+  ], 'r'.repeat(990))
+  assert.equal(every.verdict.status, 'blocked', 'the review defers')
+  const first = deferredReason(mixed)
+  assert.ok(first.length <= 1_000, `${first.length}: ${first}`)
+  assert.ok(first.includes(`a check reached its deadline: raise it with swarm_budget(taskId: "${every.source.id}", taskBudget: { checkTimeoutMs }, reason)`), first)
+  assert.doesNotMatch(first, /could not execute a check|could not run in the clean/, 'one exit, the first failure\'s')
+  assert.equal(blocker(mixed, every.source), `review ${every.review.id} deferred its verdict on this artifact: ${first.slice(first.indexOf('a check reached'), -1)}`)
 })

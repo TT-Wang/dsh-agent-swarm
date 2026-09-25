@@ -35,13 +35,14 @@ export function unexecutedCheck(command: string, error: unknown): CheckResult {
  * The one exit per failure kind, keyed by the kind the host classified where it produced the row.
  * A deferral's reason and the review-path blocker both compose from it, so a row an older host
  * stored reads through the same table (a 126/127 row stored as `infrastructure` gets that exit).
+ * An exit renders row data only through one bound, so a deferral's text has a fixed maximum.
  */
 const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult, sourceId: string, resume: string) => string> = {
   timeout: (_check, sourceId, resume) => `a check reached its deadline: raise it with swarm_budget(taskId: "${sourceId}", taskBudget: { checkTimeoutMs }, reason), then ${resume}`,
   infrastructure: (_check, _sourceId, resume) => `the host could not execute a check: repair the host condition its output reports, then ${resume}`,
   unrunnable: ({ environment }, sourceId, resume) => {
     const links = environment?.dependencyLinks
-    const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${links.materializedPaths?.length ? excerpt(links.materializedPaths.join(', '), 80) : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`})`
+    const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${excerpt(links.materializedPaths?.length ? links.materializedPaths.join(', ') : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`, 80)})`
     return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${resume}; or, if the command itself is wrong, cancel the source with swarm_cancel(taskId: "${sourceId}", reason) and repair it with swarm_propose(replaces: ["${sourceId}"], checks) holding corrected commands`
   },
 }
@@ -183,11 +184,10 @@ export class DeclaredChecks {
     return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
   }
 
-  /** The exit of each failure kind among these checks, for one review of one source. */
-  recoveryExits(checks: ReadonlyArray<CheckResult>, sourceId: string, reviewId: string): string {
-    const resume = `resume review ${reviewId} with swarm_control(action: "resume", taskId: "${reviewId}", reason: "condition repaired")`
-    const kinds = new Map(checks.flatMap(check => check.failureKind === undefined ? [] : [[check.failureKind, check] as const]))
-    return [...kinds].map(([kind, check]) => RECOVERY_EXITS[kind](check, sourceId, resume)).join('; ')
+  /** The exit of the failure that ended this pass (the host stops a pass at its first failing check), for one review of one source. */
+  recoveryExit(checks: ReadonlyArray<CheckResult>, sourceId: string, reviewId: string): string {
+    const failure = checks.find(check => check.failureKind !== undefined)
+    return failure?.failureKind === undefined ? '' : RECOVERY_EXITS[failure.failureKind](failure, sourceId, `resume review ${reviewId} with swarm_control(action: "resume", taskId: "${reviewId}", reason: "condition repaired")`)
   }
 
   /** The pass a deferred review decided on: the last host-verification pass it recorded. */
