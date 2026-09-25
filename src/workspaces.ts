@@ -1942,6 +1942,7 @@ export class Workspaces {
         for (const command of task.checks) {
           signal.throwIfAborted()
           let result: Awaited<ReturnType<typeof runProcess>>
+          let deadline = false
           try {
             const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
             result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
@@ -1963,6 +1964,7 @@ export class Workspaces {
               break
             }
             signal.throwIfAborted()
+            deadline = true
             const captured = new ProcessOutput(this.options.maxCheckOutputBytes, false)
             captured.push(Buffer.from(`[swarm] ${error.message}\n`))
             captured.push(Buffer.from(error.captured.output))
@@ -1976,7 +1978,7 @@ export class Workspaces {
           // failing test names, the TAP summary and the stage that failed.
           const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
             : { index: results.length + 1, command, ...result.attribution }
-          results.push({ command, exitCode: result.exitCode, ...(result.exitCode === 124 ? { failureKind: 'timeout' as const } : [126, 127].includes(result.exitCode) ? { failureKind: 'unrunnable' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output: result.output, truncated: result.truncated })
+          results.push({ command, exitCode: result.exitCode, ...(deadline ? { failureKind: 'timeout' as const } : [126, 127].includes(result.exitCode) ? { failureKind: 'unrunnable' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output: result.output, truncated: result.truncated })
           if (result.exitCode !== 0) break
         }
         return results

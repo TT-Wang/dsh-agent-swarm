@@ -178,29 +178,20 @@ test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that e
 })
 
 /**
- * A command that exits 124 itself (an inner `timeout`, or `exit 124`) is stored as `timeout` today,
- * like the host's own check deadline; whether it should be is an open owner decision. While it defers,
- * raising checkTimeoutMs cannot help it, so the exit that does (the command itself is wrong: withdraw
- * the source and repair it with corrected checks) is named, and performed here end to end.
+ * A command that exits 124 itself (an inner `timeout`, or `exit 124`) ran and
+ * failed: only the host's own deadline is a timeout, classified where it fires.
+ * Its review therefore decides: the source is rejected like any assertion
+ * failure, never deferred with a checkTimeoutMs exit that could not help it.
  */
-test('a command\'s own exit 124 names the replacement exit, and that exit really works', async t => {
+test('a command\'s own exit 124 is its verdict: the source is rejected, never deferred', async t => {
   const f = await realFixture(t)
   const source = f.propose({ checks: ['exit 124'] })
-  const { review, verify } = await submitForReview(f, source, answer(f))
-  assert.equal((await verify()).status, 'blocked', 'the review defers')
-  assert.equal(taskOf(f.runtime, source.id).status, 'submitted')
-  assert.deepEqual(hostRuns(f).map(run => [run.result.exitCode, /\[swarm\] Execution timed out/.test(run.result.output)]), [[124, false], [124, false]], 'no host deadline fired')
-  const reason = deferredReason(f)
-  assert.ok(reason.includes('; or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands.'), reason)
-  await assertNamedCalls(reason, ['swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_propose'])
-
-  await f.tool('swarm_cancel', { taskId: source.id, reason: 'the declared check exits 124 by itself' })
-  assert.equal(taskOf(f.runtime, review.id).status, 'cancelled', 'the deferred review is retired with its source')
-  const repair = await f.tool('swarm_propose', { workstreamId: f.stream.id, title: 'Repair', objective: 'Implement the scoped change',
-    kind: 'implementation', scope: ['**'], replaces: [source.id], checks: ['test -f src/answer.txt'], assigneeId: f.author.id })
-  const next = await submitForReview(f, taskOf(f.runtime, repair.id), answer(f))
-  assert.equal((await next.verify()).status, 'accepted')
-  assert.equal(taskOf(f.runtime, repair.id).status, 'accepted', 'the repair carries the obligation to acceptance')
+  const { verify } = await submitForReview(f, source, answer(f))
+  await verify()
+  assert.deepEqual(hostRuns(f).map(run => [run.result.exitCode, run.result.failureKind, /\[swarm\] Execution timed out/.test(run.result.output)]), [[124, undefined, false], [124, undefined, false]], 'both attempts ran to their own exit: no host deadline fired, so no failure kind')
+  assert.equal(taskOf(f.runtime, source.id).status, 'blocked', 'the source is rejected')
+  assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 0)
+  assert.equal(events(f.runtime, f.mission.id, 'task/rejected').length, 1)
 })
 
 test('a host that could not execute the check names the host repair, never checkTimeoutMs or a replacement', async t => {

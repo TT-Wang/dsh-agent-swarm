@@ -89,13 +89,13 @@ test('a missing command is an unrunnable row with its own output and the environ
 })
 
 /**
- * The timeout row is the host's own check deadline firing. What a command's own
- * exit 124 (an inner `timeout`) should classify as is an open owner decision, so
- * it is deliberately not pinned here.
+ * The timeout row is the host's own check deadline firing, classified where the
+ * deadline fires. A command's own exit 124 (an inner `timeout`, or `exit 124`)
+ * is the command's verdict, an assertion like exit 1.
  */
-test('a command the checkout cannot execute (exit 126) is unrunnable; the host\'s check deadline is a timeout; an assertion is neither', async t => {
+test('a command the checkout cannot execute (exit 126) is unrunnable; the host\'s check deadline is a timeout; an assertion, a command\'s own 124 included, is neither', async t => {
   const { workspaces, member, task, artifact } = await fixture(t)
-  for (const [check, exitCode, failureKind] of [[{ checks: ['./src/answer.txt'] }, 126, 'unrunnable'], [{ checks: ['sleep 30'], checkTimeoutMs: 300 }, 124, 'timeout'], [{ checks: ['exit 1'] }, 1, undefined]]) {
+  for (const [check, exitCode, failureKind] of [[{ checks: ['./src/answer.txt'] }, 126, 'unrunnable'], [{ checks: ['sleep 30'], checkTimeoutMs: 300 }, 124, 'timeout'], [{ checks: ['exit 1'] }, 1, undefined], [{ checks: ['exit 124'] }, 124, undefined]]) {
     const [result] = await workspaces.verifyArtifact(member, { ...task, ...check }, artifact)
     assert.deepEqual([result.exitCode, result.failureKind, /^\[swarm\] Execution timed out after 300ms/.test(result.output)], [exitCode, failureKind, failureKind === 'timeout'], `${check.checks[0]}: ${result.output}`)
   }
