@@ -265,6 +265,77 @@ test('an automatic review of the rejected submission is never read as withdrawn 
   assert.deepEqual(f.ownerNotices(/was withdrawn/), [])
 })
 
+/**
+ * A challenge re-opens the review need of an unchanged submission, and every
+ * missing-review fact is keyed on that need: its grace, its missing-review
+ * record, an owner withdrawal, its automatic review and a blocker decision.
+ */
+test('an automatic review the owner withdrew from an earlier need never blocks the need a challenge re-opens', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  assert.match(automatic.id, /^task_auto_review_/)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: automatic.id, reason: 'I will name the reviewer myself' })
+  await f.pastReviewGrace(2)
+  assert.equal(f.ownerNotices(/was withdrawn/).length, 1)
+  await f.verify(reviewer, f.proposeReview(source, { assigneeId: reviewer.id }), 'accept', 'The artifact meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  assert.equal(f.current(source).status, 'submitted')
+  await f.pastReviewGrace(3)
+  const reopened = f.live(source)
+  assert.equal(reopened.length, 1, 'the re-opened need is given its own review')
+  assert.match(reopened[0].id, /^task_auto_review_/)
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [automatic.id, reopened[0].id])
+  assert.equal(f.events('task/review-missing').length, 2, 'each need records its missing review once')
+  assert.equal(f.ownerNotices(/was withdrawn/).length, 1, 'the earlier need\'s withdrawal is not read as this need\'s')
+})
+
+test('a challenge re-opens the grace, so the owner\'s own review of the re-opened source is its only review', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  await f.verify(reviewer, automatic, 'accept', 'The artifact meets the criterion')
+  f.clock.advance(60_000)
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  const tasks = f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(f.runtime.notices.waitsLegitimately(f.current(source), tasks), true, 'the re-opened need waits out its own grace')
+  assert.equal(f.runtime.stalled(f.mission, tasks, f.runtime.store.list('members', f.mission.id)), false)
+  await f.runtime.settle(f.mission.id)
+  f.clock.advance(200)
+  // The owner's next call in the same turn: its own review of the re-opened source.
+  const own = f.proposeReview(source, { assigneeId: reviewer.id })
+  await f.pastReviewGrace(3)
+  assert.deepEqual(f.live(source).map(task => task.id), [own.id], 'the runtime never races the owner\'s own review')
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [automatic.id])
+})
+
+test('a re-opened need blocked for the reason an earlier need was blocked wakes the owner again', async t => {
+  const f = await fixture(t, { members: ['Author'] })
+  const [author] = f.m
+  const decisions = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('review-blocked:'))
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace(2)
+  assert.equal(decisions().length, 1)
+  assert.match(decisions()[0].content, /no live member other than the author/)
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'implementation' })
+  await f.pastReviewGrace()
+  await f.verify(reviewer, f.live(source)[0], 'accept', 'The artifact meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', reviewer.id); member.phase = 'stopped'; f.runtime.store.put('members', member) })
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  await f.pastReviewGrace(2)
+  assert.equal(decisions().length, 2, 'the re-opened need\'s decision reaches the owner')
+  assert.match(decisions()[1].content, /no live member other than the author/)
+})
+
 test('a real unchanged resubmission is re-reviewed by the automatic review that rejected it', async t => {
   const repo = await makeRepo('rework-review-real')
   const workspaces = makeWorkspaces(repo.root)

@@ -403,7 +403,7 @@ interface LineageRuntime {
   readonly stallPassTimeoutMs: number
   /** The runtime clock (`SwarmRuntime.now`). */
   readonly now: () => number
-  latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined
+  reviewNeed(source: Task): { age: number | undefined }
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
   reviewable(task: Task, tasks: Task[]): boolean
 }
@@ -500,8 +500,8 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // the dispatcher's live-review rule, including an admitted/parked review,
     // rather than mistaking the end of the admission grace for a stalled task.
     if (rt.reviewable(task, tasks)) return true
-    const submission = rt.latestSubmission(task.missionId, task.id)
-    return submission === undefined || submission.age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    const { age } = rt.reviewNeed(task)
+    return age === undefined || age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -1347,12 +1347,12 @@ export class Notices {
       // `stalled`, because `stalled` returns before its unreviewed check when
       // any unrelated work is running; without this an unreviewable submission
       // could stay silent behind live work forever (verifier-1 challenge,
-      // evidence_a454a771). The age comes from the durable submission event, so
-      // a restart cannot reset the grace.
+      // evidence_a454a771). The age comes from the durable row that opened the
+      // review need, so a restart cannot reset the grace.
       const grace = Math.max(this.rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
       const ripe = unreviewed.filter(task => {
-        const submission = this.rt.latestSubmission(missionId, task.id)
-        return submission === undefined || submission.age >= grace
+        const { age } = this.rt.reviewNeed(task)
+        return age === undefined || age >= grace
       })
       // On a board with no other progress (`reviewPathStalled`) the runtime's
       // own review admission owns every submitted artifact: its pass admits the
@@ -1637,11 +1637,11 @@ export class Notices {
     })
   }
 
-  /** Wake the owner once per distinct blocker for one unreviewable submitted deliverable. */
-  notifyReviewBlocked(mission: Mission, source: Task, reason: string): void {
+  /** Wake the owner once per distinct blocker for one review need (`SwarmRuntime.reviewNeed`) of an unreviewable submitted deliverable. */
+  notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
-    const key = `review-blocked:${mission.id}:${row.id}:${reason}`
+    const key = `review-blocked:${mission.id}:${row.id}:${need}:${reason}`
     // S5: the durable notice ledger (class, key, sender) is the gate; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return

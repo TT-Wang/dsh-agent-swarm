@@ -119,12 +119,12 @@ test('retired members and late start failures cannot resurrect membership', asyn
 test('submission and missing-review identity survive event-window truncation and cache loss', async t => {
   const f = await fixture(t), task = f.propose({})
   f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'task/submitted', f.a.id, { taskId: task.id }))
-  const submitted = f.runtime.latestSubmission(f.mission.id, task.id)
-  assert.ok(submitted)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), true)
+  const need = f.runtime.reviewNeed(task)
+  assert.ok(need.seq > 0)
+  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), true)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
-  assert.equal(f.runtime.latestSubmission(f.mission.id, task.id).seq, submitted.seq)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), false)
+  assert.equal(f.runtime.reviewNeed(task).seq, need.seq)
+  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), false)
 })
 
 test('owner can settle receipts after stop without queuing work or reactivating the mission', async t => {

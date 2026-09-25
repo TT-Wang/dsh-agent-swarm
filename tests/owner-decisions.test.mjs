@@ -556,8 +556,8 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
     if (runtime.reviewable(task, tasks)) return true
-    const submission = runtime.latestSubmission(missionId, task.id)
-    return submission === undefined || submission.age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    const { age } = runtime.reviewNeed(task)
+    return age === undefined || age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
@@ -616,8 +616,8 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     if (TERMINAL_STATES.has(task.status)) return false
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
     if (task.status === 'submitted') {
-      const submission = f.runtime.latestSubmission(mission.id, task.id)
-      return submission === undefined || submission.age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+      const { age } = f.runtime.reviewNeed(task)
+      return age === undefined || age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
     }
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop

@@ -172,7 +172,7 @@ for (const reviewStatus of ['pending', 'running', 'parked']) test(`owner reminde
     f.runtime.store.put('tasks', review)
   })
   t.mock.timers.tick(120000)
-  assert.ok(f.runtime.latestSubmission(f.mission.id, source.id).age >= f.runtime.config.tickMs)
+  assert.ok(f.runtime.reviewNeed(source).age >= f.runtime.config.tickMs)
   assert.equal(f.runtime.notices.waitsLegitimately(source, f.runtime.store.list('tasks', f.mission.id)), true)
   const key = `obligation-followup:${original.id}:`
   for (let i = 0; i < 2; i++) {

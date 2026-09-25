@@ -15,6 +15,7 @@ const { Scheduling } = await moduleOf('scheduling')
 const { Workspaces, runProcess } = await moduleOf('workspaces')
 const { WorkspaceAdmission, isolationIssues } = await moduleOf('workspace-admission')
 const { SwarmStore } = await moduleOf('store')
+const { SwarmRuntime } = await moduleOf('runtime')
 const { captureGitSnapshot } = await moduleOf('git-snapshot')
 const git = (cwd, args, env) => execFileSync('git', ['-c', 'user.name=R12 Test', '-c', 'user.email=r12@example.invalid', ...args], {
   cwd, env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
@@ -59,10 +60,14 @@ test('M2-2: submission grace survives newer unrelated events without aging a new
     store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'old' }))
   } finally { Date.now = clock }
   store.transaction(() => { for (let index = 0; index < 5; index++) store.event('mission', 'message/sent', 'runtime', { index }) })
-  const scheduling = new Scheduling(makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } }))
-  assert.equal(scheduling.unreviewedStall('mission', [{ id: 'old' }]), true)
+  const rt = makeRuntimeStub({ store, config: { tickMs: 100, maxEvents: 1 } })
+  // The runtime's own review-need derivation, over this store.
+  rt.reviewNeed = SwarmRuntime.prototype.reviewNeed.bind(rt)
+  const scheduling = new Scheduling(rt)
+  const submitted = id => ({ id, missionId: 'mission', epoch: 0, evidenceIds: [] })
+  assert.equal(scheduling.unreviewedStall([submitted('old')]), true)
   store.transaction(() => store.event('mission', 'task/submitted', 'runtime', { taskId: 'new' }))
-  assert.equal(scheduling.unreviewedStall('mission', [{ id: 'new' }]), false)
+  assert.equal(scheduling.unreviewedStall([submitted('new')]), false)
 })
 
 test('M2-3: dispatch explanations name isolation without inventing budget refusals', () => {

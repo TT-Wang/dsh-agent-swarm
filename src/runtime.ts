@@ -104,8 +104,10 @@ const START_FAILURE_REROUTE_LIMIT = 3
  * consume an unbounded share of the mission budget.
  */
 const AUTO_REVIEW_RECOVERY_ATTEMPTS = 2
-/** Only `automaticReviewId` mints a task id with this prefix. */
+/** Only `admitAutomaticReview` mints a task id with this prefix, followed by the review need's id. */
 const AUTOMATIC_REVIEW_PREFIX = 'task_auto_review_'
+/** F2: one review need of a submitted source (`SwarmRuntime.reviewNeed`). */
+interface ReviewNeed { id: string; seq: number; age: number | undefined }
 /**
  * Owner re-opens of one rejected task (`maxRework` when the task sets none).
  * Past it the task stays blocked until the owner raises `maxRework` or
@@ -270,12 +272,12 @@ export class SwarmRuntime {
    * docs/known-limitations.md, "Round-13 control-path slices"):
    *
    *  derivable (the gate re-reads the store; the memory value is only a cache):
-   *   - the unreviewed-submission grace: age of the durable `task/submitted`
-   *     event (`unreviewedStall`; the old `unreviewedSince` timer is removed);
+   *   - the unreviewed-submission grace: age of the durable row that opened
+   *     the review need (`reviewNeed`; the old `unreviewedSince` timer is removed);
    *   - a withdrawn automatic review: the durable `task/cancelled` event of a
    *     host-minted review identity (`withdrawnAutomaticReview`);
    *   - a recorded missing review: durable `task/review-missing` event per
-   *     submission (`missingReviewRecorded`).
+   *     review need (`reportMissingReview`).
    *  cache-only (loss changes no durable outcome; each is covered by a test that
    *  clears it and asserts the durable result is unchanged):
    *   - `idleSignals` (durable `Task.idleSignal`),
@@ -422,7 +424,7 @@ export class SwarmRuntime {
   notifyCoverageComplete(mission: Mission): void { return this.notices.notifyCoverageComplete(mission) }
   notifyParkedHolder(mission: Mission, task: Task): void { return this.notices.notifyParkedHolder(mission, task) }
   private warnIntegrationGap(mission: Mission, admitted: Task): void { return this.notices.warnIntegrationGap(mission, admitted) }
-  private notifyReviewBlocked(mission: Mission, source: Task, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, reason) }
+  private notifyReviewBlocked(mission: Mission, source: Task, need: ReviewNeed, reason: string): void { return this.notices.notifyReviewBlocked(mission, source, need.id, reason) }
   private topicDelivery(missionId: string, from: string, topic: string, content: string): void { return this.notices.topicDelivery(missionId, from, topic, content) }
   async flushOutbox(missionId: string, pass?: SchedulingPass, only?: string): Promise<void> { return this.notices.flushOutbox(missionId, pass, only) }
   pumpOutbox(): void { return this.notices.pumpOutbox() }
@@ -2429,70 +2431,66 @@ export class SwarmRuntime {
     const tasks = this.store.list('tasks', mission.id)
     const members = this.store.list('members', mission.id)
     const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
-    const unreviewable: Task[] = []
+    const unreviewable: Array<[Task, ReviewNeed]> = []
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
       if (this.reviewable(source, tasks, members)) continue
-      const submission = this.latestSubmission(mission.id, source.id)
-      if (submission !== undefined && submission.age < grace) continue
-      this.reportMissingReview(mission, source, submission?.seq ?? 0)
-      unreviewable.push(source)
+      const need = this.reviewNeed(source)
+      if (need.age !== undefined && need.age < grace) continue
+      this.reportMissingReview(mission, source, need)
+      unreviewable.push([source, need])
     }
     if (!unreviewable.length || !this.reviewPathStalled(tasks, members)) return
-    for (const source of unreviewable) {
-      const blocked = this.withdrawnAutomaticReview(mission.id, source.id) ?? this.reviewPathBlocker(mission, source, members)
-      if (blocked !== undefined) { this.notifyReviewBlocked(mission, source, blocked); continue }
-      this.admitAutomaticReview(mission, source)
+    for (const [source, need] of unreviewable) {
+      const blocked = this.withdrawnAutomaticReview(source, need) ?? this.reviewPathBlocker(mission, source, members)
+      if (blocked !== undefined) { this.notifyReviewBlocked(mission, source, need, blocked); continue }
+      this.admitAutomaticReview(mission, source, need)
     }
   }
-  /** The newest durable submission of one task: how long ago, and its event seq. */
-  latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined {
-    const event = this.store.latestTaskEvent(missionId, taskId, 'task/submitted')
-    return event === undefined ? undefined : { seq: event.seq, age: Math.max(0, this.now() - event.createdAt) }
+  /**
+   * F2: the review need of one submitted source, the one identity every
+   * missing-review fact is keyed on. The need is the submission (the epoch
+   * fences every resubmission, even of an unchanged commit) and each challenge
+   * of its claims, which re-opens it. `id` keys its automatic review and its
+   * blocker decisions; `seq` and `age` are those of the newest durable row that
+   * opened it (the `task/submitted` row, or a later `evidence/challenged` row of
+   * one of its claims), from which its grace, its missing-review record and an
+   * owner withdrawal are dated. S5: derived from the log and the evidence rows,
+   * so a restart or a lost cache re-derives the same need.
+   */
+  reviewNeed(source: Task): ReviewNeed {
+    const challenged = source.evidenceIds.flatMap(evidenceId => this.store.get('evidence', evidenceId)?.challenges.map(() => evidenceId) ?? [])
+    const opened = [...new Set(challenged)].map(evidenceId => this.store.latestTaskEvent(source.missionId, evidenceId, 'evidence/challenged', 'evidenceId'))
+      .reduce((newest, row) => row !== undefined && row.seq > (newest?.seq ?? 0) ? row : newest, this.store.latestTaskEvent(source.missionId, source.id, 'task/submitted'))
+    return { id: createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...challenged].join(':')).digest('hex').slice(0, 32),
+      seq: opened?.seq ?? 0, age: opened === undefined ? undefined : Math.max(0, this.now() - opened.createdAt) }
   }
-  /** Record the missing review once per submission; false when it is already recorded. */
-  private reportMissingReview(mission: Mission, source: Task, submissionSeq: number): boolean {
-    // S5: the durable `task/review-missing` event for this exact submission is the gate.
-    if (this.missingReviewRecorded(mission.id, source.id, submissionSeq)) return false
+  /** Record the missing review once per review need; false when it is already recorded. */
+  private reportMissingReview(mission: Mission, source: Task, need: ReviewNeed): boolean {
+    // S5: a durable `task/review-missing` row newer than the row that opened the need is the gate.
+    if ((this.store.latestTaskEvent(mission.id, source.id, 'task/review-missing')?.seq ?? 0) > need.seq) return false
     const reason = this.missingReviewPath(source) ?? `no live independent verification task reviews this submitted ${source.kind} artifact`
+    const submissionSeq = this.store.latestTaskEvent(mission.id, source.id, 'task/submitted')?.seq ?? 0
     this.commit(mission.id, () => this.store.event(mission.id, 'task/review-missing', 'runtime', { taskId: source.id, kind: source.kind, submissionSeq, reason }))
     return true
   }
   /**
-   * True when the durable event log already records a missing-review report for
-   * this submission: a `task/review-missing` row for the task that is newer than
-   * the latest `task/submitted` row for it. Derived from the store, so a
-   * restarted runtime does not duplicate the audit row for the same submission.
-   */
-  private missingReviewRecorded(missionId: string, taskId: string, submissionSeq: number): boolean {
-    const event = this.store.latestTaskEvent(missionId, taskId, 'task/review-missing')
-    if (event === undefined) return false
-    const data = event.data as { submissionSeq?: number }
-    return data.submissionSeq === undefined ? event.seq > submissionSeq : data.submissionSeq === submissionSeq
-  }
-  /**
-   * The automatic review the owner withdrew from this submission: one the
-   * owner cancelled after the submission while it was the submission's review,
-   * whether the host admitted it for this submission or a rework re-opened it
-   * for it. Control facts never use the presentation event window: the
+   * The automatic review the owner withdrew from this review need: one the
+   * owner cancelled after the need opened while it was the need's review,
+   * whether the host admitted it for this need or a rework re-opened it for
+   * it. Control facts never use the presentation event window: the
    * cancellation is its own durable `task/cancelled` row, written in the
    * cancel's transaction, and an automatic review is known by its host-minted
    * identity, which survives a failed post-admission event write and a
-   * restart. A review retired by a verdict's sibling retirement or by a rework
-   * was never cancelled by the owner, and one cancelled before this submission
-   * was not withdrawn from it.
+   * restart. A review retired by a verdict's sibling retirement, a rework or a
+   * challenge was never cancelled by the owner, and one cancelled before this
+   * need opened was not withdrawn from it.
    */
-  private withdrawnAutomaticReview(missionId: string, sourceId: string): string | undefined {
-    const submitted = this.latestSubmission(missionId, sourceId)?.seq ?? 0
-    const withdrawn = this.store.list('tasks', missionId).find(review => review.reviewOf === sourceId && review.status === 'cancelled'
-      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(missionId, review.id, 'task/cancelled')?.seq ?? 0) > submitted)
+  private withdrawnAutomaticReview(source: Task, need: ReviewNeed): string | undefined {
+    const withdrawn = this.store.list('tasks', source.missionId).find(review => review.reviewOf === source.id && review.status === 'cancelled'
+      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(source.missionId, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
     if (withdrawn === undefined) return undefined
-    return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
-  }
-  /** Keyed on the review need: the submission (the epoch fences every resubmission, even of an unchanged commit) and each challenge of its claims, which re-opens it. */
-  private automaticReviewId(source: Task): string {
-    const challenges = source.evidenceIds.flatMap(evidenceId => this.store.get('evidence', evidenceId)?.challenges.map(() => evidenceId) ?? [])
-    return `${AUTOMATIC_REVIEW_PREFIX}${createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...challenges].join(':')).digest('hex').slice(0, 32)}`
+    return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${source.id}) or cancel the source task`
   }
   /** The concrete reason the runtime cannot admit an independent review right now. */
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
@@ -2506,8 +2504,8 @@ export class SwarmRuntime {
     return undefined
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
-  private admitAutomaticReview(mission: Mission, source: Task): void {
-    const reviewId = this.automaticReviewId(source)
+  private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
+    const reviewId = `${AUTOMATIC_REVIEW_PREFIX}${need.id}`
     if (this.store.get('tasks', reviewId) !== undefined) return
     try {
       this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
@@ -2523,7 +2521,7 @@ export class SwarmRuntime {
     } catch (error) {
       // Admission can still refuse (a budget race). The submission stands;
       // the owner is told exactly what to admit instead.
-      this.notifyReviewBlocked(mission, source, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
+      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy

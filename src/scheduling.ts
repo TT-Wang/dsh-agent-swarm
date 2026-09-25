@@ -555,19 +555,16 @@ export class Scheduling {
 
   /**
    * A submission with no live review is a stall candidate, not a stall, until
-   * the same unreviewed artifact has aged past the grace. S5: the grace is read
-   * from the durable `task/submitted` event of each unreviewed task, not from an
-   * in-memory timer — a restart (or a lost cache) can no longer restart the
-   * window, and the answer is identical for the same durable board.
+   * its review need has aged past the grace. S5: the grace is read from the
+   * durable row that opened each unreviewed task's review need (its submission,
+   * or a challenge that re-opened it), not from an in-memory timer — a restart
+   * (or a lost cache) can no longer restart the window, and the answer is
+   * identical for the same durable board. With no such row the grace cannot
+   * have elapsed yet.
    */
-  unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
+  unreviewedStall(unreviewed: Task[]): boolean {
     const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    return unreviewed.every(task => {
-      const event = this.rt.store.latestTaskEvent(missionId, task.id, 'task/submitted')
-      if (event !== undefined) return this.rt.now() - event.createdAt >= grace
-      // No durable submission record: the grace cannot have elapsed yet.
-      return false
-    })
+    return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= grace })
   }
 
   /** Nothing is running, reviewably submitted or dispatchable: workers would stay idle forever. */
@@ -577,7 +574,7 @@ export class Scheduling {
     if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
     const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members))
     if (unreviewed.length) {
-      if (!this.unreviewedStall(mission.id, unreviewed)) return false
+      if (!this.unreviewedStall(unreviewed)) return false
     }
     const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))

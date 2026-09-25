@@ -1074,7 +1074,7 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     // time from the durable submission, so a submission is not a stall inside it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const unreviewed = () => f.runtime.scheduling.unreviewedStall(f.mission.id, [taskOf(f.runtime, task.id)])
+    const unreviewed = () => f.runtime.scheduling.unreviewedStall([taskOf(f.runtime, task.id)])
     assert.equal(unreviewed(), false, 'a submission is not a stall at its own instant')
     clock.advance(30 * tickMs - 1)
     assert.equal(unreviewed(), false, 'nor one clock millisecond inside the grace')
