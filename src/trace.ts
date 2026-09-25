@@ -321,9 +321,10 @@ export class TraceRecorder {
     const events = this.store.traceEvents?.(missionId, SEED_LIMIT + 1) ?? this.store.events(missionId, SEED_LIMIT + 1, 0)
     const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [], source, truncated: events.length > SEED_LIMIT }
     for (const event of events.slice(-SEED_LIMIT)) {
-      // A stored span id is validated as it is read back, so a malformed row is never a parent.
-      const span = event.data as TraceSpan | null | undefined
-      if (event.type === 'trace/span' && isSpanId(span?.spanId)) this.remember(index, span!)
+      if (event.type !== 'trace/span') continue
+      const span = event.data as TraceSpan | undefined
+      if (span === null || typeof span !== 'object' || typeof span.spanId !== 'string') continue
+      this.remember(index, span)
     }
     this.indexes.set(missionId, index)
     return index
@@ -368,8 +369,9 @@ export class TraceRecorder {
     // durable span rows. Activity/tool events cannot hide a claim or submission,
     // and a missing scoped parent must not attach this task to an unrelated one.
     const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => {
-      const span = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)?.data as TraceSpan | null | undefined
-      return isSpanId(span?.spanId) ? span! : undefined
+      const event = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)
+      const span = event?.data as TraceSpan | undefined
+      return span && typeof span.spanId === 'string' ? span : undefined
     }
     const lookup = (filter: { taskId?: string; attemptId?: string; step?: string }, spans: TraceSpan[] | undefined) =>
       index.truncated && this.store.traceEvents ? stored(filter)
@@ -410,7 +412,7 @@ export class TraceRecorder {
       if (call === undefined) { this.unscoped.set(step, (this.unscoped.get(step) ?? 0) + 1); return undefined }
       const spanId = randomUUID().replaceAll('-', '').slice(0, 16)
       const traceId = traceIdFor(call.missionId)
-      const parentSpanId = this.parentFor({ ...call, step })
+      const parent = this.parentFor({ ...call, step }), parentSpanId = isSpanId(parent) ? parent : undefined
       const span: TraceSpan = {
         traceId, spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }), missionId: call.missionId,
         ...(call.taskId === undefined ? {} : { taskId: call.taskId }), ...(call.attemptId === undefined ? {} : { attemptId: call.attemptId }),

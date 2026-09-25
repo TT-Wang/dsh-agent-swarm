@@ -7,7 +7,8 @@
  * value is made: the mission scope is an existing mission row (anything else
  * is an unscoped call), the actor is the id the session guard requires,
  * `endedAt` is `startedAt` plus a monotonic duration, and a parent read back
- * from the durable rows is used only when it is a valid span id. Recording then
+ * from the durable rows is used only when it is a valid span id (the row itself
+ * stays in the metrics window, which reports its violation). Recording then
  * has one failure policy for every sink, the host telemetry link's: a failed
  * write is contained and counted (`bindHostTelemetry(runtime).counts()`),
  * never thrown. The wrapper settles the command once, records exactly one span
@@ -18,7 +19,8 @@
  * mission that does not exist; a failing span write turns a committed command
  * into a tool error and replaces a failing command's error; a wall clock that
  * steps back mid-command throws a TraceContractError; a malformed stored span id
- * becomes a parent and throws; an agent with an empty id passes the session
+ * becomes a parent and throws (and e6b8cfa, which dropped the row from the index,
+ * reports a clean metrics window over it); an agent with an empty id passes the session
  * guard; a snapshot failure after a committed command records a second, error
  * span.
  */
@@ -113,6 +115,11 @@ test('a malformed span id read back from the durable rows is never a parent', as
   // Pair: a well-formed stored span is still the parent of the next step.
   await f.call('swarm_workstream', { missionId: f.mission.id, title: 'Docs', objective: 'Document the module' })
   assert.equal(f.spans().filter(span => span.step === 'swarm_workstream')[1].parentSpanId, recorded[0].spanId)
+  // Only parent choice ignores the row: it stays in the metrics window, so the
+  // trace report still counts its contract violation (F-44).
+  const report = (await f.call('swarm_observe', { missionId: f.mission.id, trace: true })).result.trace
+  assert.deepEqual([report.spans, report.window.spans], [3, 3])
+  assert.deepEqual(report.violations.map(violation => [violation.spanId, violation.reason]), [['NOT-A-SPAN-ID', 'trace_id must be 32 lowercase hex characters']])
 })
 
 test('beyond the span window, a malformed stored parent is ignored too', () => {
@@ -122,8 +129,14 @@ test('beyond the span window, a malformed stored parent is ignored too', () => {
   const store = { events: () => [], traceEvents: (_missionId, limit) => rows.slice(-limit), event() {}, transaction: body => body() }
   const recorder = new TraceRecorder(store)
   assert.equal(recorder.windowFor('m').truncated, true)
-  assert.equal(recorder.parentFor({ step: 'swarm_publish', missionId: 'm', taskId: 'task', attemptId: 'attempt' }), undefined)
-  assert.equal(recorder.parentFor({ step: 'swarm_verify', missionId: 'm', taskId: 'review', reviewOfTaskId: 'task' }), undefined)
+  const scope = { taskId: 'task', attemptId: 'attempt' }
+  assert.equal(recorder.parentFor({ step: 'swarm_publish', missionId: 'm', ...scope }), 'NOT-A-SPAN-ID', 'the durable lookup finds the stored row')
+  const record = (step, call) => recorder.record(step, () => ({ ...call, missionId: 'm', actor: 'worker', input: {}, output: {}, status: 'ok', startedAt: 0, durationMs: 0 }))
+  for (const [step, call] of [['swarm_publish', scope], ['swarm_verify', { taskId: 'review', reviewOfTaskId: 'task' }]]) {
+    const span = record(step, call)
+    assert.equal(span.parentSpanId, undefined, 'the recorded span treats it as absent')
+    assert.equal(spanContractViolation(span), undefined)
+  }
 })
 
 test('an agent without an id is refused at the session guard, so a span actor is never empty', async t => {
