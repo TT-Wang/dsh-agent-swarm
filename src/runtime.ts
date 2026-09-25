@@ -1745,7 +1745,8 @@ export class SwarmRuntime {
       // prose. A judgement rejection with no failing check keeps the prose.
       const rejection = passed ? input.reason : this.declaredChecks.rejectionReason(input.reason, checks)
       if (this.declaredChecks.recoveryRequired(checks)) {
-        const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - 750))}\nVerification could not establish a verdict. The immutable source ${source.id} at ${artifact.commit} remains submitted. Fix the reported environment or amend checkTimeoutMs with swarm_budget, then resume review ${task.id} using swarm_control(action: "resume", taskId: "${task.id}", reason: "condition repaired").`
+        const deferral = `\nVerification could not establish a verdict on the immutable source ${source.id} at ${artifact.commit}, which remains submitted: ${this.declaredChecks.recoveryExits(checks, source.id, task.id)}.`
+        const reason = `${excerpt(rejection, Math.max(0, this.config.maxMessageChars - deferral.length - 32))}${deferral}`
         this.commit(missionId, () => {
           const runIds = this.declaredChecks.recordRuns(missionId, { memberId: member.id, taskId: task.id, attemptId: input.attemptId, commit: artifact.commit }, checks)
           task.status = 'blocked'; task.output = this.bounded(reason)
@@ -2495,7 +2496,7 @@ export class SwarmRuntime {
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
     const tasks = this.store.list('tasks', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
-    if (deferred !== undefined) return `review ${deferred.id} awaits repair of its recorded host verification failure; fix the environment or amend checkTimeoutMs, then resume the same review with swarm_control(action: "resume", taskId: "${deferred.id}", reason: "condition repaired")`
+    if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExits(this.declaredChecks.deferredChecks(mission.id, deferred.id), source.id, deferred.id)}`
     if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
     if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
     const authors = [...authorIdsOf(source)]

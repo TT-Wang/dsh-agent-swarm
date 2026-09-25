@@ -152,8 +152,13 @@ const ancestryProof = argv => argv.includes('merge-base') && argv.includes('--is
  * rule left it, the deadline escaped `swarm_verify` as a bare throw with the
  * review left running and nothing durable. The deadline is scaled down here;
  * the substituted proof outlasts it on both passes.
+ *
+ * Review M-9: no command has run and checkTimeoutMs does not govern this
+ * deadline, so the row is the host's (exit 125, `infrastructure`) and its
+ * exit is the host repair; a65f837 stored it as a `timeout` row, whose exit
+ * (raise checkTimeoutMs) cannot move a host git deadline.
  */
-test('a host git deadline while proving the artifact ancestry defers the review with timeout rows', async t => {
+test('a host git deadline while proving the artifact ancestry defers the review with infrastructure rows', async t => {
   let armed = false, substituted = 0
   const f = await reviewFixture(t, { options: { subprocess: substitutingSeam(argv => armed && ancestryProof(argv), ['/bin/sh', '-c', 'sleep 20'], () => { substituted++ }) } })
   f.workspaces.gitTimeout = () => 1_500
@@ -166,12 +171,14 @@ test('a host git deadline while proving the artifact ancestry defers the review 
   assert.equal(events(f.runtime, f.mission.id, 'task/verification-deferred').length, 1)
   assert.equal(events(f.runtime, f.mission.id, 'task/rejected').length, 0)
   assert.match(verdict.output, /swarm_control\(action: "resume"/, 'the guided exit is on the review')
+  assert.match(verdict.output, /the host could not execute a check: repair the host condition its output reports/)
+  assert.doesNotMatch(verdict.output, /checkTimeoutMs/, 'a host deadline is not the check\'s own deadline')
   const runs = f.runs()
   assert.deepEqual(runs.map(run => run.arguments.attempt), [1, 2], 'both passes of the retry rule are durable')
   for (const run of runs) {
     assert.equal(run.result.command, PREPARATION)
-    assert.equal(run.result.exitCode, 124, 'the host deadline is a timeout row')
-    assert.equal(run.result.failureKind, 'timeout')
+    assert.equal(run.result.exitCode, 125, 'the host deadline is a row the host could not execute')
+    assert.equal(run.result.failureKind, 'infrastructure')
     assert.match(run.result.output, /^Host verification could not execute: ProcessTimeoutError: Execution timed out after 1500ms$/)
   }
   assert.deepEqual(await verificationCheckouts(f.repo.root), [], 'no checkout was created before the proof failed')
@@ -259,7 +266,7 @@ test('the published WorkerAdapter declares the check rows verifyArtifact returns
   const text = `import type { Artifact, Member, Task, WorkerAdapter } from './types.js'
 export async function read(adapter: WorkerAdapter, member: Member, task: Task, artifact: Artifact) {
   const [row] = await adapter.verifyArtifact(member, task, artifact)
-  const kind: 'timeout' | 'infrastructure' | undefined = row?.failureKind
+  const kind: 'timeout' | 'infrastructure' | 'unrunnable' | undefined = row?.failureKind
   const stage: string | null | undefined = row?.attribution?.stage
   const home: string | null | undefined = row?.environment?.home
   return { kind, stage, home }

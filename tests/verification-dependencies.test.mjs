@@ -77,10 +77,21 @@ test('R11-13: the explicit read-through link opt-in still links at every depth (
   assert.match(results[2].output, /linked/)
 })
 
-test('a missing command is diagnosed as an environment failure, and materialisation can be disabled', async t => {
+test('a missing command is an unrunnable row with its own output and the environment it ran under, and materialisation can be disabled', async t => {
   const { workspaces, member, task, artifact } = await fixture(t, { verificationDependencyDirs: [] })
   const results = await workspaces.verifyArtifact(member, { ...task, checks: ['test ! -e node_modules && echo unlinked', 'toolchain-check'] }, artifact)
-  assert.equal(results[0].exitCode, 0); assert.match(results[0].output, /unlinked/)
+  assert.equal(results[0].exitCode, 0); assert.match(results[0].output, /unlinked/); assert.equal(results[0].failureKind, undefined)
   assert.equal(results[1].exitCode, 127)
-  assert.match(results[1].output, /exit 127: a command in this check was not found in the clean verification checkout\. Copied dependency directories from the source: none/)
+  assert.equal(results[1].failureKind, 'unrunnable', 'a command that cannot run is not a host that could not execute')
+  assert.match(results[1].output, /toolchain-check/)
+  assert.doesNotMatch(results[1].output, /\[swarm\]/, 'the row carries the command\'s own output; the exit is composed from the kind')
+  assert.deepEqual(results[1].environment.dependencyLinks, { mode: 'copy', dirs: [], materializedPaths: [] }, 'what the checkout received is on the row')
+})
+
+test('a command the checkout cannot execute (exit 126) is unrunnable; an exit-124 command is a timeout; an assertion is neither', async t => {
+  const { workspaces, member, task, artifact } = await fixture(t)
+  for (const [check, exitCode, failureKind] of [['./src/answer.txt', 126, 'unrunnable'], ['exit 124', 124, 'timeout'], ['exit 1', 1, undefined]]) {
+    const [result] = await workspaces.verifyArtifact(member, { ...task, checks: [check] }, artifact)
+    assert.deepEqual([result.exitCode, result.failureKind], [exitCode, failureKind], `${check}: ${result.output}`)
+  }
 })

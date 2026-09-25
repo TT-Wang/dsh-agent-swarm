@@ -26,6 +26,26 @@ export function excerpt(value: unknown, limit: number): string {
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
 
+/** The row for a declared check the host could not prepare, confine or start: the review defers instead of rejecting the artifact. */
+export function unexecutedCheck(command: string, error: unknown): CheckResult {
+  return { command, exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(error)}` }
+}
+
+/**
+ * The one exit per failure kind, keyed by the kind the host classified where it produced the row.
+ * A deferral's reason and the review-path blocker both compose from it, so a row an older host
+ * stored reads through the same table (a 126/127 row stored as `infrastructure` gets that exit).
+ */
+const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult, sourceId: string, resume: string) => string> = {
+  timeout: (_check, sourceId, resume) => `a check reached its deadline: raise it with swarm_budget(taskId: "${sourceId}", taskBudget: { checkTimeoutMs }, reason), then ${resume}`,
+  infrastructure: (_check, _sourceId, resume) => `the host could not execute a check: repair the host condition its output reports, then ${resume}`,
+  unrunnable: ({ environment }, sourceId, resume) => {
+    const links = environment?.dependencyLinks
+    const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${links.materializedPaths?.length ? excerpt(links.materializedPaths.join(', '), 80) : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`})`
+    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${resume}; or, if the command itself is wrong, cancel the source with swarm_cancel(taskId: "${sourceId}", reason) and repair it with swarm_propose(replaces: ["${sourceId}"], checks) holding corrected commands`
+  },
+}
+
 export class DeclaredChecks {
   /**
    * S15: the attempts of the verification in flight. The key is
@@ -153,7 +173,7 @@ export class DeclaredChecks {
       if (signal?.aborted) throw error
       const code = error instanceof Error && 'code' in error ? String(error.code) : ''
       if (!['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
-      return [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
+      return [unexecutedCheck('(verification preparation)', error)]
     }
   }
 
@@ -161,6 +181,20 @@ export class DeclaredChecks {
   recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
     const failures = checks.filter(check => check.exitCode !== 0)
     return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
+  }
+
+  /** The exit of each failure kind among these checks, for one review of one source. */
+  recoveryExits(checks: ReadonlyArray<CheckResult>, sourceId: string, reviewId: string): string {
+    const resume = `resume review ${reviewId} with swarm_control(action: "resume", taskId: "${reviewId}", reason: "condition repaired")`
+    const kinds = new Map(checks.flatMap(check => check.failureKind === undefined ? [] : [[check.failureKind, check] as const]))
+    return [...kinds].map(([kind, check]) => RECOVERY_EXITS[kind](check, sourceId, resume)).join('; ')
+  }
+
+  /** The pass a deferred review decided on: the last host-verification pass it recorded. */
+  deferredChecks(missionId: string, reviewId: string): CheckResult[] {
+    const runs = this.rt.store.toolRuns(missionId, { taskId: reviewId }).filter(run => run.tool === 'swarm.host_verification')
+    const pass = (run: ToolRun | undefined) => `${run?.attemptId}:${(run?.arguments as { attempt?: number } | undefined)?.attempt}`
+    return runs.filter(run => pass(run) === pass(runs.at(-1))).map(run => run.result as CheckResult)
   }
 
   /**
