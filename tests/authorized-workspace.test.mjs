@@ -762,6 +762,39 @@ test('A fenced mission records one revocation event and wakes the owner once, ac
 })
 
 /**
+ * The revocation decision lasts as long as the revocation: the process that
+ * found it. The human restores the root and restarts, the owner resumes the
+ * work and it runs; when a later restart has removed the root again, the owner
+ * is woken for that revocation. A decision keyed on the mission alone used to
+ * stay held after the restore, so the second fence reached nobody.
+ */
+test('A revocation after the root was restored wakes the owner again', async t => {
+  const { granted, project } = await fixture(t)
+  const { config, runtime } = await makeRuntime(t, { workers: workspaceWorkers(), config: wired(await loadWorkspaceGrants([{ path: granted }])), clock: new FakeClock() })
+  const f = await grantedMission(runtime, project, granted, 'owner-revoked-again')
+  const task = f.propose({ assigneeId: f.author.id })
+  let current = runtime
+  const restart = async roots => {
+    await current.dispose()
+    current = new SwarmRuntime(wired(await loadWorkspaceGrants(roots), config), workspaceWorkers())
+    await current.start()
+    for (let pass = 0; pass < 3; pass++) { await current.tick(); await current.settle(f.mission.id) }
+  }
+  t.after(async () => { await current.dispose() })
+  await restart([])
+  assert.equal(current.store.get('tasks', task.id).status, 'blocked')
+  assert.equal(workspaceNotices(current, f.mission.id).length, 1, 'the first revocation wakes the owner')
+  await restart([{ path: granted }])
+  current.controlTask(f.owner, f.mission.id, task.id, 'resume', {}, 'root restored')
+  for (let pass = 0; pass < 3; pass++) { await current.tick(); await current.settle(f.mission.id) }
+  assert.equal(current.store.get('tasks', task.id).status, 'running', 'the restored root runs the resumed work')
+  await restart([])
+  assert.equal(current.store.get('tasks', task.id).status, 'blocked')
+  assert.deepEqual(revokedEvents(current, f.mission.id).map(event => event.data.blockedTasks), [[task.id], [task.id]])
+  assert.equal(workspaceNotices(current, f.mission.id).length, 2, 'the second revocation wakes the owner too')
+})
+
+/**
  * The declared-check retry creates a second verification checkout, possibly a
  * check duration after the first: the runtime re-validates before each one.
  */

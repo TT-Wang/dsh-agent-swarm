@@ -359,9 +359,6 @@ export function gitWriteSubcommand(command: string): string | undefined {
  */
 const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
 
-/** The identity of a mission's revocation decision (`GuardTerminalContext.localKey`). */
-const REVOKED = 'workspace-revoked'
-
 export class WorkspaceAdmission {
   /** R11-15: bounded per-path mention history and reported-pair bookkeeping. */
   private readonly tempMentions = new Map<string, TempMention[]>()
@@ -417,9 +414,11 @@ export class WorkspaceAdmission {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission)) return
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
+    // A revocation lasts this process (above), so its decision is keyed on it.
+    const revocation = `workspace-revoked:${this.rt.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner
-    // already holds the revocation decision, means the mission is fenced.
-    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, 'workspace', REVOKED)) return
+    // already holds this revocation's decision, means the mission is fenced.
+    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, 'workspace', revocation)) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
@@ -439,8 +438,8 @@ export class WorkspaceAdmission {
     for (const task of blocked) if (stopPending(task)) this.rt.attempts.resumeStoppedAttempt(missionId, task)
     // S4b: the fence reaches the shared coded workspace terminal. A revocation
     // is a local fault, not a board state, so the decision is keyed by it and
-    // the owner is woken once however the board moves afterwards.
-    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: REVOKED })
+    // the owner is woken once per revocation however the board moves afterwards.
+    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation })
   }
 
   /**
