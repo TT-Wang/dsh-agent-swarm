@@ -19,7 +19,7 @@ async function setup(t) {
     config: { tickMs: 60000, maxEvents: 200, checkTimeoutMs: undefined },
   })
   const owner = { sessionId: 'ceiling-owner' }
-  const mission = runtime.create(owner, { title: 'Ceiling surface', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  const mission = runtime.create(owner, { title: 'Ceiling surface', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Bound per-task work' })
   const builder = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

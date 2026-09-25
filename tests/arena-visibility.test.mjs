@@ -139,12 +139,12 @@ async function runtimeFixture(t) {
   await mkdir(workspace, { recursive: true })
   await writeFile(path.join(workspace, 'marker.txt'), 'workspace marker\n')
   const owner = { sessionId: `owner-${randomUUID()}` }
-  const mission = runtime.create(owner, { title: 'Arena visibility', objective: 'Exercise the registry and arena view', workspace, scope: ['src/'], acceptance: ['arena works'], budget })
+  const mission = runtime.create(owner, { title: 'Arena visibility', objective: 'Exercise the registry and arena view', workspace, scope: ['src/'], acceptance: ['arena works'], budget }, { grantRoot: workspace, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Arena work' })
   const alice = await runtime.addMember(owner, mission.id, { name: 'alice', role: 'implementation' })
   const bob = await runtime.addMember(owner, mission.id, { name: 'bob', role: 'reviewer' })
   const otherOwner = { sessionId: `owner-${randomUUID()}` }
-  const other = runtime.create(otherOwner, { title: 'Other mission', objective: 'A different tenant', workspace, scope: ['src/'], acceptance: ['other works'], budget })
+  const other = runtime.create(otherOwner, { title: 'Other mission', objective: 'A different tenant', workspace, scope: ['src/'], acceptance: ['other works'], budget }, { grantRoot: workspace, source: 'session' })
   const otherStream = runtime.workstream(otherOwner, other.id, { title: 'Other', objective: 'Other work' })
   const carol = await runtime.addMember(otherOwner, other.id, { name: 'carol', role: 'implementation' })
   return {

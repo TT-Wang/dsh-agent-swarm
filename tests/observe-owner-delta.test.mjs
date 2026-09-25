@@ -10,7 +10,7 @@ async function fixture(t, size = 1) {
   })
   const owner = { sessionId: 'owner-session' }
   const input = { title: 'Owner delta', objective: 'Read updates', workspace: root, scope: ['src/'], acceptance: ['works'], budget }
-  const mission = runtime.create(owner, input)
+  const mission = runtime.create(owner, input, { grantRoot: input.workspace, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Read updates' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement module', objective: 'Read updates', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'] })
@@ -68,7 +68,7 @@ test('owner cursors are replayable, scoped, bounded and disposable; exact reads 
   const changed = await f.read({ cursor: first.nextCursor })
   const replay = await f.read({ cursor: first.nextCursor })
   assert.deepEqual(replay.board, changed.board, 'retry a lost response from the same baseline')
-  const other = f.runtime.create(f.owner, f.input)
+  const other = f.runtime.create(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const foreign = f.runtime.observe(f.owner, other.id, { cursor: first.nextCursor })
   assert.equal(foreign.cursorReset, true)
   assert.equal(foreign.delta, undefined)

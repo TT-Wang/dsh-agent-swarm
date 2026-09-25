@@ -23,7 +23,7 @@ async function fixture(t) {
   })
   const owner = { sessionId: 'w12-owner' }
   const mission = runtime.create(owner, { title: 'W12', objective: 'Repair withdrawn obligations', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

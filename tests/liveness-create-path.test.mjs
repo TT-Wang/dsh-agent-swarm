@@ -35,7 +35,7 @@ async function fixture(t) {
   const owner = { sessionId: 'liveness-owner' }
   // The create path: no `starts` journal row, exactly like swarm_create.
   const mission = runtime.create(owner, { title: 'Liveness', objective: 'Reach automatic completion and stall notices',
-    workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+    workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

@@ -23,7 +23,7 @@ async function fixture(t) {
   runtime.kick = () => {}
   runtime.notices.wakeBudget = 0
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Owner channel', objective: 'Preserve decisions', workspace: root, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Owner channel', objective: 'Preserve decisions', workspace: root, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'research' })
   const rows = () => runtime.store.list('deliveries', mission.id)
   const question = async () => {
@@ -523,7 +523,7 @@ test('unresolved reminders excerpt a legacy long notice without losing the origi
 
 test('R12: warning precedes planning expiry, deduplicates the same deadline, and re-arms on extension', async t => {
   const f = await fixture(t)
-  const request = f.runtime.requestStart({ sessionId: 'planner-owner' }, { commandId: 'deadline-check', workspace: f.root, goal: 'Plan the retained request' })
+  const request = f.runtime.requestStart({ sessionId: 'planner-owner' }, { commandId: 'deadline-check', workspace: f.root, goal: 'Plan the retained request' }, { grantRoot: f.root, source: 'session' })
   const row = f.runtime.store.get('starts', request.id); row.planningDeadlineAt = Date.now() + 10000
   f.runtime.store.put('starts', row)
   f.runtime.sweepStarts()

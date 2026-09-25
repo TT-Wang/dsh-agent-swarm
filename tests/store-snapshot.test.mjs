@@ -29,7 +29,7 @@ async function fixture(t, { storeOptions = {}, workspace } = {}) {
   await runtime.start()
   const owner = { sessionId: 'snapshot-owner' }
   const mission = runtime.create(owner, { title: 'Snapshot', objective: 'Prove snapshot and restore', workspace: workspace ?? directory,
-    scope: ['**'], acceptance: ['works'], budget })
+    scope: ['**'], acceptance: ['works'], budget }, { grantRoot: workspace ?? directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['**'], acceptance: ['works'], checks: ['test'] })

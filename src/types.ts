@@ -849,16 +849,6 @@ export interface CreateMissionInput {
   title: string
   objective: string
   workspace: string
-  /**
-   * Human-authorization anchor for `workspace`, computed by the admission site
-   * from the session cwd or a configured `authorizedWorkspaces` root. Model
-   * tools never supply it directly: `boundPlanWorkspace` overwrites the
-   * workspace and passes the host-derived root, and the runtime re-derives it
-   * from `RuntimeConfig.grants` when roots are configured.
-   */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin, computed with `workspaceGrantRoot` at admission. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   scope: string[]
   acceptance: string[]
   budget: Budget
@@ -918,7 +908,7 @@ export interface PlanInput extends CreateMissionInput {
   workstreams: PlanWorkstream[]
   tasks: PlanTask[]
 }
-export interface DraftPlan {
+export interface DraftPlan extends Pick<Mission, 'workspaceGrantRoot' | 'workspaceAuthorizationSource'> {
   id: string
   ownerSessionId: string
   revision: number
@@ -927,10 +917,6 @@ export interface DraftPlan {
   input: PlanInput
   /** Bounded advisory preflight notes; they never change launch eligibility. */
   advisories?: string[]
-  /** Human-authorization anchor captured at staging; carried into the launched mission. */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin captured with the anchor; never inside `input`. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   createdAt: number
   updatedAt: number
   missionId?: string
@@ -941,14 +927,10 @@ export interface RequestStartInput {
   commandId: string
   goal: string
   workspace: string
-  /** Human-authorization anchor for `workspace`; defaults to the workspace itself. */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin; the native command passes `session` for its own cwd. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   /** Optional legacy hint. The primary agent supplies the actual plan budget. */
   budget?: Budget
 }
-export interface AutoStart extends RequestStartInput {
+export interface AutoStart extends RequestStartInput, Pick<Mission, 'workspaceGrantRoot' | 'workspaceAuthorizationSource'> {
   id: string
   ownerSessionId: string
   status: 'planning' | 'launching' | 'running' | 'completed' | 'failed' | 'stopped'

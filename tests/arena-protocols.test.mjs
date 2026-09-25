@@ -48,7 +48,7 @@ async function fixture(t, options = {}) {
   const mission = runtime.create(owner, {
     title: 'Arena protocols', objective: 'Exercise the arena contracts end to end', workspace,
     scope: ['src/'], acceptance: ['the arena works'], budget,
-  })
+  }, { grantRoot: workspace, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Arena work' })
   const alice = await runtime.addMember(owner, mission.id, { name: 'alice', role: 'implementation' })
   const bob = await runtime.addMember(owner, mission.id, { name: 'bob', role: 'reviewer' })

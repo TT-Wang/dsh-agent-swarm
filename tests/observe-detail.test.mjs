@@ -11,7 +11,7 @@ async function focusedMission(t) {
     budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
   })
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Inspect', objective: 'Expand records', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Inspect', objective: 'Expand records', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Inspect' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }

@@ -27,7 +27,7 @@ async function fixture(t) {
   })
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Parallel work', objective: 'Deliver independent work', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Parallel work', objective: 'Deliver independent work', workspace: root, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Delivery', objective: 'Complete the work' })
   // Spare comes first in the real dispatch order: preference must not depend on member order.
   const spare = await runtime.addMember(owner, mission.id, { name: 'Spare', role: 'general' })

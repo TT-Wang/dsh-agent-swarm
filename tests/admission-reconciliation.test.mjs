@@ -161,7 +161,7 @@ test('existing cycle, missing-review, uncovered-acceptance and integration-topol
     ],
   })
   const attempt = async (input, pattern, commandId) => {
-    const request = runtime.requestStart(owner, { commandId, goal: 'Make the requested change and verify it.', workspace: directory })
+    const request = runtime.requestStart(owner, { commandId, goal: 'Make the requested change and verify it.', workspace: directory }, { grantRoot: directory, source: 'session' })
     await assert.rejects(runtime.startPlan(owner, request.id, input), pattern)
   }
   const uncovered = automatic()

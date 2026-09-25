@@ -435,7 +435,7 @@ const GATE_TESTS = {
     const workers = new GatedWorkers()
     const f = await setup({ workers })
     try {
-      const request = f.runtime.requestStart(f.owner, { commandId: 's5c-cancel', goal: 'Make the requested change and verify it', workspace: f.dir })
+      const request = f.runtime.requestStart(f.owner, { commandId: 's5c-cancel', goal: 'Make the requested change and verify it', workspace: f.dir }, { grantRoot: f.dir, source: 'session' })
       const gate = deferred()
       workers.prepareGate = gate.promise
       const launching = f.runtime.startPlan(f.owner, request.id, automaticPlan(f.dir))

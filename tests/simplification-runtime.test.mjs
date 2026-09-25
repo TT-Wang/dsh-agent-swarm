@@ -29,19 +29,19 @@ test('draft create and edit share one advisory result but reread repository chec
   t.mock.method(fs, 'readFileSync', (file, ...args) => { if (file === packagePath) reads++; return read(file, ...args) })
   syncBuiltinESMExports()
   t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports() })
-  const draft = f.runtime.createDraft(f.owner, input)
+  const draft = f.runtime.createDraft(f.owner, input, { grantRoot: input.workspace, source: 'session' })
   assert.equal(reads, 2, 'one validation read and one advisory read')
   const staged = f.runtime.store.events(draft.id, 100).find(event => event.type === 'plan/staged').data.advisories
   assert.equal(staged.length, 25)
   assert.deepEqual(draft.advisories, staged.slice(0, 20).map(formatDiagnostic))
   await writeFile(packagePath, JSON.stringify({ scripts: Object.fromEntries(checks.map((_, i) => [`check${i}`, 'node --test'])) }))
   reads = 0
-  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, input)
+  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, input, { grantRoot: input.workspace, source: 'session' })
   assert.equal(reads, 2)
   assert.deepEqual(edited.advisories, [])
   assert.deepEqual(f.runtime.store.events(draft.id, 100).find(event => event.type === 'plan/edited').data.advisories, [])
   reads = 0
-  assert.throws(() => f.runtime.updateDraft(f.owner, draft.id, draft.revision, input), error => error.code === 'draft_revision_conflict')
+  assert.throws(() => f.runtime.updateDraft(f.owner, draft.id, draft.revision, input, { grantRoot: input.workspace, source: 'session' }), error => error.code === 'draft_revision_conflict')
   assert.equal(reads, 0, 'stale writes still fail before repository inspection')
 })
 
@@ -50,7 +50,7 @@ const task = (missionId, id, status, extra = {}) => ({ id, missionId, workstream
 
 test('synchronous graph reuse keeps repair deduplication and sees changed carriers on the next read', async t => {
   const f = await fixture(t)
-  const mission = f.runtime.create(f.owner, { title: 'Graph freshness', objective: 'Preserve graph policy', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = f.runtime.create(f.owner, { title: 'Graph freshness', objective: 'Preserve graph policy', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const original = task(mission.id, 'original', 'cancelled'), other = task(mission.id, 'other', 'blocked')
   const repair = task(mission.id, 'repair', 'pending', { replaces: [original.id, other.id] })
   const dependent = task(mission.id, 'dependent', 'pending', { dependencies: [original.id, other.id, original.id] })

@@ -81,7 +81,7 @@ async function fixture(t, config = {}) {
   }
   Object.assign(f, { runtime: quiet(runtime), workers })
   const owner = { sessionId: `r18-owner-${Math.random()}` }
-  const mission = f.runtime.create(owner, { title: 'R18', objective: 'Deliver verified work', workspace: directory, scope: ['src/', 'docs/'], acceptance: ['done'], budget: { ...BUDGET } })
+  const mission = f.runtime.create(owner, { title: 'R18', objective: 'Deliver verified work', workspace: directory, scope: ['src/', 'docs/'], acceptance: ['done'], budget: { ...BUDGET } }, { grantRoot: directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
   const member = async (name, role = 'implementation') => await f.runtime.addMember(owner, mission.id, { name, role })
   const author = await member('Author')
@@ -198,7 +198,7 @@ test('R18-2: a staged-plan member edit drops the stale composition so the member
     workstreams: [{ key: 'w', title: 'Main', objective: 'Deliver' }],
     tasks: [{ key: 't1', workstreamKey: 'w', title: 'Feature', objective: 'Write the feature', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['done'], checks: ['npm test'], assigneeKey: 'a' }],
   }
-  const draft = runtime.createDraft(owner, plan)
+  const draft = runtime.createDraft(owner, plan, { grantRoot: plan.workspace, source: 'session' })
   // The second member cannot start, so assembly fails AFTER the first member was
   // admitted and composed — the state any interrupted assembly leaves (the draft
   // is `failed`, the mission stays `staged`).
@@ -219,7 +219,7 @@ test('R18-2: a staged-plan member edit drops the stale composition so the member
   live = 10
   const repaired = structuredClone(plan)
   repaired.members[0].model = 'other-model'
-  const edited = runtime.updateDraft(owner, draft.id, staged.revision, repaired)
+  const edited = runtime.updateDraft(owner, draft.id, staged.revision, repaired, { grantRoot: repaired.workspace, source: 'session' })
   // Relaunching the repaired plan rotates the member's identity. Before the fix
   // the adapter still held a composition for the OLD identity, so `start` refused
   // every later attempt and this relaunch could never succeed.
@@ -471,7 +471,7 @@ test('R18-5b: the syntax refusal names the broken check and pairs each location 
     ],
   })
   const viaDraft = checks => {
-    const draft = runtime.createDraft(owner, plan(checks))
+    const draft = runtime.createDraft(owner, plan(checks), { grantRoot: directory, source: 'session' })
     return runtime.launchDraft(owner, draft.id, draft.revision)
   }
   let requests = 0

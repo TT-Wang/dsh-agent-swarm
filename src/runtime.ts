@@ -5,6 +5,7 @@ import { SwarmStore, WriterBusyError, StoreRecoveryError, stageRestore, type Pen
 import { Attempts, blockCauses, currentEvidenceIds, pendingStopOwner, stopPending, type BlockCause } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
+import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
 import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
@@ -343,7 +344,7 @@ export class SwarmRuntime {
   /** The mission is terminal: no further scheduling or fencing applies. */
   isMissionTerminal(mission: Mission): boolean { return terminal(mission) }
   // M1a seam 6/7: the workspace/admission surface lives in src/workspace-admission.ts.
-  assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } { return this.workspaceAdmission.assertAuthorizedRoot(workspace, grantRoot, source) }
+  assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim { return this.workspaceAdmission.assertAuthorizedRoot(workspace, claim) }
   async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> { return this.workspaceAdmission.assertWorkspaceAuthorized(mission, pass) }
   fenceWorkspace(missionId: string, reason: string): void { return this.workspaceAdmission.fenceWorkspace(missionId, reason) }
   deniedGitWrite(input: { tool: string; arguments: unknown; result: unknown; isError: boolean }): string | undefined { return this.workspaceAdmission.deniedGitWrite(input) }
@@ -1063,14 +1064,14 @@ export class SwarmRuntime {
    * records; it writes nothing.
    */
 
-  /** Create a mission with explicitly bounded resources and scope. */
-  create(actor: Actor, input: CreateMissionInput, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
+  /** Create a mission with explicitly bounded resources and scope, recording the authorization its entry point claimed. */
+  create(actor: Actor, input: CreateMissionInput, claim: WorkspaceClaim, initial: { id?: string; status?: 'active' | 'staged' } = {}): Mission {
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('worker_cannot_own_mission', 'authorization_error', 'Workers cannot create independent missions or budgets')
     requireText(input.title, 'title'); requireText(input.objective, 'objective')
     if (!isAbsolute(input.workspace)) throw new PolicyError('workspace_not_absolute', 'validation_error', 'workspace must be an absolute path')
     requireStrings(input.scope, 'scope'); requireStrings(input.acceptance, 'acceptance')
-    const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    const authorized = this.assertAuthorizedRoot(input.workspace, claim)
     input = { ...input, scope: normalizeScopeSelectors(input.scope) }
     assertScopeSelectors(input.scope, 'scope')
     const budget = validatedBudget(input.budget)
@@ -2633,7 +2634,7 @@ export class SwarmRuntime {
     return request
   }
   /** Admit once before any planning model call. Human command identity survives retries. */
-  requestStart(actor: Actor, input: RequestStartInput): AutoStart {
+  requestStart(actor: Actor, input: RequestStartInput, claim: WorkspaceClaim): AutoStart {
     actor.signal?.throwIfAborted()
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.isWorkerSession(actor.sessionId)) throw new PolicyError('worker_cannot_own_mission', 'authorization_error', 'Workers cannot create independent missions or budgets')
@@ -2650,7 +2651,7 @@ export class SwarmRuntime {
     if (this.starts(actor).some(request => ['planning', 'launching', 'running'].includes(request.status))) throw new PolicyError('automatic_request_in_progress', 'conflict_error', 'This session already has an automatic swarm request in progress')
     if (this.starts(actor).filter(request => request.status === 'failed').length >= 32) throw new Error('Too many failed automatic requests; retry a saved request')
     const now = this.now()
-    const authorized = this.assertAuthorizedRoot(input.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
+    const authorized = this.assertAuthorizedRoot(input.workspace, claim)
     const request: AutoStart = { id: id('start'), ownerSessionId: actor.sessionId, commandId: input.commandId, goal, workspace: input.workspace, workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source,
       budget, status: 'planning', planningEpoch: 1, planningDeadlineAt: now + (this.config.planningTimeoutMs ?? 600000), createdAt: now, updatedAt: now }
     this.commit(request.id, () => {
@@ -2798,7 +2799,7 @@ export class SwarmRuntime {
    */
   private automaticPlan(input: PlanInput, request: AutoStart): PlanInput {
     const options = { launch: true, dependencyDirs: this.config.verificationDependencyDirs }
-    const plan = validatePlan({ ...input, workspace: request.workspace, ...(request.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: request.workspaceGrantRoot }), ...(request.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: request.workspaceAuthorizationSource }) }, options)
+    const plan = validatePlan({ ...input, workspace: request.workspace }, options)
     // Collect every automatic-policy issue so one repair round fixes the whole plan.
     const issues: string[] = []
     if (plan.members.length < 2) issues.push('Automatic plans require at least two independent workers')
@@ -2876,9 +2877,10 @@ export class SwarmRuntime {
         launchActor.signal!.throwIfAborted()
         // Saving the deterministic link before the draft makes a crash between
         // these commits recoverable without creating an orphan or a duplicate.
+        const claim = recordedClaim(request.workspace, request)
         const draft = existing
-          ? (JSON.stringify(existing.input) === JSON.stringify(plan) ? existing : this.updateDraft(launchActor, existing.id, existing.revision, plan))
-          : this.createDraft(launchActor, plan, request.draftId)
+          ? (JSON.stringify(existing.input) === JSON.stringify(plan) ? existing : this.updateDraft(launchActor, existing.id, existing.revision, plan, claim))
+          : this.createDraft(launchActor, plan, claim, request.draftId)
         launchActor.signal!.throwIfAborted()
         const snapshot = await abortableStart(this.launchDraft(launchActor, draft.id, draft.revision), launchActor.signal!)
         // The activation commit is authoritative even if cancellation raced its
@@ -2996,41 +2998,37 @@ export class SwarmRuntime {
     if (!draft || draft.ownerSessionId !== actor.sessionId) throw new PolicyError('draft_not_owned', 'authorization_error', 'Draft is not owned by this session')
     return draft
   }
-  private prepareDraftInput(input: PlanInput) {
+  private prepareDraftInput(input: PlanInput, claim: WorkspaceClaim) {
     // The saved draft already shows the review the host adds for each deliverable.
-    const options = { dependencyDirs: this.config.verificationDependencyDirs }
-    const admitted = pairReviews(validatePlan(input, options))
-    const authorized = this.assertAuthorizedRoot(admitted.workspace, input.workspaceGrantRoot, input.workspaceAuthorizationSource)
-    // Store the authorization anchor on the draft, outside its canonical plan.
-    const { workspaceGrantRoot: _claimedRoot, workspaceAuthorizationSource: _claimedSource, ...clean } = admitted
-    return { clean, authorized }
+    const admitted = pairReviews(validatePlan(input, { dependencyDirs: this.config.verificationDependencyDirs }))
+    return { admitted, authorized: this.assertAuthorizedRoot(admitted.workspace, claim) }
   }
-  /** Saving a plan creates no workers, worktrees or model calls. */
-  createDraft(actor: Actor, input: PlanInput, admittedId?: string): DraftPlan {
+  /** Saving a plan creates no workers, worktrees or model calls; the claim is recorded beside it. */
+  createDraft(actor: Actor, input: PlanInput, claim: WorkspaceClaim, admittedId?: string): DraftPlan {
     actor.signal?.throwIfAborted()
     if (this.shuttingDown) throw new PolicyError('runtime_shutting_down', 'conflict_error', 'Swarm runtime is shutting down')
     if (this.store.list('members').some(m => m.sessionId === actor.sessionId)) throw new PolicyError('draft_owner_required', 'authorization_error', 'Workers cannot create independent missions or budgets')
     if (this.drafts(actor).filter(d => ['draft', 'failed', 'launching'].includes(d.status)).length >= 32) throw new PolicyError('draft_limit_reached', 'budget_error', 'Discard unused drafts before creating more')
     const now = this.now()
     if (admittedId && this.store.get('drafts', admittedId)) throw new PolicyError('draft_identity_conflict', 'conflict_error', 'Draft admission identity already exists')
-    const { clean, authorized } = this.prepareDraftInput(input)
-    const advisories = planAdvisories(clean)
-    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: clean, advisories: advisories.slice(0, 20).map(formatDiagnostic), workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, createdAt: now, updatedAt: now }
+    const { admitted, authorized } = this.prepareDraftInput(input, claim)
+    const advisories = planAdvisories(admitted)
+    const draft: DraftPlan = { id: admittedId ?? id('draft'), ownerSessionId: actor.sessionId, revision: 1, status: 'draft', input: admitted, advisories: advisories.slice(0, 20).map(formatDiagnostic), workspaceGrantRoot: authorized.grantRoot, workspaceAuthorizationSource: authorized.source, createdAt: now, updatedAt: now }
     this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/staged', 'owner', { draftId: draft.id, revision: draft.revision, advisories }) })
     return draft
   }
-  updateDraft(actor: Actor, draftId: string, revision: number, input: PlanInput): DraftPlan {
+  updateDraft(actor: Actor, draftId: string, revision: number, input: PlanInput, claim: WorkspaceClaim): DraftPlan {
     const draft = this.ownedDraft(actor, draftId)
     if (draft.revision !== revision) throw new PolicyError('draft_revision_conflict', 'conflict_error', 'Draft changed; reload before saving')
     if (!['draft', 'failed'].includes(draft.status)) throw new PolicyError('draft_not_editable', 'conflict_error', 'Only draft or failed plans can be edited while dispatch is closed')
-    const { clean, authorized } = this.prepareDraftInput(input)
-    this.validateDraftRepair(draft, clean)
+    const { admitted, authorized } = this.prepareDraftInput(input, claim)
+    this.validateDraftRepair(draft, admitted)
     const previousInput = draft.input
-    const advisories = planAdvisories(clean)
+    const advisories = planAdvisories(admitted)
     draft.advisories = advisories.slice(0, 20).map(formatDiagnostic)
-    draft.input = clean; draft.workspaceGrantRoot = authorized.grantRoot; draft.workspaceAuthorizationSource = authorized.source; draft.revision++; draft.updatedAt = this.now()
+    draft.input = admitted; draft.workspaceGrantRoot = authorized.grantRoot; draft.workspaceAuthorizationSource = authorized.source; draft.revision++; draft.updatedAt = this.now()
     delete draft.error
-    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/edited', 'owner', { draftId, revision: draft.revision, previousInput, input: clean, advisories }) })
+    this.commit(draft.id, () => { this.store.put('drafts', draft); this.store.event(draft.id, 'plan/edited', 'owner', { draftId, revision: draft.revision, previousInput, input: admitted, advisories }) })
     return draft
   }
   discardDraft(actor: Actor, draftId: string, revision: number): DraftPlan {
@@ -3195,10 +3193,7 @@ export class SwarmRuntime {
         const repairing = mission !== undefined
         if (!mission) {
           const { title, objective, workspace, scope, acceptance, budget } = input
-          const extra = input as PlanInput & { workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
-          const anchor = draft.workspaceGrantRoot ?? extra.workspaceGrantRoot
-          const source = draft.workspaceAuthorizationSource ?? extra.workspaceAuthorizationSource
-          mission = this.create(actor, { title, objective, workspace, ...(anchor === undefined ? {} : { workspaceGrantRoot: anchor }), ...(source === undefined ? {} : { workspaceAuthorizationSource: source }), scope, acceptance, budget }, { id: missionId, status: 'staged' })
+          mission = this.create(actor, { title, objective, workspace, scope, acceptance, budget }, recordedClaim(workspace, draft), { id: missionId, status: 'staged' })
         }
         if (mission.ownerSessionId !== actor.sessionId || mission.status !== 'staged') throw new PolicyError('draft_mission_not_launchable', 'conflict_error', 'The partially assembled mission cannot be launched')
         if (repairing) await this.repairDraftAdmissions(actor, draft, input, assertCurrent)

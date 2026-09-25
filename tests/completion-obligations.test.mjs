@@ -25,7 +25,7 @@ async function fixture(t) {
     kind: 'research', assigneeKey: 'author', dependencies })
   const review = (key, reviewOf) => ({ ...common, key, title: key, objective: key,
     kind: 'verification', assigneeKey: 'reviewer', reviewOf })
-  const request = runtime.requestStart(owner, { commandId: 'review-command', goal: 'Audit and deliver a final report', workspace: directory })
+  const request = runtime.requestStart(owner, { commandId: 'review-command', goal: 'Audit and deliver a final report', workspace: directory }, { grantRoot: directory, source: 'session' })
   const snapshot = await runtime.startPlan(owner, request.id, {
     title: 'Deep review', objective: 'Audit and deliver a final report', workspace: directory, scope: ['docs/reviews/'], acceptance, budget,
     members: [{ key: 'author', name: 'Author', role: 'research', maxOutputTokens: 2048 },

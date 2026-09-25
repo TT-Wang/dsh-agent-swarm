@@ -35,7 +35,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], maxTasks = 100 } =
   const { dir, runtime, budget } = await makeRuntime(t, { workers, clock, config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks } })
   await runtime.start()
   const owner = { sessionId: 'rework-review-owner' }
-  const mission = runtime.create(owner, { title: 'Rework review', objective: 'Review reworked work once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Rework review', objective: 'Review reworked work once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const m = []
   for (const name of members) m.push(await runtime.addMember(owner, mission.id, { name, role: 'implementation' }))
@@ -77,7 +77,7 @@ test('a rework re-pends its rejecting review, which reviews the resubmission at 
   const owner = { sessionId: 'busy-owner' }
   // The host pairs the deliverable with its review at launch; the plan has no
   // task slot to spare, so a review admitted per rework could not fit.
-  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'busy-1', goal: 'g', workspace: dir }).id, {
+  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'busy-1', goal: 'g', workspace: dir }, { grantRoot: dir, source: 'session' }).id, {
     title: 'Busy', objective: 'Busy board', workspace: dir, scope: ['src/'], acceptance: ['works'],
     budget: { maxTokens: 100_000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 3_600_000, maxTasks: 4, maxExperiments: 0 },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }, { key: 'other', name: 'Other', role: 'research', maxOutputTokens: 2048 }],

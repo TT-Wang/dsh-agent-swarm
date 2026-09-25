@@ -57,7 +57,7 @@ async function fixture(t, config, taskInput = {}) {
   })
   await runtime.start()
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Bound', objective: 'Escalate a silent operation', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Bound', objective: 'Escalate a silent operation', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Bound the operation' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }

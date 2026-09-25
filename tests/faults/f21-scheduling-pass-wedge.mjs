@@ -99,7 +99,7 @@ async function namingCommitFailsOnce() {
   try {
     await runtime.start()
     const owner = { sessionId: 'fault-owner' }
-    const mission = runtime.create(owner, { title: 'Fault injection', objective: 'A wedge naming whose first commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget })
+    const mission = runtime.create(owner, { title: 'Fault injection', objective: 'A wedge naming whose first commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget }, { grantRoot: dir, source: 'session' })
     const stream = runtime.workstream(owner, mission.id, { title: 'Faults', objective: 'Exercise the fault path' })
     const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
     const scheduling = runtime.scheduling

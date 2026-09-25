@@ -60,7 +60,7 @@ test('R12: owner can settle a receipt in paused, blocked and terminal missions w
   const owner = { sessionId: 'owner' }
   for (const status of ['paused', 'blocked', 'completed', 'stopped']) {
     const mission = rt.create(owner, { title: status, objective: 'Settle a receipt', workspace: directory, scope: ['**'], acceptance: ['answer'],
-      budget: { ...budget } })
+      budget: { ...budget } }, { grantRoot: directory, source: 'session' })
     const questionId = `question-${status}`
     rt.commit(mission.id, () => {
       const row = rt.mission(mission.id); row.status = status; rt.store.put('missions', row)
@@ -137,7 +137,7 @@ test('R12 instrument: ordinary owner questions are excluded from the decision me
   const { dir: directory, runtime: rt, budget } = await quietRuntime(t)
   const owner = { sessionId: 'owner' }
   const mission = rt.create(owner, { title: 'Metrics', objective: 'Count decisions', workspace: directory, scope: ['**'], acceptance: ['accurate'],
-    budget: { ...budget } })
+    budget: { ...budget } }, { grantRoot: directory, source: 'session' })
   rt.commit(mission.id, () => {
     rt.store.put('deliveries', { id: 'ordinary-question', missionId: mission.id, from: 'member', to: 'owner', kind: 'question', content: 'API?', createdAt: 1, replyExpected: true })
   })
@@ -235,7 +235,7 @@ test('R12: a stop whose recorded owner has no member row is refused, and the own
   const { dir, runtime, budget } = await makeRuntime(t)
   await runtime.start()
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Ghost owner', objective: 'Refuse an unconfirmable stop', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Ghost owner', objective: 'Refuse an unconfirmable stop', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const work = { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'] }
   const task = runtime.propose(owner, mission.id, work)

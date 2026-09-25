@@ -308,7 +308,7 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   try {
     await runtime.start()
     const owner = { sessionId: 'pass-owner' }
-    const mission = runtime.create(owner, { title: 'Busy naming', objective: 'Name a wedge whose first naming commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget })
+    const mission = runtime.create(owner, { title: 'Busy naming', objective: 'Name a wedge whose first naming commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget }, { grantRoot: dir, source: 'session' })
     const stream = runtime.workstream(owner, mission.id, { title: 'S', objective: 'S' })
     const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
     const wedges = () => events(runtime, mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)

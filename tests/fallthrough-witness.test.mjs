@@ -17,7 +17,7 @@ async function fixture(t, config = {}) {
   })
   await runtime.start()
   const owner = { sessionId: 'fallthrough-owner' }
-  const mission = runtime.create(owner, { title: 'Fall-through', objective: 'Name the wake', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Fall-through', objective: 'Name the wake', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }

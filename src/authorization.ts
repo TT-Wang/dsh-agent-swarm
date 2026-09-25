@@ -33,6 +33,9 @@ export interface WorkspaceAuthorized {
   grant?: WorkspaceGrant
 }
 
+/** What an entry point hands the runtime beside a plan, and the runtime records; never a plan field. */
+export type WorkspaceClaim = Pick<WorkspaceAuthorized, 'source' | 'grantRoot'>
+
 export interface WorkspaceRefused {
   ok: false
   /** Field-level diagnostic naming the authorization requirement and its repair. */
@@ -126,30 +129,35 @@ export async function authorizeWorkspace(requested: string, sessionCwd: string |
 }
 
 /**
+ * The claim a mission, draft or automatic request recorded. X3: a row without
+ * an anchor predates the feature, so its workspace is its own anchor; a row
+ * without a source never reads as a session authorization, so it is judged by
+ * the configured roots and fails closed.
+ */
+export function recordedClaim(workspace: string, row: Pick<Mission, 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>): WorkspaceClaim {
+  return { grantRoot: row.workspaceGrantRoot ?? workspace, source: row.workspaceAuthorizationSource ?? 'grant' }
+}
+
+/**
  * Re-validate a workspace already recorded on a mission or planning request.
- * The resolved workspace must still sit inside its recorded
- * `workspaceGrantRoot`; it then stays authorized as the session workspace it
- * was recorded as, or while `grantFor` still finds an active configured root
- * containing it: the admission rule, so a root added or removed around it
- * never fences a workspace admission would accept, and removing the last root
- * that contains it fences the mission at its next preparation.
- *
- * X3: only an explicit `session` record takes the session branch; a missing
- * source is judged by the configured roots and fails closed. A record without
- * an anchor predates the feature: its workspace is its own anchor and, having
- * no source either, it is judged by the configured roots alone.
+ * The resolved workspace must still sit inside its recorded claim's root; it
+ * then stays authorized as the session workspace it was recorded as, or while
+ * `grantFor` still finds an active configured root containing it: the
+ * admission rule, so a root added or removed around it never fences a
+ * workspace admission would accept, and removing the last root that contains
+ * it fences the mission at its next preparation.
  *
  * Residual TOCTOU: the check and the subsequent git operation are separate
  * syscalls, so a root replaced in that window is not caught here. This is
  * documented in docs/known-limitations.md rather than claimed closed.
  */
 export async function reauthorizeWorkspace(record: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, loaded: WorkspaceGrantSnapshot, now = Date.now()): Promise<WorkspaceAuthorization> {
-  const recorded = record.workspaceGrantRoot ?? record.workspace
+  const { grantRoot: recorded, source } = recordedClaim(record.workspace, record)
   const workspace = await realpath(record.workspace).catch(() => undefined)
   if (workspace === undefined) return { ok: false, diagnostic: `Authorized workspace ${record.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]` }
   const anchor = await realpath(recorded).catch(() => undefined)
   if (anchor === undefined || !isContained(anchor, workspace)) return { ok: false, diagnostic: `Workspace ${record.workspace} escaped its recorded authorized root ${recorded} [${WORKSPACE_AUTHORIZATION_CODE}]` }
-  if (record.workspaceAuthorizationSource === 'session' && workspace === anchor) return { ok: true, workspace, source: 'session', grantRoot: anchor }
+  if (source === 'session' && workspace === anchor) return { ok: true, workspace, source: 'session', grantRoot: anchor }
   const grant = grantFor(workspace, loaded, now)
   if (grant !== undefined) return { ok: true, workspace, source: 'grant', grantRoot: grant.path, grant }
   return { ok: false, diagnostic: `Authorized root ${recorded} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]` }

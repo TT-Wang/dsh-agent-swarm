@@ -159,7 +159,7 @@ test('A2-01: both spellings are refused at runtime.propose', async t => {
     config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 200, checkTimeoutMs: undefined },
   })
   const owner = { sessionId: 'a2-01-owner' }
-  const mission = runtime.create(owner, { title: 'Bypass', objective: 'Refuse host paths', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Bypass', objective: 'Refuse host paths', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const propose = checks => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks })

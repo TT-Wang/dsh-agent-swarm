@@ -34,7 +34,7 @@ async function fixture(t, workers = new OutageWorkers()) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
   const owner = { sessionId: 'outage-owner' }
-  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: '/source', scope: ['**'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })

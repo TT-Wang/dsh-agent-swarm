@@ -34,7 +34,7 @@ async function setup(t, options = {}) {
   const { runtime, workers } = await makeRuntime(t, { workers: new GovernanceWorkers(),
     config: { tickMs: 1000, maxEvents: 200, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Govern', objective: 'Fix governance', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget, ...options.budget } })
+  const mission = runtime.create(owner, { title: 'Govern', objective: 'Fix governance', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget, ...options.budget } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix governance' })
   const addMember = (input, admittedId) => runtime.addMember(owner, mission.id, { maxOutputTokens: 1000, ...input }, admittedId)
   const propose = (actor, extra = {}, admittedId) => runtime.propose(actor, mission.id, {
@@ -87,7 +87,7 @@ test('a mission duration beyond the clock range is one validation_error at creat
     return true
   }
   assert.throws(() => f.runtime.create(f.owner, { title: 'Long', objective: 'Too long', workspace: '/source', scope: ['src/'], acceptance: ['works'],
-    budget: { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER } }), duration)
+    budget: { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER } }, { grantRoot: '/source', source: 'session' }), duration)
   assert.throws(() => f.runtime.updateBudget(f.owner, f.mission.id, { ...budget, maxDurationMs: Number.MAX_SAFE_INTEGER }), duration)
 })
 

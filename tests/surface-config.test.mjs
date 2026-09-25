@@ -64,7 +64,7 @@ test('a non-function now in a runtime config built from the profile falls back t
     try {
       await runtime.start()
       const before = Date.now()
-      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
       assert.equal(mission.status, 'active', `now: ${JSON.stringify(now)}`)
       assert.ok(mission.createdAt >= before && mission.createdAt <= Date.now(), 'the mission is stamped by the default clock')
     } finally { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }

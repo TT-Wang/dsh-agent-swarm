@@ -33,8 +33,6 @@ export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'sw
 export const MANAGEMENT_TOOLS: readonly string[] = OWNER_ONLY_TOOLS
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
-/** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */
-const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
 export type SwarmRole = 'entry' | 'owner' | 'historical-owner' | 'worker' | 'none'
 /** Global tool names hidden from a session in the given role. */
 export function hiddenToolsFor(role: SwarmRole): string[] {
@@ -75,6 +73,9 @@ Use swarm_propose for bounded work; repairs name replaces and inherit its accept
 export const SWARM_PROMPT = ENTRY_PROMPT
 
 type Args = Record<string, unknown>
+type Run = (args: Args, actor: Actor, called: Args) => Promise<unknown> | unknown
+/** A planning tool binds its model-supplied workspace and runs with the authorization beside its arguments. */
+interface PlanningRun { bound: (args: Args, actor: Actor, authorization: WorkspaceAuthorized) => Promise<unknown> | unknown }
 /** The top-level arguments guard: typed like the schema check, the other [tool_arguments_invalid] producer. */
 function object(value: unknown): Args {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
@@ -275,7 +276,7 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
   // output; the bytes themselves are not retained.
   const trace = TraceRecorder.forRuntime(runtime)
   const register = (name: string, description: string, properties: Record<string, JsonSchemaNode>, required: string[],
-    run: (args: Args, actor: Actor, called: Args) => Promise<unknown> | unknown, missionKey = 'missionId') => {
+    run: Run | PlanningRun, missionKey = 'missionId') => {
     const definition: ToolDefinition = {
       name,
       description,
@@ -322,16 +323,19 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         // property is an omission, removed first (`withoutUnsetNulls`).
         args = withoutUnsetNulls(definition.parameters, args) as Args
         try { assertToolArguments(name, definition.parameters, args) } catch (error) { await recordSpan(undefined, 'error', error); throw error }
-        // H4: planning workspaces are bound to the calling session or a root the
-        // human configured once, never to the model's word. The matched root is
-        // attached for the mission record; the runtime re-derives it when the
-        // plugin installed its own authorization predicate.
-        if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) {
-          const bound = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
-          args = { ...args, workspace: bound.workspace, workspaceGrantRoot: bound.grantRoot, workspaceAuthorizationSource: bound.source }
+        // H4: a planning workspace is bound to the calling session or a root the
+        // human configured once, never to the model's word. The arguments keep
+        // the canonical workspace; the authorization reaches the runtime beside
+        // them, and the runtime re-derives the root from the loaded roots.
+        let invoke: () => unknown
+        if (typeof run === 'function') invoke = () => run(args, actor, called)
+        else {
+          const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
+          args = { ...args, workspace: authorization.workspace }
+          invoke = () => run.bound(args, actor, authorization)
         }
         try {
-          const result = await run(args, actor, called)
+          const result = await invoke()
           await recordSpan(result, 'ok')
           const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
           const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
@@ -384,10 +388,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         properties: { assigneeKey: string, objective: string, acceptance: strings, maxSteps: positiveInteger, maxRecoveryAttempts: positiveInteger } },
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
-  register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; the host adds one independent review per deliverable unless the plan names one. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
-    ...a, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
-    workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource'),
-  } as unknown as PlanInput))
+  register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; the host adds one independent review per deliverable unless the plan names one. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'],
+    { bound: (a, actor, authorization) => runtime.createDraft(actor, a as unknown as PlanInput, authorization) })
   const launchProperties: Record<string, JsonSchemaNode> = structuredClone(planProperties)
   // The planning message names the workspace, and callers repeat it here; the
   // launch always runs in the frozen request workspace, so the key is accepted
@@ -443,11 +445,10 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     })
   register('swarm_create', 'Create a durable mission in the user-authorized workspace and scope with every budget field chosen for this task. Returns the mission id; then add workstreams, tasks and members.',
     { title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema },
-    ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], (a, actor) => runtime.create(actor, {
+    ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], { bound: (a, actor, authorization) => runtime.create(actor, {
       title: text(a, 'title'), objective: text(a, 'objective'), workspace: text(a, 'workspace'), scope: array(a, 'scope'), acceptance: array(a, 'acceptance'),
-      budget: a.budget as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
-      workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
-    } satisfies CreateMissionInput))
+      budget: a.budget as unknown as Budget,
+    } satisfies CreateMissionInput, authorization) })
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id.',
     { ...mission, name: { ...string, description: 'Optional human name. Omit it to take the next unused name from the fixed pool.' }, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'role'],
     (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: optionalText(a, 'name'), role: text(a, 'role'), model: optionalText(a, 'model'),

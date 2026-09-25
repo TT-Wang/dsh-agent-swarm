@@ -204,7 +204,7 @@ export function registerAutomaticStart(ctx: Context, runtime: SwarmRuntime): voi
     await ctx.llm.resolveCallConfig(model, signal)
     signal.throwIfAborted()
     if (disposed) throw new Error('Agent Swarm is unloading')
-    let request = runtime.requestStart({ sessionId, signal }, { commandId, goal, workspace, workspaceAuthorizationSource: 'session' })
+    let request = runtime.requestStart({ sessionId, signal }, { commandId, goal, workspace }, { grantRoot: workspace, source: 'session' })
     try {
       request = await runtime.prepareStart({ sessionId, signal }, request.id, request.planningEpoch ?? 1)
       signal.throwIfAborted()

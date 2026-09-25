@@ -17,7 +17,7 @@ async function fixture(t) {
   t.after(() => { workers.stopping = undefined })
   const { config, runtime: rt } = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }
-  const mission = rt.create(owner, { title: 'Continue the obligation', objective: 'Same work with revised estimates', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget })
+  const mission = rt.create(owner, { title: 'Continue the obligation', objective: 'Same work with revised estimates', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
   const ws = rt.workstream(owner, mission.id, { title: 'Core', objective: 'Build it' })
   const member = await rt.addMember(owner, mission.id, { name: 'Ada', role: 'builder' })
   const other = await rt.addMember(owner, mission.id, { name: 'Alan', role: 'builder and review' })

@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
-import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization } from './authorization.ts'
+import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
 import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -131,32 +131,26 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
   return header
 }
 
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined, launching = false): Promise<PlanInput> {
-  const input = object(body.input)
-  const authorization = await canonicalWorkspace(text(input, 'workspace'), header, grants)
-  if (!authorization.ok) throw new RequestError(authorization.diagnostic)
-  // The host-derived root always overrides any client-supplied value, so a
-  // browser payload cannot widen its own authorization anchor.
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching, dependencyDirs }), true)
-  await validateModels(ctx, header.id, plan.members, signal, launching)
-  return plan
-}
-
 /**
- * The browser admission boundary, identical to the model tool boundary: the
- * workspace must be the calling session's cwd or resolve inside a configured
- * authorized root. The refusal is a field-level diagnostic naming the
- * authorization requirement, never a bare cwd-equality error.
+ * The browser plan and, beside it in the order the runtime takes them, its
+ * workspace authorization. The browser admission boundary is identical to the
+ * model tool boundary: the workspace must be the calling session's cwd or
+ * resolve inside a configured authorized root. The refusal is a field-level
+ * diagnostic naming the authorization requirement, never a bare cwd-equality error.
  */
-async function canonicalWorkspace(input: string, header: SessionHeader, grants: WorkspaceGrantSnapshot): Promise<WorkspaceAuthorization> {
-  return await authorizeWorkspace(input, header.cwd, grants)
+async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
+  const input = object(body.input)
+  const authorization = await authorizeWorkspace(text(input, 'workspace'), header.cwd, grants)
+  if (!authorization.ok) throw new RequestError(authorization.diagnostic)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs }), true)
+  await validateModels(ctx, header.id, plan.members, signal, false)
+  return [plan, authorization]
 }
 
-/** Re-validate a mission already recorded against its own durable grant root. */
-async function missionWorkspace(mission: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, grants: WorkspaceGrantSnapshot): Promise<string> {
-  const authorization = await reauthorizeWorkspace(mission, grants)
+/** Re-validate the workspace a mission or draft recorded against its own durable claim. */
+async function assertRecordedWorkspace(row: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, grants: WorkspaceGrantSnapshot): Promise<void> {
+  const authorization = await reauthorizeWorkspace(row, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
-  return authorization.workspace
 }
 
 async function validateModels(ctx: Context, ownerId: SessionId, members: Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>[], signal: AbortSignal, launching: boolean): Promise<void> {
@@ -238,7 +232,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           const missionId = text(body, 'missionId')
           const mission = runtime.store.get('missions', missionId)
           if (!mission || mission.ownerSessionId !== sessionId) throw new RequestError('Only the mission owner can access deliverables')
-          await missionWorkspace(mission, grants)
+          await assertRecordedWorkspace(mission, grants)
           if (endpoint === 'delivery') return { ok: true, value: { delivery: await exposed(() => runtime.inspectDelivery(actor, missionId)) } }
           return { ok: true, value: { result: await exposed(() => runtime.applyDelivery(actor, missionId)), snapshot: runtime.snapshot(actor, missionId) } }
         }
@@ -305,23 +299,22 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'discard-draft': {
           const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }
         }
         case 'launch-draft': {
           const draft = runtime.drafts(actor).find(candidate => candidate.id === text(body, 'draftId'))
-          if (draft?.status === 'launched') {
+          if (draft?.status !== 'launched' && ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
+          if (draft !== undefined) {
+            // A launch runs under the authorization its row recorded: its staged mission's once assembled, else the draft's.
             const mission = draft.missionId === undefined ? undefined : runtime.store.get('missions', draft.missionId)
-            if (mission !== undefined) await missionWorkspace(mission, grants)
-            else await canonicalWorkspace(draft.input.workspace, header, grants)
-            return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, draft.id, revision(body))) } }
+            await assertRecordedWorkspace(mission ?? { ...draft, workspace: draft.input.workspace }, grants)
+            if (draft.status !== 'launched') await validateModels(ctx, header.id, draft.input.members, signal, true)
           }
-          if (ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
-          if (draft !== undefined) await planInput(ctx, { input: draft.input }, header, signal, grants, runtime.config.verificationDependencyDirs, true)
           return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body))) } }
         }
         case 'control': {

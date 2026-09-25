@@ -36,7 +36,7 @@ test('R11-06: runtime.propose refuses a host-only body behind a neutral script n
   }))
   assert.deepEqual(Object.keys(loadPackageScripts(directory) ?? {}), ['smoke', 'unit', 'chain'])
   const owner = { sessionId: 'host-scripts-owner' }
-  const mission = runtime.create(owner, { title: 'Scripts', objective: 'Classify scripts', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Scripts', objective: 'Classify scripts', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const propose = checks => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks })

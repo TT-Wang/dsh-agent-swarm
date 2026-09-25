@@ -11,7 +11,7 @@ async function fixture(t) {
   // These tests drive dispatch explicitly so incidental scheduling cannot mask a race.
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Recovery', objective: 'Recover safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Recovery', objective: 'Recover safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const a = await runtime.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'B', role: 'implementation' })
@@ -21,7 +21,7 @@ async function fixture(t) {
 
 test('a failed tick guard and one failed mission do not suppress other guards or missions', async t => {
   const f = await fixture(t), calls = []
-  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget })
+  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.mission.workspace, source: 'session' })
   f.runtime.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')

@@ -22,7 +22,7 @@ async function fixture(t) {
   const owner = { sessionId: 'lineage-owner' }
   const f = { ...made, owner, actor: member => ({ sessionId: member.sessionId }) }
   await f.runtime.start()
-  f.mission = f.runtime.create(owner, { title: 'Lineage retirement', objective: 'Retire superseded repair chains', workspace: made.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget: made.budget })
+  f.mission = f.runtime.create(owner, { title: 'Lineage retirement', objective: 'Retire superseded repair chains', workspace: made.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget: made.budget }, { grantRoot: made.dir, source: 'session' })
   f.stream = f.runtime.workstream(owner, f.mission.id, { title: 'Main', objective: 'Main' })
   f.author = await f.runtime.addMember(owner, f.mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   f.reviewer = await f.runtime.addMember(owner, f.mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })

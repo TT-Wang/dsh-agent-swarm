@@ -65,7 +65,7 @@ async function fixture(t, config = {}) {
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
-  const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })

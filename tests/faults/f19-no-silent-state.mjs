@@ -538,7 +538,7 @@ await runScenario({
         await runtime.start()
         const owner = { sessionId: 'f19-empty-owner' }
         const mission = runtime.create(owner, { title: 'Empty', objective: 'Owner still planning', workspace: directory, scope: ['**'],
-          acceptance: ['x'], budget })
+          acceptance: ['x'], budget }, { grantRoot: directory, source: 'session' })
         const first = runtime.fingerprint(mission.id)
         await sleep(120)
         assert.equal(runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner').length, 0, 'row 17: the documented exemption is not spammed')

@@ -128,7 +128,7 @@ test('the guard-chain board reads a preparation block from the recorded failure,
   })
   const owner = { sessionId: 'causes-owner' }
   const mission = runtime.create(owner, { title: 'Causes', objective: 'Classify blocks', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,

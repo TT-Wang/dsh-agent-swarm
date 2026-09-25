@@ -28,7 +28,7 @@ async function firstHost(t) {
   const { runtime, config, budget } = await firstRuntime(t)
   await runtime.start()
   const owner = { sessionId: 'restart-owner' }
-  const mission = runtime.create(owner, { title: 'Restart', objective: 'Survive a host restart', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Restart', objective: 'Survive a host restart', workspace: '/source', scope: ['**'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long task', objective: 'Survive', kind: 'implementation',
@@ -87,7 +87,7 @@ test('restart recovery admits nothing again: a stored row whose text names prior
   const { runtime: first, config, budget } = await firstRuntime(t)
   await first.start()
   const owner = { sessionId: 'restart-owner' }
-  const mission = first.create(owner, { title: 'Reopen', objective: 'Reopen a stored row', workspace: '/source', scope: ['**'], acceptance: ['works'], budget })
+  const mission = first.create(owner, { title: 'Reopen', objective: 'Reopen a stored row', workspace: '/source', scope: ['**'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
   const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   await first.addMember(owner, mission.id, { name: 'Researcher', role: 'research' })
   const task = extra => first.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, kind: 'research', scope: ['**'], acceptance: ['works'], ...extra })

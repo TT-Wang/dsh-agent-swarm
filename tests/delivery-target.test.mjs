@@ -14,7 +14,7 @@ async function fixture(t) {
     budget: { maxTokens: 10000, maxSteps: 100, maxTasks: 20, maxExperiments: 2 },
   })
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Deliver', objective: 'Chain integrations', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Deliver', objective: 'Chain integrations', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const put = task => { runtime.store.put('tasks', task); return task }
   return { runtime, workers, owner, mission, put }
 }
