@@ -127,7 +127,7 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
   // No workspace-bound tool exposes a grant field in its model-visible schema.
   for (const name of ['swarm_create', 'swarm_stage', 'swarm_propose']) {
     const properties = Object.keys(tools.get(name).parameters.properties)
-    for (const forbidden of ['authorizedWorkspaces', 'workspaceGrantRoot', 'grants', 'workspace']) {
+    for (const forbidden of ['authorizedWorkspaces', 'workspaceGrantRoot', 'workspaceAuthorizationSource', 'grants', 'workspace']) {
       if (name === 'swarm_propose' || forbidden === 'workspace') continue
       assert(!properties.includes(forbidden), `${name} must not expose ${forbidden}`)
     }
@@ -141,11 +141,14 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
   const created = await tools.get('swarm_create').execute(missionFields(project), execution(session))
   const recorded = runtime.store.get('missions', created.result.id)
   assert.equal(recorded.workspaceGrantRoot, await realpath(granted), 'the model cannot widen the recorded root')
-  // An ungranted path stays refused, and a root supplied for it never reaches the binding.
-  await assert.rejects(tools.get('swarm_create').execute(missionFields(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_create').execute({ ...missionFields(outside), workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, execution(session)), /\[tool_arguments_invalid\]/)
-  await assert.rejects(tools.get('swarm_stage').execute(plan(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
-  await assert.rejects(tools.get('swarm_stage').execute({ ...plan(outside), workspaceGrantRoot: outside }, execution(session)), /\[tool_arguments_invalid\]/)
+  // An ungranted path stays refused, and no authorization supplied for it (a
+  // root or a session source) reaches the binding.
+  for (const [name, args] of [['swarm_create', missionFields], ['swarm_stage', plan]]) {
+    await assert.rejects(tools.get(name).execute(args(outside), execution(session)), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+    for (const forged of [{ workspaceGrantRoot: outside, authorizedWorkspaces: [{ path: outside }] }, { workspaceAuthorizationSource: 'session' }]) {
+      await assert.rejects(tools.get(name).execute({ ...args(outside), ...forged }, execution(session)), /\[tool_arguments_invalid\]/, `${name} refuses ${Object.keys(forged).join(', ')}`)
+    }
+  }
   // swarm_propose accepts no workspace and cannot re-point an existing mission.
   const stream = runtime.workstream({ sessionId: 'owner' }, recorded.id, { title: 'Main', objective: 'Main' })
   await runtime.propose({ sessionId: 'owner' }, recorded.id, { outputs: [], workstreamId: stream.id, title: 'Probe', objective: 'Probe the boundary', kind: 'research', scope: ['src/'], acceptance: ['works'] })
@@ -164,9 +167,13 @@ test('AC3: swarm_create, swarm_stage and swarm_propose cannot introduce or widen
 })
 
 /**
- * The planning tools compute one authorization at their workspace binding and
- * hand it to the runtime beside the plan; the plan the runtime receives carries
- * none, and no argument can supply one: the schema refuses both fields by name.
+ * A structural pin of the calling convention, not a behavioural regression:
+ * before the claim moved beside the plan, the tool path authorized correctly
+ * with the claim written into its arguments, so this test fails there only on
+ * the convention. The planning tools compute one authorization at their
+ * workspace binding and hand the runtime its claim beside a plan that carries
+ * none; a binding that drops, swaps or re-derives the claim fails here. The
+ * guard that no argument supplies an authorization is AC3.
  */
 test('The planning tools hand the runtime their binding\'s authorization beside a plan that carries none', async t => {
   const { session, granted, project } = await fixture(t)
@@ -179,9 +186,6 @@ test('The planning tools hand the runtime their binding\'s authorization beside 
   })
   const tools = definitions(runtime, grants)
   for (const [name, args] of [['swarm_create', missionFields], ['swarm_stage', plan]]) {
-    for (const forged of [{ workspaceGrantRoot: '/' }, { workspaceAuthorizationSource: 'session' }]) {
-      await assert.rejects(tools.get(name).execute({ ...args(project), ...forged }, execution(session)), /\[tool_arguments_invalid\]/, `${name} refuses ${Object.keys(forged)[0]}`)
-    }
     await tools.get(name).execute(args(session), execution(session))
     await tools.get(name).execute(args(project), execution(session))
   }
