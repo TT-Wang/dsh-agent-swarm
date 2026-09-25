@@ -244,3 +244,31 @@ test('the review-path blocker composes the unrunnable exits from the stored row,
   assert.doesNotMatch(first, /could not execute a check|could not run in the clean/, 'one exit, the first failure\'s')
   assert.equal(blocker(mixed, every.source), `review ${every.review.id} deferred its verdict on this artifact: ${first.slice(first.indexOf('a check reached'), -1)}`)
 })
+
+test('the reason and the blocker take the exit from the deciding pass: the retry, and after a resume the latest deferral', async t => {
+  const f = await fakeFixture(t)
+  const passes = [
+    [{ command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' }],
+    [unrunnable({ dependencyLinks: { mode: 'copy', dirs: ['node_modules'], materializedPaths: ['node_modules'] } })],
+  ]
+  f.workers.verifyArtifact = async () => passes.shift() ?? [{ command: 'test -d .', exitCode: 0, output: 'ok' }]
+  const source = f.propose()
+  const { review, verify } = await submitForReview(f, source)
+  await verify()
+  assert.deepEqual(hostRuns(f).map(run => [run.arguments.attempt, run.result.failureKind]), [[1, 'timeout'], [2, 'unrunnable']], 'both passes are durable')
+  const reason = deferredReason(f)
+  assert.ok(reason.includes('a command could not run in the clean verification checkout'), reason)
+  assert.doesNotMatch(reason, /checkTimeoutMs/, 'the retry decided, not the first pass')
+  assert.equal(blocker(f, source), `review ${review.id} deferred its verdict on this artifact: ${reason.slice(reason.indexOf('a command could not run'), -1)}`)
+
+  // Resumed, the review defers again on a new kind: the blocker follows the latest deferral only.
+  await f.tool('swarm_control', { action: 'resume', taskId: review.id, reason: 'condition repaired' })
+  await f.runtime.settle(f.mission.id)
+  passes.push(...Array.from({ length: 2 }, () => [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' }]))
+  const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  assert.equal((await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review again' })).status, 'blocked')
+  assert.equal(hostRuns(f).length, 4)
+  const again = deferredReason(f)
+  assert.ok(again.includes('the host could not execute a check'), again)
+  assert.equal(blocker(f, source), `review ${review.id} deferred its verdict on this artifact: ${again.slice(again.indexOf('the host could not'), -1)}`)
+})
