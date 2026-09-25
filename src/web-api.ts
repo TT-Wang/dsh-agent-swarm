@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
-import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
+import { authorizeWorkspace, WorkspaceRevokedError, type WorkspaceAuthorized } from './authorization.ts'
 import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -15,7 +15,7 @@ import { validatePlan } from './plans.ts'
 import { ownerModelSelection, workerModelSelection } from './model-selection.js'
 import { persistedSessionHeader } from './session-metadata.js'
 import { SWARM_RPC_CHANNEL, SWARM_RPC_PREFIX, SWARM_WEB_ENDPOINTS } from './types.ts'
-import type { Actor, Budget, Mission, PlanInput, PlanMember, TaskAmendment, WorkspaceGrantSnapshot } from './types.ts'
+import type { Actor, Budget, PlanInput, PlanMember, TaskAmendment, WorkspaceGrantSnapshot } from './types.ts'
 import type { LiveState, LiveUpdate } from './live-types.ts'
 import { waitForStateChange } from './watch.ts'
 
@@ -81,6 +81,8 @@ class InternalFailure extends Error {
 async function exposed<T>(operation: () => Promise<T> | T, userActionable = false): Promise<T> {
   try { return await operation() } catch (error) {
     if (error instanceof MissingSession || error instanceof RequestError) throw error
+    // The runtime's re-validation refusal names the owner's own workspace and its repair.
+    if (error instanceof WorkspaceRevokedError) throw new RequestError(error.diagnostic)
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
     if (error instanceof PolicyError) {
       // A type is not permission to expose host paths or unbounded details.
@@ -145,12 +147,6 @@ async function planInput(ctx: Context, body: Record<string, unknown>, header: Se
   const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { dependencyDirs }), true)
   await validateModels(ctx, header.id, plan.members, signal, false)
   return [plan, authorization]
-}
-
-/** Re-validate the workspace a mission or draft recorded against its own durable claim. */
-async function assertRecordedWorkspace(row: Pick<Mission, 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, grants: WorkspaceGrantSnapshot): Promise<void> {
-  const authorization = await reauthorizeWorkspace(row, grants)
-  if (!authorization.ok) throw new RequestError(authorization.diagnostic)
 }
 
 async function validateModels(ctx: Context, ownerId: SessionId, members: Pick<PlanMember, 'provider' | 'model' | 'reasoningEffort'>[], signal: AbortSignal, launching: boolean): Promise<void> {
@@ -232,7 +228,6 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           const missionId = text(body, 'missionId')
           const mission = runtime.store.get('missions', missionId)
           if (!mission || mission.ownerSessionId !== sessionId) throw new RequestError('Only the mission owner can access deliverables')
-          await assertRecordedWorkspace(mission, grants)
           if (endpoint === 'delivery') return { ok: true, value: { delivery: await exposed(() => runtime.inspectDelivery(actor, missionId)) } }
           return { ok: true, value: { result: await exposed(() => runtime.applyDelivery(actor, missionId)), snapshot: runtime.snapshot(actor, missionId) } }
         }
@@ -309,12 +304,7 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
         case 'launch-draft': {
           const draft = runtime.drafts(actor).find(candidate => candidate.id === text(body, 'draftId'))
           if (draft?.status !== 'launched' && ctx.agents.get(sessionId) === undefined) throw new RequestError('Open the owner session before launching its workers')
-          if (draft !== undefined) {
-            // A launch runs under the authorization its row recorded: its staged mission's once assembled, else the draft's.
-            const mission = draft.missionId === undefined ? undefined : runtime.store.get('missions', draft.missionId)
-            await assertRecordedWorkspace(mission ?? { ...draft, workspace: draft.input.workspace }, grants)
-            if (draft.status !== 'launched') await validateModels(ctx, header.id, draft.input.members, signal, true)
-          }
+          if (draft !== undefined && draft.status !== 'launched') await validateModels(ctx, header.id, draft.input.members, signal, true)
           return { ok: true, value: { snapshot: await exposed(() => runtime.launchDraft(actor, text(body, 'draftId'), revision(body))) } }
         }
         case 'control': {

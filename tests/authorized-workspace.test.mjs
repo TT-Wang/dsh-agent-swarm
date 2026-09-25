@@ -861,6 +861,60 @@ test('A fenced review path records one automatic admission however many passes r
   assert.equal(runtime.store.list('tasks', f.mission.id).length, tasks)
 })
 
+/**
+ * Applying a delivery writes the mission workspace, and inspecting one reads
+ * it: both are adapter calls the runtime re-validates first, whichever entry
+ * point calls them. Only the browser route used to check, so the runtime API
+ * handed a revoked workspace to the adapter.
+ */
+test('Delivery inspection and application re-validate the workspace before the adapter reaches it', async t => {
+  const { granted, project } = await fixture(t)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const workers = claimingWorkers()
+  const reached = []
+  workers.inspectDelivery = async (_mission, commit) => { reached.push('inspect'); return { resultCommit: commit } }
+  workers.applyDelivery = async () => { reached.push('apply'); return { status: 'applied', changedPaths: [], conflicts: [] } }
+  const { runtime } = await makeRuntime(t, { workers, config: wired(grants), clock: new FakeClock() })
+  const f = await grantedMission(runtime, project, granted, 'owner-delivery')
+  runtime.store.transaction(() => {
+    const mission = runtime.store.get('missions', f.mission.id)
+    mission.status = 'completed'
+    mission.baseline = { sourceHead: 'a'.repeat(40), snapshotCommit: 'b'.repeat(40), planningWorkspace: join(project, 'planning'), changedPaths: [], createdAt: 1 }
+    runtime.store.put('missions', mission)
+    runtime.store.put('tasks', { id: 'delivered', missionId: f.mission.id, kind: 'integration', status: 'accepted', dependencies: [], artifact: { commit: 'c'.repeat(40) } })
+  })
+  assert.equal((await runtime.inspectDelivery(f.owner, f.mission.id)).resultCommit, 'c'.repeat(40))
+  grants.grants.length = 0
+  await assert.rejects(runtime.inspectDelivery(f.owner, f.mission.id), revokedError)
+  await assert.rejects(runtime.applyDelivery(f.owner, f.mission.id), revokedError)
+  assert.deepEqual(reached, ['inspect'], 'the adapter never reaches the revoked workspace')
+  assert.equal(runtime.store.get('missions', f.mission.id).appliedDelivery, undefined)
+})
+
+/**
+ * A launch runs its check preflight in the workspace, so the runtime
+ * re-validates the draft's recorded claim first, whichever entry point
+ * launches. Only the browser route used to check: the runtime ran the
+ * preflight in a revoked workspace and then failed the draft at creation.
+ */
+test('A draft launch re-validates its recorded claim before the preflight reaches the workspace', async t => {
+  const { granted, project } = await fixture(t)
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const workers = claimingWorkers()
+  const preflights = []
+  workers.checkSyntaxPreflight = async (_checks, cwd) => { preflights.push(cwd); return [] }
+  const { runtime } = await makeRuntime(t, { workers, config: wired(grants), clock: new FakeClock() })
+  const owner = { sessionId: 'owner-launch' }
+  const projectPath = await realpath(project)
+  const planned = plan(projectPath)
+  const draft = runtime.createDraft(owner, { ...planned, tasks: planned.tasks.map(task => ({ ...task, outputs: [], checks: ['test -d .'] })) }, { grantRoot: await realpath(granted), source: 'grant' })
+  grants.grants.length = 0
+  await assert.rejects(runtime.launchDraft(owner, draft.id, draft.revision), revokedError)
+  assert.deepEqual(preflights, [], 'the preflight never reaches the revoked workspace')
+  assert.equal(runtime.store.get('drafts', draft.id).status, 'draft', 'the refused launch leaves the draft editable')
+  assert.deepEqual(runtime.store.list('missions'), [], 'and assembles nothing')
+})
+
 test('A record from before the anchor existed is judged by the configured roots alone', async t => {
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])

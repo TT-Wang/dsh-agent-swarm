@@ -3154,6 +3154,9 @@ export class SwarmRuntime {
       if (draft.status === 'launched' && draft.missionId) return this.snapshot(actor, draft.missionId)
       if (draft.revision !== revision) throw new PolicyError('draft_revision_conflict', 'conflict_error', 'Draft changed; reload before launching')
       if (!['draft', 'failed'].includes(draft.status)) throw new PolicyError('draft_not_launchable', 'conflict_error', 'Draft cannot be launched in its current state')
+      // A launch runs under the claim its draft recorded: re-validated before the preflight reaches the
+      // workspace, and a refusal leaves the draft, and any staged mission, as they were.
+      await this.assertWorkspaceAuthorized({ ...draft, workspace: draft.input.workspace })
       const automatic = this.store.list('starts').find(request => request.draftId === draft.id)
       const assertCurrent = () => {
         actor.signal?.throwIfAborted()
@@ -3447,6 +3450,7 @@ export class SwarmRuntime {
 
   async inspectDelivery(actor: Actor, missionId: string) {
     const { mission, task } = this.deliveryTarget(actor, missionId)
+    await this.assertWorkspaceAuthorized(mission)
     return this.workers.inspectDelivery(mission, task.artifact!.commit, actor.signal)
   }
   async applyDelivery(actor: Actor, missionId: string) {
@@ -3454,6 +3458,7 @@ export class SwarmRuntime {
     // Different completed missions for one source must not apply concurrently.
     return this.exclusive(`delivery:${target.mission.workspace}`, async () => {
       const { mission, task } = this.deliveryTarget(actor, missionId)
+      await this.assertWorkspaceAuthorized(mission)
       const result = await this.workers.applyDelivery(mission, task.artifact!.commit, actor.signal)
       this.commit(missionId, () => {
         // The projection states what is currently in effect, so a conflicts result

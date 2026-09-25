@@ -1175,9 +1175,10 @@ export interface RuntimeConfig {
    * judged at `now`, the runtime clock's instant. When present the runtime
    * re-validates a mission before every adapter call that can reach its
    * workspace (worker start, baseline, worktree, task preparation, verification
-   * checkout) and fences one no configured root authorizes any more; when absent
-   * (unit runtimes and adapters without Git) the recorded admission result
-   * stands. Never re-loaded at runtime and never a model-callable surface.
+   * checkout, launch preflight, delivery) and fences one no configured root
+   * authorizes any more; when absent (unit runtimes and adapters without Git)
+   * the recorded admission result stands. Never re-loaded at runtime and never
+   * a model-callable surface.
    */
   grants?: WorkspaceGrantSnapshot
   /**

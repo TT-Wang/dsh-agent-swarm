@@ -304,7 +304,8 @@ test('member state is visible without granting owner controls, and unrelated ses
 })
 
 test('delivery routes require owner, completed acceptance and the exact session workspace', async t => {
-  const f = await fixture(t)
+  // The runtime re-validates the recorded workspace before the adapter reaches it; wired as src/index.ts wires it.
+  const f = await fixture(t, { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } })
   const owner = { sessionId: f.ownerId }
   const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
@@ -349,7 +350,9 @@ test('delivery routes require owner, completed acceptance and the exact session 
   const applied = await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })
   assert.equal(applied.result.value.result.status, 'applied'); assert.equal(writes, 1)
   mission.workspace = f.directory; f.runtime.store.put('missions', mission)
-  assert.equal((await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })).result.ok, false)
+  const redirected = await f.rpc('apply-delivery', { sessionId: f.ownerId, missionId: mission.id })
+  assert.equal(redirected.result.error?.code, 'bad-request', redirected.text)
+  assert.match(redirected.result.error.message, /escaped its recorded authorized root .*\[workspace_not_authorized\]$/)
   assert.equal(writes, 1, 'a changed native workspace cannot redirect delivery')
 })
 
