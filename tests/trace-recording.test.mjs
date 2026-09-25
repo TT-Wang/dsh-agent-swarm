@@ -37,7 +37,7 @@ import { FakeClock, makeRuntime } from './faults/harness.mjs'
 async function fixture(t) {
   const f = await makeRuntime(t)
   const owner = { sessionId: 'trace-owner' }
-  const mission = f.runtime.create(owner, { title: 'Trace', objective: 'Record every call', workspace: f.dir, scope: ['**'], acceptance: ['works'], budget: f.budget })
+  const mission = f.runtime.create(owner, { title: 'Trace', objective: 'Record every call', workspace: f.dir, scope: ['**'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.dir, source: 'session' })
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.budget)
   const exec = (sessionId = owner.sessionId) => ({ agent: { id: sessionId, session: { header: { cwd: f.dir } } }, signal: new AbortController().signal })
