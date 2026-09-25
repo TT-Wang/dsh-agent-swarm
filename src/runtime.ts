@@ -2504,11 +2504,12 @@ export class SwarmRuntime {
     if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
-  /** Admit the bounded independent review for one unreviewable submitted deliverable. */
+  /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the submission, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task): void {
-    let review: Task
+    const reviewId = this.automaticReviewId(source)
+    if (this.store.get('tasks', reviewId) !== undefined) return
     try {
-      review = this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
+      this.propose({ sessionId: mission.ownerSessionId }, mission.id, {
         workstreamId: source.workstreamId, title: `Independent review of ${source.title}`,
         objective: `Independently verify the submitted artifact of ${source.id} (${source.title}) against its acceptance criteria.`,
         kind: 'verification', scope: [...source.scope], acceptance: [...source.acceptance], checks: [...source.checks],
@@ -2517,7 +2518,7 @@ export class SwarmRuntime {
         outputs: [],
         reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, priority: source.priority,
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
-      }, this.automaticReviewId(source))
+      }, reviewId)
     } catch (error) {
       // Admission can still refuse (a budget race). The submission stands;
       // the owner is told exactly what to admit instead.
@@ -2528,7 +2529,7 @@ export class SwarmRuntime {
     // writer must not turn a successful admission into a false blocker notice.
     try {
       this.commit(mission.id, () => this.store.event(mission.id, 'task/review-admitted', 'runtime', {
-        taskId: review.id, reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, reason: 'no live review existed for the submitted artifact',
+        taskId: reviewId, reviewOf: source.id, maxRecoveryAttempts: AUTO_REVIEW_RECOVERY_ATTEMPTS, reason: 'no live review existed for the submitted artifact',
       }))
     } catch { /* The next tick re-derives the live review from the admitted task. */ }
   }

@@ -828,6 +828,39 @@ test('A grant that expires while work runs fences that work at the next pass', a
   assert.equal(revokedEvents(runtime, f.mission.id).length, 1)
 })
 
+/**
+ * The host admits a submission's automatic review once. The fence blocks the
+ * running review, so the source has no live review; the host admits its review
+ * for the submission and dispatch fences that one too. Every later pass used
+ * to re-propose the same review id, get the blocked row back, and record
+ * another `task/review-admitted` for it.
+ */
+test('A fenced review path records one automatic admission however many passes run', async t => {
+  const { granted, project } = await fixture(t)
+  const clock = new FakeClock()
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const { runtime } = await makeRuntime(t, { workers: claimingWorkers(), config: wired(grants), clock })
+  const f = await grantedMission(runtime, project, granted, 'owner-auto-review')
+  const source = f.propose({ kind: 'implementation', checks: ['test -d .'], assigneeId: f.author.id })
+  const claimed = await runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'done' })
+  const review = f.propose({ title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  await runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await runtime.settle(f.mission.id)
+  grants.grants.length = 0
+  const passes = async count => { for (let pass = 0; pass < count; pass++) { clock.advance(5_000); await runtime.tick(); await runtime.settle(f.mission.id) } }
+  const admitted = () => runtime.store.events(f.mission.id, 500).filter(event => event.type === 'task/review-admitted').map(event => event.data.taskId)
+  await passes(5)
+  const automatic = runtime.store.list('tasks', f.mission.id).filter(task => task.reviewOf === source.id && task.id !== review.id)
+  assert.equal(runtime.store.get('tasks', review.id).status, 'blocked', 'the fence blocked the running review')
+  assert.deepEqual(automatic.map(task => task.status), ['blocked'], 'one automatic review was admitted, and dispatch fenced it')
+  assert.deepEqual(admitted(), [automatic[0].id])
+  const tasks = runtime.store.list('tasks', f.mission.id).length
+  await passes(40)
+  assert.deepEqual(admitted(), [automatic[0].id], 'a pass that admits nothing records no admission')
+  assert.equal(runtime.store.list('tasks', f.mission.id).length, tasks)
+})
+
 test('A record from before the anchor existed is judged by the configured roots alone', async t => {
   const { session, granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted }])
