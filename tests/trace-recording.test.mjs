@@ -8,21 +8,24 @@
  * is an unscoped call), the actor is the id the session guard requires,
  * `endedAt` is `startedAt` plus a monotonic duration, and a parent read back
  * from the durable rows is used only when it is a valid span id (the row itself
- * stays in the metrics window, which reports its violation). Recording then
- * has one failure policy for every sink, the host telemetry link's: a failed
- * write is contained and counted (`bindHostTelemetry(runtime).counts()`),
- * never thrown. The wrapper settles the command once, records exactly one span
- * with that outcome and rethrows exactly the command's own error.
+ * stays in the metrics window, which reports its violation). Recording is best
+ * effort under the host telemetry link's one policy: a failure resolving,
+ * building or writing a span is contained and counted
+ * (`bindHostTelemetry(runtime).counts()`), never thrown. The wrapper settles
+ * the command once, records exactly one span (or one unscoped count) with that
+ * outcome and rethrows exactly the command's own error.
  *
  * PRE-CHANGE FAILURE (a65f837): an empty missionId throws a TraceContractError
  * instead of the command's error, and an unknown one writes a span under a
- * mission that does not exist; a failing span write turns a committed command
- * into a tool error and replaces a failing command's error; a wall clock that
- * steps back mid-command throws a TraceContractError; a malformed stored span id
- * becomes a parent and throws (and e6b8cfa, which dropped the row from the index,
- * reports a clean metrics window over it); an agent with an empty id passes the session
- * guard; a snapshot failure after a committed command records a second, error
- * span.
+ * mission that does not exist; a failing span write, or a failing scope read,
+ * turns a committed command into a tool error, and a failing write replaces a
+ * failing command's error; a prelaunch request with no mission records a span
+ * under the request id; a call refused at the workspace binding is neither
+ * recorded nor counted; a wall clock that steps back mid-command throws a
+ * TraceContractError; a malformed stored span id becomes a parent and throws
+ * (and e6b8cfa, which dropped the row from the index, reports a clean metrics
+ * window over it); an agent with an empty id passes the session guard; a
+ * snapshot failure after a committed command records a second, error span.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -75,6 +78,54 @@ test('a span write that fails after a committed command is counted: the tool ret
   assert.deepEqual(f.runtime.store.list('workstreams', f.mission.id).map(row => row.id), [created.result.id])
   assert.deepEqual(f.link.counts(), { emitted: 0, failed: 1 }, 'exactly one span write was attempted, and its failure is counted')
   assert.deepEqual(f.spans(), [])
+})
+
+test('a scope read that fails after a committed command is contained like a failed write: the result returns and no span is written', async t => {
+  const f = await fixture(t)
+  // The member read in the span's scope resolution (spanContext, after the
+  // command settled) fails once; the runtime's own reads are untouched.
+  const list = f.runtime.store.list.bind(f.runtime.store)
+  let injected = 0
+  f.runtime.store.list = (table, ...rest) => {
+    if (table === 'members' && injected === 0 && new Error().stack.includes('spanContext')) { injected++; throw new Error('members unavailable') }
+    return list(table, ...rest)
+  }
+  const created = await f.call('swarm_workstream', { missionId: f.mission.id, ...stream })
+  assert.equal(injected, 1, 'the scope read failed')
+  assert.equal(created.result.title, 'Core', 'the tool returns the committed result')
+  assert.deepEqual(f.runtime.store.list('workstreams', f.mission.id).map(row => row.id), [created.result.id])
+  assert.deepEqual(f.link.counts(), { emitted: 0, failed: 1 }, 'the failed resolution is counted')
+  assert.deepEqual(f.spans(), [])
+  // Pair: with the store readable again, the same step records its span.
+  await f.call('swarm_workstream', { missionId: f.mission.id, title: 'Docs', objective: 'Document the module' })
+  assert.deepEqual(f.spans().map(span => span.step), ['swarm_workstream'])
+})
+
+test('a prelaunch request with no mission yet is an unscoped call, never a span under the request id', async t => {
+  const f = await fixture(t)
+  const now = Date.now()
+  const request = { id: 'start_trace', ownerSessionId: f.owner.sessionId, commandId: 'trace', goal: 'Trace the request', workspace: f.dir, status: 'planning', createdAt: now, updatedAt: now }
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', request))
+  assert.equal((await f.call('swarm_observe', { requestId: request.id })).result.request.id, request.id)
+  assert.deepEqual(f.spans(request.id), [], 'a request id is not a mission')
+  assert.deepEqual(await f.unscoped(), { swarm_observe: 1 })
+  // Pair: once the request names its mission, the same read is scoped to it.
+  f.runtime.store.transaction(() => f.runtime.store.put('starts', { ...request, missionId: f.mission.id }))
+  await f.call('swarm_observe', { requestId: request.id })
+  assert.equal(f.spans().filter(span => span.step === 'swarm_observe').length, 2, 'the trace read and this read')
+  assert.deepEqual(await f.unscoped(), { swarm_observe: 1 })
+})
+
+test('a planning call refused at the workspace binding throws its own error and counts one unscoped call', async t => {
+  const f = await fixture(t)
+  const fields = { title: 'Unbound', objective: 'Bind the workspace', workspace: f.dir, scope: ['**'], acceptance: ['works'], budget: f.budget }
+  const sessionWithoutCwd = { agent: { id: f.owner.sessionId, session: { header: {} } }, signal: new AbortController().signal }
+  await assert.rejects(f.definitions.get('swarm_create').execute(fields, sessionWithoutCwd), /^Error: \[session_workspace_missing\]/)
+  assert.deepEqual(await f.unscoped(), { swarm_create: 1 }, 'the refused call is recorded, not skipped')
+  // Pair: from a session with a workspace the same call creates its mission and records its span there.
+  const created = await f.call('swarm_create', fields)
+  assert.deepEqual(f.spans(created.result.id).map(span => [span.step, span.status]), [['swarm_create', 'ok']])
+  assert.deepEqual(await f.unscoped(), { swarm_create: 1 })
 })
 
 test('a failing command whose span write also fails throws the command\'s own error', async t => {
