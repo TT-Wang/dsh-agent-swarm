@@ -44,13 +44,14 @@ async function fixture(t) {
   const call = (name, args, sessionId) => definitions.get(name).execute(args, exec(sessionId))
   const spans = (missionId = mission.id) => f.runtime.store.events(missionId, 1000, 0).filter(event => event.type === 'trace/span').map(event => event.data)
   const unscoped = async () => (await call('swarm_observe', { missionId: mission.id, trace: true })).result.trace.unscopedSteps
-  /** Every durable span write fails from here on; the runtime's own events still commit. */
+  /** Every durable span write fails until the returned restore runs; the runtime's own events still commit. */
   const failSpanWrites = () => {
     const write = f.runtime.store.event.bind(f.runtime.store)
     f.runtime.store.event = (missionId, type, ...rest) => {
       if (type === 'trace/span') throw new Error('span store unavailable')
       return write(missionId, type, ...rest)
     }
+    return () => { f.runtime.store.event = write }
   }
   return { ...f, owner, mission, definitions, exec, call, spans, unscoped, failSpanWrites, link: bindHostTelemetry(f.runtime) }
 }
@@ -72,12 +73,20 @@ test('a call naming an empty or unknown mission throws its own error and counts 
 
 test('a span write that fails after a committed command is counted: the tool returns the result and records no error span', async t => {
   const f = await fixture(t)
-  f.failSpanWrites()
+  const restore = f.failSpanWrites()
   const created = await f.call('swarm_workstream', { missionId: f.mission.id, ...stream })
   assert.equal(created.result.title, 'Core', 'the tool returns the committed result')
   assert.deepEqual(f.runtime.store.list('workstreams', f.mission.id).map(row => row.id), [created.result.id])
   assert.deepEqual(f.link.counts(), { emitted: 0, failed: 1 }, 'exactly one span write was attempted, and its failure is counted')
   assert.deepEqual(f.spans(), [])
+  // Pair: with writes succeeding again the next call records its span, and the
+  // unwritten span left no index entry, so every parent is a span the log holds.
+  restore()
+  await f.call('swarm_workstream', { missionId: f.mission.id, title: 'Docs', objective: 'Document the module' })
+  const spans = f.spans()
+  assert.deepEqual(spans.map(span => span.step), ['swarm_workstream'])
+  const dangling = spans.map(span => span.parentSpanId).filter(id => id !== undefined && !spans.some(span => span.spanId === id))
+  assert.deepEqual(dangling, [], 'no span names a parent the durable log never held')
 })
 
 test('a scope read that fails after a committed command is contained like a failed write: the result returns and no span is written', async t => {
