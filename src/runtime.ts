@@ -2489,9 +2489,10 @@ export class SwarmRuntime {
     if (withdrawn === undefined) return undefined
     return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${sourceId}) or cancel the source task`
   }
-  /** Keyed on the submission: the epoch fences every resubmission, including one of an unchanged commit. */
+  /** Keyed on the review need: the submission (the epoch fences every resubmission, even of an unchanged commit) and each challenge of its claims, which re-opens it. */
   private automaticReviewId(source: Task): string {
-    return `${AUTOMATIC_REVIEW_PREFIX}${createHash('sha256').update(`${source.missionId}:${source.id}:${source.epoch}:${source.artifact?.commit ?? ''}`).digest('hex').slice(0, 32)}`
+    const challenges = source.evidenceIds.flatMap(evidenceId => this.store.get('evidence', evidenceId)?.challenges.map(() => evidenceId) ?? [])
+    return `${AUTOMATIC_REVIEW_PREFIX}${createHash('sha256').update([source.missionId, source.id, source.epoch, source.artifact?.commit ?? '', ...challenges].join(':')).digest('hex').slice(0, 32)}`
   }
   /** The concrete reason the runtime cannot admit an independent review right now. */
   private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
@@ -2504,7 +2505,7 @@ export class SwarmRuntime {
     if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
     return undefined
   }
-  /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the submission, so an existing row is that review. */
+  /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task): void {
     const reviewId = this.automaticReviewId(source)
     if (this.store.get('tasks', reviewId) !== undefined) return

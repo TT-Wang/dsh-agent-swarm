@@ -89,6 +89,36 @@ test('a submitted implementation with no live review is recorded and automatical
   assert.equal(f.current(review).reviewedCommit, f.current(source).artifact.commit)
 })
 
+/**
+ * A challenge re-opens the review need of the same submission: it returns an
+ * accepted source to `submitted` with its epoch and commit unchanged and
+ * retires the review that accepted it. When that review was the automatic
+ * one, the re-opened need gets an automatic review of its own, as a
+ * challenged source reviewed by a proposed review does; the retired row is
+ * never taken for it.
+ */
+test('a challenge of an automatically reviewed source admits an automatic review for the re-opened need', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement the change')
+  const claimed = await f.runtime.claim(f.actor('author'), f.mission.id, source.id)
+  const runId = await f.workers.callbacks.toolRun(f.added.author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })
+  const evidence = f.runtime.publish(f.actor('author'), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, claim: 'The change works', outcome: 'supported', toolRunIds: [runId] })
+  await f.runtime.submit(f.actor('author'), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Candidate artifact' })
+  const first = await eventually(() => f.reviewsOf(source)[0], 'the submission was never automatically reviewed', 3000)
+  const claimedReview = await f.runtime.claim(f.actor('reviewer'), f.mission.id, first.id)
+  await f.runtime.verify(f.actor('reviewer'), f.mission.id, { taskId: first.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Independently checked the exact submitted artifact' })
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: evidence.id, reason: 'A counterexample overturns the accepted claim', toolRunIds: [] })
+  assert.equal(f.current(source).status, 'submitted', 'the challenged source re-opens with its submission')
+  assert.equal(f.current(first).status, 'cancelled', 'the review that accepted it is retired')
+  const second = await eventually(() => f.reviewsOf(source).find(review => review.id !== first.id),
+    'the re-opened review need was never given a review, and the owner was not told', 3000)
+  assert.equal(second.status, 'pending')
+  assert.equal(second.maxRecoveryAttempts, 2)
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [first.id, second.id], 'each review need records its own admission')
+  assert.deepEqual(f.reviewPathNotices(), [], 'the runtime repaired the re-opened need without waking the owner')
+})
+
 test('the two-step owner flow keeps its own review and the runtime never duplicates it', async t => {
   const f = await fixture(t)
   const source = f.propose('Implement the change')
