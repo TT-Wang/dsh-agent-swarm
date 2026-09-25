@@ -1,15 +1,45 @@
 /** D6 span contract: closed vocabulary, digest-only payload references, causal closure and metrics. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { SWARM_TOOLS } from '../lib/tools.js'
+import { readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
+import { SWARM_TOOLS, registerTools } from '../lib/tools.js'
 import { TRACE_OPERATIONS, TRACE_STEPS, TRACE_ERROR_TYPES, canonicalJson, digestText, payloadRef, isTraceOperation, isTraceStep, spanContractViolation, traceIdFor, traceMetrics } from '../lib/trace.js'
-import { traceFixture } from './fixtures/trace-runtime.mjs'
+import { budget, traceFixture } from './fixtures/trace-runtime.mjs'
+import { makeRuntimeStub } from './faults/harness.mjs'
 
 test('the span vocabulary is closed and covers every orchestration step', () => {
   assert.deepEqual([...TRACE_OPERATIONS], ['agent', 'tool', 'llm', 'retrieval', 'review', 'merge'])
   for (const tool of SWARM_TOOLS) assert(TRACE_STEPS.includes(tool), `${tool} must be a closed-enum trace step`)
   assert(!isTraceOperation('bogus')); assert(!isTraceStep('swarm_bogus'))
   assert(TRACE_ERROR_TYPES.includes('validation_error'))
+  // The D6 step check runs once per tool, at registration: every tool
+  // registerTools actually registers is a closed step.
+  const registered = []
+  registerTools({ tools: { register: definition => registered.push(definition.name) } }, makeRuntimeStub(), budget)
+  assert.deepEqual(registered, [...SWARM_TOOLS])
+  for (const name of registered) assert(isTraceStep(name), `${name} must be a closed-enum trace step`)
+})
+
+test('a tool name outside TRACE_STEPS is refused where the tool is registered', () => {
+  // The refusal is the compiler's: `register` takes a TraceStep, so no tool can
+  // reach a call, and so a span, with a step the vocabulary does not name.
+  const project = fileURLToPath(new URL('../', import.meta.url))
+  const tools = join(project, 'src', 'tools.ts')
+  const source = readFileSync(tools, 'utf8')
+  const edited = source.replace("register('swarm_board',", "register('swarm_unregistered',")
+  assert.notEqual(edited, source, 'the fixture edit applies')
+  const { options } = ts.getParsedCommandLineOfConfigFile(join(project, 'tsconfig.json'), { noEmit: true }, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: diagnostic => { throw new Error(String(diagnostic.messageText)) } })
+  const host = ts.createCompilerHost(options)
+  const load = host.getSourceFile.bind(host)
+  host.getSourceFile = (file, language, ...rest) => resolve(file) === tools ? ts.createSourceFile(file, edited, language) : load(file, language, ...rest)
+  const program = ts.createProgram({ rootNames: [tools], options, host })
+  const refused = ts.getPreEmitDiagnostics(program, program.getSourceFile(tools))
+    .map(diagnostic => `TS${diagnostic.code}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`)
+  assert.equal(refused.length, 1, refused.join('\n'))
+  assert.match(refused[0], /^TS2345: Argument of type '"swarm_unregistered"' is not assignable to parameter of type '"swarm_stage" \| "swarm_launch"/)
 })
 
 test('every orchestration step emits a contract-valid span with digests outside the log', async t => {

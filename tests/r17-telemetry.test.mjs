@@ -48,9 +48,10 @@ function runtimeFor(root, limits = {}) {
   return makeRuntimeStub({ config: { statePath: join(root, 'db.sqlite'), ...limits }, store: memoryStore() })
 }
 
-const spanContext = (missionId, overrides = {}) => ({
-  missionId, actor: 'member-1', step: 'swarm_publish', input: { tool: 'swarm_publish' }, output: { ok: true },
-  status: 'ok', startedAt: 1000, endedAt: 2000, ...overrides,
+/** One scoped call as `TraceRecorder.record` resolves it. */
+const spanCall = (missionId, overrides = {}) => () => ({
+  missionId, actor: 'member-1', input: { tool: 'swarm_publish' }, output: { ok: true },
+  status: 'ok', startedAt: 1000, durationMs: 1000, ...overrides,
 })
 
 test('the host sink receives the ops record for every span, and the durable row is written first', async t => {
@@ -64,9 +65,9 @@ test('the host sink receives the ops record for every span, and the durable row 
   assert(recorder, 'the recorder builds from a runtime with a state path and a store')
   assert.equal(link.bound(), true)
 
-  const okSpan = await recorder.record(spanContext('mission-1'))
-  const errorSpan = await recorder.record(spanContext('mission-1', {
-    step: 'swarm_verify', status: 'error', errorType: 'validation_error', taskId: 'task-1', attemptId: 'attempt-1',
+  const okSpan = recorder.record('swarm_publish', spanCall('mission-1'))
+  const errorSpan = recorder.record('swarm_verify', spanCall('mission-1', {
+    status: 'error', errorType: 'validation_error', taskId: 'task-1', attemptId: 'attempt-1',
   }))
 
   // The durable contract is untouched: one row per span, in order, complete.
@@ -99,8 +100,8 @@ test('no backend mounted: the span still records and no transport is invented', 
   // must still write the durable row and must not fabricate a sink.
   const runtime = runtimeFor(root)
   const recorder = TraceRecorder.forRuntime(runtime)
-  assert.equal(recorder.telemetry, undefined, 'a runtime nobody bound has no sink link')
-  const span = await recorder.record(spanContext('mission-2'))
+  assert.equal(recorder.telemetry.bound(), false, 'a runtime nobody bound has no sink attached')
+  const span = recorder.record('swarm_publish', spanCall('mission-2'))
   assert.equal(runtime.store.rows.length, 1)
   assert.equal(runtime.store.rows[0].data.spanId, span.spanId)
 })
@@ -112,16 +113,30 @@ test('a throwing sink is contained and counted, never allowed to cost the row', 
   const link = bindHostTelemetry(runtime)
   link.attach({ emit: () => { throw new Error('backend down') } })
   const recorder = TraceRecorder.forRuntime(runtime)
-  const span = await recorder.record(spanContext('mission-3'))
+  const span = recorder.record('swarm_publish', spanCall('mission-3'))
   assert.equal(runtime.store.rows.length, 1, 'the durable row survives a failing backend')
   assert.equal(runtime.store.rows[0].data.spanId, span.spanId)
   assert.deepEqual(link.counts(), { emitted: 0, failed: 1 })
   // Pair of the containment guard: after detach the same call is a plain no-op,
   // so the failure count cannot grow once the backend is gone.
   link.detach()
-  await recorder.record(spanContext('mission-3'))
+  recorder.record('swarm_publish', spanCall('mission-3'))
   assert.deepEqual(link.counts(), { emitted: 0, failed: 1 })
   assert.equal(link.bound(), false)
+})
+
+test('a failing durable write follows the same policy: contained, counted, and the host sink is not fed', async t => {
+  const root = await tempDirectory('swarm-r17-logthrow-')
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const runtime = runtimeFor(root)
+  runtime.store.event = () => { throw new Error('log unavailable') }
+  const link = bindHostTelemetry(runtime)
+  const records = []
+  link.attach({ emit: record => records.push(record) })
+  const recorder = TraceRecorder.forRuntime(runtime)
+  assert.equal(recorder.record('swarm_publish', spanCall('mission-5')), undefined, 'no span was written')
+  assert.deepEqual(records, [], 'the host sink only ever carries a span the durable log holds')
+  assert.deepEqual(link.counts(), { emitted: 0, failed: 1 })
 })
 
 test("the plugin's inject wire attaches a mounted backend and detaches on unload", async t => {
@@ -138,13 +153,13 @@ test("the plugin's inject wire attaches a mounted backend and detaches on unload
   for (let attempt = 0; attempt < 200 && !link.bound(); attempt++) await new Promise(resolve => setTimeout(resolve, 5))
   assert.equal(link.bound(), true, 'the wire attaches a backend mounted after the plugin')
   const recorder = TraceRecorder.forRuntime(runtime)
-  await recorder.record(spanContext('mission-4'))
+  recorder.record('swarm_publish', spanCall('mission-4'))
   assert.equal(records.length, 1)
   assert.equal(records[0].attributes['mission.id'], 'mission-4')
   // The disposer detaches the sink with the plugin fiber.
   await fiber.dispose()
   assert.equal(link.bound(), false, 'unload must not leave a reporter attached')
-  await recorder.record(spanContext('mission-4'))
+  recorder.record('swarm_publish', spanCall('mission-4'))
   assert.equal(records.length, 1, 'a disposed wire emits nothing')
   assert.equal(runtime.store.rows.length, 2, 'the durable rows are unaffected by the wire lifecycle')
 })

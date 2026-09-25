@@ -75,6 +75,7 @@ export function errorTypeFor(error: unknown): TraceErrorType {
 
 const TRACE_ID = /^[0-9a-f]{32}$/
 const SPAN_ID = /^[0-9a-f]{16}$/
+const isSpanId = (value: unknown): value is string => typeof value === 'string' && SPAN_ID.test(value)
 const DIGEST = /^sha256:[0-9a-f]{64}$/
 
 /** Named trace/replay failures; callers branch on the class, never on message text. */
@@ -227,9 +228,9 @@ export function hostTelemetryRecord(span: TraceSpan): HostTelemetryRecord {
 /**
  * One runtime's binding to the host sink. The service may be mounted before or
  * after this plugin (`ctx.inject` fires whenever it appears), so recorded spans
- * read a mutable link instead of a value captured at construction. Emission is
- * contained exactly as the host contains a backend failure: a throwing sink is
- * counted and never allowed to cost the durable row.
+ * read a mutable link instead of a value captured at construction. The link
+ * also holds the one failure policy of every span sink, the durable row
+ * included (`contain`).
  */
 export class HostTelemetryLink {
   private sink?: HostTelemetrySink
@@ -238,11 +239,14 @@ export class HostTelemetryLink {
   attach(sink: HostTelemetrySink | undefined): void { this.sink = sink }
   detach(): void { this.sink = undefined }
   bound(): boolean { return this.sink !== undefined }
-  /** Hand one span to the host sink; returns whether a record was enqueued. */
-  emit(span: TraceSpan): boolean {
-    if (this.sink === undefined) return false
-    try { this.sink.emit(hostTelemetryRecord(span)); this.emitted++; return true }
-    catch { this.failed++; return false }
+  /** The host contract's backend-failure policy, for every span sink: a throwing write is counted, never rethrown. */
+  contain<T>(write: () => T): T | undefined {
+    try { return write() } catch { this.failed++; return undefined }
+  }
+  /** Hand one span to the host sink, when a backend is mounted. */
+  emit(span: TraceSpan): void {
+    const sink = this.sink
+    if (sink !== undefined) this.contain(() => { sink.emit(hostTelemetryRecord(span)); this.emitted++ })
   }
   /** Records enqueued and sink failures contained, for the round's instrument. */
   counts(): { emitted: number; failed: number } { return { emitted: this.emitted, failed: this.failed } }
@@ -262,8 +266,6 @@ export function bindHostTelemetry(runtime: object): HostTelemetryLink {
   hostTelemetryLinks.set(runtime, link)
   return link
 }
-const hostTelemetryFor = (runtime: unknown): HostTelemetryLink | undefined =>
-  runtime !== null && typeof runtime === 'object' ? hostTelemetryLinks.get(runtime) : undefined
 
 const SEED_LIMIT = 20000
 const HISTORY_SCAN_LIMIT = 100000
@@ -300,7 +302,7 @@ export class TraceRecorder {
    * because a leftover directory is inert and must never block plugin start.
    */
   legacyCleanup?: Promise<void>
-  constructor(readonly store: TraceStore, readonly telemetry?: HostTelemetryLink) {}
+  constructor(readonly store: TraceStore, readonly telemetry = new HostTelemetryLink()) {}
   /** A recorder exists only when the runtime owns a durable store and state path. */
   static forRuntime(runtime: unknown): TraceRecorder | undefined {
     const candidate = runtime as { config?: { statePath?: unknown } & Record<string, unknown>; store?: Partial<TraceStore> } | undefined
@@ -308,7 +310,7 @@ export class TraceRecorder {
     const store = candidate?.store
     if (typeof statePath !== 'string' || !statePath) return undefined
     if (!store || typeof store.event !== 'function' || typeof store.transaction !== 'function' || typeof store.events !== 'function') return undefined
-    const recorder = new TraceRecorder(store as TraceStore, hostTelemetryFor(runtime))
+    const recorder = new TraceRecorder(store as TraceStore, bindHostTelemetry(runtime as object))
     recorder.legacyCleanup = rm(join(dirname(statePath), 'trace-payloads'), { recursive: true, force: true }).catch(() => undefined)
     return recorder
   }
@@ -319,10 +321,9 @@ export class TraceRecorder {
     const events = this.store.traceEvents?.(missionId, SEED_LIMIT + 1) ?? this.store.events(missionId, SEED_LIMIT + 1, 0)
     const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [], source, truncated: events.length > SEED_LIMIT }
     for (const event of events.slice(-SEED_LIMIT)) {
-      if (event.type !== 'trace/span') continue
-      const span = event.data as TraceSpan | undefined
-      if (span === null || typeof span !== 'object' || typeof span.spanId !== 'string') continue
-      this.remember(index, span)
+      // A stored span id is validated as it is read back, so a malformed row is never a parent.
+      const span = event.data as TraceSpan | null | undefined
+      if (event.type === 'trace/span' && isSpanId(span?.spanId)) this.remember(index, span!)
     }
     this.indexes.set(missionId, index)
     return index
@@ -349,12 +350,6 @@ export class TraceRecorder {
     return { limit: SEED_LIMIT, spans: index.all.length, truncated: index.truncated, source: index.source,
       ...(index.all.length ? { firstSpanId: index.all[0]!.spanId, lastSpanId: index.all.at(-1)!.spanId } : {}) }
   }
-  /**
-   * A step with no mission scope (draft planning, the mission list) cannot
-   * carry a valid `mission_id`, so it is counted rather than recorded. The
-   * counter keeps the limitation measurable instead of silently dropping work.
-   */
-  noteUnscoped(step: string): void { this.unscoped.set(step, (this.unscoped.get(step) ?? 0) + 1) }
   unscopedSteps(): Record<string, number> { return Object.fromEntries(this.unscoped) }
   /**
    * Parent resolution: a worker's call joins its attempt's claim span (a
@@ -373,9 +368,8 @@ export class TraceRecorder {
     // durable span rows. Activity/tool events cannot hide a claim or submission,
     // and a missing scoped parent must not attach this task to an unrelated one.
     const stored = (filter: { taskId?: string; attemptId?: string; step?: string }): TraceSpan | undefined => {
-      const event = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)
-      const span = event?.data as TraceSpan | undefined
-      return span && typeof span.spanId === 'string' ? span : undefined
+      const span = this.store.traceEvents?.(context.missionId, 1, filter)?.at(-1)?.data as TraceSpan | null | undefined
+      return isSpanId(span?.spanId) ? span! : undefined
     }
     const lookup = (filter: { taskId?: string; attemptId?: string; step?: string }, spans: TraceSpan[] | undefined) =>
       index.truncated && this.store.traceEvents ? stored(filter)
@@ -399,40 +393,49 @@ export class TraceRecorder {
     }
     return index.all.at(-1)?.spanId
   }
-  /** Record one span row durably; the row is validated before it can enter the log. */
-  async record(context: { missionId: string; actor: string; step: TraceStep; taskId?: string; attemptId?: string; reviewOfTaskId?: string; input: unknown; output: unknown; status: TraceStatus; errorType?: TraceErrorType; startedAt: number; endedAt?: number }): Promise<TraceSpan> {
-    const spanId = randomUUID().replaceAll('-', '').slice(0, 16)
-    const traceId = traceIdFor(context.missionId)
-    const input = payloadRef(context.input)
-    const output = payloadRef(context.output)
-    const parentSpanId = this.parentFor(context)
-    const span: TraceSpan = {
-      traceId, spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }), missionId: context.missionId,
-      ...(context.taskId === undefined ? {} : { taskId: context.taskId }), ...(context.attemptId === undefined ? {} : { attemptId: context.attemptId }),
-      operation: spanOperation(context.step), step: context.step, status: context.status,
-      ...(context.status === 'error' ? { errorType: context.errorType ?? 'tool_error' } : {}),
-      startedAt: context.startedAt, endedAt: context.endedAt ?? Date.now(),
-      traceparent: traceparentFor(traceId, spanId), actor: context.actor, input, output,
-    }
-    const reason = spanContractViolation(span)
-    if (reason) throw new TraceContractError(`Refusing to record a span that violates the D6 contract: ${reason}`, undefined, context.step)
-    this.store.transaction(() => this.store.event(context.missionId, 'trace/span', context.actor, span))
-    this.remember(this.index(context.missionId), span)
-    // R17-G10: the durable row is written first, then the host sink is fed. The
-    // sink is a reporting transport (contained, counted, never rethrowing), so a
-    // backend failure can never cost the record or the mission.
-    this.telemetry?.emit(span)
+  /**
+   * Record one call: its span when `resolve` scopes it to an existing mission,
+   * else one unscoped count, since a step with no mission (draft planning, the
+   * mission list) cannot carry a `mission_id`; the count keeps that measurable.
+   * Nothing is validated here, because every D6 clause holds where its value is
+   * made: the mission row exists, the actor is the id the session guard
+   * requires, `durationMs` is a monotonic whole count so the span cannot end
+   * before it starts, a failure names its closed `error.type`, and a parent is a
+   * valid stored span id. The whole recording follows the link's one failure
+   * policy, and (R17-G10) the host sink is fed only after the durable row.
+   */
+  record(step: TraceStep, resolve: () => SpanCall | undefined): TraceSpan | undefined {
+    const span = this.telemetry.contain(() => {
+      const call = resolve()
+      if (call === undefined) { this.unscoped.set(step, (this.unscoped.get(step) ?? 0) + 1); return undefined }
+      const spanId = randomUUID().replaceAll('-', '').slice(0, 16)
+      const traceId = traceIdFor(call.missionId)
+      const parentSpanId = this.parentFor({ ...call, step })
+      const span: TraceSpan = {
+        traceId, spanId, ...(parentSpanId === undefined ? {} : { parentSpanId }), missionId: call.missionId,
+        ...(call.taskId === undefined ? {} : { taskId: call.taskId }), ...(call.attemptId === undefined ? {} : { attemptId: call.attemptId }),
+        operation: spanOperation(step), step, status: call.status, ...(call.status === 'error' ? { errorType: call.errorType } : {}),
+        startedAt: call.startedAt, endedAt: call.startedAt + call.durationMs,
+        traceparent: traceparentFor(traceId, spanId), actor: call.actor, input: payloadRef(call.input), output: payloadRef(call.output),
+      }
+      this.store.transaction(() => this.store.event(call.missionId, 'trace/span', call.actor, span))
+      this.remember(this.index(call.missionId), span)
+      return span
+    })
+    if (span !== undefined) this.telemetry.emit(span)
     return span
   }
 }
+export type SpanCall = { missionId: string; actor: string; taskId?: string; attemptId?: string; reviewOfTaskId?: string; input: unknown; output: unknown; startedAt: number; durationMs: number }
+  & ({ status: 'ok' } | { status: 'error'; errorType: TraceErrorType })
 
 /** First contract violation in a span row, or undefined when it satisfies the D6 vocabulary. */
 export function spanContractViolation(span: unknown): string | undefined {
   if (span === null || typeof span !== 'object' || Array.isArray(span)) return 'span is not an object'
   const row = span as Partial<TraceSpan>
   if (typeof row.traceId !== 'string' || !TRACE_ID.test(row.traceId)) return 'trace_id must be 32 lowercase hex characters'
-  if (typeof row.spanId !== 'string' || !SPAN_ID.test(row.spanId)) return 'span_id must be 16 lowercase hex characters'
-  if (row.parentSpanId !== undefined && (typeof row.parentSpanId !== 'string' || !SPAN_ID.test(row.parentSpanId))) return 'parent_span_id must be null or 16 lowercase hex characters'
+  if (!isSpanId(row.spanId)) return 'span_id must be 16 lowercase hex characters'
+  if (row.parentSpanId !== undefined && !isSpanId(row.parentSpanId)) return 'parent_span_id must be null or 16 lowercase hex characters'
   if (row.parentSpanId === row.spanId) return 'parent_span_id must differ from span_id'
   if (typeof row.missionId !== 'string' || !row.missionId) return 'mission_id is required'
   if (!isTraceOperation(row.operation)) return `operation must be one of ${TRACE_OPERATIONS.join('|')}`
