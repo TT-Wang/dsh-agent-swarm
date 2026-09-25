@@ -222,7 +222,7 @@ const CENSUS = [
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
   ["src/store.ts",4,"Set","return new Set(rows.map(row => String(row.owner_id)))","local","","R17-G7 function-local: the owner ids of the running attempts in one mission, read from the durable tasks table and discarded inside the same synchronous hydration, so it cannot gate a later call"],
   ["src/trace.ts",1,"Set","const reclaimed = new Set<string>()","local","","function-local: created and discarded inside one sweep call, so it cannot gate a later call; the selection it drives is re-derived from the files' mtimes and the declared bound on every later sweep"],
-  ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: the runtime-to-host-sink link registry for the telemetry transport; a missing link can drop one reporting record, never a durable row or a mission decision (the span row is appended before the sink is consulted)"],
+  ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: where a runtime's span recorder and its host-sink binding meet (whichever binds first creates the one link); the link carries the attached sink and the best-effort failure count, so losing it can cost reporting records and that count, never a durable row or a mission decision"],
   ["src/trace.ts",3,"Map","private readonly indexes = new Map<string, SpanIndex>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",4,"Map","private readonly unscoped = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",5,"Map","const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
@@ -718,7 +718,7 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
   // point: the registry names the row, and because `store.event` takes
   // `EventKind`, a constant emission is checked exactly like a literal one.
-  const { EVENT_VOCABULARY } = await import('../lib/trace.js')
+  const { EVENT_VOCABULARY } = await import('../lib/events.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
   assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string',
