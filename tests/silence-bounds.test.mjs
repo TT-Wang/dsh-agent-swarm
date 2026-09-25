@@ -73,7 +73,9 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   const owner = { sessionId: 'silence-bounds' }
   const mission = runtime.create(owner, { title: 'Silence bounds', objective: 'Bound the release and the report', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const actorFor = member => ({ sessionId: member.sessionId })
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, {
     outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
@@ -268,8 +270,10 @@ test('R16-D5 pair: an attempt whose turn ended is the close-out\'s subject, neve
   const idleMember = await f.addMember('Idle')
   const silentMember = await f.addMember('Silent')
   const idleTask = f.propose('Turn ended', { assigneeId: idleMember.id })
-  const silentTask = f.propose('No signal', { assigneeId: silentMember.id })
   const idleAttempt = (await f.runtime.claim(f.actorFor(idleMember), f.mission.id, idleTask.id)).attempt.id
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
+  const silentTask = f.propose('No signal', { assigneeId: silentMember.id })
   const silentAttempt = (await f.runtime.claim(f.actorFor(silentMember), f.mission.id, silentTask.id)).attempt.id
   // The adapter reports the first member's turn ended while it still owns the
   // attempt: the durable idle signal the W6 close-out reads.

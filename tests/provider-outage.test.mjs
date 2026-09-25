@@ -34,10 +34,12 @@ async function fixture(t, workers = new OutageWorkers()) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
   const owner = { sessionId: 'outage-owner' }
-  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: '/source', scope: ['**'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner, { title: 'Outage', objective: 'Route around a provider outage', workspace: directory, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })
+  // The members' starts re-validate the workspace on disk; their passes settle before a test claims by hand.
+  await runtime.settle(mission.id)
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Work', kind: 'implementation',
     scope: ['**'], acceptance: ['works'], checks: ['test'], assigneeId: first.id, maxRecoveryAttempts: 1, ...extra })
   return { directory, runtime, workers, owner, mission, first, second, propose, clock }

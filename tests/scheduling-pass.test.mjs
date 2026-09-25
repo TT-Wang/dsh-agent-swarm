@@ -483,6 +483,9 @@ test('S1/R17-G5: a start that fails past the bound stamps the body before it com
     workers.idle.delete(f.author.id)
     workers.idle.add(h.id); workers.idle.add(b.id)
     await ticks(f, 6)
+    // Each start re-validates the workspace on disk: the last body settles, so
+    // the proposal below opens a body of its own rather than joining it.
+    await f.runtime.settle(f.mission.id)
     // One synchronous step: the next body waits in H's start, and T is ready for B, swept after H.
     const hang = workers.armed = hold()
     const t = f.propose({ title: 'T for B', assigneeId: b.id })
@@ -815,6 +818,9 @@ test('S1: a body whose members each take less than a bound is not stopped early,
   const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60, stallPasses: 1_000 } })
   try {
     for (let n = 0; n < 16; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk, so the bodies the
+    // admissions kicked settle before the clock moves.
+    await f.runtime.settle(f.mission.id)
     const members = f.runtime.store.list('members', f.mission.id).map(member => member.id)
     await ticks(f, 20)
     const watched = watchBodies(f)
@@ -1035,7 +1041,7 @@ test('S5: the durable notice ledger alone dedups a decision notice, within one p
     assert.deepEqual(recorded(f.runtime), { deliveries: 1, events: 1 }, 'repeated passes in one process read the durable row')
     await f.runtime.dispose()
     restarted = new SwarmRuntime({ statePath: join(f.dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-      maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }, new FakeWorkers())
+      maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000, grants: f.runtime.config.grants }, new FakeWorkers())
     await restarted.start()
     await restarted.settle(f.mission.id)
     await ticks({ clock, runtime: restarted }, 30)

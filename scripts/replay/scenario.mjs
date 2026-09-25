@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
-import { FakeWorkers } from '../../tests/faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS } from '../../tests/faults/harness.mjs'
 
 const BUDGET = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 /**
@@ -61,7 +61,7 @@ export async function runScenario(options = {}) {
   const workspace = await realpath(await mkdtemp(join(root, 'workspace-')))
   const statePath = join(root, 'replay.sqlite')
   const workers = new RecordingWorkers(root)
-  const runtime = new SwarmRuntime({ statePath, leaseMs: LEASE_MS, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3 }, workers)
+  const runtime = new SwarmRuntime({ statePath, leaseMs: LEASE_MS, tickMs: 60000, maxMessageChars: 16000, maxEvents: 200, maxTasksPerMember: 3, grants: NO_GRANTS }, workers)
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, BUDGET)
   const exec = sessionId => ({ agent: { id: sessionId, session: { header: { cwd: workspace } } }, signal: new AbortController().signal })

@@ -212,13 +212,21 @@ export class WorkspaceWorkers extends FakeWorkers {
 }
 
 /**
+ * The authorization a plugin with no `authorizedWorkspaces` configured loads
+ * (`loadWorkspaceGrants(undefined)`): no root, so only the calling session's
+ * own directory is authorized. Every fixture runtime carries it unless a test
+ * wires its own snapshot.
+ */
+export const NO_GRANTS = Object.freeze({ grants: Object.freeze([]), loadedAt: 0, unresolved: Object.freeze([]) })
+
+/**
  * The RuntimeConfig every fixture runtime starts from; `overrides` wins. With a
  * `clock` the runtime reads it and runs no tick timer (see `setup`).
  */
 function runtimeConfig(dir, overrides, clock) {
   return {
     statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, grants: NO_GRANTS,
     ...(clock === undefined ? {} : { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }), ...overrides,
   }
 }
@@ -259,11 +267,11 @@ export const makeWorkspaces = (dir, overrides) => new Workspaces(workspaceOption
 /**
  * A partial runtime for a unit test that builds one component (Scheduling,
  * Attempts, RefusalRegistry, Notices, WorkspaceAdmission, OwnerReplyGuard, the
- * tool layer) without a store. It always carries `now()`, so a runtime
- * dependency every component reads is added here once; `overrides` supplies
- * the rest and wins.
+ * tool layer) without a store. It always carries `now()` and a config holding
+ * the empty grant snapshot, the runtime dependencies every component reads, so
+ * they are added here once; `overrides` supplies the rest and wins.
  */
-export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: {}, ...overrides })
+export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: { grants: NO_GRANTS }, ...overrides })
 
 /**
  * Runtime + mission + two members + a propose helper. The runtime, store,

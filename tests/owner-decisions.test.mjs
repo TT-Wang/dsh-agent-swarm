@@ -66,7 +66,9 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   const owner = { sessionId: 'owner-decisions' }
   const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => f.runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await f.runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await f.runtime.settle(mission.id); return member }
   const actorFor = member => ({ sessionId: member.sessionId })
   const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
   const notices = () => f.runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
@@ -749,6 +751,8 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   const siblingMember = await f.addMember('Sibling')
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const original = f.propose('Withdrawn original', { assigneeId: builder.id })
   const dependent = f.propose('Waits on the original', { assigneeId: builder.id })
   const dependentRow = f.runtime.store.get('tasks', dependent.id)
@@ -789,6 +793,8 @@ test('R16-A1r pair: a blocked subject with a running repair is never named, and 
   // subjects legitimately name every implementation branch.
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const source = f.block(f.propose('Blocked subject', { assigneeId: builder.id, kind: 'research' }))
   const repair = f.propose('Live repair of the subject', { replaces: [source.id], assigneeId: builder.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, repair.id)
@@ -827,6 +833,8 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
   const siblingMember = await f.addMember('Sibling')
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const original = f.block(f.propose('Blocked original', { assigneeId: builder.id, kind: 'research' }))
   const firstRepair = f.propose('First repair', { replaces: [original.id], assigneeId: builder.id, kind: 'research' })
   const firstRow = f.runtime.store.get('tasks', firstRepair.id)

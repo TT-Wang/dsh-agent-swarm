@@ -16,12 +16,12 @@
  * Usage: node scripts/load/run.mjs [--workers 16] [--scaling]
  * Requires a prior `npm run build` (it imports the built `lib/`).
  */
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { SwarmRuntime } from '../../lib/runtime.js'
-import { FakeWorkers } from '../../tests/faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS } from '../../tests/faults/harness.mjs'
 
 /**
  * The shared recording adapter, never idle, so nothing is dispatched behind the
@@ -44,9 +44,11 @@ export function median(values) { return percentile(values, 50) }
 export async function runEnvelope({ workerCount }) {
   if (!Number.isSafeInteger(workerCount) || workerCount < 2) throw new Error('workerCount must be an integer >= 2')
   const root = await mkdtemp(join(tmpdir(), 'swarm-d8-load-'))
+  // The mission workspace is a real directory, which every claim re-validates.
+  await mkdir(join(root, 'workspace'))
   const runtime = new SwarmRuntime({
     statePath: join(root, 'load.sqlite'), leaseMs: 600000, tickMs: 3600000,
-    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100,
+    maxMessageChars: 10000, maxEvents: 500, maxTasksPerMember: 100, grants: NO_GRANTS,
   }, new InertWorkers())
   try {
     await runtime.start()

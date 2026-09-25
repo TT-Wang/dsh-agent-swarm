@@ -47,14 +47,14 @@ class StartFailureWorkers extends FakeWorkers {
 async function setup(t, { gamma = false, tickMs = 20 } = {}) {
   // The runtime clock can be moved past a provider outage window.
   const clock = { skew: 0 }
-  const { runtime, workers, budget } = await makeRuntime(t, {
+  const { dir, runtime, workers, budget } = await makeRuntime(t, {
     workers: new StartFailureWorkers(),
     config: { tickMs, maxMessageChars: 10000, maxEvents: 1000, maxTasksPerMember: 100, checkTimeoutMs: undefined, now: () => Date.now() + clock.skew },
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 },
   })
   const owner = { sessionId: 'start-owner' }
-  const mission = runtime.create(owner, { title: 'Start failure', objective: 'Recover a worker start failure', workspace: '/source',
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner, { title: 'Start failure', objective: 'Recover a worker start failure', workspace: dir,
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const alpha = await runtime.addMember(owner, mission.id, { name: 'Alpha', role: 'implementation' })
   const beta = await runtime.addMember(owner, mission.id, { name: 'Beta', role: 'implementation' })

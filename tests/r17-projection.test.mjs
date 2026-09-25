@@ -44,7 +44,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
 import { SwarmStore } from '../lib/store.js'
-import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 import { guardActions, guardBoard, guardProgressActions } from './guard-model.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
@@ -282,7 +282,7 @@ test('a phase-less legacy member row keeps its recorded intent: the live-store s
   const ctx = new Context()
   await ctx.plugin(SessionProjectionRegistry)
   ctx.provide('sessions', { get: () => undefined })
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, projectionWorkers())
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS }, projectionWorkers())
   t.after(async () => { await runtime.dispose() })
   await runtime.start()
 

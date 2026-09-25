@@ -19,15 +19,15 @@ class ControlledWorkers extends FakeWorkers {
   async prepareTask(member,task) { this.prepared.push(task.epoch) }
 }
 async function setup(t, overrides = {}, options = {}) {
-  const { runtime, workers, config } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { tickMs:1000, maxEvents:100, checkTimeoutMs: undefined, ...options.config } })
+  const { dir, runtime, workers, config } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { tickMs:1000, maxEvents:100, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId:'owner-session' }
-  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}}, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:dir,scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}}, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner,mission.id,{title:'Core',objective:'Fix module'})
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
   const actorA = {sessionId:a.sessionId}, actorB = {sessionId:b.sessionId}
   const propose = (actor=actorA, extra={}) => runtime.propose(actor,mission.id,{ outputs: [],workstreamId:stream.id,title:'Fix',objective:'Fix module',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['test'],...extra})
-  return {runtime,workers,config,owner,mission,stream,a,b,actorA,actorB,propose}
+  return {dir,runtime,workers,config,owner,mission,stream,a,b,actorA,actorB,propose}
 }
 test('participants propose work within the same scope and budget, without captain relaying',async t=>{
   const f=await setup(t)
@@ -131,7 +131,7 @@ test('scope rules reject traversal and distinguish a directory from a similarly 
 
 test('runtime admission canonicalizes path aliases without mutating caller arrays or widening mission scope', async t => {
   const f = await setup(t)
-  const input = { title: 'Alias mission', objective: 'Inspect source', workspace: '/source', scope: ['./src/**'], acceptance: ['works'], budget }
+  const input = { title: 'Alias mission', objective: 'Inspect source', workspace: f.dir, scope: ['./src/**'], acceptance: ['works'], budget }
   const before = structuredClone(input)
   const mission = f.runtime.create(f.owner, input, { grantRoot: input.workspace, source: 'session' })
   assert.deepEqual(input, before)
@@ -339,7 +339,7 @@ test('completion coverage ignores verification acceptance text', async t => {
 test('create() requires every budget field through validatedBudget', async t => {
   const f = await setup(t)
   assert.throws(() => f.runtime.create(f.owner, { title: 'Partial', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { maxDurationMs: 60000 } }, { grantRoot: '/source', source: 'session' }), /Invalid budget maxTokens/)
-  const complete = f.runtime.create(f.owner, { title: 'Complete', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
+  const complete = f.runtime.create(f.owner, { title: 'Complete', objective: 'Fix', workspace: f.dir, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: f.dir, source: 'session' })
   assert.deepEqual(complete.budget, budget)
 })
 

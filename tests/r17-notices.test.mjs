@@ -39,7 +39,7 @@ import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
 import { tempDirectory } from './temp-root.mjs'
-import { FakeClock, FakeWorkers } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -61,13 +61,15 @@ const newWorkers = ctx => new FakeWorkers({ ctx, autoIdle: true, checks: [], art
 async function fixture(t, config = {}) {
   const dir = await tempDirectory('swarm-r17-notices-')
   const ctx = new Context()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, newWorkers(ctx))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers(ctx))
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
   const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notify(mission.id, content, subjects, options))

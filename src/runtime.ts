@@ -504,13 +504,11 @@ export class SwarmRuntime {
     // R17-G8: subscribe to the host's claimed signal so real consumption is
     // recorded from it (one CAS write per delivery), never inferred.
     this.notices.attach(this.workers)
-    const grants = this.config.grants
-    if (grants !== undefined) {
-      this.store.transaction(() => {
-        for (const grant of grants.grants) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: grant.path, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
-        for (const unresolved of grants.unresolved) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: unresolved, loaded: false })
-      })
-    }
+    const { grants, unresolved } = this.config.grants
+    this.store.transaction(() => {
+      for (const grant of grants) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path: grant.path, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
+      for (const path of unresolved) this.store.event('swarm/install', 'workspace/grant-loaded', 'config', { path, loaded: false })
+    })
     // Persisted activity is presentation history, never proof that an execution survived a restart.
     for (const member of this.store.list('members')) if (member.activity !== undefined) {
       delete member.activity

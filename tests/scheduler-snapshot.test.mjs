@@ -43,6 +43,8 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5000 })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation', maxOutputTokens: 5000 })
+  // The members' starts re-validate the workspace on disk; their passes settle before the claims below.
+  await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
   const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: undefined })
@@ -52,6 +54,8 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // T1 owns an expired lease; T2 is inside the renewal window. Both are running.
   const first = propose('Expired lease')
   const firstClaim = await runtime.claim(actor(author), mission.id, first.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await runtime.settle(mission.id)
   const second = propose('Renewal window')
   const secondClaim = await runtime.claim(actor(other), mission.id, second.id)
   runtime.store.transaction(() => {

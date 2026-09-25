@@ -207,7 +207,7 @@ function assertToolArguments(name: string, schema: JsonSchemaNode, args: Args): 
  * no cwd, and return the canonical workspace plus the matched root so the
  * mission records both durably.
  */
-async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot | undefined): Promise<WorkspaceAuthorized> {
+async function boundPlanWorkspace(exec: ToolExecution, requested: string, grants: WorkspaceGrantSnapshot): Promise<WorkspaceAuthorized> {
   const cwd = exec.agent?.session?.header?.cwd
   if (typeof cwd !== 'string' || cwd.trim() === '') throw new Error('[session_workspace_missing] Swarm planning tools require an agent session workspace; call `swarm_stage` or `swarm_create` from a session whose cwd is inside the authorized `workspace` and retry the same request.')
   const authorization = await authorizeWorkspace(requested, cwd, grants)

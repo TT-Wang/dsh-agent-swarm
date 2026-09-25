@@ -6,10 +6,10 @@ const buckets = (input, requests = 1) => ({ uncachedInputTokens: input, cacheRea
 async function fixture(t) {
   // The reopened runtime is disposed first; makeRuntime's own cleanup then removes the state directory.
   t.after(async () => { await runtime.dispose() })
-  let { config, runtime, workers, budget } = await makeRuntime(t, { config: { tickMs: 1000, maxEvents: 100, checkTimeoutMs: undefined },
+  let { dir, config, runtime, workers, budget } = await makeRuntime(t, { config: { tickMs: 1000, maxEvents: 100, checkTimeoutMs: undefined },
     budget: { maxTokens: 10000, maxSteps: 100, maxWorkers: 1, maxTasks: 4, maxExperiments: 1 } })
   const owner = { sessionId: 'usage-owner' }
-  const mission = runtime.create(owner, { title: 'Accounting', objective: 'Retain recovered usage', workspace: '/source', scope: ['**'], acceptance: ['done'], budget }, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner, { title: 'Accounting', objective: 'Retain recovered usage', workspace: dir, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: dir, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Ada', role: 'Research' })
   return {
     record(total, usage, source) { return workers.callbacks.usageSnapshot(member.id, total, usage, source) },

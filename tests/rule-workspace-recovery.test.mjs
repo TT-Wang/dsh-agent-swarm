@@ -106,6 +106,9 @@ test('R15: ordinary failed Git writes do not claim a sandbox denial, and EPERM d
 
 test('R17: a deterministic preparation fault blocks once with owner recovery and does not consume task credits', async t => {
   const f = await runtimeFixture(t)
+  // The test drives each pass by hand: the setup passes settle and no kick races them.
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   f.workers.isIdle = () => true
   let calls = 0
   f.workers.prepareTask = async () => { calls++; throw new Error('[workspace_uncommitted] preserved conflict requires resolution') }
@@ -122,6 +125,9 @@ test('R17: a deterministic preparation fault blocks once with owner recovery and
 
 test('R17: a typed transient preparation failure backs off and keeps the task identity', async t => {
   const f = await runtimeFixture(t)
+  // The test drives each pass by hand: the setup passes settle and no kick races them.
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   f.workers.isIdle = () => true
   let calls = 0
   f.workers.prepareTask = async () => { if (++calls < 2) throw Object.assign(new Error('temporarily busy'), { code: 'EBUSY' }) }

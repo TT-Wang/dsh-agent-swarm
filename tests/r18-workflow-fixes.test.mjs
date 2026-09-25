@@ -478,7 +478,7 @@ test('R18-5b: the syntax refusal names the broken check and pairs each location 
   const viaStart = checks => {
     const id = `start_r18_syntax_${++requests}`
     runtime.store.transaction(() => runtime.store.put('starts', { id, ownerSessionId: owner.sessionId, commandId: id, goal: 'Deliver',
-      workspace: directory, status: 'planning', createdAt: Date.now(), updatedAt: Date.now() }))
+      workspace: directory, workspaceGrantRoot: directory, workspaceAuthorizationSource: 'session', status: 'planning', createdAt: Date.now(), updatedAt: Date.now() }))
     return runtime.startPlan(owner, id, plan(checks))
   }
   /** The refused locations, one line each, in the order the refusal lists them. */

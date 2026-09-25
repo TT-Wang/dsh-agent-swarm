@@ -15,9 +15,9 @@ async function fixture(t) {
   const workers = new Workers()
   // Registered first, so a held stop is released before makeRuntime's cleanup disposes the runtime.
   t.after(() => { workers.stopping = undefined })
-  const { config, runtime: rt } = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
+  const { dir, config, runtime: rt } = await makeRuntime(t, { workers, config: { tickMs: 60000, maxEvents: 500, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner' }
-  const mission = rt.create(owner, { title: 'Continue the obligation', objective: 'Same work with revised estimates', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
+  const mission = rt.create(owner, { title: 'Continue the obligation', objective: 'Same work with revised estimates', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const ws = rt.workstream(owner, mission.id, { title: 'Core', objective: 'Build it' })
   const member = await rt.addMember(owner, mission.id, { name: 'Ada', role: 'builder' })
   const other = await rt.addMember(owner, mission.id, { name: 'Alan', role: 'builder and review' })

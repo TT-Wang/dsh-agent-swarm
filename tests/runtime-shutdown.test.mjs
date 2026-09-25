@@ -89,7 +89,10 @@ for (const scenario of [
       assert.equal(running.resumeAfterStop, undefined)
       assert.match(running.handoff, /prior worktree checkpoint/)
     } else {
-      await eventually(() => recoveryWorkers.starts >= 4, 'recovery scheduler did not inspect the members', 2500)
+      // Each member is started once (a pass that finds a start in flight joins
+      // it), and the recovery pass settles before the block is read.
+      await eventually(() => recoveryWorkers.starts >= 2, 'recovery did not start the members', 2500)
+      await recovered.settle(mission.id)
       assert.equal(recovered.store.get('tasks', task.id).status, 'blocked', 'a newer revocation or exhausted retry budget must retain its block')
       assert.equal(recovered.store.get('tasks', task.id).attempt, undefined)
     }

@@ -13,9 +13,9 @@ class ControlledWorkers extends FakeWorkers {
   async captureArtifact(member, task) { return { commit: `c-${task.id.slice(-8)}`, baseCommit: 'base', workspace: member.workspace, changedPaths: task.kind === 'research' ? [] : ['src/a.ts'] } }
 }
 async function manual(t, overrides = {}, acceptance = ['works']) {
-  const { runtime, workers } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { maxEvents: 100, checkTimeoutMs: undefined } })
+  const { dir, runtime, workers } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Build', objective: 'Fix module', workspace: '/source', scope: ['src/'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner, { title: 'Build', objective: 'Fix module', workspace: dir, scope: ['src/'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix module' })
   const a = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

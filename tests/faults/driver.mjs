@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { SwarmRuntime, WorkspaceWorkers, PROJECT, events, eventually, setup, acceptThroughReview, makeWorkspaces } from './harness.mjs'
+import { NO_GRANTS, SwarmRuntime, WorkspaceWorkers, PROJECT, events, eventually, setup, acceptThroughReview, makeWorkspaces } from './harness.mjs'
 
 const { applyDelivery: realApplyDelivery } = await import(pathToFileURL(join(PROJECT, 'lib/delivery.js')).href)
 
@@ -46,7 +46,7 @@ await mkdir(stateDir, { recursive: true })
 // fixture gap: the harness exports no default RuntimeConfig for a runtime that reopens a state file outside makeRuntime/setup (no node:test context here).
 const config = {
   statePath: join(stateDir, 'swarm.sqlite'), leaseMs: 600_000, tickMs: 20, maxMessageChars: 16_000,
-  maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+  maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, grants: NO_GRANTS,
 }
 
 if (phase === 'f4-crash') {

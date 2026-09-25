@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Config } from '../lib/index.js'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { FakeWorkers, budget } from './faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS, budget } from './faults/harness.mjs'
 
 const base = { statePath: '/tmp/swarm-config/swarm.sqlite', workspacesRoot: '/tmp/swarm-config/workspaces' }
 
@@ -60,7 +60,7 @@ test('a non-function now in a runtime config built from the profile falls back t
   for (const now of [5, 'x']) {
     // fixture gap: makeRuntime cannot build a runtime whose whole config is Config(profile); this one is the subject.
     const dir = await mkdtemp(join(tmpdir(), 'swarm-config-now-'))
-    const runtime = new SwarmRuntime({ ...Config({ statePath: join(dir, 'swarm.sqlite'), workspacesRoot: join(dir, 'workspaces'), now }), maxTasksPerMember: 3 }, new FakeWorkers())
+    const runtime = new SwarmRuntime({ ...Config({ statePath: join(dir, 'swarm.sqlite'), workspacesRoot: join(dir, 'workspaces'), now }), maxTasksPerMember: 3, grants: NO_GRANTS }, new FakeWorkers())
     try {
       await runtime.start()
       const before = Date.now()

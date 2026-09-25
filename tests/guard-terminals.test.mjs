@@ -245,6 +245,8 @@ test('R17 runtime pair (dirty workspace x preparation): deterministic failure pr
 test('R14 runtime pair (attempt close-out x "Member has uncommitted commits"): the throw is contained and escalated', async () => {
   const f = await setup()
   try {
+    // The setup members' starts re-validate the workspace on disk; their passes settle before the claim.
+    await f.runtime.settle(f.mission.id)
     f.workers.autoIdle = true
     const held = f.propose({ title: 'Held work', assigneeId: f.author.id })
     await f.runtime.claim(f.actor(f.author), f.mission.id, held.id)
@@ -582,6 +584,8 @@ test('S4r-D5: a budget-blocked mission still escalates, and the terminal emissio
 test('S4b pair (workspace capture x close-out): a failed close-out checkpoint escalates the attempt terminal', async () => {
   const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
+    // The setup members' starts re-validate the workspace on disk; their passes settle before the claim.
+    await f.runtime.settle(f.mission.id)
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Held attempt', maxRecoveryAttempts: 3 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)
@@ -610,6 +614,8 @@ test('S4b (owner finding): an abandoned and an exhausted close-out both name the
   // attempt/lease chain now.
   const f = await setup({ config: { maxIdleCloseouts: 0 } })
   try {
+    // The setup members' starts re-validate the workspace on disk; their passes settle before the claim.
+    await f.runtime.settle(f.mission.id)
     f.workers.autoIdle = true
     const task = f.propose({ title: 'Close-out exhaustion', maxRecoveryAttempts: 1 })
     await f.runtime.claim(f.actor(f.author), f.mission.id, task.id)

@@ -1171,16 +1171,16 @@ export interface RuntimeConfig {
   stallPassTimeoutMs?: number
   /**
    * The human-authorized roots, loaded once from plugin configuration at
-   * start: the one representation every admission and re-validation reads,
-   * judged at `now`, the runtime clock's instant. When present the runtime
-   * re-validates a mission before every adapter call that can reach its
-   * workspace (worker start, baseline, worktree, task preparation, verification
-   * checkout, launch preflight, delivery) and fences one no configured root
-   * authorizes any more; when absent (unit runtimes and adapters without Git)
-   * the recorded admission result stands. Never re-loaded at runtime and never
-   * a model-callable surface.
+   * start (`loadWorkspaceGrants`; no configured root loads an empty snapshot,
+   * which authorizes only the calling session's own directory): the one
+   * representation every admission and re-validation reads, judged at `now`,
+   * the runtime clock's instant. The runtime re-validates a mission before
+   * every adapter call that can reach its workspace (worker start, baseline,
+   * worktree, task preparation, verification checkout, launch preflight,
+   * delivery) and fences one no configured root authorizes any more. Never
+   * re-loaded at runtime and never a model-callable surface.
    */
-  grants?: WorkspaceGrantSnapshot
+  grants: WorkspaceGrantSnapshot
   /**
    * The dependency directory names the host's workspace engine treats as
    * toolchain state (the plugin `verificationDependencyDirs`). Admission checks

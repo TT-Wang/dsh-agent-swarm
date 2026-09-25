@@ -14,12 +14,12 @@ import { FakeWorkers, budget as sharedBudget, makeRuntime } from './faults/harne
 const budget = { ...sharedBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 }
 
 async function setup(t) {
-  const { runtime, workers } = await makeRuntime(t, {
+  const { dir, runtime, workers } = await makeRuntime(t, {
     workers: new FakeWorkers({ checks: [{ command: 'test', exitCode: 0, output: 'ok' }], artifact: { commit: 'abc', baseCommit: 'base', workspace: '/isolated', changedPaths: ['src/a.ts'] } }),
     config: { tickMs: 60000, maxEvents: 200, checkTimeoutMs: undefined },
   })
   const owner = { sessionId: 'ceiling-owner' }
-  const mission = runtime.create(owner, { title: 'Ceiling surface', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
+  const mission = runtime.create(owner, { title: 'Ceiling surface', objective: 'Bound per-task work', workspace: dir, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Bound per-task work' })
   const builder = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

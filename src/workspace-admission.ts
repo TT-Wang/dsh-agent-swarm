@@ -377,24 +377,19 @@ export class WorkspaceAdmission {
    */
   assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim {
     if (!isContained(claim.grantRoot, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claim.grantRoot} [${WORKSPACE_AUTHORIZATION_CODE}]`)
-    const grants = this.rt.config.grants
-    if (grants === undefined) return { grantRoot: claim.grantRoot, source: claim.source }
-    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, grants, this.rt.now())
+    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, this.rt.config.grants, this.rt.now())
     if (authorized !== undefined) return authorized
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
   }
 
   /**
    * Re-validate a recorded mission against the human authorization loaded at
-   * start, with `reauthorizeWorkspace` at the runtime clock's instant. Returns
-   * without error when this runtime has no loaded roots (unit runtimes and
-   * adapters without Git). A refusal fences the mission (`fenceWorkspace`) and
-   * throws the typed `WorkspaceRevokedError`.
+   * start, with `reauthorizeWorkspace` at the runtime clock's instant. A
+   * refusal fences the mission (`fenceWorkspace`) and throws the typed
+   * `WorkspaceRevokedError`.
    */
   async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> {
-    const grants = this.rt.config.grants
-    if (grants === undefined) return
-    const authorization = await reauthorizeWorkspace(mission, grants, this.rt.now())
+    const authorization = await reauthorizeWorkspace(mission, this.rt.config.grants, this.rt.now())
     if (authorization.ok) return
     // The scheduling body awaiting this check (`pass`) stamps its progress
     // before the fence commits, so the fence publishes as its own commit.

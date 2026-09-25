@@ -24,7 +24,7 @@ import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
-import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
 const budget = { ...defaultBudget, maxTokens: 100000, maxSteps: 100, maxTasks: 10, maxExperiments: 2 }
 /** Records the members it started and the workspaces it prepared. */
@@ -35,7 +35,7 @@ class Workers extends FakeWorkers {
   async start(spec) { this.starts.push(spec.member.id) }
 }
 /** `grants` is the runtime's one loaded snapshot, which the web API reads from it, as src/index.ts wires the plugin. */
-async function fixture(t, { grants } = {}) {
+async function fixture(t, { grants = NO_GRANTS } = {}) {
   // Registered before makeRuntime's cleanup, so the runtime and then the host
   // composition are disposed before the temp dir goes.
   const ctx = new Context()
