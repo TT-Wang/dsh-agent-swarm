@@ -862,6 +862,48 @@ test('A fenced review path records one automatic admission however many passes r
 })
 
 /**
+ * An accepted source is immutable, so no rework can re-open its reviews: one
+ * the fence blocked before it recorded anything is closed with the verdict.
+ * The fence blocks the running review, the host admits the submission's
+ * automatic review and dispatch fences that one too; the human restores the
+ * root and restarts, the owner resumes the first review and it accepts. The
+ * automatic review used to stay blocked and hold the mission open.
+ */
+test('An accepted source closes the reviews the fence blocked, so the restored mission completes', async t => {
+  const { granted, project } = await fixture(t)
+  const clock = new FakeClock()
+  const grants = await loadWorkspaceGrants([{ path: granted }])
+  const reviewing = () => new FakeWorkers({ autoIdle: false, artifact: { commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40), workspace: '/isolated', changedPaths: ['src/a'] },
+    async prepareWorkspace(mission, memberId) { return join(mission.workspace, memberId) } })
+  const { config, runtime } = await makeRuntime(t, { workers: reviewing(), config: wired(grants), clock })
+  const f = await grantedMission(runtime, project, granted, 'owner-restored-review')
+  const source = f.propose({ kind: 'implementation', checks: ['test -d .'], assigneeId: f.author.id })
+  const claimed = await runtime.claim(f.actor(f.author), f.mission.id, source.id)
+  await runtime.submit(f.actor(f.author), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'done' })
+  const review = f.propose({ title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, assigneeId: f.reviewer.id })
+  await runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await runtime.settle(f.mission.id)
+  grants.grants.length = 0
+  for (let pass = 0; pass < 5; pass++) { clock.advance(5_000); await runtime.tick(); await runtime.settle(f.mission.id) }
+  const [automatic] = runtime.store.list('tasks', f.mission.id).filter(task => task.reviewOf === source.id && task.id !== review.id)
+  assert.deepEqual([review, automatic].map(task => runtime.store.get('tasks', task.id).status), ['blocked', 'blocked'], 'the fence blocked both reviews')
+  await runtime.dispose()
+  const restored = new SwarmRuntime(wired(await loadWorkspaceGrants([{ path: granted }]), config), reviewing())
+  t.after(async () => { await restored.dispose() })
+  await restored.start()
+  restored.controlTask(f.owner, f.mission.id, review.id, 'resume', {}, 'root restored')
+  await restored.settle(f.mission.id)
+  const resumed = await restored.claim(f.actor(f.reviewer), f.mission.id, review.id)
+  await restored.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: resumed.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
+  assert.equal(restored.store.get('tasks', source.id).status, 'accepted')
+  assert.equal(restored.store.get('tasks', automatic.id).status, 'cancelled', 'the verdict closed the fenced automatic review')
+  const retired = restored.store.events(f.mission.id, 500).filter(event => event.type === 'task/review-retired').map(event => [event.data.taskId, event.data.previousStatus])
+  assert.deepEqual(retired, [[automatic.id, 'blocked']])
+  assert.equal(restored.completionError(restored.mission(f.mission.id)), undefined, 'no review of the accepted source holds the mission open')
+  assert.equal(restored.control(f.owner, f.mission.id, 'complete', 'done').status, 'completed')
+})
+
+/**
  * Applying a delivery writes the mission workspace, and inspecting one reads
  * it: both are adapter calls the runtime re-validates first, whichever entry
  * point calls them. Only the browser route used to check, so the runtime API

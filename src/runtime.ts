@@ -2265,13 +2265,13 @@ export class SwarmRuntime {
   private retireReviewSiblings(missionId: string, sourceId: string, options: { exclude?: string; reason: string; blocked?: boolean }): { retired: Task[]; released: Set<string> } {
     const retired: Task[] = []
     const released = new Set<string>()
-    const closeBlocked = options.blocked === true || this.task(missionId, sourceId).status === 'cancelled'
+    const closeBlocked = options.blocked === true || TERMINAL_STATES.has(this.task(missionId, sourceId).status)
     for (const review of this.store.list('tasks', missionId)) {
       if (review.id === options.exclude || review.reviewOf !== sourceId) continue
       // A negative verdict remains blocked while its source needs repair. Once
-      // the owner withdraws that source, an accepted replacement retires it or a
-      // rework re-opens it (`blocked`), its blocked reviews are closed too, a
-      // deferred one included; keep their verdict, output and evidence.
+      // that source is closed (accepted, withdrawn, retired by a replacement) or
+      // a rework re-opens it (`blocked`), its blocked reviews are closed too, a
+      // deferred or fenced one included; keep their verdict, output and evidence.
       const moot = review.status === 'pending' || review.status === 'running' || this.quiescencePending(review)
         || (closeBlocked && review.status === 'blocked')
       if (!moot) continue
