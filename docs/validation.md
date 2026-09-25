@@ -7,6 +7,166 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 | `0.1.5-rc.3` (npm `latest`, default host) | `a4c74a91e06b00fe0b0937bde982170c526cc842` |
 | `0.1.7-rc.1` (npm `next`) | `46a7f68b0922371ce7144b668b90e377d8e799f4` |
 
+## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
+
+**Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration`
+(`96f6db9` batch9/commit, `c99e854` batch9/auth, `bb242d9` batch9/checks, `380e03f` batch9/adapter, `2226867`
+batch9r2/authz, `cb331ca` batch9r2/trace, `72cc577` batch9r2/exits), followed by `27fa353`. On both supported hosts
+the build passed, and the behavioral suite ran 1564 tests: 1554 passed and 10 failed, all in
+`tests/trace-recording.test.mjs`, whose fixture called `runtime.create` without the claim argument the authorization
+branch made required. `19dbc30` fixed the fixture, and the file passed 11/11 three times on 0.1.5-rc.3 and once on
+0.1.7-rc.1. Every other gate passed on both hosts (table below). Six repair commits followed (`832b4a3` to
+`95318c0`); each is recorded below with its own regression, and the gate figures are those of `27fa353` and
+`19dbc30`. `src` net against `75b765a`: −464 lines (+649/−1113) at `19dbc30`, −478 (+664/−1142) at `95318c0`, where
+the behavioral suite has 1571 tests.
+
+**Progress clock** (`2f7f57a`, `c371e34`; review M-2, L-1). Wrong model: after every commit `Notices.transition()`
+recomputed the absence net's clock from the bounded event window (`maxEvents`), a hard-coded set of 20 type names
+(three of them never registered) and every evidence row, and saved it on the mission through a second, nested commit
+after the first was durable; a `WriterBusyError` there made a committed claim report `writer_busy`. Right model:
+whether an event is progress is a property of its kind (`EventSpec.progress`), and the clock is read from the
+append-only log (`SwarmStore.progressAt`: the newest progress-kind row, else the mission's `createdAt`), so no writer
+can leave it behind and `commit()` opens one transaction. Deleted: `Notices.lastTransitionAt()` with its scans and
+name set, the nested commit, and the stored `meaningfulProgressAt` with its casts (`tests/progress-clock.test.mjs`).
+
+**One workspace authorization rule** (batch9/auth, batch9r2/authz, and the repairs `b7f78f2`, `1912420`,
+`95318c0`; review H-1, L-36).
+
+- Wrong model: the rule was written three times over two representations and judged at two layers on two clocks.
+  The runtime asked a closure (`RuntimeConfig.authorizeWorkspace`) that demanded the longest configured root equal
+  the recorded one, so a narrower root configured later fenced a healthy mission as "removed" (H-1). The adapter
+  and the browser API re-checked with an exact-root rule on host time. A worker start and the planning snapshot
+  reached the adapter with no runtime check, and the declared-check retry created a second checkout with none.
+  The authorization rode inside the plan as optional fields that validation dropped and a cast recovered; once
+  `592a0c6` stopped reading a missing source as a session authorization, both web smokes failed from `c99e854`.
+- Right model: `RuntimeConfig.grants` is the one representation and `claimFor` (`src/authorization.ts`) the one
+  rule: the calling session's own directory, else the most specific active configured root that contains the
+  realpath-resolved workspace. Admission, the synchronous create path and re-validation all decide through it. Each
+  entry point hands the runtime its claim beside the plan (`WorkspaceClaim`), and the runtime records it. Only the
+  runtime re-validates, on its own clock, before every path that can reach the workspace: worker start, member
+  admission, claim and dispatch, planning snapshot, plan repair, each verification checkout (the retry included),
+  and since `1912420` delivery inspection and application and a draft launch before its check preflight. The
+  browser API only admits, and answers the runtime's `WorkspaceRevokedError` as a bad request carrying its
+  diagnostic. `fenceWorkspace` is idempotent from mission state; since `95318c0` its owner decision is keyed on the
+  runtime instance that found the revocation, so the owner is woken once per host process.
+- Deleted: `RuntimeConfig.authorizeWorkspace` and its closure, the duplicate grant types, the adapter's grants and
+  checks (`WorkspaceOptions.grants`, `HarnessWorkerOptions.grants`, the manifest's anchor copy), the plan's
+  authorization fields and `WORKSPACE_BOUND_TOOLS`, scheduling's second fence, the browser's
+  `assertRecordedWorkspace`, `grantFor` as a separate export, the three session-then-root sequences and the
+  mission-wide revocation key (`tests/authorized-workspace.test.mjs`).
+
+**Deletions without production readers** (batch9/checks; review M-4, M-11, M-12, L-6, L-9, L-11, L-16, L-17, L-33,
+L-34, L-36). `readScratch`/`ScratchRead`; the `ownerReplyGuard` mode nothing read (a profile that still sets it
+loads, `tests/surface-config.test.mjs`); the runtime's test-only cache getters and the write-only
+`RuntimeGates.budgetStops` mirror; the `export` keyword on 123 declarations nothing imports, a duplicated pair of
+delivery interfaces and a `CheckResult` alias; the arena helpers `liveCarrier` and `proposalAllowance`; three client
+projection wrappers only tests called (a board lane now resolves with the roster, `a66f25c`); the web smoke's
+`[data-swarm-dock]` assertion, which could not fail; three raw control bytes, one of which had disabled the
+session-append guard's first alternative since `21976c1`. The restored guard now requires the host vocabulary
+(`687927b`), and `recoveryRequired` reads only a row's `failureKind` (`5ed3061`).
+
+**Worker adapter** (batch9/adapter; review M-7, M-8).
+
+- Task records (M-7, `4c45ad2`). Wrong model: a cross-process `.lock` file, broken by its mtime after 30 s and
+  polled every 5 ms, guarded a record only the owning process writes. Right model: an in-process keyed chain
+  (`serialized` in `src/workspaces.ts`) orders every write of one record. Deleted: `withTaskRecordLock` with its lock
+  file, staleness, polling and timeout, and the chain body `queueWorktree` duplicated.
+- Verification checkouts (M-8, `4423b64`, `c972a3c`, `e31cca9`, `4e10ec4`, and the repair `30266b4`). Wrong model:
+  each verification removed only its own checkout, so one a crash (SIGKILL, OOM) left between `git worktree add` and
+  that cleanup, tree and registration, was never removed; the first fix, like `75b765a`'s fallback and the
+  worktree-add race retry, ran a repository-wide `git worktree prune`, which also drops the user's own worktrees whose
+  directory is missing at that moment. Right model: one reclaim path, by path. Every checkout under the mission's
+  `verification/` that no in-flight verification of this process owns loses its tree first (a link is never
+  followed), then its registration (`git worktree remove --force --force`); nothing prunes, and the race retry
+  reclaims only its own target. Deleted: the per-checkout special cases, every prune, the plain `rm` before the
+  permission repair and `recordCleanupIssue` (`tests/workspaces.test.mjs`; `W4: the metadata-race retry reclaims only
+  its own target …` in `tests/worktree-concurrency.test.mjs`).
+
+**Trace spans** (batch9r2/trace; review M-3). Wrong model: `record()` validated each span at call time and threw
+`TraceContractError`, and the wrapper awaited the span inside the `try` that held the command, so a failed span write
+turned a committed command into a tool error, the `catch` wrote a second, false error span, and a throw from that
+write replaced the command's own error (`missionId: ""` threw `mission_id is required`). Right model: each D6 clause
+holds where its value is made: a span is scoped only to an existing mission, the actor is the id the session guard
+requires, `endedAt` is `startedAt` plus a monotonic duration, and a stored parent is used only when its id is valid
+(the malformed row stays in the metrics window). The wrapper settles the command once, records at most one span with
+that outcome, and rethrows exactly the command's error; recording is contained and counted
+(`HostTelemetryLink.contain`). Deleted: the per-call contract check and its throw, the double-span path, the second
+wall-clock read, `hostTelemetryFor` and `noteUnscoped` (folded into `record`) (`tests/trace-recording.test.mjs`).
+
+**Check failure exits** (batch9r2/exits and `27fa353`; review M-9). Wrong model: a failure's kind was decided twice,
+where the row was produced and again in `recoveryRequired` by exit code (124, 126, 127); the exit-127 hint was prose
+appended to the command's own output; `verify` gave one fixed deferral reason for every kind and
+`reviewPathBlocker` held a paraphrase of it; the host deadline was stored as exit 124 and then recognised by that
+code, so a command's own 124 deferred and told the owner to raise `checkTimeoutMs`. Right model: the kind is set once
+where the row is produced (`timeout` only where the host deadline fires, `infrastructure` from the one
+`unexecutedCheck` producer, `unrunnable` for 126/127), `recoveryRequired` reads only the kind, and one table
+(`RECOVERY_EXITS`) gives each kind's exit, taken from the last classified failure of the deciding pass. Deleted: the
+127 prose, the fixed deferral string and its paraphrase, the second unexecuted-check producer,
+`DeclaredChecks.deferredChecks` and the exit-code proxy for the timeout kind (`tests/check-failure-exits.test.mjs`).
+Case F of `tests/r19-recovery-fallback.test.mjs` now reads the cleanup fact through a wake-budget summary; that fold,
+about one run in ten under load, was its intermittent failure (`f8f45c0`).
+
+**Repairs after the gate.**
+
+- `832b4a3`: the host admits a submission's automatic review once. Its id is keyed on the submission, so an existing
+  row is that review and `task/review-admitted` means a pass created it; before, a review the fence had blocked was
+  re-proposed and recorded on every pass (`A fenced review path records one automatic admission however many passes
+  run`).
+- `30266b4`: the worktree-add race retry reclaims its own target by path and no longer prunes (`W4` above).
+- `b7f78f2`: `claimFor` replaces the three session-then-root sequences of `authorizeWorkspace`,
+  `reauthorizeWorkspace` and `assertAuthorizedRoot`; `grantFor` and the unread `WorkspaceAuthorized.grant` are gone.
+- `1912420`: the runtime re-validates before delivery inspection and application and before a draft launch's
+  preflight (`Delivery inspection and application re-validate the workspace before the adapter reaches it`, `A draft
+  launch re-validates its recorded claim before the preflight reaches the workspace`).
+- `b9f16c6`: an accepting verdict closes every review of its source that is still blocked (fenced, out of recovery
+  credit, or deferred on the same artifact) as `task/review-retired` with `previousStatus: "blocked"`, keeping its
+  verdict, output and evidence; such a review used to hold completion. This closes the batch notes' open item that a
+  review deferred on an artifact stayed blocked after a second review accepted the source (`An accepted source closes
+  the reviews the fence blocked, so the restored mission completes`; `an accepting verdict closes a sibling review
+  deferred on the same artifact` in `tests/durability-sibling-retirement.test.mjs`).
+- `95318c0`: the revocation decision is keyed on the process that found it; a mission-wide key stayed held after the
+  root was restored, so a later revocation reached no one (`A revocation after the root was restored wakes the owner
+  again`).
+
+**What the review got wrong.** M-15 (a rejected native dispose leaks the worker handle, so stop and unload should
+retry it) was implemented in `213e630` and reverted in `d36efd8`. On both supported hosts the handle's dispose is
+memoized (`disposing ??= …` in `@deepseek-ai/dsh-agent-loop`) and runs registry, scope and ownership teardown to
+quiescence before it rejects, so a rejected dispose has already released the handle and a retry re-awaits the same
+rejection: with the retry, one failed close left the member unable to start again in that process and unload failing.
+`c9d78d0` pins the host contract on the real AgentLoop with JSONL persistence; no `src` change remains for the item.
+M-1 is left as is.
+
+**Owner decisions.** M-9: a check that decides no verdict still defers its review (the deferral is kept, still with no
+bound), and the deferral's exit is chosen by the failure's kind; a command's own exit 124 is its verdict and rejects the
+source like exit 1.
+
+**Kept limitations** (in [known-limitations.md](known-limitations.md)): deferred verification has no bound, and an
+`infrastructure` failure the artifact caused reads as a host problem on every resume; the review-blocked notice
+appends its fixed exit also under blockers where no verification task can be admitted or a review is deferred; a
+contained span-recording failure is only counted in process; a registration git left locked without a recorded
+`gitdir` cannot be reclaimed by path; a record without an authorization source is judged by the configured roots
+alone; the `swarm_stage`/`swarm_create` binding and the browser's draft saves check grants on host time.
+`scripts/smoke-deepseek.mjs` was edited (the claim moved beside the input) and not run, because it needs provider
+credentials. Known-limitations no longer lists checkout re-authorization and task-record lock staleness on host time,
+or case F among the timer-bound tests; it corrects the claim that the plugin writes nothing into a session log
+(worker activations have appended the host's own `sandbox/mode` and `approval/policy` events since `becba81`).
+
+| Check | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
+| --- | --- | --- |
+| `npm run build` at `27fa353` | passed | passed |
+| `node --test tests/*.test.mjs` at `27fa353` | 1554/1564; the 10 failures are all in `tests/trace-recording.test.mjs` | 1554/1564; the same 10 |
+| `tests/trace-recording.test.mjs` at `19dbc30` | 11/11, three runs | 11/11, one run |
+| `npm run test:harness` | passed | passed |
+| `npm run test:replay` | passed, digest `sha256:61a921e64088b78b957cd6aeaa563d5436d4a6eae4b0130725d1f3c74c6f971e` unchanged | passed, digest unchanged |
+| `npm run test:pack` / `test:profile` / `test:bundle` | passed / passed / passed | passed / passed / passed |
+| `node scripts/faults/run.mjs` | 24/24 | 24/24 |
+| `npm run test:web` | passed, 13 checks | passed, 13 checks |
+| `npm run test:command-web` | passed, 10 checks | passed, 10 checks |
+
+With this entry's documentation on `95318c0`, the four test files that read the docs
+(`tests/authorized-workspace.test.mjs`, `tests/client-event-projection.test.mjs`, `tests/packaging.test.mjs`,
+`tests/reader-census.test.mjs`) passed 47/47 with the plugin linked to 0.1.5-rc.3.
+
 ## Batch-8 fix: boundary compaction reaches the member's preset realm (2026-09-24)
 
 Boundary compaction (`boundaryCompactionTokens`, default 250000) was on by default but never ran. The batch-8 measurement found 288 recorded (member, verdict) boundaries whose last prompt was at or above 250K, and no boundary compaction. The only two member compactions were the preset engine's own pressure path at about 800K (0.8 of the 1M window).
