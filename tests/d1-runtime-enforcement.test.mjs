@@ -15,7 +15,7 @@ async function setup(t, overrides = {}) {
     config: { tickMs: 60000, maxEvents: 200, checkTimeoutMs: undefined },
     budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2, ...overrides } })
   const owner = { sessionId: 'd1-owner' }
-  const mission = runtime.create(owner, { title: 'D1 enforcement', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'D1 enforcement', objective: 'Bound per-task work', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Bound per-task work' })
   const builder = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

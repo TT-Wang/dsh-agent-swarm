@@ -63,7 +63,7 @@ test('the real runtime snapshot projects the workspace binding into the compact 
   await runtime.start(grants)
   const owner = { sessionId: 'owner-bound' }
   const mission = runtime.create(owner, { title: 'Bound mission', objective: 'Work inside a human-authorized root',
-    workspace: await realpath(project), workspaceGrantRoot: await realpath(granted), scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    workspace: await realpath(project), scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: await realpath(granted), source: 'grant' })
   const snapshot = runtime.snapshot(owner, mission.id)
   const bound = snapshot.events.find(event => event.type === 'mission/workspace-bound')
   assert.ok(bound, 'the mission snapshot carries the durable binding event')
@@ -88,7 +88,7 @@ test('a real restart with the human root removed projects the revocation with it
   const owner = { sessionId: 'owner-revoked' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = before.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath,
-    workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: grantedPath, source: 'grant' })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = before.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   before.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
@@ -118,7 +118,7 @@ test('the sanctioned board stays model-tool-only in the client and the declared 
   const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: runtimeConfig })
   const owner = { sessionId: 'owner-board' }
   const mission = runtime.create(owner, { title: 'Board mission', objective: 'Post a durable note', workspace: session,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: session, source: 'session' })
   const marker = 'BOARD-ONLY-MARKER-9f2c'
   runtime.post(owner, mission.id, { kind: 'IDEA', body: `cross-task note ${marker}`, to: 'owner' })
   // The post is readable through the model tool surface...

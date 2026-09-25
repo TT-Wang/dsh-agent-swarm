@@ -231,7 +231,7 @@ test('one owner with a hung flush cannot block another owner recovery notice', a
   const other = { id: session.id, session, inbox, send(message, target) { inbox.append(target, message); received.push(message) } }
   f.agents.set(other.id, other)
   const actor = { sessionId: other.id }
-  const second = f.runtime.requestStart(actor, { commandId: 'other-command', goal: 'other owner goal', workspace: f.root })
+  const second = f.runtime.requestStart(actor, { commandId: 'other-command', goal: 'other owner goal', workspace: f.root }, { grantRoot: f.root, source: 'session' })
   f.runtime.failStart(actor, second.id, 'second owner needs recovery', 1)
   await eventually(() => !f.runtime.store.get('starts', second.id).recoveryNoticePending)
   assert.equal(received.length, 1)
@@ -289,7 +289,7 @@ test('retry snapshot preparation uses the planning deadline rather than the shor
     async beforeSnapshot(signal) { await new Promise(resolve => setTimeout(resolve, 60)); preparations.push(signal.aborted ? 'aborted' : 'held past the outbox timeout'); signal.throwIfAborted() },
   })
   const actor = { sessionId: f.agent.id }
-  const request = f.runtime.requestStart(actor, { commandId: 'slow-snapshot', goal: 'finish a slow snapshot', workspace: f.root })
+  const request = f.runtime.requestStart(actor, { commandId: 'slow-snapshot', goal: 'finish a slow snapshot', workspace: f.root }, { grantRoot: f.root, source: 'session' })
   f.runtime.failStart(actor, request.id, 'snapshot needs a retry', 1)
   f.runtime.controlStart(actor, request.id, 'retry', 'allow the snapshot to finish')
   await poll(() => preparations.length > 0, 'the retried preparation never reached its snapshot', 30_000)
@@ -299,4 +299,28 @@ test('retry snapshot preparation uses the planning deadline rather than the shor
   assert.deepEqual(preparations, ['held past the outbox timeout'], 'and it ran once, never repeated')
   assert.ok(f.runtime.store.get('starts', request.id).baseline)
   assert.equal(f.runtime.store.get('starts', request.id).status, 'planning')
+})
+
+/**
+ * The plugin always loads its configured roots, so a runtime wired like it
+ * never labels a claim for a caller. The native command's session
+ * authorization used to ride inside the plan, which validation rebuilt without
+ * it: the automatic launch then found no root containing the session cwd and
+ * refused the validated plan. It now travels beside the plan from the request.
+ */
+test('a native request launches its validated plan with the session authorization it was admitted with', async t => {
+  const f = await fixture(t, { config: { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } } })
+  assert.equal((await f.execute('/agent-swarm deliver the change')).result.kind, 'success')
+  const [request] = f.runtime.starts({ sessionId: f.agent.id })
+  assert.deepEqual([request.workspaceAuthorizationSource, request.workspaceGrantRoot], ['session', f.root])
+  const plan = { title: 'Native request', objective: 'Deliver verified code', workspace: f.root, scope: ['src/'], acceptance: ['works'],
+    budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 6, maxExperiments: 0 },
+    members: [{ key: 'builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', role: 'verification', maxOutputTokens: 2048 }],
+    workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }],
+    tasks: [{ key: 'code', workstreamKey: 'main', title: 'Code', objective: 'Implement the change', kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['test -d .'], maxRecoveryAttempts: 1, checkTimeoutMs: 1000 }] }
+  const { mission } = await f.runtime.startPlan({ sessionId: f.agent.id }, request.id, plan, request.planningEpoch)
+  assert.equal(mission.status, 'active', 'the validated plan launched')
+  assert.deepEqual([mission.workspaceAuthorizationSource, mission.workspaceGrantRoot], ['session', f.root], 'the mission records the request authorization')
+  const draft = f.runtime.store.get('drafts', f.runtime.store.get('starts', request.id).draftId)
+  assert.deepEqual([draft.workspaceAuthorizationSource, draft.workspaceGrantRoot], ['session', f.root], 'and so does the draft it launched from')
 })

@@ -32,7 +32,7 @@ async function fixture(t, config = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'closeout-owner' }
   const mission = runtime.create(owner, { title: 'Close-out', objective: 'Never strand uncommitted work', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

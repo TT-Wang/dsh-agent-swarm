@@ -32,7 +32,7 @@ async function fixture(t, config = {}) {
   })
   const owner = { sessionId: 'reply-owner' }
   const mission = runtime.create(owner, { title: 'Reply protocol', objective: 'Answer questions', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: directory, source: 'session' })
   runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'implementation' })
   const asker = { sessionId: member.sessionId }

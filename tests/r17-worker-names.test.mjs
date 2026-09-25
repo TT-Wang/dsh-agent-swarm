@@ -43,7 +43,7 @@ async function scenario(t, options = {}) {
   await runtime.start()
   const owner = { sessionId: 'owner-worker-names' }
   const mission = runtime.create(owner, { title: 'Worker identity', objective: 'Name every worker from the fixed pool',
-    workspace: directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: options.maxWorkers ?? budget.maxWorkers } })
+    workspace: directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxWorkers: options.maxWorkers ?? budget.maxWorkers } }, { grantRoot: directory, source: 'session' })
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)
   const exec = { agent: { id: owner.sessionId }, signal: new AbortController().signal }

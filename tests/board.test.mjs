@@ -44,7 +44,7 @@ async function fixture(t, options = {}) {
   const runtime = new SwarmRuntime(config, workers)
   t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: `owner-${randomUUID()}` }
-  const mission = runtime.create(owner, { title: 'Board mission', objective: 'Exercise the sanctioned board', workspace, scope: ['src/'], acceptance: ['board works'], budget })
+  const mission = runtime.create(owner, { title: 'Board mission', objective: 'Exercise the sanctioned board', workspace, scope: ['src/'], acceptance: ['board works'], budget }, { grantRoot: workspace, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Board work' })
   const alice = await runtime.addMember(owner, mission.id, { name: 'alice', role: 'implementation' })
   const bob = await runtime.addMember(owner, mission.id, { name: 'bob', role: 'reviewer' })
@@ -205,7 +205,7 @@ test('invalid posts are rejected: kind, bound, citations, foreign member and rep
 
   // A member of a different mission can never be named as a recipient.
   const owner2 = { sessionId: `owner-${randomUUID()}` }
-  const mission2 = f.runtime.create(owner2, { title: 'Other mission', objective: 'Foreign member', workspace: f.workspace, scope: ['src/'], acceptance: ['works'], budget })
+  const mission2 = f.runtime.create(owner2, { title: 'Other mission', objective: 'Foreign member', workspace: f.workspace, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.workspace, source: 'session' })
   const carol = await f.runtime.addMember(owner2, mission2.id, { name: 'carol', role: 'implementation' })
   assert.throws(() => f.runtime.post(f.aliceActor, f.mission.id, { kind: 'ASK', to: carol.id, body: 'hello foreign' }), /another mission/)
   assert.throws(() => f.runtime.board(f.aliceActor, f.mission.id, { to: carol.id }), /another mission/)

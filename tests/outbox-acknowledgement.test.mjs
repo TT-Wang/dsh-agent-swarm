@@ -23,7 +23,7 @@ async function fixture(t, config = {}) {
   runtime.pumpOutbox = () => {}
   const owner = { sessionId: 'ack-owner' }
   const mission = runtime.create(owner, { title: 'Outbox acknowledgement', objective: 'Preserve concurrent decisions',
-    workspace: directory, scope: ['**'], acceptance: ['preserved'], budget })
+    workspace: directory, scope: ['**'], acceptance: ['preserved'], budget }, { grantRoot: directory, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'implementation' })
   const rows = () => runtime.store.list('deliveries', mission.id)
   const emit = key => {

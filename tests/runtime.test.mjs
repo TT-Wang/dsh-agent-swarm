@@ -21,7 +21,7 @@ class ControlledWorkers extends FakeWorkers {
 async function setup(t, overrides = {}, options = {}) {
   const { runtime, workers, config } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { tickMs:1000, maxEvents:100, checkTimeoutMs: undefined, ...options.config } })
   const owner = { sessionId:'owner-session' }
-  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}})
+  const mission = runtime.create(owner,{title:'Build',objective:'Fix module',workspace:'/source',scope:['src/'],acceptance:options.acceptance ?? ['works'],budget:{...budget,...overrides}}, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner,mission.id,{title:'Core',objective:'Fix module'})
   const a = await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'})
   const b = await runtime.addMember(owner,mission.id,{name:'Reviewer',role:'verification'})
@@ -133,7 +133,7 @@ test('runtime admission canonicalizes path aliases without mutating caller array
   const f = await setup(t)
   const input = { title: 'Alias mission', objective: 'Inspect source', workspace: '/source', scope: ['./src/**'], acceptance: ['works'], budget }
   const before = structuredClone(input)
-  const mission = f.runtime.create(f.owner, input)
+  const mission = f.runtime.create(f.owner, input, { grantRoot: input.workspace, source: 'session' })
   assert.deepEqual(input, before)
   assert.deepEqual(mission.scope, ['src/'])
   assert.deepEqual(f.runtime.snapshot(f.owner, mission.id).mission.scope, ['src/'])
@@ -144,7 +144,7 @@ test('runtime admission canonicalizes path aliases without mutating caller array
   assert.deepEqual(f.runtime.snapshot(f.owner, f.mission.id).tasks[0].scope, ['src/a.ts'])
   assert.throws(() => f.propose(f.actorA, { scope: ['./src-other/**'] }), /task\.scope exceeds mission scope/)
   for (const selector of ['.', './', '/source/src/', './src/../secret', 'src/*.ts']) {
-    assert.throws(() => f.runtime.create(f.owner, { ...input, scope: [selector] }), /scope\[0\].*is invalid/)
+    assert.throws(() => f.runtime.create(f.owner, { ...input, scope: [selector] }, { grantRoot: input.workspace, source: 'session' }), /scope\[0\].*is invalid/)
   }
   assert.equal(f.runtime.list(f.owner.sessionId).length, 2)
 })
@@ -338,8 +338,8 @@ test('completion coverage ignores verification acceptance text', async t => {
 
 test('create() requires every budget field through validatedBudget', async t => {
   const f = await setup(t)
-  assert.throws(() => f.runtime.create(f.owner, { title: 'Partial', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { maxDurationMs: 60000 } }), /Invalid budget maxTokens/)
-  const complete = f.runtime.create(f.owner, { title: 'Complete', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+  assert.throws(() => f.runtime.create(f.owner, { title: 'Partial', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { maxDurationMs: 60000 } }, { grantRoot: '/source', source: 'session' }), /Invalid budget maxTokens/)
+  const complete = f.runtime.create(f.owner, { title: 'Complete', objective: 'Fix', workspace: '/source', scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
   assert.deepEqual(complete.budget, budget)
 })
 

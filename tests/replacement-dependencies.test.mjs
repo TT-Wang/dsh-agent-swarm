@@ -24,7 +24,7 @@ async function fixture(t) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
   const owner = { sessionId: 'replacement-owner' }
   const mission = runtime.create(owner, { title: 'Repair existing plan', objective: 'Preserve accepted replacement obligations', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
   const integrator = await runtime.addMember(owner, mission.id, { name: 'Integrator', role: 'integration' })

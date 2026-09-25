@@ -7,7 +7,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-llm'
-import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization } from './authorization.ts'
+import { authorizeWorkspace, reauthorizeWorkspace, type WorkspaceAuthorization, type WorkspaceAuthorized } from './authorization.ts'
 import { AdmissionError, TaskGraphAdmissionError, type AdmissionDiagnostic } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
@@ -131,15 +131,14 @@ async function sessionHeader(ctx: Context, id: SessionId, signal: AbortSignal): 
   return header
 }
 
-async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined, launching = false): Promise<PlanInput> {
+/** The browser plan and, beside it in the order the runtime takes them, its workspace authorization. */
+async function planInput(ctx: Context, body: Record<string, unknown>, header: SessionHeader, signal: AbortSignal, grants: WorkspaceGrantSnapshot, dependencyDirs: readonly string[] | undefined, launching = false): Promise<[plan: PlanInput, authorization: WorkspaceAuthorized]> {
   const input = object(body.input)
   const authorization = await canonicalWorkspace(text(input, 'workspace'), header, grants)
   if (!authorization.ok) throw new RequestError(authorization.diagnostic)
-  // The host-derived root always overrides any client-supplied value, so a
-  // browser payload cannot widen its own authorization anchor.
-  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace, workspaceGrantRoot: authorization.grantRoot, workspaceAuthorizationSource: authorization.source }, { launch: launching, dependencyDirs }), true)
+  const plan = await exposed(() => validatePlan({ ...input, workspace: authorization.workspace }, { launch: launching, dependencyDirs }), true)
   await validateModels(ctx, header.id, plan.members, signal, launching)
-  return plan
+  return [plan, authorization]
 }
 
 /**
@@ -305,9 +304,9 @@ export function registerWebApi(ctx: Context, runtime: SwarmRuntime, options: Web
           return { ok: true, value: update }
         }
         case 'create-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.createDraft(actor, ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'update-draft':
-          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
+          return { ok: true, value: { draft: await exposed(async () => runtime.updateDraft(actor, text(body, 'draftId'), revision(body), ...await planInput(ctx, body, header, signal, grants, runtime.config.verificationDependencyDirs))) } }
         case 'discard-draft': {
           const draft = await exposed(() => runtime.discardDraft(actor, text(body, 'draftId'), revision(body)))
           return { ok: true, value: { draft } }

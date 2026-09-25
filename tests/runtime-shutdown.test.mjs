@@ -55,7 +55,7 @@ for (const scenario of [
     const { dir: directory, config, runtime, budget } = await shutdownRuntime(t)
     const owner = { sessionId: 'crash-owner' }
     const mission = runtime.create(owner, { title: 'Interrupted stop', objective: 'Recover task ownership',
-      workspace: directory, scope: ['src/'], acceptance: ['done'], budget })
+      workspace: directory, scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
     const previousOwner = await runtime.addMember(owner, mission.id, { name: 'previous', role: 'implementation' })
     const nextOwner = await runtime.addMember(owner, mission.id, { name: 'next', role: 'implementation' })
     const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Continue checkpoint' })
@@ -104,7 +104,7 @@ for (const stage of ['start', 'prepare']) {
     const { dir: directory, config, runtime, workers, budget } = await shutdownRuntime(t, { maxTasksPerMember: 100 })
     const owner = { sessionId: 'shutdown-owner' }
     const mission = runtime.create(owner, { title: 'Resume after shutdown', objective: 'Preserve unfinished work',
-      workspace: directory, scope: ['src/'], acceptance: ['done'], budget })
+      workspace: directory, scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
     const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
     const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Recover this dispatch' })
     workers.gate = { stage, entered: deferred(), release: deferred() }
@@ -136,7 +136,7 @@ test('pausing an in-flight worker start preserves membership for resume', async 
   const { dir: directory, runtime, workers, budget } = await shutdownRuntime(t, {}, { maxTasks: 10, maxExperiments: 1 })
   const owner = { sessionId: 'pause-owner' }
   const mission = runtime.create(owner, { title: 'Pause dispatch', objective: 'Resume the same worker', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Resume dispatch' })
   workers.gate = { stage: 'start', entered: deferred(), release: deferred() }
@@ -160,7 +160,7 @@ async function budgetFixture(t) {
   const { dir: directory, config, runtime, budget } = await shutdownRuntime(t, { tickMs: 10 }, { maxTasks: 10, maxExperiments: 1 })
   const owner = { sessionId: 'budget-owner' }
   const mission = runtime.create(owner, { title: 'Pause', objective: 'Resume the same attempt', workspace: directory, scope: ['src/'], acceptance: ['done'],
-    budget })
+    budget }, { grantRoot: directory, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'author', role: 'implementation' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Work', objective: 'Resume' })
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Paused task', objective: 'Resume', kind: 'implementation',

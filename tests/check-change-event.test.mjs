@@ -25,7 +25,7 @@ async function runtimeFixture(t) {
   })
   const owner = { sessionId: 'check-events-owner' }
   const mission = runtime.create(owner, { title: 'Check lineage', objective: 'Track declared checks', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['npm run typecheck'], ...extra })

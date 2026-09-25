@@ -24,7 +24,7 @@ async function fixture(t) {
   quiet()
   const owner = { sessionId: 'wake-identity-owner' }
   const mission = runtime.create(owner, { title: 'Wake identity', objective: 'Report each fact once',
-    workspace: directory, scope: ['**'], acceptance: ['facts reach the owner'], budget })
+    workspace: directory, scope: ['**'], acceptance: ['facts reach the owner'], budget }, { grantRoot: directory, source: 'session' })
   const rows = () => runtime.store.list('deliveries', mission.id).filter(row => row.to === 'owner')
   const emit = (content, { subject = 'task_delivery@0', reason = content, ...options } = {}) => {
     runtime.commit(mission.id, () => runtime.notify(mission.id, content, [subject], {

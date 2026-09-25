@@ -17,7 +17,7 @@ async function fixture(t, overrides = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100, ...overrides } })
   const owner = { sessionId: 'f8-owner' }
   const mission = runtime.create(owner, { title: 'F8', objective: 'Clamp the stored lease', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',

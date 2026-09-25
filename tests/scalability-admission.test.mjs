@@ -28,7 +28,7 @@ async function fixture(t, options = {}) {
 }
 
 async function mission(runtime, overrides = {}) {
-  return runtime.create(owner, { title: 'D8 admission', objective: 'prove admission control', workspace: '/inert-workspace', scope: ['**'], acceptance: ['admission is durable'], budget: { ...budget, ...overrides } })
+  return runtime.create(owner, { title: 'D8 admission', objective: 'prove admission control', workspace: '/inert-workspace', scope: ['**'], acceptance: ['admission is durable'], budget: { ...budget, ...overrides } }, { grantRoot: '/inert-workspace', source: 'session' })
 }
 
 async function addWorker(runtime, m, name) {

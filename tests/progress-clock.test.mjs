@@ -26,7 +26,7 @@ async function fixture(t, config = {}) {
   const { runtime, dir, budget } = made
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Progress clock', objective: 'Measure progress where it is made', workspace: dir, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Progress clock', objective: 'Measure progress where it is made', workspace: dir, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   // Every transaction the store opens, counted at the store boundary.
   const store = runtime.store, original = store.transaction.bind(store)
   const counter = { transactions: 0, failAfter: undefined }

@@ -40,7 +40,7 @@ async function fixture(t) {
     config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks: 100, maxExperiments: 2 } })
   await runtime.start()
   const owner = { sessionId: 'rework-owner' }
-  const mission = runtime.create(owner, { title: 'Rework', objective: 'Repair rejected work in place', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Rework', objective: 'Repair rejected work in place', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

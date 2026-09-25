@@ -177,7 +177,7 @@ test('admission refuses a declared check that names a host-absolute path outside
 
   // The runtime.propose admission point applies the same rule.
   const owner = { sessionId: 'check-integrity-owner' }
-  const mission = runtime.create(owner, { title: 'Checks', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Checks', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const propose = extra => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Implement change',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['node check.cjs'], ...extra })

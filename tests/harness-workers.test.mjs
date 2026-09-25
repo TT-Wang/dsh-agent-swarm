@@ -412,7 +412,7 @@ for (const wakeDuringRejection of [false, true]) {
       registerTools(f.ctx, runtime, budget)
       const owner = { sessionId: String(f.owner.agent.id) }
       const mission = runtime.create(owner, { title: 'Wait for evidence', objective: 'Park until useful peer input arrives',
-        workspace: f.mission.workspace, scope: ['**'], acceptance: ['resume on input'], budget })
+        workspace: f.mission.workspace, scope: ['**'], acceptance: ['resume on input'], budget }, { grantRoot: f.mission.workspace, source: 'session' })
       missionId = mission.id
       const member = await runtime.addMember(owner, mission.id, { name: 'waiting-reviewer', role: 'verification' })
       const worker = f.ctx.agents.get(SessionId(member.sessionId))
@@ -628,7 +628,7 @@ test('a silent generation keeps its attempt lease renewed through the runtime wi
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 2, maxDurationMs: 3600000, maxTasks: 100, maxExperiments: 10 } })
   try {
     const owner = { sessionId: String(f.owner.agent.id) }
-    const mission = runtime.create(owner, { title: 'Lease liveness', objective: 'Survive one silent generation', workspace: f.mission.workspace, scope: ['**'], acceptance: ['survives'], budget })
+    const mission = runtime.create(owner, { title: 'Lease liveness', objective: 'Survive one silent generation', workspace: f.mission.workspace, scope: ['**'], acceptance: ['survives'], budget }, { grantRoot: f.mission.workspace, source: 'session' })
     const member = await runtime.addMember(owner, mission.id, { name: 'silent-worker', role: 'implementation' })
     const actor = { sessionId: member.sessionId }
     const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep the attempt alive' })

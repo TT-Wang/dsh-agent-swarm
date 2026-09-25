@@ -64,7 +64,7 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   const f = await fixture(t, config, workers)
   await f.runtime.start()
   const owner = { sessionId: 'owner-decisions' }
-  const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => f.runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const actorFor = member => ({ sessionId: member.sessionId })
@@ -91,7 +91,7 @@ test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carri
   const limited = await fixture(t, { maxTasks: 1 })
   await limited.runtime.start()
   const owner = { sessionId: 'ceiling-owner' }
-  const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } })
+  const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } }, { grantRoot: limited.directory, source: 'session' })
   const stream = limited.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const builder = await limited.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
@@ -591,7 +591,7 @@ function referenceStallRoot(runtime, missionId, task, tasks, stallPassTimeoutMs)
 test('R16-A1: the waiting classifier is enumerated over every constructed board and resolves through the effective lineage', async t => {
   const f = await fixture(t)
   const owner = { sessionId: 'r16-a1' }
-  const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const now = Date.now()
   let seq = 0

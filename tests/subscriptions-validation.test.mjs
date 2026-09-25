@@ -12,7 +12,7 @@ async function fixture(t) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 6, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'subscription-owner' }
   const mission = runtime.create(owner, { title: 'Subscriptions', objective: 'Validate the runtime boundary', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   return { runtime, workers, owner, mission }
 }
 

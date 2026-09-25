@@ -32,7 +32,7 @@ async function setup(t, overrides = {}) {
   const { runtime, workers, budget } = await prepRuntime(t, 20)
   const owner = { sessionId: 'prep-owner' }
   const mission = runtime.create(owner, { title: 'Preparation', objective: 'Recover a preparation failure', workspace: '/source',
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await runtime.start()
@@ -167,7 +167,7 @@ test('the assignment of a task that never failed preparation embeds its stored r
   const { runtime, budget } = await prepRuntime(t, 60000)
   const owner = { sessionId: 'shape-owner' }
   const mission = runtime.create(owner, { title: 'Shape', objective: 'Assignment shape', workspace: '/source',
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const proposed = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Fix', objective: 'Fix', kind: 'implementation',

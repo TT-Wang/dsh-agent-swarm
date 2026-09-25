@@ -54,7 +54,7 @@ export async function runEnvelope({ workerCount }) {
     const mission = runtime.create(owner, {
       title: 'D8 load envelope', objective: 'measure admission control under concurrent claims', workspace: join(root, 'workspace'), scope: ['**'], acceptance: ['envelope printed'],
       budget: { maxTokens: 10000000, maxSteps: 100000, maxWorkers: workerCount, maxDurationMs: 3600000, maxTasks: workerCount * 2 + 8, maxExperiments: 0 },
-    })
+    }, { grantRoot: join(root, 'workspace'), source: 'session' })
     const stream = runtime.workstream(owner, mission.id, { title: 'load', objective: 'load' })
     const members = []
     for (let index = 0; index < workerCount; index++) members.push(await runtime.addMember(owner, mission.id, { name: `load-${index}`, role: 'worker', maxOutputTokens: 1000 }))

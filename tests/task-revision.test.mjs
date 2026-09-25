@@ -51,7 +51,7 @@ async function fixture(t) {
     budget: { maxTokens: 1_000_000, maxSteps: 1_000, maxWorkers: 2, maxDurationMs: 3_600_000, maxTasks: 20 } })
   const owner = { sessionId: 's5-owner' }
   const mission = runtime.create(owner, { title: 'Revisions', objective: 'Prove per-task compare-and-swap', workspace: directory,
-    scope: ['**'], acceptance: ['works'], budget })
+    scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   // The tick timer is deliberately not started: these tests drive writes directly

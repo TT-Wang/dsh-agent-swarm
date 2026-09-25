@@ -11,7 +11,7 @@ test('a live model stream renews the lease with output-token headroom; a stale a
   })
   await runtime.start()
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Live', objective: 'Keep the lease', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Live', objective: 'Keep the lease', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep the lease' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
   const actor = { sessionId: member.sessionId }

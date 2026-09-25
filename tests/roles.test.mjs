@@ -95,7 +95,7 @@ test('the runtime guard refuses exactly the owner-only surface the role projecti
   const f = await fixture(t, () => prompt('done'))
   await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   const owner = { sessionId: 'owner-session' }
-  const mission = f.runtime.create(owner, { title: 'Guard', objective: 'Guard the owner surface', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const mission = f.runtime.create(owner, { title: 'Guard', objective: 'Guard the owner surface', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
   const builder = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const guard = (tool) => f.workers.callbacks.guard(builder.id, tool)
   for (const tool of MANAGEMENT_TOOLS) {
@@ -124,7 +124,7 @@ test('an ordinary session sees the entry set and prompt; owning a request promot
   assert.match(systemTextOf(f.requests[0]), new RegExp(ENTRY_PROMPT.slice(0, 40).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   assert.doesNotMatch(systemTextOf(f.requests[0]), /owner protocol/)
   // A durable automatic request promotes the session synchronously on commit.
-  f.runtime.requestStart({ sessionId: 'owner-session' }, { commandId: 'c1', goal: 'Do it', workspace: f.source })
+  f.runtime.requestStart({ sessionId: 'owner-session' }, { commandId: 'c1', goal: 'Do it', workspace: f.source }, { grantRoot: f.source, source: 'session' })
   assert.deepEqual(visible(), SWARM_TOOLS.filter(name => !MEMBER_TOOLS.includes(name)).sort())
   owner.agent.followup({ id: 'm2', role: 'user', content: [{ type: 'text', text: 'plan' }], source: { kind: 'user' } })
   await owner.agent.whenIdle()
@@ -143,7 +143,7 @@ test('failed request history keeps owner tools with a short prompt, and a new st
   const f = await fixture(t, () => prompt('ok'))
   const owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   const actor = { sessionId: 'owner-session' }
-  const start = f.runtime.requestStart(actor, { commandId: 'failed-start', goal: 'Do it', workspace: f.source })
+  const start = f.runtime.requestStart(actor, { commandId: 'failed-start', goal: 'Do it', workspace: f.source }, { grantRoot: f.source, source: 'session' })
   const failed = f.runtime.failStart(actor, start.id, 'Snapshot unavailable')
   // Settled/legacy history has no undelivered recovery notice.
   delete failed.recoveryNoticePending
@@ -156,7 +156,7 @@ test('failed request history keeps owner tools with a short prompt, and a new st
   assert.ok(systemTextOf(f.requests[0]).includes(HISTORICAL_OWNER_PROMPT))
   assert.doesNotMatch(systemTextOf(f.requests[0]), /Agent Swarm owner protocol/)
   assert.ok(HISTORICAL_OWNER_PROMPT.length < 800 && HISTORICAL_OWNER_PROMPT.length < OWNER_PROMPT.length / 4)
-  f.runtime.requestStart(actor, { commandId: 'new-start', goal: 'Try another task', workspace: f.source })
+  f.runtime.requestStart(actor, { commandId: 'new-start', goal: 'Try another task', workspace: f.source }, { grantRoot: f.source, source: 'session' })
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'promotion precedes the next planning turn')
   owner.agent.followup({ id: 'plan-again', role: 'user', content: [{ type: 'text', text: 'Plan the new task.' }], source: { kind: 'user' } })
   await owner.agent.whenIdle()
@@ -176,7 +176,7 @@ for (const ending of ['error', 'aborted']) test(`planning recovery retains the o
   })
   owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   const actor = { sessionId: 'owner-session' }
-  const request = f.runtime.requestStart(actor, { commandId: 'recover-start', goal: 'Do it', workspace: f.source })
+  const request = f.runtime.requestStart(actor, { commandId: 'recover-start', goal: 'Do it', workspace: f.source }, { grantRoot: f.source, source: 'session' })
   f.runtime.failStart(actor, request.id, 'Planning deadline expired', request.planningEpoch)
   assert.equal(f.scoper.roleOf(owner.agent), 'owner', 'durable recovery pending needs the full owner protocol')
   const message = { id: `swarm-start:${request.id}:1:failure`, role: 'user', source: { kind: 'swarm-start', form: 'notice', summary: 'Planning needs recovery', requestId: request.id, commandId: request.commandId, planningEpoch: 1, phase: 'failure' }, content: [{ type: 'text', text: 'Inspect the failed request and decide retry or stop.' }] }
@@ -209,7 +209,7 @@ for (const ending of ['error', 'aborted']) test(`planning recovery retains the o
 test('all nonterminal missions and unresolved owner questions retain the full owner role', async t => {
   const f = await fixture(t, () => prompt('ok'))
   const owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
-  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Lifecycle', objective: 'Keep obligations visible', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Lifecycle', objective: 'Keep obligations visible', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
   // These are durable projection fixtures, not mission-completion/receipt tests.
   for (const status of ['active', 'staged', 'paused', 'blocked']) {
     f.runtime.commit(mission.id, () => f.runtime.store.put('missions', { ...mission, status }))
@@ -244,7 +244,7 @@ for (const ending of ['error', 'aborted']) test(`final owner notices retain thei
     return prompt('The final result is ready.')
   })
   owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
-  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Final delivery', objective: 'Report the result', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const mission = f.runtime.create({ sessionId: 'owner-session' }, { title: 'Final delivery', objective: 'Report the result', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
   // Mark transport accepted to keep the background outbox out of this focused
   // host-intake test. A real adapter delivery below writes the owner session log.
   const notice = { id: 'final-result', missionId: mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'Completed: report the final result.', createdAt: Date.now(), deliveredAt: Date.now(), notice: { class: 'decision', dedupKey: 'legacy-completion', sentAt: Date.now(), queuedAt: Date.now() } }
@@ -296,7 +296,7 @@ test('workers see only member tools and the member protocol, and each tool resul
   f.ctx.tools.register(defineContentToolFixture({ name: 'probe', description: 'Probe', parameters: {}, execute: async () => [{ type: 'text', text: 'probe executed' }] }))
   const owner = await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
   const actor = { sessionId: 'owner-session' }
-  const mission = f.runtime.create(actor, { title: 'Roles', objective: 'Scope tools by role', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const mission = f.runtime.create(actor, { title: 'Roles', objective: 'Scope tools by role', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
   missionId = mission.id
   const stream = f.runtime.workstream(actor, missionId, { title: 'Main', objective: 'Main' })
   const builder = await f.runtime.addMember(actor, missionId, { name: 'Builder', role: 'implementation' })
@@ -351,7 +351,7 @@ test('boundary compaction uses the native engine only when idle and over the pro
     f.ctx.provide('compaction', { async compactNow(agent, signal) { compacted.push({ id: String(agent.id), aborted: signal.aborted }); return null } })
     const actor = { sessionId: 'owner-session' }
     await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
-    const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Trim history at boundaries', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+    const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Trim history at boundaries', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
     const builder = await f.runtime.addMember(actor, mission.id, { name: 'Builder', role: 'implementation' })
     const worker = f.ctx.agents.get(SessionId(builder.sessionId))
     f.workers.compactAtBoundary(builder.id)
@@ -391,7 +391,7 @@ test('a boundary requested mid-turn compacts at the next idle, before a re-woken
   } })
   const actor = { sessionId: 'owner-session' }
   await f.ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: f.source }, agentOptions: { provider: 'swarm-test', model: 'scripted' } })
-  const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Compact at the next idle', workspace: f.source, scope: ['**'], acceptance: ['done'], budget })
+  const mission = f.runtime.create(actor, { title: 'Compaction', objective: 'Compact at the next idle', workspace: f.source, scope: ['**'], acceptance: ['done'], budget }, { grantRoot: f.source, source: 'session' })
   const builder = await f.runtime.addMember(actor, mission.id, { name: 'Builder', role: 'implementation' })
   const worker = f.ctx.agents.get(SessionId(builder.sessionId))
   await f.workers.deliver(builder, { id: 'd1', missionId: mission.id, from: 'owner', to: builder.id, kind: 'question', content: 'Hold.', createdAt: 1 })

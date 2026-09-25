@@ -279,7 +279,7 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
   const runtime = new SwarmRuntime(runtimeConfig(dir, config, clock), workers)
   await runtime.start()
   const owner = { sessionId: 'fault-owner' }
-  const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } })
+  const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: workspace ?? dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Faults', objective: 'Exercise the fault path' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })

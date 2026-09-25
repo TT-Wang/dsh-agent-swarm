@@ -159,7 +159,7 @@ async function missionFixture(t, options = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
   const owner = { sessionId: 'envelope-owner' }
-  const mission = runtime.create(owner, { title: 'Envelope', objective: 'State the check environment', workspace: base.source, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Envelope', objective: 'State the check environment', workspace: base.source, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: base.source, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewers = []

@@ -35,7 +35,7 @@ async function fixture(t) {
   return { directory, config, workers, runtime, owner, requestInput, input: plan(directory) }
 }
 async function launch(f, input = f.input) {
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const snapshot = await f.runtime.startPlan(f.owner, request.id, input)
   return { request, snapshot }
 }
@@ -46,7 +46,7 @@ test('automatic default names persist in the plan and roster through a failed la
   delete f.input.members[1].name
   let fail = true
   f.workers.onStart = async spec => { if (spec.member.name === 'Alan' && fail) throw new Error('Temporary named worker failure') }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Temporary named worker failure/)
   const failed = f.runtime.starts(f.owner)[0]
   const draft = f.runtime.store.get('drafts', failed.draftId)
@@ -98,26 +98,26 @@ async function accept(f, snapshot, { evidence = false } = {}) {
 
 test('automatic request admission is durable, owner-scoped, bounded and command-idempotent', async t => {
   const f = await fixture(t)
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   assert.equal(request.status, 'planning')
   assert.equal(request.budget, undefined, 'resource decisions belong to the planning primary agent')
   assert.equal(f.workers.starts.length, 0)
   assert.equal(f.runtime.drafts(f.owner).length, 0)
-  const replay = f.runtime.requestStart(f.owner, { ...f.requestInput, budget: { ...budget, maxTokens: 999999 } })
+  const replay = f.runtime.requestStart(f.owner, { ...f.requestInput, budget: { ...budget, maxTokens: 999999 } }, { grantRoot: f.requestInput.workspace, source: 'session' })
   assert.equal(replay.id, request.id)
   assert.equal(replay.budget, undefined, 'replaying command admission cannot install a fixed allowance')
   assert.deepEqual(f.runtime.starts({ sessionId: 'stranger' }), [])
-  assert.throws(() => f.runtime.requestStart(f.owner, { ...f.requestInput, goal: 'different' }), /identity conflicts/)
-  assert.throws(() => f.runtime.requestStart(f.owner, { ...f.requestInput, commandId: 'command-2' }), /in progress/)
-  assert.throws(() => f.runtime.requestStart({ sessionId: 'other' }, { ...f.requestInput, goal: 'x'.repeat(10001) }), /exceeds/)
-  assert.throws(() => f.runtime.requestStart({ sessionId: 'other' }, { ...f.requestInput, budget: { ...budget, maxWorkers: undefined } }), /Invalid budget/)
+  assert.throws(() => f.runtime.requestStart(f.owner, { ...f.requestInput, goal: 'different' }, { grantRoot: f.requestInput.workspace, source: 'session' }), /identity conflicts/)
+  assert.throws(() => f.runtime.requestStart(f.owner, { ...f.requestInput, commandId: 'command-2' }, { grantRoot: f.requestInput.workspace, source: 'session' }), /in progress/)
+  assert.throws(() => f.runtime.requestStart({ sessionId: 'other' }, { ...f.requestInput, goal: 'x'.repeat(10001) }, { grantRoot: f.requestInput.workspace, source: 'session' }), /exceeds/)
+  assert.throws(() => f.runtime.requestStart({ sessionId: 'other' }, { ...f.requestInput, budget: { ...budget, maxWorkers: undefined } }, { grantRoot: f.requestInput.workspace, source: 'session' }), /Invalid budget/)
   const abort = new AbortController(); abort.abort(new Error('cancelled'))
-  assert.throws(() => f.runtime.requestStart({ sessionId: 'other', signal: abort.signal }, f.requestInput), /cancelled/)
+  assert.throws(() => f.runtime.requestStart({ sessionId: 'other', signal: abort.signal }, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' }), /cancelled/)
 })
 
 test('concurrent plan delivery launches once with the saved workspace and primary-agent budget', async t => {
   const f = await fixture(t)
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const input = { ...f.input, workspace: '/not-authorized', budget: { ...budget, maxTokens: 999999 } }
   const [first, duplicate] = await Promise.all([f.runtime.startPlan(f.owner, request.id, input), f.runtime.startPlan(f.owner, request.id, input)])
   assert.equal(first.mission.id, duplicate.mission.id)
@@ -130,7 +130,7 @@ test('concurrent plan delivery launches once with the saved workspace and primar
   assert.equal(f.runtime.starts(f.owner)[0].status, 'running')
   assert.equal(first.members.find(member => member.name === 'Builder').maxOutputTokens, 4096)
   assert.equal(first.members.find(member => member.name === 'Reviewer').maxOutputTokens, 2048)
-  assert.throws(() => f.runtime.requestStart({ sessionId: first.members[0].sessionId }, f.requestInput), /Workers cannot/)
+  assert.throws(() => f.runtime.requestStart({ sessionId: first.members[0].sessionId }, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' }), /Workers cannot/)
   await assert.rejects(f.runtime.startPlan({ sessionId: 'stranger' }, request.id, input), /not owned/)
   assert.match(f.workers.callbacks.guard(first.members[0].id, 'swarm_launch'), /bypass mission authority/)
 })
@@ -151,7 +151,7 @@ test('automatic admission rejects incomplete topology before creating workers or
   ]) {
     const f = await fixture(t)
     mutate(f.input)
-    const request = f.runtime.requestStart(f.owner, f.requestInput)
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
     await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Automatic/)
     assert.equal(f.workers.prepared.length, 0)
     assert.equal(f.runtime.drafts(f.owner).length, 0)
@@ -164,7 +164,7 @@ test('automatic implementation plans require a final integration dependency and 
   const implementation = { ...f.input.tasks[0], key: 'implement', kind: 'implementation' }
   const implementationReview = { ...f.input.tasks[1], key: 'implementation-review', reviewOf: 'implement' }
   f.input.tasks.unshift(implementation, implementationReview)
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /integration task must depend on implementation implement/)
   f.input.tasks.find(task => task.key === 'deliver').dependencies = ['implement']
   const snapshot = await f.runtime.startPlan(f.owner, request.id, f.input)
@@ -177,7 +177,7 @@ test('missing acceptance diagnostics identify the exact strings and a corrected 
   const exact = 'Keep the existing response shape, including empty results.'
   f.input.acceptance.push(exact)
   f.input.tasks[0].acceptance = ['works', 'Keep compatible responses']
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), error => {
     assert.ok(error.message.includes(JSON.stringify([exact])))
     assert.match(error.message, /Copy each missing string into the acceptance array/)
@@ -193,7 +193,7 @@ test('failed assembly and retries retain one deterministic plan and worker roste
   const f = await fixture(t)
   let fail = true
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer' && fail) throw new Error('Temporary launch failure') }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /Temporary launch failure/)
   const failed = f.runtime.starts(f.owner)[0]
   assert.equal(failed.status, 'failed')
@@ -210,7 +210,7 @@ test('a reentrant failure while assembly waits fences activation and permits sav
   const f = await fixture(t)
   const entered = deferred(), gate = deferred()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const launch = f.runtime.startPlan(f.owner, request.id, f.input)
   const failed = assert.rejects(launch, /Planning cancelled/)
   await entered.promise
@@ -230,7 +230,7 @@ test('caller cancellation and explicit mission stop cannot revive a partially as
   const f = await fixture(t)
   const entered = deferred(), gate = deferred(), abort = new AbortController()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const launch = f.runtime.startPlan({ ...f.owner, signal: abort.signal }, request.id, f.input)
   const rejected = assert.rejects(launch, /cancel assembly/)
   await entered.promise
@@ -491,7 +491,7 @@ test('zero experiment allowance is valid and updates cannot erase admitted exper
 
 test('manual missions retain explicit completion behavior', async t => {
   const f = await fixture(t)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const snapshot = await f.runtime.launchDraft(f.owner, draft.id, draft.revision)
   await accept(f, snapshot)
   await new Promise(resolve => setTimeout(resolve, 30))
@@ -532,9 +532,9 @@ test('failed checks and unresolved evidence challenges cannot produce automatic 
 
 test('restart recovers interrupted planning and assembly while retaining launched mission identity', async t => {
   const f = await fixture(t)
-  const planning = f.runtime.requestStart(f.owner, f.requestInput)
+  const planning = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const other = { sessionId: 'other-owner' }
-  const assembling = f.runtime.requestStart(other, { ...f.requestInput, commandId: 'command-2' })
+  const assembling = f.runtime.requestStart(other, { ...f.requestInput, commandId: 'command-2' }, { grantRoot: f.requestInput.workspace, source: 'session' })
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') throw new Error('Interrupted assembly') }
   await assert.rejects(f.runtime.startPlan(other, assembling.id, f.input), /Interrupted assembly/)
   const journal = f.runtime.starts(other)[0]
@@ -546,7 +546,7 @@ test('restart recovers interrupted planning and assembly while retaining launche
     await recovered.start()
     assert.equal(recovered.starts(f.owner)[0].status, 'failed')
     assert.match(recovered.starts(f.owner)[0].error, /restarted/)
-    assert.equal(recovered.requestStart(f.owner, f.requestInput).id, planning.id)
+    assert.equal(recovered.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' }).id, planning.id)
     assert.equal(recovered.starts(other)[0].status, 'failed')
     assert.equal(workers.delivered.length, 0)
     const snapshot = await recovered.startPlan(other, assembling.id, f.input)
@@ -580,7 +580,7 @@ test('restart trusts an already activated mission when the last launch acknowled
 test('prelaunch deadline releases the session without a mission and queues durable owner recovery', async t => {
   const f = await fixture(t)
   await f.runtime.start()
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   request.planningDeadlineAt = Date.now() - 1
   f.runtime.store.transaction(() => f.runtime.store.put('starts', request))
   await eventually(() => f.runtime.starts(f.owner)[0].status === 'failed', 'the start fails', 2500)
@@ -589,7 +589,7 @@ test('prelaunch deadline releases the session without a mission and queues durab
   assert.equal(failed.recoveryNoticePending, true)
   assert.equal(f.runtime.list(f.owner.sessionId).length, 0)
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /stale|cancelled/)
-  const next = f.runtime.requestStart(f.owner, { ...f.requestInput, commandId: 'new-request' })
+  const next = f.runtime.requestStart(f.owner, { ...f.requestInput, commandId: 'new-request' }, { grantRoot: f.requestInput.workspace, source: 'session' })
   assert.equal(next.status, 'planning')
   assert.throws(() => f.runtime.controlStart(f.owner, request.id, 'retry', 'resume'), /in progress/)
   f.runtime.controlStart(f.owner, next.id, 'stop', 'Use the saved snapshot instead')
@@ -611,7 +611,7 @@ test('stop releases an uncooperative snapshot and late completion cannot overwri
   const entered = deferred(), gate = deferred()
   const baseline = { sourceHead: 'head', snapshotCommit: 'snapshot', planningWorkspace: '/snapshot' }
   f.workers.prepareBaseline = async () => { entered.resolve(); await gate.promise; return baseline }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const prepare = f.runtime.prepareStart(f.owner, request.id)
   const rejected = assert.rejects(prepare, /user stop/)
   await entered.promise
@@ -630,7 +630,7 @@ test('planning retry preserves frozen baseline and usage and extension is an own
   const f = await fixture(t)
   const baseline = { sourceHead: 'head', snapshotCommit: 'snapshot', planningWorkspace: '/snapshot' }
   f.workers.prepareBaseline = async () => baseline
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const ready = await f.runtime.prepareStart(f.owner, request.id)
   ready.ownerUsage = { inputTokens: 300, outputTokens: 40, cacheReadTokens: 20, cacheWriteTokens: 0 }
   f.runtime.store.transaction(() => f.runtime.store.put('starts', ready))
@@ -653,7 +653,7 @@ test('an expired launch settles before an uncooperative adapter and cannot resur
   await f.runtime.start()
   const entered = deferred(), gate = deferred()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const pending = f.runtime.startPlan(f.owner, request.id, f.input)
   const rejected = assert.rejects(pending, /deadline/)
   await entered.promise
@@ -686,7 +686,7 @@ test('retry can activate the saved draft while its cancelled adapter call is sti
   f.config.stallPassTimeoutMs = 25
   const entered = deferred(), gate = deferred()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   const original = f.runtime.startPlan(f.owner, request.id, f.input)
   const rejected = assert.rejects(original, /cancelled hung launch/)
   await entered.promise
@@ -708,7 +708,7 @@ test('retry can activate the saved draft while its cancelled adapter call is sti
 test('stopping partially assembled planning also retires its staged mission', async t => {
   const f = await fixture(t)
   f.workers.onStart = async () => { throw new Error('adapter unavailable') }
-  const request = f.runtime.requestStart(f.owner, f.requestInput)
+  const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /adapter unavailable/)
   const failed = f.runtime.starts(f.owner)[0]
   assert.equal(f.runtime.store.get('missions', failed.missionId).status, 'staged')
@@ -723,7 +723,7 @@ test('late failure from a superseded startup cannot stop the successfully retrie
     f.config.stallPassTimeoutMs = 25
     const entered = deferred(), gate = Promise.withResolvers()
     f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-    const request = f.runtime.requestStart(f.owner, f.requestInput)
+    const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })
     const original = f.runtime.startPlan(f.owner, request.id, f.input)
     const rejected = assert.rejects(original, /cancel|interrupted|old provider/)
     await entered.promise

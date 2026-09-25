@@ -54,7 +54,7 @@ async function setup(t, { gamma = false, tickMs = 20 } = {}) {
   })
   const owner = { sessionId: 'start-owner' }
   const mission = runtime.create(owner, { title: 'Start failure', objective: 'Recover a worker start failure', workspace: '/source',
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const alpha = await runtime.addMember(owner, mission.id, { name: 'Alpha', role: 'implementation' })
   const beta = await runtime.addMember(owner, mission.id, { name: 'Beta', role: 'implementation' })

@@ -71,7 +71,7 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   })
   await runtime.start()
   const owner = { sessionId: 'silence-bounds' }
-  const mission = runtime.create(owner, { title: 'Silence bounds', objective: 'Bound the release and the report', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Silence bounds', objective: 'Bound the release and the report', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const actorFor = member => ({ sessionId: member.sessionId })

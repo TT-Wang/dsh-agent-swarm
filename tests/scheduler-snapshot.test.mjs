@@ -39,7 +39,7 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t)
   await runtime.start()
   const owner = { sessionId: 's1-owner' }
-  const mission = runtime.create(owner, { title: 'S1', objective: 'No stale snapshot write', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'S1', objective: 'No stale snapshot write', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5000 })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation', maxOutputTokens: 5000 })
@@ -101,7 +101,7 @@ test('S1r: a live operation whose lease already expired is renewed, not expired,
   const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t)
   await runtime.start()
   const owner = { sessionId: 's1r-owner' }
-  const mission = runtime.create(owner, { title: 'S1r', objective: 'Renew before expiring', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'S1r', objective: 'Renew before expiring', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
   const actor = { sessionId: member.sessionId }

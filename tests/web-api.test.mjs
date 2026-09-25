@@ -20,6 +20,7 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import LlmRuntime, { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { ObserveDetailRefusedError } from '../lib/runtime.js'
 import { registerWebApi } from '../lib/web-api.js'
+import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { PolicyError } from '../lib/policy-error.js'
 import { errorTypeFor } from '../lib/trace.js'
 import { AdmissionError, TaskGraphAdmissionError } from '../lib/admission.js'
@@ -33,13 +34,14 @@ class Workers extends FakeWorkers {
   async prepareWorkspace(mission, id) { this.workspaces.push(id); return path.join(mission.workspace, id) }
   async start(spec) { this.starts.push(spec.member.id) }
 }
-async function fixture(t) {
+/** `grants` wires the runtime and the web API to one loaded snapshot, as src/index.ts does. */
+async function fixture(t, { grants } = {}) {
   // Registered before makeRuntime's cleanup, so the runtime and then the host
   // composition are disposed before the temp dir goes.
   const ctx = new Context()
   let runtime
   t.after(async () => { await runtime?.dispose(); await ctx.fiber.dispose() })
-  const made = await makeRuntime(t, { workers: new Workers(), config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined } })
+  const made = await makeRuntime(t, { workers: new Workers(), config: { tickMs: 60000, maxMessageChars: 10000, maxEvents: 100, checkTimeoutMs: undefined, grants } })
   const { dir: directory, workers } = made
   const workspace = path.join(directory, 'workspace')
   await mkdir(workspace)
@@ -98,7 +100,7 @@ async function fixture(t) {
   } })
   await ownerFiber
   ctx.sessions.create(SessionId('other-owner'), { meta: { cwd: workspace } })
-  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192 }) } })
+  const bridge = ctx.plugin({ name: 'test-swarm-web', inject: ['connection', 'webServer', 'sessions', 'sessionPersistence', 'agents', 'llm'], apply(scope) { registerWebApi(scope, runtime, { defaultBudget: budget, maxPayloadBytes: 8192, grants }) } })
   await bridge
   const port = ctx.webServer.port
   const authority = `127.0.0.1:${port}`
@@ -213,10 +215,45 @@ test('draft API persists editable plans, enforces revision ownership and canonic
   assert.deepEqual(outsider.result.value.drafts, [])
 })
 
+/**
+ * With the configured roots loaded, as the plugin always loads them, the
+ * browser's authorization used to ride inside the plan, which validation
+ * rebuilt without it: every save of a session-workspace draft failed with an
+ * internal error, and a session cwd inside a root was relabelled a grant. The
+ * authorization now travels beside the plan, and the launch records the one
+ * the draft was saved with.
+ */
+test('browser drafts under the configured roots save, edit and launch with their own authorization', async t => {
+  // One snapshot, filled once the fixture's directories exist; the runtime and the API read it live.
+  const grants = { grants: [], loadedAt: Date.now(), unresolved: [] }
+  const f = await fixture(t, { grants })
+  const granted = path.join(f.directory, 'granted'), project = path.join(granted, 'project')
+  await mkdir(project, { recursive: true })
+  grants.grants.push(...(await loadWorkspaceGrants([{ path: granted }])).grants)
+  const saveEditLaunch = async (input, expected) => {
+    const created = await f.rpc('create-draft', { sessionId: f.ownerId, input })
+    assert.equal(created.result.ok, true, created.text)
+    const { id, revision } = created.result.value.draft
+    const updated = await f.rpc('update-draft', { sessionId: f.ownerId, draftId: id, revision, input: { ...input, title: 'Edited under the roots' } })
+    assert.equal(updated.result.ok, true, updated.text)
+    const draft = updated.result.value.draft
+    assert.deepEqual({ source: draft.workspaceAuthorizationSource, root: draft.workspaceGrantRoot }, expected, 'the draft records its authorization beside the plan')
+    const launched = await f.rpc('launch-draft', { sessionId: f.ownerId, draftId: draft.id, revision: draft.revision })
+    assert.equal(launched.result.ok, true, launched.text)
+    const { mission } = launched.result.value.snapshot
+    assert.deepEqual({ source: mission.workspaceAuthorizationSource, root: mission.workspaceGrantRoot }, expected, 'the launch records the authorization the draft was saved with')
+  }
+  await saveEditLaunch(f.input, { source: 'session', root: f.workspace })
+  await saveEditLaunch({ ...f.input, workspace: project }, { source: 'grant', root: granted })
+  // A root that also contains the session cwd never turns the session's own workspace into a grant.
+  grants.grants.push(...(await loadWorkspaceGrants([{ path: f.directory }])).grants)
+  await saveEditLaunch(f.input, { source: 'session', root: f.workspace })
+})
+
 test('member state is visible without granting owner controls, and unrelated sessions see no missions', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
   const state = await f.rpc('state', { sessionId: member.sessionId })
@@ -234,7 +271,7 @@ test('member state is visible without granting owner controls, and unrelated ses
 test('delivery routes require owner, completed acceptance and the exact session workspace', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
   let writes = 0
@@ -284,7 +321,7 @@ test('delivery routes require owner, completed acceptance and the exact session 
 test('a stopped historical member session stays readonly even when active mission views are absent', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   f.workers.start = async () => { throw new Error('Worker failed to start') }
   await assert.rejects(f.runtime.addMember(owner, mission.id, { name: 'Stopped worker', role: 'implementation' }), /Worker failed to start/)
   const member = f.runtime.snapshot(owner, mission.id).members[0]
@@ -397,7 +434,7 @@ test('unexpected web API failures are sanitized while validation messages stay a
 test('replacement cycles return an actionable bad-request through native RPC without admitting work', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Graph', objective: 'Repair dependencies' })
   const input = { workstreamId: stream.id, title: 'Original', objective: 'Implement', kind: 'implementation', scope: ['src/'], acceptance: ['works'], outputs: [], checks: ['test -d .'] }
   const original = f.runtime.propose(owner, mission.id, input)
@@ -429,7 +466,7 @@ test('replacement cycles return an actionable bad-request through native RPC wit
 test('admission refusals are typed policy errors carrying their diagnostics, with the legacy bytes', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, { ...f.input, scope: ['src/'] })
+  const mission = f.runtime.create(owner, { ...f.input, scope: ['src/'] }, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   let refused
   try { f.runtime.propose(owner, mission.id, { workstreamId: stream.id, title: 'Wide', objective: 'Edit docs', kind: 'research', scope: ['docs/'], acceptance: ['works'] }) } catch (error) { refused = error }
@@ -479,7 +516,7 @@ test('plan refusals reach the browser by type at the validator and at the launch
 test('mission authority, lifecycle and budget refusals reach the browser by their policy code, with the legacy wording', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, { ...f.input, budget: { ...budget, maxWorkers: 1 } })
+  const mission = f.runtime.create(owner, { ...f.input, budget: { ...budget, maxWorkers: 1 } }, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   const propose = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   await f.runtime.addMember(owner, mission.id, { name: 'Worker', role: 'implementation' })
@@ -508,7 +545,7 @@ test('mission authority, lifecycle and budget refusals reach the browser by thei
 test('task admission refusals reach the browser by their policy code, with the legacy wording', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   const research = { workstreamId: stream.id, title: 'Research', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   const pending = f.runtime.propose(owner, mission.id, research)
@@ -542,7 +579,7 @@ test('task admission refusals reach the browser by their policy code, with the l
 test('an automatic mission refuses an unbounded propose RPC as a typed bad-request, not an internal error', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   f.runtime.store.transaction(() => f.runtime.store.put('starts', { id: 'start_typed', ownerSessionId: f.ownerId,
     commandId: 'typed', goal: 'g', workspace: f.workspace, status: 'running', createdAt: Date.now(), updatedAt: Date.now(), missionId: mission.id }))
@@ -562,7 +599,7 @@ test('an automatic mission refuses an unbounded propose RPC as a typed bad-reque
 
 test('add-member validates subscriptions as a string array before admitting a worker', async t => {
   const f = await fixture(t)
-  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
   // M9(c): a bare string would be stored and make topic matching substring-based.
   const rejected = await f.rpc('add-member', { sessionId: f.ownerId, missionId: mission.id,
     input: { name: 'Worker', role: 'implementation', subscriptions: 'topic-a' } })
@@ -582,7 +619,7 @@ test('add-member validates subscriptions as a string array before admitting a wo
 test('worker history pages retain message source groups and cold sessions without activating workers', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { name: 'History worker', role: 'research' })
   let worker
   const workerScope = f.ctx.plugin({ name: 'history-worker-fixture', inject: ['agents'], async apply(scope) {
@@ -631,7 +668,7 @@ test('watch returns only authorized changed missions and includes eventless stat
   const f = await fixture(t)
   const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
   assert.equal(typeof initial.revision, 'number')
-  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const first = (await f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 0 })).result.value
   assert.equal(first.kind, 'delta')
   assert.deepEqual(first.missionIds, [mission.id])
@@ -675,7 +712,7 @@ test('native watch wakes on commit and releases observers when its plugin unload
   const initial = (await f.rpc('state', { sessionId: f.ownerId })).result.value
   const pending = f.rpc('watch', { sessionId: f.ownerId, afterRevision: initial.revision, waitMs: 1000 })
   await new Promise(resolve => setTimeout(resolve, 25))
-  f.runtime.create({ sessionId: f.ownerId }, f.input)
+  f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const response = await pending
   assert.equal(response.result.value.kind, 'delta')
   const unloading = f.rpc('watch', { sessionId: f.ownerId, afterRevision: response.result.value.revision, waitMs: 1000 })
@@ -688,7 +725,7 @@ test('native watch wakes on commit and releases observers when its plugin unload
 
 test('watch removes mission data when a worker loses read membership', async t => {
   const f = await fixture(t)
-  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember({ sessionId: f.ownerId }, mission.id, { name: 'Worker', role: 'Builder' })
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
   const initial = (await f.rpc('state', { sessionId: member.sessionId })).result.value
@@ -741,7 +778,7 @@ test('watch wakes for native owner lifecycle without inventing a swarm revision'
 test('web request controls recover and stop prelaunch work with native session authorization', async t => {
   const f = await fixture(t)
   const actor = { sessionId: f.ownerId }
-  const request = f.runtime.requestStart(actor, { commandId: 'web-planning', workspace: f.workspace, goal: 'Inspect this repository' })
+  const request = f.runtime.requestStart(actor, { commandId: 'web-planning', workspace: f.workspace, goal: 'Inspect this repository' }, { grantRoot: f.workspace, source: 'session' })
   f.runtime.failStart(actor, request.id, 'Interrupted planning')
   const denied = await f.rpc('control', { sessionId: 'other-owner', requestId: request.id, action: 'retry', reason: 'Retry' })
   assert.equal(denied.result.ok, false)
@@ -850,7 +887,7 @@ test('launch refusals reach the browser by their policy code, with the legacy wo
 test('a shutting-down runtime refuses control RPCs with a typed conflict', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   f.runtime.shuttingDown = true
   const refused = await f.rpc('cancel', { sessionId: f.ownerId, missionId: mission.id, taskId: 'any', reason: 'x' })
   assert.equal(refused.result.error.code, 'bad-request', refused.text)
@@ -860,7 +897,7 @@ test('a shutting-down runtime refuses control RPCs with a typed conflict', async
 
 test('mission owner refusals carry authorization even when the wording has no legacy match', async t => {
   const f = await fixture(t)
-  const mission = f.runtime.create({ sessionId: f.ownerId }, { ...f.input, workspace: f.workspace })
+  const mission = f.runtime.create({ sessionId: f.ownerId }, { ...f.input, workspace: f.workspace }, { grantRoot: f.workspace, source: 'session' })
   const member = await f.runtime.addMember({ sessionId: f.ownerId }, mission.id, { role: 'implementation' })
   let refused
   try { f.runtime.control({ sessionId: member.sessionId }, mission.id, 'pause', 'Pause') } catch (error) { refused = error }
@@ -873,7 +910,7 @@ test('mission owner refusals carry authorization even when the wording has no le
 test('task and scope controls distinguish owner lifecycle conflicts from member authorization refusals', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, { ...f.input, workspace: f.workspace })
+  const mission = f.runtime.create(owner, { ...f.input, workspace: f.workspace }, { grantRoot: f.workspace, source: 'session' })
   const member = await f.runtime.addMember(owner, mission.id, { role: 'implementation' })
   const actor = { sessionId: member.sessionId }
   const taskPayload = { missionId: mission.id, taskId: 'guarded-task', action: 'resume', reason: 'Resume saved work' }

@@ -110,7 +110,7 @@ test('S2: one never-settling adapter deliver cannot starve a notice for another 
     const other = f.runtime.create(f.owner, {
       title: 'Other mission', objective: 'Prove the pump is not globally locked', workspace: f.dir, scope: ['**'],
       acceptance: f.mission.acceptance, budget: { ...budget, maxTasks: 10 },
-    })
+    }, { grantRoot: f.dir, source: 'session' })
     const hung = { id: 'msg_s2b_hung', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'notice whose delivery never settles', createdAt: Date.now() }
     workers.hung.add(hung.id)
     f.runtime.store.transaction(() => f.runtime.store.put('deliveries', hung))

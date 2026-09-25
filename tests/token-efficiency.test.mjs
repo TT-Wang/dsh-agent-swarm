@@ -15,7 +15,7 @@ class ControlledWorkers extends FakeWorkers {
 async function manual(t, overrides = {}, acceptance = ['works']) {
   const { runtime, workers } = await makeRuntime(t, { workers: new ControlledWorkers(), config: { maxEvents: 100, checkTimeoutMs: undefined } })
   const owner = { sessionId: 'owner-session' }
-  const mission = runtime.create(owner, { title: 'Build', objective: 'Fix module', workspace: '/source', scope: ['src/'], acceptance, budget: { ...budget, ...overrides } })
+  const mission = runtime.create(owner, { title: 'Build', objective: 'Fix module', workspace: '/source', scope: ['src/'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: '/source', source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Core', objective: 'Fix module' })
   const a = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -255,7 +255,7 @@ async function automatic(t, tasks, acceptance = ['works']) {
   const plan = { title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance, budget: { ...budget, maxTokens: 100000, maxSteps: 100 },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
     workstreams: [{ key: 'main', title: 'Delivery', objective: 'Complete the change' }], tasks }
-  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Make the change.', workspace: directory })
+  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Make the change.', workspace: directory }, { grantRoot: directory, source: 'session' })
   return { runtime, workers, owner, plan, request, directory }
 }
 const codeTask = (key, extra = {}) => ({ key, workstreamKey: 'main', title: key, objective: key, kind: 'implementation', outputs: [], scope: ['src/'], acceptance: ['works'], assigneeKey: 'builder', checks: ['node check.cjs'], maxRecoveryAttempts: 3, checkTimeoutMs: 45000, ...extra })

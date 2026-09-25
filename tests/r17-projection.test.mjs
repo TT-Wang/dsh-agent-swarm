@@ -69,7 +69,7 @@ async function fixture(t, { workers: provided, registry } = {}) {
   ctx.provide('sessions', { get: id => String(id) === OWNER ? session : undefined })
   await runtime.start()
   const owner = { sessionId: OWNER }
-  const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })

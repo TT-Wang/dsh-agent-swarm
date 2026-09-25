@@ -77,12 +77,12 @@ test('plans exceeding the default name pool can supply a unique explicit name', 
 
 test('manual drafts retain legacy binding and round-trip only valid explicit assignment modes', async t => {
   const f = await fixture(t)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.ok(draft.input.tasks.every(task => task.assignmentMode === undefined))
   const changed = structuredClone(f.input)
   changed.tasks[0].assignmentMode = 'pinned'
   changed.tasks[1].assignmentMode = 'preferred'
-  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, changed)
+  const edited = f.runtime.updateDraft(f.owner, draft.id, draft.revision, changed, { grantRoot: changed.workspace, source: 'session' })
   assert.deepEqual(edited.input.tasks.map(task => task.assignmentMode), ['pinned', 'preferred'])
   changed.tasks[0].assignmentMode = 'surprise'
   assert.throws(() => validatePlan(changed), /assignmentMode/)
@@ -94,13 +94,13 @@ test('manual drafts retain legacy binding and round-trip only valid explicit ass
 
 test('draft edits are durable, optimistic and cannot consume workers before launch', async t => {
   const f = await fixture(t)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.equal(f.workers.prepared.length, 0)
   assert.equal(f.runtime.list(f.owner.sessionId).length, 0)
-  const edited = f.runtime.updateDraft(f.owner, draft.id, 1, { ...f.input, title: 'Reviewed plan' })
+  const edited = f.runtime.updateDraft(f.owner, draft.id, 1, { ...f.input, title: 'Reviewed plan' }, { grantRoot: f.input.workspace, source: 'session' })
   assert.equal(edited.revision, 2)
   assert.equal(f.runtime.drafts(f.owner)[0].input.title, 'Reviewed plan')
-  assert.throws(() => f.runtime.updateDraft(f.owner, draft.id, 1, f.input), /changed/)
+  assert.throws(() => f.runtime.updateDraft(f.owner, draft.id, 1, f.input, { grantRoot: f.input.workspace, source: 'session' }), /changed/)
   assert.throws(() => f.runtime.discardDraft({ sessionId: 'stranger' }, draft.id, 2), /owned/)
   f.runtime.discardDraft(f.owner, draft.id, 2)
   assert.deepEqual(f.runtime.drafts(f.owner), [])
@@ -111,7 +111,7 @@ test('launch holds execution until roster and dependency/review topology are com
   const f = await fixture(t)
   const gate = deferred(), entered = deferred()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const launch = f.runtime.launchDraft(f.owner, draft.id, draft.revision)
   await entered.promise
   const assembling = f.runtime.list(f.owner.sessionId)[0]
@@ -140,13 +140,13 @@ test('failed launch resumes existing admissions without duplicating workers or r
   const f = await fixture(t)
   let fail = true
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer' && fail) throw new Error('Temporary worker start failure') }
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), /Temporary worker/)
   const failed = f.runtime.drafts(f.owner)[0]
   assert.equal(failed.status, 'failed')
   assert.equal(f.runtime.list(f.owner.sessionId)[0].status, 'staged')
   assert.equal(f.workers.delivered.length, 0)
-  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input)
+  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.equal(revised.revision, failed.revision + 1)
   fail = false
   const snapshot = await f.runtime.launchDraft(f.owner, revised.id, revised.revision)
@@ -159,7 +159,7 @@ test('stopping during plan assembly prevents activation and retry cannot revive 
   const f = await fixture(t)
   const gate = deferred(), entered = deferred()
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') { entered.resolve(); await gate.promise } }
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const launch = f.runtime.launchDraft(f.owner, draft.id, draft.revision)
   const rejected = assert.rejects(launch, /stopped/)
   await entered.promise
@@ -213,7 +213,7 @@ test('equivalent scope notation and duplicate review edges canonicalize without 
   assert.deepEqual(canonical.acceptance, before.acceptance)
   assert.deepEqual(canonical.budget, before.budget)
   assert.deepEqual(f.input, before)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   // The saved draft also carries the review the host adds for the unreviewed research task.
   assert.deepEqual(f.runtime.drafts(f.owner)[0].input, JSON.parse(JSON.stringify(pairReviews(canonical))))
   assert.deepEqual(draft.input.tasks.map(task => task.key), ['review', 'code', 'preparation', 'preparation-review'])
@@ -239,7 +239,7 @@ test('scope and missing code checks are diagnosed together before any admission,
   f.input.tasks[1].scope = ['lib/value.cjs']
   f.input.tasks[1].checks = []
   const before = structuredClone(f.input)
-  assert.throws(() => f.runtime.createDraft(f.owner, f.input), error => {
+  assert.throws(() => f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' }), error => {
     assert.match(error.message, /tasks\[1\]\.scope exceeds mission scope/)
     assert.match(error.message, /tasks\[1\]\.checks \(task "code"\)/)
     assert.match(error.message, /same task\/request/)
@@ -253,7 +253,7 @@ test('scope and missing code checks are diagnosed together before any admission,
   assert.deepEqual(f.input, before)
   f.input.tasks[1].scope = ['src/value.cjs']
   f.input.tasks[1].checks = ['node check.cjs']
-  const admitted = f.runtime.createDraft(f.owner, f.input)
+  const admitted = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.equal(admitted.input.tasks[1].kind, before.tasks[1].kind)
   assert.deepEqual(admitted.input.acceptance, before.acceptance)
   assert.deepEqual(admitted.input.budget, before.budget)
@@ -325,7 +325,7 @@ test('a task scope entry that is not a string is one diagnostic among the others
   // The staged draft path refuses with the same text and saves nothing.
   const f = await fixture(t)
   Object.assign(f.input.tasks[0], { scope: [{ path: 'src/' }], outputs: ['src/a.ts'], priority: 500 })
-  assert.throws(() => f.runtime.createDraft(f.owner, f.input), error => error instanceof AdmissionError && error.message === expected)
+  assert.throws(() => f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' }), error => error instanceof AdmissionError && error.message === expected)
   assert.deepEqual(f.runtime.drafts(f.owner), [])
 })
 
@@ -405,7 +405,7 @@ test('scope errors report the offending path and allowed selectors so the primar
 
 test('a saved draft survives a cold host restart without an owner or worker process', async t => {
   const f = await fixture(t)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await f.runtime.dispose()
   const workers = new Workers(), recovered = new SwarmRuntime(f.config, workers)
   try {
@@ -419,7 +419,7 @@ test('a saved draft survives a cold host restart without an owner or worker proc
 test('interrupted assembly journals recover without duplicating prior admissions', async t => {
   const f = await fixture(t)
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer') throw new Error('Interrupted before topology') }
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, 1), /Interrupted/)
   const interrupted = f.runtime.drafts(f.owner)[0]
   interrupted.status = 'launching'
@@ -454,16 +454,16 @@ test('R24: plan staging and launch check declared outputs against the host-confi
   assert.throws(() => validatePlan(vendored, { launch: true }), refusedFor('vendor'))
   assert.doesNotThrow(() => validatePlan(vendored, { launch: true, dependencyDirs: ['node_modules', 'gen'] }))
   // A draft staged under the default set is refused at launch by a host configured with gen/.
-  const draft = f.runtime.createDraft(f.owner, generated)
+  const draft = f.runtime.createDraft(f.owner, generated, { grantRoot: generated.workspace, source: 'session' })
   await f.runtime.dispose()
   const configured = new SwarmRuntime({ ...f.config, verificationDependencyDirs: ['node_modules', 'gen'] }, f.workers)
   t.after(() => configured.dispose())
   await assert.rejects(configured.launchDraft(f.owner, draft.id, draft.revision), refusedFor('gen'))
   assert.equal(f.workers.prepared.length, 0, 'the refusal precedes every worker and worktree')
-  assert.throws(() => configured.createDraft(f.owner, generated), refusedFor('gen'), 'staging uses the configured set too')
-  const request = configured.requestStart(f.owner, { commandId: 'configured-dirs', goal: 'Deliver verified code', workspace: f.directory })
+  assert.throws(() => configured.createDraft(f.owner, generated, { grantRoot: generated.workspace, source: 'session' }), refusedFor('gen'), 'staging uses the configured set too')
+  const request = configured.requestStart(f.owner, { commandId: 'configured-dirs', goal: 'Deliver verified code', workspace: f.directory }, { grantRoot: f.directory, source: 'session' })
   await assert.rejects(configured.startPlan(f.owner, request.id, generated), refusedFor('gen'), 'the automatic launch path uses it too')
-  const admitted = configured.createDraft(f.owner, vendored)
+  const admitted = configured.createDraft(f.owner, vendored, { grantRoot: vendored.workspace, source: 'session' })
   const snapshot = await configured.launchDraft(f.owner, admitted.id, admitted.revision)
   assert.deepEqual(snapshot.tasks.find(task => task.title === 'Deliver').outputs, ['src/vendor/patch.txt'], 'a default name the host removed launches')
 })
@@ -472,7 +472,7 @@ test('R24: a staged draft may omit outputs, but launch refuses each task that do
   const f = await fixture(t)
   for (const task of f.input.tasks) delete task.outputs
   assert.doesNotThrow(() => validatePlan(f.input), 'staging leaves outputs optional')
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.ok(draft.input.tasks.every(task => task.outputs === undefined), 'the staged draft keeps the omission')
   const schemaIndex = await toolSchemaIndex()
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), error => {
@@ -506,10 +506,10 @@ test('R24: a staged draft may omit outputs, but launch refuses each task that do
     assert.deepEqual(assessText(error.message, schemaIndex), [], 'the refusal satisfies the refusal contract')
     return true
   })
-  const request = f.runtime.requestStart(f.owner, { commandId: 'outputs-required', goal: 'Deliver verified code', workspace: f.directory })
+  const request = f.runtime.requestStart(f.owner, { commandId: 'outputs-required', goal: 'Deliver verified code', workspace: f.directory }, { grantRoot: f.directory, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, single), /\[outputs_required\] tasks\[1\] \(code\)\.outputs/, 'the automatic launch path refuses the same plan')
 
-  const declared = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.map(task => ({ ...task, outputs: [] })) })
+  const declared = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.map(task => ({ ...task, outputs: [] })) }, { grantRoot: draft.input.workspace, source: 'session' })
   const snapshot = await f.runtime.launchDraft(f.owner, declared.id, declared.revision)
   assert.deepEqual(snapshot.tasks.map(task => task.outputs), [[], []], 'an empty declaration launches')
 })

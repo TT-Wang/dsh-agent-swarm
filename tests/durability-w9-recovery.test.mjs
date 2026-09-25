@@ -43,7 +43,7 @@ async function fixture(t) {
   t.after(async () => { await workspaces.dispose(); await rm(root, { recursive: true, force: true }) })
   const owner = { sessionId: 'w9-owner' }
   const mission = runtime.create(owner, { title: 'W9', objective: 'Never dead-end on a dirty workspace', workspace: source,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: source, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

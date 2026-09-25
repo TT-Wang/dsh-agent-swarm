@@ -26,7 +26,7 @@ async function fixture(t, { members = ['author', 'reviewer'], budget: overrides 
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: { ...reviewBudget, ...overrides } })
   const owner = { sessionId: 'review-path-owner' }
   const mission = runtime.create(owner, { title: 'Review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const added = {}
   for (const name of members) {
@@ -175,7 +175,7 @@ test('an unreviewable submission survives a host restart and is repaired on reco
   const { dir: directory, config, runtime: first, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: reviewBudget })
   const owner = { sessionId: 'restart-owner' }
   const mission = first.create(owner, { title: 'Restart review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const author = await first.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   await first.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -203,7 +203,7 @@ test('automatic plan admission adds the independent review a code deliverable la
     budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 },
   })
   const owner = { sessionId: 'plan-owner' }
-  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Deliver verified code', workspace: directory })
+  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Deliver verified code', workspace: directory }, { grantRoot: directory, source: 'session' })
   const plan = { title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'],
     budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
@@ -219,7 +219,7 @@ test('automatic plan admission adds the independent review a code deliverable la
   assert.equal(reviews[0].maxRecoveryAttempts, 5, 'the added review takes the source\'s recovery limit')
 
   const authoredOwner = { sessionId: 'plan-owner-authored' }
-  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory })
+  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory }, { grantRoot: directory, source: 'session' })
   plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'],
     acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 })
   const snapshot = await runtime.startPlan(authoredOwner, authoredRequest.id, plan)
