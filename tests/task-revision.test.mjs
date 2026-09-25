@@ -33,7 +33,8 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { SwarmStore, StaleTaskRevisionError, STALE_TASK_REFUSAL_EVENT, WriterBusyError, isSqliteBusy } from '../lib/store.js'
 import { missionFingerprint } from '../lib/gates.js'
-import { EVENT_VOCABULARY, eventVocabularyReport } from '../lib/trace.js'
+import { EVENT_VOCABULARY } from '../lib/events.js'
+import { eventVocabularyReport } from '../lib/trace.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
 /**

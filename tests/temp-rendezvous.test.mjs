@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision } from '../lib/runtime.js'
-import { EVENT_VOCABULARY } from '../lib/trace.js'
+import { EVENT_VOCABULARY } from '../lib/events.js'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 test('R11-15: sharedTempPaths extracts only shared-temp absolute paths from host-recorded input', () => {

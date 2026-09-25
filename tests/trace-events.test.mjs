@@ -1,7 +1,8 @@
 /** F-12/F-13/F-14: verdict and retired-review events, older-event reads and event vocabulary. */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { EVENT_VOCABULARY, eventVocabularyReport, readEventHistory, verdictRows } from '../lib/trace.js'
+import { EVENT_VOCABULARY } from '../lib/events.js'
+import { eventVocabularyReport, readEventHistory, verdictRows } from '../lib/trace.js'
 import { traceFixture } from './fixtures/trace-runtime.mjs'
 
 const UNSURFACED = ['task/cancelled', 'task/checkpointed', 'task/checkpoint-failed', 'task/closeout-nudged', 'task/closeout-abandoned', 'task/closeout-failed', 'task/git-write-denied']

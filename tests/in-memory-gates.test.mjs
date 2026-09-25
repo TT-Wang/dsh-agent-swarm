@@ -718,7 +718,7 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
   // point: the registry names the row, and because `store.event` takes
   // `EventKind`, a constant emission is checked exactly like a literal one.
-  const { EVENT_VOCABULARY } = await import('../lib/trace.js')
+  const { EVENT_VOCABULARY } = await import('../lib/events.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
   assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string',

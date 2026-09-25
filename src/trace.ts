@@ -34,7 +34,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { rm } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { taskGraphDefects, type TaskGraphDefect, type TaskGraphNode } from './admission.ts'
-import { EVENT_VOCABULARY, type EventKind } from './events.ts'
+import { EVENT_VOCABULARY } from './events.ts'
 import { ATTEMPT_FENCING_EVENTS, type SwarmEvent } from './types.ts'
 import { PolicyError } from './policy-error.ts'
 
@@ -503,12 +503,6 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { seqOf
   }
 }
 
-/**
- * The read path's view of the registry in `src/events.ts`. The rows live there
- * because that module imports nothing and both tsconfigs compile it, so the
- * client renders the same registry the host writes.
- */
-export { EVENT_VOCABULARY, type EventKind }
 export interface EventVocabularyReport {
   recognized: string[]
   unrecognized: string[]
