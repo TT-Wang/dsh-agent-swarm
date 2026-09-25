@@ -331,12 +331,24 @@ test('AC5: a worker session cannot create a mission or use a grant, and another 
   assert.deepEqual({ workspace: runtime.store.get('missions', mission.id).workspace, root: runtime.store.get('missions', mission.id).workspaceGrantRoot }, { workspace: projectPath, root: grantedPath })
   const foreign = runtime.store.get('missions', mission.id)
   assert.equal(foreign.ownerSessionId, 'owner-a', 'ownership is durable and cannot be transferred by a peer')
-  // A forged wider root is never recorded: the runtime re-derives the root from
-  // the loaded configuration, so the mission anchors on the configured root.
-  const forged = runtime.create({ sessionId: 'owner-b' }, { title: 'Wide', objective: 'Widen', workspace: projectPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: '/', source: 'grant' })
-  assert.equal(runtime.store.get('missions', forged.id).workspaceGrantRoot, grantedPath, 'the configured root wins over the caller claim')
-  // A forged narrower root that does not contain the workspace is refused.
-  assert.throws(() => runtime.create({ sessionId: 'owner-b' }, { title: 'Narrow', objective: 'Narrow', workspace: projectPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: join(grantedPath, 'nope'), source: 'grant' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE))
+  // Every runtime entry that records a claim re-derives it from the loaded
+  // configuration, so no caller widens its own authorization: a forged wider
+  // root records the configured root, and a forged narrower root that does not
+  // contain the workspace is refused.
+  const other = { sessionId: 'owner-b' }
+  let starts = 0
+  const recorders = {
+    create: claim => runtime.store.get('missions', runtime.create(other, { title: 'Forged', objective: 'Widen', workspace: projectPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, claim).id),
+    createDraft: claim => runtime.store.get('drafts', runtime.createDraft(other, plan(projectPath), claim).id),
+    updateDraft: claim => { const saved = runtime.createDraft(other, plan(projectPath), grant); return runtime.store.get('drafts', runtime.updateDraft(other, saved.id, saved.revision, plan(projectPath), claim).id) },
+    // One planning request per session is in progress at a time.
+    requestStart: claim => runtime.store.get('starts', runtime.requestStart({ sessionId: `owner-start-${++starts}` }, { commandId: 'forged', goal: 'Widen', workspace: projectPath }, claim).id),
+  }
+  for (const [entry, record] of Object.entries(recorders)) {
+    const wide = record({ grantRoot: '/', source: 'grant' })
+    assert.deepEqual({ root: wide.workspaceGrantRoot, source: wide.workspaceAuthorizationSource }, { root: grantedPath, source: 'grant' }, `${entry}: the configured root wins over the caller claim`)
+    assert.throws(() => record({ grantRoot: join(grantedPath, 'nope'), source: 'grant' }), new RegExp(WORKSPACE_AUTHORIZATION_CODE), `${entry}: a root that does not contain the workspace is refused`)
+  }
 })
 
 /** Criterion 6: removing a root refuses new missions and fences a running one. */
