@@ -893,7 +893,7 @@ export class Notices {
       dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))),
       unreviewed: tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
-      stalled: this.rt.stalled(mission, tasks, members),
+      stalled: this.rt.stalled(tasks, members),
       parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),

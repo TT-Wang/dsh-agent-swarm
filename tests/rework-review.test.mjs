@@ -306,7 +306,7 @@ test('a challenge re-opens the grace, so the owner\'s own review of the re-opene
   f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
   const tasks = f.runtime.store.list('tasks', f.mission.id)
   assert.equal(f.runtime.notices.waitsLegitimately(f.current(source), tasks), true, 'the re-opened need waits out its own grace')
-  assert.equal(f.runtime.stalled(f.mission, tasks, f.runtime.store.list('members', f.mission.id)), false)
+  assert.equal(f.runtime.stalled(tasks, f.runtime.store.list('members', f.mission.id)), false)
   await f.runtime.settle(f.mission.id)
   f.clock.advance(200)
   // The owner's next call in the same turn: its own review of the re-opened source.

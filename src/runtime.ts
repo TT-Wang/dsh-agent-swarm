@@ -434,7 +434,7 @@ export class SwarmRuntime {
   ready(task: Task, member: Member, tasks?: Task[]): boolean { return this.scheduling.ready(task, member, tasks) }
   unschedulable(mission: Mission, tasks: Task[], members: Member[]): Task[] { return this.scheduling.unschedulable(mission, tasks, members) }
   reviewable(task: Task, tasks: Task[], members?: Member[]): boolean { return this.scheduling.reviewable(task, tasks, members) }
-  stalled(mission: Mission, tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(mission, tasks, members) }
+  stalled(tasks: Task[], members: Member[]): boolean { return this.scheduling.stalled(tasks, members) }
   private quiescencePending(task: Task): boolean { return this.scheduling.quiescencePending(task) }
   private selectDeliveryTarget(missionId: string, tasks: Task[]): Task { return this.scheduling.selectDeliveryTarget(missionId, tasks) }
   private deliveryTarget(actor: Actor, missionId: string): { mission: Mission; task: Task } { return this.scheduling.deliveryTarget(actor, missionId) }
@@ -3507,7 +3507,7 @@ export class SwarmRuntime {
     const automatic = this.store.list('starts', missionId).length > 0
     const tasks = this.store.list('tasks', missionId), members = this.store.list('members', missionId)
     const strict = this.completionError(mission)
-    const isStalled = strict !== undefined && this.stalled(mission, tasks, members)
+    const isStalled = strict !== undefined && this.stalled(tasks, members)
     // Spec §2: a notice is fresh only for the state it described. Once the board
     // leaves the stalled / coverage-complete class, forget the dedup key so a
     // later return to the same fingerprint re-notifies instead of staying silent.
