@@ -819,8 +819,8 @@ export class HarnessWorkers implements WorkerAdapter {
           })
         }
       })
-      // The handle ends where the host ends this agent (its own dispose or a factory teardown), so no reader reaches a retired inbox.
-      agentCtx.effect(() => () => { if (resident.handle?.agent === agent) resident.handle = undefined }, 'swarm.worker-handle')
+      // The resident ends where the host ends this agent (a factory teardown, an agent-loop reload): no reader reaches the retired inbox, and the next start opens a live agent.
+      agentCtx.effect(() => () => { if (resident.handle?.agent === agent) { resident.handle = undefined; void this.end(resident) } }, 'swarm.worker-handle')
       agentCtx.on('agent/error', ({ error }) => { this.failure(spec.member.id, error) })
       agentCtx.on('agent/status', ({ status }) => {
         if (status !== 'idle') return
@@ -976,7 +976,7 @@ export class HarnessWorkers implements WorkerAdapter {
       resident.recoveryInbox.set(message.id, { target, message })
       await this.preserveInbox(resident)
       resident.abort.signal.throwIfAborted()
-      if (this.closing || resident.stopping !== undefined || resident.handle === undefined) throw new Error('Worker is stopping')
+      if (this.closing || resident.stopping !== undefined) throw new Error('Worker is stopping')
       // Claims and findings are visible at the next step; a new assignment owns a turn.
       resident.handle.agent.send(message, target, true)
       resident.delivered.add(id)
@@ -1028,8 +1028,12 @@ export class HarnessWorkers implements WorkerAdapter {
   async stop(memberId: string): Promise<void> {
     this.workspaces.cancel(memberId)
     const resident = this.residents.get(memberId)
-    if (resident === undefined) return
-    if (resident.stopping !== undefined) return await resident.stopping
+    if (resident !== undefined) await this.end(resident)
+  }
+
+  /** A resident ends once, stopped by the runtime or by the host ending its agent; all it holds settles before its entry is released. */
+  private end(resident: Resident): Promise<void> {
+    if (resident.stopping !== undefined) return resident.stopping
     resident.abort.abort('worker stopped')
     this.clearActivities(resident)
     // Node fetch may annotate an object abort reason with a non-JSON stack.
@@ -1037,23 +1041,23 @@ export class HarnessWorkers implements WorkerAdapter {
     // Accepted peer context is durable even when its model step has not begun.
     // Only stale assignments are removed by removeRevokedPending on activation.
     resident.handle?.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true })
-    resident.stopping = (async () => {
-      await resident.opening.catch(() => undefined)
-      const handle = resident.handle
-      if (handle !== undefined) {
-        handle.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true })
-        await handle.agent.whenIdle()
+    return resident.stopping = (async () => {
+      try {
+        await resident.opening.catch(() => undefined)
+        const handle = resident.handle
+        handle?.agent.cancel(Object.freeze({ kind: 'parent' }), { keepInbox: true })
+        await handle?.agent.whenIdle()
         await this.drainObservations(resident)
+        await resident.journalWrites
+        if (handle === undefined) return
         try {
           await this.preserveInbox(resident)
           // Persistence drains the session of an agent the host retired meanwhile; flush() accepts only an attached one.
           if (resident.handle === handle) await this.ctx.get('sessions')?.flush(handle.agent.session)
         }
         finally { await handle.dispose() }
-      }
+      } finally { if (this.residents.get(resident.spec.member.id) === resident) this.residents.delete(resident.spec.member.id) }
     })()
-    try { await resident.stopping }
-    finally { if (this.residents.get(memberId) === resident) this.residents.delete(memberId) }
   }
 
   /**

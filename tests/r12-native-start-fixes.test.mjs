@@ -123,15 +123,17 @@ test('stop releases the handle only after the journal write in flight has settle
   const f = await fixture(t)
   await f.adapter.start(f.spec)
   const resident = f.adapter.residents.get(f.member.id)
-  const write = deferred()
-  resident.journalWrites = write.promise // an earlier delivery's journal write, still in flight
+  const write = deferred(), order = []
+  resident.journalWrites = write.promise.then(() => { order.push('earlier write settled') }) // an earlier delivery's journal write, still in flight
+  const values = resident.recoveryInbox.values.bind(resident.recoveryInbox)
+  resident.recoveryInbox.values = () => { order.push('stop write began'); return values() }
   f.agent.inbox.nextStep.push(nativeNote)
-  let stopped = false
-  const stopping = f.adapter.stop(f.member.id).then(() => { stopped = true })
-  for (let turn = 0; turn < 5; turn++) await flush()
-  assert.deepEqual([stopped, f.calls.disposed], [false, 0], 'a restart cannot race the late write')
+  const stopping = f.adapter.stop(f.member.id)
+  // Everything before the stop's own journal write settles within this turn; only the earlier write can hold it.
+  await flush()
+  assert.deepEqual([order, f.calls.disposed], [[], 0], 'a restart cannot race the late write')
   write.resolve(); await stopping
-  assert.equal(f.calls.disposed, 1)
+  assert.deepEqual([order, f.calls.disposed], [['earlier write settled', 'stop write began'], 1])
   assert.deepEqual((await journal(f)).nextStep.map(message => message.id), ['native-note'], 'the stop wrote its journal after the earlier one')
 })
 
@@ -144,8 +146,49 @@ test('a delivery the host overtakes mid-journal is refused, never sent to the re
   await flush()
   f.retire()
   write.resolve()
-  await assert.rejects(delivering, /Worker is stopping/, 'the delivery stays a durable outbox obligation')
+  await assert.rejects(delivering, /worker stopped/, 'the delivery stays a durable outbox obligation')
   assert.equal(f.calls.sent, 0)
+})
+
+test('a host teardown ends the resident: its entry outlives the observations and journal write in flight, then the next start opens a fresh agent', async t => {
+  const f = await fixture(t)
+  await f.adapter.start(f.spec)
+  const resident = f.adapter.residents.get(f.member.id)
+  const observation = deferred(), write = deferred()
+  resident.observations.add(observation.promise) // a usage snapshot or tool run still reaching the runtime
+  resident.journalWrites = write.promise // a delivery's journal write
+  f.retire()
+  let stopped = false
+  const stopping = f.adapter.stop(f.member.id).then(() => { stopped = true })
+  await flush()
+  const held = () => [stopped, f.adapter.residents.get(f.member.id) === resident, f.adapter.isIdle(f.member.id)]
+  assert.deepEqual(held(), [false, true, false], 'a restart cannot race the retired resident\'s observation')
+  observation.resolve(); resident.observations.delete(observation.promise)
+  await flush()
+  assert.deepEqual(held(), [false, true, false], 'nor its late journal write')
+  write.resolve()
+  await stopping
+  assert.deepEqual([f.adapter.residents.has(f.member.id), f.calls.disposed], [false, 0], 'the host disposed the retired agent; the adapter reads nothing of it')
+  f.agent.inbox = { nextTurn: [], nextStep: [], remove() {} }
+  await f.adapter.start(f.spec)
+  assert.equal(f.calls.create, 2, 'the next start opens a fresh agent')
+})
+
+test('a host teardown during startup fails that start, and the next start opens a fresh agent', async t => {
+  const f = await fixture(t)
+  const reached = deferred(), held = deferred()
+  f.adapter.ctx.sessions.flush = async () => { reached.resolve(); await held.promise }
+  const starting = f.adapter.start(f.spec)
+  await reached.promise // the handle is published; startup awaits its first session flush
+  f.retire()
+  held.resolve()
+  await assert.rejects(starting)
+  f.adapter.ctx.sessions.flush = async () => {}
+  f.agent.inbox = { nextTurn: [], nextStep: [], remove() {} }
+  await f.adapter.start(f.spec)
+  assert.equal(f.calls.create, 2, 'the next start opens a fresh agent')
+  await f.adapter.deliver(f.member, { id: 'after', missionId: 'm', from: 'owner', to: f.member.id, kind: 'finding', content: 'after', createdAt: 1 })
+  assert.equal(f.calls.sent, 1)
 })
 
 test('a stop the host overtakes reads neither the retired inbox nor its session, and journals the resident record', async t => {

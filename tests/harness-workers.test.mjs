@@ -220,15 +220,35 @@ test('a worker the host tore down first stops without reading its retired inbox,
   await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
   assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'])
   await f.agentLoop.dispose()
-  // The worker's handle ended with the agent, so no adapter reader reaches the retired inbox.
+  // The worker's resident ended with the agent, so no adapter reader reaches the retired inbox.
   assert.equal(f.adapter.isIdle(f.member.id), false, 'a worker whose agent the host retired is not startable')
-  await assert.rejects(f.adapter.deliver(f.member, { ...message(f.member, 'finding-two'), kind: 'finding', content: 'A later finding.' }), /Worker is stopping/,
-    'the delivery stays a durable outbox obligation')
   await f.adapter.stop(f.member.id)
+  await assert.rejects(f.adapter.deliver(f.member, { ...message(f.member, 'finding-two'), kind: 'finding', content: 'A later finding.' }), /Worker must be started before delivery/,
+    'the delivery stays a durable outbox obligation')
   await f.ctx.plugin(AgentLoop, { agents: [] })
   await f.adapter.start(f.spec)
   assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'],
     'the journal restores the accepted input the host teardown cleared')
+})
+
+test('an agent-loop reload ends the worker resident, so the next start opens a live agent with the input it accepted', async t => {
+  const f = await fixture(t, undefined, {
+    beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    }) : undefined,
+  })
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
+  await f.agentLoop.dispose()
+  assert.equal(f.adapter.isIdle(f.member.id), false, 'a worker whose agent the host retired is not startable')
+  await f.ctx.plugin(AgentLoop, { agents: [] })
+  // No adapter stop in between: the runtime's next dispatch pass only starts the member again.
+  await f.adapter.start(f.spec)
+  const agent = f.ctx.agents.get(SessionId(f.member.sessionId))
+  assert.notEqual(agent, undefined, 'the start opened a live agent')
+  assert.deepEqual(agent.inbox.nextStep.map(item => item.id), ['swarm:finding-one'], 'the journal restores the accepted input the reload cleared')
+  await f.adapter.deliver(f.member, { ...message(f.member, 'finding-two'), kind: 'finding', content: 'A later finding.' })
 })
 
 test('input a worker conversation received natively and had not consumed survives a stop and restart', async t => {
