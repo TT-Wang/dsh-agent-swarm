@@ -83,7 +83,7 @@ const SHELL_COMMAND_KEYS = new Map<string, readonly string[]>([
 ])
 
 /** The executed command line of a shell tool, or undefined for any other tool. */
-export function executedShellCommand(tool: string, args: unknown): string | undefined {
+function executedShellCommand(tool: string, args: unknown): string | undefined {
   const keys = SHELL_COMMAND_KEYS.get(tool)
   if (keys === undefined || args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
   const record = args as Record<string, unknown>
@@ -332,7 +332,7 @@ function atCommandPosition(tokens: string[], index: number): boolean {
  * values are skipped; the R6-01 property (result text never decides) is
  * preserved.
  */
-export function gitWriteSubcommand(command: string): string | undefined {
+function gitWriteSubcommand(command: string): string | undefined {
   for (const segment of shellSegments(command)) {
     const tokens = segment.map(token => token.text)
     for (let git = 0; git < tokens.length; git++) {
@@ -528,7 +528,7 @@ export class WorkspaceAdmission {
   }
 }
 
-export interface IsolationIssue { memberIds: string[]; message: string }
+interface IsolationIssue { memberIds: string[]; message: string }
 
 /** Identity-bearing evidence shared by admission and its read-only explanation. */
 export function isolationIssues(allMembers: readonly Member[], tasks: readonly Task[], overlaps: (left: string[], right: string[]) => boolean): IsolationIssue[] {

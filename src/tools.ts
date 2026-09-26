@@ -5,10 +5,9 @@ import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts
 import { inheritedAcceptance } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
-import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, type TraceStep } from './trace.ts'
-import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
+import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const

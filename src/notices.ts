@@ -247,7 +247,7 @@ function renderNoticeFacts(header: string, facts: readonly string[], missionId: 
  * same order as the runtime's attempt-silence bound: a mission without
  * task, evidence or owner-decision progress is reported as an absence.
  */
-export const DEFAULT_ABSENCE_BOUND_MS = 600_000
+const DEFAULT_ABSENCE_BOUND_MS = 600_000
 /**
  * R17-G2: the reviewed notice template table. Every reviewed family's body is
  * built by one pure function from the durable rows it cites, and the generator

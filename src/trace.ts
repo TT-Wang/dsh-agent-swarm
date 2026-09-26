@@ -40,13 +40,13 @@ import { PolicyError } from './policy-error.ts'
 
 /** Closed operation vocabulary from the D6 contract (OTel/OpenInference analogue). */
 export const TRACE_OPERATIONS = ['agent', 'tool', 'llm', 'retrieval', 'review', 'merge'] as const
-export type TraceOperation = (typeof TRACE_OPERATIONS)[number]
+type TraceOperation = (typeof TRACE_OPERATIONS)[number]
 /** Closed status vocabulary. */
-export const TRACE_STATUSES = ['ok', 'error'] as const
-export type TraceStatus = (typeof TRACE_STATUSES)[number]
+const TRACE_STATUSES = ['ok', 'error'] as const
+type TraceStatus = (typeof TRACE_STATUSES)[number]
 /** Closed `error.type` vocabulary; every failed span names exactly one. */
 export const TRACE_ERROR_TYPES = ['validation_error', 'authorization_error', 'budget_error', 'lease_error', 'conflict_error', 'tool_error', 'internal_error', 'contract_error'] as const
-export type TraceErrorType = (typeof TRACE_ERROR_TYPES)[number]
+type TraceErrorType = (typeof TRACE_ERROR_TYPES)[number]
 /** Closed step vocabulary: one row per orchestration step, no free-form names. */
 export const TRACE_STEPS = ['swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member', 'swarm_workstream', 'swarm_propose', 'swarm_claim', 'swarm_publish', 'swarm_submit', 'swarm_verify', 'swarm_message', 'swarm_challenge', 'swarm_handoff', 'swarm_subscribe', 'swarm_wait', 'swarm_observe', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_escalate', 'swarm_post', 'swarm_board', 'swarm_restore', 'delivery-apply'] as const
 export type TraceStep = (typeof TRACE_STEPS)[number]
@@ -59,8 +59,8 @@ const OPERATION_BY_STEP: Record<TraceStep, TraceOperation> = {
 export const spanOperation = (step: TraceStep): TraceOperation => OPERATION_BY_STEP[step]
 export const isTraceOperation = (value: unknown): value is TraceOperation => typeof value === 'string' && (TRACE_OPERATIONS as readonly string[]).includes(value)
 export const isTraceStep = (value: unknown): value is TraceStep => typeof value === 'string' && (TRACE_STEPS as readonly string[]).includes(value)
-export const isTraceStatus = (value: unknown): value is TraceStatus => value === 'ok' || value === 'error'
-export const isTraceErrorType = (value: unknown): value is TraceErrorType => typeof value === 'string' && (TRACE_ERROR_TYPES as readonly string[]).includes(value)
+const isTraceStatus = (value: unknown): value is TraceStatus => value === 'ok' || value === 'error'
+const isTraceErrorType = (value: unknown): value is TraceErrorType => typeof value === 'string' && (TRACE_ERROR_TYPES as readonly string[]).includes(value)
 /** Map a thrown orchestration failure onto the closed `error.type` vocabulary. */
 export function errorTypeFor(error: unknown): TraceErrorType {
   if (error instanceof PolicyError) return error.category
@@ -126,14 +126,14 @@ export const traceparentFor = (traceId: string, spanId: string): string => `00-$
  * `stored: false`; the flag stays because rows written by older builds carry
  * `stored: true` and `spanContractViolation` still validates both.
  */
-export interface TracePayloadRef { digest: string; bytes: number; stored: boolean }
+interface TracePayloadRef { digest: string; bytes: number; stored: boolean }
 /** Digest and size one span payload, without retaining the bytes. */
 export function payloadRef(value: unknown): TracePayloadRef {
   const text = canonicalJson(value)
   return { digest: digestText(text), bytes: Buffer.byteLength(text, 'utf8'), stored: false }
 }
 
-export interface TraceSpan {
+interface TraceSpan {
   traceId: string
   spanId: string
   parentSpanId?: string
@@ -153,7 +153,7 @@ export interface TraceSpan {
 }
 
 /** Structural slice of `SwarmStore` the trace layer needs; keeps store.ts untouched. */
-export interface TraceStore {
+interface TraceStore {
   events(missionId: string, limit: number, after?: number): SwarmEvent[]
   /** Newest matching spans in chronological order; optional for older store adapters. */
   traceEvents?(missionId: string, limit: number, filter?: { taskId?: string; attemptId?: string; step?: string }): SwarmEvent[]
@@ -187,7 +187,7 @@ export interface TraceStore {
  * help here: it mirrors host session events, and a swarm span is a plugin event
  * in the swarm store.
  */
-export interface HostTelemetryRecord {
+interface HostTelemetryRecord {
   channel: 'ledger' | 'ops'
   time: number
   severity: 'info' | 'warn' | 'error'
@@ -231,7 +231,7 @@ export function hostTelemetryRecord(span: TraceSpan): HostTelemetryRecord {
  * read a mutable link instead of a value captured at construction. The link
  * also holds the one failure policy of span recording (`contain`).
  */
-export class HostTelemetryLink {
+class HostTelemetryLink {
   private sink?: HostTelemetrySink
   private emitted = 0
   private failed = 0
@@ -270,7 +270,7 @@ const HISTORY_SCAN_LIMIT = 100000
 const HISTORY_PAGE_DEFAULT = 50
 const HISTORY_PAGE_MAX = 500
 
-export interface TraceWindow {
+interface TraceWindow {
   limit: number
   spans: number
   truncated: boolean
@@ -426,7 +426,7 @@ export class TraceRecorder {
     return span
   }
 }
-export type SpanCall = { missionId: string; actor: string; taskId?: string; attemptId?: string; reviewOfTaskId?: string; input: unknown; output: unknown; startedAt: number; durationMs: number }
+type SpanCall = { missionId: string; actor: string; taskId?: string; attemptId?: string; reviewOfTaskId?: string; input: unknown; output: unknown; startedAt: number; durationMs: number }
   & ({ status: 'ok' } | { status: 'error'; errorType: TraceErrorType })
 
 /** First contract violation in a span row, or undefined when it satisfies the D6 vocabulary. */
@@ -453,8 +453,8 @@ export function spanContractViolation(span: unknown): string | undefined {
   return undefined
 }
 
-export interface TraceViolation { seq?: number; spanId?: string; step?: string; reason: string }
-export interface TraceMetrics {
+interface TraceViolation { seq?: number; spanId?: string; step?: string; reason: string }
+interface TraceMetrics {
   window?: TraceWindow
   spans: number
   roots: number
@@ -503,7 +503,7 @@ export async function traceMetrics(spans: readonly TraceSpan[], options: { seqOf
   }
 }
 
-export interface EventVocabularyReport {
+interface EventVocabularyReport {
   recognized: string[]
   unrecognized: string[]
   types: Array<{ type: string; count: number; description?: string }>
@@ -523,7 +523,7 @@ export const eventSummary = (event: SwarmEvent, limit = 240): string => {
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
 
-export interface EventHistory {
+interface EventHistory {
   events: SwarmEvent[]
   total: number
   pageSize: number
@@ -556,8 +556,8 @@ export function readEventHistory(store: TraceStore, missionId: string, options: 
 }
 
 /** Raw `events` table row, as stored by SQLite; the replay gate decodes these directly. */
-export interface ReplayEventRow { seq: number; mission_id: string; type: string; actor: string; data: string; created_at: number }
-export function decodeEventRow(row: ReplayEventRow): SwarmEvent {
+interface ReplayEventRow { seq: number; mission_id: string; type: string; actor: string; data: string; created_at: number }
+function decodeEventRow(row: ReplayEventRow): SwarmEvent {
   if (!Number.isSafeInteger(row.seq) || row.seq < 1) throw new ReplayCorruptionError(`event row has an invalid seq: ${String(row.seq)}`, row.seq)
   if (typeof row.mission_id !== 'string' || !row.mission_id) throw new ReplayCorruptionError('event row has no mission id', row.seq)
   if (typeof row.type !== 'string' || !row.type) throw new ReplayCorruptionError(`event ${row.seq} has no type`, row.seq)
@@ -584,8 +584,8 @@ export function decodeDurableLog(rows: readonly ReplayEventRow[]): SwarmEvent[] 
   return events
 }
 
-export type ReplayCommandKind = 'dispatch' | 'verify' | 'stop' | 'checkpoint'
-export interface ReplayCommand {
+type ReplayCommandKind = 'dispatch' | 'verify' | 'stop' | 'checkpoint'
+interface ReplayCommand {
   kind: ReplayCommandKind
   seq: number
   taskId?: string
@@ -602,7 +602,7 @@ export const replayDigest = (keys: readonly string[]): string => digestText(keys
  * so the sequence is keyed by admission order instead. A golden sequence is
  * therefore byte-identical across runs while still naming every decision.
  */
-export interface ReplayLabels { task: (id: string) => string; member: (id: string) => string }
+interface ReplayLabels { task: (id: string) => string; member: (id: string) => string }
 export function replayLabels(events: readonly SwarmEvent[]): ReplayLabels {
   const tasks = new Map<string, string>(), members = new Map<string, string>()
   for (const event of events) {
@@ -637,7 +637,7 @@ const required = (data: Record<string, unknown>, key: string, seq: number): stri
 /** Events that close a dispatched attempt; anything else leaves the attempt unresolved. */
 /** The one declared set (`src/types.ts`): every event that fences a running attempt. */
 const ATTEMPT_CLOSERS: ReadonlySet<string> = new Set(ATTEMPT_FENCING_EVENTS)
-export interface ReplayResult {
+interface ReplayResult {
   commands: ReplayCommand[]
   keys: string[]
   digest: string
@@ -743,7 +743,7 @@ export function assertReplayParity(expected: readonly string[], actual: readonly
 }
 
 /** Verdict normalization for the client contract: `{ evidenceId, verdict, retired }`. */
-export interface VerdictRow { evidenceId: string; verdict: 'verified' | 'refuted'; outcome: string; taskId: string; verificationTaskId: string; retired: string[]; reason: string }
+interface VerdictRow { evidenceId: string; verdict: 'verified' | 'refuted'; outcome: string; taskId: string; verificationTaskId: string; retired: string[]; reason: string }
 export function verdictRows(input: {
   sourceTaskId: string
   verificationTaskId: string
