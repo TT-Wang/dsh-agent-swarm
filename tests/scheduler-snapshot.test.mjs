@@ -108,6 +108,8 @@ test('S1r: a live operation whose lease already expired is renewed, not expired,
   const mission = runtime.create(owner, { title: 'S1r', objective: 'Renew before expiring', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
+  // The member's start re-validates the workspace on disk; its pass settles before the claim below.
+  await runtime.settle(mission.id)
   const actor = { sessionId: member.sessionId }
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long verification', objective: 'Long host verification',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, maxRecoveryAttempts: 3 })

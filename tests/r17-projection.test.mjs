@@ -71,7 +71,9 @@ async function fixture(t, { workers: provided, registry } = {}) {
   const owner = { sessionId: OWNER }
   const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const claim = (member, task) => runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
   const memberRow = member => runtime.store.get('members', member.id)

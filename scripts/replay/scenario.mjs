@@ -95,6 +95,9 @@ export async function runScenario(options = {}) {
     // Task 2: dispatch, lease expiry (checkpoint + stop + re-dispatch), submission.
     const second = await propose({ title: 'Implement two', objective: 'Deliver two', kind: 'implementation', checks: ['replay-check'], assigneeId: builder.id })
     const firstAttempt = (await running(second.id)).attempt.id
+    // The dispatching body settles, so the resume below opens a body of its own
+    // (a kick made while a body is open joins it, and the next tick is minutes away).
+    await runtime.settle(missionId)
     // Drive lease expiry from durable state, not from a wall-clock sleep: the
     // scheduler's recovery path reads `attempt.leaseUntil`, so writing it into
     // the past produces the identical checkpoint/stop/re-dispatch commands

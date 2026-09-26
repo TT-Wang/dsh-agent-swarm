@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeRuntime } from './faults/harness.mjs'
+import { eventually, makeRuntime } from './faults/harness.mjs'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function fixture(t) {
@@ -35,10 +35,12 @@ test('a failed tick guard and one failed mission do not suppress other guards or
 
 test('failure after an awaited startup preserves newly committed member fields and park intent', async t => {
   const f = await fixture(t)
-  let reject
-  f.workers.start = () => new Promise((_resolve, fail) => { reject = fail })
+  let reject, entered
+  const started = new Promise(resolve => { entered = resolve })
+  f.workers.start = () => new Promise((_resolve, fail) => { reject = fail; entered() })
   const pending = f.runtime.startWorker(f.mission, f.a)
-  await delay(0)
+  // The start re-validates the workspace on disk before it reaches the adapter.
+  await started
   f.runtime.store.transaction(() => {
     const member = f.runtime.store.get('members', f.a.id)
     member.phase = 'parked'; member.role = 'updated while starting'; member.activity = { sentinel: 'fresh' }
@@ -58,8 +60,8 @@ test('recovery returns with a stuck startup, starts siblings, and records one sh
     if (spec.member.id === f.a.id) { signals.push(signal); await new Promise(() => {}) }
   }
   await f.runtime.start()
-  await delay(5)
-  assert.ok(started.includes(f.b.id), 'healthy sibling recovers independently')
+  // Each start re-validates the workspace on disk before it reaches the adapter.
+  await eventually(() => started.includes(f.b.id), 'healthy sibling recovers independently', 2000)
   const same = f.runtime.startWorker(f.mission, f.a)
   const duplicate = f.runtime.startWorker(f.mission, f.a)
   assert.equal(same, duplicate)

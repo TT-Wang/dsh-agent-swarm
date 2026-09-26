@@ -291,6 +291,9 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
   const stream = runtime.workstream(owner, mission.id, { title: 'Faults', objective: 'Exercise the fault path' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })
+  // Each member start re-validates the workspace on disk: the bodies the
+  // admissions kicked settle, so a scenario starts from a quiescent runtime.
+  await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
     outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',

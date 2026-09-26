@@ -130,8 +130,8 @@ test('a create-path stall notice names the parked work, and admitting the follow
   // R17-G7: the live status is derived from the phase and the attempt, never
   // written, so the new attempt alone makes its owner `working`.
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'the member has a confirmed stopped predecessor and a new assignment')
-  const assignment = f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id)
-  assert.ok(assignment, 'the wake is a durable assignment delivery')
+  const assignment = await eventually(() => f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id),
+    'the wake is a durable assignment delivery', 2500)
   assert.equal(assignment.member.id, f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'the woken member takes its next step')
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'and the derived status follows the live attempt')

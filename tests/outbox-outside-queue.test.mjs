@@ -72,6 +72,9 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
   const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 50 } })
   try {
     f.propose()
+    // The body that dispatches the proposal re-validates the workspace on disk,
+    // so it settles first: no pass that still changes the board takes the wedge.
+    await f.runtime.settle(f.mission.id)
     // Arm only once the open pass started from the exact current board, so the
     // pass that wedges is the one the injection targets (the same discipline F21
     // uses); otherwise an older queued pass consumes the wedge and the

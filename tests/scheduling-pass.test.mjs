@@ -476,9 +476,15 @@ test('S1/R17-G5: a start that fails past the bound stamps the body before it com
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.names.set(h.id, 'H')
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
+    // The body that proposal kicked re-validates the workspace on disk before
+    // it dispatches; it settles before the clock moves.
+    await f.runtime.settle(f.mission.id)
     await ticksUntil(f, () => taskOf(f.runtime, live.id).status === 'running', 'the live work dispatches', 400)
     workers.idle.delete(f.author.id)
     workers.idle.add(h.id); workers.idle.add(b.id)
@@ -529,8 +535,14 @@ test('S1/R17-G5: a recovery fallback reported from inside the body\'s preparatio
   const f = await setup({ workers, clock: new FakeClock(), budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
   try {
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
+    // The body that proposal kicked re-validates the workspace on disk before
+    // it dispatches; it settles before the clock moves.
+    await f.runtime.settle(f.mission.id)
     await ticksUntil(f, () => taskOf(f.runtime, live.id).status === 'running', 'the live work dispatches', 400)
     workers.idle.delete(f.author.id)
     workers.idle.add(b.id)
@@ -573,6 +585,9 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
     // Only the body delivers: the queue-external pump is off.
     f.runtime.notices.pumpOutbox = () => {}
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
     const t = f.propose({ title: 'T for busy B', assigneeId: b.id })
@@ -817,10 +832,12 @@ test('S1: a body whose members each take less than a bound is not stopped early,
   const workers = new ComputingStartWorkers()
   const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60, stallPasses: 1_000 } })
   try {
-    for (let n = 0; n < 16; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
-    // Each start re-validates the workspace on disk, so the bodies the
-    // admissions kicked settle before the clock moves.
-    await f.runtime.settle(f.mission.id)
+    // Each start re-validates the workspace on disk, so the body each admission
+    // kicks settles before the next admission queues and before the clock moves.
+    for (let n = 0; n < 16; n += 1) {
+      await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+      await f.runtime.settle(f.mission.id)
+    }
     const members = f.runtime.store.list('members', f.mission.id).map(member => member.id)
     await ticks(f, 20)
     const watched = watchBodies(f)

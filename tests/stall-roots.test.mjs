@@ -319,15 +319,17 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   // each summarized fact has its own reminder allowance.
   //
   // This test stays on the real clock and the tick timer. The held owner
-  // transport is what keeps the summary open, and a scheduling body's pass-end
-  // flush waits in it holding the mission queue, which the claims below need:
-  // only the outbox's real delivery bound (stallPassTimeoutMs of wall time)
-  // abandons that delivery, twice, and no clock or test release can end it
-  // without delivering the summary before the repair. Each wait below is on an
-  // order (the transport is entered, the unrelated fact's reminders are spent,
-  // the root is named), not on a latency; the one bound left (the root's
-  // reminder, about 60ms after the withdrawal on an idle host) has a margin of
-  // two orders of magnitude.
+  // transport is what keeps the summary open, and no clock or test release can
+  // end it without delivering the summary before the repair. While it is held
+  // only the queue-external pump attempts deliveries: a body's pass-end flush
+  // would wait in it holding the mission queue that the hand operations below
+  // need, racing that delivery's bound (stallPassTimeoutMs of wall time) with
+  // their own queue bound. Each hand claim is made while no scheduling body is
+  // open, so no body dispatches its task first. Each wait below is on an order
+  // (the transport is entered, no body is open, the unrelated fact's reminders
+  // are spent, the root is named), not on a latency; the one bound left (the
+  // root's reminder, about 60ms after the withdrawal on an idle host) has a
+  // margin of two orders of magnitude.
   const f = await fixture(t, { tickMs: 10, stallPassTimeoutMs: 5000 })
   const rt = f.runtime
   rt.notices.wakeBudget = 1
@@ -340,16 +342,22 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   let held = 0
   const deliver = rt.workers.deliver.bind(rt.workers)
   rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) { held += 1; await gate } return deliver(member, delivery) }
+  const flush = rt.flushOutbox.bind(rt)
+  rt.flushOutbox = (missionId, pass, only) => hold && pass !== undefined ? Promise.resolve() : flush(missionId, pass, only)
+  const noBody = () => eventually(() => !rt.scheduling.passes.has(f.mission.id), 'no scheduling body is open')
   const reviewer = await rt.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await rt.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  await rt.settle(f.mission.id)
   const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
   await rt.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
   rt.commit(f.mission.id, () => rt.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
   const unrelated = f.propose('Unrelated dead end', { kind: 'research', checks: undefined, assigneeId: other.id })
   await eventually(() => held > 0, 'the first owner fact is held in transport')
+  await noBody()
   const source = f.propose('Source')
   const claimed = await rt.claim(f.actor, f.mission.id, source.id)
   await rt.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await noBody()
   const review = rt.propose(f.owner, f.mission.id, { outputs: [], workstreamId: rt.store.get('tasks', source.id).workstreamId, title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
   const reviewing = await rt.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
   await rt.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
@@ -366,6 +374,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   assert.equal(root.coveredBy, undefined, 'a rejection decision carried by a summary covers nothing: the root is its own fact')
   // The owner repairs the root before the notices arrive; the unrelated fact
   // stays open while the repair runs, and is reminded until its allowance is spent.
+  await noBody()
   const repair = f.propose('Repair', { replaces: [source.id] })
   await rt.claim(f.actor, f.mission.id, repair.id)
   hold = false; release()
