@@ -14,13 +14,15 @@
  *
  * Each family below produces a blocker through the real runtime, on a board
  * with nothing else to do (the runtime's admission names it) or beside running
- * work (the transition classifier names it). `followExits` then checks every
- * decision the owner gets (the body is the diagnostic alone, the reason is
- * durable, every named call resolves in the published tool schemas) and
- * performs each call it names, as named, through the owner's registered tools
- * until the source has a live review; a family whose exit uncovers a further
- * cause lists that cause as its next step. The withdrawal a first decision
- * names is performed separately and must withdraw the source.
+ * work. `followExits` then checks every decision the owner gets (the body is
+ * the diagnostic alone, the reason is durable, every named call resolves in
+ * the published tool schemas) and performs the calls of its first exit, as
+ * named, through the owner's registered tools until the source has a live
+ * review; a family whose exit uncovers a further cause lists that cause as its
+ * next step, and a performed step's decision is no longer outstanding. Every
+ * other exit a first decision names (the withdrawal, a deferral's repair) is
+ * performed separately and must withdraw the source. A refusal met on the way
+ * is followed through the exit it names.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -112,9 +114,11 @@ function blockedNotice(f, source, cause) {
   return notice
 }
 
-/** The calls a decision names, in order, each with the parameters it names (`name`, or `name: <JSON value>`). */
+/** The calls a text names, in order, each with the parameters it names (`name`, or `name: <JSON value>`; an object's fields are its own). */
 const namedCalls = text => [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, params]) =>
-  [tool, Object.fromEntries([...params.matchAll(/([A-Za-z]\w*)(?::\s*("[^"]*"|\[\]))?/g)].map(([, param, given]) => [param, given === undefined ? undefined : JSON.parse(given)]))])
+  [tool, Object.fromEntries([...params.replace(/\{[^}]*\}/g, '{}').matchAll(/([A-Za-z]\w*)(?::\s*("[^"]*"|\[\]))?/g)].map(([, param, given]) => [param, given === undefined ? undefined : JSON.parse(given)]))])
+/** The alternative exits a decision names (`X, or Y`; `X; or, if ..., Y`), each the calls it performs in order. */
+const alternatives = text => text.split(/[,;] or,? /).map(namedCalls).filter(calls => calls.length)
 
 /**
  * Perform one call a decision names, as named: the parameters it names (a
@@ -133,7 +137,12 @@ async function perform(f, source, reason, tool, named) {
       return { ...budget, [ceiling]: budget[ceiling] + 1 }
     },
     taskId: () => tool === 'swarm_control' ? /^review (\S+) deferred/.exec(reason)[1] : source.id,
+    taskBudget: () => ({ checkTimeoutMs: 90_000 }),
     reviewOf: () => source.id,
+    replaces: () => [source.id],
+    // The corrected command a repair holds.
+    checks: () => ['test -f README.md'],
+    kind: () => taskOf(f.runtime, source.id).kind,
     acceptance: () => taskOf(f.runtime, source.id).acceptance,
     reason: () => 'Follow the exit the decision names',
     role: () => 'verification',
@@ -155,8 +164,8 @@ async function perform(f, source, reason, tool, named) {
 
 /**
  * Walk a family's steps: each step's decision is checked (the cause, the body,
- * exactly the calls expected, each resolving in its tool's schema) and every
- * call it names but the withdrawal is performed in order, then one tick runs;
+ * exactly the calls expected, each resolving in its tool's schema) and the
+ * calls of its first alternative are performed in order, then one tick runs;
  * the decision is then no longer outstanding, so no reminder repeats a cause
  * its exit removed. The last step's exits must leave the source with a live
  * review, with no action a decision did not name, meeting exactly the
@@ -167,7 +176,7 @@ async function followExits(f, { source }, { steps, refused = [] }) {
     assert.equal(f.live(source), false, `the source has no live review before ${cause}`)
     const notice = blockedNotice(f, source, cause)
     await assertNamedCalls(notice.content, calls)
-    for (const [tool, named] of namedCalls(notice.content)) if (tool !== 'swarm_cancel') await perform(f, source, notice.notice.reason, tool, named)
+    for (const [tool, named] of alternatives(notice.content)[0]) await perform(f, source, notice.notice.reason, tool, named)
     await f.pass()
     assert.equal(f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id)), false, `the exit retires its decision: ${notice.content}`)
   }
@@ -196,14 +205,21 @@ async function withdrawn(f, { running, stop } = {}) {
   return { source }
 }
 
-/** An independent review of the source defers its verdict: the host could not execute its check. */
-async function deferred(f, { running } = {}) {
+/** The host rows a deferred review's check left, per failure kind. */
+const DEFERRAL = {
+  infrastructure: { command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' },
+  timeout: { command: 'test -d .', exitCode: 124, failureKind: 'timeout', output: '[swarm] Execution timed out after 30000ms' },
+  unrunnable: { command: 'test -d .', exitCode: 127, failureKind: 'unrunnable', output: 'sh: test: command not found' },
+}
+
+/** An independent review of the source defers its verdict on a check of `kind`. */
+async function deferred(f, { running, kind = 'infrastructure' } = {}) {
   const source = f.propose()
   await f.submit(source)
   const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.stream.id, title: 'Review the source', objective: 'Independently review the scoped change',
     kind: 'verification', reviewOf: source.id, scope: ['**'], acceptance: MISSION_ACCEPTANCE, assigneeId: f.reviewer.id })
   const taken = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, review.id)
-  f.workers.checks = [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' }]
+  f.workers.checks = [DEFERRAL[kind]]
   assert.equal((await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: review.id, attemptId: taken.attempt.id, verdict: 'accept', reason: 'Review against acceptance' })).status, 'blocked')
   f.workers.checks = [{ command: 'test -d .', exitCode: 0, output: 'ok' }]
   if (running !== undefined) await f.run(running(f))
@@ -217,6 +233,10 @@ const BUDGET = n => new RegExp(`^the mission task budget is exhausted \\(${n}/${
 const NO_MEMBER = /^no live member other than the author \(member_[\w-]+\) can review this artifact independently: add /
 const WITHDRAWN = /^the automatically admitted review task_auto_review_\w+ was withdrawn: /
 const DEFERRED = /^review task_[\w-]+ deferred its verdict on this artifact: the host could not execute a check: /
+const DEFERRED_TIMEOUT = /^review task_[\w-]+ deferred its verdict on this artifact: a check reached its deadline: /
+const DEFERRED_UNRUNNABLE = /^review task_[\w-]+ deferred its verdict on this artifact: a command could not run in the clean verification checkout: /
+const REPLACE = ['swarm_control', 'swarm_cancel', 'swarm_propose']
+const TASK_CEILING = /^\[mission_task_budget_exhausted\] Mission task budget exhausted: raise maxTasks with swarm_budget\(budget, reason\), then /
 const RUNNING = /^it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: /
 const PROPOSE_OR_CANCEL = ['swarm_propose', 'swarm_cancel']
 
@@ -296,6 +316,21 @@ const FAMILIES = [
     steps: [[DEFERRED, ['swarm_control']]],
   },
   {
+    name: 'a review deferred its verdict at a check deadline, and the task budget is exhausted',
+    options: { budget: { maxTasks: 2 } },
+    block: f => deferred(f, { kind: 'timeout' }),
+    // The raise and the resume need no task slot; the repair does, and its refusal names the raise.
+    steps: [[DEFERRED_TIMEOUT, ['swarm_budget', ...REPLACE]]],
+    otherRefused: [TASK_CEILING],
+  },
+  {
+    name: 'a review deferred its verdict on a command that could not run, and the task budget is exhausted',
+    options: { budget: { maxTasks: 2 } },
+    block: f => deferred(f, { kind: 'unrunnable' }),
+    steps: [[DEFERRED_UNRUNNABLE, REPLACE]],
+    otherRefused: [TASK_CEILING],
+  },
+  {
     name: 'the rest of the board keeps running',
     block: f => submitted(f, { running: reviewer }),
     steps: [[RUNNING, PROPOSE_OR_CANCEL]],
@@ -368,14 +403,19 @@ for (const family of FAMILIES) {
   })
   const [[cause, calls]] = family.steps
   if (calls.includes('swarm_cancel')) {
-    test(`${family.name}: the withdrawal the decision names withdraws the source`, async t => {
-      const f = await fixture(t, family.options)
-      const { source } = await family.block(f)
-      const notice = blockedNotice(f, source, cause)
-      const [[, named]] = namedCalls(notice.content).filter(([tool]) => tool === 'swarm_cancel')
-      await perform(f, source, notice.notice.reason, 'swarm_cancel', named)
-      await f.pass()
-      assert.equal(taskOf(f.runtime, source.id).status, 'cancelled', 'the source is withdrawn')
+    test(`${family.name}: every other exit the first decision names withdraws the source`, async t => {
+      for (let index = 1, count = 2; index < count; index++) {
+        const f = await fixture(t, family.options)
+        const { source } = await family.block(f)
+        const notice = blockedNotice(f, source, cause)
+        const exits = alternatives(notice.content)
+        count = exits.length
+        for (const [tool, named] of exits[index]) await perform(f, source, notice.notice.reason, tool, named)
+        await f.pass()
+        assert.equal(taskOf(f.runtime, source.id).status, 'cancelled', `the source is withdrawn by ${exits[index].map(([tool]) => tool)}`)
+        assert.equal(f.refused.length, (family.otherRefused ?? []).length, `the refusals met: ${JSON.stringify(f.refused)}`)
+        ;(family.otherRefused ?? []).forEach((pattern, at) => assert.match(f.refused[at], pattern))
+      }
     })
   }
 }

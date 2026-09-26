@@ -1340,7 +1340,7 @@ export class SwarmRuntime {
       // the refusal a recorded decision with the executable exits (raise the
       // ceiling with swarm_budget, or withdraw work with swarm_cancel).
       emitGuardTerminal(this, missionId, 'task_ceiling', { detail: `mission task budget exhausted (${tasks.length}/${mission.budget.maxTasks} tasks admitted)` })
-      throw new PolicyError('mission_task_budget_exhausted', 'budget_error', 'Mission task budget exhausted')
+      throw new PolicyError('mission_task_budget_exhausted', 'budget_error', '[mission_task_budget_exhausted] Mission task budget exhausted: raise maxTasks with swarm_budget(budget, reason), then propose the task again')
     }
     if (input.experiment && tasks.filter(t => t.experiment).length >= mission.budget.maxExperiments) {
       const used = tasks.filter(t => t.experiment).length
