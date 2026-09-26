@@ -120,7 +120,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   await ctx.plugin(SandboxPolicy, { mode: 'read-only', workspaceRoot: source })
   await ctx.plugin(Approval, { policy: 'never' })
   await ctx.plugin(UserQuestionService)
-  await ctx.plugin(AgentLoop, { agents: [] })
+  const agentLoop = await ctx.plugin(AgentLoop, { agents: [] })
   if (config.defaults !== undefined) await ctx.plugin(AgentDefaultModel, config.defaults)
   ctx.llm.registerAdapter(['swarm-test', 'other-provider'], new Scripted())
   const owner = await ctx.agents.create({ sessionId: SessionId('owner-session'), meta: { cwd: source }, agentOptions: config.ownerOptions ?? { provider: 'swarm-test', model: 'scripted' } })
@@ -148,7 +148,7 @@ async function fixture(t, responder = () => ({ kind: 'text', text: 'done' }), co
   const member = { id: 'worker-test', missionId: mission.id, sessionId: 'worker-session', name: 'worker', role: 'implementer', workspace: await adapter.prepareWorkspace(mission, 'worker-test'), ...config.member }
   const spec = { mission, member, ownerSessionId: 'owner-session' }
   if (config.start !== false) await adapter.start(spec)
-  return { root, ctx, adapter, owner, options, observations, callbacks, mission, member, spec, requests, workerOwnerScope }
+  return { root, ctx, adapter, owner, options, observations, callbacks, mission, member, spec, requests, workerOwnerScope, agentLoop }
 }
 
 const message = (member, id = 'delivery-one') => ({ id, missionId: member.missionId, from: 'coordinator-test', to: member.id, kind: 'assignment', content: 'Complete the assigned task.', createdAt: 1 })
@@ -203,6 +203,28 @@ test('a native dispose that rejected has still released the worker, so the membe
   assert.ok(f.ctx.agents.get(SessionId(f.member.sessionId)), 'the member starts again on one fresh handle')
   await f.adapter.dispose()
   assert.equal(f.ctx.agents.get(SessionId(f.member.sessionId)), undefined, 'and unload releases it')
+})
+
+test('a worker the host tore down first stops without reading its retired inbox, and the input it accepted survives', async t => {
+  // A host shutdown unloads the agent loop, whose factory teardown disposes
+  // every live agent: it clears each native inbox and releases the inbox
+  // projection registration. A deferred adapter stop (a completed mission's)
+  // can run after it.
+  const f = await fixture(t, undefined, {
+    beforeChunks: (_action, options, count) => count === 1 ? new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true })
+    }) : undefined,
+  })
+  await f.adapter.deliver(f.member, message(f.member))
+  await eventually(() => f.requests.length === 1, 'the assignment turn never reached the provider', 10000)
+  await f.adapter.deliver(f.member, { ...message(f.member, 'finding-one'), kind: 'finding', content: 'A finding for the next step.' })
+  assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'])
+  await f.agentLoop.dispose()
+  await f.adapter.stop(f.member.id)
+  await f.ctx.plugin(AgentLoop, { agents: [] })
+  await f.adapter.start(f.spec)
+  assert.deepEqual(f.ctx.agents.get(SessionId(f.member.sessionId)).inbox.nextStep.map(item => item.id), ['swarm:finding-one'],
+    'the journal restores the accepted input the host teardown cleared')
 })
 
 const reasoningModel = model => model === 'plain-model' ? {} : {

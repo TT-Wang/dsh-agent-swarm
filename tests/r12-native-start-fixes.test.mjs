@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { HarnessWorkers } from '../lib/harness-workers.js'
@@ -89,18 +89,20 @@ test('uncooperative pre-factory setup cannot hang disposal; timed-out disposal r
   assert.equal(f.adapter.residents.size, 0, 'late settlement completes the retained cleanup continuation')
 })
 
-test('late shutdown journal cleanup preserves pending messages without querying the closed runtime observer', async t => {
+test('late shutdown keeps accepted pending input journaled without querying the closed runtime observer', async t => {
   const f = await fixture(t)
   await f.adapter.start(f.spec)
   const resident = f.adapter.residents.get(f.member.id)
-  const pending = { id: 'assignment', role: 'user', content: [], source: { kind: 'swarm', deliveryKind: 'assignment', deliveryId: 'delivery' } }
-  f.agent.inbox.nextTurn.push(pending)
+  // The resident journals the assignment when it accepts it; shutdown reads neither the native inbox nor the observer.
+  await f.adapter.deliver(f.member, { id: 'delivery', missionId: 'm', from: 'owner', to: f.member.id, kind: 'assignment', content: 'work', createdAt: 1 })
   const idle = deferred()
   f.agent.whenIdle = () => idle.promise
   const disposing = f.adapter.dispose()
   f.adapter.callbacks = new Proxy({}, { get() { assert.fail('runtime observer was already closed') } })
   idle.resolve(); await disposing
-  assert.equal(resident.recoveryInbox.has('assignment'), true, 'pending provenance is retained for validation on next activation')
+  assert.equal(resident.recoveryInbox.has('swarm:delivery'), true, 'pending provenance is retained for validation on next activation')
+  const journal = JSON.parse(await readFile(`${f.adapter.workspaces.metadataPath()}.inbox.json`, 'utf8'))
+  assert.deepEqual(journal.nextTurn.map(message => message.id), ['swarm:delivery'])
   assert.equal(f.calls.disposed, 1)
 })
 

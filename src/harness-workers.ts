@@ -511,15 +511,12 @@ export class HarnessWorkers implements WorkerAdapter {
     return `${this.workspaces.metadataPath(spec.mission.id, spec.member.id)}.inbox.json`
   }
 
-  /** Native handle disposal clears Inbox; retain accepted, unclaimed input across that lifecycle. */
-  private async preserveInbox(resident: Resident, agent: Agent): Promise<void> {
-    for (const [target, messages] of [['next-step', agent.inbox.nextStep], ['next-turn', agent.inbox.nextTurn]] as const) {
-      for (const message of messages) resident.recoveryInbox.set(message.id, { target, message })
-    }
+  /** Native handle disposal clears Inbox; journal the input this resident accepted from its own record, never the native inbox. */
+  private async preserveInbox(resident: Resident): Promise<void> {
     const writing = resident.journalWrites.then(async () => {
       const entries = [...resident.recoveryInbox.values()].filter(({ message }) => !this.revokedAssignment(resident, message))
       await writePrivateJson(this.inboxJournal(resident.spec), {
-        version: 1, sessionId: agent.id,
+        version: 1, sessionId: resident.spec.member.sessionId,
         nextStep: entries.filter(entry => entry.target === 'next-step').map(entry => entry.message),
         nextTurn: entries.filter(entry => entry.target === 'next-turn').map(entry => entry.message),
       })
@@ -846,7 +843,7 @@ export class HarnessWorkers implements WorkerAdapter {
       }
       abort.signal.throwIfAborted()
       await this.ctx.sessions.flush(handle.agent.session)
-      await this.preserveInbox(resident, handle.agent)
+      await this.preserveInbox(resident)
       abort.signal.throwIfAborted()
     } catch (error) {
       if (resident.handle === handle) resident.handle = undefined
@@ -971,7 +968,7 @@ export class HarnessWorkers implements WorkerAdapter {
       // Native factory/fiber teardown can clear Inbox before adapter.stop runs.
       // Journal the accepted identity before publication and outbox acknowledgement.
       resident.recoveryInbox.set(message.id, { target, message })
-      await this.preserveInbox(resident, resident.handle.agent)
+      await this.preserveInbox(resident)
       resident.abort.signal.throwIfAborted()
       if (this.closing || resident.stopping !== undefined) throw new Error('Worker is stopping')
       // Claims and findings are visible at the next step; a new assignment owns a turn.
@@ -1042,7 +1039,7 @@ export class HarnessWorkers implements WorkerAdapter {
         await handle.agent.whenIdle()
         await this.drainObservations(resident)
         try {
-          await this.preserveInbox(resident, handle.agent)
+          await resident.journalWrites
           // Cordis tears sibling effects down concurrently. The native factory
           // may already have retired this exact Session; persistence owns that
           // retired drain, while flush() only accepts a currently attached one.
