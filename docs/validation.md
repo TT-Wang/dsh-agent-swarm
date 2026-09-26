@@ -9,16 +9,19 @@ Current **0.7.0** working-tree checks and the historical **0.6.0** baseline are 
 
 ## Round-29 simplification batch 9: one authorization rule, one exit table, a derived progress clock (2026-09-25)
 
-**Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration`
-(`96f6db9` batch9/commit, `c99e854` batch9/auth, `bb242d9` batch9/checks, `380e03f` batch9/adapter, `2226867`
-batch9r2/authz, `cb331ca` batch9r2/trace, `72cc577` batch9r2/exits), followed by `27fa353`. On both supported hosts
-the build passed, and the behavioral suite ran 1564 tests: 1554 passed and 10 failed, all in
-`tests/trace-recording.test.mjs`, whose fixture called `runtime.create` without the claim argument the authorization
-branch made required. `19dbc30` fixed the fixture, and the file passed 11/11 three times on 0.1.5-rc.3 and once on
-0.1.7-rc.1. Every other gate passed on both hosts (table below). Six repair commits followed (`832b4a3` to
-`95318c0`); each is recorded below with its own regression, and the gate figures are those of `27fa353` and
-`19dbc30`. `src` net against `75b765a`: −464 lines (+649/−1113) at `19dbc30`, −478 (+664/−1142) at `95318c0`, where
-the behavioral suite has 1571 tests.
+**Gate at `27fa353` and `19dbc30`.** Seven branches were merged onto main `75b765a` on `b9-integration` (`96f6db9`
+batch9/commit, `c99e854` batch9/auth, `bb242d9` batch9/checks, `380e03f` batch9/adapter, `2226867` batch9r2/authz,
+`cb331ca` batch9r2/trace, `72cc577` batch9r2/exits), with the whitespace-only `a65f837` between `380e03f` and
+`2226867`, and followed by `27fa353`. On both supported hosts the build passed, and the behavioral suite ran 1564
+tests: 1554 passed and 10 failed, all in `tests/trace-recording.test.mjs`, whose fixture called `runtime.create`
+without the claim argument the authorization branch made required. `19dbc30` fixed the fixture, and the file passed
+11/11 three times on 0.1.5-rc.3 and once on 0.1.7-rc.1. Every other gate passed on both hosts (table below). Six
+repair commits followed (`832b4a3` to `95318c0`); each fix is recorded below with its own regression (`b7f78f2` is a
+refactor covered by the existing `tests/authorized-workspace.test.mjs` cases), and the gate figures are those of
+`27fa353` and `19dbc30`. A second repair series (`dc5d0f6` to `c65f7f1`, 2026-09-26) has its own gate record below.
+`src` net against `75b765a`: −464 lines (+649/−1113) at `19dbc30`, −478 (+664/−1142) at `95318c0`, where the
+behavioral suite has 1571 tests, −482 (+682/−1164) at `8b97e07`, and −497 (+749/−1246) at `c65f7f1`, where it has
+1577.
 
 **Progress clock** (`2f7f57a`, `c371e34`; review M-2, L-1). Wrong model: after every commit `Notices.transition()`
 recomputed the absence net's clock from the bounded event window (`maxEvents`), a hard-coded set of 20 type names
@@ -30,7 +33,7 @@ can leave it behind and `commit()` opens one transaction. Deleted: `Notices.last
 name set, the nested commit, and the stored `meaningfulProgressAt` with its casts (`tests/progress-clock.test.mjs`).
 
 **One workspace authorization rule** (batch9/auth, batch9r2/authz, and the repairs `b7f78f2`, `1912420`,
-`95318c0`; review H-1, L-36).
+`95318c0`, `79910ee`, `db41b05`; review H-1, L-36).
 
 - Wrong model: the rule was written three times over two representations and judged at two layers on two clocks.
   The runtime asked a closure (`RuntimeConfig.authorizeWorkspace`) that demanded the longest configured root equal
@@ -42,18 +45,29 @@ name set, the nested commit, and the stored `meaningfulProgressAt` with its cast
 - Right model: `RuntimeConfig.grants` is the one representation and `claimFor` (`src/authorization.ts`) the one
   rule: the calling session's own directory, else the most specific active configured root that contains the
   realpath-resolved workspace. Admission, the synchronous create path and re-validation all decide through it. Each
-  entry point hands the runtime its claim beside the plan (`WorkspaceClaim`), and the runtime records it. Only the
-  runtime re-validates, on its own clock, before every path that can reach the workspace: worker start, member
-  admission, claim and dispatch, planning snapshot, plan repair, each verification checkout (the retry included),
-  and since `1912420` delivery inspection and application and a draft launch before its check preflight. The
-  browser API only admits, and answers the runtime's `WorkspaceRevokedError` as a bad request carrying its
-  diagnostic. `fenceWorkspace` is idempotent from mission state; since `95318c0` its owner decision is keyed on the
-  runtime instance that found the revocation, so the owner is woken once per host process.
+  entry point hands the runtime its claim beside the plan (`WorkspaceClaim`), and the runtime records it. Since
+  `79910ee` the runtime's config is also the snapshot's one channel: `SwarmRuntime.start()` takes no argument and
+  records the audit of `config.grants`, and the planning tools and the browser plan path authorize against
+  `runtime.config.grants`. Since `db41b05` the field is required: a plugin with no configured root loads the empty
+  snapshot, which authorizes only the calling session's own directory, and admission, re-validation and every entry
+  point read that one value. Only the runtime re-validates, on its own clock, before each of these paths: worker
+  start, member admission, claim and dispatch, planning snapshot, plan repair, each verification checkout (the retry
+  included), and since `1912420` delivery inspection and application and a draft launch before its check preflight.
+  Submission capture, a review's artifact inspection and capture, and the checkpoints taken at a stop, an idle
+  close-out or a lease expiry inside a running attempt are not re-validated themselves; they write objects and refs
+  into the authorized repository, and a revocation reaches that attempt only when a later re-validation on one of
+  these paths fences the mission, which blocks and stops its running work. The browser API only admits, and answers
+  the runtime's `WorkspaceRevokedError` as a bad request carrying its diagnostic. `fenceWorkspace` is idempotent from
+  mission state; since `95318c0` its owner decision is keyed on the runtime instance that found the revocation, so
+  the owner is woken once per runtime instance, that is, per Harness start or plugin reload.
 - Deleted: `RuntimeConfig.authorizeWorkspace` and its closure, the duplicate grant types, the adapter's grants and
   checks (`WorkspaceOptions.grants`, `HarnessWorkerOptions.grants`, the manifest's anchor copy), the plan's
   authorization fields and `WORKSPACE_BOUND_TOOLS`, scheduling's second fence, the browser's
-  `assertRecordedWorkspace`, `grantFor` as a separate export, the three session-then-root sequences and the
-  mission-wide revocation key (`tests/authorized-workspace.test.mjs`).
+  `assertRecordedWorkspace`, `grantFor` as a separate export, the three session-then-root sequences, the
+  mission-wide revocation key, and the snapshot's other channels with their two "absent means no roots" defaults
+  (the `start(grants)` parameter, `registerTools`' grants parameter, `WebApiOptions.grants`, `planInput`'s grants and
+  dependency-directory parameters) and the runtime's two `grants === undefined` branches, which recorded a caller's
+  claim verbatim and skipped re-validation (`tests/authorized-workspace.test.mjs`).
 
 **Deletions without production readers** (batch9/checks; review M-4, M-11, M-12, L-6, L-9, L-11, L-16, L-17, L-33,
 L-34, L-36). `readScratch`/`ScratchRead`; the `ownerReplyGuard` mode nothing read (a profile that still sets it
@@ -71,16 +85,21 @@ session-append guard's first alternative since `21976c1`. The restored guard now
   polled every 5 ms, guarded a record only the owning process writes. Right model: an in-process keyed chain
   (`serialized` in `src/workspaces.ts`) orders every write of one record. Deleted: `withTaskRecordLock` with its lock
   file, staleness, polling and timeout, and the chain body `queueWorktree` duplicated.
-- Verification checkouts (M-8, `4423b64`, `c972a3c`, `e31cca9`, `4e10ec4`, and the repair `30266b4`). Wrong model:
-  each verification removed only its own checkout, so one a crash (SIGKILL, OOM) left between `git worktree add` and
-  that cleanup, tree and registration, was never removed; the first fix, like `75b765a`'s fallback and the
-  worktree-add race retry, ran a repository-wide `git worktree prune`, which also drops the user's own worktrees whose
-  directory is missing at that moment. Right model: one reclaim path, by path. Every checkout under the mission's
-  `verification/` that no in-flight verification of this process owns loses its tree first (a link is never
-  followed), then its registration (`git worktree remove --force --force`); nothing prunes, and the race retry
-  reclaims only its own target. Deleted: the per-checkout special cases, every prune, the plain `rm` before the
-  permission repair and `recordCleanupIssue` (`tests/workspaces.test.mjs`; `W4: the metadata-race retry reclaims only
-  its own target …` in `tests/worktree-concurrency.test.mjs`).
+- Verification checkouts (M-8, `4423b64`, `c972a3c`, `e31cca9`, `4e10ec4`, and the repairs `30266b4` and `8b97e07`).
+  Wrong model: each verification removed only its own checkout, so one a crash (SIGKILL, OOM) left between
+  `git worktree add` and that cleanup, tree and registration, was never removed; the first fix, like `75b765a`'s
+  fallback and the worktree-add race retry, ran a repository-wide `git worktree prune`, which also drops the user's
+  own worktrees whose directory is missing at that moment. Right model: one reclaim path, by path, and since
+  `8b97e07` one method (`Workspaces.reclaim`), which the race retry and `cleanupVerification` both run in the
+  repository's worktree queue. Every checkout under the mission's `verification/` that no in-flight verification of
+  this process owns loses its tree first (a link is never followed), then the registration of the now missing path
+  (`git worktree remove --force --force`); a tree that resists is thrown before git sees its path. Nothing prunes,
+  and the race retry reclaims only its own target: when that target's tree resists, the add fails with the reclaim's
+  own cause instead of git receiving a remove and a second add on a path whose tree still exists. Deleted: the
+  per-checkout special cases, every prune, the plain `rm` before the permission repair, `recordCleanupIssue`, and
+  the second copy of the reclaim (the retry's inline pair and `cleanupVerification`'s remove and reclaim closures)
+  (`tests/workspaces.test.mjs`; `W4: the metadata-race retry reclaims only its own target …` and `W4: a raced target
+  whose tree resists the reclaim fails the add and is never handed to git` in `tests/worktree-concurrency.test.mjs`).
 
 **Trace spans** (batch9r2/trace; review M-3). Wrong model: `record()` validated each span at call time and threw
 `TraceContractError`, and the wrapper awaited the span inside the `try` that held the command, so a failed span write
@@ -108,11 +127,12 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
 
 **Repairs after the gate.**
 
-- `832b4a3`: the host admits a submission's automatic review once. Its id is keyed on the submission, so an existing
-  row is that review and `task/review-admitted` means a pass created it; before, a review the fence had blocked was
-  re-proposed and recorded on every pass (`A fenced review path records one automatic admission however many passes
-  run`).
-- `30266b4`: the worktree-add race retry reclaims its own target by path and no longer prunes (`W4` above).
+- `832b4a3`: the host admits a submission's automatic review once. Its id was keyed on the submission (since
+  `dc5d0f6`, on the review need; see the second series below), so an existing row is that review and
+  `task/review-admitted` means a pass created it; before, a review the fence had blocked was re-proposed and recorded
+  on every pass (`A fenced review path records one automatic admission however many passes run`).
+- `30266b4`: the worktree-add race retry reclaims its own target by path and no longer prunes (`W4` above); its
+  inline reclaim became the one `Workspaces.reclaim` method in `8b97e07`.
 - `b7f78f2`: `claimFor` replaces the three session-then-root sequences of `authorizeWorkspace`,
   `reauthorizeWorkspace` and `assertAuthorizedRoot`; `grantFor` and the unread `WorkspaceAuthorized.grant` are gone.
 - `1912420`: the runtime re-validates before delivery inspection and application and before a draft launch's
@@ -124,9 +144,80 @@ about one run in ten under load, was its intermittent failure (`f8f45c0`).
   review deferred on an artifact stayed blocked after a second review accepted the source (`An accepted source closes
   the reviews the fence blocked, so the restored mission completes`; `an accepting verdict closes a sibling review
   deferred on the same artifact` in `tests/durability-sibling-retirement.test.mjs`).
-- `95318c0`: the revocation decision is keyed on the process that found it; a mission-wide key stayed held after the
-  root was restored, so a later revocation reached no one (`A revocation after the root was restored wakes the owner
-  again`).
+- `95318c0`: the revocation decision is keyed on the runtime instance that found it (one per Harness start or plugin
+  reload); a mission-wide key stayed held after the root was restored, so a later revocation reached no one (`A
+  revocation after the root was restored wakes the owner again`).
+
+**Second repair series** (`dc5d0f6` to `c65f7f1`, 2026-09-26).
+
+- `dc5d0f6`: a challenge that re-opens an automatically reviewed source (accepted back to submitted, or a running
+  automatic review invalidated on a submitted source) gets a fresh automatic review for the re-opened need, as a
+  challenged source with a proposed review already did (R10-16). The id was keyed on the submission alone, so every
+  later pass found the retired row under the same id and returned: at `95318c0` the source stayed submitted with no
+  review and no owner notice; at `75b765a` the owner instead got a `review_path_missing` notice that blamed an owner
+  cancel that never happened. An unchallenged submission keeps its id (`a challenge of an automatically reviewed
+  source admits an automatic review for the re-opened need` in `tests/review-path.test.mjs`).
+- `79910ee`: every entry point reads the grants from the runtime config (above). Plugin behaviour is unchanged,
+  since `src/index.ts` already handed one snapshot to all four channels; the module API changed:
+  `SwarmRuntime.start()` takes no argument, and `registerTools(ctx, runtime, defaultBudget)` and
+  `registerWebApi(ctx, runtime, { defaultBudget, maxPayloadBytes })` take no grants. The updated tests (AC2, AC3,
+  AC5, the binding-authorization test and the browser granted-drafts test) failed 5/70 against the previous `src` and
+  pass after.
+- `8b97e07`: one reclaim method for the race retry and `cleanupVerification` (M-8 above; `W4: a raced target whose
+  tree resists the reclaim fails the add and is never handed to git`). The retry's target that resists is now the
+  add's failure with its own cause; if the removal empties a target but cannot unlink the directory itself (a
+  non-writable parent), the add fails with that cause where git used to add into the empty directory.
+- `dff54b2`: every missing-review fact is keyed on the one review need (`SwarmRuntime.reviewNeed`). Its id keys the
+  automatic review and the owner's blocker decision; the admission grace (the runtime's, the notices' legitimacy and
+  ripeness checks and the scheduler's unreviewed-stall grace), the `task/review-missing` record and an owner
+  withdrawal are dated from the newest row that opened it. Before, only the automatic review's id followed the need:
+  a re-opened need found an earlier need's withdrawal and stayed silent until the absence net, a challenge of an old
+  submission was admitted an automatic review at once (racing a review the owner proposed in the same turn), and a
+  re-opened need recorded no missing review. A blocker decision is now one per (review need, reason), not per
+  (source, reason), so a source blocked across the upgrade is told once more (`an automatic review the owner withdrew
+  from an earlier need never blocks the need a challenge re-opens`, `a challenge re-opens the grace, so the owner's
+  own review of the re-opened source is its only review`, `a re-opened need blocked for the reason an earlier need
+  was blocked wakes the owner again` in `tests/rework-review.test.mjs`).
+- `db41b05`: `RuntimeConfig.grants` is required (above). Production never took the two `grants === undefined`
+  branches; they served unit fixtures, which now carry the empty snapshot (`NO_GRANTS` in `tests/faults/harness.mjs`,
+  also the runtime stub's config) and real temporary workspaces, so a member start in a fixture re-validates on disk
+  as it does in the plugin. The replay digest is unchanged.
+- `86445d6` (tests only): fixtures that proposed, claimed or moved the fake clock right after an admission raced the
+  pass that member start kicks; they now settle the mission or wait for the start first, and the fixed
+  `delay(0)`/`delay(5)` waits are order-based waits.
+- `0a4d167` (tests only): fault scenario F18 read the re-routed task in the poll that first saw `task/reassigned`.
+  Since `db41b05` that dispatch awaits an on-disk re-validation, so the read saw `pending` in about half the runs on
+  both hosts; the scenario now waits until the task is running (interleaved on 0.1.5-rc.3, the old scenario failed
+  4/8 and the new one passed 8/8; 8/8 on 0.1.7-rc.1).
+- `c65f7f1`: a review need re-opens only when a challenge takes a review away. `dc5d0f6` and `dff54b2` keyed the
+  need on one token per challenge of the source's claims and dated it from the newest `evidence/challenged` row, so
+  each challenge of an unreviewed submission minted a new need (another identical owner decision and
+  `task/review-missing` row, and a restarted grace), and a challenge while the automatic review was still pending
+  moved the need off that live review, so a second automatic review was admitted if that one later blocked. The need
+  is now the submission plus each review of it that a challenge retired (the `task/invalidated` row `challenge()`
+  writes for the review that accepted the source or one running or blocked) newer than its `task/submitted` row, and
+  it is dated from the newest such row; a challenge that retires no review (of an unreviewed submission, or one whose
+  review is still pending) leaves the need as it was. An unchallenged submission's id is unchanged, and
+  `SwarmStore.latestTaskEvent` is keyed by task id only again (`dff54b2` had replaced its unused `reviewOf` key with
+  an `evidenceId` key only the challenge lookup used) (`a challenge that takes no review away leaves the review need
+  as it was` in `tests/rework-review.test.mjs`).
+
+**Gate for the second series.**
+
+- `8b97e07`, on 0.1.5-rc.3 only: `node --test` 1573/1573, `test:harness`, `test:replay` (digest unchanged), the
+  fault suite 24/24, `test:web` (13 checks) and `test:command-web` (10 checks) passed.
+- `86445d6`, on 0.1.5-rc.3: `node --test` 1576/1576 on a quiet host (earlier failures there were git deadlines under
+  a load average near 270).
+- The fault gate is not a valid record at `db41b05` or `86445d6`: F18 failed about half its runs on both hosts
+  until `0a4d167`.
+- `c65f7f1`, on 0.1.5-rc.3: typecheck, build, `test:harness`, `test:replay` (digest unchanged), the fault suite 24/24
+  in two runs, `test:web` (13 checks) and `test:command-web` (10 checks) passed, and the 19 test files that reference
+  the review need, `latestTaskEvent` or `challenge()` passed 273/273 (`tests/rework-review.test.mjs` also 20/20 in
+  each of two concurrent copies over three rounds). On 0.1.7-rc.1 only typecheck, the fault suite (24/24 in two
+  runs), F18 (8/8) and `tests/rework-review.test.mjs` with `tests/review-path.test.mjs` (29/29) ran.
+- Not run at `c65f7f1`: the full `node --test` suite and `test:pack`/`test:profile`/`test:bundle` on either host, and
+  the build, `test:harness`, `test:replay` and both web smokes on 0.1.7-rc.1. The integrator commits `a65f837`,
+  `bb242d9`, `cb331ca` and `27fa353` have had no independent review.
 
 **What the review got wrong.** M-15 (a rejected native dispose leaks the worker handle, so stop and unload should
 retry it) was implemented in `213e630` and reverted in `d36efd8`. On both supported hosts the handle's dispose is
@@ -145,10 +236,14 @@ source like exit 1.
 appends its fixed exit also under blockers where no verification task can be admitted or a review is deferred; a
 contained span-recording failure is only counted in process; a registration git left locked without a recorded
 `gitdir` cannot be reclaimed by path; a record without an authorization source is judged by the configured roots
-alone; the `swarm_stage`/`swarm_create` binding and the browser's draft saves check grants on host time.
+alone; the `swarm_stage`/`swarm_create` binding and the browser's draft saves check grants on host time; submission
+capture, a review's artifact inspection and capture, and a running attempt's checkpoints are not re-validated
+themselves; a review of an accepted source that a challenge of the review's own prerequisite cancelled counts, once
+the source itself is challenged, as the re-opening of its need, so that need has no admission grace.
 `scripts/smoke-deepseek.mjs` was edited (the claim moved beside the input) and not run, because it needs provider
 credentials. Known-limitations no longer lists checkout re-authorization and task-record lock staleness on host time,
-or case F among the timer-bound tests; it corrects the claim that the plugin writes nothing into a session log
+the host-time grant check at `swarm_launch` and at a browser launch (the runtime now re-validates a draft launch on
+its own clock, `1912420`), or case F among the timer-bound tests; it corrects the claim that the plugin writes nothing into a session log
 (worker activations have appended the host's own `sandbox/mode` and `approval/policy` events since `becba81`).
 
 | Check | 0.1.5-rc.3 (`a4c74a91e0`) | 0.1.7-rc.1 (`46a7f68b09`) |
@@ -165,7 +260,8 @@ or case F among the timer-bound tests; it corrects the claim that the plugin wri
 
 With this entry's documentation on `95318c0`, the four test files that read the docs
 (`tests/authorized-workspace.test.mjs`, `tests/client-event-projection.test.mjs`, `tests/packaging.test.mjs`,
-`tests/reader-census.test.mjs`) passed 47/47 with the plugin linked to 0.1.5-rc.3.
+`tests/reader-census.test.mjs`) passed 47/47 with the plugin linked to 0.1.5-rc.3, and again 47/47 with the second
+series' documentation on `c65f7f1`.
 
 ## Batch-8 fix: boundary compaction reaches the member's preset realm (2026-09-24)
 
