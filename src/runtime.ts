@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, reviewGraceMs, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -2428,13 +2428,12 @@ export class SwarmRuntime {
   private admitMissingReviews(mission: Mission): void {
     const tasks = this.store.list('tasks', mission.id)
     const members = this.store.list('members', mission.id)
-    const grace = Math.max(this.config.tickMs, AUTO_REVIEW_GRACE_MS)
     const unreviewable: Array<[Task, ReviewNeed]> = []
     for (const source of tasks) {
       if (source.status !== 'submitted' || source.artifact === undefined) continue
       if (this.reviewable(source, tasks, members)) continue
       const need = this.reviewNeed(source)
-      if (need.age !== undefined && need.age < grace) continue
+      if (need.age !== undefined && need.age < reviewGraceMs(this.config)) continue
       this.reportMissingReview(mission, source, need)
       unreviewable.push([source, need])
     }

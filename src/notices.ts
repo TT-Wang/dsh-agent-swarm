@@ -390,7 +390,7 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * author the turn in which it submitted to propose its own review; the floor
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
-export const AUTO_REVIEW_GRACE_MS = 1000
+export const reviewGraceMs = (config: { tickMs: number }): number => Math.max(config.tickMs, 1000)
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -501,7 +501,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // rather than mistaking the end of the admission grace for a stalled task.
     if (rt.reviewable(task, tasks)) return true
     const { age } = rt.reviewNeed(task)
-    return age === undefined || age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    return age === undefined || age < reviewGraceMs(rt.config)
   }
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -1237,7 +1237,7 @@ export class Notices {
    * empty board the owner is still planning (row 17) and a board whose
    * non-terminal work is running under a live lease (row 3). The bounded
    * missing-review grace is respected: the row-5 notice arrives after
-   * `AUTO_REVIEW_GRACE_MS`, not on the tick the artifact was submitted. A
+   * `reviewGraceMs`, not on the tick the artifact was submitted. A
    * submitted artifact with no live review path is witnessed even while
    * unrelated work runs, because no other witness can ever advance it.
    *
@@ -1358,17 +1358,13 @@ export class Notices {
     const unreviewed = view.unreviewed
     if (unreviewed.length) {
       // A submitted artifact no live review can accept is an owner decision. The
-      // documented `AUTO_REVIEW_GRACE_MS` floor is honored here, not only inside
+      // documented `reviewGraceMs` floor is honored here, not only inside
       // `stalled`, because `stalled` returns before its unreviewed check when
       // any unrelated work is running; without this an unreviewable submission
       // could stay silent behind live work forever (verifier-1 challenge,
       // evidence_a454a771). The age comes from the durable row that opened the
       // review need, so a restart cannot reset the grace.
-      const grace = Math.max(this.rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
-      const ripe = unreviewed.filter(task => {
-        const { age } = this.rt.reviewNeed(task)
-        return age === undefined || age >= grace
-      })
+      const ripe = unreviewed.filter(task => { const { age } = this.rt.reviewNeed(task); return age === undefined || age >= reviewGraceMs(this.rt.config) })
       // On a board with no other progress (`reviewPathStalled`) the runtime's
       // own review admission owns every submitted artifact: its pass admits the
       // review or names the exact blocker, so a second, generic fact here would
