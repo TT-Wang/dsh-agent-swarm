@@ -217,6 +217,23 @@ test('a stored span row whose id is not a string is judged like any malformed ro
   assert.deepEqual(recorder.spansFor('m').map(row => row.step), ['swarm_create', 'swarm_launch', 'swarm_workstream'])
 })
 
+test('an attempt whose stored claim row has no string id gives its next span no parent, in the window and beyond it', () => {
+  // The attempt's claim is its scoped parent; a valid publish of the same
+  // attempt is only the fallback when no claim row exists.
+  const claim = { type: 'trace/span', data: { attemptId: 'a', step: 'swarm_claim' } }
+  const publish = { type: 'trace/span', data: { spanId: '0123456789abcdef', attemptId: 'a', step: 'swarm_publish' } }
+  const submit = () => ({ missionId: 'm', actor: 'worker', attemptId: 'a', input: {}, output: {}, status: 'ok', startedAt: 0, durationMs: 0 })
+  const windowed = new TraceRecorder({ events: () => [claim, publish], event() {}, transaction: body => body() })
+  assert.equal(windowed.record('swarm_submit', submit).parentSpanId, undefined, 'the indexed claim row is the parent, and it has no valid id')
+  // Beyond the window, parent lookup reads the durable rows by scope.
+  const filler = { type: 'trace/span', data: { spanId: 'fedcba9876543210', attemptId: 'other', step: 'swarm_publish' } }
+  const rows = [...Array.from({ length: 20_001 }, () => filler), claim, publish]
+  const traceEvents = (_missionId, limit, filter = {}) => rows.filter(row => Object.entries(filter).every(([key, value]) => row.data[key] === value)).slice(-limit)
+  const beyond = new TraceRecorder({ events: () => [], traceEvents, event() {}, transaction: body => body() })
+  assert.equal(beyond.windowFor('m').truncated, true)
+  assert.equal(beyond.record('swarm_submit', submit).parentSpanId, undefined, 'the durable claim row is the parent, and it has no valid id')
+})
+
 test('an agent without an id is refused at the session guard, so a span actor is never empty', async t => {
   const f = await fixture(t)
   await assert.rejects(f.definitions.get('swarm_observe').execute({}, { agent: { id: '' }, signal: new AbortController().signal }), /^Error: \[session_required\]/)
