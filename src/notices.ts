@@ -12,7 +12,7 @@ import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
-import { blockCauses } from './attempts.ts'
+import { blockCauses, stopFaultKey } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
@@ -1106,16 +1106,14 @@ export class Notices {
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
-    const prefix = guardTerminalKey('attempt_lease', 'stop:')
     const key = delivery.notice?.dedupKey
-    if (!key?.startsWith(prefix)) return undefined
+    if (!key?.startsWith(guardTerminalKey('attempt_lease', 'stop:'))) return undefined
     const tasks = this.rt.store.list('tasks', missionId)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
       const marker = task?.resumeAfterStop
       if (task === undefined || marker?.epoch !== task.epoch || marker.failure === undefined) return false
-      const digest = createHash('sha256').update(marker.failure.message).digest('hex')
-      return key === `${prefix}${task.id}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${digest}`
+      return key === guardTerminalKey('attempt_lease', stopFaultKey(task.id, marker, marker.failure.message))
     })
   }
 
