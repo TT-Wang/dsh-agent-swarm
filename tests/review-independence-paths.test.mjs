@@ -189,10 +189,10 @@ test('waitsLegitimately: a pending review only a prior owner could take waits on
 
 test('reviewPathBlocker: a prior owner does not count as the independent member an automatic review needs', async t => {
   const f = await coauthored(t)
-  const members = () => f.runtime.store.list('members', f.mission.id)
-  assert.equal(f.runtime.reviewPathBlocker(f.runtime.mission(f.mission.id), taskOf(f.runtime, f.source.id), members()), undefined)
+  const blocker = () => f.runtime.reviewPathBlocker(taskOf(f.runtime, f.source.id), f.runtime.reviewNeed(taskOf(f.runtime, f.source.id)))
+  assert.equal(blocker(), undefined)
   f.stopReviewer()
-  assert.match(f.runtime.reviewPathBlocker(f.runtime.mission(f.mission.id), taskOf(f.runtime, f.source.id), members()), /no live member other than the author/)
+  assert.match(blocker(), /no live member other than the author/)
 })
 
 test('unschedulable: a pending review whose only live candidates authored its source is dead', async t => {

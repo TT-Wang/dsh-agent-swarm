@@ -7,7 +7,7 @@ import { PolicyError } from './policy-error.ts'
 export { WorkspaceRevokedError } from './authorization.ts'
 import { recordedClaim, type WorkspaceClaim } from './authorization.ts'
 import { WorkspaceAdmission, gitWriteDeniedMessage, TEMP_RENDEZVOUS_WINDOW_MS, type TempMention } from './workspace-admission.ts'
-import { Notices, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
+import { Notices, ADMIT_REVIEW, AUTO_REVIEW_GRACE_MS, NOTICE_TEMPLATES, REJECTION_DECISION_TRIGGER, TERMINAL_STATES, WITHDRAW_SOURCE, missionSubject, renderNotice, subjectsOfTasks, taskSubject, type NotifyOptions } from './notices.ts'
 import { RefusalRegistry, emitGuardTerminal, queueWriterBusy, requireStrings, requireText, sameChecks, unsupportedEffort, validatedBudget } from './refusals.ts'
 import { Scheduling, progressed, type SchedulingPass } from './scheduling.ts'
 // R17-G6/G7: the one derivation of mission derived state and its host projection.
@@ -2440,7 +2440,7 @@ export class SwarmRuntime {
     }
     if (!unreviewable.length || !this.reviewPathStalled(tasks, members)) return
     for (const [source, need] of unreviewable) {
-      const blocked = this.withdrawnAutomaticReview(source, need) ?? this.reviewPathBlocker(mission, source, members)
+      const blocked = this.reviewPathBlocker(source, need)
       if (blocked !== undefined) { this.notifyReviewBlocked(mission, source, need, blocked); continue }
       this.admitAutomaticReview(mission, source, need)
     }
@@ -2474,33 +2474,25 @@ export class SwarmRuntime {
     return true
   }
   /**
-   * The automatic review the owner withdrew from this review need: one the
-   * owner cancelled after the need opened while it was the need's review,
-   * whether the host admitted it for this need or a rework re-opened it for
-   * it. Control facts never use the presentation event window: the
-   * cancellation is its own durable `task/cancelled` row, written in the
-   * cancel's transaction, and an automatic review is known by its host-minted
-   * identity, which survives a failed post-admission event write and a
-   * restart. A review retired by a verdict's sibling retirement, a rework or a
-   * challenge was never cancelled by the owner, and one cancelled before this
-   * need opened was not withdrawn from it.
+   * Why the host cannot give this unreviewable source a live review under this
+   * need, each cause with the exit that removes it, or undefined when it can
+   * admit one. A review the owner admits needs a task slot and an independent
+   * member, so the owner's withdrawal of the automatic review is named last.
+   * That withdrawal is the automatic review (known by its host-minted id) with
+   * a durable `task/cancelled` row newer than the row that opened the need; a
+   * review a verdict, rework or challenge retired was never cancelled by the owner.
    */
-  private withdrawnAutomaticReview(source: Task, need: ReviewNeed): string | undefined {
-    const withdrawn = this.store.list('tasks', source.missionId).find(review => review.reviewOf === source.id && review.status === 'cancelled'
-      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(source.missionId, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
-    if (withdrawn === undefined) return undefined
-    return `the automatically admitted review ${withdrawn.id} was withdrawn; admit a replacement review (kind verification, reviewOf ${source.id}) or cancel the source task`
-  }
-  /** The concrete reason the runtime cannot admit an independent review right now. */
-  private reviewPathBlocker(mission: Mission, source: Task, members: Member[]): string | undefined {
+  reviewPathBlocker(source: Task, need: ReviewNeed): string | undefined {
+    const mission = this.mission(source.missionId)
     const tasks = this.store.list('tasks', mission.id)
     const deferred = tasks.find(task => task.status === 'blocked' && task.reviewOf === source.id && task.verificationRecovery?.commit === source.artifact?.commit)
     if (deferred !== undefined) return `review ${deferred.id} deferred its verdict on this artifact: ${this.declaredChecks.recoveryExit(this.store.toolRuns(mission.id, { taskId: deferred.id }).filter(run => run.tool === 'swarm.host_verification').map(run => run.result as CheckResult))}`
-    if (mission.status !== 'active') return `the mission is ${mission.status}; a review can only start while the mission is active`
-    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted`
+    if (tasks.length >= mission.budget.maxTasks) return `the mission task budget is exhausted (${tasks.length}/${mission.budget.maxTasks} admitted tasks), so no verification task can be admitted: raise maxTasks with swarm_budget(budget, reason), or ${WITHDRAW_SOURCE}`
     const authors = [...authorIdsOf(source)]
-    if (!members.some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently; add an independent member and admit a verification task`
-    return undefined
+    if (!this.store.list('members', mission.id).some(member => memberPhaseOf(member) !== 'stopped' && canOwnReview(source, member.id))) return `no live member other than the author (${authors.join(', ') || 'unknown'}) can review this artifact independently: add an independent member with swarm_add_member(role), or ${WITHDRAW_SOURCE}`
+    const withdrawn = tasks.find(review => review.reviewOf === source.id && review.status === 'cancelled'
+      && review.id.startsWith(AUTOMATIC_REVIEW_PREFIX) && (this.store.latestTaskEvent(mission.id, review.id, 'task/cancelled')?.seq ?? 0) > need.seq)
+    return withdrawn === undefined ? undefined : `the automatically admitted review ${withdrawn.id} was withdrawn: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`
   }
   /** Admit the bounded independent review for one unreviewable submitted deliverable once: its id is keyed on the review need, so an existing row is that review. */
   private admitAutomaticReview(mission: Mission, source: Task, need: ReviewNeed): void {
@@ -2518,9 +2510,9 @@ export class SwarmRuntime {
         ...(source.checkTimeoutMs === undefined ? {} : { checkTimeoutMs: source.checkTimeoutMs }),
       }, reviewId)
     } catch (error) {
-      // Admission can still refuse (a budget race). The submission stands;
-      // the owner is told exactly what to admit instead.
-      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${error instanceof Error ? error.message : String(error)}`)
+      // Admission can still refuse a field copied from the source. The
+      // submission stands; the owner is told exactly what to admit instead.
+      this.notifyReviewBlocked(mission, source, need, `automatic review admission failed: ${ADMIT_REVIEW} correcting what its refusal names, or ${WITHDRAW_SOURCE}. The refusal: ${error instanceof Error ? error.message : String(error)}`)
       return
     }
     // The review already exists and its task/proposed event is durable; a busy

@@ -184,12 +184,8 @@ export class TaskGraphAdmissionError extends AdmissionError {
   override toString(): string { return `${this.name}: ${this.message}` }
 }
 
-/** Machine-checkable diagnostic for a submitted code deliverable no review can accept. */
+/** Machine-checkable diagnostic for a submitted code deliverable no review can accept; the reason names its cause's own exit (`SwarmRuntime.reviewPathBlocker`). */
 export function missingReviewDiagnostic(taskId: string, reason: string): AdmissionDiagnostic {
-  // The message is the caller's reason; the only call site (Runtime's review
-  // notification) composes the imperative exit next to it. The rendered form is
-  // pinned byte-for-byte by tests/review-path-admission.test.mjs, so the
-  // actionable half travels with the caller, not inside this stable code carrier.
   return { code: 'review_path_missing', location: `task ${JSON.stringify(taskId)}`, message: reason }
 }
 

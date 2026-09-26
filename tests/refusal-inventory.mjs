@@ -37,6 +37,7 @@
  * to a local coded producer. The schema guard's rendered text is held to the
  * full `assessText` contract by tests/tool-output.test.mjs.
  */
+import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
 import { codeProperties, refusalNodes } from './source-semantics.mjs'
 
@@ -145,6 +146,25 @@ export async function toolSchemaIndex(budget) {
   return { definitions, toolNames, propertyNames, ownProperties, names: [...SWARM_TOOLS] }
 }
 
+/** The owner's registered tools on a fixture's real runtime (`setup`'s shape): every call is checked against its published schema. */
+export async function ownerTools(f) {
+  const { registerTools } = await import('../lib/tools.js')
+  const definitions = new Map()
+  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
+  return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
+}
+
+/** Every `swarm_*(...)` call a text names is one of `expected`, with each parameter it names declared by that tool's own schema. */
+export async function assertNamedCalls(text, expected) {
+  const index = await toolSchemaIndex()
+  const calls = [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
+  assert.deepEqual(calls.map(([tool]) => tool).sort(), [...expected].sort(), `the exits named: ${text}`)
+  for (const [tool, params] of calls) {
+    assert.ok(index.toolNames.has(tool), `${tool} is a registered tool`)
+    for (const param of params) assert.ok(index.ownProperties.get(tool).has(param), `${tool} declares ${param}`)
+  }
+}
+
 /**
  * A refusal that delegates its message to another module's diagnostic. The
  * delegate must be declared with the source that authors the message and the
@@ -173,7 +193,7 @@ export const CALLER_COMPOSED_MESSAGES = [
     code: 'review_path_missing',
     authoredIn: 'src/notices.ts',
     probe: 'reviewPathExit',
-    note: 'Notices.notifyReviewBlocked (src/notices.ts since the M1a split) renders formatDiagnostic(missingReviewDiagnostic(...)) and appends the swarm_propose/reviewOf exit; tests/review-path-admission.test.mjs pins the diagnostic render itself.',
+    note: 'Each review-blocked reason names its own exit: SwarmRuntime.reviewPathBlocker, the automatic-review admission failure and the classifier fallback compose it, with the shared ADMIT_REVIEW/WITHDRAW_SOURCE exits in src/notices.ts; tests/review-blocked-exits.test.mjs performs every named exit.',
   },
 ]
 

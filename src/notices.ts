@@ -282,8 +282,7 @@ export const NOTICE_TEMPLATES = {
   },
   'review-blocked': {
     trigger: 'task/review-blocked',
-    build: (input: { diagnostic: string; sourceId: string }) =>
-      `${input.diagnostic}. Admit an independent verification task with swarm_propose (kind verification, reviewOf ${input.sourceId}) or cancel the source task; the mission cannot complete while it is unreviewable.`,
+    build: (input: { sourceId: string; reason: string }) => formatDiagnostic(missingReviewDiagnostic(input.sourceId, input.reason)),
   },
   'integration-gap': {
     trigger: 'task/proposed',
@@ -391,6 +390,9 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
 export const AUTO_REVIEW_GRACE_MS = 1000
+/** The exits a review-path blocker may name beside its own cause's: admit the review, or withdraw the source. */
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf)'
+export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -1379,8 +1381,11 @@ export class Notices {
       const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
       const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
       if (!named.length) return false
-      // The runtime admission's one emitter: a decision per source and review need.
-      for (const task of named) this.notifyReviewBlocked(view.mission, task, this.rt.reviewNeed(task).id, 'it has no live independent review path and cannot reach a verdict while the rest of the board keeps running')
+      // The runtime admission's one emitter and blocker: a decision per source and review need.
+      for (const task of named) {
+        const need = this.rt.reviewNeed(task)
+        this.notifyReviewBlocked(view.mission, task, need.id, this.rt.reviewPathBlocker(task, need) ?? `it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: ${ADMIT_REVIEW}, or ${WITHDRAW_SOURCE}`)
+      }
       return true
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
@@ -1657,10 +1662,9 @@ export class Notices {
     // S5: the durable notice ledger (class, key, sender) is the gate; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
-    const diagnostic = formatDiagnostic(missingReviewDiagnostic(source.id, reason))
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
-      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: row.id })
+      const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
       this.notify(mission.id, content, view.subjectsOf([row]),
         { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })
     })

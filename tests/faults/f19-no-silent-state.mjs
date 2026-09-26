@@ -157,14 +157,15 @@ await runScenario({
         await sleep(200)
         assert.equal(ownerNotices(f).some(delivery => delivery.content.includes(source.id)), false,
           `row 5 ${kind}: the bounded missing-review grace is honored before the notice`)
-        const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)),
+        // The witness names the runtime's own blocker: no independent member is live.
+        const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live member other than the author/.test(delivery.content)),
           `row 5 ${kind}: an unreviewable submission must be witnessed while unrelated work runs`)
         assert.match(notice.content, new RegExp(source.id))
         assertWitness(f, 'W2', `row 5 ${kind}`)
         await eventually(() => events(f.runtime, f.mission.id, 'task/review-missing').some(event => event.data.taskId === source.id),
           `row 5 ${kind}: the missing review is recorded durably`)
         await sleep(150)
-        assert.equal(ownerNotices(f).filter(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)).length, 1,
+        assert.equal(ownerNotices(f).filter(delivery => delivery.content.includes(source.id) && /no live member other than the author/.test(delivery.content)).length, 1,
           `row 5 ${kind}: an unchanged mixed board does not spam`)
         rows[`row5_${kind}`] = { witness: 'W2', taskId: source.id }
       } finally { await f.cleanup() }
@@ -187,7 +188,7 @@ await runScenario({
         assert.equal(f.runtime.store.get('members', f.reviewer.id).status, 'idle', 'the independent reviewer is live and capable')
         const notice = await eventually(() => ownerNotices(f).find(delivery => delivery.content.includes(source.id) && /no live independent review path/.test(delivery.content)),
           'row 5d: a capable idle reviewer behind live work must still produce a witness')
-        assert.match(notice.content, new RegExp(`reviewOf ${source.id}`), 'the notice tells the owner exactly what to admit')
+        assert.ok(notice.content.startsWith(`[review_path_missing] task ${JSON.stringify(source.id)}: `) && notice.content.includes('admit a review with swarm_propose(kind: "verification", reviewOf)'), 'the notice tells the owner exactly what to admit')
         assertWitness(f, 'W2', 'row 5d')
         assert.equal(reviewsOf(f, source.id).length, 0, 'the deliberate rule is kept: no automatic review while the board can still progress')
         rows.row5_capable_reviewer = { witness: 'W2', taskId: source.id }

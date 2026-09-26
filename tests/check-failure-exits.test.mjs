@@ -29,27 +29,8 @@ import assert from 'node:assert/strict'
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { registerTools } from '../lib/tools.js'
-import { toolSchemaIndex } from './refusal-inventory.mjs'
+import { assertNamedCalls, ownerTools } from './refusal-inventory.mjs'
 import { FakeWorkers, MISSION_ACCEPTANCE, WorkspaceWorkers, events, makeRepo, makeWorkspaces, setup, taskOf } from './faults/harness.mjs'
-
-/** The owner's registered tools on the fixture's real runtime: every call is checked against its published schema. */
-function ownerTools(f) {
-  const definitions = new Map()
-  registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, f.runtime, f.mission.budget)
-  return async (name, args) => (await definitions.get(name).execute({ missionId: f.mission.id, ...args }, { signal: new AbortController().signal, agent: { id: f.owner.sessionId } })).result
-}
-
-/** Every `swarm_*(...)` call the text names, with each parameter it names checked against that tool's own schema. */
-async function assertNamedCalls(text, expected) {
-  const index = await toolSchemaIndex()
-  const calls = [...text.matchAll(/(swarm_\w+)\(([^()]*)\)/g)].map(([, tool, args]) => [tool, args.replace(/"[^"]*"/g, '').match(/[A-Za-z]\w*/g) ?? []])
-  assert.deepEqual(calls.map(([tool]) => tool).sort(), [...expected].sort(), `the exits named: ${text}`)
-  for (const [tool, params] of calls) {
-    assert.ok(index.toolNames.has(tool), `${tool} is a registered tool`)
-    for (const param of params) assert.ok(index.ownProperties.get(tool).has(param), `${tool} declares ${param}`)
-  }
-}
 
 const deferredReason = f => events(f.runtime, f.mission.id, 'task/verification-deferred').at(-1)?.data.reason
 const hostRuns = f => f.runtime.store.list('tool_runs', f.mission.id).filter(run => run.tool === 'swarm.host_verification')
@@ -84,7 +65,7 @@ async function realFixture(t, files = {}) {
   const workspaces = makeWorkspaces(repo.root)
   const f = await setup({ workers: new WorkspaceWorkers(workspaces), workspace: repo.source, config: { tickMs: 60_000 } })
   t.after(async () => { await f.cleanup(); await workspaces.dispose(); await rm(repo.root, { recursive: true, force: true }) })
-  return { ...f, repo, tool: ownerTools(f) }
+  return { ...f, repo, tool: await ownerTools(f) }
 }
 
 const answer = f => async () => { await writeFile(join(f.author.workspace, 'src/answer.txt'), 'candidate\n') }
@@ -149,7 +130,7 @@ test('exit 126: the replacement exit named in the reason really works end to end
 async function fakeFixture(t, config = {}) {
   const f = await setup({ workers: new FakeWorkers(), config: { tickMs: 60_000, ...config } })
   t.after(f.cleanup)
-  return { ...f, tool: ownerTools(f) }
+  return { ...f, tool: await ownerTools(f) }
 }
 
 async function deferOn(f, rows, reason, ids = {}) {
@@ -162,7 +143,7 @@ async function deferOn(f, rows, reason, ids = {}) {
   return { source, review, verdict }
 }
 
-const blocker = (f, source) => f.runtime.reviewPathBlocker(f.runtime.mission(f.mission.id), taskOf(f.runtime, source.id), f.runtime.store.list('members', f.mission.id))
+const blocker = (f, source) => f.runtime.reviewPathBlocker(taskOf(f.runtime, source.id), f.runtime.reviewNeed(taskOf(f.runtime, source.id)))
 
 test('exit 124: the reason names checkTimeoutMs through swarm_budget, and that exit really works', async t => {
   const f = await fakeFixture(t)
