@@ -23,7 +23,7 @@ async function fixture(t) {
   runtime.kick = () => {}
   runtime.notices.wakeBudget = 0
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Owner channel', objective: 'Preserve decisions', workspace: root, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Owner channel', objective: 'Preserve decisions', workspace: root, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Asker', role: 'research' })
   const rows = () => runtime.store.list('deliveries', mission.id)
   const question = async () => {
@@ -76,13 +76,12 @@ for (const status of ['completed', 'stopped']) test(`R02: ${status} receipt clos
   assert.equal(f.rows().filter(item => item.inReplyTo === question.id).length, 0)
 })
 
-test('R01: legacy block config leaves owner tool execution available to answer', async t => {
-  const f = await fixture(t), question = await f.question(), hooks = []
-  const guard = new OwnerReplyGuard({ on: () => () => {}, agents: { get: () => ({ ctx: { on: (...args) => { hooks.push(args); return () => {} } } }) } }, f.runtime, { guard: 'block', maxNudges: 2 })
+test('R01: the reply guard leaves owner tool execution available to answer', async t => {
+  const f = await fixture(t), question = await f.question()
+  const guard = new OwnerReplyGuard({ on: () => () => {} }, f.runtime, { maxNudges: 2 })
   t.after(() => guard.dispose())
   guard.observe('owner', 'user/message', { createdAt: Date.now() + 1 })
   guard.observe('owner', 'turn/end', { reason: { kind: 'completed' } })
-  assert.equal(hooks.length, 0)
   assert.equal(f.runtime.store.get('deliveries', question.id).replyNudges, 1)
   f.runtime.message(f.owner, f.mission.id, { to: f.member.id, kind: 'question', replyTo: question.id, content: 'Now answered' })
   assert.equal(f.runtime.openAsks(f.mission.id).length, 0)
@@ -173,7 +172,7 @@ for (const reviewStatus of ['pending', 'running', 'parked']) test(`owner reminde
     f.runtime.store.put('tasks', review)
   })
   t.mock.timers.tick(120000)
-  assert.ok(f.runtime.latestSubmission(f.mission.id, source.id).age >= f.runtime.config.tickMs)
+  assert.ok(f.runtime.reviewNeed(source).age >= f.runtime.config.tickMs)
   assert.equal(f.runtime.notices.waitsLegitimately(source, f.runtime.store.list('tasks', f.mission.id)), true)
   const key = `obligation-followup:${original.id}:`
   for (let i = 0; i < 2; i++) {
@@ -196,21 +195,23 @@ test('a reminder queued before review admission is retained in the ledger but ne
   const reminder = f.rows().find(row => row.notice?.dedupKey === `obligation-followup:${original.id}:1`)
   assert.ok(reminder)
   const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  const other = { ...source, id: 'other-submission' }
   f.runtime.store.transaction(() => {
     f.runtime.store.put('tasks', source)
     f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending' })
-    f.runtime.store.put('tasks', { ...source, id: 'other-submission' })
-    f.runtime.notify(f.mission.id, 'Admit the now-existing review', [`${source.id}@${source.epoch}`], { family: 'review-blocked' })
-    f.runtime.notify(f.mission.id, 'Stale mixed batch', [`${source.id}@${source.epoch}`, 'other-submission@1'], { family: 'review-blocked' })
-    f.runtime.notify(f.mission.id, 'Current remaining request', ['other-submission@1'], { family: 'review-blocked' })
+    f.runtime.store.put('tasks', other)
     f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`])
   })
+  // Each review-blocked decision comes from the one emitter, per source and review need.
+  const mission = f.runtime.mission(f.mission.id)
+  for (const task of [source, other]) f.runtime.notices.notifyReviewBlocked(mission, task, f.runtime.reviewNeed(task).id, `no live independent review admits ${task.id}`)
+  const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   await f.runtime.flushOutbox(f.mission.id)
-  for (const row of f.rows().filter(row => row.id === reminder.id || ['Admit the now-existing review', 'Legacy review decision', 'Stale mixed batch'].includes(row.content))) {
+  for (const row of [f.rows().find(row => row.id === reminder.id), decisionOf(source), f.rows().find(row => row.content === 'Legacy review decision')]) {
     assert.equal(row.deliveredAt, undefined, 'suppression is not a transport acknowledgement')
     assert.equal(f.workers.deliveries.some(delivery => delivery.id === row.id), false)
   }
-  assert.equal(f.workers.deliveries.some(delivery => delivery.content === 'Current remaining request'), true)
+  assert.equal(f.workers.deliveries.some(delivery => delivery.id === decisionOf(other).id), true, 'the still-unreviewed source\'s decision is delivered')
 })
 
 test('bounded reminders do not create reminders of reminders', async t => {
@@ -225,7 +226,7 @@ test('bounded reminders do not create reminders of reminders', async t => {
   assert.ok(reminders.every(row => !reminders.some(parent => row.notice.dedupKey.startsWith(`obligation-followup:${parent.id}:`))))
 })
 
-test('review admission replaces a stale multi-subject decision with a fresh remaining-subject decision', async t => {
+test('review admission retires only the reviewed source\'s decision; the other source\'s decision stays live', async t => {
   const f = await fixture(t)
   await stalledDecision(f)
   const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
@@ -235,19 +236,17 @@ test('review admission replaces a stale multi-subject decision with a fresh rema
     f.runtime.store.put('tasks', other)
   })
   await flush()
-  const old = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 2)
-  assert.ok(old, 'the actual transition publisher announces both missing reviews')
+  const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+  assert.ok(decisionOf(source) && decisionOf(other), 'the transition publisher announces each missing review as its own decision')
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', {
     ...source, id: 'admitted-review', kind: 'verification', reviewOf: source.id, status: 'running',
     attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 },
   }))
   await flush()
-  const fresh = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 1 && row.subjects[0] === `${other.id}@1`)
-  assert.ok(fresh, 'the same publisher regenerates the still-unresolved subject')
-  assert.notEqual(old.notice.dedupKey, fresh.notice.dedupKey)
   await f.runtime.flushOutbox(f.mission.id)
-  assert.equal(f.workers.deliveries.some(row => row.id === old.id), false)
-  assert.equal(f.workers.deliveries.some(row => row.id === fresh.id), true, 'suppressing the obsolete batch does not suppress the necessary owner wake')
+  assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(source).id), false, 'the admitted review retired its source\'s decision')
+  assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(other).id), true, 'retiring one source\'s decision does not suppress the other\'s owner wake')
+  assert.equal(f.rows().filter(row => row.notice?.dedupKey?.startsWith('review-blocked:')).length, 2, 'no decision is regenerated for the source still blocked')
 })
 
 test('completion suppresses old actions while delivering the final result and historical facts once', async t => {
@@ -306,10 +305,8 @@ test('a delivered summary does not revive a resolved review request because unre
   })
   t.mock.timers.tick(120000)
   f.runtime.notices.wakeBudget = 1
-  f.runtime.store.transaction(() => {
-    f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress' })
-    f.runtime.notify(f.mission.id, 'Please admit the review', [`${source.id}@1`], { family: 'review-blocked' })
-  })
+  f.runtime.store.transaction(() => f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress' }))
+  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, f.runtime.reviewNeed(source).id, 'Please admit the review')
   await f.runtime.flushOutbox(f.mission.id)
   const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
   assert.ok(summary.deliveredAt)
@@ -524,7 +521,7 @@ test('unresolved reminders excerpt a legacy long notice without losing the origi
 
 test('R12: warning precedes planning expiry, deduplicates the same deadline, and re-arms on extension', async t => {
   const f = await fixture(t)
-  const request = f.runtime.requestStart({ sessionId: 'planner-owner' }, { commandId: 'deadline-check', workspace: f.root, goal: 'Plan the retained request' })
+  const request = f.runtime.requestStart({ sessionId: 'planner-owner' }, { commandId: 'deadline-check', workspace: f.root, goal: 'Plan the retained request' }, { grantRoot: f.root, source: 'session' })
   const row = f.runtime.store.get('starts', request.id); row.planningDeadlineAt = Date.now() + 10000
   f.runtime.store.put('starts', row)
   f.runtime.sweepStarts()

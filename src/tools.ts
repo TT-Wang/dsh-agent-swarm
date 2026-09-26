@@ -1,15 +1,14 @@
 /** Model tools are thin, authenticated consumers of the swarm runtime. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { JsonSchemaNode, ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
-import { authorizeWorkspace, type WorkspaceAuthorized, type WorkspaceGrantSnapshot } from './authorization.ts'
+import { authorizeWorkspace, type WorkspaceAuthorized } from './authorization.ts'
 import { inheritedAcceptance } from './admission.ts'
 import { PolicyError } from './policy-error.ts'
 import { validatePlan } from './plans.ts'
 import { runProcess } from './workspaces.ts'
 import type { SwarmRuntime } from './runtime.ts'
-import type { SwarmStore } from './store.ts'
 import { TraceRecorder, eventSummary, eventVocabularyReport, errorTypeFor, readEventHistory, traceMetrics, type TraceStep } from './trace.ts'
-import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task, TaskAmendment } from './types.ts'
+import { OWNER_ONLY_TOOLS, Actor, BoardQuery, Budget, CreateMissionInput, DraftPlan, ObserveQuery, PlanInput, PostInput, PostKind, ProposeTaskInput, PublishInput, Snapshot, Task, TaskAmendment, type WorkspaceGrantSnapshot } from './types.ts'
 
 const string = { type: 'string' } as const
 const strings = { type: 'array', items: string } as const
@@ -33,8 +32,6 @@ export const MEMBER_TOOLS = ['swarm_claim', 'swarm_publish', 'swarm_submit', 'sw
 export const MANAGEMENT_TOOLS: readonly string[] = OWNER_ONLY_TOOLS
 /** Meaningful only once a session owns an automatic request or a mission. */
 export const OWNER_SESSION_TOOLS = ['swarm_launch', 'swarm_budget', 'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore'] as const
-/** Planning tools that accept a model-supplied workspace and must bind it to the calling session. */
-export const WORKSPACE_BOUND_TOOLS = ['swarm_stage', 'swarm_create'] as const
 export type SwarmRole = 'entry' | 'owner' | 'historical-owner' | 'worker' | 'none'
 /** Global tool names hidden from a session in the given role. */
 export function hiddenToolsFor(role: SwarmRole): string[] {
@@ -48,7 +45,7 @@ export function hiddenToolsFor(role: SwarmRole): string[] {
 }
 
 /** Shared task semantics for primary planning and worker proposals. */
-export const TASK_PLANNING_RULES = `scope contains only repository-relative paths: exact files, directory prefixes ending in /, or ** only when the authorized task covers the entire repository. Put read-only restrictions, coverage instructions, methodology and other prose in objective/acceptance, never in scope; preserve those instructions when correcting paths. Do not broaden scope to make validation pass.
+const TASK_PLANNING_RULES = `scope contains only repository-relative paths: exact files, directory prefixes ending in /, or ** only when the authorized task covers the entire repository. Put read-only restrictions, coverage instructions, methodology and other prose in objective/acceptance, never in scope; preserve those instructions when correcting paths. Do not broaden scope to make validation pass.
 Choose kind from the deliverable: research includes read-only code audits, analysis and synthesis of reports from accepted research dependencies. Report synthesis does not require a code integration task. Research and synthesis must publish their own current-attempt findings backed by host-recorded tool runs before submission; citing earlier task IDs alone is insufficient. implementation changes code; integration assembles or delivers code artifacts. Both code kinds require nonempty checks chosen from actual repository acceptance commands, which run on the clean committed artifact. Do not invent an always-passing check or relabel real code work as research to evade verification. verification names reviewOf and inherits the source artifact/checks; ordinary dependencies are other accepted prerequisites, not the reviewed source.
 A task validation error is feedback for you to repair and retry the same request or proposal, not a request for the user to configure fields. Read every field diagnostic, inspect the repository if needed, preserve the user goal, task identity, acceptance and chosen budget, and retry with all required fields. Do not create a second mission to escape an error. End the turn only after successful launch/proposal or a concrete blocker you cannot resolve from available tools.`
 
@@ -75,6 +72,9 @@ Use swarm_propose for bounded work; repairs name replaces and inherit its accept
 export const SWARM_PROMPT = ENTRY_PROMPT
 
 type Args = Record<string, unknown>
+type Run = (args: Args, actor: Actor, called: Args) => Promise<unknown> | unknown
+/** A planning tool binds its model-supplied workspace and runs with the authorization beside its arguments. */
+interface PlanningRun { bound: (args: Args, actor: Actor, authorization: WorkspaceAuthorized) => Promise<unknown> | unknown }
 /** The top-level arguments guard: typed like the schema check, the other [tool_arguments_invalid] producer. */
 function object(value: unknown): Args {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new PolicyError('tool_arguments_invalid', 'validation_error', '[tool_arguments_invalid] Expected an object: pass this tool\'s named parameters as one JSON object and retry the same call.')
@@ -241,41 +241,40 @@ interface SpanContext { missionId: string; taskId?: string; attemptId?: string; 
  * attempt comes from the task the runtime actually assigned to its session.
  */
 function spanContext(runtime: SwarmRuntime, step: string, sessionId: string, args: Args, result: unknown): SpanContext | undefined {
-  const store = (runtime as { store?: SwarmStore }).store
+  const store = runtime.store
   const created = result as { mission?: { id?: unknown }; id?: unknown } | undefined
   let missionId = typeof args.missionId === 'string' ? args.missionId : undefined
   if (missionId === undefined && typeof args.requestId === 'string') {
-    const request = store?.get('starts', args.requestId)
-    if (request?.ownerSessionId === sessionId) missionId = request.missionId ?? request.id
+    const request = store.get('starts', args.requestId)
+    if (request?.ownerSessionId === sessionId) missionId = request.missionId
   }
   if (missionId === undefined && step === 'swarm_launch' && typeof created?.mission?.id === 'string') missionId = created.mission.id
   if (missionId === undefined && step === 'swarm_create' && typeof created?.id === 'string') missionId = created.id
-  if (missionId === undefined) return undefined
+  // A span is scoped only to a mission that exists: a call naming no mission,
+  // an empty one or an unknown one is an unscoped call.
+  if (missionId === undefined || store.get('missions', missionId) === undefined) return undefined
   let taskId = typeof args.taskId === 'string' ? args.taskId : undefined
   let attemptId = typeof args.attemptId === 'string' ? args.attemptId : undefined
   if (step === 'swarm_propose' && typeof created?.id === 'string') taskId = created.id
-  if (store !== undefined) {
-    const member = store.list('members', missionId).find(candidate => candidate.sessionId === sessionId)
-    const running = member === undefined ? undefined : store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
-    // A failed claim must not borrow the attempt of the task the member is
-    // already working on: the span names the step's own target or nothing.
-    if (running?.attempt !== undefined && (step !== 'swarm_claim' || running.id === taskId)) { taskId ??= running.id; attemptId ??= running.attempt.id }
-  }
-  const reviewOfTaskId = step === 'swarm_verify' && taskId !== undefined && store !== undefined ? store.get('tasks', taskId)?.reviewOf : undefined
+  const member = store.list('members', missionId).find(candidate => candidate.sessionId === sessionId)
+  const running = member === undefined ? undefined : store.list('tasks', missionId).find(task => task.status === 'running' && task.attempt?.ownerId === member.id)
+  // A failed claim must not borrow the attempt of the task the member is
+  // already working on: the span names the step's own target or nothing.
+  if (running?.attempt !== undefined && (step !== 'swarm_claim' || running.id === taskId)) { taskId ??= running.id; attemptId ??= running.attempt.id }
+  const reviewOfTaskId = step === 'swarm_verify' && taskId !== undefined ? store.get('tasks', taskId)?.reviewOf : undefined
   return { missionId, ...(taskId === undefined ? {} : { taskId }), ...(attemptId === undefined ? {} : { attemptId }), ...(reviewOfTaskId === undefined ? {} : { reviewOfTaskId }) }
 }
 
 /** Install tools with host-derived identity and durable UI metadata. */
-export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget, grants?: WorkspaceGrantSnapshot): void {
-  // No grants supplied (unit fixtures) means the only authorization is the
-  // calling session's own cwd — the pre-feature H4 boundary, never wider.
-  const authorized: WorkspaceGrantSnapshot = grants ?? { grants: [], loadedAt: Date.now(), unresolved: [] }
+export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget: Budget): void {
   // One recorder per runtime: every mission-scoped orchestration step emits a
   // durable `trace/span` row carrying the digest and size of its input and
   // output; the bytes themselves are not retained.
   const trace = TraceRecorder.forRuntime(runtime)
-  const register = (name: string, description: string, properties: Record<string, JsonSchemaNode>, required: string[],
-    run: (args: Args, actor: Actor, called: Args) => Promise<unknown> | unknown, missionKey = 'missionId') => {
+  // A tool's name is its D6 span step, so a name outside the closed TRACE_STEPS
+  // vocabulary is refused where the tool is registered, never when it is called.
+  const register = (name: TraceStep, description: string, properties: Record<string, JsonSchemaNode>, required: string[],
+    run: Run | PlanningRun, missionKey = 'missionId') => {
     const definition: ToolDefinition = {
       name,
       description,
@@ -296,50 +295,39 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
       presentCall: () => ({ card: 'generic', title: name.replaceAll('_', ' '), kind: 'read' }),
       async execute(value, exec) {
         exec.signal.throwIfAborted()
-        if (!exec.agent) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
+        // The session id is every span's actor, so an agent without one is refused here.
+        if (!exec.agent?.id) throw new Error('[session_required] Swarm tools require an authenticated Harness agent session; call this tool from an authenticated session and retry with the same `missionId`.')
         let args = object(value)
         const called = args
-        const actor = { sessionId: String(exec.agent.id), signal: exec.signal }
-        const step = name as TraceStep
-        const startedAt = Date.now()
-        // D6: one span row per orchestration step. A failed step still records a
-        // row with status=error and a closed error.type before the failure
-        // reaches the model, so the trace is complete even on the error path.
-        // Every registered tool name is a closed TRACE_STEPS member (asserted by
-        // tests/trace-span.test.mjs), so an unknown step fails loudly here
-        // instead of being silently unspanned. The span input is the arguments
-        // the step ran with, after the workspace binding below.
-        const recordSpan = async (result: unknown, status: 'ok' | 'error', error?: unknown): Promise<void> => {
-          if (trace === undefined) return
-          const context = spanContext(runtime, name, actor.sessionId, args, result)
-          if (context === undefined) { trace.noteUnscoped(name); return }
-          await trace.record({ ...context, actor: actor.sessionId, step, input: { tool: name, arguments: args },
-            output: status === 'ok' ? { result } : { error: error instanceof Error ? error.message : String(error) },
-            status, ...(status === 'error' ? { errorType: errorTypeFor(error) } : {}), startedAt, endedAt: Date.now() })
-        }
-        // The call is checked against this tool's own published schema before
-        // anything runs; the refused step is still traced. A null on an optional
-        // property is an omission, removed first (`withoutUnsetNulls`).
+        const actor = { sessionId: exec.agent.id, signal: exec.signal }
+        // A null on an optional property is an omission, removed first (`withoutUnsetNulls`).
         args = withoutUnsetNulls(definition.parameters, args) as Args
-        try { assertToolArguments(name, definition.parameters, args) } catch (error) { await recordSpan(undefined, 'error', error); throw error }
-        // H4: planning workspaces are bound to the calling session or a root the
-        // human configured once, never to the model's word. The matched root is
-        // attached for the mission record; the runtime re-derives it when the
-        // plugin installed its own authorization predicate.
-        if ((WORKSPACE_BOUND_TOOLS as readonly string[]).includes(name)) {
-          const bound = await boundPlanWorkspace(exec, text(args, 'workspace'), authorized)
-          args = { ...args, workspace: bound.workspace, workspaceGrantRoot: bound.grantRoot, workspaceAuthorizationSource: bound.source }
+        // The command: the call checked against this tool's own published schema;
+        // then (H4) a planning workspace bound to the calling session or a root the
+        // human configured once, never to the model's word. The arguments keep the
+        // canonical workspace; the authorization reaches the runtime beside them.
+        const command = async (): Promise<unknown> => {
+          assertToolArguments(name, definition.parameters, args)
+          if (typeof run === 'function') return await run(args, actor, called)
+          const authorization = await boundPlanWorkspace(exec, text(args, 'workspace'), runtime.config.grants)
+          args = { ...args, workspace: authorization.workspace }
+          return await run.bound(args, actor, authorization)
         }
-        try {
-          const result = await run(args, actor, called)
-          await recordSpan(result, 'ok')
-          const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
-          const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
-          return JSON.parse(JSON.stringify({ result, snapshot }))
-        } catch (error) {
-          await recordSpan(undefined, 'error', error)
-          throw error
-        }
+        const startedAt = Date.now(), started = performance.now()
+        const [outcome] = await Promise.allSettled([command()])
+        // D6: exactly one span per call, carrying the command's own outcome and the
+        // arguments it ran with; recording cannot change that outcome (`TraceRecorder.record`).
+        const result = outcome.status === 'fulfilled' ? outcome.value : undefined
+        trace?.record(name, () => {
+          const context = spanContext(runtime, name, actor.sessionId, args, result)
+          return context && { ...context, actor: actor.sessionId, input: { tool: name, arguments: args }, startedAt, durationMs: Math.round(performance.now() - started),
+            ...(outcome.status === 'fulfilled' ? { status: 'ok' as const, output: { result } }
+              : { status: 'error' as const, errorType: errorTypeFor(outcome.reason), output: { error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason) } }) }
+        })
+        if (outcome.status === 'rejected') throw outcome.reason
+        const missionId = name === 'swarm_launch' ? (result as Snapshot).mission.id : name === 'swarm_create' ? (result as { id: string }).id : args[missionKey]
+        const snapshot = typeof missionId === 'string' ? runtime.snapshot(actor, missionId) : undefined
+        return JSON.parse(JSON.stringify({ result, snapshot }))
       },
     }
     ctx.tools.register(definition)
@@ -384,10 +372,8 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
         properties: { assigneeKey: string, objective: string, acceptance: strings, maxSteps: positiveInteger, maxRecoveryAttempts: positiveInteger } },
     }, required: ['key', 'workstreamKey', 'title', 'objective', 'kind', 'scope', 'acceptance'] } },
   }
-  register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; the host adds one independent review per deliverable unless the plan names one. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'], (a, actor) => runtime.createDraft(actor, {
-    ...a, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
-    workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource'),
-  } as unknown as PlanInput))
+  register('swarm_stage', 'Save an editable mission plan for the Agent Swarm panel; creates no workers or model calls. Use only when the user explicitly asks for an editable draft. Local keys link members, workstreams and tasks; the host adds one independent review per deliverable unless the plan names one. End your turn after staging.', planProperties, ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget', 'members', 'workstreams', 'tasks'],
+    { bound: (a, actor, authorization) => runtime.createDraft(actor, a as unknown as PlanInput, authorization) })
   const launchProperties: Record<string, JsonSchemaNode> = structuredClone(planProperties)
   // The planning message names the workspace, and callers repeat it here; the
   // launch always runs in the frozen request workspace, so the key is accepted
@@ -443,11 +429,10 @@ export function registerTools(ctx: Context, runtime: SwarmRuntime, defaultBudget
     })
   register('swarm_create', 'Create a durable mission in the user-authorized workspace and scope with every budget field chosen for this task. Returns the mission id; then add workstreams, tasks and members.',
     { title: string, objective: string, workspace: string, scope: scopeSchema, acceptance: strings, budget: budgetSchema },
-    ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], (a, actor) => runtime.create(actor, {
+    ['title', 'objective', 'workspace', 'scope', 'acceptance', 'budget'], { bound: (a, actor, authorization) => runtime.create(actor, {
       title: text(a, 'title'), objective: text(a, 'objective'), workspace: text(a, 'workspace'), scope: array(a, 'scope'), acceptance: array(a, 'acceptance'),
-      budget: a.budget as unknown as Budget, workspaceGrantRoot: optionalText(a, 'workspaceGrantRoot'),
-      workspaceAuthorizationSource: optionalText(a, 'workspaceAuthorizationSource') as 'session' | 'grant' | undefined,
-    } satisfies CreateMissionInput))
+      budget: a.budget as unknown as Budget,
+    } satisfies CreateMissionInput, authorization) })
   register('swarm_add_member', 'Add a persistent worker sharing the mission budget; the runtime creates its isolated worktree. Omit `name` and the runtime assigns the next unused human name from the fixed pool; `role` carries the responsibility text and every address stays the member id.',
     { ...mission, name: { ...string, description: 'Optional human name. Omit it to take the next unused name from the fixed pool.' }, role: string, model: string, provider: string, reasoningEffort: string, maxOutputTokens: integer, subscriptions: strings }, ['missionId', 'role'],
     (a, actor) => runtime.addMember(actor, text(a, 'missionId'), { name: optionalText(a, 'name'), role: text(a, 'role'), model: optionalText(a, 'model'),

@@ -40,7 +40,7 @@ async function fixture(t) {
   })
   const owner = { sessionId: 'verdict-owner' }
   const mission = runtime.create(owner, { title: 'Verdict', objective: 'Honest verdicts', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -105,7 +105,7 @@ test('an infrastructure-deferred verification names the actual failed check and 
   const { source } = await f.submittedSourceWithEvidence()
   const verdict = f.proposeReview(source, 'Verdict review')
   const claimed = await f.runtime.claim(f.actor(f.reviewer), f.mission.id, verdict.id)
-  f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
+  f.workers.checks = [{ command: 'npm run typecheck && npm run build', exitCode: 127, failureKind: 'infrastructure', output: 'sh: line 1: npm: command not found\nthe toolchain is absent' }]
   await f.runtime.verify(f.actor(f.reviewer), f.mission.id, { taskId: verdict.id, attemptId: claimed.attempt.id,
     verdict: 'accept', reason: 'passed every acceptance criterion' })
   assert.equal(f.current(source.id).status, 'submitted')
@@ -122,7 +122,7 @@ test('an infrastructure-deferred verification names the actual failed check and 
   const recorded = f.runtime.store.get('tool_runs', rejected.data.checks[0])
   assert.equal(recorded.result.exitCode, 127)
   assert.match(recorded.result.output, /npm: command not found/)
-  const [notice] = f.ownerNotices().filter(delivery => /Verification could not establish a verdict/.test(delivery.content))
+  const [notice] = f.ownerNotices().filter(delivery => /deferred its verdict on the immutable source/.test(delivery.content))
   assert.ok(notice, 'the owner is woken for repair of the host environment')
   assert.match(notice.content, /swarm_control/)
   assert.match(notice.content, /passed every acceptance criterion/, 'the notice keeps the reviewer reason')

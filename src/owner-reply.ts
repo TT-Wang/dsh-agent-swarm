@@ -3,6 +3,29 @@ import type { SwarmRuntime } from './runtime.ts'
 import type { Delivery, Mission } from './types.ts'
 import { emitGuardTerminal } from './refusals.ts'
 
+/** One question booked at turn start, with everything the nudge must name. */
+interface Booking {
+  missionId: string
+  from: string
+  taskId?: string
+  content: string
+  deliveredAt?: number
+  consumedAt?: number
+}
+
+/** The nudge body: the question, the exact call, and the rule the owner must know. */
+function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking, attempt: number, limit: number): string {
+  return [
+    `[owner_reply_missing] ${booking.from} asked a question that this turn did not answer (nudge ${attempt} of ${limit}).`,
+    '',
+    `Question: ${booking.content.replace(/\s+/g, ' ').slice(0, 400)}`,
+    '',
+    `Answer it with: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<your answer>", replyTo: "${delivery.id}" })`,
+    `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<why not>", replyTo: "${delivery.id}", dismiss: true })`,
+    'Your reply in the conversation is not delivered to the member: only that call writes the receipt.',
+  ].join('\n')
+}
+
 /**
  * L2: the owner-side half of the reply protocol.
  *
@@ -24,55 +47,22 @@ import { emitGuardTerminal } from './refusals.ts'
  * makes the missing receipt visible and executable, which is the invariant the
  * board already keeps for task state.
  */
-export interface OwnerReplyOptions {
-  /**
-   * `nudge` records the miss and instructs. Legacy `block` is accepted as an
-   * alias: the owner control channel must remain available to answer it.
-   */
-  guard: 'nudge' | 'block'
-  /** Nudges spent on one question before the guard terminal; default 2. */
-  maxNudges: number
-}
-
-/** One question booked at turn start, with everything the nudge must name. */
-interface Booking {
-  missionId: string
-  from: string
-  taskId?: string
-  content: string
-  deliveredAt?: number
-  consumedAt?: number
-}
-
-/** The nudge body: the question, the exact call, and the rule the owner must know. */
-export function ownerReplyNudge(missionId: string, delivery: Delivery, booking: Booking, attempt: number, limit: number): string {
-  return [
-    `[owner_reply_missing] ${booking.from} asked a question that this turn did not answer (nudge ${attempt} of ${limit}).`,
-    '',
-    `Question: ${booking.content.replace(/\s+/g, ' ').slice(0, 400)}`,
-    '',
-    `Answer it with: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<your answer>", replyTo: "${delivery.id}" })`,
-    `Or close it deliberately: swarm_message({ missionId: "${missionId}", to: "${booking.from}", kind: "question", content: "<why not>", replyTo: "${delivery.id}", dismiss: true })`,
-    'Your reply in the conversation is not delivered to the member: only that call writes the receipt.',
-  ].join('\n')
-}
-
 export class OwnerReplyGuard {
   private readonly bookings = new Map<string, Map<string, Booking>>()
-  private readonly removals: Array<() => void> = []
+  private readonly removal: () => void
   private closed = false
 
-  constructor(private readonly ctx: Context, private readonly rt: SwarmRuntime, private readonly options: OwnerReplyOptions) {
-    this.removals.push(ctx.on('session/event', (session, event) => {
+  constructor(ctx: Context, private readonly rt: SwarmRuntime, private readonly options: { /** Nudges spent on one question before the guard terminal. */ maxNudges: number }) {
+    this.removal = ctx.on('session/event', (session, event) => {
       if (this.closed) return
       try { this.observe(String(session.header.id), event.type, event.data) }
       catch { /* An observer must never break a turn; the next turn re-derives the miss. */ }
-    }))
+    })
   }
 
   dispose(): void {
     this.closed = true
-    for (const remove of this.removals.splice(0)) { try { remove() } catch { /* Continue releasing the other registrations. */ } }
+    this.removal()
     this.bookings.clear()
   }
 

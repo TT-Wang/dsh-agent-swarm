@@ -124,7 +124,6 @@ const CENSUS = [
   ["src/admission.ts",14,"Set","const resolved = resolveHostOnlyScript(command, scripts, new Set(), 0)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/admission.ts",15,"Set","const SHELL_WORD_OPERATORS = new Set([';', '&', '|', '(', ')', '<', '>', '\\n'])","constant","","module-level immutable lookup table, never mutated after construction: data, not a gate"],
   ["src/admission.ts",16,"Set","const seen = new Set<string>()","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
-  ["src/arena.ts",1,"Set","export function liveCarrier(tasks: readonly Task[], dependencyId: string, seen: Set<string> = new Set()): Task | undefined {","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/attempts.ts",1,"Map","readonly idleSignals = new Map<string, { attemptId: string; at: number }>()","gate","cache-only","the durable Task.idleSignal carries the same value and the scheduling pass re-reads it"],
   ["src/attempts.ts",2,"Set","if (owner !== undefined) task.priorOwnerIds = [...new Set([...(task.priorOwnerIds ?? []), owner])]","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/declared-checks.ts",1,"Map","private readonly checkRuns = new Map<string, CheckResult[][]>()","outside","","outside the runtime decision path: the declared-check runner (DeclaredChecks) below the runtime, reached through the verification adapter; the in-memory hold carries the FIRST failed pass until recordRuns() writes the pair, so losing it under-records that pair without changing the verdict (enumerated, no label claimed)"],
@@ -132,7 +131,6 @@ const CENSUS = [
   ["src/delivery.ts",2,"Map","const sourceIdentities = new Map<string, string>()","outside","","outside the runtime decision path: the delivery engine module (applyDelivery); the runtime serializes applies per workspace through exclusive(\"delivery:<workspace>\"), so the runtime path does not depend on this process-global mutex (enumerated, no label claimed)"],
   ["src/delivery.ts",3,"Set","const FALLBACK_TEMP_CODES = new Set(['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR'])","constant","","module-level immutable lookup table, never mutated after construction: the errno allowlist the R15-F5 temp-root fallback decides on, data rather than a gate"],
   ["src/gates.ts",1,"Map","readonly fingerprintCache = new Map<string, { revision: number; fingerprint: string }>()","gate","cache-only","keyed by the global store revision; the digest is pure over durable state and is bypassed inside a transaction"],
-  ["src/gates.ts",2,"Set","readonly budgetStops = new Set<string>()","gate","cache-only","S5r: the durable `budgetPause.stopping` claim (written before the first await, bounded like the pass guard) is the gate; the Set is only the public mirror `SwarmRuntime.budgetStops` names and is never read to decide whether a stop may run"],
   ["src/gates.ts",3,"Set","const ready = new Set(tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/gates.ts",4,"Set","const unreviewed = new Set(tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)).map(task => task.id))","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
   ["src/git-snapshot.ts",1,"Set","const trackedSet = new Set(tracked)","local","","function-local: created and discarded inside one synchronous call, so it cannot gate a later call"],
@@ -224,7 +222,7 @@ const CENSUS = [
   ["src/store.ts",3,"Set","let liveOwners = new Set<string>()","local","","R17-G7 function-local: the live-attempt owner ids for the member rows being hydrated, created and discarded inside one synchronous read, so it cannot gate a later call"],
   ["src/store.ts",4,"Set","return new Set(rows.map(row => String(row.owner_id)))","local","","R17-G7 function-local: the owner ids of the running attempts in one mission, read from the durable tasks table and discarded inside the same synchronous hydration, so it cannot gate a later call"],
   ["src/trace.ts",1,"Set","const reclaimed = new Set<string>()","local","","function-local: created and discarded inside one sweep call, so it cannot gate a later call; the selection it drives is re-derived from the files' mtimes and the declared bound on every later sweep"],
-  ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: the runtime-to-host-sink link registry for the telemetry transport; a missing link can drop one reporting record, never a durable row or a mission decision (the span row is appended before the sink is consulted)"],
+  ["src/trace.ts",2,"WeakMap","const hostTelemetryLinks = new WeakMap<object, HostTelemetryLink>()","outside","","outside the runtime decision path: where a runtime's span recorder and its host-sink binding meet (whichever binds first creates the one link); the link carries the attached sink and the best-effort failure count, so losing it can cost reporting records and that count, never a durable row or a mission decision"],
   ["src/trace.ts",3,"Map","private readonly indexes = new Map<string, SpanIndex>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",4,"Map","private readonly unscoped = new Map<string, number>()","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
   ["src/trace.ts",5,"Map","const index: SpanIndex = { byTask: new Map(), byAttempt: new Map(), all: [] }","outside","","outside the runtime decision path: the trace read model (TraceIndex): an owner-UI projection cache no runtime decision reads (enumerated, no label claimed)"],
@@ -297,6 +295,12 @@ const RECOVERY_COLLECTIONS = {
   'src/runtime.ts:ownerObserveCursors': { kind: 'Map', label: 'cache-only', proof: 'tests/observe-owner-delta.test.mjs',
     behavior: 'owner cursors are replayable, scoped, bounded and disposable',
     reason: 'At most64 immutable compact baselines belong to explicit owner/mission cursors; loss or eviction returns a complete compact view, never gates execution or settles an obligation.' },
+  'src/workspaces.ts:pathQueues': { kind: 'Map', label: 'in-flight', proof: 'tests/durability-advisories.test.mjs',
+    behavior: 'waits behind the checkpoint of a member leaving the task, so it is never lost',
+    reason: 'One promise chain per git common dir and per task record: every writer of either runs in this process, so the chain is the whole serialization; an entry is released when its last callback settles and holds nothing durable.' },
+  'src/workspaces.ts:verificationCheckouts': { kind: 'Set', label: 'in-flight', proof: 'tests/workspaces.test.mjs',
+    behavior: 'never reclaims the checkout of a concurrent in-flight verification',
+    reason: 'The verification checkouts in flight in this process, each until its cleanup ends. Loss on restart is the point: every checkout left under a mission is then garbage, and the next verification of that mission reclaims its tree and its registration.' },
   'src/workspaces.ts:preparations': { kind: 'Map', label: 'in-flight', proof: 'tests/rule-workspace-recovery.test.mjs',
     behavior: 'overlapping preparation of one member and epoch reuses its workspace after the first preparation settles',
     reason: 'Per-member preparation promises serialize concurrent workspace I/O and release in finally; stop/dispose abort queued work. Durable workspace manifests, not this process-local queue, own restart recovery.' },
@@ -431,7 +435,7 @@ const GATE_TESTS = {
     const workers = new GatedWorkers()
     const f = await setup({ workers })
     try {
-      const request = f.runtime.requestStart(f.owner, { commandId: 's5c-cancel', goal: 'Make the requested change and verify it', workspace: f.dir })
+      const request = f.runtime.requestStart(f.owner, { commandId: 's5c-cancel', goal: 'Make the requested change and verify it', workspace: f.dir }, { grantRoot: f.dir, source: 'session' })
       const gate = deferred()
       workers.prepareGate = gate.promise
       const launching = f.runtime.startPlan(f.owner, request.id, automaticPlan(f.dir))
@@ -509,8 +513,8 @@ const GATE_TESTS = {
     const f = await setup()
     try {
       const before = f.runtime.fingerprint(f.mission.id)
-      assert.ok(f.runtime.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
-      f.runtime.fingerprintCache.clear()   // the loss
+      assert.ok(f.runtime.gates.fingerprintCache.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.gates.fingerprintCache.clear()   // the loss
       assert.equal(f.runtime.fingerprint(f.mission.id), before, 'the digest is recomputed from durable state and is identical')
       let inside
       const task = f.propose({ title: 'Board change' })
@@ -525,51 +529,6 @@ const GATE_TESTS = {
       assert.equal(inside, after, 'inside a transaction the cache is bypassed (commitDepth), so it can never gate on a stale board')
     } finally { await f.cleanup() }
   },
-  'src/gates.ts:2': async t => {
-    const f = await setup({ config: { tickMs: 10 } })
-    try {
-      // Gate the adapter stop so the claim window is observable: the Set is
-      // provably non-empty when the loss is injected, and the stop is in flight.
-      let releaseStop
-      const stopGate = new Promise(resolve => { releaseStop = resolve })
-      let stopCalls = 0
-      f.workers.stop = async () => { stopCalls += 1; await stopGate }
-      f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); mission.usedTokens = mission.budget.maxTokens; f.runtime.store.put('missions', mission) })
-      await eventually(() => f.runtime.mission(f.mission.id).status === 'blocked', 'the exhausted budget blocks the mission')
-      const pauseId = f.runtime.mission(f.mission.id).budgetPause.id
-      await eventually(() => f.runtime.budgetStops.size > 0, 'the in-flight stop is mirrored')
-      assert.ok(f.runtime.budgetStops.size > 0, 'the loss must be exercised on a non-empty collection')
-      assert.equal(f.runtime.mission(f.mission.id).budgetPause.stopping?.instanceId, f.runtime.instanceId,
-        'the durable claim is written before the stop awaits the adapter')
-      // THE LOSS: drop the mirror while the stop is in flight, then ask for the
-      // same stop again. The durable claim, not the Set, must absorb it.
-      f.runtime.budgetStops.clear()
-      f.runtime.beginBudgetStop(f.mission.id, pauseId)
-      releaseStop()
-      await eventually(() => f.runtime.mission(f.mission.id).budgetPause?.quiesced === true, 'the stop completes')
-      await new Promise(resolve => setTimeout(resolve, 80))
-      assert.equal(events(f.runtime, f.mission.id, 'mission/budget-quiesced').length, 1,
-        'the durable claim absorbs the duplicate: exactly one quiesced event')
-      assert.equal(events(f.runtime, f.mission.id, 'mission/budget-exhausted').length, 1)
-      assert.equal(stopCalls, 2, 'the duplicate request stopped no member a second time')
-      assert.equal(f.runtime.mission(f.mission.id).budgetPause.stopping, undefined, 'the completed stop clears its claim')
-    } finally { await f.cleanup() }
-    // Bounded claim: a crashed stop (foreign instance, older than the declared
-    // pass bound) must not gate a fresh attempt forever.
-    const crashed = await setup()
-    try {
-      crashed.runtime.store.transaction(() => {
-        const mission = crashed.runtime.mission(crashed.mission.id)
-        mission.status = 'blocked'
-        mission.budgetPause = { id: 'pause-crashed', quiesced: false, stopping: { instanceId: 'other-runtime', at: Date.now() - 60_000 } }
-        crashed.runtime.store.put('missions', mission)
-      })
-      crashed.runtime.beginBudgetStop(crashed.mission.id, 'pause-crashed')
-      await eventually(() => crashed.runtime.mission(crashed.mission.id).budgetPause?.quiesced === true,
-        'a foreign, expired claim does not gate the stop')
-      assert.equal(events(crashed.runtime, crashed.mission.id, 'mission/budget-quiesced').length, 1)
-    } finally { await crashed.cleanup() }
-  },
   'src/attempts.ts:1': async t => {
     const f = await setup({ config: { tickMs: 10 } })
     try {
@@ -578,9 +537,9 @@ const GATE_TESTS = {
       await f.workers.callbacks.idle(f.author.id)
       const signal = taskOf(f.runtime, task.id).idleSignal
       assert.ok(signal?.attemptId, 'the durable `Task.idleSignal` carries the same value the map held')
-      assert.equal(f.runtime.idleSignals.get(f.author.id)?.attemptId, signal.attemptId)
-      assert.ok(f.runtime.idleSignals.size > 0, 'the loss must be exercised on a non-empty collection')
-      f.runtime.idleSignals.clear()   // the loss
+      assert.equal(f.runtime.attempts.idleSignals.get(f.author.id)?.attemptId, signal.attemptId)
+      assert.ok(f.runtime.attempts.idleSignals.size > 0, 'the loss must be exercised on a non-empty collection')
+      f.runtime.attempts.idleSignals.clear()   // the loss
       // Dispatch must be able to reach the open attempt for the durable signal
       // to be consulted at all.
       f.workers.autoIdle = true
@@ -759,7 +718,7 @@ test('S5c D1 closed: the stale-revision refusal event is registered and visible 
   // as unrecognized — verifier-1's reproduction). S5c closes it at the choke
   // point: the registry names the row, and because `store.event` takes
   // `EventKind`, a constant emission is checked exactly like a literal one.
-  const { EVENT_VOCABULARY } = await import('../lib/trace.js')
+  const { EVENT_VOCABULARY } = await import('../lib/events.js')
   const { STALE_TASK_REFUSAL_EVENT } = await import('../lib/store.js')
   assert.equal(STALE_TASK_REFUSAL_EVENT, 'task/stale-revision-refused')
   assert.equal(typeof EVENT_VOCABULARY[STALE_TASK_REFUSAL_EVENT], 'string',
@@ -789,6 +748,50 @@ test('S5 gate src/runtime.ts:7 pair: the mission queue never forks two waiters o
 test('S5 inventory: every gate entry has exactly one test', () => {
   for (const entry of GATES) assert.equal(typeof GATE_TESTS[key(entry)], 'function', `${key(entry)} is labelled a gate, so it needs a test body`)
   for (const entry of Object.keys(GATE_TESTS)) assert.ok(GATES.some(candidate => key(candidate) === entry), `${entry} has a test but is not a labelled gate entry`)
+})
+
+test('S5r: the durable budget-stop claim absorbs a duplicate stop in flight, and a crashed claim does not gate', async () => {
+  const f = await setup({ config: { tickMs: 10 } })
+  try {
+    // Gate the adapter stop so the claim window is observable: the stop is
+    // provably in flight when the duplicate request arrives.
+    let releaseStop
+    const stopGate = new Promise(resolve => { releaseStop = resolve })
+    let stopCalls = 0
+    f.workers.stop = async () => { stopCalls += 1; await stopGate }
+    f.runtime.store.transaction(() => { const mission = f.runtime.mission(f.mission.id); mission.usedTokens = mission.budget.maxTokens; f.runtime.store.put('missions', mission) })
+    await eventually(() => f.runtime.mission(f.mission.id).status === 'blocked', 'the exhausted budget blocks the mission')
+    const pauseId = f.runtime.mission(f.mission.id).budgetPause.id
+    await eventually(() => f.runtime.mission(f.mission.id).budgetPause.stopping, 'the in-flight stop holds its durable claim')
+    assert.equal(f.runtime.mission(f.mission.id).budgetPause.stopping.instanceId, f.runtime.instanceId,
+      'the durable claim is written before the stop awaits the adapter')
+    // Ask for the same stop again while the first is in flight: the durable
+    // claim must absorb it.
+    f.runtime.beginBudgetStop(f.mission.id, pauseId)
+    releaseStop()
+    await eventually(() => f.runtime.mission(f.mission.id).budgetPause?.quiesced === true, 'the stop completes')
+    await f.runtime.settle(f.mission.id)
+    assert.equal(events(f.runtime, f.mission.id, 'mission/budget-quiesced').length, 1,
+      'the durable claim absorbs the duplicate: exactly one quiesced event')
+    assert.equal(events(f.runtime, f.mission.id, 'mission/budget-exhausted').length, 1)
+    assert.equal(stopCalls, 2, 'the duplicate request stopped no member a second time')
+    assert.equal(f.runtime.mission(f.mission.id).budgetPause.stopping, undefined, 'the completed stop clears its claim')
+  } finally { await f.cleanup() }
+  // Bounded claim: a crashed stop (foreign instance, older than the declared
+  // pass bound) must not gate a fresh attempt forever.
+  const crashed = await setup()
+  try {
+    crashed.runtime.store.transaction(() => {
+      const mission = crashed.runtime.mission(crashed.mission.id)
+      mission.status = 'blocked'
+      mission.budgetPause = { id: 'pause-crashed', quiesced: false, stopping: { instanceId: 'other-runtime', at: Date.now() - 60_000 } }
+      crashed.runtime.store.put('missions', mission)
+    })
+    crashed.runtime.beginBudgetStop(crashed.mission.id, 'pause-crashed')
+    await eventually(() => crashed.runtime.mission(crashed.mission.id).budgetPause?.quiesced === true,
+      'a foreign, expired claim does not gate the stop')
+    assert.equal(events(crashed.runtime, crashed.mission.id, 'mission/budget-quiesced').length, 1)
+  } finally { await crashed.cleanup() }
 })
 
 for (const [entryKey, body] of Object.entries(GATE_TESTS)) {

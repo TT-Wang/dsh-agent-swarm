@@ -72,6 +72,9 @@ test('S2: a stalled pass still delivers the owner escalation inside the declared
   const f = await setup({ workers, config: { tickMs: 10, stallPassTimeoutMs: boundMs, stallPasses: 50 } })
   try {
     f.propose()
+    // The body that dispatches the proposal re-validates the workspace on disk,
+    // so it settles first: no pass that still changes the board takes the wedge.
+    await f.runtime.settle(f.mission.id)
     // Arm only once the open pass started from the exact current board, so the
     // pass that wedges is the one the injection targets (the same discipline F21
     // uses); otherwise an older queued pass consumes the wedge and the
@@ -110,7 +113,7 @@ test('S2: one never-settling adapter deliver cannot starve a notice for another 
     const other = f.runtime.create(f.owner, {
       title: 'Other mission', objective: 'Prove the pump is not globally locked', workspace: f.dir, scope: ['**'],
       acceptance: f.mission.acceptance, budget: { ...budget, maxTasks: 10 },
-    })
+    }, { grantRoot: f.dir, source: 'session' })
     const hung = { id: 'msg_s2b_hung', missionId: f.mission.id, from: 'runtime', to: 'owner', kind: 'control', content: 'notice whose delivery never settles', createdAt: Date.now() }
     workers.hung.add(hung.id)
     f.runtime.store.transaction(() => f.runtime.store.put('deliveries', hung))

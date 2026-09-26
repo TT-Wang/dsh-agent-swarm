@@ -31,7 +31,7 @@ class ControlledWorkers extends FakeWorkers {
 async function runtimeFixture(t,clock) {
   const {dir:root,runtime,workers,config,budget}=await makeRuntime(t,{workers:new ControlledWorkers(),clock,config:{leaseMs:100,maxEvents:100,checkTimeoutMs:undefined},budget:{maxTokens:100000,maxSteps:100,maxWorkers:2,maxDurationMs:60000,maxTasks:10,maxExperiments:1}})
   await runtime.start()
-  const owner={sessionId:'owner'}, mission=runtime.create(owner,{title:'Activity',objective:'Work',workspace:'/source',scope:['src/'],acceptance:['works'],budget})
+  const owner={sessionId:'owner'}, mission=runtime.create(owner,{title:'Activity',objective:'Work',workspace:root,scope:['src/'],acceptance:['works'],budget}, { grantRoot: root, source: 'session' })
   const stream=runtime.workstream(owner,mission.id,{title:'Code',objective:'Work'})
   const member=await runtime.addMember(owner,mission.id,{name:'Builder',role:'implementation'}), actor={sessionId:member.sessionId}
   const propose=(extra={})=>runtime.propose(owner,mission.id,{ outputs: [],workstreamId:stream.id,title:'Task',objective:'Work',kind:'implementation',scope:['src/'],acceptance:['works'],checks:['check'],maxRecoveryAttempts:1,...extra})

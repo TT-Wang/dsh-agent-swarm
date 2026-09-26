@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TEMP_RENDEZVOUS_WINDOW_MS, sharedTempPaths, tempRendezvousDecision } from '../lib/runtime.js'
-import { EVENT_VOCABULARY } from '../lib/trace.js'
+import { EVENT_VOCABULARY } from '../lib/events.js'
 import { FakeWorkers, makeRuntime } from './faults/harness.mjs'
 
 test('R11-15: sharedTempPaths extracts only shared-temp absolute paths from host-recorded input', () => {
@@ -43,7 +43,7 @@ test('R11-15: two members naming the same temp path emit one durable event and o
   })
   await runtime.start()
   const owner = { sessionId: 'temp-owner' }
-  const mission = runtime.create(owner, { title: 'Temp channel', objective: 'Detect a rendezvous', workspace: directory, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Temp channel', objective: 'Detect a rendezvous', workspace: directory, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const first = await runtime.addMember(owner, mission.id, { name: 'First', role: 'implementation' })
   const second = await runtime.addMember(owner, mission.id, { name: 'Second', role: 'implementation' })

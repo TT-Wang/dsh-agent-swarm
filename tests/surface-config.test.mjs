@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Config } from '../lib/index.js'
 import { SwarmRuntime } from '../lib/runtime.js'
-import { FakeWorkers, budget } from './faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS, budget } from './faults/harness.mjs'
 
 const base = { statePath: '/tmp/swarm-config/swarm.sqlite', workspacesRoot: '/tmp/swarm-config/workspaces' }
 
@@ -60,13 +60,23 @@ test('a non-function now in a runtime config built from the profile falls back t
   for (const now of [5, 'x']) {
     // fixture gap: makeRuntime cannot build a runtime whose whole config is Config(profile); this one is the subject.
     const dir = await mkdtemp(join(tmpdir(), 'swarm-config-now-'))
-    const runtime = new SwarmRuntime({ ...Config({ statePath: join(dir, 'swarm.sqlite'), workspacesRoot: join(dir, 'workspaces'), now }), maxTasksPerMember: 3 }, new FakeWorkers())
+    const runtime = new SwarmRuntime({ ...Config({ statePath: join(dir, 'swarm.sqlite'), workspacesRoot: join(dir, 'workspaces'), now }), maxTasksPerMember: 3, grants: NO_GRANTS }, new FakeWorkers())
     try {
       await runtime.start()
       const before = Date.now()
-      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+      const mission = runtime.create({ sessionId: 'config-owner' }, { title: 'Clock', objective: 'Run on the default clock', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
       assert.equal(mission.status, 'active', `now: ${JSON.stringify(now)}`)
       assert.ok(mission.createdAt >= before && mission.createdAt <= Date.now(), 'the mission is stamped by the default clock')
     } finally { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) }
+  }
+})
+
+test('the owner-reply guard mode is no longer offered, and a profile that still sets it loads', () => {
+  // No code read `ownerReplyGuard`: 'block' behaved exactly like 'nudge'. The
+  // schema no longer advertises it, and the object schema keeps an unknown key,
+  // so an existing profile naming it still parses.
+  assert.equal(Object.hasOwn(Config.dict, 'ownerReplyGuard'), false, 'the settings surface does not offer a mode nothing reads')
+  for (const ownerReplyGuard of ['block', 'nudge']) {
+    assert.equal(Config({ ...base, ownerReplyGuard }).maxOwnerReplyNudges, 2, `a profile naming ownerReplyGuard: ${ownerReplyGuard} still loads`)
   }
 })

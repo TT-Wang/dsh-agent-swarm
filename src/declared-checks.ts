@@ -10,12 +10,12 @@
  */
 import type { SwarmRuntime } from './runtime.ts'
 import { randomUUID } from 'node:crypto'
-import type { Artifact, Member, Task, ToolRun } from './types.ts'
+import type { Artifact, CheckResult, Member, Task, ToolRun } from './types.ts'
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
 /** Host verification timeout when a task chose none; matches the plugin config default. */
-export const DEFAULT_CHECK_TIMEOUT_MS = 60000
+const DEFAULT_CHECK_TIMEOUT_MS = 60000
 
 /** A rejection names at most this many failing checks; the rest are counted. */
 export const MAX_REPORTED_CHECK_FAILURES = 4
@@ -26,8 +26,23 @@ export function excerpt(value: unknown, limit: number): string {
   return raw.length <= limit ? raw : `${raw.slice(0, limit)}… [${raw.length - limit} more chars]`
 }
 
-/** One declared check's outcome, as the host recorded it. */
-export type CheckResult = import('./types.ts').CheckResult
+/** The row for a declared check the host could not prepare, confine or start: the review defers instead of rejecting the artifact. */
+export function unexecutedCheck(command: string, error: unknown): CheckResult {
+  return { command, exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(error)}` }
+}
+
+const RESUME = 'resume the review with swarm_control(action: "resume", taskId, reason)'
+const REPLACE = 'or, if the command itself is wrong, cancel the source with swarm_cancel(taskId, reason) and repair it with swarm_propose(replaces, checks) holding corrected commands'
+/** The one exit per failure kind classified on the row, an older host's rows included; it names no id and bounds row data, so a deferral has a fixed maximum. */
+const RECOVERY_EXITS: Record<NonNullable<CheckResult['failureKind']>, (check: CheckResult) => string> = {
+  timeout: () => `a check reached its deadline: raise the source's checkTimeoutMs with swarm_budget(taskId, taskBudget: { checkTimeoutMs }, reason), then ${RESUME}; ${REPLACE}`,
+  infrastructure: () => `the host could not execute a check: repair the host condition its output reports, then ${RESUME}`,
+  unrunnable: ({ environment }) => {
+    const links = environment?.dependencyLinks
+    const found = links === undefined ? '' : ` (dependency directories ${links.mode === 'copy' ? 'copied' : 'linked'} from the source: ${excerpt(links.materializedPaths?.length ? links.materializedPaths.join(', ') : `none of verificationDependencyDirs ${JSON.stringify(links.dirs)}`, 60)})`
+    return `a command could not run in the clean verification checkout${found}: provide what it needs in the source project or on the host, then ${RESUME}; ${REPLACE}`
+  },
+}
 
 export class DeclaredChecks {
   /**
@@ -149,20 +164,27 @@ export class DeclaredChecks {
    * and for I/O outside its preparation phase.
    */
   private async execute(member: Member, source: Task, artifact: Artifact, signal?: AbortSignal): Promise<CheckResult[]> {
+    // Every checkout, the retry's included, is created only after the runtime re-validates.
+    await this.rt.assertWorkspaceAuthorized(this.rt.mission(source.missionId))
     try { return await this.rt.workers.verifyArtifact(member, source, artifact, signal) }
     catch (error) {
       if (signal?.aborted) throw error
       const code = error instanceof Error && 'code' in error ? String(error.code) : ''
       if (!['EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT'].includes(code)) throw error
-      return [{ command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: `Host verification could not execute: ${String(error)}` }]
+      return [unexecutedCheck('(verification preparation)', error)]
     }
   }
 
   /** Uncertain execution is not evidence that the artifact's assertions failed. */
   recoveryRequired(checks: ReadonlyArray<CheckResult>): boolean {
     const failures = checks.filter(check => check.exitCode !== 0)
-    return failures.length > 0 && failures.every(check => check.failureKind === 'timeout' || check.failureKind === 'infrastructure'
-      || [124, 126, 127].includes(check.exitCode))
+    return failures.length > 0 && failures.every(check => check.failureKind !== undefined)
+  }
+
+  /** A deferred review's exit: its last classified failure's (a pass stops at its first failing check), or resuming when no row has a kind. */
+  recoveryExit(checks: ReadonlyArray<CheckResult>): string {
+    const failure = checks.findLast(check => check.failureKind !== undefined)
+    return failure?.failureKind === undefined ? RESUME : RECOVERY_EXITS[failure.failureKind](failure)
   }
 
   /**

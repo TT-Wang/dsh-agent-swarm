@@ -308,7 +308,7 @@ test('S1: a naming whose commit fails once is retried by a later tick, and the w
   try {
     await runtime.start()
     const owner = { sessionId: 'pass-owner' }
-    const mission = runtime.create(owner, { title: 'Busy naming', objective: 'Name a wedge whose first naming commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget })
+    const mission = runtime.create(owner, { title: 'Busy naming', objective: 'Name a wedge whose first naming commit fails', workspace: dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget }, { grantRoot: dir, source: 'session' })
     const stream = runtime.workstream(owner, mission.id, { title: 'S', objective: 'S' })
     const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
     const wedges = () => events(runtime, mission.id, 'mission/stalled').filter(item => item.data.cause === 'scheduling-pass' && item.data.wedged === true)
@@ -476,13 +476,22 @@ test('S1/R17-G5: a start that fails past the bound stamps the body before it com
   try {
     const h = await f.runtime.addMember(f.owner, f.mission.id, { name: 'H', role: 'implementation', maxOutputTokens: 5_000 })
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.names.set(h.id, 'H')
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
+    // The body that proposal kicked re-validates the workspace on disk before
+    // it dispatches; it settles before the clock moves.
+    await f.runtime.settle(f.mission.id)
     await ticksUntil(f, () => taskOf(f.runtime, live.id).status === 'running', 'the live work dispatches', 400)
     workers.idle.delete(f.author.id)
     workers.idle.add(h.id); workers.idle.add(b.id)
     await ticks(f, 6)
+    // Each start re-validates the workspace on disk: the last body settles, so
+    // the proposal below opens a body of its own rather than joining it.
+    await f.runtime.settle(f.mission.id)
     // One synchronous step: the next body waits in H's start, and T is ready for B, swept after H.
     const hang = workers.armed = hold()
     const t = f.propose({ title: 'T for B', assigneeId: b.id })
@@ -526,8 +535,14 @@ test('S1/R17-G5: a recovery fallback reported from inside the body\'s preparatio
   const f = await setup({ workers, clock: new FakeClock(), budget: { maxWorkers: 8 }, config: { tickMs: 10, stallPassTimeoutMs: 100, stallPassLiveGraceMs: 20_000, stallPasses: 1_000, attemptSilenceBoundMs: 0 } })
   try {
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
+    // The body that proposal kicked re-validates the workspace on disk before
+    // it dispatches; it settles before the clock moves.
+    await f.runtime.settle(f.mission.id)
     await ticksUntil(f, () => taskOf(f.runtime, live.id).status === 'running', 'the live work dispatches', 400)
     workers.idle.delete(f.author.id)
     workers.idle.add(b.id)
@@ -570,6 +585,9 @@ test('S1/R17-G5: the body stamps each delivery of its own pass-end outbox flush,
     // Only the body delivers: the queue-external pump is off.
     f.runtime.notices.pumpOutbox = () => {}
     const b = await f.runtime.addMember(f.owner, f.mission.id, { name: 'B', role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk: the admissions' bodies
+    // settle before the clock moves, so none spans the ticks below.
+    await f.runtime.settle(f.mission.id)
     workers.idle.add(f.author.id)
     const live = f.propose({ title: 'Live work' })
     const t = f.propose({ title: 'T for busy B', assigneeId: b.id })
@@ -814,7 +832,12 @@ test('S1: a body whose members each take less than a bound is not stopped early,
   const workers = new ComputingStartWorkers()
   const f = await setup({ workers, clock, budget: { maxWorkers: 24 }, config: { stallPassTimeoutMs: 60, stallPasses: 1_000 } })
   try {
-    for (let n = 0; n < 16; n += 1) await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+    // Each start re-validates the workspace on disk, so the body each admission
+    // kicks settles before the next admission queues and before the clock moves.
+    for (let n = 0; n < 16; n += 1) {
+      await f.runtime.addMember(f.owner, f.mission.id, { name: `Busy ${n}`, role: 'implementation', maxOutputTokens: 5_000 })
+      await f.runtime.settle(f.mission.id)
+    }
     const members = f.runtime.store.list('members', f.mission.id).map(member => member.id)
     await ticks(f, 20)
     const watched = watchBodies(f)
@@ -964,10 +987,9 @@ test('S5: clearing every in-memory scheduling cache leaves the durable outcome u
     // The cache-only entries enumerated on the scheduling path, cleared while
     // the bodies the setup kicked may still be queued.
     f.runtime.queues.clear()
-    f.runtime.idleSignals.clear()
+    f.runtime.attempts.idleSignals.clear()
     f.runtime.startFailures.clear()
-    f.runtime.budgetStops.clear()
-    f.runtime.fingerprintCache.clear()
+    f.runtime.gates.fingerprintCache.clear()
     const task = f.propose()
     const running = await ticksUntil(f, () => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
       'dispatch must not depend on any in-memory gate', 400)
@@ -1036,7 +1058,7 @@ test('S5: the durable notice ledger alone dedups a decision notice, within one p
     assert.deepEqual(recorded(f.runtime), { deliveries: 1, events: 1 }, 'repeated passes in one process read the durable row')
     await f.runtime.dispose()
     restarted = new SwarmRuntime({ statePath: join(f.dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-      maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }, new FakeWorkers())
+      maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000, grants: f.runtime.config.grants }, new FakeWorkers())
     await restarted.start()
     await restarted.settle(f.mission.id)
     await ticks({ clock, runtime: restarted }, 30)
@@ -1075,7 +1097,7 @@ test('manualTick runs no timer while tickMs stays the tick unit: settle() return
     // time from the durable submission, so a submission is not a stall inside it.
     const claimed = taskOf(f.runtime, task.id)
     await f.runtime.submit(f.actor(f.author), f.mission.id, { taskId: task.id, attemptId: claimed.attempt.id, output: 'candidate' })
-    const unreviewed = () => f.runtime.scheduling.unreviewedStall(f.mission.id, [taskOf(f.runtime, task.id)])
+    const unreviewed = () => f.runtime.scheduling.unreviewedStall([taskOf(f.runtime, task.id)])
     assert.equal(unreviewed(), false, 'a submission is not a stall at its own instant')
     clock.advance(30 * tickMs - 1)
     assert.equal(unreviewed(), false, 'nor one clock millisecond inside the grace')

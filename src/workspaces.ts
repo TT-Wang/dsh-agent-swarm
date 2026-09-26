@@ -5,12 +5,11 @@ import { StringDecoder } from 'node:string_decoder'
 import { chmod, copyFile, cp, lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { scrubbedParentEnv, type SubprocessHandle, type SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
-import { reauthorizeWorkspace, type WorkspaceGrantSnapshot } from './authorization.js'
 import { withinScope } from './scope.js'
 import { PolicyError } from './policy-error.js'
 import { captureGitSnapshot } from './git-snapshot.js'
+import { unexecutedCheck } from './declared-checks.js'
 import type { Artifact, CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult, CheckSyntaxIssue, Member, Mission, RecoveryFallback, Task, VerificationCleanupFailure, WorkspaceBaseline } from './types.js'
-export type { CheckAttribution, CheckEnvelope, CheckEnvironment, CheckResult }
 
 /** Full-repository path inventories are metadata, not user-visible check output. */
 const INVENTORY_BYTES = 16 * 1024 * 1024
@@ -36,7 +35,7 @@ export const DEFAULT_VERIFICATION_DEPENDENCY_DIRS: readonly string[] = ['node_mo
  * installed toolchain.
  */
 export const SWARM_SCRATCH_DIRNAME = '.swarm-scratch'
-export interface WorkspaceOptions {
+interface WorkspaceOptions {
   workspacesRoot: string
   checkTimeoutMs: number
   maxCheckOutputBytes: number
@@ -92,15 +91,6 @@ export interface WorkspaceOptions {
    */
   onRecoveryFallback(info: RecoveryFallback): void
   /**
-   * Human-authorized roots loaded once at plugin start. When supplied, every
-   * baseline preparation, member workspace and verification checkout
-   * re-validates the mission's recorded `workspaceGrantRoot`, so a root the
-   * human removed from configuration fences the mission instead of letting it
-   * continue against an unauthorized root. Absent in unit fixtures that drive
-   * `Workspaces` directly; the recorded admission result then stands.
-   */
-  grants?: WorkspaceGrantSnapshot
-  /**
    * R11-19: maximum declared-check executions per host process. Verifications
    * beyond the limit wait in a FIFO queue; every wait and run is measured and
    * reported through `checkEnvelope()`. Default 2.
@@ -135,7 +125,7 @@ const DEFAULT_CHECK_CONCURRENCY = 2
  */
 export const HOST_GIT_TIMEOUT_MS = 5 * 60_000
 
-export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
+const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
 /**
  * ENV: the measured envelope plus the declared-check environment.
  * `environment` is the declared envelope the runtime delivers to the assignee
@@ -148,7 +138,7 @@ export const CHECKOUT_PLACEHOLDER = '<verification-checkout>'
  * of a check that actually ran live on its own `CheckResult` row
  * (`environment`, `attribution`), which is what the durable `tool_runs` record carries.
  */
-export interface DeclaredCheckEnvelope extends CheckEnvelope {
+interface DeclaredCheckEnvelope extends CheckEnvelope {
   environment: CheckEnvironment
   selfRunEnvironment: CheckEnvironment
 }
@@ -238,13 +228,13 @@ class CheckOutputScanner {
   }
 }
 /** ENV: what the scanner extracts from a stream before the call site labels it. */
-export interface CheckAttributionShot { stage: string | null; subtest: string | null; failingTests: string[]; failingTestCount: number; tapSummary: string[]; outputTruncated: boolean }
+interface CheckAttributionShot { stage: string | null; subtest: string | null; failingTests: string[]; failingTestCount: number; tapSummary: string[]; outputTruncated: boolean }
 /**
  * R11-19: a per-host FIFO semaphore over declared-check executions. A queued
  * verification is not lost and not run unconfined; its wait is measured so the
  * owner can see the queueing the lease has to survive.
  */
-export class CheckSemaphore {
+class CheckSemaphore {
   private active = 0
   private readonly waiters: Array<{ resolve: (handedOff: boolean) => void; reject: (error: unknown) => void; signal?: AbortSignal; onAbort?: () => void }> = []
   private maxActive = 0
@@ -301,7 +291,6 @@ export class CheckSemaphore {
       totalWaitMs: this.totalWaitMs, maxWaitMs: this.maxWaitMs, totalRunMs: this.totalRunMs, maxRunMs: this.maxRunMs }
   }
 }
-export type { RecoveryFallback, VerificationCleanupFailure } from './types.js'
 /** Persisted on the task workspace record so the fallback survives restarts. */
 interface TaskRecovery { commit: string; previousOwnerId: string; preserved: boolean; reason: string; at: number }
 /** Reject a symlink whose target string alone leaves its owning workspace (fast pre-commit check). */
@@ -312,7 +301,7 @@ function assertContainedSymlink(workspace: string, relative: string, target: str
   if (resolved !== root && !resolved.startsWith(root + path.sep)) throw new Error(`Artifact symlink escapes the mission workspace: ${relative} -> ${JSON.stringify(target)}`)
 }
 /** One resolved component of a symlink-chain walk; a non-link entry stops resolution. */
-export type SymlinkChainEntry = { kind: 'file' } | { kind: 'directory' } | { kind: 'symlink'; target: string }
+type SymlinkChainEntry = { kind: 'file' } | { kind: 'directory' } | { kind: 'symlink'; target: string }
 /** Look up one workspace-relative path in the tree being validated, or undefined when absent. */
 export type SymlinkChainLookup = (relative: string) => Promise<SymlinkChainEntry | undefined>
 /** Bound a chain so a symlink cycle cannot spin; the kernel's own limit is platform-specific. */
@@ -359,7 +348,7 @@ export async function assertContainedSymlinkChain(relative: string, target: stri
     queue.unshift(...next.split('/'))
   }
 }
-interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline; workspaceGrantRoot?: string; workspaceAuthorizationSource?: 'session' | 'grant' }
+interface MissionWorkspace { version: 1; missionId: string; source: string; baseCommit: string; baseline?: WorkspaceBaseline }
 const INTEGRATION_CONFLICT_FILE = '.swarm-integration-conflicts.json'
 interface IntegrationConflict { dependencyId: string; commit: string; paths: string[] }
 interface TaskBase { taskId: string; epoch: number; baseCommit: string; capturedCommit?: string; preservedCommit?: string; recovery?: TaskRecovery
@@ -379,25 +368,35 @@ interface TaskWorkspace { version: 1; missionId: string; memberId: string; works
  * belong to the provider behind the seam (its TERM-before-KILL staging, its
  * spill and drain bounds, its host-exit force-stop).
  */
-export interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
+interface ProcessSeam { spawn(spec: SubprocessSpawnSpec): SubprocessHandle }
 /**
  * Resolve the seam at the moment a command starts. A resolver rather than a
  * value because the provider's mount order is the host's business: a workspace
  * built during plugin load must still execute commands once the service is
  * active, and a host that mounts none refuses at the point of use.
  */
-export type ProcessSeamSource = () => ProcessSeam | undefined
+type ProcessSeamSource = () => ProcessSeam | undefined
 interface ProcessOptions { cwd: string; signal?: AbortSignal; timeoutMs: number; maxBytes: number; env?: Record<string, string>; captureAttribution?: boolean; subprocess?: ProcessSeamSource }
 /**
- * Worktree metadata mutation queues keyed by canonical git common dir. Git
- * publishes `.git/worktrees/<name>/commondir` non-atomically, so concurrent
- * `git worktree add` calls in one repository can observe a half-written file
- * and fail with `git worktree failed (128): failed to read .../commondir`,
- * which blocks the task. Module scope makes every Workspaces instance in one
- * process share the queue for a repository.
+ * One promise chain per path, shared by every Workspaces instance in this
+ * process. It serializes worktree metadata mutation per canonical git common
+ * dir (git publishes `.git/worktrees/<name>/commondir` non-atomically, so
+ * concurrent `git worktree add` calls can read a half-written file and fail
+ * with `failed to read .../commondir`) and each task record's read-check-write
+ * (advisory A1). A task record has no writer outside this process: it lives
+ * under `workspacesRoot/<missionId>`, and a mission id is minted from a random
+ * UUID by the one runtime that holds its store's lock.
  */
-const worktreeQueues = new Map<string, Promise<void>>()
+const pathQueues = new Map<string, Promise<void>>()
+async function serialized<T>(key: string, callback: () => Promise<T>): Promise<T> {
+  const result = (pathQueues.get(key) ?? Promise.resolve()).then(callback)
+  const tail = result.then(() => undefined, () => undefined)
+  pathQueues.set(key, tail)
+  try { return await result } finally { if (pathQueues.get(key) === tail) pathQueues.delete(key) }
+}
 const WORKTREE_METADATA_RACE = /(?:failed|unable) to read .*commondir/i
+/** Verification checkouts in flight in this process, until their cleanup ends; any other under a mission's `verification/` was left by one that died. */
+const verificationCheckouts = new Set<string>()
 
 /**
  * ENV: one bounded output window over a command's two streams. The retained
@@ -440,16 +439,6 @@ class ProcessTimeoutError extends Error {
     super(`Execution timed out after ${timeoutMs}ms`)
     this.name = 'ProcessTimeoutError'
   }
-}
-
-/**
- * The row for a declared check the host could not execute: exit 124 when the
- * host's own deadline stopped the preparation, otherwise 125, with the failure
- * kind the declared-check layer defers on instead of rejecting the artifact.
- */
-function unexecutedCheck(command: string, error: unknown): CheckResult {
-  const timeout = error instanceof ProcessTimeoutError
-  return { command, exitCode: timeout ? 124 : 125, failureKind: timeout ? 'timeout' : 'infrastructure', output: `Host verification could not execute: ${String(error)}` }
 }
 
 /**
@@ -602,7 +591,7 @@ function ambientEnvironment(): Record<string, string> {
   return Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
 /** ENV: the scoped roots one declared check receives live under this checkout subdirectory. */
-export const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
+const CHECK_CACHE_DIRNAME = '.swarm-check-cache'
 /**
  * R16-B: the temp root one declared check receives, beside the scoped cache
  * roots. The check sandbox is rooted at the disposable verification checkout, so
@@ -836,21 +825,6 @@ export class Workspaces {
   }
 
   /**
-   * Re-validate the human authorization behind a mission before its first
-   * filesystem effect (baseline snapshot, member worktree, verification
-   * checkout). The recorded `workspaceGrantRoot` — falling back to the mission
-   * record, then to the workspace itself for records written before this
-   * feature — anchors the check, and the loaded grant snapshot decides whether
-   * that root is still configured and unexpired. A root the human removed
-   * therefore fences the mission here instead of silently continuing.
-   */
-  private async assertWorkspaceAuthorized(workspace: string, recordedRoot: string | undefined, source?: 'session' | 'grant'): Promise<void> {
-    const grants = this.options.grants
-    if (grants === undefined) return
-    const authorization = await reauthorizeWorkspace(workspace, recordedRoot ?? workspace, grants, source)
-    if (!authorization.ok) throw new Error(authorization.diagnostic)
-  }
-  /**
    * Host git operations (worktree add, capture, commit) are not the declared
    * check and must not inherit its budget. Round 14 lost three verdicts because
    * they did: a verification checkout under load exceeded the 60 s check budget
@@ -905,12 +879,7 @@ export class Workspaces {
 
   /** Serialize worktree metadata mutation for one repository, never per member or mission. */
   private async queueWorktree<T>(cwd: string, callback: () => Promise<T>): Promise<T> {
-    const key = await this.commonDir(cwd)
-    const previous = worktreeQueues.get(key) ?? Promise.resolve()
-    const result = previous.then(callback)
-    const tail = result.then(() => undefined, () => undefined)
-    worktreeQueues.set(key, tail)
-    try { return await result } finally { if (worktreeQueues.get(key) === tail) worktreeQueues.delete(key) }
+    return await serialized(await this.commonDir(cwd), callback)
   }
 
   /** Serialized `git worktree add` with one retry for a cross-process metadata race. */
@@ -920,17 +889,16 @@ export class Workspaces {
       catch (error) {
         if (!(error instanceof Error) || !WORKTREE_METADATA_RACE.test(error.message)) throw error
         // Another process outside this manager can still publish the metadata
-        // non-atomically. Drop the partial registration and retry exactly once.
-        await rm(target, { recursive: true, force: true }).catch(() => undefined)
-        await this.git(cwd, ['worktree', 'prune'], signal).catch(() => undefined)
+        // non-atomically. Reclaim this target by path and retry exactly once.
+        await this.reclaim(cwd, target, signal)
         await this.git(cwd, ['worktree', 'add', '--detach', target, commit], signal)
       }
     })
   }
 
-  /** Serialized worktree metadata mutation (remove/prune) for one repository. */
+  /** Serialized worktree metadata access (remove, list) for one repository; a listing is an inventory. */
   private async worktreeGit(cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
-    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal))
+    return await this.queueWorktree(cwd, async () => await this.git(cwd, args, signal, undefined, INVENTORY_BYTES))
   }
 
   private async missionRecord(missionId: string): Promise<MissionWorkspace> {
@@ -942,13 +910,12 @@ export class Workspaces {
       if (!isRecord(saved) || !commitId(saved.sourceHead) || saved.snapshotCommit !== value.baseCommit || typeof saved.planningWorkspace !== 'string' || !Array.isArray(saved.changedPaths) || saved.changedPaths.some(item => typeof item !== 'string') || !Number.isSafeInteger(saved.createdAt)) throw new Error('Invalid mission snapshot metadata')
       baseline = { sourceHead: saved.sourceHead, snapshotCommit: value.baseCommit, planningWorkspace: saved.planningWorkspace, changedPaths: saved.changedPaths as string[], createdAt: saved.createdAt as number }
     }
-    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }), ...(typeof value.workspaceGrantRoot === 'string' ? { workspaceGrantRoot: value.workspaceGrantRoot } : {}), ...(value.workspaceAuthorizationSource === 'session' || value.workspaceAuthorizationSource === 'grant' ? { workspaceAuthorizationSource: value.workspaceAuthorizationSource } : {}) }
+    return { version: 1, missionId, source: value.source, baseCommit: value.baseCommit, ...(baseline === undefined ? {} : { baseline }) }
   }
 
   /** Freeze one source baseline before planning; all members and restarts reuse it. */
-  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
+  async prepareBaseline(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline> {
     signal?.throwIfAborted()
-    await this.assertWorkspaceAuthorized(mission.workspace, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
     const existing = this.baselines.get(mission.id)
     if (existing !== undefined) {
       const baseline = await existing
@@ -970,17 +937,10 @@ export class Workspaces {
         // Full repository path inventories need a metadata bound independent
         // of the much smaller user-visible check-output retention limit.
         const snapshot = await captureGitSnapshot(source, this.missionDir(mission.id), (args, env) => this.git(source, args, ownedSignal, env, INVENTORY_BYTES), ownedSignal)
-        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace }, ...(mission.workspaceGrantRoot === undefined ? {} : { workspaceGrantRoot: mission.workspaceGrantRoot }), ...(mission.workspaceAuthorizationSource === undefined ? {} : { workspaceAuthorizationSource: mission.workspaceAuthorizationSource }) }
+        record = { version: 1, missionId: mission.id, source, baseCommit: snapshot.snapshotCommit, baseline: { ...snapshot, planningWorkspace } }
         await writePrivateJson(manifest, record)
       } else record = await this.missionRecord(mission.id)
       if (record.source !== source) throw new Error('Mission source workspace changed')
-      // Re-validate the persisted root, not just the in-memory mission: a
-      // manifest written before the root was recorded still fences correctly.
-      await this.assertWorkspaceAuthorized(source, record.workspaceGrantRoot ?? mission.workspaceGrantRoot, record.workspaceAuthorizationSource ?? mission.workspaceAuthorizationSource)
-      if ((record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined) || (record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined)) {
-        record = { ...record, ...(record.workspaceGrantRoot === undefined && mission.workspaceGrantRoot !== undefined ? { workspaceGrantRoot: mission.workspaceGrantRoot } : {}), ...(record.workspaceAuthorizationSource === undefined && mission.workspaceAuthorizationSource !== undefined ? { workspaceAuthorizationSource: mission.workspaceAuthorizationSource } : {}) }
-        await writePrivateJson(manifest, record)
-      }
       // Older manifests must retain their original baseline even if the source
       // now has unrelated edits. Add only the planning-view metadata.
       const baseline = record.baseline ?? { sourceHead: record.baseCommit, snapshotCommit: record.baseCommit, planningWorkspace, changedPaths: [], createdAt: Date.now() }
@@ -1320,40 +1280,12 @@ export class Workspaces {
     return missing
   }
 
-  /**
-   * Serialize one task record's read-check-write across members and processes.
-   * The member record is per member, but the task record is shared by the
-   * previous owner, the recovering owner and capture; without mutual exclusion
-   * a repair could read a stale record and clobber a newer owner's write (W1
-   * advisory A1). The lock is a leaf lock: it is never held while another lock
-   * or a git operation runs.
-   */
-  private async withTaskRecordLock<T>(taskPath: string, callback: () => Promise<T>): Promise<T> {
-    const lockPath = `${taskPath}.lock`
-    const staleAfterMs = 30_000
-    const started = Date.now()
-    await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 })
-    for (;;) {
-      try { await writeFile(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 }); break }
-      catch (error) {
-        const code = error instanceof Error && 'code' in error ? (error as NodeJS.ErrnoException).code : undefined
-        if (code !== 'EEXIST') throw error
-        const info = await lstat(lockPath).catch(() => undefined)
-        if (info === undefined) continue
-        if (Date.now() - info.mtimeMs > staleAfterMs) { await rm(lockPath, { force: true }).catch(() => undefined); continue }
-        if (Date.now() - started > staleAfterMs) throw new Error(`Timed out waiting for the task workspace record lock: ${taskPath}`)
-        await new Promise(resolve => setTimeout(resolve, 5))
-      }
-    }
-    try { return await callback() } finally { await rm(lockPath, { force: true }).catch(() => undefined) }
-  }
-
   private async saveTaskWorkspace(record: MemberWorkspace): Promise<void> {
     await writePrivateJson(this.memberPath(record.missionId, record.memberId), record)
     const task = record.task
     if (task === undefined) return
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
+    await serialized(taskPath, async () => { await writePrivateJson(taskPath, { ...record, task } satisfies TaskWorkspace) })
   }
 
   /** Preserve quiescent WIP without applying artifact scope or changing the checkout. */
@@ -1513,7 +1445,7 @@ export class Workspaces {
     await this.publishArtifactRef(record.missionId, record.workspace, snapshot.snapshotCommit,
       `refs/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, `refs/swarm/${segment(record.missionId)}/preservation/${segment(task.taskId)}/${task.epoch}/${nonce}`, signal)
     const taskPath = this.taskPath(record.missionId, task.taskId)
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const current = await readJson(taskPath)
       const ownsTask = isRecord(current) && current.memberId === record.memberId && isRecord(current.task) && current.task.epoch === task.epoch
       // Preparation may revisit a member's previous checkout after this task
@@ -1546,9 +1478,9 @@ export class Workspaces {
     const previous = record.task
     if (previous === undefined || previous.taskId === nextTaskId) return
     const taskPath = this.taskPath(record.missionId, previous.taskId)
-    // Read, compare and write under one lock: a newer owner's record written
+    // Read, compare and write as one serialized step: a newer owner's record written
     // while this checkpoint was deciding can never be clobbered (advisory A1).
-    await this.withTaskRecordLock(taskPath, async () => {
+    await serialized(taskPath, async () => {
       const saved = await readJson(taskPath)
       if (!isRecord(saved) || saved.memberId !== record.memberId || !isRecord(saved.task) || saved.task.epoch !== previous.epoch || commitId(saved.task.capturedCommit)) return
       await writePrivateJson(taskPath, {
@@ -1954,21 +1886,19 @@ export class Workspaces {
       try { await this.validateArtifact(member, artifact, signal) }
       catch (error) {
         // Only the host's own git deadline (HOST_GIT_TIMEOUT_MS) proving the
-        // artifact is a timeout row: no command has run. Any other failure here
+        // artifact is an infrastructure row: no command has run. Any other failure here
         // (a non-ancestor, a missing commit) refuses the artifact by a throw,
         // and cancellation stays cancellation.
         if (!(error instanceof ProcessTimeoutError) || signal.aborted) throw error
         return [unexecutedCheck('(verification preparation)', error)]
       }
       const mission = await this.missionRecord(member.missionId)
-      // Revocation fencing: the verification checkout is created only after the
-      // persisted mission manifest still authorizes its recorded root.
-      await this.assertWorkspaceAuthorized(mission.source, mission.workspaceGrantRoot, mission.workspaceAuthorizationSource)
       signal.throwIfAborted()
       // Research can require independent review without declaring host commands.
       // Keep the validation above, but reserve execution capacity only for checks.
       if (task.checks.length === 0) return []
       const checkout = path.join(this.missionDir(member.missionId), 'verification', randomUUID())
+      verificationCheckouts.add(checkout)
       let release: (() => void) | undefined
       try {
         let linked: string[]
@@ -2011,6 +1941,7 @@ export class Workspaces {
         for (const command of task.checks) {
           signal.throwIfAborted()
           let result: Awaited<ReturnType<typeof runProcess>>
+          let deadline = false
           try {
             const argv = await this.options.confineCheck(['/bin/sh', '-c', command], checkout)
             result = await runProcess(argv, { cwd: checkout, signal, timeoutMs: task.checkTimeoutMs ?? this.options.checkTimeoutMs, maxBytes: this.options.maxCheckOutputBytes, env, captureAttribution: true, subprocess: this.options.subprocess })
@@ -2032,6 +1963,7 @@ export class Workspaces {
               break
             }
             signal.throwIfAborted()
+            deadline = true
             const captured = new ProcessOutput(this.options.maxCheckOutputBytes, false)
             captured.push(Buffer.from(`[swarm] ${error.message}\n`))
             captured.push(Buffer.from(error.captured.output))
@@ -2040,22 +1972,19 @@ export class Workspaces {
             result = { exitCode: 124, ...bounded, truncated,
               ...(error.captured.attribution === undefined ? {} : { attribution: { ...error.captured.attribution, outputTruncated: truncated } }) }
           }
-          // Exit 127 is "command not found": name the environment cause so a reviewer does not retry the same artifact blindly.
-          const output = result.exitCode === 127
-            ? `${result.output}\n[swarm] exit 127: a command in this check was not found in the clean verification checkout. ${this.dependencyMode() === 'copy' ? 'Copied' : 'Linked'} dependency directories from the source: ${linked.length ? linked.join(', ') : 'none (install dependencies in the source project, or choose checks that need no installed toolchain)'}. The artifact itself was not changed by this failure.`
-            : result.output
           // ENV: attribution and environment are written BEFORE the free-form
           // output, so a bound on the record removes detail rather than the
           // failing test names, the TAP summary and the stage that failed.
           const attribution: CheckAttribution | undefined = result.attribution === undefined ? undefined
             : { index: results.length + 1, command, ...result.attribution }
-          results.push({ command, exitCode: result.exitCode, ...([124, 126, 127].includes(result.exitCode) ? { failureKind: result.exitCode === 124 ? 'timeout' as const : 'infrastructure' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output, truncated: result.truncated })
+          results.push({ command, exitCode: result.exitCode, ...(deadline ? { failureKind: 'timeout' as const } : [126, 127].includes(result.exitCode) ? { failureKind: 'unrunnable' as const } : {}), ...(attribution === undefined ? {} : { attribution }), environment, output: result.output, truncated: result.truncated })
           if (result.exitCode !== 0) break
         }
         return results
       } finally {
         release?.()
         await this.cleanupVerification(member, task, mission.source, checkout)
+        verificationCheckouts.delete(checkout)
       }
     }, signal)
   }
@@ -2076,51 +2005,44 @@ export class Workspaces {
   }
 
   /**
-   * Remove a disposable verification checkout without ever masking the check
-   * results. `git worktree remove` fails when a check left an unreadable
-   * directory; fall back to `fs.rm`, then to an owner-permission repair before
-   * `git worktree prune` drops a stale registration. Failures are recorded for
-   * the host and are never thrown.
+   * Remove this verification's checkout, then every checkout of its mission no verification in this
+   * process owns (a crash left it): the entries of its canonical `verification/` and the registrations
+   * naming a path there. Git removes the own checkout; a refusal is reported and the checkout reclaimed
+   * (`reclaim`), as every leftover is. Nothing else is touched or pruned.
+   * Best effort by contract: what resists stays for the mission's next verification; nothing is thrown.
    */
   private async cleanupVerification(member: Member, task: Task, source: string, checkout: string): Promise<void> {
-    let failure: unknown
-    try {
-      await this.worktreeGit(source, ['worktree', 'remove', '--force', checkout])
-      return
-    } catch (error) { failure = error }
-    if (!(await lstat(checkout).then(() => true, () => false))) {
-      try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-      return
-    }
-    try { await rm(checkout, { recursive: true, force: true, maxRetries: 1 }) }
-    catch { try { await this.forceRemove(checkout) } catch (error) { failure = error } }
-    try { await this.worktreeGit(source, ['worktree', 'prune']) } catch { /* registration cleanup is best effort */ }
-    this.recordCleanupIssue(member, task, checkout, failure)
+    await this.worktreeGit(source, ['worktree', 'remove', '--force', '--force', checkout]).catch(async (removal: unknown) => {
+      if (!(await lstat(checkout).then(() => true, () => false))) return
+      const failure = await this.queueWorktree(source, async () => await this.reclaim(source, checkout)).then(() => removal, (error: unknown) => error)
+      try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason: failure instanceof Error ? failure.message : String(failure) }) } catch { /* reporting must not mask results */ }
+    })
+    const directory = path.dirname(checkout)
+    if (await realpath(directory).catch(() => undefined) !== directory) return
+    const registered = (await this.worktreeGit(source, ['worktree', 'list', '--porcelain', '-z']).catch(() => '')).split('\0').flatMap(line => line.startsWith('worktree ') ? [line.slice('worktree '.length)] : [])
+    const leftovers = new Set([...(await readdir(directory).catch(() => [])).map(name => path.join(directory, name)), ...registered.filter(candidate => path.dirname(candidate) === directory)])
+    for (const candidate of leftovers) if (!verificationCheckouts.has(candidate)) await this.queueWorktree(source, async () => await this.reclaim(source, candidate)).catch(() => undefined)
   }
 
-  /** Restore owner permissions on an unreadable tree so removal can finish. */
-  private async forceRemove(directory: string): Promise<void> {
+  /** Reclaim a checkout by path in the caller's worktree queue: the tree as what it is, then the registration (even locked) of the now missing path; a tree that resists is thrown before git sees its path. */
+  private async reclaim(cwd: string, target: string, signal?: AbortSignal): Promise<void> {
+    await this.forceRemove(target)
+    await this.git(cwd, ['worktree', 'remove', '--force', '--force', target], signal).catch(() => undefined)
+  }
+
+  /** Remove `target` after restoring owner access to each directory in it (unlink needs no more); a link is never followed. */
+  private async forceRemove(target: string): Promise<void> {
     const gone = (error: unknown): boolean => error instanceof Error && 'code' in error && error.code === 'ENOENT'
     // A failed recursive removal can still be deleting entries, so every step
     // tolerates a path that disappeared underneath it.
     const ignoringMissing = async <T>(operation: Promise<T>): Promise<T | undefined> => await operation.catch(error => { if (gone(error)) return undefined; throw error })
     const repair = async (current: string): Promise<void> => {
-      for (const entry of await ignoringMissing(readdir(current, { withFileTypes: true })) ?? []) {
-        const child = path.join(current, entry.name)
-        const info = await ignoringMissing(lstat(child))
-        if (info === undefined || info.isSymbolicLink()) continue
-        if (info.isDirectory()) { await ignoringMissing(chmod(child, 0o700)); await repair(child) }
-        else await ignoringMissing(chmod(child, 0o600))
-      }
+      if (!(await ignoringMissing(lstat(current)))?.isDirectory()) return
+      await ignoringMissing(chmod(current, 0o700))
+      for (const name of await ignoringMissing(readdir(current)) ?? []) await repair(path.join(current, name))
     }
-    await repair(directory)
-    await ignoringMissing(chmod(directory, 0o700))
-    await rm(directory, { recursive: true, force: true })
-  }
-
-  private recordCleanupIssue(member: Member, task: Task, checkout: string, failure: unknown): void {
-    const reason = failure instanceof Error ? failure.message : String(failure)
-    try { this.options.onCleanupFailure({ missionId: member.missionId, taskId: task.id, memberId: member.id, checkout, reason }) } catch { /* reporting must not mask results */ }
+    await repair(target)
+    await rm(target, { recursive: true, force: true })
   }
 
   /** Cancel member-owned artifact/check subprocesses; worker cancellation belongs to the adapter. */

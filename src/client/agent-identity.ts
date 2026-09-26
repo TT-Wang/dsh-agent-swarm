@@ -1,5 +1,5 @@
 /** Identity belongs to the durable member, not its current role, name or task. */
-export interface AgentIdentity {
+interface AgentIdentity {
   palette: number
   head: number
   eyes: number

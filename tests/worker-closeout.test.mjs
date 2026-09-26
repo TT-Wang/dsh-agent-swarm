@@ -32,10 +32,12 @@ async function fixture(t, config = {}) {
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   const owner = { sessionId: 'closeout-owner' }
   const mission = runtime.create(owner, { title: 'Close-out', objective: 'Never strand uncommitted work', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
+  // The members' starts re-validate the workspace on disk; their passes settle before a test claims by hand.
+  await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...extra })
@@ -115,7 +117,10 @@ test('a failed checkpoint blocks the task and wakes the owner instead of reassig
   assert.match(blocked.output, /could not be checkpointed.*outside task scope/)
   assert.equal(blocked.attempt, undefined, 'the abandoned attempt is fenced')
   assert.equal(f.workers.captured.length, 0)
-  assert.equal(f.workers.stopped.length, 0, 'no reassignment is attempted without a checkpoint')
+  // The abandoned handle is still stopped (the fence's quiescence), but the
+  // task never re-pends for another attempt.
+  assert.deepEqual(f.events('task/closeout-ready'), [], 'no reassignment is attempted without a checkpoint')
+  assert.equal(f.workers.prepared.length, 1, 'only the claimed attempt was ever prepared')
   assert.equal(f.events('task/closeout-failed').length, 1)
   const notice = await eventually(() => f.workers.deliveries.find(item => item.memberId === 'owner'
     && /could not be checkpointed/.test(item.delivery.content)), 'the owner is woken for the uncheckpointable workspace', 2500)

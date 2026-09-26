@@ -77,10 +77,26 @@ test('R11-13: the explicit read-through link opt-in still links at every depth (
   assert.match(results[2].output, /linked/)
 })
 
-test('a missing command is diagnosed as an environment failure, and materialisation can be disabled', async t => {
+test('a missing command is an unrunnable row with its own output and the environment it ran under, and materialisation can be disabled', async t => {
   const { workspaces, member, task, artifact } = await fixture(t, { verificationDependencyDirs: [] })
   const results = await workspaces.verifyArtifact(member, { ...task, checks: ['test ! -e node_modules && echo unlinked', 'toolchain-check'] }, artifact)
-  assert.equal(results[0].exitCode, 0); assert.match(results[0].output, /unlinked/)
+  assert.equal(results[0].exitCode, 0); assert.match(results[0].output, /unlinked/); assert.equal(results[0].failureKind, undefined)
   assert.equal(results[1].exitCode, 127)
-  assert.match(results[1].output, /exit 127: a command in this check was not found in the clean verification checkout\. Copied dependency directories from the source: none/)
+  assert.equal(results[1].failureKind, 'unrunnable', 'a command that cannot run is not a host that could not execute')
+  assert.match(results[1].output, /toolchain-check/)
+  assert.doesNotMatch(results[1].output, /\[swarm\]/, 'the row carries the command\'s own output; the exit is composed from the kind')
+  assert.deepEqual(results[1].environment.dependencyLinks, { mode: 'copy', dirs: [], materializedPaths: [] }, 'what the checkout received is on the row')
+})
+
+/**
+ * The timeout row is the host's own check deadline firing, classified where the
+ * deadline fires. A command's own exit 124 (an inner `timeout`, or `exit 124`)
+ * is the command's verdict, an assertion like exit 1.
+ */
+test('a command the checkout cannot execute (exit 126) is unrunnable; the host\'s check deadline is a timeout; an assertion, a command\'s own 124 included, is neither', async t => {
+  const { workspaces, member, task, artifact } = await fixture(t)
+  for (const [check, exitCode, failureKind] of [[{ checks: ['./src/answer.txt'] }, 126, 'unrunnable'], [{ checks: ['sleep 30'], checkTimeoutMs: 300 }, 124, 'timeout'], [{ checks: ['exit 1'] }, 1, undefined], [{ checks: ['exit 124'] }, 124, undefined]]) {
+    const [result] = await workspaces.verifyArtifact(member, { ...task, ...check }, artifact)
+    assert.deepEqual([result.exitCode, result.failureKind, /^\[swarm\] Execution timed out after 300ms/.test(result.output)], [exitCode, failureKind, failureKind === 'timeout'], `${check.checks[0]}: ${result.output}`)
+  }
 })

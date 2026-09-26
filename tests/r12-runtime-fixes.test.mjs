@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeRuntime } from './faults/harness.mjs'
+import { eventually, makeRuntime } from './faults/harness.mjs'
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function fixture(t) {
@@ -11,7 +11,7 @@ async function fixture(t) {
   // These tests drive dispatch explicitly so incidental scheduling cannot mask a race.
   runtime.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Recovery', objective: 'Recover safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Recovery', objective: 'Recover safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const a = await runtime.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const b = await runtime.addMember(owner, mission.id, { name: 'B', role: 'implementation' })
@@ -21,7 +21,7 @@ async function fixture(t) {
 
 test('a failed tick guard and one failed mission do not suppress other guards or missions', async t => {
   const f = await fixture(t), calls = []
-  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget })
+  const second = f.runtime.create(f.owner, { title: 'Other', objective: 'Continue', workspace: f.mission.workspace, scope: ['src/'], acceptance: ['works'], budget: f.budget }, { grantRoot: f.mission.workspace, source: 'session' })
   f.runtime.pumpOutbox = () => { calls.push('outbox'); throw new Error('injected write contention') }
   f.runtime.sweepStarts = () => calls.push('starts')
   f.runtime.checkSchedulingPasses = () => calls.push('passes')
@@ -35,10 +35,12 @@ test('a failed tick guard and one failed mission do not suppress other guards or
 
 test('failure after an awaited startup preserves newly committed member fields and park intent', async t => {
   const f = await fixture(t)
-  let reject
-  f.workers.start = () => new Promise((_resolve, fail) => { reject = fail })
+  let reject, entered
+  const started = new Promise(resolve => { entered = resolve })
+  f.workers.start = () => new Promise((_resolve, fail) => { reject = fail; entered() })
   const pending = f.runtime.startWorker(f.mission, f.a)
-  await delay(0)
+  // The start re-validates the workspace on disk before it reaches the adapter.
+  await started
   f.runtime.store.transaction(() => {
     const member = f.runtime.store.get('members', f.a.id)
     member.phase = 'parked'; member.role = 'updated while starting'; member.activity = { sentinel: 'fresh' }
@@ -58,8 +60,8 @@ test('recovery returns with a stuck startup, starts siblings, and records one sh
     if (spec.member.id === f.a.id) { signals.push(signal); await new Promise(() => {}) }
   }
   await f.runtime.start()
-  await delay(5)
-  assert.ok(started.includes(f.b.id), 'healthy sibling recovers independently')
+  // Each start re-validates the workspace on disk before it reaches the adapter.
+  await eventually(() => started.includes(f.b.id), 'healthy sibling recovers independently', 2000)
   const same = f.runtime.startWorker(f.mission, f.a)
   const duplicate = f.runtime.startWorker(f.mission, f.a)
   assert.equal(same, duplicate)
@@ -119,12 +121,12 @@ test('retired members and late start failures cannot resurrect membership', asyn
 test('submission and missing-review identity survive event-window truncation and cache loss', async t => {
   const f = await fixture(t), task = f.propose({})
   f.runtime.store.transaction(() => f.runtime.store.event(f.mission.id, 'task/submitted', f.a.id, { taskId: task.id }))
-  const submitted = f.runtime.latestSubmission(f.mission.id, task.id)
-  assert.ok(submitted)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), true)
+  const need = f.runtime.reviewNeed(task)
+  assert.ok(need.seq > 0)
+  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), true)
   f.runtime.store.transaction(() => { for (let i = 0; i < 5; i++) f.runtime.store.event(f.mission.id, 'noise', 'runtime', {}) })
-  assert.equal(f.runtime.latestSubmission(f.mission.id, task.id).seq, submitted.seq)
-  assert.equal(f.runtime.reportMissingReview(f.mission, task, submitted.seq), false)
+  assert.equal(f.runtime.reviewNeed(task).seq, need.seq)
+  assert.equal(f.runtime.reportMissingReview(f.mission, task, need), false)
 })
 
 test('owner can settle receipts after stop without queuing work or reactivating the mission', async t => {

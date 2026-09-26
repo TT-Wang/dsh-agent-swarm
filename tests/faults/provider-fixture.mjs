@@ -42,8 +42,9 @@ export async function providerFixture({ leaseMs = 60_000, fault }) {
   const runtime = ctx.swarm
   const mission = runtime.create(FAULT_OWNER, {
     title: 'Provider fault injection', objective: 'Prove the provider fault fired and recovery is per mode',
+    // The owner session's own cwd, authorized as the session workspace every production caller records.
     workspace: source, scope: ['**'], acceptance: ['provider fault recovery holds'], budget: defaultBudget,
-  })
+  }, { grantRoot: source, source: 'session' })
   const stream = runtime.workstream(FAULT_OWNER, mission.id, { title: 'Provider faults', objective: 'Exercise the provider boundary' })
   const author = await runtime.addMember(FAULT_OWNER, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   state.authorSessionId = author.sessionId

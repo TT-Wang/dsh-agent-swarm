@@ -38,7 +38,7 @@ async function runtimeFixture(t) {
   })
   const owner = { sessionId: 'git-owner' }
   const mission = runtime.create(owner, { title: 'Git write', objective: 'Surface the sandbox boundary', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget })
+    scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -106,6 +106,9 @@ test('R15: ordinary failed Git writes do not claim a sandbox denial, and EPERM d
 
 test('R17: a deterministic preparation fault blocks once with owner recovery and does not consume task credits', async t => {
   const f = await runtimeFixture(t)
+  // The test drives each pass by hand: the setup passes settle and no kick races them.
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   f.workers.isIdle = () => true
   let calls = 0
   f.workers.prepareTask = async () => { calls++; throw new Error('[workspace_uncommitted] preserved conflict requires resolution') }
@@ -122,6 +125,9 @@ test('R17: a deterministic preparation fault blocks once with owner recovery and
 
 test('R17: a typed transient preparation failure backs off and keeps the task identity', async t => {
   const f = await runtimeFixture(t)
+  // The test drives each pass by hand: the setup passes settle and no kick races them.
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   f.workers.isIdle = () => true
   let calls = 0
   f.workers.prepareTask = async () => { if (++calls < 2) throw Object.assign(new Error('temporarily busy'), { code: 'EBUSY' }) }

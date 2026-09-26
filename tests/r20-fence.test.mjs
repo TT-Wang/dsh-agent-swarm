@@ -51,7 +51,7 @@ async function fixture(t) {
   }
   const owner = { sessionId: `r20-owner-${Math.random()}` }
   const mission = runtime.create(owner, { title: 'R20', objective: 'Deliver verified work', workspace: directory,
-    scope: ['src/', 'docs/'], acceptance: ['done'], budget })
+    scope: ['src/', 'docs/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Work' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

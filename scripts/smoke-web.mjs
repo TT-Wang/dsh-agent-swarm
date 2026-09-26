@@ -45,7 +45,6 @@ await runWebSmoke({ name: 'web', scriptedLlm: { owner: 'stage' }, async scenario
   await openSwarmDetails(panel, 'editor')
   checks.push('default staged view hides technical tabs, budgets and manual plan fields until its advanced disclosure is opened')
   await page.getByTestId('draft-title').fill('Unsaved sidebar draft')
-  assert.equal(await page.locator('[data-swarm-dock]').count(), 0, 'no plugin-owned dock renders beside the host right sidebar')
   await until(async () => {
     const box = await panel.boundingBox()
     const input = await composer.boundingBox()

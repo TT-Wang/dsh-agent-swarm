@@ -30,7 +30,7 @@ async function fixture(t) {
   rt = made.runtime
   rt.kick = () => {}
   const owner = { sessionId: 'owner' }
-  const mission = rt.create(owner, { title: 'Review recovery', objective: 'Keep same work safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = rt.create(owner, { title: 'Review recovery', objective: 'Keep same work safely', workspace: root, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: root, source: 'session' })
   const stream = rt.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await rt.addMember(owner, mission.id, { name: 'A', role: 'implementation' })
   const other = await rt.addMember(owner, mission.id, { name: 'B', role: 'implementation' })

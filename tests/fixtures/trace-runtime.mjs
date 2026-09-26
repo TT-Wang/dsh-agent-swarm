@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import { SwarmRuntime } from '../../lib/runtime.js'
 import { registerTools } from '../../lib/tools.js'
 import { tempDirectory } from '../temp-root.mjs'
-import { FakeWorkers } from '../faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS } from '../faults/harness.mjs'
 
 export const budget = { maxTokens: 100000, maxSteps: 1000, maxWorkers: 4, maxDurationMs: 3600000, maxTasks: 20, maxExperiments: 0 }
 
@@ -37,7 +37,7 @@ export async function traceFixture(t, options = {}) {
   const statePath = join(root, 'db.sqlite')
   const workers = new TraceWorkers()
   if (options.checks !== undefined) workers.checks = options.checks
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3 }, workers)
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 60000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 3, grants: NO_GRANTS }, workers)
   t.after(async () => { await runtime.dispose(); await rm(root, { recursive: true, force: true }) })
   const definitions = new Map()
   registerTools({ tools: { register: definition => definitions.set(definition.name, definition) } }, runtime, budget)

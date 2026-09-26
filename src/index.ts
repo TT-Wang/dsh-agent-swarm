@@ -3,7 +3,7 @@ import type { Context, Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join, isAbsolute } from 'node:path'
-import { authorizeWorkspace, loadWorkspaceGrants, type WorkspaceGrant } from './authorization.ts'
+import { loadWorkspaceGrants } from './authorization.ts'
 import { applyPendingRestore } from './store.ts'
 import { SwarmRuntime } from './runtime.ts'
 import { HarnessWorkers, installOwnerDeliveryFilter } from './harness-workers.ts'
@@ -15,7 +15,7 @@ import { OwnerReplyGuard } from './owner-reply.ts'
 import { registerAutomaticStart } from './planner.ts'
 import { registerWebApi } from './web-api.ts'
 import { bindHostTelemetry, type HostTelemetrySink } from './trace.ts'
-import type { Budget } from './types.ts'
+import type { Budget, WorkspaceGrant } from './types.ts'
 import { reportHarnessSupport } from './host-version.ts'
 
 declare module '@deepseek-ai/cordis' { interface Context { swarm: SwarmRuntime } }
@@ -66,12 +66,6 @@ export interface Config {
    */
   authorizedWorkspaces: WorkspaceGrant[]
   defaultBudget: Budget
-  /**
-   * L2 owner-reply guard. `nudge` (default) records a question the owner's turn
-   * left unanswered and instructs with the exact call. Legacy `block` is an
-   * alias: the owner's control channel always remains available to answer.
-   */
-  ownerReplyGuard: 'nudge' | 'block'
   /** Nudges spent on one unanswered owner question before the guard terminal; default 2. */
   maxOwnerReplyNudges: number
 }
@@ -94,7 +88,6 @@ export const Config: z<Config> = z.object({
   // campaign) and that value wins.
   checkTimeoutMs: z.natural().min(100).default(600000),
   maxCheckOutputBytes: z.natural().min(1024).default(32000),
-  ownerReplyGuard: z.union(['nudge', 'block']).default('nudge'),
   maxOwnerReplyNudges: z.natural().min(0).default(2),
   verificationDependencyDirs: z.array(z.string()).default([...DEFAULT_VERIFICATION_DEPENDENCY_DIRS]),
   verificationDependencyMode: z.union(['link', 'copy']).default('link'),
@@ -127,13 +120,9 @@ export const Config: z<Config> = z.object({
  * registry instead of importing the host package: `ctx.inject` fires whether the
  * backend is mounted before or after this plugin, and a composition with no
  * backend mounted records exactly as before (durable span rows, no sink) — the
- * host's own "no backend" behaviour, not this plugin's silence. The link is
- * created before `registerTools` builds the recorder and shared through the
- * runtime identity, because the recorder's construction site (`src/tools.ts`) is
- * outside this change's scope while the context is only available here. The
- * disposer detaches the sink with the plugin fiber, so no backend keeps a
- * reporter after unload; the fiber is returned so a caller (and the pair test)
- * can reach it.
+ * host's own "no backend" behaviour, not this plugin's silence. The disposer
+ * detaches the sink with the plugin fiber, so no backend keeps a reporter after
+ * unload; the fiber is returned so a caller (and the pair test) can reach it.
  */
 export function installHostTelemetry(ctx: Context, runtime: unknown): Fiber {
   const link = bindHostTelemetry(runtime as object)
@@ -156,11 +145,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // instead of starting empty. Applying here (not in a model tool) keeps the
   // swap outside any live runtime's ownership.
   const restored = applyPendingRestore(config.statePath)
-  const workers = new HarnessWorkers(ctx, { ...config, grants })
+  const workers = new HarnessWorkers(ctx, config)
   // The profile passes unknown keys through; the runtime clock and the manual
   // tick are never among them.
-  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants,
-    authorizeWorkspace: (workspace, sessionCwd, now) => authorizeWorkspace(workspace, sessionCwd, grants, now) }, workers)
+  const runtime = new SwarmRuntime({ ...config, now: undefined, manualTick: undefined, maxTasksPerMember: config.maxAttempts, grants }, workers)
   if (restored !== undefined) runtime.store.transaction(() => runtime.store.event('swarm/install', 'store/restored', 'runtime',
     { snapshot: restored.snapshot, requestedAt: restored.requestedAt, ...(restored.requestedBy === undefined ? {} : { requestedBy: restored.requestedBy }) }))
   ctx.effect(() => () => runtime.dispose(), 'swarm.runtime')
@@ -177,19 +165,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const owner = mission === undefined ? undefined : ctx.agents.get(SessionId(mission.ownerSessionId))
     if (owner !== undefined) pruneOwnerInbox(owner)
   }), 'swarm.owner-inbox-relevance')
-  // R17-G10: the host sink link exists before the recorder does; `registerTools`
-  // builds the recorder from the runtime identity this binding is keyed on.
   installHostTelemetry(ctx, runtime)
-  registerTools(ctx, runtime, config.defaultBudget, grants)
+  registerTools(ctx, runtime, config.defaultBudget)
   // Ordinary sessions get the entry prompt; owner, worker and subagent sessions shadow it by role.
   ctx.systemPrompt.section({ name: 'swarm:usage', order: 119, text: SWARM_PROMPT })
   new RoleScoper(ctx, runtime)
   // L2: the owner side of the reply protocol. The guard observes owner turns and
   // reports questions the turn did not settle; it never answers on the owner's
   // behalf and never edits a message.
-  const ownerReplies = new OwnerReplyGuard(ctx, runtime, { guard: config.ownerReplyGuard, maxNudges: config.maxOwnerReplyNudges })
+  const ownerReplies = new OwnerReplyGuard(ctx, runtime, { maxNudges: config.maxOwnerReplyNudges })
   ctx.effect(() => () => ownerReplies.dispose(), 'swarm.owner-reply-guard')
   ctx.inject(['commands'], commands => registerAutomaticStart(commands, runtime))
-  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576, grants }))
-  await runtime.start(grants)
+  ctx.inject(['connection', 'webServer'], browser => registerWebApi(browser, runtime, { defaultBudget: config.defaultBudget, maxPayloadBytes: 1048576 }))
+  await runtime.start()
 }

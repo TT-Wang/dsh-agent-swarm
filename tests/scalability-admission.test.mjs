@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { AdmissionRefusedError, decideAdmission, defaultLimitRules, effectiveLimit, scopeKeysOverlap } from '../lib/scheduler.js'
 import { SwarmStore } from '../lib/store.js'
@@ -27,8 +27,10 @@ async function fixture(t, options = {}) {
   return { root, runtime, workers, config: settings }
 }
 
+/** The mission's workspace is the runtime's own temp directory, a real path its re-validation resolves. */
 async function mission(runtime, overrides = {}) {
-  return runtime.create(owner, { title: 'D8 admission', objective: 'prove admission control', workspace: '/inert-workspace', scope: ['**'], acceptance: ['admission is durable'], budget: { ...budget, ...overrides } })
+  const workspace = dirname(runtime.config.statePath)
+  return runtime.create(owner, { title: 'D8 admission', objective: 'prove admission control', workspace, scope: ['**'], acceptance: ['admission is durable'], budget: { ...budget, ...overrides } }, { grantRoot: workspace, source: 'session' })
 }
 
 async function addWorker(runtime, m, name) {

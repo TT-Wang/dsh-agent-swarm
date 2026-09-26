@@ -30,7 +30,7 @@ import { mkdir, readFile, realpath, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { authorizeWorkspace, loadWorkspaceGrants } from '../lib/authorization.js'
+import { loadWorkspaceGrants } from '../lib/authorization.js'
 import { recentProgress } from '../lib/types/client/progress.js'
 import { LiveWorkOverview } from '../lib/types/client/LiveWorkPanel.js'
 import { SwarmBoard } from '../lib/types/client/SwarmBoard.js'
@@ -54,16 +54,16 @@ async function fixture(t) {
   return { temp, session, granted, project }
 }
 const runtimeConfig = { tickMs: 20, maxMessageChars: 10000, maxEvents: 500, checkTimeoutMs: undefined }
-const granting = grants => ({ ...runtimeConfig, grants, authorizeWorkspace: (workspace, cwd) => authorizeWorkspace(workspace, cwd, grants) })
+const granting = grants => ({ ...runtimeConfig, grants })
 
 test('the real runtime snapshot projects the workspace binding into the compact panel with its payload', async t => {
   const { granted, project } = await fixture(t)
   const grants = await loadWorkspaceGrants([{ path: granted, note: 'human-approved tree' }])
   const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: granting(grants) })
-  await runtime.start(grants)
+  await runtime.start()
   const owner = { sessionId: 'owner-bound' }
   const mission = runtime.create(owner, { title: 'Bound mission', objective: 'Work inside a human-authorized root',
-    workspace: await realpath(project), workspaceGrantRoot: await realpath(granted), scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    workspace: await realpath(project), scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: await realpath(granted), source: 'grant' })
   const snapshot = runtime.snapshot(owner, mission.id)
   const bound = snapshot.events.find(event => event.type === 'mission/workspace-bound')
   assert.ok(bound, 'the mission snapshot carries the durable binding event')
@@ -88,11 +88,11 @@ test('a real restart with the human root removed projects the revocation with it
   const owner = { sessionId: 'owner-revoked' }
   const projectPath = await realpath(project), grantedPath = await realpath(granted)
   const mission = before.create(owner, { title: 'Running', objective: 'Keep working', workspace: projectPath,
-    workspaceGrantRoot: grantedPath, scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: grantedPath, source: 'grant' })
   await before.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const stream = before.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   before.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Work', objective: 'Do the work', kind: 'research', scope: ['src/'], acceptance: ['works'] })
-  await before.start(grants)
+  await before.start()
   await eventually(() => workers.prepared.length > 0, 'the mission never started working', 15000)
   await before.dispose()
   // A human removes the root and restarts the host: the same durable state, no grant.
@@ -118,7 +118,7 @@ test('the sanctioned board stays model-tool-only in the client and the declared 
   const { runtime } = await makeRuntime(t, { workers: projectionWorkers(), config: runtimeConfig })
   const owner = { sessionId: 'owner-board' }
   const mission = runtime.create(owner, { title: 'Board mission', objective: 'Post a durable note', workspace: session,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: session, source: 'session' })
   const marker = 'BOARD-ONLY-MARKER-9f2c'
   runtime.post(owner, mission.id, { kind: 'IDEA', body: `cross-task note ${marker}`, to: 'owner' })
   // The post is readable through the model tool surface...

@@ -22,7 +22,7 @@ async function fixture(t) {
   const owner = { sessionId: 'lineage-owner' }
   const f = { ...made, owner, actor: member => ({ sessionId: member.sessionId }) }
   await f.runtime.start()
-  f.mission = f.runtime.create(owner, { title: 'Lineage retirement', objective: 'Retire superseded repair chains', workspace: made.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget: made.budget })
+  f.mission = f.runtime.create(owner, { title: 'Lineage retirement', objective: 'Retire superseded repair chains', workspace: made.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget: made.budget }, { grantRoot: made.dir, source: 'session' })
   f.stream = f.runtime.workstream(owner, f.mission.id, { title: 'Main', objective: 'Main' })
   f.author = await f.runtime.addMember(owner, f.mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   f.reviewer = await f.runtime.addMember(owner, f.mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })
@@ -177,6 +177,11 @@ test('work still running or stopping when its carrier is accepted stays live thr
   const f = await fixture(t)
   const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
   const helper = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Helper', role: 'implementation', maxOutputTokens: 5_000 })
+  // The members' starts re-validate the workspace on disk: their passes settle,
+  // and no pass acts on the hand-written history below before the verdict (the
+  // restart runs passes again).
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   const running = f.propose({ title: 'Running original', assigneeId: builder.id })
   const claimed = await f.runtime.claim(f.actor(builder), f.mission.id, running.id)
   const handingOff = f.propose({ title: 'Stopping original', assigneeId: helper.id })
@@ -199,6 +204,11 @@ test('recovery replays the retirement once, only for an acceptance recorded befo
   const f = await fixture(t)
   const builder = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5_000 })
   const helper = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Helper', role: 'implementation', maxOutputTokens: 5_000 })
+  // The members' starts re-validate the workspace on disk: their passes settle,
+  // and no pass acts on the hand-written history below before the verdict (the
+  // restart runs passes again).
+  await f.runtime.settle(f.mission.id)
+  f.runtime.kick = () => {}
   const { a, r1, r2 } = await rejectedChain(f)
   const running = f.propose({ title: 'Running original', assigneeId: builder.id })
   await f.runtime.claim(f.actor(builder), f.mission.id, running.id)

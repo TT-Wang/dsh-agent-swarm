@@ -41,7 +41,7 @@ test('R11-05: a long queued check keeps its attempt lease alive and does not del
     budget: { maxTokens: 100000, maxSteps: 1000, maxDurationMs: 3600000, maxTasks: 100 } })
   await runtime.start()
   const owner = { sessionId: 'lease-owner' }
-  const mission = runtime.create(owner, { title: 'Long check', objective: 'Keep the lease', workspace: directory, scope: ['**'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Long check', objective: 'Keep the lease', workspace: directory, scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation' })

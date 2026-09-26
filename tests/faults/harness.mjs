@@ -212,13 +212,21 @@ export class WorkspaceWorkers extends FakeWorkers {
 }
 
 /**
+ * The authorization a plugin with no `authorizedWorkspaces` configured loads
+ * (`loadWorkspaceGrants(undefined)`): no root, so only the calling session's
+ * own directory is authorized. Every fixture runtime carries it unless a test
+ * wires its own snapshot.
+ */
+export const NO_GRANTS = Object.freeze({ grants: Object.freeze([]), loadedAt: 0, unresolved: Object.freeze([]) })
+
+/**
  * The RuntimeConfig every fixture runtime starts from; `overrides` wins. With a
  * `clock` the runtime reads it and runs no tick timer (see `setup`).
  */
 function runtimeConfig(dir, overrides, clock) {
   return {
     statePath: join(dir, 'swarm.sqlite'), leaseMs: 60_000, tickMs: 10, maxMessageChars: 16_000,
-    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000,
+    maxEvents: 5_000, maxTasksPerMember: 3, checkTimeoutMs: 30_000, grants: NO_GRANTS,
     ...(clock === undefined ? {} : { manualTick: true, now: clock.now, stallPassTimeoutMs: 60_000 }), ...overrides,
   }
 }
@@ -259,11 +267,11 @@ export const makeWorkspaces = (dir, overrides) => new Workspaces(workspaceOption
 /**
  * A partial runtime for a unit test that builds one component (Scheduling,
  * Attempts, RefusalRegistry, Notices, WorkspaceAdmission, OwnerReplyGuard, the
- * tool layer) without a store. It always carries `now()`, so a runtime
- * dependency every component reads is added here once; `overrides` supplies
- * the rest and wins.
+ * tool layer) without a store. It always carries `now()` and a config holding
+ * the empty grant snapshot, the runtime dependencies every component reads, so
+ * they are added here once; `overrides` supplies the rest and wins.
  */
-export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), ...overrides })
+export const makeRuntimeStub = (overrides = {}) => ({ now: () => Date.now(), config: { grants: NO_GRANTS }, ...overrides })
 
 /**
  * Runtime + mission + two members + a propose helper. The runtime, store,
@@ -279,10 +287,13 @@ export async function setup({ workers = new FakeWorkers(), config = {}, budget: 
   const runtime = new SwarmRuntime(runtimeConfig(dir, config, clock), workers)
   await runtime.start()
   const owner = { sessionId: 'fault-owner' }
-  const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } })
+  const mission = runtime.create(owner, { title: 'Fault injection', objective: 'Prove the injected fault fired and recovery holds', workspace: workspace ?? dir, scope: ['**'], acceptance, budget: { ...budget, ...overrides } }, { grantRoot: workspace ?? dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Faults', objective: 'Exercise the fault path' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5_000 })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification', maxOutputTokens: 5_000 })
+  // Each member start re-validates the workspace on disk: the bodies the
+  // admissions kicked settle, so a scenario starts from a quiescent runtime.
+  await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
   const propose = (extra = {}) => runtime.propose(owner, mission.id, {
     outputs: [], workstreamId: stream.id, title: 'Implement', objective: 'Implement the scoped change',

@@ -15,7 +15,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import type { AutoStart, Delivery, DraftPlan, Evidence, Member, Mission, Post, PostKind, SwarmEvent, Task, ToolRun, Workstream } from './types.ts'
 import type { AdmissionReason, AdmissionRecord, LimitRule } from './scheduler.ts'
-import type { EventKind } from './events.ts'
+import { PROGRESS_KINDS, type EventKind } from './events.ts'
 // R17-G7: one derivation for the derived member status; the store never persists it.
 import { deriveMemberStatus, memberPhaseOf } from './projection.ts'
 
@@ -32,7 +32,7 @@ interface Tables {
   admissions: AdmissionRecord
   limits: LimitRule
 }
-export type Table = keyof Tables
+type Table = keyof Tables
 /**
  * A store written before the scheduling pass guard moved into memory also holds
  * a `passes` table; nothing reads it, and it is left in place untouched.
@@ -141,7 +141,7 @@ export class StaleTaskRevisionError extends Error {
   }
 }
 /** One refused stale task write, recorded durably when the refused write rolled back. */
-export interface StaleTaskRefusal {
+interface StaleTaskRefusal {
   missionId: string
   taskId: string
   expected: number
@@ -289,7 +289,7 @@ function finishRestore(statePath: string): void {
   rmSync(intentPath)
   syncDirectory(statePath)
 }
-export interface StoreChange { revision: number; scopes: string[] }
+interface StoreChange { revision: number; scopes: string[] }
 /** SQLite-backed source of truth. Only one live runtime may own a state file. */
 export class SwarmStore {
   private readonly db: DatabaseSync
@@ -498,9 +498,8 @@ export class SwarmStore {
     // accepted write.
     if (table === 'tasks') { this.putTask(value as Task); return }
     // R17-G7: the member funnel drops the derived live status and normalizes the
-    // durable phase. A caller that assigns `member.status` (there are legacy
-    // sites outside this round's write scope) changes nothing durable: the next
-    // read re-derives the status from the phase and the live attempts.
+    // durable phase. Status is never stored: every read re-derives it from the
+    // phase and the live attempts.
     if (table === 'members') {
       const member = value as Member
       const { status: _derivedStatus, ...durable } = member
@@ -694,10 +693,13 @@ export class SwarmStore {
       : this.db.prepare('SELECT * FROM (SELECT * FROM events WHERE mission_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq').all(missionId, limit)
     return rows.map(row => ({ seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }))
   }
+  /** The mission's progress clock: its newest progress-kind row in the whole append-only log (never the event window), else its creation. */
+  progressAt(mission: Mission): number {
+    return Number(this.db.prepare(`SELECT COALESCE(MAX(created_at), ?) AS at FROM events WHERE mission_id=? AND type IN (${PROGRESS_KINDS.map(() => '?').join()})`).get(mission.createdAt, mission.id, ...PROGRESS_KINDS)?.at)
+  }
   /** Durable task fact lookup, independent of the presentation event window. */
-  latestTaskEvent(missionId: string, taskId: string, type: string, key: 'taskId' | 'reviewOf' = 'taskId'): SwarmEvent | undefined {
-    const field = key === 'reviewOf' ? '$.reviewOf' : '$.taskId'
-    const row = this.db.prepare(`SELECT * FROM events WHERE mission_id=? AND type=? AND json_extract(data,'${field}')=? ORDER BY seq DESC LIMIT 1`).get(missionId, type, taskId)
+  latestTaskEvent(missionId: string, taskId: string, type: string): SwarmEvent | undefined {
+    const row = this.db.prepare(`SELECT * FROM events WHERE mission_id=? AND type=? AND json_extract(data,'$.taskId')=? ORDER BY seq DESC LIMIT 1`).get(missionId, type, taskId)
     return row === undefined ? undefined : { seq: Number(row.seq), missionId: String(row.mission_id), type: String(row.type), actor: String(row.actor), data: JSON.parse(String(row.data)), createdAt: Number(row.created_at) }
   }
   /** Trace-only window; unrelated coordination events cannot evict parent spans. */

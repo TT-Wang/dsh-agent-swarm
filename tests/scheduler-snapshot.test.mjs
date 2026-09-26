@@ -39,10 +39,12 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t)
   await runtime.start()
   const owner = { sessionId: 's1-owner' }
-  const mission = runtime.create(owner, { title: 'S1', objective: 'No stale snapshot write', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'S1', objective: 'No stale snapshot write', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation', maxOutputTokens: 5000 })
   const other = await runtime.addMember(owner, mission.id, { name: 'Other', role: 'implementation', maxOutputTokens: 5000 })
+  // The members' starts re-validate the workspace on disk; their passes settle before the claims below.
+  await runtime.settle(mission.id)
   const actor = member => ({ sessionId: member.sessionId })
   const propose = title => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: undefined })
@@ -52,6 +54,8 @@ test('S1: a cancel committed during a lease-expiry await is not reverted by a st
   // T1 owns an expired lease; T2 is inside the renewal window. Both are running.
   const first = propose('Expired lease')
   const firstClaim = await runtime.claim(actor(author), mission.id, first.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await runtime.settle(mission.id)
   const second = propose('Renewal window')
   const secondClaim = await runtime.claim(actor(other), mission.id, second.id)
   runtime.store.transaction(() => {
@@ -101,9 +105,11 @@ test('S1r: a live operation whose lease already expired is renewed, not expired,
   const { dir: directory, runtime, workers, budget } = await snapshotRuntime(t)
   await runtime.start()
   const owner = { sessionId: 's1r-owner' }
-  const mission = runtime.create(owner, { title: 'S1r', objective: 'Renew before expiring', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'S1r', objective: 'Renew before expiring', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation', maxOutputTokens: 5000 })
+  // The member's start re-validates the workspace on disk; its pass settles before the claim below.
+  await runtime.settle(mission.id)
   const actor = { sessionId: member.sessionId }
   const task = runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Long verification', objective: 'Long host verification',
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: member.id, maxRecoveryAttempts: 3 })

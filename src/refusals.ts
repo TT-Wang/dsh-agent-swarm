@@ -72,7 +72,6 @@ export function queueWriterBusy(rt: SwarmRuntime, recovery: WriterBusyRecovery):
 
 export class RefusalRegistry {
 
-
   constructor(private readonly rt: SwarmRuntime) {}
 
   /**
@@ -270,7 +269,7 @@ export class RefusalRegistry {
 export type GuardChainId = 'budget' | 'workspace' | 'attempt_lease' | 'task_ceiling' | 'review_admission' | 'dispatch_preconditions' | 'owner_reply'
 
 /** One executable exit: the tool, the parameter of that tool, and the instruction. */
-export interface DecisionExit {
+interface DecisionExit {
   tool: string
   parameter: string
   instruction: string
@@ -367,8 +366,13 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
 }
 
 /** The durable dedup key of one terminal decision request: one per chain and board state. */
-export function guardTerminalKey(chain: GuardChainId, code: string, fingerprint: string): string {
+function guardTerminalKey(chain: GuardChainId, code: string, fingerprint: string): string {
   return `guard-terminal:${chain}:${code}:${fingerprint}`
+}
+
+/** The dedup `emitGuardTerminal` applies: the owner holds `chain`'s decision for this board, `question:<id>` or `localKey`. */
+export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, chain: GuardChainId, fingerprint: string): boolean {
+  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: guardTerminalKey(chain, GUARD_TERMINAL_CODES[chain], fingerprint), from: 'runtime' })
 }
 
 /**
@@ -403,8 +407,8 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
   const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
+  if (guardTerminalHeld(rt, missionId, chain, fingerprint)) return terminal
   const key = guardTerminalKey(chain, terminal.code, fingerprint)
-  if (hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })) return terminal
   try {
     rt.commit(missionId, () => {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so

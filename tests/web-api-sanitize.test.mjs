@@ -174,7 +174,7 @@ test('authored validation and policy refusals stay actionable', async t => {
   assert.equal(plan.result.error.code, 'bad-request')
   assert.match(plan.result.error.message, /scope\[0\] is invalid/)
   // A runtime policy refusal authored by the runtime remains visible.
-  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input)
+  const mission = f.runtime.create({ sessionId: f.ownerId }, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const member = await f.runtime.addMember({ sessionId: f.ownerId }, mission.id, { name: 'Worker', role: 'implementation' })
   f.ctx.sessions.create(SessionId(member.sessionId), { meta: { cwd: f.workspace } })
   const denied = await f.rpc('control', { sessionId: member.sessionId, missionId: mission.id, action: 'stop', reason: 'member attempt' })
@@ -187,7 +187,7 @@ test('authored validation and policy refusals stay actionable', async t => {
 test('the cancel RPC withdraws one task for the owner and refuses other sessions', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   const task = f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id,
     title: 'Withdrawable', objective: 'A task the owner withdraws', kind: 'research', scope: ['src/'], acceptance: ['works'] })
@@ -226,7 +226,7 @@ test('T2 W8/F7 owner-actionable refusals stay actionable over the RPCs', async t
   assert.deepEqual(member.result.error.details, { issues: [], policyCode: 'member_reasoning_effort_unsupported', category: 'tool_error' })
   // F7 from the real runtime: a deterministic retry of a withdrawn record is a typed refusal.
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   const input = { workstreamId: stream.id, title: 'Withdrawn', objective: 'Read it', kind: 'research', scope: ['src/'], acceptance: ['works'], outputs: [] }
   f.runtime.propose(owner, mission.id, input, 'task_1')
@@ -255,7 +255,7 @@ test('a rejected reasoning effort reaches the browser in the canonical shape, ne
   const f = await fixture(t)
   f.catalog.reasoning = { efforts: [{ id: 'high', name: 'High' }] }
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   // The effort start is rejected with the adapter's code; the retry without it fails too.
   const rejectWith = message => {
     f.workers.onStart = async spec => {
@@ -327,7 +327,7 @@ test('a typed refusal naming an absolute host path under any system root is an i
 test('a scope or check echoing the caller\'s own absolute path is a fixed repair, not an internal error', async t => {
   const f = await fixture(t)
   const owner = { sessionId: f.ownerId }
-  const mission = f.runtime.create(owner, f.input)
+  const mission = f.runtime.create(owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Build it' })
   const task = f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'Read', objective: 'Read the code', kind: 'research', scope: ['src/'], acceptance: ['works'] })
   const repair = location => `[scope_selector_invalid] ${location}: the value names an absolute path and is not repeated here. Use a repository-relative path and retry.`

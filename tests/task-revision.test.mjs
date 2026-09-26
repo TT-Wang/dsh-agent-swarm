@@ -33,7 +33,8 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { SwarmStore, StaleTaskRevisionError, STALE_TASK_REFUSAL_EVENT, WriterBusyError, isSqliteBusy } from '../lib/store.js'
 import { missionFingerprint } from '../lib/gates.js'
-import { EVENT_VOCABULARY, eventVocabularyReport } from '../lib/trace.js'
+import { EVENT_VOCABULARY } from '../lib/events.js'
+import { eventVocabularyReport } from '../lib/trace.js'
 import { FakeWorkers, SwarmRuntime, makeRuntime } from './faults/harness.mjs'
 
 /**
@@ -51,7 +52,7 @@ async function fixture(t) {
     budget: { maxTokens: 1_000_000, maxSteps: 1_000, maxWorkers: 2, maxDurationMs: 3_600_000, maxTasks: 20 } })
   const owner = { sessionId: 's5-owner' }
   const mission = runtime.create(owner, { title: 'Revisions', objective: 'Prove per-task compare-and-swap', workspace: directory,
-    scope: ['**'], acceptance: ['works'], budget })
+    scope: ['**'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   // The tick timer is deliberately not started: these tests drive writes directly
@@ -194,7 +195,7 @@ test('S5 pair: the revision-keyed fingerprint cache can never serve the stale bo
   const after = f.runtime.fingerprint(f.mission.id)
   assert.equal(after, missionFingerprint(f.runtime.fingerprintBoard(f.mission.id)),
     'the refusal record advanced the store revision, so the cache recomputed instead of gating on the stale digest')
-  f.runtime.fingerprintCache.clear()
+  f.runtime.gates.fingerprintCache.clear()
   assert.equal(f.runtime.fingerprint(f.mission.id), after, 'losing the cache changes no digest (cache-only)')
 })
 

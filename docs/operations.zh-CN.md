@@ -129,7 +129,7 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 
 任务可以使用调用会话的工作目录，或 realpath 位于 `authorizedWorkspaces` 某个授权根内的路径。修改授权根需要用户编辑 profile 或 `cordis.patch.yml`，然后重启 Harness。任何模型可调用工具都不能添加、扩大或撤销授权根。
 
-解析后的工作区和匹配到的授权会持久记录。未授权路径返回 `[workspace_not_authorized]` 及修正说明。删除某个根并重启后，系统拒绝在该目录创建新任务；现有任务在下一次准备工作区或创建验证检出时会被阻止继续，并记录 blocked 原因和主 agent 通知。
+解析后的工作区和匹配到的授权会持久记录。未授权路径返回 `[workspace_not_authorized]` 及修正说明。运行时在每次启动 worker、准备工作区、创建规划快照、启动草稿、交付和创建验证检出之前，都会按准入规则（调用会话自身的目录；否则取包含该工作区、仍有效且最具体的授权根）重新校验任务的工作区。因此删除某个根并重启后，系统拒绝在该目录创建新任务；现有任务会在下一次调度时被阻止继续，并记录 blocked 原因和主 agent 通知；每个发现该任务授权已撤销的插件运行时（每次 Harness 启动或插件重载）只通知主 agent 一次。宿主运行期间授权根的 `expiresAt` 到期（或工作区无法再解析）时，相关任务也会在下一次调度时以同样方式被隔离。增删嵌套的授权根不会隔离仍被其他已配置根包含的任务。在授权根恢复之前恢复的工作会再次被隔离。
 
 授权不等于保密隔离。它不提供独立的网络或凭据隔离；配置文件的写权限以及授权根被替换仍是相关风险。详见[已知限制](known-limitations.md)。
 
@@ -155,11 +155,13 @@ node "$DSH_HARNESS_ROOT/apps/cli/lib/bin.js" --profile web
 | 任务被驳回，下游持续等待 | 主 agent 可准入保留原验收标准的 replacement；replacement 验收通过后，下游依赖会解析到它。 |
 | 主 agent 离线或原生调用挂起 | 通知持久保留。主 agent 恢复可用并到达原生 inbox 边界后才能行动；运行时取消不依赖它。通知投递不保证模型立即响应。 |
 | 数据库被截断或丢失 | 存储拒绝继续运行并指出快照。主 agent 可通过 `swarm_restore` 暂存一个已校验快照，下次宿主启动时会在打开数据库前应用。 |
-| 检查找不到命令 | 检查已安装工具链和 `verificationDependencyDirs`。命令缺失属于环境失败；插件不会代为安装项目依赖。 |
+| 检查找不到命令 | 在干净验证检出中退出码为 126 或 127 的检查记为 `unrunnable`，复核被延迟；原因会列出检出从源项目获得的依赖目录。请在源项目或宿主上补齐命令所需内容（检查已安装工具链和 `verificationDependencyDirs`），再用 `swarm_control` 恢复该复核；如果命令本身有误，用 `swarm_cancel` 取消源任务，并用 `swarm_propose`（指定 `replaces` 和修正后的 `checks`）提出修复。插件不会代为安装项目依赖。 |
 | 浏览器返回 HTTP 401 | 使用当前 Harness profile 输出的认证启动链接。 |
 | 缺少供应商 key | 在 Harness 中配置模型路由和凭据。插件没有独立的 API-key 存储。 |
 
 验证会针对精确的提交工件执行任务声明的命令。agent 的成功声明不能豁免失败命令，但检查通过也不意味着命令覆盖了全部需求。默认将被忽略的依赖目录复制到验证检出中；它们是已安装的工具链状态，不是全新的 CI 安装。显式启用链接模式可能允许沿链接读取源项目。
+
+不能给出结论的声明检查会延迟复核，而不是驳回工件；宿主在检查记录上写明原因：`timeout`（宿主的检查时限触发）、`infrastructure`（宿主无法准备、隔离或启动该检查，退出码 125）或 `unrunnable`（退出码 126 或 127）。命令自身返回的 124（例如内部的 `timeout`）属于断言失败，会驳回工件。延迟原因会给出对应的出路：用 `swarm_budget` 提高源任务的 `checkTimeoutMs`、修复输出中报告的宿主问题，或补齐命令所需内容；之后用 `swarm_control`（`action: "resume"`）恢复同一个复核。git 无法删除一次性验证检出时，宿主会自行删除目录并尝试移除其注册，剩余部分由同一任务下一次运行声明检查的验证回收；`task/verification-cleanup-failed` 通知会说明这一点，无需运行 `git worktree prune`。
 
 复制模式支持本身为符号链接的依赖目录，并重定位目录内部的链接。指向外部普通可执行文件的链接，例如虚拟环境中的 Python 解释器，会物化为复制的可执行文件，仍可能依赖系统库。损坏链接、指向源项目其他内容的链接，以及指向外部目录或非可执行数据的链接无法物化：不会运行任何声明检查，该次复核记为基础设施失败（`(verification preparation)`，退出码 125）并被延迟，输出中给出修复方式（`verificationDependencyMode: "link"` 加 `allowDependencyLinkReads: true`，或调整 `verificationDependencyDirs`）；宿主配置好后用 `swarm_control` 恢复。请使用自包含依赖；若宿主明确接受外部读取，需同时配置 `verificationDependencyMode: link` 和 `allowDependencyLinkReads: true`。
 

@@ -49,9 +49,12 @@ import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { guardActions, guardBoard, guardDispatchActions, guardMissionTerminal, guardProgressActions, guardTerminalChain, terminalEscalation } from './guard-model.mjs'
 import { emitGuardTerminal, guardTerminal } from '../lib/refusals.js'
-import { DEPENDENCY_ASSUMPTION_CODE, dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
+import { dependencyAssumptions, reconcileTaskAdmission } from '../lib/admission.js'
 import { assessText, toolSchemaIndex } from './refusal-inventory.mjs'
 import { setup, eventually, events, FakeClock, budget } from './faults/harness.mjs'
+
+/** The model-visible code of the R12-F9 admission refusal. */
+const DEPENDENCY_ASSUMPTION_CODE = 'dependency_assumption_missing'
 
 import { CHAINS, TASK_STATUS, ATTEMPTS, WORKSPACES, MEMBER_STATUS, BUDGETS, FLAGS, MISSION_BASE, MISSION_STATUS, TASK_ID, MEMBER_ID, budgetFields, flagFields, generatedBoards, keyOf, reachableFrom, generatorLimits } from './guard-states.mjs'
 
@@ -391,8 +394,12 @@ test('R14 runtime (workspace chain): a revoked workspace escalates with the code
   const f = await setup()
   try {
     f.workers.autoIdle = true
-    const { WorkspaceRevokedError } = await import('../lib/workspace-admission.js')
-    f.runtime.assertWorkspaceAuthorized = async () => { throw new WorkspaceRevokedError('workspace_revoked: the authorized grant root was removed') }
+    // The re-validation fences where it detects the revocation, then throws the typed error.
+    const { WorkspaceRevokedError } = await import('../lib/authorization.js')
+    f.runtime.assertWorkspaceAuthorized = async mission => {
+      f.runtime.fenceWorkspace(mission.id, 'workspace_revoked: the authorized grant root was removed')
+      throw new WorkspaceRevokedError('workspace_revoked: the authorized grant root was removed')
+    }
     f.propose({ title: 'Work under a revoked grant' })
     const event = await eventually(() => events(f.runtime, f.mission.id, 'mission/stalled')
       .filter(item => item.data.cause === 'guard-terminal' && item.data.chain === 'workspace').at(-1),

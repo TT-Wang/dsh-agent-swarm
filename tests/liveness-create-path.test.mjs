@@ -35,7 +35,7 @@ async function fixture(t) {
   const owner = { sessionId: 'liveness-owner' }
   // The create path: no `starts` journal row, exactly like swarm_create.
   const mission = runtime.create(owner, { title: 'Liveness', objective: 'Reach automatic completion and stall notices',
-    workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+    workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -130,8 +130,8 @@ test('a create-path stall notice names the parked work, and admitting the follow
   // R17-G7: the live status is derived from the phase and the attempt, never
   // written, so the new attempt alone makes its owner `working`.
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'the member has a confirmed stopped predecessor and a new assignment')
-  const assignment = f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id)
-  assert.ok(assignment, 'the wake is a durable assignment delivery')
+  const assignment = await eventually(() => f.workers.deliveries.find(item => item.delivery.kind === 'assignment' && item.delivery.taskId === repair.id),
+    'the wake is a durable assignment delivery', 2500)
   assert.equal(assignment.member.id, f.author.id)
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'the woken member takes its next step')
   assert.equal(f.runtime.store.get('members', f.author.id).status, 'working', 'and the derived status follows the live attempt')

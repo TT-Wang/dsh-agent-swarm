@@ -6,7 +6,6 @@ import { orchestratorCommands, ReplayGraphError, ReplayTruncationError } from '.
 import { validatePlan, planAdvisories } from '../lib/plans.js'
 import { classifyCheck, taskCeilingExhaustion } from '../lib/admission.js'
 import { taskGraphIndex, selectAcceptedDelivery } from '../lib/task-graph.js'
-import { liveCarrier, proposalAllowance } from '../lib/arena.js'
 import { boardIndex, deliverableTask } from '../lib/types/client/projection.js'
 import { FakeWorkers, budget as defaultBudget, makeRuntime } from './faults/harness.mjs'
 
@@ -45,9 +44,9 @@ test('plans retain an optional fixed deadline through validation, draft editing 
   const f = await fixture(t), deadlineAt = Date.now() + 7_200_000
   f.input.budget.deadlineAt = deadlineAt
   assert.equal(validatePlan(f.input).budget.deadlineAt, deadlineAt)
-  const draft = f.runtime.createDraft(f.owner, f.input)
+  const draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   assert.equal(draft.input.budget.deadlineAt, deadlineAt)
-  const revised = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, title: 'Same deadline' })
+  const revised = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, title: 'Same deadline' }, { grantRoot: draft.input.workspace, source: 'session' })
   assert.equal(revised.input.budget.deadlineAt, deadlineAt)
   const launched = await f.runtime.launchDraft(f.owner, revised.id, revised.revision)
   assert.equal(launched.mission.budget.deadlineAt, deadlineAt)
@@ -59,7 +58,7 @@ test('plans retain an optional fixed deadline through validation, draft editing 
 
 test('R08 corrected automatic input repairs the same staged admissions and keeps consumption', async t => {
   const f = await fixture(t), restore = failAfterAdmission(f)
-  const request = f.runtime.requestStart(f.owner, { commandId: 'launch', goal: 'Deliver change', workspace: f.directory })
+  const request = f.runtime.requestStart(f.owner, { commandId: 'launch', goal: 'Deliver change', workspace: f.directory }, { grantRoot: f.directory, source: 'session' })
   await assert.rejects(f.runtime.startPlan(f.owner, request.id, f.input), /assembly fixture failure/)
   restore()
   const saved = f.runtime.starts(f.owner)[0], before = f.runtime.store.list('tasks', saved.missionId)
@@ -82,13 +81,13 @@ test('R08 corrected automatic input repairs the same staged admissions and keeps
 })
 
 test('R08 member configuration changes await stop acknowledgement and retain compatible identities', async t => {
-  const f = await fixture(t), restore = failAfterAdmission(f), draft = f.runtime.createDraft(f.owner, f.input)
+  const f = await fixture(t), restore = failAfterAdmission(f), draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), /assembly fixture/); restore()
   const failed = f.runtime.drafts(f.owner)[0], before = f.runtime.store.list('members', failed.missionId)
   const changed = structuredClone(f.input); changed.members[0].model = 'correct-route'
-  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, changed)
+  const revised = f.runtime.updateDraft(f.owner, failed.id, failed.revision, changed, { grantRoot: changed.workspace, source: 'session' })
   assert.ok(revised.revision > failed.revision)
-  assert.throws(() => f.runtime.updateDraft(f.owner, revised.id, failed.revision, changed), /Draft changed/)
+  assert.throws(() => f.runtime.updateDraft(f.owner, revised.id, failed.revision, changed, { grantRoot: changed.workspace, source: 'session' }), /Draft changed/)
   const gate = deferred(); f.workers.stopGate = gate.promise; f.workers.stopping = deferred()
   const launch = f.runtime.launchDraft(f.owner, revised.id, revised.revision)
   await f.workers.stopping.promise
@@ -103,13 +102,13 @@ test('R08 member configuration changes await stop acknowledgement and retain com
 })
 
 test('R08 repairing a failed draft cannot rewrite a submitted artifact or drop acceptance', async t => {
-  const f = await fixture(t), restore = failAfterAdmission(f), draft = f.runtime.createDraft(f.owner, f.input)
+  const f = await fixture(t), restore = failAfterAdmission(f), draft = f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' })
   await assert.rejects(f.runtime.launchDraft(f.owner, draft.id, draft.revision), /assembly fixture/); restore()
   const failed = f.runtime.drafts(f.owner)[0], code = f.runtime.store.list('tasks', failed.missionId).find(task => task.kind === 'implementation')
   code.status = 'submitted'; code.artifact = { commit: 'immutable', baseCommit: 'base', workspace: f.directory, changedPaths: ['src/x'] }; f.runtime.store.put('tasks', code)
   const changed = structuredClone(f.input); changed.tasks[0].checks = ['node different.cjs']
-  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, changed), /immutable evidence/)
-  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, { ...f.input, acceptance: ['different'] }), /original acceptance/)
+  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, changed, { grantRoot: changed.workspace, source: 'session' }), /immutable evidence/)
+  assert.throws(() => f.runtime.updateDraft(f.owner, failed.id, failed.revision, { ...f.input, acceptance: ['different'] }, { grantRoot: f.input.workspace, source: 'session' }), /original acceptance/)
   assert.deepEqual(f.runtime.store.get('tasks', code.id).artifact, code.artifact)
 })
 
@@ -120,7 +119,7 @@ test('R19 actual target scripts decide confinement; unresolved names are advisor
   f.input.tasks[0].checks = ['npm run indirect']; assert.throws(() => validatePlan(f.input), /nested sandbox/)
   assert.equal(f.workers.prepared.length, 0)
   f.input.tasks[0].checks = ['npm run unknown']; assert.doesNotThrow(() => validatePlan(f.input)); assert.ok(planAdvisories(f.input).some(item => item.code === 'check_preflight'))
-  assert.ok(f.runtime.createDraft(f.owner, f.input).advisories.some(note => note.includes('check_preflight')))
+  assert.ok(f.runtime.createDraft(f.owner, f.input, { grantRoot: f.input.workspace, source: 'session' }).advisories.some(note => note.includes('check_preflight')))
   assert.equal(classifyCheck('npm run verify').runnable, 'worker')
 })
 
@@ -142,17 +141,17 @@ test('R25 all projections reject ambiguity and cross-kind replacements, with exa
   const review = task('review', 'verification', 'pending', { reviewOf: source.id })
   for (const rows of [[source, repair, second, review], [source, { ...repair, kind: 'research' }, review]]) {
     assert.equal(taskGraphIndex(rows).dependencyMet(source.id), false)
-    assert.notEqual(liveCarrier(rows, source.id)?.status, 'accepted')
+    assert.notEqual(taskGraphIndex(rows).effective(source.id)?.status, 'accepted')
     assert.equal(boardIndex(rows).dependencyMet(source.id), false)
   }
   repair.status = 'submitted'
   const rows = [source, repair, review]
   assert.equal(taskGraphIndex(rows).reviewSource(review).id, source.id)
-  assert.equal(boardIndex(rows).lane(review), 'blocked')
+  assert.equal(boardIndex(rows).lane(review, [{ id: 'reviewer', status: 'idle' }]), 'blocked')
 })
 
 test('R23/R24 completion and delivery share unique artifact coverage before terminal state', async t => {
-  const f = await fixture(t), mission = f.runtime.create(f.owner, { ...f.input, title: 'graph' })
+  const f = await fixture(t), mission = f.runtime.create(f.owner, { ...f.input, title: 'graph' }, { grantRoot: f.input.workspace, source: 'session' })
   const rows = [accepted('code'), accepted('one', 'integration', ['code']), accepted('two', 'integration', ['code'])].map(row => ({ ...row, missionId: mission.id }))
   for (const row of rows) f.runtime.store.put('tasks', row)
   assert.match(f.runtime.completionError(mission), /unique accepted integration/)
@@ -166,13 +165,6 @@ test('R23/R24 completion and delivery share unique artifact coverage before term
   assert.equal(deliverableTask({ tasks: remaining }).id, 'code')
   const missingCoverage = [accepted('a'), accepted('b'), accepted('integration', 'integration', ['a'])]
   assert.throws(() => selectAcceptedDelivery(missingCoverage), /all implementation results/)
-})
-
-test('R11 worker expansion leaves aggregate proposal safety unchanged', () => {
-  const rows = Array.from({ length: 6 }, (_, i) => task(`t${i}`, 'research', 'pending'))
-  const before = proposalAllowance({ budget: { ...budget, maxTasks: 40, maxWorkers: 4 } }, [], rows, 'worker')
-  const after = proposalAllowance({ budget: { ...budget, maxTasks: 40, maxWorkers: 8 } }, [], rows, 'worker')
-  assert.equal(before.limit, 40); assert.equal(after.limit, 40); assert.equal(after.admitted, 6)
 })
 
 

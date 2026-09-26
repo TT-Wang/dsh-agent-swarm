@@ -118,9 +118,9 @@ export interface CheckEnvelope {
   totalRunMs: number
   maxRunMs: number
 }
-/** One declared check's outcome, as the host recorded it or, with `failureKind`, as the host failed to execute it. */
+/** One declared check's outcome as the host recorded it; `failureKind`, classified where the row is produced, marks one that decides no verdict: the host's check deadline (stored as exit 124), a host that could not execute it, or exit 126/127 (it could not run in the checkout). */
 export interface CheckResult { command: string; exitCode: number; output: string; truncated?: boolean
-  failureKind?: 'timeout' | 'infrastructure'
+  failureKind?: 'timeout' | 'infrastructure' | 'unrunnable'
   /** ENV: failure attribution captured ahead of the output bound; durable with the check row. */
   attribution?: CheckAttribution
   /** ENV: the environment this check actually ran under. */
@@ -219,13 +219,11 @@ export interface Mission {
   coordinatorId?: string
   reason?: string
   baseline?: WorkspaceBaseline
-  /** Durable gate while budget exhaustion stops the previous worker activity. */
   /**
    * S5r: the durable stop claim. `stopping` is written before the deferred stop
-   * touches the adapter, so clearing the in-memory `budgetStops` mirror cannot
-   * re-run a stop that is already in flight. A claim from another runtime
-   * instance, or one older than the declared pass bound, is a crashed stop and
-   * does not gate a fresh attempt.
+   * touches the adapter, so a second request cannot re-run a stop that is
+   * already in flight. A claim from another runtime instance, or one older than
+   * the declared pass bound, is a crashed stop and does not gate a fresh attempt.
    */
   budgetPause?: { id: string; quiesced: boolean; stopping?: { instanceId: string; at: number } }
   /** Bucketed worker usage behind `usedTokens`; absent on missions recorded before bucket accounting. */
@@ -737,30 +735,6 @@ export interface Delivery {
   escalation?: Escalation
 }
 /**
- * Every durable event that fences a running attempt, and therefore closes the
- * attempt interval both readers reconstruct from the log:
- *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
- *    and refuses the whole log with `ReplayTruncationError` when one never
- *    closes;
- *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
- *    with the same set.
- *
- * The two readers used to carry hand-mirrored copies. They drifted: neither had
- * `task/restart-repended` (emitted when a host restart re-pends a running task,
- * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
- * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
- * refuse its own mission as truncated. One list, both readers.
- */
-/**
- * The owner-only tool surface: management and runtime modification that a
- * worker session must never reach. Declared ONCE, because two enforcement points
- * read it and they had drifted: the role projection hides exactly this set from
- * a worker's schemas (`src/tools.ts`), and the runtime's synchronous final guard
- * refuses exactly this set on every dispatch surface (`src/runtime.ts`). The
- * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
- * tool the guard would have allowed.
- */
-/**
  * The host's shared browser-transport channel and this plugin's endpoint prefix
  * inside it.
  *
@@ -787,11 +761,35 @@ export const SWARM_WEB_ENDPOINTS: readonly string[] = [
   'create-draft', 'update-draft', 'discard-draft', 'launch-draft', 'add-member', 'propose',
 ]
 
+/**
+ * The owner-only tool surface: management and runtime modification that a
+ * worker session must never reach. Declared ONCE, because two enforcement points
+ * read it and they had drifted: the role projection hides exactly this set from
+ * a worker's schemas (`src/tools.ts`), and the runtime's synchronous final guard
+ * refuses exactly this set on every dispatch surface (`src/runtime.ts`). The
+ * guard's hand-written copy had lost `swarm_registry`, so the projection hid a
+ * tool the guard would have allowed.
+ */
 export const OWNER_ONLY_TOOLS: readonly string[] = [
   'swarm_stage', 'swarm_launch', 'swarm_budget', 'swarm_create', 'swarm_add_member',
   'swarm_control', 'swarm_cancel', 'swarm_registry', 'swarm_restore',
 ]
 
+/**
+ * Every durable event that fences a running attempt, and therefore closes the
+ * attempt interval both readers reconstruct from the log:
+ *  - the replay decoder (`src/trace.ts`) opens one attempt per `task/claimed`
+ *    and refuses the whole log with `ReplayTruncationError` when one never
+ *    closes;
+ *  - the scheduling board model (`src/scheduling.ts`) ends the attempt interval
+ *    with the same set.
+ *
+ * The two readers used to carry hand-mirrored copies. They drifted: neither had
+ * `task/restart-repended` (emitted when a host restart re-pends a running task,
+ * `src/runtime.ts`) nor `task/ceiling-exhausted` (emitted when a task blocks at
+ * its own ceiling, `src/runtime.ts`), so a log containing either made the replay
+ * refuse its own mission as truncated. One list, both readers.
+ */
 export const ATTEMPT_FENCING_EVENTS: readonly EventKind[] = [
   // `attempt/fenced` is the uniform closer every control path now writes through
   // `Attempts.fenceForStop`. Mission pause/stop and challenge closed attempts
@@ -851,16 +849,6 @@ export interface CreateMissionInput {
   title: string
   objective: string
   workspace: string
-  /**
-   * Human-authorization anchor for `workspace`, computed by the admission site
-   * from the session cwd or a configured `authorizedWorkspaces` root. Model
-   * tools never supply it directly: `boundPlanWorkspace` overwrites the
-   * workspace and passes the host-derived root, and the runtime re-derives it
-   * through `RuntimeConfig.authorizeWorkspace` when that check is configured.
-   */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin, computed with `workspaceGrantRoot` at admission. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   scope: string[]
   acceptance: string[]
   budget: Budget
@@ -920,7 +908,7 @@ export interface PlanInput extends CreateMissionInput {
   workstreams: PlanWorkstream[]
   tasks: PlanTask[]
 }
-export interface DraftPlan {
+export interface DraftPlan extends Pick<Mission, 'workspaceGrantRoot' | 'workspaceAuthorizationSource'> {
   id: string
   ownerSessionId: string
   revision: number
@@ -929,10 +917,6 @@ export interface DraftPlan {
   input: PlanInput
   /** Bounded advisory preflight notes; they never change launch eligibility. */
   advisories?: string[]
-  /** Human-authorization anchor captured at staging; carried into the launched mission. */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin captured with the anchor; never inside `input`. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   createdAt: number
   updatedAt: number
   missionId?: string
@@ -943,14 +927,10 @@ export interface RequestStartInput {
   commandId: string
   goal: string
   workspace: string
-  /** Human-authorization anchor for `workspace`; defaults to the workspace itself. */
-  workspaceGrantRoot?: string
-  /** Host-derived authorization origin; defaults from the anchor for automatic starts. */
-  workspaceAuthorizationSource?: 'session' | 'grant'
   /** Optional legacy hint. The primary agent supplies the actual plan budget. */
   budget?: Budget
 }
-export interface AutoStart extends RequestStartInput {
+export interface AutoStart extends RequestStartInput, Pick<Mission, 'workspaceGrantRoot' | 'workspaceAuthorizationSource'> {
   id: string
   ownerSessionId: string
   status: 'planning' | 'launching' | 'running' | 'completed' | 'failed' | 'stopped'
@@ -1093,7 +1073,7 @@ export interface CheckSyntaxIssue { index: number; message: string }
 export interface WorkerAdapter {
   bind(callbacks: WorkerCallbacks): void
   /** Freeze once before planning; optional only for adapters without Git execution. */
-  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
+  prepareBaseline?(mission: Pick<Mission, 'id' | 'workspace'>, signal?: AbortSignal): Promise<WorkspaceBaseline>
   inspectDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryInspection>
   applyDelivery(mission: Mission, resultCommit: string, signal?: AbortSignal): Promise<DeliveryApplication>
   prepareWorkspace(mission: Mission, memberId: string): Promise<string>
@@ -1171,12 +1151,6 @@ export interface RuntimeConfig {
   checkTimeoutMs?: number
   /** Idle close-out nudges before an open attempt is checkpointed and abandoned; defaults to 2. */
   maxIdleCloseouts?: number
-  /**
-   * L2 owner-reply guard. `nudge` (default) records the missing reply and sends a
-   * bounded instruction to the owner; `block` additionally refuses the owner's
-   * next step, which ends the turn that answered in prose only.
-   */
-  ownerReplyGuard?: 'nudge' | 'block'
   /** Owner-reply nudges before the guard terminal; defaults to 2. */
   maxOwnerReplyNudges?: number
   /** Approaching-limit fractions per budget dimension; defaults to [0.7, 0.9]. */
@@ -1196,20 +1170,17 @@ export interface RuntimeConfig {
    */
   stallPassTimeoutMs?: number
   /**
-   * Human-authorized workspace predicate, loaded once from plugin configuration
-   * at start. When present the runtime re-derives every mission's grant root
-   * from it and fences a mission whose root was revoked; when absent (unit
-   * runtimes and adapters without Git) the recorded admission result stands.
-   * It judges grant expiry at `now`, the runtime clock's instant, as admission
-   * does. It is a value on the runtime's own config, never a model-callable surface.
+   * The human-authorized roots, loaded once from plugin configuration at
+   * start (`loadWorkspaceGrants`; no configured root loads an empty snapshot,
+   * which authorizes only the calling session's own directory): the one
+   * representation every admission and re-validation reads, judged at `now`,
+   * the runtime clock's instant. The runtime re-validates a mission before
+   * every adapter call that can reach its workspace (worker start, baseline,
+   * worktree, task preparation, verification checkout, launch preflight,
+   * delivery) and fences one no configured root authorizes any more. Never
+   * re-loaded at runtime and never a model-callable surface.
    */
-  authorizeWorkspace?: (workspace: string, sessionCwd: string | undefined, now: number) => Promise<WorkspaceAuthorization>
-  /**
-   * The roots `authorizeWorkspace` closes over, carried so revocation fencing
-   * can name the recorded root without re-reading configuration. Never
-   * re-loaded at runtime.
-   */
-  grants?: WorkspaceGrantSnapshot
+  grants: WorkspaceGrantSnapshot
   /**
    * The dependency directory names the host's workspace engine treats as
    * toolchain state (the plugin `verificationDependencyDirs`). Admission checks
@@ -1220,17 +1191,11 @@ export interface RuntimeConfig {
 }
 
 /**
- * Structural mirror of the authorization types in `src/authorization.ts`. They
- * live here so the browser typecheck (which includes this file) never pulls in
- * Node built-ins; the runtime values are assignable to these shapes.
+ * One human-configured root and the set loaded at start. They live here, not in
+ * `src/authorization.ts`, so the browser typecheck (which includes this file)
+ * never pulls in Node built-ins. `note` is audit metadata; past `expiresAt`
+ * (epoch ms) a root is no longer consulted. `unresolved` names configured roots
+ * that did not resolve or had already expired at start.
  */
 export interface WorkspaceGrant { path: string; note?: string; expiresAt?: number }
 export interface WorkspaceGrantSnapshot { grants: readonly WorkspaceGrant[]; loadedAt: number; unresolved: readonly string[] }
-export interface WorkspaceAuthorization {
-  ok: boolean
-  workspace?: string
-  source?: 'session' | 'grant'
-  grantRoot?: string
-  grant?: WorkspaceGrant
-  diagnostic?: string
-}

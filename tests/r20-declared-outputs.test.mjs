@@ -52,9 +52,11 @@ async function runtimeFixture(t, config = {}) {
   await runtime.start()
   const owner = { sessionId: 'r20-outputs-owner' }
   const mission = runtime.create(owner, { title: 'Outputs', objective: 'Declare deliverables', workspace: directory,
-    scope: ['src/', 'docs/'], acceptance: ['works'], budget })
+    scope: ['src/', 'docs/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { workstreamId: stream.id, title, objective: title,
     kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   return { directory, runtime, owner, mission, stream, addMember, propose }

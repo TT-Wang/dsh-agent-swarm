@@ -3,14 +3,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands'
 
 /** Preserve the native invocation identity for durable admission and cancellation. */
-export interface SwarmCommandRequest extends CommandInvocation {
+interface SwarmCommandRequest extends CommandInvocation {
   readonly sessionId: string
   readonly goal: string
 }
 
-export type SwarmCommandStart = (request: SwarmCommandRequest) => CommandResult | Promise<CommandResult>
+type SwarmCommandStart = (request: SwarmCommandRequest) => CommandResult | Promise<CommandResult>
 
-export interface SwarmCommandOptions {
+interface SwarmCommandOptions {
   /** The runtime owns planning, authorization, deduplication and worker launch. */
   readonly start: SwarmCommandStart
   readonly maxGoalChars?: number

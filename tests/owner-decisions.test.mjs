@@ -64,9 +64,11 @@ async function scenario(t, { workers = new Workers(), config = {} } = {}) {
   const f = await fixture(t, config, workers)
   await f.runtime.start()
   const owner = { sessionId: 'owner-decisions' }
-  const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = f.runtime.create(owner, { title: 'Owner decisions', objective: 'Name the subject', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => f.runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await f.runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await f.runtime.settle(mission.id); return member }
   const actorFor = member => ({ sessionId: member.sessionId })
   const propose = (title, input = {}) => f.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], ...input })
   const notices = () => f.runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
@@ -91,7 +93,7 @@ test('R15-A1: the guard-terminal owner notice behind the task-ceiling path carri
   const limited = await fixture(t, { maxTasks: 1 })
   await limited.runtime.start()
   const owner = { sessionId: 'ceiling-owner' }
-  const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } })
+  const mission = limited.runtime.create(owner, { title: 'Ceiling', objective: 'Name the subject', workspace: limited.directory, scope: ['src/'], acceptance: ['works'], budget: { ...budget, maxTasks: 1 } }, { grantRoot: limited.directory, source: 'session' })
   const stream = limited.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const builder = await limited.runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   await limited.runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title: 'First', objective: 'First', kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test'], assigneeId: builder.id })
@@ -556,8 +558,8 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
   if (task.status === 'submitted') {
     if (runtime.reviewable(task, tasks)) return true
-    const submission = runtime.latestSubmission(missionId, task.id)
-    return submission === undefined || submission.age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    const { age } = runtime.reviewNeed(task)
+    return age === undefined || age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
@@ -591,7 +593,7 @@ function referenceStallRoot(runtime, missionId, task, tasks, stallPassTimeoutMs)
 test('R16-A1: the waiting classifier is enumerated over every constructed board and resolves through the effective lineage', async t => {
   const f = await fixture(t)
   const owner = { sessionId: 'r16-a1' }
-  const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = f.runtime.create(owner, { title: 'Lineage enumeration', objective: 'Enumerate the classifier', workspace: f.directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: f.directory, source: 'session' })
   const stream = f.runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const now = Date.now()
   let seq = 0
@@ -616,8 +618,8 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     if (TERMINAL_STATES.has(task.status)) return false
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
     if (task.status === 'submitted') {
-      const submission = f.runtime.latestSubmission(mission.id, task.id)
-      return submission === undefined || submission.age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+      const { age } = f.runtime.reviewNeed(task)
+      return age === undefined || age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
     }
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop
@@ -749,6 +751,8 @@ test("R16-A2: a cancelled predecessor with a live repair leaves its dependent wa
   const siblingMember = await f.addMember('Sibling')
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const original = f.propose('Withdrawn original', { assigneeId: builder.id })
   const dependent = f.propose('Waits on the original', { assigneeId: builder.id })
   const dependentRow = f.runtime.store.get('tasks', dependent.id)
@@ -789,6 +793,8 @@ test('R16-A1r pair: a blocked subject with a running repair is never named, and 
   // subjects legitimately name every implementation branch.
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const source = f.block(f.propose('Blocked subject', { assigneeId: builder.id, kind: 'research' }))
   const repair = f.propose('Live repair of the subject', { replaces: [source.id], assigneeId: builder.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(builder), f.mission.id, repair.id)
@@ -827,6 +833,8 @@ test('R16-A1r2 pair: a two-hop repair chain through a cancelled repair keeps the
   const siblingMember = await f.addMember('Sibling')
   const sibling = f.propose('Healthy sibling', { assigneeId: siblingMember.id, kind: 'research' })
   await f.runtime.claim(f.actorFor(siblingMember), f.mission.id, sibling.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const original = f.block(f.propose('Blocked original', { assigneeId: builder.id, kind: 'research' }))
   const firstRepair = f.propose('First repair', { replaces: [original.id], assigneeId: builder.id, kind: 'research' })
   const firstRow = f.runtime.store.get('tasks', firstRepair.id)

@@ -37,7 +37,7 @@ async function fixture(t) {
   await command(source, ['git', 'add', '.'])
   await command(source, ['git', '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'baseline'])
   const owner = { sessionId: 'owner' }
-  const mission = runtime.create(owner, { title: 'Review', objective: 'Inspect project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget })
+  const mission = runtime.create(owner, { title: 'Review', objective: 'Inspect project', workspace: source, scope: ['**'], acceptance: ['Reviewed'], budget }, { grantRoot: source, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Review', objective: 'Inspect project' })
   const author = await runtime.addMember(owner, mission.id, { role: 'author' })
   const reviewer = await runtime.addMember(owner, mission.id, { role: 'reviewer' })

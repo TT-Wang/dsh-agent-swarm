@@ -4,8 +4,8 @@ import { createReadStream } from 'node:fs'
 import { lstat, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
-export type SnapshotGit = (args: string[], env?: Record<string, string>) => Promise<string>
-export interface GitSnapshot {
+type SnapshotGit = (args: string[], env?: Record<string, string>) => Promise<string>
+interface GitSnapshot {
   sourceHead: string
   snapshotCommit: string
   changedPaths: string[]

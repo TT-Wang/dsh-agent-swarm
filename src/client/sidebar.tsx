@@ -6,18 +6,18 @@ import { currentSessionId } from './navigation.ts'
  * client integration does not pull its newer Harness peers into this plugin.
  * Source: dsh-better-sidebar/client/service (TabDescriptor / BetterSidebarService).
  */
-export interface SidebarScope {
+interface SidebarScope {
   sessionId: string
   cwd?: string
 }
 
-export interface SidebarTabProps {
+interface SidebarTabProps {
   scope: SidebarScope
   /** Better Sidebar keeps inactive tabs mounted; the view should pause polling. */
   visible: boolean
 }
 
-export interface SidebarTabDescriptor {
+interface SidebarTabDescriptor {
   id: string
   title: string | (() => string)
   single?: boolean
@@ -42,7 +42,7 @@ interface BetterSidebar {
   getSnapshot?(): { state?: SidebarState }
 }
 
-export interface SidebarAdapter {
+interface SidebarAdapter {
   subscribe(listener: () => void): () => void
   /** Whether this provider owns the registered tab surface, independent of visibility. */
   getSnapshot(): boolean
@@ -152,7 +152,7 @@ interface SlotRegistrar {
  * pane can open. Without it a registered type is invisible: the guide is how a
  * user reaches a page type that recognizes no resource address.
  */
-export interface RightSidebarGuideEntry {
+interface RightSidebarGuideEntry {
   /** Stable within the tab type; the registry requires it and rejects duplicates. */
   id: string
   order: number
@@ -185,7 +185,7 @@ interface RightSidebarController {
 const REVEAL_ATTEMPTS = 60
 const REVEAL_INTERVAL_MS = 500
 
-export interface RightSidebarDescriptor {
+interface RightSidebarDescriptor {
   /** Registry id: also the key both seats register under. */
   id: string
   /** Tab kind `openTab` names. */

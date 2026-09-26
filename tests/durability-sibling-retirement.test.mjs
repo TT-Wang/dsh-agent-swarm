@@ -23,7 +23,7 @@ async function fixture(t) {
   })
   const owner = { sessionId: 'retire-owner' }
   const mission = runtime.create(owner, { title: 'Retire', objective: 'Retire moot reviews', workspace: directory,
-    scope: ['src/'], acceptance: ['works'], budget: { ...budget } })
+    scope: ['src/'], acceptance: ['works'], budget: { ...budget } }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const first = await runtime.addMember(owner, mission.id, { name: 'Reviewer One', role: 'verification' })
@@ -97,6 +97,33 @@ test('an accepting verdict retires a running sibling, a pending sibling and a pa
   await new Promise(resolve => setTimeout(resolve, 40))
   assert.equal(f.current(sibling.id).status, 'cancelled')
   assert.equal(f.events('task/claimed').length, 3, 'the source, the verdict review and the sibling were claimed; no review is re-claimed')
+})
+
+/**
+ * An accepted source is immutable: no rework or resume can re-open a review of
+ * it, so a sibling blocked on it has nothing left to decide. A review deferred
+ * on the same artifact used to stay blocked after a second review accepted it
+ * and held the mission open.
+ */
+test('an accepting verdict closes a sibling review deferred on the same artifact', async t => {
+  const f = await fixture(t)
+  const source = await f.submittedSource()
+  const deferred = f.proposeReview(source, 'Deferred review')
+  const claimedDeferred = await f.runtime.claim(f.actor(f.first), f.mission.id, deferred.id)
+  f.workers.checks = [{ command: 'test', exitCode: 124, failureKind: 'timeout', output: 'timed out' }]
+  await f.runtime.verify(f.actor(f.first), f.mission.id, { taskId: deferred.id, attemptId: claimedDeferred.attempt.id, verdict: 'accept', reason: 'checks timed out' })
+  assert.equal(f.current(deferred).status, 'blocked')
+  assert.ok(f.current(deferred).verificationRecovery, 'the review deferred its verdict')
+  f.workers.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
+  const verdict = f.proposeReview(source, 'Verdict review')
+  const claimedVerdict = await f.runtime.claim(f.actor(f.second), f.mission.id, verdict.id)
+  await f.runtime.verify(f.actor(f.second), f.mission.id, { taskId: verdict.id, attemptId: claimedVerdict.attempt.id, verdict: 'accept', reason: 'Independent host checks pass' })
+  assert.equal(f.current(source).status, 'accepted')
+  const closed = f.current(deferred)
+  assert.equal(closed.status, 'cancelled', 'the deferred sibling of an accepted source is closed')
+  assert.match(closed.output, /deferred its verdict[\s\S]*Superseded: .* was accepted by review/, 'its deferral is kept beside the retirement')
+  assert.deepEqual(f.events('task/review-retired').map(event => [event.data.taskId, event.data.previousStatus]), [[deferred.id, 'blocked']])
+  assert.equal(f.runtime.completionError(f.runtime.mission(f.mission.id)), undefined)
 })
 
 test('a rejecting verdict retires a running sibling review too', async t => {

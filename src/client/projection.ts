@@ -29,17 +29,19 @@ export interface BoardIndex {
   effective(id: string): Task | undefined
   dependencyMet(id: string): boolean
   blockedDependencies(task: Task): string[]
-  lane(task: Task, members?: readonly Member[]): BoardLane
+  lane(task: Task, members: readonly Member[]): BoardLane
 }
 
 /** One pure identity index supplies dependency and exact review-source facts. */
 export function boardIndex(tasks: readonly Task[]): BoardIndex {
   const { byId, effective, dependencyMet, reviewSource } = taskGraphIndex(tasks)
+  const reviews = new Map<string, Task[]>()
+  for (const task of tasks) if (task.reviewOf !== undefined) reviews.set(task.reviewOf, [...reviews.get(task.reviewOf) ?? [], task])
   const blockedDependencies = (task: Task): string[] => task.dependencies.filter(id => !dependencyMet(id))
   // A task is still alive while it can reach an acceptance or a verdict on its
   // own; only a dead one makes its dependents blocked rather than queued.
   const alive = (status: string): boolean => status === 'pending' || status === 'running' || status === 'submitted'
-  const lane = (task: Task, members?: readonly Member[]): BoardLane => {
+  const lane = (task: Task, members: readonly Member[]): BoardLane => {
     if (task.status === 'accepted') return 'done'
     if (task.status === 'running') return 'active'
     if (task.status === 'submitted') return 'review'
@@ -55,24 +57,11 @@ export function boardIndex(tasks: readonly Task[]): BoardIndex {
     }
     const unmet = blockedDependencies(task)
     if (unmet.length > 0) return unmet.every(id => { const dependency = effective(id); return dependency !== undefined && alive(dependency.status) }) ? 'queued' : 'blocked'
-    if (members !== undefined) {
-      const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
-      if (!members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
-        && assignmentAllows(task, member.id, tasks))) return 'blocked'
-    }
-    return 'ready'
+    const source = task.reviewOf === undefined ? undefined : byId.get(task.reviewOf)
+    return members.some(member => member.status !== 'stopped' && canOwnReview(source, member.id)
+      && assignmentAllows(task, member.id, reviews.get(task.id) ?? [])) ? 'ready' : 'blocked'
   }
   return { byId, effective, dependencyMet, blockedDependencies, lane }
-}
-
-/** Compatibility wrapper for a single lineage query; render paths reuse one `boardIndex`. */
-export function dependencyMet(id: string, tasks: readonly Task[]): boolean {
-  return boardIndex(tasks).dependencyMet(id)
-}
-
-/** Dependent pending work is visibly blocked instead of advertised as dispatchable. */
-export function taskLane(task: Task, tasks: readonly Task[]): BoardLane {
-  return boardIndex(tasks).lane(task)
 }
 
 export function remainingPercent(used: number, limit: number): number {
@@ -115,9 +104,9 @@ function attempt(value: unknown): boolean {
  * declarations in `types.ts`; reading them through a validating accessor keeps
  * this projection honest about untrusted payloads and independent of that landing.
  */
-export interface DeliveryTargetProjection { taskId: string; commit: string }
-export interface CompletionProjection { eligible: boolean; reason?: string }
-export interface AppliedDeliveryProjection { resultCommit: string; appliedAt?: number }
+interface DeliveryTargetProjection { taskId: string; commit: string }
+interface CompletionProjection { eligible: boolean; reason?: string }
+interface AppliedDeliveryProjection { resultCommit: string; appliedAt?: number }
 function projected(snapshot: Snapshot, key: string): unknown {
   return (snapshot as unknown as Record<string, unknown>)[key]
 }
@@ -381,11 +370,6 @@ export function retiredReviewsBySource(snapshot: Snapshot): Map<string, RetiredR
   return retired
 }
 
-/** Verification tasks of one source that the owner or runtime withdrew (F-12 sibling surface). */
-export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): RetiredReview[] {
-  return retiredReviewsBySource(snapshot).get(sourceTaskId) ?? []
-}
-
 /**
  * OWNER PASS 2026-09-11: the Activity tab used to be one flat newest-first list
  * in which the runtime, the owner and every worker were interleaved, so the
@@ -399,7 +383,7 @@ export function retiredReviews(snapshot: Snapshot, sourceTaskId: string): Retire
 const ACTOR_LABELS: Record<string, string> = {
   owner: 'Owner conversation', runtime: 'Runtime', config: 'Configuration', host: 'Harness',
 }
-export interface ActivityGroup { actor: string; name: string; member?: Member; events: SwarmEvent[] }
+interface ActivityGroup { actor: string; name: string; member?: Member; events: SwarmEvent[] }
 export function activityGroups(snapshot: Snapshot): ActivityGroup[] {
   const members = new Map(snapshot.members.map(member => [member.id, member]))
   const groups = new Map<string, ActivityGroup>()

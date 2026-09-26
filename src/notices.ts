@@ -7,7 +7,7 @@
  * thin forwarding methods, so no call site changed.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
+import { covered, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
 import { requireText } from './refusals.ts'
@@ -48,7 +48,7 @@ export function subjectsOfTasks(tasks: readonly Pick<Task, 'id' | 'epoch'>[], mi
  * failure notices). Those callers fall back to `missionSubject`, so this guard
  * is reachable only from a genuine programming error.
  */
-export function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<Mission, 'id'>): string[] {
+function noticeSubjects(subjects: readonly string[] | undefined, mission: Pick<Mission, 'id'>): string[] {
   const clean = Array.isArray(subjects) ? subjects.filter(subject => typeof subject === 'string' && subject.length > 0) : []
   if (clean.length === 0) {
     // R15-A1: a caller that dropped its subjects must not produce an anonymous
@@ -118,7 +118,7 @@ export interface NotifyOptions {
  * the body states. A fact carried by a wake-budget summary is recorded in its
  * `aggregatedFacts` constituent, which has no statement.
  */
-export interface NoticeStatement {
+interface NoticeStatement {
   family: keyof typeof NOTICE_TEMPLATES
   /** Named counts the body states (dependents, implementations, unschedulable); empty when it states none. */
   counts: Record<string, number>
@@ -138,7 +138,7 @@ export const REJECTION_DECISION_TRIGGER = 'task/rejected'
  * read through this view. `claimedAt` is deliberately absent: it was stamped
  * from `deliveredAt` and carried no information beyond the transport.
  */
-export interface NoticeFactRecord {
+interface NoticeFactRecord {
   subjects: string[]
   trigger: string
   reason: string
@@ -160,9 +160,9 @@ export interface NoticeFactRecord {
   /** R17-G2: what a reviewed-template body states (`NoticeStatement`). */
   statement?: NoticeStatement
 }
-export type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
+type NoticeRow = NonNullable<Delivery['notice']> & Partial<NoticeFactRecord>
 /** The fact view of one delivery row, or undefined when it is not a notice. */
-export const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undefined => delivery.notice === undefined ? undefined : delivery.notice as NoticeRow
+const noticeRow = (delivery: Pick<Delivery, 'notice'>): NoticeRow | undefined => delivery.notice === undefined ? undefined : delivery.notice as NoticeRow
 
 /**
  * OWNER QUIET: whether an owner delivery is moot because the owner has taken the
@@ -224,8 +224,8 @@ export function factKey(missionId: string, fact: { trigger: string; reason: stri
  * (never dropped). Values are public fields so a test can tighten the budget
  * without inventing a second code path.
  */
-export const DEFAULT_WAKE_BUDGET = 6
-export const DEFAULT_WAKE_WINDOW_MS = 5_000
+const DEFAULT_WAKE_BUDGET = 6
+const DEFAULT_WAKE_WINDOW_MS = 5_000
 const WAKE_SUMMARY_HEADER = 'Wake budget reached: further facts in this window are summarized here, none is dropped.'
 /** Bound generated owner text; full facts remain on the same durable delivery. */
 const MAX_OWNER_NOTICE_CHARS = 3200
@@ -397,13 +397,13 @@ export const AUTO_REVIEW_GRACE_MS = 1000
  * delivery-time relevance check consume ONE implementation (`SwarmRuntime`
  * satisfies it structurally; a test can supply the same shape).
  */
-export interface LineageRuntime {
+interface LineageRuntime {
   readonly store: { list: (table: 'tasks', missionId: string) => Task[] }
   readonly config: { tickMs: number }
   readonly stallPassTimeoutMs: number
   /** The runtime clock (`SwarmRuntime.now`). */
   readonly now: () => number
-  latestSubmission(missionId: string, taskId: string): { seq: number; age: number } | undefined
+  reviewNeed(source: Task): { age: number | undefined }
   unfinishedDependencies(missionId: string, task: Task, tasks?: Task[]): Task[]
   reviewable(task: Task, tasks: Task[]): boolean
 }
@@ -418,7 +418,7 @@ export interface LineageRuntime {
  * fall-through, which may name a subject only when this set does not contain it.
  * The walk is the task graph's `replacedLineage`.
  */
-export function replacementCoverage(tasks: Task[]): Set<string> {
+function replacementCoverage(tasks: Task[]): Set<string> {
   const graph = taskGraphIndex(tasks)
   const replaced = new Set<string>()
   for (const task of tasks) if (!TERMINAL_STATES.has(task.status)) for (const origin of graph.replacedLineage(task.id).slice(1)) replaced.add(origin.id)
@@ -430,7 +430,7 @@ export function replacementCoverage(tasks: Task[]): Set<string> {
  * durable rows, so the pass, the timer-driven notice path, the delivery-time
  * relevance check and a test all classify the same board identically.
  */
-export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
+function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'now'>, tasks: Task[]): Task[] {
   // A live replacement marks every id in its transitive lineage as covered.
   const replaced = replacementCoverage(tasks)
   return tasks.filter(task => {
@@ -454,7 +454,7 @@ export function stallRootsFor(rt: Pick<LineageRuntime, 'stallPassTimeoutMs' | 'n
  * back-off (a permanent failure has no `retryAt`; `blockCauses` reads it as a
  * block cause). One bound for `waitsLegitimately` and the witness dedup.
  */
-export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task, 'status' | 'preparationFailure'>): number | undefined {
+function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task, 'status' | 'preparationFailure'>): number | undefined {
   const retryAt = task.status === 'pending' ? task.preparationFailure?.retryAt : undefined
   return retryAt === undefined ? undefined : retryAt + rt.config.tickMs
 }
@@ -468,7 +468,7 @@ export function backoffBound(rt: Pick<LineageRuntime, 'config'>, task: Pick<Task
  * back-off forever. The witness therefore compares F(S) plus this one clock
  * fact, read from its own durable `at`; F(S) itself stays clock-free.
  */
-export function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: readonly Task[], since: number, now = rt.now()): boolean {
+function backoffExpiredSince(rt: Pick<LineageRuntime, 'config' | 'now'>, tasks: readonly Task[], since: number, now = rt.now()): boolean {
   return tasks.some(task => {
     const bound = backoffBound(rt, task)
     return bound !== undefined && since <= bound && bound < now
@@ -500,8 +500,8 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // the dispatcher's live-review rule, including an admitted/parked review,
     // rather than mistaking the end of the admission grace for a stalled task.
     if (rt.reviewable(task, tasks)) return true
-    const submission = rt.latestSubmission(task.missionId, task.id)
-    return submission === undefined || submission.age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    const { age } = rt.reviewNeed(task)
+    return age === undefined || age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
   }
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -558,6 +558,9 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 }
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
+
+/** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
+const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
 
 export class Notices {
   /**
@@ -895,7 +898,7 @@ export class Notices {
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
       implementations: tasks.filter(task => task.kind === 'implementation'),
-      lastTransitionAt: this.lastTransitionAt(missionId),
+      lastTransitionAt: this.rt.store.progressAt(mission),
       subjectsOf: list => subjectsOfTasks(list, mission),
     }
   }
@@ -931,24 +934,6 @@ export class Notices {
     })
   }
 
-  /** A progress clock excludes scheduling, usage, transport and repeated tool logs. */
-  private lastTransitionAt(missionId: string): number {
-    const mission = this.rt.store.get('missions', missionId) as (Mission & { meaningfulProgressAt?: number }) | undefined
-    if (mission === undefined) return 0
-    let latest = mission.meaningfulProgressAt ?? mission.createdAt
-    const progressTypes = new Set([
-      'mission/created', 'mission/resume', 'mission/budget-updated', 'mission/revised', 'mission/scope-amended',
-      'task/proposed', 'task/claimed', 'task/submitted', 'task/accepted', 'task/rejected',
-      'task/cancelled', 'task/cancelled-at-completion', 'task/handoff', 'task/revised', 'task/amended',
-      'evidence/published', 'evidence/verified', 'evidence/refuted', 'message/answered', 'message/dismissed',
-    ])
-    for (const event of this.rt.store.events(missionId, this.rt.config.maxEvents)) {
-      if (progressTypes.has(event.type)) latest = Math.max(latest, event.createdAt)
-    }
-    for (const evidence of this.rt.store.list('evidence', missionId)) if (Number.isFinite(evidence.createdAt)) latest = Math.max(latest, evidence.createdAt)
-    return latest
-  }
-
   /**
    * Revisit delivered decisions only while their original durable obligation
    * still stands. Each fact has its own reminder allowance: a wake-budget
@@ -965,7 +950,7 @@ export class Notices {
       const fact = noticeRow(delivery)
       // A covered fact is never sent, so it has no reminders of its own: the
       // covering delivery's reminders carry its root.
-      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined || fact.coveredBy !== undefined
+      if (delivery.to !== 'owner' || delivery.deliveredAt === undefined || fact === undefined || covered(delivery)
         || ['progress', 'completion'].includes(fact.class)
         || FOLLOWUP_EXCLUDED_FAMILIES.has(noticeFamily(delivery))) continue
       const spent = fact.followupCount ?? 0
@@ -1008,6 +993,7 @@ export class Notices {
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
     if (noticeFamily(delivery) === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
+    if (noticeFamily(delivery) === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
     return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
       if (subject === missionSubject(mission)) {
         if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
@@ -1029,7 +1015,7 @@ export class Notices {
     if (ownerDeliveryMoot(mission, delivery)) return false
     // A covered fact is never a wake of its own: the covering delivery carried
     // the obligation, and that delivery's reminders carry it too.
-    if (noticeRow(delivery)?.coveredBy !== undefined) return false
+    if (covered(delivery)) return false
     if (delivery.replyExpected === true && delivery.answeredBy !== undefined) return false
     const stopFailures = this.stopFailureSubjects(mission.id, delivery)
     if (stopFailures !== undefined) return mission.status !== 'completed' && stopFailures.length > 0
@@ -1065,13 +1051,13 @@ export class Notices {
       // Old unattributed rows cannot be judged from their text alone.
       if (subjects.length === 0) return true
       if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, tasks).length > 0
+      if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, tasks).length === subjects.length
       // A batch asserts the condition for every named subject. If one changes,
       // the transition publisher emits the remaining subjects as a fresh fact.
       return subjects.every(subject => {
         if (subject === missionSubject(mission)) return true
         const task = taskFromSubject(subject, tasks)
         if (task === undefined || TERMINAL_STATES.has(task.status)) return false
-        if (family === 'review-blocked') return task.status === 'submitted' && !this.rt.reviewable(task, tasks)
         if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
@@ -1105,6 +1091,17 @@ export class Notices {
     const root = key.startsWith(rootPrefix) ? key.slice(rootPrefix.length) : (delivery.subjects ?? noticeRow(delivery)?.subjects)?.[0]
     const task = root === undefined ? undefined : taskFromSubject(root, tasks)
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
+  }
+
+  /** A review-blocked decision is outstanding while its source is unreviewable under the same review need; a re-opened need retires it. */
+  private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
+    const key = delivery.notice?.dedupKey
+    const reason = noticeRow(delivery)?.reason ?? ''
+    return (delivery.subjects ?? []).filter(subject => {
+      const task = taskFromSubject(subject, tasks)
+      return task?.status === 'submitted' && !this.rt.reviewable(task, tasks)
+        && key === reviewBlockedKey(missionId, task.id, this.rt.reviewNeed(task).id, reason)
+    })
   }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
@@ -1189,14 +1186,6 @@ export class Notices {
    * `attemptSilenceBoundMs`).
    */
   transition(missionId: string): void {
-    // Save progress when its transition commits, before telemetry can evict it
-    // from the bounded event window. Interpretation remains read-only.
-    const mission = this.rt.store.get('missions', missionId) as (Mission & { meaningfulProgressAt?: number }) | undefined
-    const progressAt = this.lastTransitionAt(missionId)
-    if (mission !== undefined && mission.meaningfulProgressAt !== progressAt) {
-      mission.meaningfulProgressAt = progressAt
-      this.rt.commit(missionId, () => this.rt.store.put('missions', mission))
-    }
     if (this.publishingTransition) return
     this.pendingTransitions.add(missionId)
     if (this.transitionScheduled) return
@@ -1373,12 +1362,12 @@ export class Notices {
       // `stalled`, because `stalled` returns before its unreviewed check when
       // any unrelated work is running; without this an unreviewable submission
       // could stay silent behind live work forever (verifier-1 challenge,
-      // evidence_a454a771). The age comes from the durable submission event, so
-      // a restart cannot reset the grace.
+      // evidence_a454a771). The age comes from the durable row that opened the
+      // review need, so a restart cannot reset the grace.
       const grace = Math.max(this.rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
       const ripe = unreviewed.filter(task => {
-        const submission = this.rt.latestSubmission(missionId, task.id)
-        return submission === undefined || submission.age >= grace
+        const { age } = this.rt.reviewNeed(task)
+        return age === undefined || age >= grace
       })
       // On a board with no other progress (`reviewPathStalled`) the runtime's
       // own review admission owns every submitted artifact: its pass admits the
@@ -1390,11 +1379,8 @@ export class Notices {
       const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
       const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
       if (!named.length) return false
-      const diagnostic = `Submitted artifact ${named.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running`
-      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: named[0]!.id })
-      this.rt.commit(missionId, () => {
-        this.notify(missionId, content, view.subjectsOf(named), { family: 'review-blocked', trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason: diagnostic, statement })
-      })
+      // The runtime admission's one emitter: a decision per source and review need.
+      for (const task of named) this.notifyReviewBlocked(view.mission, task, this.rt.reviewNeed(task).id, 'it has no live independent review path and cannot reach a verdict while the rest of the board keeps running')
       return true
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
@@ -1663,11 +1649,11 @@ export class Notices {
     })
   }
 
-  /** Wake the owner once per distinct blocker for one unreviewable submitted deliverable. */
-  notifyReviewBlocked(mission: Mission, source: Task, reason: string): void {
+  /** Wake the owner once per distinct blocker for one review need (`SwarmRuntime.reviewNeed`) of an unreviewable submitted deliverable. */
+  notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
-    const key = `review-blocked:${mission.id}:${row.id}:${reason}`
+    const key = reviewBlockedKey(mission.id, row.id, need, reason)
     // S5: the durable notice ledger (class, key, sender) is the gate; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return

@@ -12,7 +12,7 @@
  *    could not be read back by its own writer and the real-host tiers refused
  *    with `SessionFormatUnsupportedError`. The publication and the registration
  *    are deleted; this file pins that the log stays empty and that no source
- *    appends a session event.
+ *    appends a session event type outside the host's vocabulary.
  * 2. **Member state is a durable phase plus a derived live status.** The durable
  *    row carries `phase` and never `status`; `SwarmStore` drops any status on
  *    write and re-derives it on read from the phase and the running attempts, so
@@ -44,7 +44,7 @@ import { Context } from '@deepseek-ai/cordis'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
 import { SwarmStore } from '../lib/store.js'
-import { FakeWorkers, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
+import { FakeWorkers, NO_GRANTS, SwarmRuntime, budget as sharedBudget, eventually, makeRuntime } from './faults/harness.mjs'
 import { guardActions, guardBoard, guardProgressActions } from './guard-model.mjs'
 import { tempDirectory } from './temp-root.mjs'
 
@@ -69,9 +69,11 @@ async function fixture(t, { workers: provided, registry } = {}) {
   ctx.provide('sessions', { get: id => String(id) === OWNER ? session : undefined })
   await runtime.start()
   const owner = { sessionId: OWNER }
-  const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'One truth', objective: 'One derivation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const claim = (member, task) => runtime.claim({ sessionId: member.sessionId }, mission.id, task.id)
   const memberRow = member => runtime.store.get('members', member.id)
@@ -103,13 +105,17 @@ test('no session event: the plugin appends nothing to the owner log, and the der
 
   // The class of failure this replaced: a stored log is refused when it carries
   // an event type the host's closed vocabulary does not know and the envelope is
-  // not marked ignorable. The only durable answer is to append nothing, so the
-  // check is source-level and exhaustive over every writer in src/.
+  // not marked ignorable. So the check is source-level and exhaustive over every
+  // writer in src/: each append names a literal type from that vocabulary (a
+  // worker activation writes the host's own sandbox and approval policy events).
   const { readdir } = await import('node:fs/promises')
   const sources = await Promise.all((await readdir(join(ROOT, 'src'))).filter(name => name.endsWith('.ts'))
     .map(async name => [name, await readFile(join(ROOT, 'src', name), 'utf8')]))
-  const appenders = sources.filter(([, source]) => /session\.append\(|\.append\(\s*['"]swarm\//.test(source)).map(([name]) => name)
-  assert.deepEqual(appenders, [], 'no src module appends a session event: the host format cannot carry a plugin-owned type')
+  const unreadable = sources.flatMap(([name, source]) => [...source.matchAll(/\bsession\.append\(\s*([^,)]*)|\.append\(\s*(['"]swarm\/[^,)]*)/g)]
+    .map(([, type, swarm]) => (type ?? swarm).trim())
+    .filter(type => !KNOWN_SESSION_EVENT_TYPES.has(/^(['"])([^'"]*)\1$/.exec(type)?.[2]))
+    .map(type => `${name}: ${type}`))
+  assert.deepEqual(unreadable, [], 'no src module appends a session event type outside the host vocabulary: the host format cannot carry a plugin-owned type')
 })
 
 test('the durable member row carries a phase and never a status; the read face derives it', async t => {
@@ -278,7 +284,7 @@ test('a phase-less legacy member row keeps its recorded intent: the live-store s
   const ctx = new Context()
   await ctx.plugin(SessionProjectionRegistry)
   ctx.provide('sessions', { get: () => undefined })
-  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9 }, projectionWorkers())
+  const runtime = new SwarmRuntime({ statePath, leaseMs: 60000, tickMs: 10_000, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS }, projectionWorkers())
   t.after(async () => { await runtime.dispose() })
   await runtime.start()
 

@@ -144,7 +144,7 @@ test('R10-09/S3: a task ready only for a waiting member is dispatched and woken'
   const running = await eventually(() => taskOf(f.runtime, task.id).status === 'running' ? taskOf(f.runtime, task.id) : undefined,
     'a waiting member must still be dispatched')
   assert.equal(running.attempt.ownerId, f.author.id)
-  assert.ok(f.workers.deliveries.some(item => item.kind === 'assignment' && item.taskId === task.id), 'the wake is a durable assignment delivery')
+  await eventually(() => f.workers.deliveries.some(item => item.kind === 'assignment' && item.taskId === task.id), 'the wake is a durable assignment delivery')
   assert.equal(await f.workers.callbacks.beforeStep(f.author.id, true), undefined, 'fresh input lets the woken member take its next step')
 })
 

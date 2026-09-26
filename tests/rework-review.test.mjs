@@ -35,7 +35,7 @@ async function fixture(t, { members = ['Author', 'Reviewer'], maxTasks = 100 } =
   const { dir, runtime, budget } = await makeRuntime(t, { workers, clock, config: { maxEvents: 5000, maxTasksPerMember: 100, checkTimeoutMs: undefined }, budget: { maxTasks } })
   await runtime.start()
   const owner = { sessionId: 'rework-review-owner' }
-  const mission = runtime.create(owner, { title: 'Rework review', objective: 'Review reworked work once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Rework review', objective: 'Review reworked work once', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const m = []
   for (const name of members) m.push(await runtime.addMember(owner, mission.id, { name, role: 'implementation' }))
@@ -77,7 +77,7 @@ test('a rework re-pends its rejecting review, which reviews the resubmission at 
   const owner = { sessionId: 'busy-owner' }
   // The host pairs the deliverable with its review at launch; the plan has no
   // task slot to spare, so a review admitted per rework could not fit.
-  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'busy-1', goal: 'g', workspace: dir }).id, {
+  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'busy-1', goal: 'g', workspace: dir }, { grantRoot: dir, source: 'session' }).id, {
     title: 'Busy', objective: 'Busy board', workspace: dir, scope: ['src/'], acceptance: ['works'],
     budget: { maxTokens: 100_000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 3_600_000, maxTasks: 4, maxExperiments: 0 },
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }, { key: 'other', name: 'Other', role: 'research', maxOutputTokens: 2048 }],
@@ -129,7 +129,7 @@ test('a deferred review of the rejected commit is retired with the rework, so th
   const source = f.propose('Implement')
   await f.submit(author, source)
   const deferred = f.proposeReview(source)
-  f.workers.checks = [{ command: 'test', exitCode: 124, output: 'timed out' }]
+  f.workers.checks = [{ command: 'test', exitCode: 124, failureKind: 'timeout', output: 'timed out' }]
   await f.verify(reviewer, deferred, 'accept', 'checks timed out')
   f.workers.checks = [{ command: 'test', exitCode: 0, output: 'ok' }]
   assert.equal(f.current(deferred).status, 'blocked')
@@ -263,6 +263,119 @@ test('an automatic review of the rejected submission is never read as withdrawn 
   assert.notEqual(fresh[0].id, automatic.id, 'an automatic review is keyed on the submission, not the commit alone')
   assert.deepEqual(f.events('task/review-blocked'), [])
   assert.deepEqual(f.ownerNotices(/was withdrawn/), [])
+})
+
+/**
+ * A challenge re-opens the review need of an unchanged submission, and every
+ * missing-review fact is keyed on that need: its grace, its missing-review
+ * record, an owner withdrawal, its automatic review and a blocker decision.
+ */
+test('an automatic review the owner withdrew from an earlier need never blocks the need a challenge re-opens', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  assert.match(automatic.id, /^task_auto_review_/)
+  f.runtime.cancel(f.owner, f.mission.id, { taskId: automatic.id, reason: 'I will name the reviewer myself' })
+  await f.pastReviewGrace(2)
+  assert.equal(f.ownerNotices(/was withdrawn/).length, 1)
+  await f.verify(reviewer, f.proposeReview(source, { assigneeId: reviewer.id }), 'accept', 'The artifact meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  assert.equal(f.current(source).status, 'submitted')
+  await f.pastReviewGrace(3)
+  const reopened = f.live(source)
+  assert.equal(reopened.length, 1, 'the re-opened need is given its own review')
+  assert.match(reopened[0].id, /^task_auto_review_/)
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [automatic.id, reopened[0].id])
+  assert.equal(f.events('task/review-missing').length, 2, 'each need records its missing review once')
+  assert.equal(f.ownerNotices(/was withdrawn/).length, 1, 'the earlier need\'s withdrawal is not read as this need\'s')
+})
+
+test('a challenge re-opens the grace, so the owner\'s own review of the re-opened source is its only review', async t => {
+  const f = await fixture(t)
+  const [author, reviewer] = f.m
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  await f.verify(reviewer, automatic, 'accept', 'The artifact meets the criterion')
+  f.clock.advance(60_000)
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  const tasks = f.runtime.store.list('tasks', f.mission.id)
+  assert.equal(f.runtime.notices.waitsLegitimately(f.current(source), tasks), true, 'the re-opened need waits out its own grace')
+  assert.equal(f.runtime.stalled(f.mission, tasks, f.runtime.store.list('members', f.mission.id)), false)
+  await f.runtime.settle(f.mission.id)
+  f.clock.advance(200)
+  // The owner's next call in the same turn: its own review of the re-opened source.
+  const own = f.proposeReview(source, { assigneeId: reviewer.id })
+  await f.pastReviewGrace(3)
+  assert.deepEqual(f.live(source).map(task => task.id), [own.id], 'the runtime never races the owner\'s own review')
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [automatic.id])
+})
+
+test('a re-opened need blocked for the reason an earlier need was blocked wakes the owner again', async t => {
+  const f = await fixture(t, { members: ['Author'] })
+  const [author] = f.m
+  const decisions = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('review-blocked:'))
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace(2)
+  assert.equal(decisions().length, 1)
+  assert.match(decisions()[0].content, /no live member other than the author/)
+  const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'implementation' })
+  await f.pastReviewGrace()
+  await f.verify(reviewer, f.live(source)[0], 'accept', 'The artifact meets the criterion')
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.store.transaction(() => { const member = f.runtime.store.get('members', reviewer.id); member.phase = 'stopped'; f.runtime.store.put('members', member) })
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A counterexample overturns the claim', toolRunIds: [] })
+  await f.pastReviewGrace(2)
+  assert.equal(decisions().length, 2, 'the re-opened need\'s decision reaches the owner')
+  assert.match(decisions()[1].content, /no live member other than the author/)
+  // One review need, one live decision: the earlier need's decision is retired
+  // by the need the challenge opened, never revived beside it.
+  const [earlier, current] = decisions()
+  const mission = f.runtime.mission(f.mission.id)
+  assert.deepEqual([earlier, current].map(delivery => f.runtime.notices.ownerDeliveryRelevant(mission, delivery)), [false, true])
+  for (let i = 0; i < 4; i++) { f.clock.advance(f.runtime.notices.obligationFollowupMs + 1); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const reminded = f.runtime.store.list('deliveries', f.mission.id)
+    .filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('obligation-followup:'))
+    .map(delivery => delivery.notice.dedupKey.split(':')[1])
+  assert.ok(reminded.includes(current.id), 'the current need\'s decision is reminded')
+  assert.ok(!reminded.includes(earlier.id), 'the retired need\'s decision is never reminded')
+})
+
+/**
+ * Only a challenge that takes a review away from the source re-opens its need:
+ * one that invalidates the review that accepted it or a review in progress. A
+ * challenge of a submission nobody reviews, or one whose review is still
+ * pending, leaves the need, its grace, its record and its decision as they were.
+ */
+test('a challenge that takes no review away leaves the review need as it was', async t => {
+  const f = await fixture(t, { members: ['Author'] })
+  const [author] = f.m
+  const decisions = () => f.runtime.store.list('deliveries', f.mission.id).filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('review-blocked:'))
+  const source = f.propose('Implement')
+  const claim = await f.submit(author, source, 'The change meets the criterion')
+  await f.pastReviewGrace(2)
+  const { id, seq } = f.runtime.reviewNeed(f.current(source))
+  for (const reason of ['A counterexample overturns the claim', 'A second counterexample']) {
+    f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason, toolRunIds: [] })
+    const need = f.runtime.reviewNeed(f.current(source))
+    assert.deepEqual([need.id, need.seq], [id, seq], 'a challenge of an unreviewed submission re-opens nothing')
+    await f.pastReviewGrace(2)
+  }
+  assert.equal(decisions().length, 1, 'the owner is told once for the one need')
+  assert.equal(f.events('task/review-missing').length, 1, 'the one need records its missing review once')
+  await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'implementation' })
+  await f.pastReviewGrace()
+  const [automatic] = f.live(source)
+  assert.equal(automatic.status, 'pending')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: claim.id, reason: 'A third counterexample', toolRunIds: [] })
+  assert.equal(f.current(automatic).status, 'pending', 'a pending review is not taken away')
+  assert.equal(`task_auto_review_${f.runtime.reviewNeed(f.current(source)).id}`, automatic.id, 'the pending automatic review is still the need\'s review')
 })
 
 test('a real unchanged resubmission is re-reviewed by the automatic review that rejected it', async t => {

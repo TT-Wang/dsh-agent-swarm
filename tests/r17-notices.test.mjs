@@ -38,8 +38,9 @@ import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
+import { formatDiagnostic, missingReviewDiagnostic } from '../lib/admission.js'
 import { tempDirectory } from './temp-root.mjs'
-import { FakeClock, FakeWorkers } from './faults/harness.mjs'
+import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const budget = { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 }
@@ -61,13 +62,15 @@ const newWorkers = ctx => new FakeWorkers({ ctx, autoIdle: true, checks: [], art
 async function fixture(t, config = {}) {
   const dir = await tempDirectory('swarm-r17-notices-')
   const ctx = new Context()
-  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, ...config }, newWorkers(ctx))
+  const runtime = new SwarmRuntime({ statePath: join(dir, 'db.sqlite'), leaseMs: 60000, tickMs: 25, maxMessageChars: 16000, maxEvents: 500, maxTasksPerMember: 9, grants: NO_GRANTS, ...config }, newWorkers(ctx))
   t.after(async () => { await runtime.dispose(); await rm(dir, { recursive: true, force: true }) })
   await runtime.start()
   const owner = { sessionId: 'r17-notices-owner' }
-  const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Notices', objective: 'Fact-only wake generation', workspace: dir, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: dir, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
-  const addMember = name => runtime.addMember(owner, mission.id, { name, role: 'implementation' })
+  // A member's start re-validates the workspace on disk, so the pass it kicks is
+  // settled before a caller proposes work and claims it by hand.
+  const addMember = async name => { const member = await runtime.addMember(owner, mission.id, { name, role: 'implementation' }); await runtime.settle(mission.id); return member }
   const propose = (title, input = {}) => runtime.propose(owner, mission.id, { outputs: [], workstreamId: stream.id, title, objective: title, kind: 'implementation', scope: ['src/'], acceptance: ['works'], checks: ['test -d .'], ...input })
   const ownerNotices = () => runtime.store.list('deliveries', mission.id).filter(delivery => delivery.to === 'owner')
   const emit = (content, subjects, options = {}) => runtime.commit(mission.id, () => runtime.notify(mission.id, content, subjects, options))
@@ -485,7 +488,8 @@ test('R17-G2g: the review-blocked notice beside running work is the template too
   assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'every review-blocked body states its template')
   assert.deepEqual(notice.notice.subjects, [subjectOf(row)])
   assert.match(notice.notice.reason, /has no live independent review path/)
-  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: notice.notice.reason, sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
+  // The one review-blocked emitter: the recorded reason under the review_path_missing code.
+  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: formatDiagnostic(missingReviewDiagnostic(row.id, notice.notice.reason)), sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
   assertDecision(notice, 'review-blocked')
 })
 

@@ -24,7 +24,7 @@ async function fixture(t, extra = {}) {
   runtime.pumpOutbox = () => {}
   runtimes.push(runtime)
   const owner = { sessionId: 'identity-owner' }
-  const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget })
+  const mission = runtime.create(owner, { title: 'Orchestration identities', objective: 'Complete independently verified work', workspace: root, scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: root, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Complete the work' })
   const author = await runtime.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   const reviewer = await runtime.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })

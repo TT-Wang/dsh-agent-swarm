@@ -26,7 +26,7 @@ async function fixture(t, { members = ['author', 'reviewer'], budget: overrides 
   const { dir: directory, runtime, workers, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: { ...reviewBudget, ...overrides } })
   const owner = { sessionId: 'review-path-owner' }
   const mission = runtime.create(owner, { title: 'Review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const added = {}
   for (const name of members) {
@@ -87,6 +87,36 @@ test('a submitted implementation with no live review is recorded and automatical
   await f.runtime.verify(f.actor('reviewer'), f.mission.id, { taskId: review.id, attemptId: claimed.attempt.id, verdict: 'accept', reason: 'Independently checked the exact submitted artifact' })
   assert.equal(f.current(source).status, 'accepted')
   assert.equal(f.current(review).reviewedCommit, f.current(source).artifact.commit)
+})
+
+/**
+ * A challenge re-opens the review need of the same submission: it returns an
+ * accepted source to `submitted` with its epoch and commit unchanged and
+ * retires the review that accepted it. When that review was the automatic
+ * one, the re-opened need gets an automatic review of its own, as a
+ * challenged source reviewed by a proposed review does; the retired row is
+ * never taken for it.
+ */
+test('a challenge of an automatically reviewed source admits an automatic review for the re-opened need', async t => {
+  const f = await fixture(t)
+  const source = f.propose('Implement the change')
+  const claimed = await f.runtime.claim(f.actor('author'), f.mission.id, source.id)
+  const runId = await f.workers.callbacks.toolRun(f.added.author.id, { tool: 'bash', arguments: { command: 'true' }, result: { exitCode: 0 }, isError: false })
+  const evidence = f.runtime.publish(f.actor('author'), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, claim: 'The change works', outcome: 'supported', toolRunIds: [runId] })
+  await f.runtime.submit(f.actor('author'), f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'Candidate artifact' })
+  const first = await eventually(() => f.reviewsOf(source)[0], 'the submission was never automatically reviewed', 3000)
+  const claimedReview = await f.runtime.claim(f.actor('reviewer'), f.mission.id, first.id)
+  await f.runtime.verify(f.actor('reviewer'), f.mission.id, { taskId: first.id, attemptId: claimedReview.attempt.id, verdict: 'accept', reason: 'Independently checked the exact submitted artifact' })
+  assert.equal(f.current(source).status, 'accepted')
+  f.runtime.challenge(f.owner, f.mission.id, { evidenceId: evidence.id, reason: 'A counterexample overturns the accepted claim', toolRunIds: [] })
+  assert.equal(f.current(source).status, 'submitted', 'the challenged source re-opens with its submission')
+  assert.equal(f.current(first).status, 'cancelled', 'the review that accepted it is retired')
+  const second = await eventually(() => f.reviewsOf(source).find(review => review.id !== first.id),
+    'the re-opened review need was never given a review, and the owner was not told', 3000)
+  assert.equal(second.status, 'pending')
+  assert.equal(second.maxRecoveryAttempts, 2)
+  assert.deepEqual(f.events('task/review-admitted').map(event => event.data.taskId), [first.id, second.id], 'each review need records its own admission')
+  assert.deepEqual(f.reviewPathNotices(), [], 'the runtime repaired the re-opened need without waking the owner')
 })
 
 test('the two-step owner flow keeps its own review and the runtime never duplicates it', async t => {
@@ -175,7 +205,7 @@ test('an unreviewable submission survives a host restart and is repaired on reco
   const { dir: directory, config, runtime: first, budget } = await makeRuntime(t, { workers: new ReviewWorkers(), config: reviewConfig, budget: reviewBudget })
   const owner = { sessionId: 'restart-owner' }
   const mission = first.create(owner, { title: 'Restart review path', objective: 'Keep submitted work reviewable', workspace: directory,
-    scope: ['src/'], acceptance: ['done'], budget })
+    scope: ['src/'], acceptance: ['done'], budget }, { grantRoot: directory, source: 'session' })
   const stream = first.workstream(owner, mission.id, { title: 'Main', objective: 'Keep submitted work reviewable' })
   const author = await first.addMember(owner, mission.id, { name: 'Author', role: 'implementation' })
   await first.addMember(owner, mission.id, { name: 'Reviewer', role: 'verification' })
@@ -203,7 +233,7 @@ test('automatic plan admission adds the independent review a code deliverable la
     budget: { maxTokens: 100000, maxSteps: 100, maxTasks: 12, maxExperiments: 2 },
   })
   const owner = { sessionId: 'plan-owner' }
-  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Deliver verified code', workspace: directory })
+  const request = runtime.requestStart(owner, { commandId: 'command-1', goal: 'Deliver verified code', workspace: directory }, { grantRoot: directory, source: 'session' })
   const plan = { title: 'Automatic delivery', objective: 'Deliver verified code', workspace: directory, scope: ['src/'], acceptance: ['works'],
     budget,
     members: [{ key: 'builder', name: 'Builder', role: 'implementation', maxOutputTokens: 4096 }, { key: 'reviewer', name: 'Reviewer', role: 'verification', maxOutputTokens: 2048 }],
@@ -219,7 +249,7 @@ test('automatic plan admission adds the independent review a code deliverable la
   assert.equal(reviews[0].maxRecoveryAttempts, 5, 'the added review takes the source\'s recovery limit')
 
   const authoredOwner = { sessionId: 'plan-owner-authored' }
-  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory })
+  const authoredRequest = runtime.requestStart(authoredOwner, { commandId: 'command-2', goal: 'Deliver verified code', workspace: directory }, { grantRoot: directory, source: 'session' })
   plan.tasks.push({ key: 'review', workstreamKey: 'main', title: 'Review', objective: 'Verify immutable artifact', kind: 'verification', outputs: [], scope: ['src/'],
     acceptance: ['works'], assigneeKey: 'reviewer', reviewOf: 'deliver', maxRecoveryAttempts: 5 })
   const snapshot = await runtime.startPlan(authoredOwner, authoredRequest.id, plan)

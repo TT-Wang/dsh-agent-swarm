@@ -43,7 +43,7 @@ async function fixture(t) {
   // One owner session per launch: a session holds one running automatic request.
   const launch = input => {
     const session = { sessionId: `pairing-owner-${++commands}` }
-    return runtime.startPlan(session, runtime.requestStart(session, { commandId: `command-${commands}`, goal: 'Deliver reviewed code', workspace: dir }).id, input)
+    return runtime.startPlan(session, runtime.requestStart(session, { commandId: `command-${commands}`, goal: 'Deliver reviewed code', workspace: dir }, { grantRoot: dir, source: 'session' }).id, input)
   }
   const member = (snapshot, key) => snapshot.members.find(row => row.id.endsWith(`_${key}`))
   return { dir, runtime, workers, owner, launch, member }
@@ -174,7 +174,7 @@ test('the added review of an optional experiment inherits its exemption: a rejec
     { key: 'exp', workstreamKey: 'main', title: 'Exp', objective: 'Measure an alternative idea', kind: 'research', experiment: true, outputs: [], scope: ['src/'], acceptance: ['alternative measured'], assigneeKey: 'builder', maxRecoveryAttempts: 2 },
   ] })
   input.budget.maxExperiments = 1
-  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'experiment', goal: 'Deliver', workspace: dir }).id, input)
+  const snapshot = await runtime.startPlan(owner, runtime.requestStart(owner, { commandId: 'experiment', goal: 'Deliver', workspace: dir }, { grantRoot: dir, source: 'session' }).id, input)
   const missionId = snapshot.mission.id
   const task = key => runtime.store.list('tasks', missionId).find(row => row.id.endsWith(`_${key}`))
   const actor = key => ({ sessionId: snapshot.members.find(row => row.id.endsWith(`_${key}`)).sessionId })
@@ -202,13 +202,13 @@ test('a staged draft shows the synthesized review in the editor before launch, a
   const f = await fixture(t)
   const { members: _members, ...rest } = plan(f.dir)
   const staged = { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) }
-  const draft = f.runtime.createDraft(f.owner, staged)
+  const draft = f.runtime.createDraft(f.owner, staged, { grantRoot: staged.workspace, source: 'session' })
   const row = draft.input.tasks.find(task => task.kind === 'verification')
   assert.deepEqual({ key: row.key, reviewOf: row.reviewOf, assigneeKey: row.assigneeKey }, { key: 'deliver-review', reviewOf: 'deliver', assigneeKey: undefined })
   const editor = renderToStaticMarkup(React.createElement(DraftEditor, { sessionId: f.owner.sessionId, workspace: f.dir, budget: draft.input.budget, draft,
     request: async () => ({}), onSaved() {}, onLaunched() {}, onDiscarded() {} }))
   assert.match(editor, /<summary>Independent review of Deliver · verification<\/summary>/, 'the editor lists it like an authored review')
-  const withoutRow = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.filter(task => task.kind !== 'verification') })
+  const withoutRow = f.runtime.updateDraft(f.owner, draft.id, draft.revision, { ...draft.input, tasks: draft.input.tasks.filter(task => task.kind !== 'verification') }, { grantRoot: draft.input.workspace, source: 'session' })
   assert.equal(withoutRow.input.tasks.filter(task => task.kind === 'verification').length, 1, 'a saved edit that drops it gets it back')
   const launched = await f.runtime.launchDraft(f.owner, withoutRow.id, withoutRow.revision)
   const source = launched.tasks.find(task => task.kind === 'implementation')
@@ -234,12 +234,12 @@ test('the review override schema states the defaults the added review really tak
 test('removing a deliverable in the draft editor removes the review that pairs it, so the next save is admitted', async t => {
   const f = await fixture(t)
   const { members: _members, ...rest } = plan(f.dir, { tasks: [deliverable({ key: 'build', title: 'Build' }), deliverable({ key: 'second', title: 'Second', dependencies: ['build'] })] })
-  const draft = f.runtime.createDraft(f.owner, { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) })
+  const draft = f.runtime.createDraft(f.owner, { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) }, { grantRoot: rest.workspace, source: 'session' })
   assert.deepEqual(draft.input.tasks.map(task => task.key), ['build', 'build-review', 'second', 'second-review'])
   const edited = removeTask(draft.input, 'build')
   assert.deepEqual(edited.tasks.map(task => [task.key, task.reviewOf ?? null, task.dependencies ?? []]), [['second', null, []], ['second-review', 'second', []]],
     'the paired review goes with its source, and a dependency on the source is dropped')
-  const saved = f.runtime.updateDraft(f.owner, draft.id, draft.revision, edited)
+  const saved = f.runtime.updateDraft(f.owner, draft.id, draft.revision, edited, { grantRoot: edited.workspace, source: 'session' })
   assert.deepEqual(saved.input.tasks.map(task => task.key), ['second', 'second-review'])
 })
 
@@ -249,7 +249,7 @@ test('a draft saved before reviews were paired shows its review, or its maxTasks
   const staged = { ...rest, members: plan(f.dir).members.map(({ maxOutputTokens: _tokens, ...member }) => member) }
   /** The row an older build stored: the plan as validated, with no host-added review. */
   const legacy = maxTasks => {
-    const draft = f.runtime.createDraft(f.owner, staged)
+    const draft = f.runtime.createDraft(f.owner, staged, { grantRoot: staged.workspace, source: 'session' })
     const row = f.runtime.store.get('drafts', draft.id)
     row.input = { ...row.input, budget: { ...row.input.budget, maxTasks }, tasks: row.input.tasks.filter(task => task.kind !== 'verification') }
     f.runtime.store.transaction(() => f.runtime.store.put('drafts', row))
@@ -296,7 +296,7 @@ test('a host-added review no live member may own is no review path: the owner is
       const owner = { sessionId: 'strand-owner' }
       const base = plan(dir)
       const members = (variant === 'one member' ? base.members.slice(0, 1) : base.members).map(({ maxOutputTokens: _tokens, ...member }) => member)
-      const draft = runtime.createDraft(owner, { ...base, members })
+      const draft = runtime.createDraft(owner, { ...base, members }, { grantRoot: base.workspace, source: 'session' })
       const snapshot = await runtime.launchDraft(owner, draft.id, draft.revision)
       const missionId = snapshot.mission.id
       if (variant !== 'one member') {

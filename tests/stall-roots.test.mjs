@@ -14,13 +14,14 @@ import { FakeClock, FakeWorkers, eventually, makeRuntime } from './faults/harnes
  * (FakeClock) the runtime reads it and runs no tick timer: the test moves the
  * clock and drives `runtime.tick()` itself (`ticks`).
  */
+/** A test that adds a member settles the pass its start kicks (the start re-validates the workspace on disk) before it proposes and claims by hand. */
 async function fixture(t, { clock, ...config } = {}) {
   const workers = new FakeWorkers({ autoIdle: true, checks: [], artifact: { commit: 'c', baseCommit: 'b', workspace: '/isolated', changedPaths: [] } })
   const { dir: directory, runtime, budget } = await makeRuntime(t, { workers, clock, config: { tickMs: 25, maxEvents: 500, maxTasksPerMember: 9, checkTimeoutMs: undefined, ...config },
     budget: { maxTokens: 100000, maxSteps: 100, maxWorkers: 3, maxDurationMs: 600000, maxTasks: 20, maxExperiments: 2 } })
   await runtime.start()
   const owner = { sessionId: 'stall-owner' }
-  const mission = runtime.create(owner, { title: 'Stall roots', objective: 'Name the root', workspace: directory, scope: ['src/'], acceptance: ['works'], budget })
+  const mission = runtime.create(owner, { title: 'Stall roots', objective: 'Name the root', workspace: directory, scope: ['src/'], acceptance: ['works'], budget }, { grantRoot: directory, source: 'session' })
   const stream = runtime.workstream(owner, mission.id, { title: 'Main', objective: 'Main' })
   const member = await runtime.addMember(owner, mission.id, { name: 'Builder', role: 'implementation' })
   const actor = { sessionId: member.sessionId }
@@ -196,6 +197,7 @@ test('a real review rejection names its stall root exactly once, with exactly on
   // The clock and the ticks are driven by hand.
   const f = await fixture(t, { clock: new FakeClock(), tickMs: 10 })
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  await f.runtime.settle(f.mission.id)
   const source = f.propose('Rejected implementation')
   const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
   await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -233,6 +235,7 @@ test('one rejection is one owner wake for its root: the stall root is recorded a
   // Exactly the decision and the board stall fit; a third wake would be summarized.
   f.runtime.notices.wakeBudget = 2
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+  await f.runtime.settle(f.mission.id)
   const source = f.propose('Rejected implementation')
   const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
   await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -281,12 +284,15 @@ test('a rejected root that strands a dependent names it in a delivered notice, n
   f.runtime.notices.obligationFollowupMs = 1e9
   const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  await f.runtime.settle(f.mission.id)
   const source = f.propose('Rejected implementation')
   const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
   await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
   const review = f.runtime.propose(f.owner, f.mission.id, { outputs: [], workstreamId: f.runtime.store.get('tasks', source.id).workstreamId,
     title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
   const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
+  // The pass that claim's workspace check let run settles before the next propose and hand claim.
+  await f.runtime.settle(f.mission.id)
   const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
   await f.runtime.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
   // Research kind keeps the integration-gap diagnostic (which lists every
@@ -313,15 +319,17 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   // each summarized fact has its own reminder allowance.
   //
   // This test stays on the real clock and the tick timer. The held owner
-  // transport is what keeps the summary open, and a scheduling body's pass-end
-  // flush waits in it holding the mission queue, which the claims below need:
-  // only the outbox's real delivery bound (stallPassTimeoutMs of wall time)
-  // abandons that delivery, twice, and no clock or test release can end it
-  // without delivering the summary before the repair. Each wait below is on an
-  // order (the transport is entered, the unrelated fact's reminders are spent,
-  // the root is named), not on a latency; the one bound left (the root's
-  // reminder, about 60ms after the withdrawal on an idle host) has a margin of
-  // two orders of magnitude.
+  // transport is what keeps the summary open, and no clock or test release can
+  // end it without delivering the summary before the repair. While it is held
+  // only the queue-external pump attempts deliveries: a body's pass-end flush
+  // would wait in it holding the mission queue that the hand operations below
+  // need, racing that delivery's bound (stallPassTimeoutMs of wall time) with
+  // their own queue bound. Each hand claim is made while no scheduling body is
+  // open, so no body dispatches its task first. Each wait below is on an order
+  // (the transport is entered, no body is open, the unrelated fact's reminders
+  // are spent, the root is named), not on a latency; the one bound left (the
+  // root's reminder, about 60ms after the withdrawal on an idle host) has a
+  // margin of two orders of magnitude.
   const f = await fixture(t, { tickMs: 10, stallPassTimeoutMs: 5000 })
   const rt = f.runtime
   rt.notices.wakeBudget = 1
@@ -334,16 +342,22 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   let held = 0
   const deliver = rt.workers.deliver.bind(rt.workers)
   rt.workers.deliver = async (member, delivery) => { if (member.id === 'owner' && hold) { held += 1; await gate } return deliver(member, delivery) }
+  const flush = rt.flushOutbox.bind(rt)
+  rt.flushOutbox = (missionId, pass, only) => hold && pass !== undefined ? Promise.resolve() : flush(missionId, pass, only)
+  const noBody = () => eventually(() => !rt.scheduling.passes.has(f.mission.id), 'no scheduling body is open')
   const reviewer = await rt.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
   const other = await rt.addMember(f.owner, f.mission.id, { name: 'Other', role: 'implementation' })
+  await rt.settle(f.mission.id)
   const sibling = f.propose('Healthy sibling', { kind: 'research', checks: undefined, assigneeId: other.id })
   await rt.claim({ sessionId: other.sessionId }, f.mission.id, sibling.id)
   rt.commit(f.mission.id, () => rt.notify(f.mission.id, 'First owner fact', [`mission:${f.mission.id}`], { trigger: 'probe/first', reason: 'first' }))
   const unrelated = f.propose('Unrelated dead end', { kind: 'research', checks: undefined, assigneeId: other.id })
   await eventually(() => held > 0, 'the first owner fact is held in transport')
+  await noBody()
   const source = f.propose('Source')
   const claimed = await rt.claim(f.actor, f.mission.id, source.id)
   await rt.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
+  await noBody()
   const review = rt.propose(f.owner, f.mission.id, { outputs: [], workstreamId: rt.store.get('tasks', source.id).workstreamId, title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
   const reviewing = await rt.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
   await rt.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
@@ -360,6 +374,7 @@ test('a rejected root whose decision was summarized is its own fact, and is name
   assert.equal(root.coveredBy, undefined, 'a rejection decision carried by a summary covers nothing: the root is its own fact')
   // The owner repairs the root before the notices arrive; the unrelated fact
   // stays open while the repair runs, and is reminded until its allowance is spent.
+  await noBody()
   const repair = f.propose('Repair', { replaces: [source.id] })
   await rt.claim(f.actor, f.mission.id, repair.id)
   hold = false; release()
@@ -408,6 +423,7 @@ for (const repaired of [true, false]) {
     const followupMs = f.runtime.notices.obligationFollowupMs = 300
     const reminderIntervals = async count => { for (let step = 0; step < count; step += 1) { clock.advance(followupMs); await f.runtime.tick() } }
     const reviewer = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Reviewer', role: 'verification' })
+    await f.runtime.settle(f.mission.id)
     const source = f.propose('Rejected implementation')
     const claimed = await f.runtime.claim(f.actor, f.mission.id, source.id)
     await f.runtime.submit(f.actor, f.mission.id, { taskId: source.id, attemptId: claimed.attempt.id, output: 'candidate' })
@@ -415,6 +431,8 @@ for (const repaired of [true, false]) {
       title: 'Review', objective: 'Independent review', kind: 'verification', reviewOf: source.id, scope: ['src/'], acceptance: ['works'], assigneeId: reviewer.id })
     const reviewing = await f.runtime.claim({ sessionId: reviewer.sessionId }, f.mission.id, review.id)
     await f.runtime.verify({ sessionId: reviewer.sessionId }, f.mission.id, { taskId: review.id, attemptId: reviewing.attempt.id, verdict: 'reject', reason: 'The candidate does not work' })
+    // The body the verdict kicked settles, so this tick runs a pass of its own.
+    await f.runtime.settle(f.mission.id)
     await f.runtime.tick()
     const rootSubject = `${source.id}@${f.runtime.store.get('tasks', source.id).epoch}`
     // Delivered itself, or (a rejected root) through the decision it is recorded against.
@@ -468,6 +486,8 @@ for (const repaired of [true, false]) {
     // subject rule of every other decision reads as a legitimate wait.
     const prerequisite = f.propose('Live prerequisite')
     const root = f.block(f.propose('Root with a live prerequisite', { dependencies: [prerequisite.id] }))
+    // The body those proposals kicked settles, so this tick runs a pass of its own.
+    await f.runtime.settle(f.mission.id)
     await f.runtime.tick()
     const rootKey = `stall-root:${f.mission.id}:${root.id}@${root.epoch}`
     // Its own row, or a wake-budget summary that carries it.
@@ -486,6 +506,7 @@ test('a pending task in preparation back-off is a bounded live wait, and a named
   const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+  await f.runtime.settle(f.mission.id)
   // A healthy sibling keeps the board out of the W3 stall class; research kind
   // keeps the integration-gap diagnostic off the board.
   const research = { kind: 'research', checks: undefined }
@@ -534,6 +555,7 @@ for (const coStamp of ['stall-root', 'permanent-preparation-failure']) {
     const f = await fixture(t, { clock: new FakeClock() })
     const tickMs = f.runtime.config.tickMs
     const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+    await f.runtime.settle(f.mission.id)
     const research = { kind: 'research', checks: undefined }
     const sibling = f.propose('Healthy sibling', research)
     await f.runtime.claim(f.actor, f.mission.id, sibling.id)
@@ -642,6 +664,7 @@ test('a back-off whose bound passes while a pass judges the board is still judge
   const f = await fixture(t, { clock: new FakeClock() })
   const tickMs = f.runtime.config.tickMs
   const second = await f.runtime.addMember(f.owner, f.mission.id, { name: 'Second', role: 'implementation' })
+  await f.runtime.settle(f.mission.id)
   const research = { kind: 'research', checks: undefined }
   const sibling = f.propose('Healthy sibling', research)
   await f.runtime.claim(f.actor, f.mission.id, sibling.id)

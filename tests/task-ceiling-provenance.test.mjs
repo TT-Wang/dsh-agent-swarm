@@ -63,7 +63,7 @@ test('draft launch and subsequent proposals durably retain ceiling provenance', 
   const owner = { sessionId: 'owner' }
   const input = plan(directory)
   input.tasks[0].maxSteps = 17
-  const draft = runtime.createDraft(owner, input)
+  const draft = runtime.createDraft(owner, input, { grantRoot: input.workspace, source: 'session' })
   const canonical = validatePlan(draft.input)
   const launched = await runtime.launchDraft(owner, draft.id, draft.revision)
   const source = launched.tasks.find(task => task.kind === 'research')
@@ -86,7 +86,7 @@ test('automatic worker proposals preserve inherited defaults and identify explic
   const input = plan(directory)
   for (const member of input.members) member.maxOutputTokens = 1000
   for (const task of input.tasks) task.maxRecoveryAttempts = 3
-  const request = runtime.requestStart(owner, { commandId: 'research-command', goal: input.objective, workspace: directory })
+  const request = runtime.requestStart(owner, { commandId: 'research-command', goal: input.objective, workspace: directory }, { grantRoot: directory, source: 'session' })
   const launched = await runtime.startPlan(owner, request.id, input)
   const source = launched.tasks.find(task => task.kind === 'research')
   const author = launched.members.find(member => member.name === 'Author')

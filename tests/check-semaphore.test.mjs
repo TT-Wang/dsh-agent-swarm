@@ -144,7 +144,7 @@ test('R11-19: the plugin config declares the limit and the composition passes it
   // `apply()` builds HarnessWorkers from exactly this config object.
   const config = Config({ ...base, checkConcurrency: 1 })
   const ctx = { on: () => () => {}, get: () => undefined, logger: { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} } }
-  const workers = new HarnessWorkers(ctx, { ...config, grants: undefined })
+  const workers = new HarnessWorkers(ctx, config)
   t.after(async () => { await workers.dispose() })
   assert.equal(workers.checkEnvelope().limit, 1, 'the configured limit reaches the semaphore, not a hand-supplied fixture')
 })

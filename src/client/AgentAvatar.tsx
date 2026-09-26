@@ -3,7 +3,7 @@ import { agentIdentity } from './agent-identity.ts'
 import { useCopy } from './locale.tsx'
 
 export type AgentAvatarState = 'active' | 'waiting' | 'idle' | 'stopped' | 'stale'
-export interface AgentAvatarProps {
+interface AgentAvatarProps {
   id?: string
   name: string
   size?: number

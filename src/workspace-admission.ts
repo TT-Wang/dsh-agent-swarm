@@ -7,11 +7,10 @@
  * src/runtime.ts. The runtime keeps thin forwarding methods for the method group,
  * so no call site changed; the pure helpers are imported by name.
  */
-import { realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
-import { isContained, WORKSPACE_AUTHORIZATION_CODE } from './authorization.ts'
-import { emitGuardTerminal } from './refusals.ts'
+import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
+import { emitGuardTerminal, guardTerminalHeld } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -360,17 +359,6 @@ export function gitWriteSubcommand(command: string): string | undefined {
  */
 const GIT_WRITE = /\bgit\b[^\n]{0,200}?\b(commit|add|merge|rebase|cherry-pick|revert|reset|switch|checkout|update-ref|rm|mv|am|push|init|gc|repack)\b/
 
-/**
- * A mission's recorded workspace is no longer inside a human-authorized root.
- * Distinct from an ordinary preparation failure because it is terminal for this
- * host process: the mission is fenced immediately instead of spending recovery
- * credit, and the owner is woken with the durable reason.
- */
-export class WorkspaceRevokedError extends Error {
-  readonly code = 'workspace_revoked'
-  constructor(readonly diagnostic: string) { super(diagnostic); this.name = 'WorkspaceRevokedError' }
-}
-
 export class WorkspaceAdmission {
   /** R11-15: bounded per-path mention history and reported-pair bookkeeping. */
   private readonly tempMentions = new Map<string, TempMention[]>()
@@ -380,75 +368,34 @@ export class WorkspaceAdmission {
 
   /**
    * The runtime-side half of the workspace authorization boundary. `create` is
-   * synchronous, so the full realpath check happened at admission; here the
-   * runtime proves the recorded workspace really resolves inside the root the
-   * admission site reported, so a caller that fabricates a wider
-   * `workspaceGrantRoot` cannot widen its own authorization. When the plugin
-   * installed `config.authorizeWorkspace`/`config.grants`, the workspace must
-   * also still sit inside a root that is currently loaded and unexpired.
+   * synchronous, so the full realpath check happened at the entry point that
+   * computed `claim` over canonical paths; here the runtime proves the
+   * workspace sits inside the claimed root, then decides by `claimFor`, the
+   * rule admission and re-validation use. The root recorded is therefore never
+   * the caller's claim: a fabricated wider root records the configured root
+   * that contains the workspace, and a narrower one that does not is refused.
    */
-  assertAuthorizedRoot(workspace: string, grantRoot: string | undefined, source?: 'session' | 'grant'): { grantRoot: string; source: 'session' | 'grant' } {
-    const claimed = grantRoot ?? workspace
-    if (!isContained(claimed, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claimed} [${WORKSPACE_AUTHORIZATION_CODE}]`)
-    const grants = this.rt.config.grants
-    if (this.rt.config.authorizeWorkspace === undefined || grants === undefined) return { grantRoot: claimed, source: source ?? (claimed === workspace ? 'session' : 'grant') }
-    const now = this.rt.now()
-    // A session authorization wins over a root that happens to contain the
-    // session cwd: the human authorized that directory directly, so removing a
-    // root must not fence it. The admission site computed this source.
-    if (source === 'session' && claimed === workspace) return { grantRoot: workspace, source: 'session' }
-    // The recorded root is the configured root that actually contains the
-    // workspace — never the caller's claim. A caller that fabricates a wider
-    // root therefore cannot record it, and a fabricated narrower root is
-    // refused by the containment check above.
-    const matched = grants.grants
-      .filter(grant => isContained(grant.path, workspace) && (grant.expiresAt === undefined || grant.expiresAt > now))
-      .sort((left, right) => right.path.length - left.path.length)[0]
-    if (matched !== undefined) return { grantRoot: matched.path, source: 'grant' }
-    if (claimed === workspace) return { grantRoot: claimed, source: source ?? 'session' }
+  assertAuthorizedRoot(workspace: string, claim: WorkspaceClaim): WorkspaceClaim {
+    if (!isContained(claim.grantRoot, workspace)) throw new Error(`Mission workspace ${workspace} is not inside its reported authorized root ${claim.grantRoot} [${WORKSPACE_AUTHORIZATION_CODE}]`)
+    const authorized = claimFor(workspace, claim.source === 'session' ? claim.grantRoot : undefined, this.rt.config.grants, this.rt.now())
+    if (authorized !== undefined) return authorized
     throw new Error(`Mission workspace ${workspace} is not inside a currently authorizedWorkspaces root [${WORKSPACE_AUTHORIZATION_CODE}]`)
   }
 
   /**
    * Re-validate a recorded mission against the human authorization loaded at
-   * start. Returns without error when this runtime has no authorization
-   * predicate (unit runtimes and adapters without Git). Otherwise the mission's
-   * own durable `workspaceGrantRoot` anchors the check: a session workspace
-   * stays authorized exactly while it still resolves to itself, and a
-   * grant-bound mission stays authorized only while that same root is still
-   * configured and unexpired. Removing a root therefore fences the mission at
-   * its next prepare or verification checkout.
+   * start, with `reauthorizeWorkspace` at the runtime clock's instant. A
+   * refusal fences the mission (`fenceWorkspace`) and throws the typed
+   * `WorkspaceRevokedError`.
    */
   async assertWorkspaceAuthorized(mission: Pick<Mission, 'id' | 'workspace' | 'workspaceGrantRoot' | 'workspaceAuthorizationSource'>, pass?: SchedulingPass): Promise<void> {
-    const authorize = this.rt.config.authorizeWorkspace
-    if (authorize === undefined) return
-    const anchor = mission.workspaceGrantRoot
-    // A mission recorded before this feature has no anchor; its workspace is its
-    // own anchor, which is exactly the pre-feature session-cwd authorization.
-    if (anchor === undefined) return
-    const resolved = await realpath(mission.workspace).catch(() => undefined)
-    const root = await realpath(anchor).catch(() => undefined)
-    let diagnostic: string | undefined
-    if (resolved === undefined) diagnostic = `Authorized workspace ${mission.workspace} no longer exists or cannot be resolved [${WORKSPACE_AUTHORIZATION_CODE}]`
-    else if (root === undefined || !isContained(root, resolved)) diagnostic = `Workspace ${mission.workspace} escaped its recorded authorized root ${anchor} [${WORKSPACE_AUTHORIZATION_CODE}]`
-    else {
-      // X3: the configured predicate decides first. A recorded root that is
-      // still a live configured grant authorizes the mission even when the
-      // record omitted its source; an explicit 'session' record authorizes a
-      // workspace that is its own root; anything else — including a missing
-      // source on a root that is no longer configured — fails closed, because
-      // it could be a revoked grant whose root happens to equal the workspace.
-      const live = await authorize(mission.workspace, undefined, this.rt.now())
-      const liveGrant = live.ok && live.grantRoot === root
-      const sessionWorkspace = resolved === root && mission.workspaceAuthorizationSource === 'session'
-      if (!liveGrant && !sessionWorkspace) diagnostic = `Authorized root ${anchor} was removed from authorizedWorkspaces or has expired; restart with the root restored to continue [${WORKSPACE_AUTHORIZATION_CODE}]`
-    }
-    if (diagnostic === undefined) return
+    const authorization = await reauthorizeWorkspace(mission, this.rt.config.grants, this.rt.now())
+    if (authorization.ok) return
     // The scheduling body awaiting this check (`pass`) stamps its progress
     // before the fence commits, so the fence publishes as its own commit.
     progressed(pass, this.rt.now())
-    this.fenceWorkspace(mission.id, diagnostic)
-    throw new WorkspaceRevokedError(diagnostic)
+    this.fenceWorkspace(mission.id, authorization.diagnostic)
+    throw new WorkspaceRevokedError(authorization.diagnostic)
   }
 
   /**
@@ -461,8 +408,12 @@ export class WorkspaceAdmission {
   fenceWorkspace(missionId: string, reason: string): void {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || this.rt.isMissionTerminal(mission)) return
-    if (this.rt.store.events(missionId, 1000).some(event => event.type === 'mission/workspace-revoked')) return
     const blocked = this.rt.store.list('tasks', missionId).filter(task => task.status === 'pending' || task.status === 'running')
+    // A revocation lasts this process (above), so its decision is keyed on it.
+    const revocation = `workspace-revoked:${this.rt.instanceId}`
+    // Idempotent from mission state: nothing left to block, and the owner
+    // already holds this revocation's decision, means the mission is fenced.
+    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, 'workspace', revocation)) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the
@@ -480,12 +431,10 @@ export class WorkspaceAdmission {
     // The marker is an obligation, not a record: without this poke the fenced
     // handle keeps running against a workspace the human withdrew.
     for (const task of blocked) if (stopPending(task)) this.rt.attempts.resumeStoppedAttempt(missionId, task)
-    // S4b: every caller of `fenceWorkspace` (the dispatch catch, the authorization
-    // re-checks in src/runtime.ts) now reaches the shared coded workspace
-    // terminal, not only the dispatch path. The emission is deduplicated per
-    // (chain, code, board fingerprint), so a caller that emits after this one is
-    // absorbed.
-    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason })
+    // S4b: the fence reaches the shared coded workspace terminal. A revocation
+    // is a local fault, not a board state, so the decision is keyed by it and
+    // the owner is woken once per revocation however the board moves afterwards.
+    emitGuardTerminal(this.rt, missionId, 'workspace', { detail: reason, localKey: revocation })
   }
 
   /**

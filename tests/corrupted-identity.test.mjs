@@ -36,7 +36,7 @@ test('F3c: a taskId from another mission is refused as not in this mission and i
   const f = await setup()
   try {
     const call = toolsOf(f)
-    const other = f.runtime.create(f.owner, { title: 'Other', objective: 'Another mission of the same owner', workspace: f.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget })
+    const other = f.runtime.create(f.owner, { title: 'Other', objective: 'Another mission of the same owner', workspace: f.dir, scope: ['**'], acceptance: MISSION_ACCEPTANCE, budget }, { grantRoot: f.dir, source: 'session' })
     const stream = f.runtime.workstream(f.owner, other.id, { title: 'Other', objective: 'Other' })
     const foreign = f.runtime.propose(f.owner, other.id, { outputs: [], workstreamId: stream.id, title: 'Foreign', objective: 'Foreign work',
       kind: 'implementation', scope: ['**'], acceptance: MISSION_ACCEPTANCE, checks: ['test -d .'] })

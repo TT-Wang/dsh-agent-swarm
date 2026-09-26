@@ -59,7 +59,7 @@ test('M1-T1: older scoped parents remain correct beyond the span window and metr
   assert.equal(metrics.window.limit, 20_000)
   assert.equal(metrics.window.spans, metrics.spans)
   assert.ok(reads.every(([, limit]) => limit === 20_001 || limit === 1), 'no unbounded history scan')
-  await recorder.record({ missionId: 'm', actor: 'worker', step: 'swarm_publish', taskId: 'source', attemptId: 'old-attempt', input: {}, output: {}, status: 'ok', startedAt: Date.now() })
+  recorder.record('swarm_publish', () => ({ missionId: 'm', actor: 'worker', taskId: 'source', attemptId: 'old-attempt', input: {}, output: {}, status: 'ok', startedAt: Date.now(), durationMs: 0 }))
   assert.equal(recorder.spansFor('m').length, 20_000, 'live recording also keeps the index bounded')
   assert.equal(recorder.spansFor('m').at(-1).parentSpanId, claimed.spanId)
 })

@@ -16,7 +16,7 @@ import { hasNotice } from './arena.ts'
 import { subjectsOfTasks, taskSubject } from './notices.ts'
 import { emitGuardTerminal, type GuardChainId, type GuardTerminal, type GuardTerminalContext } from './refusals.ts'
 import { AdmissionRefusedError } from './scheduler.ts'
-import { isolationIssues, WorkspaceRevokedError } from './workspace-admission.ts'
+import { isolationIssues } from './workspace-admission.ts'
 // R17-G6/G7: the one derivation of the derived member status.
 import { memberPhaseOf } from './projection.ts'
 import { PolicyError } from './policy-error.ts'
@@ -29,9 +29,9 @@ import { type Actor, type Attempt, type Member, type Mission, type Task } from '
  * planned; a submission that stays unreviewable past this bounded grace is a
  * stall. The wall-clock bound keeps the notice prompt even with a slow tick.
  */
-export const STALL_GRACE_PASSES = 30
+const STALL_GRACE_PASSES = 30
 
-export const STALL_GRACE_MAX_MS = 1000
+const STALL_GRACE_MAX_MS = 1000
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
@@ -43,7 +43,7 @@ const id = (prefix: string) => `${prefix}_${randomUUID()}`
  * that belongs to the task and epoch, so an unrelated notice can never consume
  * this decision.
  */
-export interface DispatchQuestion {
+interface DispatchQuestion {
   task: Task
   holder?: Member
   message: string
@@ -139,10 +139,10 @@ interface WedgeRecord {
 }
 
 /** R16-D: the dedup-key family of the attempt reporting-bound escalation. */
-export const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
+const ATTEMPT_SILENCE_PREFIX = 'attempt-silent:'
 
 /** R16-D: one live attempt whose durable progress is past its declared bound. */
-export interface SilentAttempt {
+interface SilentAttempt {
   taskId: string
   epoch: number
   /** The notice subject (`taskId@epoch`). */
@@ -335,17 +335,8 @@ export class Scheduling {
             // pending and a later tick re-evaluates it when a slot frees up.
             if (error instanceof AdmissionRefusedError) continue
             if (this.rt.shuttingDown || this.rt.mission(missionId).status !== 'active') return false
-            // A withdrawn authorization is terminal for this host process, not a
-            // transient preparation failure: fence the mission now, never retry.
-            if (error instanceof WorkspaceRevokedError) {
-              this.rt.fenceWorkspace(missionId, error.diagnostic)
-              // Round 14: the workspace chain's terminal element. `fenceWorkspace`
-              // blocks the work and records the raw diagnostic; this adds the coded
-              // decision request naming the executable exits, so a fenced mission
-              // never ends with a record that has no way forward in it.
-              this.escalateGuardTerminal(missionId, 'workspace', { taskId: task.id, detail: error.diagnostic })
-              return false
-            }
+            // A withdrawn authorization was fenced where it was detected, which
+            // blocked this task, so the changed-task rule below skips it.
             const fresh = this.rt.task(missionId, task.id)
             if (fresh.epoch !== task.epoch || fresh.assigneeId !== task.assigneeId || fresh.plannedAssigneeId !== task.plannedAssigneeId
               || fresh.assignmentMode !== task.assignmentMode || !this.ready(fresh, member)) continue
@@ -564,19 +555,16 @@ export class Scheduling {
 
   /**
    * A submission with no live review is a stall candidate, not a stall, until
-   * the same unreviewed artifact has aged past the grace. S5: the grace is read
-   * from the durable `task/submitted` event of each unreviewed task, not from an
-   * in-memory timer — a restart (or a lost cache) can no longer restart the
-   * window, and the answer is identical for the same durable board.
+   * its review need has aged past the grace. S5: the grace is read from the
+   * durable row that opened each unreviewed task's review need (its submission,
+   * or a challenge that re-opened it), not from an in-memory timer — a restart
+   * (or a lost cache) can no longer restart the window, and the answer is
+   * identical for the same durable board. With no such row the grace cannot
+   * have elapsed yet.
    */
-  unreviewedStall(missionId: string, unreviewed: Task[]): boolean {
+  unreviewedStall(unreviewed: Task[]): boolean {
     const grace = Math.min(this.rt.config.tickMs * STALL_GRACE_PASSES, STALL_GRACE_MAX_MS)
-    return unreviewed.every(task => {
-      const event = this.rt.store.latestTaskEvent(missionId, task.id, 'task/submitted')
-      if (event !== undefined) return this.rt.now() - event.createdAt >= grace
-      // No durable submission record: the grace cannot have elapsed yet.
-      return false
-    })
+    return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= grace })
   }
 
   /** Nothing is running, reviewably submitted or dispatchable: workers would stay idle forever. */
@@ -586,7 +574,7 @@ export class Scheduling {
     if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
     const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members))
     if (unreviewed.length) {
-      if (!this.unreviewedStall(mission.id, unreviewed)) return false
+      if (!this.unreviewedStall(unreviewed)) return false
     }
     const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
     return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
