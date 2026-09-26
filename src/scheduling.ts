@@ -567,17 +567,13 @@ export class Scheduling {
     return unreviewed.every(task => { const { age } = this.rt.reviewNeed(task); return age !== undefined && age >= grace })
   }
 
-  /** Nothing is running, reviewably submitted or dispatchable: workers would stay idle forever. */
-  stalled(mission: Mission, tasks: Task[], members: Member[]): boolean {
-    // An empty board is a mission the owner has not planned yet, not a stall.
-    if (!tasks.length) return false
-    if (tasks.some(task => task.status === 'running' || this.quiescencePending(task))) return false
-    const unreviewed = tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members))
-    if (unreviewed.length) {
-      if (!this.unreviewedStall(unreviewed)) return false
-    }
-    const live = members.filter(member => memberPhaseOf(member) !== 'stopped')
-    return !tasks.some(task => task.status === 'pending' && live.some(member => this.ready(task, member, tasks)))
+  /**
+   * Nothing is running, reviewably submitted or dispatchable: workers would stay
+   * idle forever. An empty board is a mission the owner has not planned yet.
+   */
+  stalled(tasks: Task[], members: Member[]): boolean {
+    return tasks.length > 0 && this.reviewPathStalled(tasks, members)
+      && this.unreviewedStall(tasks.filter(task => task.status === 'submitted' && !this.reviewable(task, tasks, members)))
   }
 
   /**
@@ -1002,7 +998,7 @@ export class Scheduling {
   boardCannotProgress(missionId: string): boolean {
     const mission = this.rt.store.get('missions', missionId)
     if (mission === undefined || mission.status !== 'active') return false
-    return this.stalled(mission, this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId))
+    return this.stalled(this.rt.store.list('tasks', missionId), this.rt.store.list('members', missionId))
   }
 
   /**

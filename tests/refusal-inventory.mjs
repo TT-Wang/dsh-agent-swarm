@@ -307,7 +307,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
   const { readFileSync } = await import('node:fs')
   const index = await toolSchemaIndex()
   const { workspaceAuthorizationDiagnostic } = await import('../lib/authorization.js')
-  index.probes = { workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], loadedAt: 0, unresolved: [] }) }
+  index.probes = { workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], unresolved: [] }) }
   for (const file of process.argv.slice(2)) {
     const sites = refusalSites(readFileSync(file, 'utf8'), file)
     const producers = diagnosticProducers([sites])

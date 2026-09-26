@@ -214,7 +214,7 @@ test('failed assembly and retries retain one deterministic plan and worker roste
  * the draft and the relaunched mission all carry the session authorization.
  */
 test('a retried automatic plan edits its saved draft under the session authorization of its request', async t => {
-  const f = await fixture(t, { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } })
+  const f = await fixture(t, { grants: { grants: [], unresolved: [] } })
   let fail = true
   f.workers.onStart = async spec => { if (spec.member.name === 'Reviewer' && fail) throw new Error('Temporary launch failure') }
   const request = f.runtime.requestStart(f.owner, f.requestInput, { grantRoot: f.requestInput.workspace, source: 'session' })

@@ -1,10 +1,10 @@
-import { createContext, memo, useContext, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useContext, useMemo, useState, type ReactNode } from 'react'
 import type { Snapshot, Task, Evidence, Member, UsageBuckets } from '../types.ts'
 import { LANES, activityGroups, boardIndex, cancellationNotes, compactNumber, durableVerdicts, evidenceCounts, eventSummary, remainingPercent, retiredReviewsBySource, shortId, type BoardIndex, type BoardLane, type CancellationKind, type CancellationNote, type DurableVerdict, type RetiredReview } from './projection.ts'
 import { leaseExpired, useVisibleClock } from './clock.ts'
 import { DependencyGraph } from './DependencyGraph.tsx'
 import { useCopy } from './locale.tsx'
-import { memberActivity, taskReasons, type ConnectionState } from './progress.ts'
+import { taskReasons, type ConnectionState } from './progress.ts'
 import { AgentAvatar } from './AgentAvatar.tsx'
 import { MissionOverview } from './LiveWorkPanel.tsx'
 
@@ -67,8 +67,8 @@ function TaskLease({ attempt }: { attempt: NonNullable<Task['attempt']> }) {
   const t = useCopy(), reference = useContext(LeaseTime)
   return <span title={`${t('Attempt')} ${attempt.id}`}>{t('Attempt')} {attempt.epoch} · {t('lease')} {time(attempt.leaseUntil)}{leaseExpired(attempt.leaseUntil, reference) ? ` ${t('(expired)')}` : ''}</span>
 }
-function TaskCard({ task, snapshot, index, memberById, lane, reason, cancellation, onCancel }: {
-  task: Task; snapshot: Snapshot; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
+function TaskCard({ task, index, memberById, lane, reason, cancellation, onCancel }: {
+  task: Task; index: BoardIndex; memberById: ReadonlyMap<string, Member>; lane: BoardLane;
   reason?: string; cancellation?: CancellationNote; onCancel?: (task: Task) => void;
 }) {
   const t = useCopy()
@@ -237,7 +237,7 @@ export function SwarmBoard({ snapshot, initialView, onOpenWorker, onCancelTask, 
           <div className="sw-lane-title">{t(lane.label)}<span className="sw-count">{items.length}</span></div>
           {/* Item 3: an empty lane collapses to its header instead of drawing a
               dashed placeholder box in every one of the seven columns. */}
-          {items.length === 0 ? <div className="sw-lane-void" aria-hidden="true" /> : items.map(task => <TaskCard key={task.id} task={task} snapshot={snapshot}
+          {items.length === 0 ? <div className="sw-lane-void" aria-hidden="true" /> : items.map(task => <TaskCard key={task.id} task={task}
             index={index} memberById={memberById}
             lane={lanes.get(task.id) ?? 'ready'} reason={reasons.get(task.id)} cancellation={cancellations.get(task.id)} onCancel={onCancelTask} />)}
         </section>

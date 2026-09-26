@@ -309,7 +309,7 @@ test('retry snapshot preparation uses the planning deadline rather than the shor
  * refused the validated plan. It now travels beside the plan from the request.
  */
 test('a native request launches its validated plan with the session authorization it was admitted with', async t => {
-  const f = await fixture(t, { config: { grants: { grants: [], loadedAt: Date.now(), unresolved: [] } } })
+  const f = await fixture(t, { config: { grants: { grants: [], unresolved: [] } } })
   assert.equal((await f.execute('/agent-swarm deliver the change')).result.kind, 'success')
   const [request] = f.runtime.starts({ sessionId: f.agent.id })
   assert.deepEqual([request.workspaceAuthorizationSource, request.workspaceGrantRoot], ['session', f.root])

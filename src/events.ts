@@ -17,7 +17,7 @@
  */
 
 /** One registered kind. `panel` is the client's decision: a label, or why there is none. */
-export interface EventSpec {
+interface EventSpec {
   /** What the row means, for the read path and `eventVocabularyReport`. */
   description: string
   /** The compact-panel label in both catalogue languages, or the reason the panel omits it. */

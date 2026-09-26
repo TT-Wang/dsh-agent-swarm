@@ -365,14 +365,14 @@ export function guardTerminal(chain: GuardChainId, context: GuardTerminalContext
   return { chain, code: GUARD_TERMINAL_CODES[chain], message: messages[chain], exits: exits[chain] }
 }
 
-/** The durable dedup key of one terminal decision request: one per chain and board state. */
-function guardTerminalKey(chain: GuardChainId, code: string, fingerprint: string): string {
-  return `guard-terminal:${chain}:${code}:${fingerprint}`
+/** The durable dedup key of one terminal decision request: one per chain and board state, `question:<id>` or `localKey`. */
+export function guardTerminalKey(chain: GuardChainId, fingerprint: string): string {
+  return `guard-terminal:${chain}:${GUARD_TERMINAL_CODES[chain]}:${fingerprint}`
 }
 
-/** The dedup `emitGuardTerminal` applies: the owner holds `chain`'s decision for this board, `question:<id>` or `localKey`. */
-export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, chain: GuardChainId, fingerprint: string): boolean {
-  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: guardTerminalKey(chain, GUARD_TERMINAL_CODES[chain], fingerprint), from: 'runtime' })
+/** The dedup `emitGuardTerminal` applies: the owner already holds the decision request `key` names. */
+export function guardTerminalHeld(rt: SwarmRuntime, missionId: string, key: string): boolean {
+  return hasNotice(rt.store.list('deliveries', missionId), { class: 'decision', dedupKey: key, from: 'runtime' })
 }
 
 /**
@@ -407,8 +407,8 @@ export function emitGuardTerminal(rt: SwarmRuntime, missionId: string, chain: Gu
   if (mission === undefined || rt.isMissionTerminal(mission)) return undefined
   const terminal = guardTerminal(chain, context)
   const fingerprint = context.questionId !== undefined ? `question:${context.questionId}` : context.localKey ?? rt.fingerprint(missionId)
-  if (guardTerminalHeld(rt, missionId, chain, fingerprint)) return terminal
-  const key = guardTerminalKey(chain, terminal.code, fingerprint)
+  const key = guardTerminalKey(chain, fingerprint)
+  if (guardTerminalHeld(rt, missionId, key)) return terminal
   try {
     rt.commit(missionId, () => {
       // The board-stall event type is reused with `cause: 'guard-terminal'`, so

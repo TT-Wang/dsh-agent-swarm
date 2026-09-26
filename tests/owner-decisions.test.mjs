@@ -26,7 +26,7 @@ import assert from 'node:assert/strict'
 import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { HarnessWorkers, strandedInboxDecision } from '../lib/harness-workers.js'
-import { AUTO_REVIEW_GRACE_MS } from '../lib/notices.js'
+import { reviewGraceMs } from '../lib/notices.js'
 import { sidebarState } from '../lib/types/client/progress.js'
 import { tempDirectory } from './temp-root.mjs'
 import { guardBoard } from './guard-model.mjs'
@@ -559,7 +559,7 @@ function referenceWaiting(runtime, missionId, task, tasks) {
   if (task.status === 'submitted') {
     if (runtime.reviewable(task, tasks)) return true
     const { age } = runtime.reviewNeed(task)
-    return age === undefined || age < Math.max(runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    return age === undefined || age < reviewGraceMs(runtime.config)
   }
   if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
     const stop = task.resumeAfterStop
@@ -619,7 +619,7 @@ test('R16-A1: the waiting classifier is enumerated over every constructed board 
     if (task.status === 'running') return task.attempt !== undefined && task.attempt.leaseUntil >= Date.now()
     if (task.status === 'submitted') {
       const { age } = f.runtime.reviewNeed(task)
-      return age === undefined || age < Math.max(f.runtime.config.tickMs, AUTO_REVIEW_GRACE_MS)
+      return age === undefined || age < reviewGraceMs(f.runtime.config)
     }
     if (task.status === 'blocked' && task.resumeAfterStop?.epoch === task.epoch) {
       const stop = task.resumeAfterStop

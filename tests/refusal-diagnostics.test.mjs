@@ -46,7 +46,7 @@ const read = file => readFileSync(new URL(`../${file}`, import.meta.url), 'utf8'
 async function inventory() {
   const index = await toolSchemaIndex()
   index.probes = {
-    workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], loadedAt: 0, unresolved: [] }),
+    workspaceAuthorizationDiagnostic: () => workspaceAuthorizationDiagnostic('probe', { grants: [], unresolved: [] }),
     // The declared composer of the missing-review exit must really carry it.
     reviewPathExit: () => /swarm_propose[\s\S]{0,400}reviewOf/.test(read('src/notices.ts')),
   }

@@ -17,7 +17,7 @@ import { isAbsolute, relative, sep } from 'node:path'
 import type { Mission, WorkspaceGrant, WorkspaceGrantSnapshot } from './types.ts'
 
 /** Why a workspace was accepted; `session` means the calling session's own cwd. */
-export type WorkspaceAuthorizationSource = 'session' | 'grant'
+type WorkspaceAuthorizationSource = 'session' | 'grant'
 
 export interface WorkspaceAuthorized {
   ok: true
@@ -34,13 +34,13 @@ export interface WorkspaceAuthorized {
 /** What an entry point hands the runtime beside a plan, and the runtime records; never a plan field. */
 export type WorkspaceClaim = Pick<WorkspaceAuthorized, 'source' | 'grantRoot'>
 
-export interface WorkspaceRefused {
+interface WorkspaceRefused {
   ok: false
   /** Field-level diagnostic naming the authorization requirement and its repair. */
   diagnostic: string
 }
 
-export type WorkspaceAuthorization = WorkspaceAuthorized | WorkspaceRefused
+type WorkspaceAuthorization = WorkspaceAuthorized | WorkspaceRefused
 
 /**
  * A recorded workspace is no longer inside a human-authorized root. Distinct
@@ -95,7 +95,7 @@ export async function loadWorkspaceGrants(configured: readonly WorkspaceGrant[] 
     if (grant.expiresAt !== undefined && grant.expiresAt <= now) { unresolved.push(`${grant.path} (expired)`); continue }
     grants.push({ path: canonical, ...(grant.note === undefined ? {} : { note: grant.note }), ...(grant.expiresAt === undefined ? {} : { expiresAt: grant.expiresAt }) })
   }
-  return { grants, loadedAt: now, unresolved }
+  return { grants, unresolved }
 }
 
 /**

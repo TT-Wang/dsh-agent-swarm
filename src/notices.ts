@@ -10,9 +10,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { covered, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
-import { requireText } from './refusals.ts'
+import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
-import { blockCauses } from './attempts.ts'
+import { blockCauses, stopFaultKey } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { awaited, type SchedulingPass } from './scheduling.ts'
@@ -247,7 +247,7 @@ function renderNoticeFacts(header: string, facts: readonly string[], missionId: 
  * same order as the runtime's attempt-silence bound: a mission without
  * task, evidence or owner-decision progress is reported as an absence.
  */
-export const DEFAULT_ABSENCE_BOUND_MS = 600_000
+const DEFAULT_ABSENCE_BOUND_MS = 600_000
 /**
  * R17-G2: the reviewed notice template table. Every reviewed family's body is
  * built by one pure function from the durable rows it cites, and the generator
@@ -390,7 +390,7 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  * author the turn in which it submitted to propose its own review; the floor
  * keeps a fast tick from turning a same-turn proposal into a race.
  */
-export const AUTO_REVIEW_GRACE_MS = 1000
+export const reviewGraceMs = (config: { tickMs: number }): number => Math.max(config.tickMs, 1000)
 
 /**
  * R17-G9: the runtime slice the lineage rules read, so the classifiers and the
@@ -501,7 +501,7 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
     // rather than mistaking the end of the admission grace for a stalled task.
     if (rt.reviewable(task, tasks)) return true
     const { age } = rt.reviewNeed(task)
-    return age === undefined || age < Math.max(rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
+    return age === undefined || age < reviewGraceMs(rt.config)
   }
   if (task.status === 'blocked') {
     // A blocked verdict record is not outstanding on its own while its source
@@ -893,7 +893,7 @@ export class Notices {
       dispatchable: tasks.filter(task => task.status === 'pending' && runnable.some(member => this.rt.ready(task, member, tasks))),
       unreviewed: tasks.filter(task => task.status === 'submitted' && !this.rt.reviewable(task, tasks)),
       unschedulable: this.rt.unschedulable(mission, tasks, members),
-      stalled: this.rt.stalled(mission, tasks, members),
+      stalled: this.rt.stalled(tasks, members),
       parkedHolders: tasks.filter(task => task.status === 'running' && task.attempt !== undefined
         && members.some(member => member.id === task.attempt?.ownerId && memberPhaseOf(member) === 'parked'))
         .map(task => ({ task, member: members.find(member => member.id === task.attempt?.ownerId)! })),
@@ -1106,16 +1106,14 @@ export class Notices {
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
-    const prefix = 'guard-terminal:attempt_lease:attempt_terminal:stop:'
     const key = delivery.notice?.dedupKey
-    if (!key?.startsWith(prefix)) return undefined
+    if (!key?.startsWith(guardTerminalKey('attempt_lease', 'stop:'))) return undefined
     const tasks = this.rt.store.list('tasks', missionId)
     return (delivery.subjects ?? []).filter(subject => {
       const task = taskFromSubject(subject, tasks)
       const marker = task?.resumeAfterStop
       if (task === undefined || marker?.epoch !== task.epoch || marker.failure === undefined) return false
-      const digest = createHash('sha256').update(marker.failure.message).digest('hex')
-      return key === `${prefix}${task.id}:${marker.epoch}:${marker.memberId ?? 'unresolved'}:${digest}`
+      return key === guardTerminalKey('attempt_lease', stopFaultKey(task.id, marker, marker.failure.message))
     })
   }
 
@@ -1237,7 +1235,7 @@ export class Notices {
    * empty board the owner is still planning (row 17) and a board whose
    * non-terminal work is running under a live lease (row 3). The bounded
    * missing-review grace is respected: the row-5 notice arrives after
-   * `AUTO_REVIEW_GRACE_MS`, not on the tick the artifact was submitted. A
+   * `reviewGraceMs`, not on the tick the artifact was submitted. A
    * submitted artifact with no live review path is witnessed even while
    * unrelated work runs, because no other witness can ever advance it.
    *
@@ -1358,17 +1356,13 @@ export class Notices {
     const unreviewed = view.unreviewed
     if (unreviewed.length) {
       // A submitted artifact no live review can accept is an owner decision. The
-      // documented `AUTO_REVIEW_GRACE_MS` floor is honored here, not only inside
+      // documented `reviewGraceMs` floor is honored here, not only inside
       // `stalled`, because `stalled` returns before its unreviewed check when
       // any unrelated work is running; without this an unreviewable submission
       // could stay silent behind live work forever (verifier-1 challenge,
       // evidence_a454a771). The age comes from the durable row that opened the
       // review need, so a restart cannot reset the grace.
-      const grace = Math.max(this.rt.config.tickMs, AUTO_REVIEW_GRACE_MS)
-      const ripe = unreviewed.filter(task => {
-        const { age } = this.rt.reviewNeed(task)
-        return age === undefined || age >= grace
-      })
+      const ripe = unreviewed.filter(task => { const { age } = this.rt.reviewNeed(task); return age === undefined || age >= reviewGraceMs(this.rt.config) })
       // On a board with no other progress (`reviewPathStalled`) the runtime's
       // own review admission owns every submitted artifact: its pass admits the
       // review or names the exact blocker, so a second, generic fact here would
