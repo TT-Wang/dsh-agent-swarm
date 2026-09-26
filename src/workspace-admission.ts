@@ -10,7 +10,7 @@
 import { tmpdir } from 'node:os'
 import { stopPending } from './attempts.ts'
 import { claimFor, isContained, reauthorizeWorkspace, WorkspaceRevokedError, WORKSPACE_AUTHORIZATION_CODE, type WorkspaceClaim } from './authorization.ts'
-import { emitGuardTerminal, guardTerminalHeld } from './refusals.ts'
+import { emitGuardTerminal, guardTerminalHeld, guardTerminalKey } from './refusals.ts'
 import type { SwarmRuntime } from './runtime.ts'
 import { progressed, type SchedulingPass } from './scheduling.ts'
 import { absoluteCheckPaths, shellSegments } from './admission.ts'
@@ -413,7 +413,7 @@ export class WorkspaceAdmission {
     const revocation = `workspace-revoked:${this.rt.instanceId}`
     // Idempotent from mission state: nothing left to block, and the owner
     // already holds this revocation's decision, means the mission is fenced.
-    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, 'workspace', revocation)) return
+    if (blocked.length === 0 && guardTerminalHeld(this.rt, missionId, guardTerminalKey('workspace', revocation))) return
     this.rt.commit(missionId, () => {
       for (const task of blocked) {
         // A running task here holds a live attempt and a live handle. Setting the

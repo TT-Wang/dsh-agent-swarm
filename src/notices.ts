@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { covered, hasNotice, noticeFingerprint as computeNoticeKey, noticeLedger as projectNoticeLedger } from './arena.ts'
 import { hostContextOf, memberPhaseOf } from './projection.ts'
 import { formatDiagnostic, missingReviewDiagnostic } from './admission.ts'
-import { requireText } from './refusals.ts'
+import { guardTerminalKey, requireText } from './refusals.ts'
 import { taskGraphIndex } from './task-graph.ts'
 import { blockCauses } from './attempts.ts'
 import { PolicyError } from './policy-error.ts'
@@ -1106,7 +1106,7 @@ export class Notices {
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
-    const prefix = 'guard-terminal:attempt_lease:attempt_terminal:stop:'
+    const prefix = guardTerminalKey('attempt_lease', 'stop:')
     const key = delivery.notice?.dedupKey
     if (!key?.startsWith(prefix)) return undefined
     const tasks = this.rt.store.list('tasks', missionId)
