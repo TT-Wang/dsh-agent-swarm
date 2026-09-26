@@ -348,6 +348,8 @@ export function nextWorkerName(used: Iterable<string>): string | undefined {
   const taken = new Set(used)
   return WORKER_NAME_POOL.find(name => !taken.has(name))
 }
+/** A mission criterion's id: c1 is the first acceptance item. The list is frozen once the mission exists, so the id is stable. */
+export const criterionId = (index: number): string => `c${index + 1}`
 export interface Workstream {
   id: string
   missionId: string
@@ -414,6 +416,8 @@ export interface Task {
   dependencies: string[]
   scope: string[]
   acceptance: string[]
+  /** Ids of the mission criteria this deliverable satisfies (see `criterionId`); absent means none. A repair also answers for the covers of the tasks it replaces. A plan's review may name them for its source; a stored review never carries them. */
+  covers?: string[]
   /**
    * The repository-relative files this task must produce, declared by whoever
    * planned it instead of inferred from the objective prose. An empty array is
@@ -864,7 +868,7 @@ export interface PlanMember {
   maxOutputTokens?: number
 }
 export interface PlanWorkstream { key: string; title: string; objective: string }
-export interface PlanTask {
+export interface PlanTask extends Pick<Task, 'covers'> {
   key: string
   workstreamKey: string
   title: string
@@ -972,7 +976,7 @@ export interface ObserveQuery {
   /** `full` includes complete task records, evidence claims and the owner arena instruments. */
   detail?: 'summary' | 'full'
 }
-export interface ProposeTaskInput {
+export interface ProposeTaskInput extends Pick<Task, 'covers'> {
   workstreamId: string
   title: string
   objective: string
