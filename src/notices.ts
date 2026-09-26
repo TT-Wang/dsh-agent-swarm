@@ -559,6 +559,9 @@ export function waitsLegitimately(rt: LineageRuntime, task: Task, tasks: Task[])
 
 const id = (prefix: string) => `${prefix}_${randomUUID()}`
 
+/** A review-blocked decision's identity: one per blocker reason of one review need (`SwarmRuntime.reviewNeed`) of a source. */
+const reviewBlockedKey = (missionId: string, sourceId: string, need: string, reason: string): string => `review-blocked:${missionId}:${sourceId}:${need}:${reason}`
+
 export class Notices {
   /**
    * Deliveries a pump is currently attempting (cache-only claim keyed per
@@ -990,6 +993,7 @@ export class Notices {
     // A stall-root decision is outstanding exactly while its root still is one;
     // the dependents it lists (a rejecting review) never keep it open.
     if (noticeFamily(delivery) === 'stall-root') return this.openStallRoot(mission.id, delivery, view.tasks)
+    if (noticeFamily(delivery) === 'review-blocked') return this.openReviewBlock(mission.id, delivery, view.tasks)
     return (delivery.subjects ?? [missionSubject(mission)]).filter(subject => {
       if (subject === missionSubject(mission)) {
         if (delivery.notice?.class === 'budget') return (mission.budgetReviewedAt ?? 0) <= delivery.createdAt
@@ -1047,13 +1051,13 @@ export class Notices {
       // Old unattributed rows cannot be judged from their text alone.
       if (subjects.length === 0) return true
       if (family === 'stall-root') return this.openStallRoot(mission.id, delivery, tasks).length > 0
+      if (family === 'review-blocked') return this.openReviewBlock(mission.id, delivery, tasks).length === subjects.length
       // A batch asserts the condition for every named subject. If one changes,
       // the transition publisher emits the remaining subjects as a fresh fact.
       return subjects.every(subject => {
         if (subject === missionSubject(mission)) return true
         const task = taskFromSubject(subject, tasks)
         if (task === undefined || TERMINAL_STATES.has(task.status)) return false
-        if (family === 'review-blocked') return task.status === 'submitted' && !this.rt.reviewable(task, tasks)
         if (family === 'fallthrough') return !this.waitsLegitimately(task, tasks)
         if (family === 'dispatch-question') return task.status === 'pending'
         return this.interpretation(mission.id).parkedHolders.some(holder => holder.task.id === task.id)
@@ -1087,6 +1091,17 @@ export class Notices {
     const root = key.startsWith(rootPrefix) ? key.slice(rootPrefix.length) : (delivery.subjects ?? noticeRow(delivery)?.subjects)?.[0]
     const task = root === undefined ? undefined : taskFromSubject(root, tasks)
     return task !== undefined && stallRootsFor(this.rt, tasks).some(candidate => candidate.id === task.id) ? [root!] : []
+  }
+
+  /** A review-blocked decision is outstanding while its source is unreviewable under the same review need; a re-opened need retires it. */
+  private openReviewBlock(missionId: string, delivery: Delivery, tasks: Task[]): string[] {
+    const key = delivery.notice?.dedupKey
+    const reason = noticeRow(delivery)?.reason ?? ''
+    return (delivery.subjects ?? []).filter(subject => {
+      const task = taskFromSubject(subject, tasks)
+      return task?.status === 'submitted' && !this.rt.reviewable(task, tasks)
+        && key === reviewBlockedKey(missionId, task.id, this.rt.reviewNeed(task).id, reason)
+    })
   }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
@@ -1364,11 +1379,8 @@ export class Notices {
       const admitted = options.wedged !== true && this.rt.reviewPathStalled(tasks, members)
       const named = admitted ? ripe.filter(task => task.artifact === undefined) : ripe
       if (!named.length) return false
-      const diagnostic = `Submitted artifact ${named.map(task => task.id).join(', ')} has no live independent review path and cannot reach a verdict while the rest of the board keeps running`
-      const { content, statement } = renderNotice('review-blocked', { diagnostic, sourceId: named[0]!.id })
-      this.rt.commit(missionId, () => {
-        this.notify(missionId, content, view.subjectsOf(named), { family: 'review-blocked', trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason: diagnostic, statement })
-      })
+      // The runtime admission's one emitter: a decision per source and review need.
+      for (const task of named) this.notifyReviewBlocked(view.mission, task, this.rt.reviewNeed(task).id, 'it has no live independent review path and cannot reach a verdict while the rest of the board keeps running')
       return true
     }
     // Row 3 (documented scope): a board whose *every* non-terminal task is
@@ -1641,7 +1653,7 @@ export class Notices {
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
-    const key = `review-blocked:${mission.id}:${row.id}:${need}:${reason}`
+    const key = reviewBlockedKey(mission.id, row.id, need, reason)
     // S5: the durable notice ledger (class, key, sender) is the gate; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
     if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return

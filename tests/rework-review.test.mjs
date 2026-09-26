@@ -334,6 +334,17 @@ test('a re-opened need blocked for the reason an earlier need was blocked wakes 
   await f.pastReviewGrace(2)
   assert.equal(decisions().length, 2, 'the re-opened need\'s decision reaches the owner')
   assert.match(decisions()[1].content, /no live member other than the author/)
+  // One review need, one live decision: the earlier need's decision is retired
+  // by the need the challenge opened, never revived beside it.
+  const [earlier, current] = decisions()
+  const mission = f.runtime.mission(f.mission.id)
+  assert.deepEqual([earlier, current].map(delivery => f.runtime.notices.ownerDeliveryRelevant(mission, delivery)), [false, true])
+  for (let i = 0; i < 4; i++) { f.clock.advance(f.runtime.notices.obligationFollowupMs + 1); await f.runtime.tick(); await f.runtime.settle(f.mission.id) }
+  const reminded = f.runtime.store.list('deliveries', f.mission.id)
+    .filter(delivery => delivery.to === 'owner' && delivery.notice?.dedupKey?.startsWith('obligation-followup:'))
+    .map(delivery => delivery.notice.dedupKey.split(':')[1])
+  assert.ok(reminded.includes(current.id), 'the current need\'s decision is reminded')
+  assert.ok(!reminded.includes(earlier.id), 'the retired need\'s decision is never reminded')
 })
 
 /**

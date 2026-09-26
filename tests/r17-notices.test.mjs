@@ -38,6 +38,7 @@ import { Context } from '@deepseek-ai/cordis'
 import ts from 'typescript'
 import { SwarmRuntime } from '../lib/runtime.js'
 import { NOTICE_TEMPLATES, noticeTemplateKey } from '../lib/notices.js'
+import { formatDiagnostic, missingReviewDiagnostic } from '../lib/admission.js'
 import { tempDirectory } from './temp-root.mjs'
 import { FakeClock, FakeWorkers, NO_GRANTS } from './faults/harness.mjs'
 
@@ -487,7 +488,8 @@ test('R17-G2g: the review-blocked notice beside running work is the template too
   assert.deepEqual(notice.notice.statement, { family: 'review-blocked', counts: {} }, 'every review-blocked body states its template')
   assert.deepEqual(notice.notice.subjects, [subjectOf(row)])
   assert.match(notice.notice.reason, /has no live independent review path/)
-  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: notice.notice.reason, sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
+  // The one review-blocked emitter: the recorded reason under the review_path_missing code.
+  assert.equal(notice.content, NOTICE_TEMPLATES['review-blocked'].build({ diagnostic: formatDiagnostic(missingReviewDiagnostic(row.id, notice.notice.reason)), sourceId: row.id }), 'the body is the template rebuilt from the recorded reason and the source row')
   assertDecision(notice, 'review-blocked')
 })
 

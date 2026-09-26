@@ -195,21 +195,23 @@ test('a reminder queued before review admission is retained in the ledger but ne
   const reminder = f.rows().find(row => row.notice?.dedupKey === `obligation-followup:${original.id}:1`)
   assert.ok(reminder)
   const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
+  const other = { ...source, id: 'other-submission' }
   f.runtime.store.transaction(() => {
     f.runtime.store.put('tasks', source)
     f.runtime.store.put('tasks', { ...source, id: 'review', kind: 'verification', reviewOf: source.id, status: 'pending' })
-    f.runtime.store.put('tasks', { ...source, id: 'other-submission' })
-    f.runtime.notify(f.mission.id, 'Admit the now-existing review', [`${source.id}@${source.epoch}`], { family: 'review-blocked' })
-    f.runtime.notify(f.mission.id, 'Stale mixed batch', [`${source.id}@${source.epoch}`, 'other-submission@1'], { family: 'review-blocked' })
-    f.runtime.notify(f.mission.id, 'Current remaining request', ['other-submission@1'], { family: 'review-blocked' })
+    f.runtime.store.put('tasks', other)
     f.runtime.notify(f.mission.id, 'Legacy review decision', [`${source.id}@${source.epoch}`])
   })
+  // Each review-blocked decision comes from the one emitter, per source and review need.
+  const mission = f.runtime.mission(f.mission.id)
+  for (const task of [source, other]) f.runtime.notices.notifyReviewBlocked(mission, task, f.runtime.reviewNeed(task).id, `no live independent review admits ${task.id}`)
+  const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
   await f.runtime.flushOutbox(f.mission.id)
-  for (const row of f.rows().filter(row => row.id === reminder.id || ['Admit the now-existing review', 'Legacy review decision', 'Stale mixed batch'].includes(row.content))) {
+  for (const row of [f.rows().find(row => row.id === reminder.id), decisionOf(source), f.rows().find(row => row.content === 'Legacy review decision')]) {
     assert.equal(row.deliveredAt, undefined, 'suppression is not a transport acknowledgement')
     assert.equal(f.workers.deliveries.some(delivery => delivery.id === row.id), false)
   }
-  assert.equal(f.workers.deliveries.some(delivery => delivery.content === 'Current remaining request'), true)
+  assert.equal(f.workers.deliveries.some(delivery => delivery.id === decisionOf(other).id), true, 'the still-unreviewed source\'s decision is delivered')
 })
 
 test('bounded reminders do not create reminders of reminders', async t => {
@@ -224,7 +226,7 @@ test('bounded reminders do not create reminders of reminders', async t => {
   assert.ok(reminders.every(row => !reminders.some(parent => row.notice.dedupKey.startsWith(`obligation-followup:${parent.id}:`))))
 })
 
-test('review admission replaces a stale multi-subject decision with a fresh remaining-subject decision', async t => {
+test('review admission retires only the reviewed source\'s decision; the other source\'s decision stays live', async t => {
   const f = await fixture(t)
   await stalledDecision(f)
   const source = f.runtime.task(f.mission.id, 'blocked-task'); source.status = 'submitted'
@@ -234,19 +236,17 @@ test('review admission replaces a stale multi-subject decision with a fresh rema
     f.runtime.store.put('tasks', other)
   })
   await flush()
-  const old = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 2)
-  assert.ok(old, 'the actual transition publisher announces both missing reviews')
+  const decisionOf = task => f.rows().find(row => row.notice?.dedupKey?.startsWith(`review-blocked:${f.mission.id}:${task.id}:`))
+  assert.ok(decisionOf(source) && decisionOf(other), 'the transition publisher announces each missing review as its own decision')
   f.runtime.commit(f.mission.id, () => f.runtime.store.put('tasks', {
     ...source, id: 'admitted-review', kind: 'verification', reviewOf: source.id, status: 'running',
     attempt: { id: 'review-attempt', ownerId: f.member.id, epoch: 1, leaseUntil: Date.now() + 3600000 },
   }))
   await flush()
-  const fresh = f.rows().find(row => row.notice?.dedupKey.startsWith('review-blocked:') && row.subjects?.length === 1 && row.subjects[0] === `${other.id}@1`)
-  assert.ok(fresh, 'the same publisher regenerates the still-unresolved subject')
-  assert.notEqual(old.notice.dedupKey, fresh.notice.dedupKey)
   await f.runtime.flushOutbox(f.mission.id)
-  assert.equal(f.workers.deliveries.some(row => row.id === old.id), false)
-  assert.equal(f.workers.deliveries.some(row => row.id === fresh.id), true, 'suppressing the obsolete batch does not suppress the necessary owner wake')
+  assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(source).id), false, 'the admitted review retired its source\'s decision')
+  assert.equal(f.workers.deliveries.some(row => row.id === decisionOf(other).id), true, 'retiring one source\'s decision does not suppress the other\'s owner wake')
+  assert.equal(f.rows().filter(row => row.notice?.dedupKey?.startsWith('review-blocked:')).length, 2, 'no decision is regenerated for the source still blocked')
 })
 
 test('completion suppresses old actions while delivering the final result and historical facts once', async t => {
@@ -305,10 +305,8 @@ test('a delivered summary does not revive a resolved review request because unre
   })
   t.mock.timers.tick(120000)
   f.runtime.notices.wakeBudget = 1
-  f.runtime.store.transaction(() => {
-    f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress' })
-    f.runtime.notify(f.mission.id, 'Please admit the review', [`${source.id}@1`], { family: 'review-blocked' })
-  })
+  f.runtime.store.transaction(() => f.runtime.notify(f.mission.id, 'An observed fact', ['mission:' + f.mission.id], { noticeClass: 'progress' }))
+  f.runtime.notices.notifyReviewBlocked(f.runtime.mission(f.mission.id), source, f.runtime.reviewNeed(source).id, 'Please admit the review')
   await f.runtime.flushOutbox(f.mission.id)
   const summary = f.rows().find(row => row.notice?.aggregatedFacts?.some(part => part.subjects.includes(`${source.id}@1`)))
   assert.ok(summary.deliveredAt)
