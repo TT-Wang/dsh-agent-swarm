@@ -1102,10 +1102,13 @@ export class Notices {
       const task = taskFromSubject(subject, tasks)
       if (task?.status !== 'submitted' || this.rt.reviewable(task, tasks)) return false
       const need = this.rt.reviewNeed(task)
-      const blocker = this.rt.reviewPathBlocker(task, need) ?? (this.rt.store.latestTaskEvent(missionId, task.id, 'task/review-blocked')?.data as { reason: string } | undefined)?.reason
+      const blocker = this.rt.reviewPathBlocker(task, need) ?? this.recordedBlocker(missionId, task.id)
       return blocker !== undefined && delivery.notice?.dedupKey === reviewBlockedKey(missionId, task.id, need.id, blocker)
     })
   }
+
+  /** The newest review blocker recorded for a source; it follows each derived one, whether or not that one woke the owner. */
+  private recordedBlocker(missionId: string, sourceId: string): string | undefined { return (this.rt.store.latestTaskEvent(missionId, sourceId, 'task/review-blocked')?.data as { reason?: string } | undefined)?.reason }
 
   /** A cancelled task can still owe preservation; its exact stop fault ends when cleanup succeeds. */
   private stopFailureSubjects(missionId: string, delivery: Delivery): string[] | undefined {
@@ -1652,16 +1655,18 @@ export class Notices {
     })
   }
 
-  /** Wake the owner once per distinct blocker for one review need (`SwarmRuntime.reviewNeed`) of an unreviewable submitted deliverable. */
+  /** Record an unreviewable submitted deliverable's blocker whenever it changes, and wake the owner once per blocker and review need (`SwarmRuntime.reviewNeed`). */
   notifyReviewBlocked(mission: Mission, source: Task, need: string, reason: string): void {
     const view = this.interpretation(mission.id)
     const row = view.tasks.find(candidate => candidate.id === source.id) ?? source
     const key = reviewBlockedKey(mission.id, row.id, need, reason)
-    // S5: the durable notice ledger (class, key, sender) is the gate; its row is
+    // S5: the durable notice ledger (class, key, sender) gates the wake; its row is
     // written in this call, so neither a restart nor a repeat can re-emit it.
-    if (hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })) return
+    const woken = hasNotice(this.rt.store.list('deliveries', mission.id), { class: 'decision', dedupKey: key, from: 'runtime' })
+    if (woken && this.recordedBlocker(mission.id, source.id) === reason) return
     this.rt.commit(mission.id, () => {
       this.rt.store.event(mission.id, 'task/review-blocked', 'runtime', { taskId: source.id, kind: source.kind, reason })
+      if (woken) return
       const { content, statement } = renderNotice('review-blocked', { sourceId: row.id, reason })
       this.notify(mission.id, content, view.subjectsOf([row]),
         { dedupe: true, dedupKey: key, trigger: NOTICE_TEMPLATES['review-blocked'].trigger, reason, statement })

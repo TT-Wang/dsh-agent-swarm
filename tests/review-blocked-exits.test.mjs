@@ -205,6 +205,19 @@ async function withdrawn(f, { running, stop } = {}) {
   return { source }
 }
 
+/**
+ * The host's own review of the source is refused: the source's check was
+ * worker-runnable when it was admitted, and its script now resolves to a
+ * nested sandbox, so the review that copies it is refused.
+ */
+async function refusedAdmission(f) {
+  const source = f.propose({ checks: ['npm run verify'] })
+  await writeFile(join(f.dir, 'package.json'), JSON.stringify({ scripts: { verify: 'sandbox-exec -f verify.sb node verify.js' } }))
+  await f.submit(source)
+  await f.pass()
+  return { source }
+}
+
 /** The host rows a deferred review's check left, per failure kind. */
 const DEFERRAL = {
   infrastructure: { command: '(verification preparation)', exitCode: 125, failureKind: 'infrastructure', output: 'Host verification could not execute: Error: EMFILE' },
@@ -238,6 +251,7 @@ const DEFERRED_UNRUNNABLE = /^review task_[\w-]+ deferred its verdict on this ar
 const REPLACE = ['swarm_control', 'swarm_cancel', 'swarm_propose']
 const TASK_CEILING = /^\[mission_task_budget_exhausted\] Mission task budget exhausted: raise maxTasks with swarm_budget\(budget, reason\), then /
 const RUNNING = /^it has no live independent review path and cannot reach a verdict while the rest of the board keeps running: /
+const REFUSED = /^automatic review admission failed: .* The refusal: \[check_requires_host\] /
 const PROPOSE_OR_CANCEL = ['swarm_propose', 'swarm_cancel']
 
 /**
@@ -292,16 +306,8 @@ const FAMILIES = [
   },
   {
     name: 'the automatic review\'s admission is refused',
-    block: async f => {
-      // The source's check was worker-runnable when it was admitted; its script
-      // now resolves to a nested sandbox, so the review that copies it is refused.
-      const source = f.propose({ checks: ['npm run verify'] })
-      await writeFile(join(f.dir, 'package.json'), JSON.stringify({ scripts: { verify: 'sandbox-exec -f verify.sb node verify.js' } }))
-      await f.submit(source)
-      await f.pass()
-      return { source }
-    },
-    steps: [[/^automatic review admission failed: .* The refusal: \[check_requires_host\] /, PROPOSE_OR_CANCEL]],
+    block: f => refusedAdmission(f),
+    steps: [[REFUSED, PROPOSE_OR_CANCEL]],
   },
   {
     name: 'a review deferred its verdict on the artifact',
@@ -392,6 +398,24 @@ test('beside running work, no reminder repeats the budget cause the owner remove
   assert.deepEqual(reminders.filter(delivery => delivery.notice.reason === notice.id).map(delivery => delivery.content), [], 'the removed cause is never reminded')
   const running = blockedNotice(f, source, RUNNING)
   assert.ok(reminders.some(delivery => delivery.notice.reason === running.id), 'the cause that holds now is the one reminded')
+})
+
+test('a refused admission, then running work, then a stall: the refusal is again the recorded cause and the outstanding decision', async t => {
+  const f = await fixture(t)
+  const { source } = await refusedAdmission(f)
+  const refusal = blockedNotice(f, source, REFUSED)
+  const running = await f.run(f.reviewer)
+  await f.pass()
+  const busy = blockedNotice(f, source, RUNNING)
+  await f.tool('swarm_cancel', { taskId: running.id, reason: 'Stop the unrelated work' })
+  await f.pass()
+  assert.equal(f.runtime.reviewPathStalled(f.runtime.store.list('tasks', f.mission.id), f.runtime.store.list('members', f.mission.id)), true, 'the board stalls again')
+  assert.deepEqual(f.reviewsOf(source), [], 'and the host\'s admission is refused again')
+  const recorded = events(f.runtime, f.mission.id, 'task/review-blocked').filter(event => event.data.taskId === source.id).map(event => event.data.reason)
+  assert.deepEqual(recorded, [refusal.notice.reason, busy.notice.reason, refusal.notice.reason], 'the recorded cause follows the derived one')
+  const outstanding = notice => f.runtime.ownerDeliveryRelevant(f.runtime.mission(f.mission.id), f.runtime.store.get('deliveries', notice.id))
+  assert.deepEqual([outstanding(refusal), outstanding(busy)], [true, false], 'the refusal is outstanding again, the running board no longer')
+  blockedNotice(f, source, REFUSED)
 })
 
 test('two sources share the last task slot: the first gets the host review, the second the budget decision, and no decision is stale when written', async t => {
