@@ -391,7 +391,7 @@ export function taskFromSubject(subject: string, tasks: readonly Task[]): Task |
  */
 export const AUTO_REVIEW_GRACE_MS = 1000
 /** The exits a review-path blocker may name beside its own cause's: admit the review, or withdraw the source. */
-export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf)'
+export const ADMIT_REVIEW = 'admit a review with swarm_propose(kind: "verification", reviewOf, acceptance, outputs: [])'
 export const WITHDRAW_SOURCE = 'withdraw the source with swarm_cancel(taskId, reason)'
 
 /**
